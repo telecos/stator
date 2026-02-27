@@ -1,4 +1,4 @@
-use crate::gc::heap::HeapObject;
+use crate::objects::heap_object::HeapObject;
 
 /// A pointer-sized tagged value that can represent either a small integer
 /// (`Smi`) or a pointer to a [`HeapObject`].
@@ -141,8 +141,8 @@ mod tests {
 
     #[test]
     fn heap_ptr_round_trip() {
-        // Use an aligned allocation as a stand-in for a HeapObject.
-        let mut obj = HeapObject { meta: 0 };
+        // Use a null-map HeapObject as a stand-in; we only need the address.
+        let mut obj = HeapObject::new_null();
         let ptr = &mut obj as *mut HeapObject;
         // SAFETY: ptr is non-null and properly aligned.
         let tv = unsafe { TaggedValue::from_heap_object(ptr) };

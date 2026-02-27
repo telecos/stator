@@ -1,16 +1,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::mem::align_of;
 
-/// Every GC-managed allocation starts with this header.
-///
-/// The `meta` field stores GC bookkeeping data:
-/// - bit 0: mark bit (set during mark phase, cleared between collections)
-/// - bits 1..: reserved for future use (object type tag, forwarding pointer, …)
-#[repr(C)]
-pub struct HeapObject {
-    /// GC bookkeeping metadata (mark bit, type tag, forwarding pointer, …).
-    pub meta: usize,
-}
+pub use crate::objects::heap_object::HeapObject;
 
 /// A contiguous, fixed-size memory region used as a semi-space or generation.
 ///
@@ -128,7 +119,7 @@ impl Heap {
 
         match self.young_space.bump_alloc(layout) {
             Some(ptr) => {
-                // Zero-initialise so `meta` starts with no mark bits set.
+                // Zero-initialise so map_word starts as null (no map set yet).
                 // SAFETY: `ptr` is freshly allocated with `layout` bytes.
                 unsafe { std::ptr::write_bytes(ptr, 0, layout.size()) };
                 ptr as *mut HeapObject
