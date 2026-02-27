@@ -7,7 +7,12 @@ members = [
 ]
 resolver = "2"
 
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
 [workspace.dependencies]
+stator_core = { path = "crates/stator_core" }
 bumpalo = "3.20.2"
 log = "0.4.29"
 env_logger = "0.11.9"
