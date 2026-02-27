@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn test_map_ptr_round_trip() {
-        let mut map = Map::new(InstanceType::Map);
+        let mut map = Map::new(InstanceType::Map, 0);
         let obj = HeapObject {
             map_word: TaggedValue(&raw mut map as usize),
         };
@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn test_instance_type_via_map() {
-        let mut map = Map::new(InstanceType::Map);
+        let mut map = Map::new(InstanceType::Map, 0);
         let obj = HeapObject {
             map_word: TaggedValue(&raw mut map as usize),
         };
