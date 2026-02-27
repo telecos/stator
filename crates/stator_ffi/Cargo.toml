@@ -8,7 +8,6 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 stator_core.workspace = true
-stator_core = { path = "../stator_core" }
 log.workspace = true
 
 [lints]
