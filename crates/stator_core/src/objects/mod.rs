@@ -1,5 +1,7 @@
 /// The `HeapObject` base type shared by all GC-managed objects.
 pub mod heap_object;
+/// JavaScript Array with element-kind tracking and length semantics.
+pub mod js_array;
 /// JavaScript ordinary objects with in-object, overflow, and element storage.
 pub mod js_object;
 /// Hidden class ([`map::Map`]) and instance-type tag for heap objects.

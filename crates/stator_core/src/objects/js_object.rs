@@ -116,6 +116,20 @@ impl JsObject {
         }
     }
 
+    /// Creates an empty object using `instance_type` as the hidden-class tag.
+    ///
+    /// This is used internally by subtypes such as [`JsArray`][super::js_array::JsArray]
+    /// that need to stamp the correct [`InstanceType`] into the object's [`Map`]
+    /// while reusing the same storage layout.
+    pub fn new_with_instance_type(instance_type: InstanceType) -> Self {
+        Self {
+            map: Map::new(instance_type, 0),
+            named_properties: NamedProperties::Fast(Box::new(SmallVec::new())),
+            elements: Vec::new(),
+            prototype: None,
+        }
+    }
+
     /// Creates an empty ordinary object with the given prototype.
     pub fn with_prototype(prototype: Rc<RefCell<JsObject>>) -> Self {
         Self {
@@ -479,6 +493,14 @@ impl JsObject {
     /// `undefined` holes created by sparse assignments).
     pub fn elements_length(&self) -> usize {
         self.elements.len()
+    }
+
+    /// Truncates the element backing store to `new_len` slots.
+    ///
+    /// If `new_len` is greater than or equal to the current length this is a
+    /// no-op.  Slots beyond `new_len` are dropped.
+    pub fn truncate_elements(&mut self, new_len: usize) {
+        self.elements.truncate(new_len);
     }
 }
 
