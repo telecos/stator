@@ -63,7 +63,7 @@ fn bench_tagged_smi_round_trip(c: &mut Criterion) {
 }
 
 fn bench_tagged_heap_ptr_round_trip(c: &mut Criterion) {
-    let mut obj = HeapObject { meta: 0 };
+    let mut obj = HeapObject::new_null();
     let ptr: *mut HeapObject = &mut obj;
     c.bench_function("tagged_heap_ptr_round_trip", |b| {
         b.iter(|| {
