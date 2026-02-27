@@ -32,7 +32,10 @@ impl<'isolate> HandleScope<'isolate> {
     /// that no two scopes are open simultaneously on the same isolate (a
     /// constraint the real engine will enforce more rigorously later).
     pub fn new(_isolate: &'isolate mut ()) -> Self {
-        Self { handles: Vec::new(), _isolate: PhantomData }
+        Self {
+            handles: Vec::new(),
+            _isolate: PhantomData,
+        }
     }
 
     /// Register `ptr` with this scope and return a [`Local`] handle.
@@ -44,12 +47,12 @@ impl<'isolate> HandleScope<'isolate> {
     /// # Safety
     /// `ptr` must point to a live, properly-aligned `T` that the heap will
     /// not collect for at least as long as this `HandleScope` is alive.
-    pub unsafe fn create_local<'scope, T>(
-        &'scope mut self,
-        ptr: NonNull<T>,
-    ) -> Local<'scope, T> {
+    pub unsafe fn create_local<'scope, T>(&'scope mut self, ptr: NonNull<T>) -> Local<'scope, T> {
         self.handles.push(ptr.as_ptr() as *mut u8);
-        Local { ptr, _scope: PhantomData }
+        Local {
+            ptr,
+            _scope: PhantomData,
+        }
     }
 
     /// Iterate the raw handle pointers registered in this scope.
@@ -167,13 +170,15 @@ impl<T> Persistent<T> {
     /// # Safety
     /// `roots` must remain valid (i.e. not be dropped or moved) for the entire
     /// lifetime of this `Persistent`.
-    pub unsafe fn from_local<'scope>(
-        local: Local<'scope, T>,
-        roots: &mut PersistentRoots,
-    ) -> Self {
+    pub unsafe fn from_local<'scope>(local: Local<'scope, T>, roots: &mut PersistentRoots) -> Self {
         let ptr = local.ptr;
         let index = roots.register(ptr.as_ptr() as *mut u8);
-        Self { ptr, roots, index, _marker: PhantomData }
+        Self {
+            ptr,
+            roots,
+            index,
+            _marker: PhantomData,
+        }
     }
 
     /// Return a shared reference to the underlying value.

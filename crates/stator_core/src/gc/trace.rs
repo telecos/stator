@@ -12,7 +12,9 @@ pub struct Tracer {
 impl Tracer {
     /// Create a new, empty `Tracer`.
     pub fn new() -> Self {
-        Self { gray_stack: Vec::new() }
+        Self {
+            gray_stack: Vec::new(),
+        }
     }
 
     /// Mark a raw heap pointer as reachable and enqueue it for tracing.
