@@ -36,7 +36,11 @@ impl MemoryRegion {
         let layout = Layout::from_size_align(capacity, 8).expect("valid layout");
         let base = unsafe { alloc(layout) };
         assert!(!base.is_null(), "heap region allocation failed");
-        Self { base, capacity, used: 0 }
+        Self {
+            base,
+            capacity,
+            used: 0,
+        }
     }
 
     /// Bump-allocate `layout` bytes, returning a pointer to the start of the
@@ -78,8 +82,7 @@ impl Drop for MemoryRegion {
     fn drop(&mut self) {
         if !self.base.is_null() {
             // SAFETY: `base` was allocated with the same layout in `new`.
-            let layout =
-                Layout::from_size_align(self.capacity, 8).expect("valid layout");
+            let layout = Layout::from_size_align(self.capacity, 8).expect("valid layout");
             unsafe { dealloc(self.base, layout) };
         }
     }
