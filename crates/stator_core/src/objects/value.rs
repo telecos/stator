@@ -21,7 +21,7 @@ use crate::objects::heap_object::HeapObject;
 /// the engine heap.  It is the caller's responsibility to ensure the object
 /// outlives the `JsValue` that wraps it and that no GC compaction has
 /// invalidated the pointer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum JsValue {
     /// The ECMAScript `undefined` primitive.
     Undefined,
