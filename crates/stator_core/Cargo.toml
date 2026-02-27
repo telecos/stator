@@ -5,3 +5,11 @@ edition = "2024"
 
 [lib]
 crate-type = ["rlib"]
+
+[dependencies]
+bumpalo.workspace = true
+log.workspace = true
+bitflags.workspace = true
+smallvec.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
