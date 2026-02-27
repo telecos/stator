@@ -3,9 +3,12 @@
 //!
 //! # Crate layout
 //!
+//! - [`error`] — Engine error types and `StatorResult` alias.
 //! - [`gc`] — Garbage collector infrastructure (heap, tracing, handles).
 //! - [`objects`] — JavaScript value representation and heap object types.
 
+/// Engine error types and [`StatorResult`] alias.
+pub mod error;
 /// Garbage collector infrastructure: heap, tracing, and handle scopes.
 pub mod gc;
 /// JavaScript value representation and heap object types.
