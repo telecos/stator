@@ -1,0 +1,5 @@
+[toolchain]
+# Rust edition 2024 requires rustc >= 1.85 (stabilised February 2025).
+# We pin to the stable channel so CI always uses the latest stable release
+# that ships edition-2024 support.  No nightly features are used.
+channel = "stable"
