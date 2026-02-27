@@ -17,9 +17,13 @@ use stator_core::objects::tagged::TaggedValue;
 // Object allocation throughput
 // ---------------------------------------------------------------------------
 
+const BURST_ALLOC_COUNT: usize = 1000;
+
 fn bench_heap_allocate(c: &mut Criterion) {
     let layout = Layout::new::<HeapObject>();
     c.bench_function("heap_allocate_single", |b| {
+        // Heap lives across iterations to measure steady-state bump-allocation.
+        // When the young space fills up we collect (reset) and keep going.
         let mut heap = Heap::new();
         b.iter(|| {
             let ptr = heap.allocate(black_box(layout));
@@ -36,7 +40,7 @@ fn bench_heap_allocate_burst(c: &mut Criterion) {
     c.bench_function("heap_allocate_burst_1000", |b| {
         b.iter(|| {
             let mut heap = Heap::new();
-            for _ in 0..1000 {
+            for _ in 0..BURST_ALLOC_COUNT {
                 let ptr = heap.allocate(black_box(layout));
                 black_box(ptr);
             }
@@ -77,6 +81,8 @@ fn bench_tagged_heap_ptr_round_trip(c: &mut Criterion) {
 // HandleScope create / destroy
 // ---------------------------------------------------------------------------
 
+const LOCAL_HANDLE_COUNT: usize = 100;
+
 fn bench_handle_scope_create_destroy(c: &mut Criterion) {
     c.bench_function("handle_scope_create_destroy", |b| {
         b.iter(|| {
@@ -90,7 +96,7 @@ fn bench_handle_scope_create_destroy(c: &mut Criterion) {
 
 fn bench_handle_scope_create_locals(c: &mut Criterion) {
     c.bench_function("handle_scope_create_100_locals", |b| {
-        let mut values: Vec<u64> = (0..100).collect();
+        let mut values: Vec<u64> = (0..LOCAL_HANDLE_COUNT as u64).collect();
         let ptrs: Vec<NonNull<u64>> = values
             .iter_mut()
             .map(|v| NonNull::new(v as *mut u64).unwrap())
