@@ -4,3 +4,5 @@ pub mod heap_object;
 pub mod map;
 /// Tagged pointer representation for JavaScript values.
 pub mod tagged;
+/// Top-level JavaScript value enum and ECMAScript §7.1 type conversions.
+pub mod value;
