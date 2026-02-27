@@ -8,3 +8,11 @@ crate-type = ["rlib"]
 
 [lints]
 workspace = true
+
+[dependencies]
+bumpalo.workspace = true
+log.workspace = true
+bitflags.workspace = true
+smallvec.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true

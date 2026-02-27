@@ -9,6 +9,9 @@ path = "src/main.rs"
 
 [dependencies]
 stator_core.workspace = true
+stator_core = { path = "../stator_core" }
+env_logger.workspace = true
+log.workspace = true
 
 [lints]
 workspace = true
