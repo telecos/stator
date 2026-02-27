@@ -210,12 +210,13 @@ mod tests {
     use super::*;
 
     /// Dummy isolate token (the real `Isolate` will own this slot).
-    fn make_isolate() -> () {}
+    fn make_isolate() {}
 
     #[test]
     fn local_lifetime_tied_to_scope() {
-        let mut isolate = make_isolate();
-        let mut scope = HandleScope::new(&mut isolate);
+        make_isolate();
+        let mut unit = ();
+        let mut scope = HandleScope::new(&mut unit);
         let value: u32 = 99;
         let mut boxed = Box::new(value);
         let ptr = NonNull::new(boxed.as_mut() as *mut u32).unwrap();
@@ -227,14 +228,15 @@ mod tests {
 
     #[test]
     fn persistent_root_is_tracked() {
-        let mut isolate = make_isolate();
+        make_isolate();
         let mut roots = PersistentRoots::new();
         let value: u32 = 42;
         let mut boxed = Box::new(value);
         let ptr = NonNull::new(boxed.as_mut() as *mut u32).unwrap();
 
         let persistent = {
-            let mut scope = HandleScope::new(&mut isolate);
+            let mut unit = ();
+            let mut scope = HandleScope::new(&mut unit);
             // SAFETY: `boxed` outlives `persistent`.
             let local = unsafe { scope.create_local(ptr) };
             // SAFETY: `roots` outlives `persistent`.

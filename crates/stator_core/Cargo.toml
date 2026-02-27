@@ -10,6 +10,9 @@ crate-type = ["rlib"]
 name = "engine_benchmarks"
 harness = false
 
+[lints]
+workspace = true
+
 [dependencies]
 bumpalo.workspace = true
 log.workspace = true

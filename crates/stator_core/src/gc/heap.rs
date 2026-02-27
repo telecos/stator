@@ -8,6 +8,7 @@ use std::mem::align_of;
 /// - bits 1..: reserved for future use (object type tag, forwarding pointer, …)
 #[repr(C)]
 pub struct HeapObject {
+    /// GC bookkeeping metadata (mark bit, type tag, forwarding pointer, …).
     pub meta: usize,
 }
 
@@ -98,7 +99,9 @@ const OLD_SPACE_SIZE: usize = 64 * 1024 * 1024; // 64 MiB — tenured objects
 /// New allocations land in `young_space`.  When the nursery is full, `collect`
 /// must be called; surviving objects will eventually be promoted to `old_space`.
 pub struct Heap {
+    /// The young (nursery) generation where new allocations land.
     pub young_space: MemoryRegion,
+    /// The old (tenured) generation for long-lived objects.
     pub old_space: MemoryRegion,
 }
 

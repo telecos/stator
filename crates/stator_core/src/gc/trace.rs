@@ -48,6 +48,7 @@ impl Default for Tracer {
 /// Implementors must not hold any mutable borrows to GC-managed memory while
 /// `trace` is running, as the tracer may inspect the same objects.
 pub trait Trace {
+    /// Visit all outgoing heap references, marking each via the tracer.
     fn trace(&self, tracer: &mut Tracer);
 }
 
