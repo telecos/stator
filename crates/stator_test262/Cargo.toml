@@ -1,0 +1,11 @@
+[package]
+name = "stator_test262"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "stator_test262"
+path = "src/main.rs"
+
+[dependencies]
+stator_core = { path = "../stator_core" }
