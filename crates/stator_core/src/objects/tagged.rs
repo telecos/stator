@@ -40,7 +40,7 @@ impl TaggedValue {
     /// - `ptr` must be at least 2-byte aligned (bit 0 must be 0).
     /// - `ptr` must point to a live `HeapObject` managed by the [`Heap`][crate::gc::heap::Heap].
     #[inline]
-    pub unsafe fn from_heap_ptr(ptr: *mut HeapObject) -> Self {
+    pub unsafe fn from_heap_object(ptr: *mut HeapObject) -> Self {
         debug_assert!(!ptr.is_null(), "heap pointer must be non-null");
         debug_assert!(
             ptr as usize & SMI_TAG_MASK == 0,
@@ -83,7 +83,7 @@ impl TaggedValue {
     /// freed the object (i.e., no collection has occurred since this value was
     /// created).
     #[inline]
-    pub unsafe fn as_heap_ptr(self) -> Option<*mut HeapObject> {
+    pub unsafe fn as_heap_object(self) -> Option<*mut HeapObject> {
         if self.is_heap_object() {
             Some(self.0 as *mut HeapObject)
         } else {
@@ -145,12 +145,12 @@ mod tests {
         let mut obj = HeapObject { meta: 0 };
         let ptr = &mut obj as *mut HeapObject;
         // SAFETY: ptr is non-null and properly aligned.
-        let tv = unsafe { TaggedValue::from_heap_ptr(ptr) };
+        let tv = unsafe { TaggedValue::from_heap_object(ptr) };
         assert!(tv.is_heap_object());
         assert!(!tv.is_smi());
         assert_eq!(tv.as_smi(), None);
         // SAFETY: obj is still live.
-        let recovered = unsafe { tv.as_heap_ptr() };
+        let recovered = unsafe { tv.as_heap_object() };
         assert_eq!(recovered, Some(ptr));
     }
 }
