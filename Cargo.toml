@@ -6,3 +6,10 @@ members = [
     "crates/st8",
 ]
 resolver = "2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.dependencies]
+stator_core = { path = "crates/stator_core" }

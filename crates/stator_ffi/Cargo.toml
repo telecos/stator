@@ -7,4 +7,7 @@ edition = "2024"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-stator_core = { path = "../stator_core" }
+stator_core.workspace = true
+
+[lints]
+workspace = true
