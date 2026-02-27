@@ -69,10 +69,10 @@ fn bench_tagged_heap_ptr_round_trip(c: &mut Criterion) {
         b.iter(|| {
             // SAFETY: `ptr` is non-null, aligned, and `obj` is live for the
             // duration of the benchmark.
-            let tv = unsafe { TaggedValue::from_heap_ptr(black_box(ptr)) };
+            let tv = unsafe { TaggedValue::from_heap_object(black_box(ptr)) };
             black_box(tv.is_heap_object());
             // SAFETY: `obj` has not been freed.
-            black_box(unsafe { tv.as_heap_ptr() });
+            black_box(unsafe { tv.as_heap_object() });
         });
     });
 }
