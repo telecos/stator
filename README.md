@@ -4,7 +4,7 @@ Stator is an experimental JavaScript engine written in Rust, designed to be
 embedded in browser-like environments such as Chromium via a stable C FFI layer.
 
 [![CI](https://github.com/telecos/stator/actions/workflows/ci.yml/badge.svg)](https://github.com/telecos/stator/actions/workflows/ci.yml)
-[![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ## Architecture
 
@@ -97,4 +97,4 @@ board for the current roadmap and planned milestones.
 
 ## License
 
-Stator is distributed under the [BSD 3-Clause License](LICENSE).
+Stator is distributed under the [MIT License](LICENSE).
