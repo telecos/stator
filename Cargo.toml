@@ -6,3 +6,12 @@ members = [
     "crates/st8",
 ]
 resolver = "2"
+
+[workspace.dependencies]
+bumpalo = "3.20.2"
+log = "0.4.29"
+env_logger = "0.11.9"
+bitflags = "2.11.0"
+smallvec = "1.15.1"
+parking_lot = "0.12.5"
+thiserror = "2.0.18"
