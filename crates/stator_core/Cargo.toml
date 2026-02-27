@@ -5,3 +5,10 @@ edition = "2024"
 
 [lib]
 crate-type = ["rlib"]
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "engine_benchmarks"
+harness = false
