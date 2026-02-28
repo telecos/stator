@@ -80,36 +80,209 @@ impl Drop for MemoryRegion {
     }
 }
 
-// Default sizes for the two generations.
-const YOUNG_SPACE_SIZE: usize = 8 * 1024 * 1024; //  8 MiB — nursery
-const OLD_SPACE_SIZE: usize = 64 * 1024 * 1024; // 64 MiB — tenured objects
-
-/// The garbage-collected heap, composed of a young generation (nursery) and
-/// an old generation (tenured space).
+/// Capacity of each semi-space half in the young (nursery) generation.
 ///
-/// New allocations land in `young_space`.  When the nursery is full, `collect`
-/// must be called; surviving objects will eventually be promoted to `old_space`.
-pub struct Heap {
-    /// The young (nursery) generation where new allocations land.
-    pub young_space: MemoryRegion,
-    /// The old (tenured) generation for long-lived objects.
-    pub old_space: MemoryRegion,
+/// Value: 4 MiB (4 × 1024 × 1024 = 4,194,304 bytes).
+/// The total young-generation footprint is `2 × YOUNG_SEMI_SPACE_SIZE` because
+/// Cheney's algorithm requires a mirrored *to-space* of equal size.
+const YOUNG_SEMI_SPACE_SIZE: usize = 4 * 1024 * 1024;
+
+/// Capacity of the old (tenured) generation (64 MiB).
+const OLD_SPACE_SIZE: usize = 64 * 1024 * 1024;
+
+/// Objects whose adjusted allocation size meets or exceeds this threshold
+/// bypass the nursery and are placed directly in the [`LargeObjectSpace`].
+///
+/// Set equal to [`YOUNG_SEMI_SPACE_SIZE`] so that an object guaranteed never
+/// to fit in a single semi-space half is routed to the LOS immediately.
+const LARGE_OBJECT_THRESHOLD: usize = YOUNG_SEMI_SPACE_SIZE;
+
+/// A Cheney-style semi-space for the young (nursery) generation.
+///
+/// The semi-space is split into two equally-sized halves: *from-space* and
+/// *to-space*.  New allocations always land in the from-space via a bump
+/// pointer.  During a minor GC the collector copies surviving objects into the
+/// to-space, then swaps the two halves so the old from-space becomes the new
+/// (empty) to-space, ready to receive survivors in the next cycle.
+///
+/// In this skeletal implementation live-object copying is not yet performed
+/// (the root-scanning infrastructure is incomplete).  The from-space is simply
+/// reset after a swap, treating every nursery object as dead — a safe
+/// approximation for a nursery whose live set is fully re-rooted on every
+/// minor GC.
+pub struct SemiSpace {
+    from_space: MemoryRegion,
+    to_space: MemoryRegion,
 }
 
-impl Heap {
-    /// Create a heap with default nursery and old-generation sizes.
-    pub fn new() -> Self {
+impl SemiSpace {
+    /// Create a semi-space with two halves each of `semi_size` bytes.
+    pub fn new(semi_size: usize) -> Self {
         Self {
-            young_space: MemoryRegion::new(YOUNG_SPACE_SIZE),
-            old_space: MemoryRegion::new(OLD_SPACE_SIZE),
+            from_space: MemoryRegion::new(semi_size),
+            to_space: MemoryRegion::new(semi_size),
         }
     }
 
-    /// Bump-allocate enough memory for `layout` bytes in the young generation
-    /// and return a pointer to a zero-initialised `HeapObject` header.
+    /// Bump-allocate `layout` bytes from the active from-space.
     ///
-    /// Returns a null pointer when the young space is exhausted; the caller
-    /// is responsible for triggering a collection and retrying.
+    /// Returns `None` when the from-space is exhausted.
+    pub fn bump_alloc(&mut self, layout: Layout) -> Option<*mut u8> {
+        self.from_space.bump_alloc(layout)
+    }
+
+    /// Perform a Cheney-style minor collection.
+    ///
+    /// The from-space and to-space are swapped and the new from-space
+    /// (previously the to-space) is reset, making it available for fresh
+    /// allocations.  Surviving objects are not yet copied; that step will be
+    /// added once root-tracing is complete.
+    pub fn collect(&mut self) {
+        std::mem::swap(&mut self.from_space, &mut self.to_space);
+        self.from_space.reset();
+    }
+
+    /// Bytes currently allocated in the active from-space.
+    pub fn used(&self) -> usize {
+        self.from_space.used()
+    }
+
+    /// Capacity of each semi-space half in bytes.
+    pub fn capacity(&self) -> usize {
+        self.from_space.capacity()
+    }
+}
+
+/// The old (tenured) generation: a simple bump allocator for long-lived objects.
+///
+/// Objects are promoted here from the young generation when they survive
+/// enough minor collections.  Compaction and major GC are not yet implemented.
+pub struct OldSpace {
+    region: MemoryRegion,
+}
+
+impl OldSpace {
+    /// Create an old-space region of `capacity` bytes.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            region: MemoryRegion::new(capacity),
+        }
+    }
+
+    /// Bump-allocate `layout` bytes, returning a pointer or `None` if full.
+    pub fn bump_alloc(&mut self, layout: Layout) -> Option<*mut u8> {
+        self.region.bump_alloc(layout)
+    }
+
+    /// Bytes currently in use.
+    pub fn used(&self) -> usize {
+        self.region.used()
+    }
+
+    /// Total capacity in bytes.
+    pub fn capacity(&self) -> usize {
+        self.region.capacity()
+    }
+}
+
+/// Space for objects too large to fit in the young generation's semi-space.
+///
+/// Each large object is backed by an individual allocation from the system
+/// allocator and tracked in an internal list.  Objects are reclaimed when the
+/// space is dropped.
+pub struct LargeObjectSpace {
+    objects: Vec<(*mut u8, Layout)>,
+}
+
+// SAFETY: The raw pointers stored here are owned exclusively by this space;
+// no aliases exist outside of it.
+unsafe impl Send for LargeObjectSpace {}
+
+impl LargeObjectSpace {
+    /// Create an empty large-object space.
+    pub fn new() -> Self {
+        Self {
+            objects: Vec::new(),
+        }
+    }
+
+    /// Allocate a large object for the given `layout`.
+    ///
+    /// Returns a pointer to zero-initialised memory, or a null pointer when
+    /// the system allocator fails.
+    pub fn allocate(&mut self, layout: Layout) -> *mut HeapObject {
+        // SAFETY: `layout.align()` is guaranteed to be a non-zero power of two
+        // by the `Layout` type invariant.  `layout.size() > 0` is a documented
+        // precondition of `alloc`; all call sites in this crate supply layouts
+        // derived from `HeapObject`-aligned base layouts that are never zero-sized.
+        let ptr = unsafe { alloc(layout) };
+        if ptr.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: `ptr` is valid and `layout.size()` bytes are accessible.
+        unsafe { std::ptr::write_bytes(ptr, 0, layout.size()) };
+        self.objects.push((ptr, layout));
+        ptr as *mut HeapObject
+    }
+
+    /// Number of large objects currently tracked in this space.
+    pub fn object_count(&self) -> usize {
+        self.objects.len()
+    }
+}
+
+impl Default for LargeObjectSpace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for LargeObjectSpace {
+    fn drop(&mut self) {
+        for (ptr, layout) in self.objects.drain(..) {
+            // SAFETY: each pointer was allocated with its stored layout.
+            unsafe { dealloc(ptr, layout) };
+        }
+    }
+}
+
+/// The garbage-collected heap, composed of a young generation (nursery),
+/// an old generation, and a large-object space.
+///
+/// New allocations land first in the young generation's from-space.  When the
+/// from-space is full, a minor collection is triggered automatically and the
+/// allocation is retried.  Objects too large for the semi-space are forwarded
+/// directly to the large-object space.
+pub struct Heap {
+    /// Young (nursery) generation: a Cheney-style semi-space.
+    pub young_space: SemiSpace,
+    /// Old (tenured) generation: a bump allocator for promoted objects.
+    pub old_space: OldSpace,
+    /// Space for objects that are too large for the nursery.
+    pub large_object_space: LargeObjectSpace,
+}
+
+impl Heap {
+    /// Create a heap with default generation sizes.
+    pub fn new() -> Self {
+        Self {
+            young_space: SemiSpace::new(YOUNG_SEMI_SPACE_SIZE),
+            old_space: OldSpace::new(OLD_SPACE_SIZE),
+            large_object_space: LargeObjectSpace::new(),
+        }
+    }
+
+    /// Allocate a zero-initialised [`HeapObject`] header for the given layout.
+    ///
+    /// The allocation follows this policy:
+    ///
+    /// 1. Large objects (adjusted size ≥ [`LARGE_OBJECT_THRESHOLD`]) are
+    ///    placed directly in the large-object space.
+    /// 2. Small objects are bump-allocated in the young from-space.
+    /// 3. If the from-space is exhausted, a minor collection is triggered and
+    ///    the allocation is retried once.
+    /// 4. A null pointer is returned only if the retry also fails (i.e., the
+    ///    requested size exceeds the semi-space capacity).
     pub fn allocate(&mut self, layout: Layout) -> *mut HeapObject {
         // Ensure the allocation is at least as aligned as `HeapObject`.
         let layout = layout
@@ -117,9 +290,22 @@ impl Heap {
             .expect("alignment adjustment failed")
             .pad_to_align();
 
+        // Large objects bypass the nursery entirely.
+        if layout.size() >= LARGE_OBJECT_THRESHOLD {
+            return self.large_object_space.allocate(layout);
+        }
+
+        // Fast path: bump-allocate in the young from-space.
+        if let Some(ptr) = self.young_space.bump_alloc(layout) {
+            // SAFETY: `ptr` is freshly allocated with `layout` bytes.
+            unsafe { std::ptr::write_bytes(ptr, 0, layout.size()) };
+            return ptr as *mut HeapObject;
+        }
+
+        // Slow path: nursery is full — run a minor GC and retry once.
+        self.collect();
         match self.young_space.bump_alloc(layout) {
             Some(ptr) => {
-                // Zero-initialise so map_word starts as null (no map set yet).
                 // SAFETY: `ptr` is freshly allocated with `layout` bytes.
                 unsafe { std::ptr::write_bytes(ptr, 0, layout.size()) };
                 ptr as *mut HeapObject
@@ -130,11 +316,11 @@ impl Heap {
 
     /// Perform a minor (young-generation) collection.
     ///
-    /// In this initial skeleton the young space is simply reset.  A full
-    /// copying/tracing GC will be layered on top once the object model and
-    /// the `Trace` infrastructure are complete.
+    /// Swaps the semi-space halves and resets the new from-space, making it
+    /// ready for fresh allocations.  Object promotion to the old generation
+    /// will be added once root-tracing is complete.
     pub fn collect(&mut self) {
-        self.young_space.reset();
+        self.young_space.collect();
     }
 }
 
@@ -168,14 +354,84 @@ mod tests {
     }
 
     #[test]
-    fn allocate_returns_null_when_young_space_full() {
+    fn allocate_triggers_minor_gc_and_retries_when_young_space_full() {
         let mut heap = Heap::new();
-        // Fill the young space with 1-byte allocations to exhaust it.
-        let layout = Layout::from_size_align(YOUNG_SPACE_SIZE, 1).unwrap();
-        let first = heap.allocate(layout);
-        assert!(!first.is_null());
-        // Next allocation must fail.
-        let second = heap.allocate(Layout::new::<HeapObject>());
-        assert!(second.is_null());
+        let layout = Layout::new::<HeapObject>();
+        // Exhaust the young from-space directly (bypassing the auto-GC path).
+        while heap.young_space.bump_alloc(layout).is_some() {}
+        // heap.allocate() must detect exhaustion, run a minor GC, and succeed.
+        let ptr = heap.allocate(layout);
+        assert!(
+            !ptr.is_null(),
+            "allocate must succeed after implicit minor GC"
+        );
+    }
+
+    #[test]
+    fn semi_space_collect_resets_from_space() {
+        let mut ss = SemiSpace::new(1024);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        assert!(ss.bump_alloc(layout).is_some());
+        assert!(ss.used() > 0);
+        ss.collect();
+        assert_eq!(ss.used(), 0);
+        // Fresh allocation is possible in the new from-space.
+        assert!(ss.bump_alloc(layout).is_some());
+    }
+
+    #[test]
+    fn old_space_bump_alloc_and_capacity() {
+        let mut os = OldSpace::new(4096);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        assert!(os.bump_alloc(layout).is_some());
+        assert_eq!(os.used(), 64);
+        assert_eq!(os.capacity(), 4096);
+    }
+
+    #[test]
+    fn large_object_space_allocates_and_tracks_objects() {
+        let mut los = LargeObjectSpace::new();
+        let layout = Layout::from_size_align(1024, 8).unwrap();
+        let ptr = los.allocate(layout);
+        assert!(!ptr.is_null());
+        assert_eq!(los.object_count(), 1);
+    }
+
+    #[test]
+    fn large_object_bypasses_young_space() {
+        let mut heap = Heap::new();
+        // An allocation at or above LARGE_OBJECT_THRESHOLD is routed to LOS.
+        let large_layout = Layout::from_size_align(LARGE_OBJECT_THRESHOLD, 8).unwrap();
+        let young_used_before = heap.young_space.used();
+        let ptr = heap.allocate(large_layout);
+        assert!(!ptr.is_null());
+        assert_eq!(
+            heap.young_space.used(),
+            young_used_before,
+            "young space must be untouched for large objects"
+        );
+        assert_eq!(heap.large_object_space.object_count(), 1);
+    }
+
+    #[test]
+    fn allocate_until_young_full_then_verify_after_collection() {
+        let mut heap = Heap::new();
+        let layout = Layout::new::<HeapObject>();
+        // Fill the young from-space by bumping directly.
+        while heap.young_space.bump_alloc(layout).is_some() {}
+        assert!(
+            heap.young_space.used() > 0,
+            "from-space must be non-empty after fill"
+        );
+        // Trigger a manual collection.
+        heap.collect();
+        assert_eq!(
+            heap.young_space.used(),
+            0,
+            "young space must be empty after collection"
+        );
+        // Allocation succeeds again after collection.
+        let ptr = heap.allocate(layout);
+        assert!(!ptr.is_null(), "allocation after collection must succeed");
     }
 }
