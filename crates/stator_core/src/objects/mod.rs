@@ -2,6 +2,8 @@
 pub mod heap_object;
 /// JavaScript Array with element-kind tracking and length semantics.
 pub mod js_array;
+/// JavaScript function objects: [`js_function::SharedFunctionInfo`] and [`js_function::JsFunction`].
+pub mod js_function;
 /// JavaScript ordinary objects with in-object, overflow, and element storage.
 pub mod js_object;
 /// Hidden class ([`map::Map`]) and instance-type tag for heap objects.
