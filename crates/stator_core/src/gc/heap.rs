@@ -68,6 +68,14 @@ impl MemoryRegion {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
+
+    /// Raw base pointer of this region.
+    ///
+    /// Used by the scavenger to determine whether a given heap pointer falls
+    /// within this region's address range.
+    pub(crate) fn base_ptr(&self) -> *mut u8 {
+        self.base
+    }
 }
 
 impl Drop for MemoryRegion {
@@ -131,15 +139,51 @@ impl SemiSpace {
         self.from_space.bump_alloc(layout)
     }
 
-    /// Perform a Cheney-style minor collection.
+    /// Bump-allocate `layout` bytes into the **to-space**.
     ///
-    /// The from-space and to-space are swapped and the new from-space
-    /// (previously the to-space) is reset, making it available for fresh
-    /// allocations.  Surviving objects are not yet copied; that step will be
-    /// added once root-tracing is complete.
+    /// Used by the scavenger to copy live objects from the from-space into
+    /// the to-space during a Cheney collection.  Returns `None` when the
+    /// to-space is exhausted.
+    pub(crate) fn bump_alloc_to_space(&mut self, layout: Layout) -> Option<*mut u8> {
+        self.to_space.bump_alloc(layout)
+    }
+
+    /// Returns `true` if `ptr` points into the active from-space.
+    ///
+    /// Used by the scavenger to decide whether a pointer needs to be copied.
+    pub fn is_in_from_space(&self, ptr: *mut HeapObject) -> bool {
+        let base = self.from_space.base_ptr() as usize;
+        let end = base + self.from_space.capacity();
+        let addr = ptr as usize;
+        addr >= base && addr < end
+    }
+
+    /// Bytes currently used in the to-space (live objects copied so far).
+    pub(crate) fn to_space_used(&self) -> usize {
+        self.to_space.used()
+    }
+
+    /// Raw base pointer of the to-space region.
+    ///
+    /// Used by the Cheney BFS scan to walk newly-copied objects.
+    pub(crate) fn to_space_base(&self) -> *mut u8 {
+        self.to_space.base_ptr()
+    }
+
+    /// Perform a Cheney-style semi-space collection.
+    ///
+    /// Swaps the from-space and to-space halves, then resets the new
+    /// to-space (the old from-space) so it is ready to receive copies in the
+    /// next scavenge cycle.
+    ///
+    /// After this call the new from-space contains whatever was written into
+    /// the old to-space (i.e. the live objects copied by the scavenger),
+    /// while the new to-space is empty.
     pub fn collect(&mut self) {
         std::mem::swap(&mut self.from_space, &mut self.to_space);
-        self.from_space.reset();
+        // Reset the *new* to-space (which is the old from-space that held
+        // both live and dead nursery objects).
+        self.to_space.reset();
     }
 
     /// Bytes currently allocated in the active from-space.
@@ -221,6 +265,10 @@ impl LargeObjectSpace {
         }
         // SAFETY: `ptr` is valid and `layout.size()` bytes are accessible.
         unsafe { std::ptr::write_bytes(ptr, 0, layout.size()) };
+        // Record the allocation size in the header so the scavenger can copy
+        // the object without additional size information.
+        // SAFETY: ptr is non-null, properly aligned, and zero-initialised.
+        unsafe { (*(ptr as *mut HeapObject)).init_alloc_size(layout.size() as u32) };
         self.objects.push((ptr, layout));
         ptr as *mut HeapObject
     }
@@ -299,6 +347,8 @@ impl Heap {
         if let Some(ptr) = self.young_space.bump_alloc(layout) {
             // SAFETY: `ptr` is freshly allocated with `layout` bytes.
             unsafe { std::ptr::write_bytes(ptr, 0, layout.size()) };
+            // SAFETY: ptr is non-null, properly aligned, and zero-initialised.
+            unsafe { (*(ptr as *mut HeapObject)).init_alloc_size(layout.size() as u32) };
             return ptr as *mut HeapObject;
         }
 
@@ -308,6 +358,8 @@ impl Heap {
             Some(ptr) => {
                 // SAFETY: `ptr` is freshly allocated with `layout` bytes.
                 unsafe { std::ptr::write_bytes(ptr, 0, layout.size()) };
+                // SAFETY: ptr is non-null, properly aligned, and zero-initialised.
+                unsafe { (*(ptr as *mut HeapObject)).init_alloc_size(layout.size() as u32) };
                 ptr as *mut HeapObject
             }
             None => std::ptr::null_mut(),
@@ -316,11 +368,40 @@ impl Heap {
 
     /// Perform a minor (young-generation) collection.
     ///
-    /// Swaps the semi-space halves and resets the new from-space, making it
-    /// ready for fresh allocations.  Object promotion to the old generation
-    /// will be added once root-tracing is complete.
+    /// Swaps the semi-space halves and resets the old from-space (now the
+    /// to-space), making it ready for the next scavenge cycle.  This
+    /// "collect-all-as-dead" variant is used when no root information is
+    /// available; for a proper live-object copy use
+    /// [`scavenge_with_roots`][Self::scavenge_with_roots].
     pub fn collect(&mut self) {
         self.young_space.collect();
+    }
+
+    /// Perform a minor GC using the Cheney scavenger with explicit roots.
+    ///
+    /// Each entry in `roots` is a `*mut *mut HeapObject` — a mutable pointer
+    /// to a root-pointer slot.  After the scavenge, each slot is updated to
+    /// the object's new address (in the young to-space or, for promoted
+    /// objects, in old-space).
+    ///
+    /// The `remembered_set` provides additional roots: old-space objects that
+    /// hold references into the young generation.  The set is cleared at the
+    /// end of the cycle.
+    ///
+    /// # Safety
+    /// Every pointer reachable from `roots` or `remembered_set` must be a
+    /// valid, aligned, live heap object currently residing in the young
+    /// generation's from-space.
+    pub unsafe fn scavenge_with_roots(
+        &mut self,
+        roots: &mut [*mut *mut HeapObject],
+        remembered_set: &mut crate::gc::scavenger::RememberedSet,
+    ) {
+        // SAFETY: caller upholds the preconditions.
+        unsafe {
+            crate::gc::scavenger::Scavenger::new(&mut self.young_space, &mut self.old_space)
+                .scavenge(roots, remembered_set);
+        }
     }
 }
 
