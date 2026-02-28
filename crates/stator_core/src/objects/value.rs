@@ -8,6 +8,7 @@
 //! [`to_js_string`][JsValue::to_js_string] (§7.1.17).
 
 use crate::error::{StatorError, StatorResult};
+use crate::gc::trace::{Trace, Tracer};
 use crate::objects::heap_object::HeapObject;
 
 /// Any ECMAScript value.
@@ -224,6 +225,25 @@ impl JsValue {
                 "Cannot convert an Object to a string without ToPrimitive".to_string(),
             )),
             Self::BigInt(n) => Ok(n.to_string()),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GC Trace
+// ──────────────────────────────────────────────────────────────────────────────
+
+impl Trace for JsValue {
+    /// Report any GC-managed heap pointer embedded in this value to the tracer.
+    ///
+    /// Only the [`JsValue::Object`] variant holds a raw heap pointer; all
+    /// primitive variants carry no GC reference and are silently ignored.
+    fn trace(&self, tracer: &mut Tracer) {
+        if let Self::Object(ptr) = self {
+            // SAFETY: Object pointers must refer to live, GC-managed HeapObjects.
+            // The caller is responsible for ensuring the value is not used after
+            // a collection that may have freed or moved the object.
+            unsafe { tracer.mark_raw(*ptr as *mut u8) };
         }
     }
 }

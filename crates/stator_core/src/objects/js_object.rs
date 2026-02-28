@@ -25,6 +25,7 @@ use std::rc::Rc;
 use smallvec::SmallVec;
 
 use crate::error::{StatorError, StatorResult};
+use crate::gc::trace::{Trace, Tracer};
 use crate::objects::map::{InstanceType, Map, PropertyAttributes, PropertyDescriptor};
 use crate::objects::value::JsValue;
 
@@ -507,6 +508,35 @@ impl JsObject {
 impl Default for JsObject {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Trace for JsObject {
+    /// Visit every GC-managed heap reference reachable through this object.
+    ///
+    /// Traces:
+    /// * all values in the named-property store (fast or slow mode),
+    /// * all indexed elements,
+    /// * the prototype chain (via the `Rc<RefCell<JsObject>>` link).
+    fn trace(&self, tracer: &mut Tracer) {
+        match &self.named_properties {
+            NamedProperties::Fast(props) => {
+                for v in props.iter() {
+                    v.trace(tracer);
+                }
+            }
+            NamedProperties::Slow(map) => {
+                for prop in map.values() {
+                    prop.value().trace(tracer);
+                }
+            }
+        }
+        for v in &self.elements {
+            v.trace(tracer);
+        }
+        if let Some(proto) = &self.prototype {
+            proto.borrow().trace(tracer);
+        }
     }
 }
 

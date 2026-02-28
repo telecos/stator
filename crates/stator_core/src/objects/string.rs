@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use crate::error::{StatorError, StatorResult};
+use crate::gc::trace::{Trace, Tracer};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // ExternalStringResource trait
@@ -499,6 +500,37 @@ fn fnv1a_hash_u16(units: impl Iterator<Item = u16>) -> u32 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GC Trace
+// ──────────────────────────────────────────────────────────────────────────────
+
+impl Trace for JsString {
+    /// Trace all GC-reachable heap references embedded in this string.
+    ///
+    /// Most variants contain only character data and have no GC references.
+    /// [`ConsString`] is the exception: it holds two child [`JsString`]
+    /// values whose own sub-trees must be traced recursively.  [`SlicedString`]
+    /// also holds a parent string reference that must be traced.
+    // The `tracer` parameter appears only in recursive sub-calls on child
+    // strings; that is intentional — the recursion terminates at leaf variants
+    // (SeqOneByte / SeqTwoByte / External) which carry no GC pointers.
+    #[allow(clippy::only_used_in_recursion)]
+    fn trace(&self, tracer: &mut Tracer) {
+        match self {
+            Self::SeqOneByte(_) | Self::SeqTwoByte(_) | Self::External(_) => {
+                // No GC-managed heap pointers in these variants.
+            }
+            Self::Cons(cons) => {
+                cons.left.trace(tracer);
+                cons.right.trace(tracer);
+            }
+            Self::Sliced(sliced) => {
+                sliced.parent.trace(tracer);
+            }
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
