@@ -76,6 +76,23 @@ impl MemoryRegion {
     pub(crate) fn base_ptr(&self) -> *mut u8 {
         self.base
     }
+
+    /// Force the allocation cursor to exactly `used` bytes from the base.
+    ///
+    /// Used by the Mark-Sweep-Compact collector after it has physically moved
+    /// live objects toward the base: the new high-water mark is set to the
+    /// total size of all surviving objects.
+    ///
+    /// # Panics
+    /// Panics if `used` exceeds the region's capacity.
+    pub(crate) fn force_used(&mut self, used: usize) {
+        assert!(
+            used <= self.capacity,
+            "force_used: used ({used}) must not exceed capacity ({})",
+            self.capacity
+        );
+        self.used = used;
+    }
 }
 
 impl Drop for MemoryRegion {
@@ -200,7 +217,8 @@ impl SemiSpace {
 /// The old (tenured) generation: a simple bump allocator for long-lived objects.
 ///
 /// Objects are promoted here from the young generation when they survive
-/// enough minor collections.  Compaction and major GC are not yet implemented.
+/// enough minor collections.  Compaction and major GC are handled by the
+/// [`MarkSweepCompactor`][crate::gc::mark_sweep_compact::MarkSweepCompactor].
 pub struct OldSpace {
     region: MemoryRegion,
 }
@@ -226,6 +244,35 @@ impl OldSpace {
     /// Total capacity in bytes.
     pub fn capacity(&self) -> usize {
         self.region.capacity()
+    }
+
+    /// Raw base pointer of the old-space region.
+    ///
+    /// Used by the Mark-Sweep-Compact collector to walk all objects in
+    /// address order.
+    pub(crate) fn base_ptr(&self) -> *mut u8 {
+        self.region.base_ptr()
+    }
+
+    /// Returns `true` if `ptr` falls within the allocated portion of old-space.
+    ///
+    /// Only memory within `[base, base + used)` contains valid objects; this
+    /// method returns `false` for addresses beyond the allocation cursor even
+    /// though they are within the region's physical capacity.
+    pub(crate) fn contains(&self, ptr: *mut u8) -> bool {
+        let base = self.region.base_ptr() as usize;
+        let end = base + self.region.used();
+        let addr = ptr as usize;
+        addr >= base && addr < end
+    }
+
+    /// Force the allocation cursor to `used` bytes from the base.
+    ///
+    /// Called by the compactor after moving live objects to the front of
+    /// the region so that subsequent bump allocations start at the correct
+    /// offset.
+    pub(crate) fn force_used(&mut self, used: usize) {
+        self.region.force_used(used);
     }
 }
 
@@ -402,6 +449,47 @@ impl Heap {
             crate::gc::scavenger::Scavenger::new(&mut self.young_space, &mut self.old_space)
                 .scavenge(roots, remembered_set);
         }
+    }
+
+    /// Perform a full (major) GC: minor scavenge followed by a
+    /// Mark-Sweep-Compact cycle on the old generation.
+    ///
+    /// The two-phase strategy is:
+    ///
+    /// 1. **Minor GC** – The Cheney scavenger evacuates surviving nursery
+    ///    objects, promoting long-lived ones into old-space and updating every
+    ///    root slot.
+    /// 2. **Major GC** – The [`MarkSweepCompactor`] marks all old-space
+    ///    objects reachable from the (now-updated) roots, sweeps unreachable
+    ///    objects, and compacts the survivors toward the base of the region.
+    ///
+    /// After this call:
+    /// * Every root slot in `roots` points to a live, relocated object.
+    /// * The old-space allocation cursor is at the lowest unused address.
+    /// * The remembered set is empty.
+    ///
+    /// # Safety
+    /// Every pointer reachable from `roots` or `remembered_set` must be a
+    /// valid, aligned, live heap object.  Young-space pointers must reside in
+    /// the current from-space; old-space pointers must be within the
+    /// old-space region.
+    pub unsafe fn full_gc_with_roots(
+        &mut self,
+        roots: &mut [*mut *mut HeapObject],
+        remembered_set: &mut crate::gc::scavenger::RememberedSet,
+    ) {
+        // Phase 1: evacuate the nursery.
+        // SAFETY: caller upholds scavenge_with_roots preconditions.
+        unsafe { self.scavenge_with_roots(roots, remembered_set) };
+
+        // Phase 2: mark-sweep-compact the old generation.
+        // After the scavenge all root slots have been updated to valid
+        // old-space or new-from-space addresses, so MSC can safely mark them.
+        // SAFETY: roots contain valid old-space pointers after phase 1.
+        unsafe {
+            crate::gc::mark_sweep_compact::MarkSweepCompactor::new(&mut self.old_space)
+                .collect(roots)
+        };
     }
 }
 
