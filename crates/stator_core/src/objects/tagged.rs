@@ -1,3 +1,4 @@
+use crate::gc::trace::{Trace, Tracer};
 use crate::objects::heap_object::HeapObject;
 
 /// A pointer-sized tagged value that can represent either a small integer
@@ -95,6 +96,19 @@ impl TaggedValue {
     #[inline]
     pub fn raw(self) -> usize {
         self.0
+    }
+}
+
+impl Trace for TaggedValue {
+    /// Mark the heap object this tagged value points to, if any.
+    ///
+    /// Smi-encoded values carry no heap reference and are silently ignored.
+    fn trace(&self, tracer: &mut Tracer) {
+        if self.is_heap_object() {
+            // SAFETY: is_heap_object() guarantees bit 0 == 0, so self.0 is a
+            // naturally-aligned pointer to a live HeapObject managed by the heap.
+            unsafe { tracer.mark_raw(self.0 as *mut u8) };
+        }
     }
 }
 

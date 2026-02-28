@@ -20,6 +20,7 @@
 //! value; "Holey" means at least one slot contains a `JsValue::Undefined`
 //! hole.
 
+use crate::gc::trace::{Trace, Tracer};
 use crate::objects::js_object::JsObject;
 use crate::objects::map::InstanceType;
 use crate::objects::value::JsValue;
@@ -187,6 +188,16 @@ impl JsArray {
 impl Default for JsArray {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Trace for JsArray {
+    /// Delegate tracing to the underlying [`JsObject`].
+    ///
+    /// All GC-reachable heap references (named properties, indexed elements,
+    /// and the prototype chain) are owned by the inner object.
+    fn trace(&self, tracer: &mut Tracer) {
+        self.object.trace(tracer);
     }
 }
 

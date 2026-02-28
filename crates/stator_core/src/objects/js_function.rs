@@ -24,6 +24,7 @@
 use std::rc::Rc;
 
 use crate::error::StatorResult;
+use crate::gc::trace::{Trace, Tracer};
 use crate::objects::value::JsValue;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -424,6 +425,36 @@ impl JsFunction {
             Some(f(args))
         } else {
             None
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GC Trace
+// ──────────────────────────────────────────────────────────────────────────────
+
+impl Trace for JsFunction {
+    /// Visit every GC-managed heap reference reachable through this function.
+    ///
+    /// Traces:
+    /// * all values bound in the captured [`Context`],
+    /// * for bound functions: the wrapped target function, the pre-bound `this`
+    ///   value, and each element of the pre-bound argument list.
+    fn trace(&self, tracer: &mut Tracer) {
+        for (_, v) in &self.context.bindings {
+            v.trace(tracer);
+        }
+        if let FunctionKind::Bound {
+            target,
+            bound_this,
+            bound_args,
+        } = &self.kind
+        {
+            target.trace(tracer);
+            bound_this.trace(tracer);
+            for v in bound_args {
+                v.trace(tracer);
+            }
         }
     }
 }
