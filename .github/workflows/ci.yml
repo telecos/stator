@@ -100,3 +100,51 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  mini_browser:
+    name: mini_browser output
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-release-
+
+      - name: Build stator_ffi (release)
+        run: cargo build --package stator_ffi --release
+
+      - name: Build mini_browser
+        run: |
+          mkdir -p examples/mini_browser/build
+          cd examples/mini_browser/build
+          cmake ..
+          make
+
+      - name: Verify mini_browser output
+        run: |
+          actual=$(examples/mini_browser/build/mini_browser)
+          expected=$(printf '[tab] created context\n[tab] allocated: number(42), string("hello"), object{x: 1, y: 2}\n[tab] GC: 3 objects survived (held by handles)\n[tab] released handles, GC: 0 objects (all reclaimed)\n[tab] heap: 0 bytes used / 8388608 bytes capacity')
+          if [ "$actual" != "$expected" ]; then
+            echo "Output mismatch!"
+            printf 'Expected:\n%s\n\nActual:\n%s\n' "$expected" "$actual"
+            exit 1
+          fi
