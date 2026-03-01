@@ -503,6 +503,69 @@ impl JsObject {
     pub fn truncate_elements(&mut self, new_len: usize) {
         self.elements.truncate(new_len);
     }
+
+    // ── Write-barrier–aware store operations ─────────────────────────────────
+
+    /// ECMAScript `[[Set]]` with a generational write barrier.
+    ///
+    /// Equivalent to [`set_property`][JsObject::set_property] but also invokes
+    /// the write barrier so that old-generation → young-generation pointer
+    /// edges are recorded in the remembered set.
+    ///
+    /// # Parameters
+    ///
+    /// * `host` – raw pointer to the [`HeapObject`] header of the object that
+    ///   *contains* this `JsObject`.  Required by the write barrier to decide
+    ///   whether the store creates an old→young edge.
+    /// * `key` – property name.
+    /// * `value` – new property value.
+    /// * `barrier` – mutable reference to the active [`WriteBarrier`].
+    ///
+    /// # Safety
+    ///
+    /// `host` must be non-null and point to the live [`HeapObject`] header that
+    /// was allocated to back this `JsObject` instance.
+    pub unsafe fn set_property_with_barrier(
+        &mut self,
+        host: *mut crate::objects::heap_object::HeapObject,
+        key: &str,
+        value: JsValue,
+        barrier: &mut crate::gc::write_barrier::WriteBarrier<'_>,
+    ) -> StatorResult<()> {
+        // SAFETY: caller guarantees `host` is a valid live HeapObject.
+        unsafe { barrier.record(host, std::ptr::null(), &value) };
+        self.set_property(key, value)
+    }
+
+    /// Sets the element at `index` with a generational write barrier.
+    ///
+    /// Equivalent to [`set_element`][JsObject::set_element] but also invokes
+    /// the write barrier so that old-generation → young-generation pointer
+    /// edges are recorded in the remembered set.
+    ///
+    /// # Parameters
+    ///
+    /// * `host` – raw pointer to the [`HeapObject`] header of the object that
+    ///   *contains* this `JsObject`.
+    /// * `index` – element index.
+    /// * `value` – new element value.
+    /// * `barrier` – mutable reference to the active [`WriteBarrier`].
+    ///
+    /// # Safety
+    ///
+    /// `host` must be non-null and point to the live [`HeapObject`] header that
+    /// was allocated to back this `JsObject` instance.
+    pub unsafe fn set_element_with_barrier(
+        &mut self,
+        host: *mut crate::objects::heap_object::HeapObject,
+        index: usize,
+        value: JsValue,
+        barrier: &mut crate::gc::write_barrier::WriteBarrier<'_>,
+    ) {
+        // SAFETY: caller guarantees `host` is a valid live HeapObject.
+        unsafe { barrier.record(host, std::ptr::null(), &value) };
+        self.set_element(index, value);
+    }
 }
 
 impl Default for JsObject {

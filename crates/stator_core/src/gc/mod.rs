@@ -8,3 +8,5 @@ pub mod mark_sweep_compact;
 pub mod scavenger;
 /// Mark-and-trace infrastructure for garbage collection.
 pub mod trace;
+/// Write barrier for tracking old-generation → young-generation pointer edges.
+pub mod write_barrier;
