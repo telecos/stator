@@ -7,7 +7,8 @@
 //! - [`gc`] — Garbage collector infrastructure (heap, tracing, handles).
 //! - [`objects`] — JavaScript value representation and heap object types.
 //! - [`zone`] — Bump-pointer region allocator for compiler temporaries.
-//! - [`parser`] — Lexer ([`parser::scanner`]) and AST ([`parser::ast`]).
+//! - [`parser`] — Lexer ([`parser::scanner`]), AST ([`parser::ast`]), and
+//!   scope analysis ([`parser::scope`]).
 
 /// Engine error types and [`StatorResult`] alias.
 pub mod error;
