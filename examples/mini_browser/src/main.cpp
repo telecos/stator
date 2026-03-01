@@ -1,148 +1,82 @@
 /**
- * mini_browser — Placeholder C++ application demonstrating Stator engine usage.
+ * mini_browser — Demonstrates Stator object allocation and GC.
  *
- * This sample simulates the lifecycle a real browser embedding would follow:
+ * This sample exercises the Phase 1 GC and object model:
  *
- *   1. Initialize — create one Stator isolate per browser tab / worker.
- *   2. Load page  — parse HTML, extract inline <script> content (stubbed here).
- *   3. Execute    — run the extracted scripts through the engine (stubbed here).
- *   4. Idle GC    — trigger a minor collection between navigations.
- *   5. Teardown   — destroy the isolate when the tab is closed.
- *
- * NOTE: Script execution is not yet implemented in the engine.  The calls
- *       below show the *intended* API surface; they will be filled in as
- *       stator_core gains an interpreter / bytecode compiler.
+ *   1. Create an isolate and a JS context.
+ *   2. Allocate a number value, a string value, and an object with properties.
+ *   3. Print their types and values via FFI.
+ *   4. Trigger GC while handles are held — objects survive.
+ *   5. Release all handles, trigger GC — objects are reclaimed.
+ *   6. Print final heap statistics.
  */
 
 #include <cstdio>
-#include <cstring>
-#include <string>
-#include <vector>
+#include <cstdlib>
 
 #include "stator.h"
 
-/* -------------------------------------------------------------------------
- * Minimal HTML parser stub
- *
- * Extracts the content of every <script>…</script> block found in `html`.
- * In a real browser this would be part of a full HTML5 parser.
- * ------------------------------------------------------------------------- */
-static std::vector<std::string> extract_scripts(const char *html) {
-    std::vector<std::string> scripts;
-    const char *open_tag  = "<script>";
-    const char *close_tag = "</script>";
-    const char *cursor    = html;
-
-    while (true) {
-        const char *start = std::strstr(cursor, open_tag);
-        if (!start) break;
-        start += std::strlen(open_tag);
-
-        const char *end = std::strstr(start, close_tag);
-        if (!end) break;
-
-        scripts.emplace_back(start, static_cast<std::size_t>(end - start));
-        cursor = end + std::strlen(close_tag);
-    }
-
-    return scripts;
-}
-
-/* -------------------------------------------------------------------------
- * Browser tab simulation
- * ------------------------------------------------------------------------- */
-
-/** Represents one browser tab, owning its own JS engine isolate. */
-class BrowserTab {
-public:
-    explicit BrowserTab(const char *url) : url_(url), isolate_(nullptr) {
-        std::printf("[tab] opening   %s\n", url_.c_str());
-        isolate_ = stator_isolate_create();
-        if (!isolate_) {
-            std::fprintf(stderr, "[tab] ERROR: failed to create Stator isolate\n");
-        }
-    }
-
-    ~BrowserTab() {
-        if (isolate_) {
-            std::printf("[tab] closing   %s\n", url_.c_str());
-            stator_isolate_destroy(isolate_);
-            isolate_ = nullptr;
-        }
-    }
-
-    /* Disallow copy; allow move (simplified). */
-    BrowserTab(const BrowserTab &)            = delete;
-    BrowserTab &operator=(const BrowserTab &) = delete;
-
-    /**
-     * Simulate loading a page.
-     *
-     * @param html  Raw HTML source of the page.
-     */
-    void load(const char *html) {
-        if (!isolate_) return;
-
-        std::printf("[tab] loading   %s\n", url_.c_str());
-
-        /* --- (stub) Parse HTML & build DOM -------------------------------- */
-        std::printf("[tab] parsed    HTML document\n");
-
-        /* --- Extract and run inline scripts ------------------------------- */
-        auto scripts = extract_scripts(html);
-        std::printf("[tab] found     %zu inline script(s)\n", scripts.size());
-
-        for (std::size_t i = 0; i < scripts.size(); ++i) {
-            std::printf("[tab] executing script[%zu]: %s\n", i,
-                        scripts[i].c_str());
-            /* TODO: call stator_context_eval(isolate_, scripts[i].c_str())
-             *       once the interpreter is implemented. */
-            std::printf("[tab] (script execution not yet implemented)\n");
-        }
-
-        /* --- Run a GC pass to clean up short-lived allocations ----------- */
-        std::printf("[tab] gc        collecting nursery\n");
-        stator_isolate_gc(isolate_);
-
-        std::printf("[tab] loaded    %s\n", url_.c_str());
-    }
-
-private:
-    std::string    url_;
-    StatorIsolate *isolate_;
-};
-
-/* -------------------------------------------------------------------------
- * Entry point
- * ------------------------------------------------------------------------- */
 int main() {
-    std::printf("=== Stator mini-browser (placeholder) ===\n\n");
-
-    /* Simulate two tabs with simple HTML pages containing inline scripts. */
-    const char *page_a =
-        "<html><body>"
-        "<h1>Hello, Stator!</h1>"
-        "<script>console.log('page A loaded');</script>"
-        "</body></html>";
-
-    const char *page_b =
-        "<html><body>"
-        "<script>const x = 1 + 2;</script>"
-        "<script>console.log('x =', x);</script>"
-        "</body></html>";
-
-    {
-        BrowserTab tab_a("https://example.com/page-a");
-        tab_a.load(page_a);
+    StatorIsolate *isolate = stator_isolate_create();
+    if (!isolate) {
+        std::fprintf(stderr, "ERROR: failed to create isolate\n");
+        return 1;
     }
 
-    std::printf("\n");
+    /* 1. Create a context ------------------------------------------------- */
+    /* The context is the execution environment for JS code.  In this Phase 1
+     * demo it is not yet wired to a script evaluator, but creating it via the
+     * FFI ensures the lifecycle API (create / destroy) is exercised. */
+    StatorContext *ctx = stator_context_new(isolate);
+    std::printf("[tab] created context\n");
 
+    /* 2. Allocate values -------------------------------------------------- */
+    StatorValue  *num = stator_value_new_number(isolate, 42.0);
+    StatorValue  *str = stator_value_new_string(isolate, "hello", 5);
+    StatorObject *obj = stator_object_new(isolate);
+
+    /* Set object properties x = 1, y = 2 (temporaries destroyed right away). */
     {
-        BrowserTab tab_b("https://example.com/page-b");
-        tab_b.load(page_b);
+        StatorValue *xv = stator_value_new_number(isolate, 1.0);
+        StatorValue *yv = stator_value_new_number(isolate, 2.0);
+        stator_object_set(obj, "x", xv);
+        stator_object_set(obj, "y", yv);
+        stator_value_destroy(xv);
+        stator_value_destroy(yv);
     }
 
-    std::printf("\nDone.\n");
+    /* 3. Print types and values ------------------------------------------- */
+    {
+        StatorValue *xv = stator_object_get(obj, "x");
+        StatorValue *yv = stator_object_get(obj, "y");
+        std::printf(
+            "[tab] allocated: %s(%g), %s(\"%s\"), object{x: %g, y: %g}\n",
+            stator_value_type(num),   stator_value_as_number(num),
+            stator_value_type(str),   stator_value_as_string(str),
+            stator_value_as_number(xv), stator_value_as_number(yv));
+        stator_value_destroy(xv);
+        stator_value_destroy(yv);
+    }
+
+    /* 4. GC with handles held — 3 live objects survive ------------------- */
+    stator_gc_collect(isolate);
+    std::printf("[tab] GC: %zu objects survived (held by handles)\n",
+                stator_live_object_count(isolate));
+
+    /* 5. Release handles, GC — all objects reclaimed --------------------- */
+    stator_value_destroy(num);
+    stator_value_destroy(str);
+    stator_object_destroy(obj);
+    stator_gc_collect(isolate);
+    std::printf("[tab] released handles, GC: %zu objects (all reclaimed)\n",
+                stator_live_object_count(isolate));
+
+    /* 6. Print heap stats ------------------------------------------------- */
+    std::printf("[tab] heap: %zu bytes used / %zu bytes capacity\n",
+                stator_heap_used(isolate), stator_heap_capacity(isolate));
+
+    stator_context_destroy(ctx);
+    stator_isolate_destroy(isolate);
     return 0;
 }
+
