@@ -1,0 +1,36 @@
+name: Nightly Fuzz
+
+on:
+  schedule:
+    # Run every night at 02:00 UTC.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz-nightly:
+    name: Nightly Fuzz (10 min each)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run fuzz targets (10 min each)
+        run: |
+          for target in fuzz_tagged_value fuzz_heap_alloc fuzz_handle_scope fuzz_gc_stress fuzz_property_ops; do
+            cargo fuzz run "$target" -- -max_total_time=600
+          done
+
+      - name: Archive corpus
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ github.run_id }}
+          path: fuzz/corpus/
+          retention-days: 90

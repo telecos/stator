@@ -5,6 +5,7 @@ members = [
     "crates/stator_test262",
     "crates/st8",
 ]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.lints.rust]

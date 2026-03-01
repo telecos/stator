@@ -100,3 +100,24 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  fuzz-smoke:
+    name: Fuzz Smoke Test (60 s)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run fuzz smoke tests (60 s each)
+        run: |
+          for target in fuzz_tagged_value fuzz_heap_alloc fuzz_handle_scope fuzz_gc_stress fuzz_property_ops; do
+            cargo fuzz run "$target" -- -max_total_time=60
+          done
