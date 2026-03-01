@@ -14,5 +14,7 @@ pub mod error;
 pub mod gc;
 /// JavaScript value representation and heap object types.
 pub mod objects;
+/// JavaScript parser infrastructure (lexer, future AST, …).
+pub mod parser;
 /// Bump-pointer region allocator for compiler temporaries.
 pub mod zone;
