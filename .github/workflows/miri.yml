@@ -45,9 +45,9 @@ jobs:
       - name: Set up Miri sysroot
         run: cargo +nightly miri setup
 
-      - name: Run Miri tests – Stacked Borrows
+      - name: Run Miri tests – Stacked Borrows (default)
         env:
-          MIRIFLAGS: "-Zmiri-stacked-borrows -Zmiri-preemption-rate=0.1"
+          MIRIFLAGS: "-Zmiri-preemption-rate=0.1"
         run: cargo +nightly miri test -p stator_core
 
       - name: Run Miri tests – Tree Borrows
