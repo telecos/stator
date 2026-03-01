@@ -32,35 +32,35 @@ jobs:
         run: cargo install cargo-fuzz
 
       - name: Build fuzz targets
-        run: cargo fuzz build
+        run: cargo +nightly fuzz build
 
       - name: Run fuzz_tagged_value (10 min)
         run: >
-          cargo fuzz run fuzz_tagged_value
+          cargo +nightly fuzz run fuzz_tagged_value
           fuzz/corpus/fuzz_tagged_value
           -- -max_total_time=600
 
       - name: Run fuzz_heap_alloc (10 min)
         run: >
-          cargo fuzz run fuzz_heap_alloc
+          cargo +nightly fuzz run fuzz_heap_alloc
           fuzz/corpus/fuzz_heap_alloc
           -- -max_total_time=600
 
       - name: Run fuzz_handle_scope (10 min)
         run: >
-          cargo fuzz run fuzz_handle_scope
+          cargo +nightly fuzz run fuzz_handle_scope
           fuzz/corpus/fuzz_handle_scope
           -- -max_total_time=600
 
       - name: Run fuzz_gc_stress (10 min)
         run: >
-          cargo fuzz run fuzz_gc_stress
+          cargo +nightly fuzz run fuzz_gc_stress
           fuzz/corpus/fuzz_gc_stress
           -- -max_total_time=600
 
       - name: Run fuzz_property_ops (10 min)
         run: >
-          cargo fuzz run fuzz_property_ops
+          cargo +nightly fuzz run fuzz_property_ops
           fuzz/corpus/fuzz_property_ops
           -- -max_total_time=600
 
