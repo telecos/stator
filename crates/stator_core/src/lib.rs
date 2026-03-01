@@ -6,6 +6,7 @@
 //! - [`error`] — Engine error types and `StatorResult` alias.
 //! - [`gc`] — Garbage collector infrastructure (heap, tracing, handles).
 //! - [`objects`] — JavaScript value representation and heap object types.
+//! - [`zone`] — Bump-pointer region allocator for compiler temporaries.
 
 /// Engine error types and [`StatorResult`] alias.
 pub mod error;
@@ -13,3 +14,5 @@ pub mod error;
 pub mod gc;
 /// JavaScript value representation and heap object types.
 pub mod objects;
+/// Bump-pointer region allocator for compiler temporaries.
+pub mod zone;
