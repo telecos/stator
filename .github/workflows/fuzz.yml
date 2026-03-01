@@ -1,0 +1,65 @@
+name: Fuzz Smoke Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-smoke:
+    name: Fuzz smoke tests (60 s each)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-fuzz-registry-${{ hashFiles('fuzz/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fuzz-registry-
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+
+      - name: Smoke-test fuzz_tagged_value
+        run: >
+          cargo +nightly fuzz run fuzz_tagged_value
+          fuzz/corpus/fuzz_tagged_value
+          -- -max_total_time=60
+
+      - name: Smoke-test fuzz_heap_alloc
+        run: >
+          cargo +nightly fuzz run fuzz_heap_alloc
+          fuzz/corpus/fuzz_heap_alloc
+          -- -max_total_time=60
+
+      - name: Smoke-test fuzz_handle_scope
+        run: >
+          cargo +nightly fuzz run fuzz_handle_scope
+          fuzz/corpus/fuzz_handle_scope
+          -- -max_total_time=60
+
+      - name: Smoke-test fuzz_gc_stress
+        run: >
+          cargo +nightly fuzz run fuzz_gc_stress
+          fuzz/corpus/fuzz_gc_stress
+          -- -max_total_time=60
+
+      - name: Smoke-test fuzz_property_ops
+        run: >
+          cargo +nightly fuzz run fuzz_property_ops
+          fuzz/corpus/fuzz_property_ops
+          -- -max_total_time=60

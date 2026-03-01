@@ -1,0 +1,72 @@
+name: Nightly Fuzz
+
+on:
+  schedule:
+    # Run at 02:00 UTC every night.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-nightly:
+    name: Nightly fuzz run (10 min each)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-fuzz-registry-${{ hashFiles('fuzz/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fuzz-registry-
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+
+      - name: Run fuzz_tagged_value (10 min)
+        run: >
+          cargo +nightly fuzz run fuzz_tagged_value
+          fuzz/corpus/fuzz_tagged_value
+          -- -max_total_time=600
+
+      - name: Run fuzz_heap_alloc (10 min)
+        run: >
+          cargo +nightly fuzz run fuzz_heap_alloc
+          fuzz/corpus/fuzz_heap_alloc
+          -- -max_total_time=600
+
+      - name: Run fuzz_handle_scope (10 min)
+        run: >
+          cargo +nightly fuzz run fuzz_handle_scope
+          fuzz/corpus/fuzz_handle_scope
+          -- -max_total_time=600
+
+      - name: Run fuzz_gc_stress (10 min)
+        run: >
+          cargo +nightly fuzz run fuzz_gc_stress
+          fuzz/corpus/fuzz_gc_stress
+          -- -max_total_time=600
+
+      - name: Run fuzz_property_ops (10 min)
+        run: >
+          cargo +nightly fuzz run fuzz_property_ops
+          fuzz/corpus/fuzz_property_ops
+          -- -max_total_time=600
+
+      - name: Archive corpus
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ github.run_id }}
+          path: fuzz/corpus/
+          retention-days: 90

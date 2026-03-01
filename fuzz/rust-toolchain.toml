@@ -1,0 +1,3 @@
+[toolchain]
+# cargo-fuzz requires nightly Rust for -Zsanitizer and other unstable features
+channel = "nightly"
