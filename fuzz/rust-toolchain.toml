@@ -1,0 +1,3 @@
+[toolchain]
+# cargo-fuzz requires nightly for -Zsanitizer and the sancov-module pass.
+channel = "nightly"
