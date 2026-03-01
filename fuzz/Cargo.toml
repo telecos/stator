@@ -1,0 +1,44 @@
+[package]
+name = "stator-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+stator_core = { path = "../crates/stator_core" }
+
+[[bin]]
+name = "fuzz_tagged_value"
+path = "fuzz_targets/fuzz_tagged_value.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_heap_alloc"
+path = "fuzz_targets/fuzz_heap_alloc.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_handle_scope"
+path = "fuzz_targets/fuzz_handle_scope.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_gc_stress"
+path = "fuzz_targets/fuzz_gc_stress.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_property_ops"
+path = "fuzz_targets/fuzz_property_ops.rs"
+test = false
+doc = false
