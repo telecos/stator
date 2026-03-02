@@ -9,7 +9,7 @@
 //! - [`zone`] — Bump-pointer region allocator for compiler temporaries.
 //! - [`parser`] — Lexer ([`parser::scanner`]), AST ([`parser::ast`]), and
 //!   scope analysis ([`parser::scope`]), and lazy parsing
-//!([`parser::preparser`])
+//!   ([`parser::preparser`])
 //! - [`bytecode`] — Bytecode instruction set ([`bytecode::bytecodes`]):
 //!   ~174 opcodes matching V8 Ignition semantics, operand encoding, and
 //!   encode/decode utilities.
