@@ -234,7 +234,7 @@ pub fn math_min(values: &[f64]) -> f64 {
 /// ```
 /// use stator_core::builtins::math::math_pow;
 ///
-/// assert_eq!(math_pow(2.0, 10.0), 1024.0);
+/// assert!((math_pow(2.0, 10.0) - 1024.0).abs() < 1e-10);
 /// assert_eq!(math_pow(4.0, 0.5), 2.0);
 /// ```
 pub fn math_pow(base: f64, exponent: f64) -> f64 {
@@ -339,7 +339,7 @@ pub fn math_log(x: f64) -> f64 {
 /// ```
 /// use stator_core::builtins::math::math_log2;
 ///
-/// assert_eq!(math_log2(8.0), 3.0);
+/// assert!((math_log2(8.0) - 3.0).abs() < 1e-10);
 /// assert!(math_log2(-1.0).is_nan());
 /// ```
 pub fn math_log2(x: f64) -> f64 {
@@ -470,15 +470,22 @@ pub fn math_atan2(y: f64, x: f64) -> f64 {
 /// ```
 pub fn math_random() -> f64 {
     use std::cell::Cell;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     thread_local! {
         static STATE: Cell<u64> = Cell::new({
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.subsec_nanos() as u64 ^ (d.as_secs().wrapping_mul(6_364_136_223_846_793_005)))
-                .unwrap_or(12_345_678_901_234_567)
-                | 1 // ensure non-zero
+            // Under Miri, `clock_gettime` is not available in isolation mode;
+            // use a deterministic fixed seed instead.
+            #[cfg(miri)]
+            { 12_345_678_901_234_567_u64 }
+            #[cfg(not(miri))]
+            {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos() as u64 ^ (d.as_secs().wrapping_mul(6_364_136_223_846_793_005)))
+                    .unwrap_or(12_345_678_901_234_567)
+                    | 1 // ensure non-zero
+            }
         });
     }
 
@@ -739,7 +746,9 @@ mod tests {
 
     #[test]
     fn test_pow_integer() {
-        assert_eq!(math_pow(2.0, 10.0), 1024.0);
+        // Use approximate comparison: `powf` is a transcendental function and
+        // Miri's software-float implementation may have ≤1 ULP error.
+        assert!((math_pow(2.0, 10.0) - 1024.0).abs() < 1e-10);
     }
 
     #[test]
@@ -829,7 +838,9 @@ mod tests {
 
     #[test]
     fn test_log2_power_of_two() {
-        assert_eq!(math_log2(8.0), 3.0);
+        // Use approximate comparison: `log2` is a transcendental function and
+        // Miri's software-float implementation may have ≤1 ULP error.
+        assert!((math_log2(8.0) - 3.0).abs() < 1e-10);
     }
 
     #[test]
