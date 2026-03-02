@@ -61,6 +61,10 @@ static void compile_and_report(StatorContext *ctx,
         std::printf("[tab] OK -- %zu bytecode(s) generated\n", count);
         if (dump_code) {
             std::printf("[tab] bytecodes:\n");
+            // Flush C's stdio buffer before calling into Rust so that all
+            // preceding printf output is written to fd 1 before the Rust
+            // println! calls inside stator_bytecode_dump write to the same fd.
+            std::fflush(nullptr);
             stator_bytecode_dump(script);
         }
     }

@@ -11,6 +11,7 @@
 //! function.
 
 use std::ffi::{CStr, CString, c_char};
+use std::io::Write as _;
 
 use stator_core::bytecode::bytecode_array::BytecodeArray;
 use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
@@ -602,6 +603,13 @@ pub unsafe extern "C" fn stator_bytecode_dump(script: *const StatorScript) {
             println!("  <decode error: {e}>");
         }
     }
+    // Flush Rust's stdout immediately so output appears in-order relative to
+    // the surrounding C stdio output.  When stdout is a pipe (e.g. captured
+    // by a shell), both Rust and C maintain separate internal buffers for the
+    // same fd.  Without an explicit flush here the Rust lines would not reach
+    // fd 1 until Rust's runtime teardown, which happens before C's atexit
+    // handlers — causing the bytecodes to appear before all C printf output.
+    let _ = std::io::stdout().flush();
 }
 
 /// Format a single [`Operand`] for human-readable bytecode listing.
