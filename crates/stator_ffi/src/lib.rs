@@ -11,10 +11,15 @@
 //! function.
 
 use std::ffi::{CStr, CString, c_char};
+use std::io::Write as _;
 
+use stator_core::bytecode::bytecode_array::BytecodeArray;
+use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
+use stator_core::bytecode::bytecodes::{Operand, decode};
 use stator_core::gc::heap::Heap;
 use stator_core::objects::js_object::JsObject;
 use stator_core::objects::value::JsValue;
+use stator_core::parser;
 
 /// An opaque isolate handle.
 ///
@@ -467,6 +472,214 @@ pub unsafe extern "C" fn stator_heap_capacity(isolate: *const StatorIsolate) -> 
     unsafe { (*isolate).heap.young_space.capacity() * 2 }
 }
 
+// ── Script (Phase 2: parsing + compilation) ───────────────────────────────────
+
+/// The outcome of a `stator_script_compile` call.
+///
+/// Created by [`stator_script_compile`] and released by [`stator_script_free`].
+pub struct StatorScript {
+    /// Compiled bytecodes on success; `None` on parse / compile error.
+    bytecodes: Option<BytecodeArray>,
+    /// Human-readable error message, or `None` on success.
+    error: Option<CString>,
+}
+
+/// Compile `source` (a UTF-8 string of `source_len` bytes) into bytecode.
+///
+/// Returns a non-null [`StatorScript`] pointer in all cases (even on error).
+/// Call [`stator_script_get_error`] to check whether compilation succeeded.
+/// The caller must eventually pass the returned pointer to
+/// [`stator_script_free`].
+///
+/// Returns a null pointer only on an internal allocation failure (extremely
+/// unlikely in practice).
+///
+/// # Safety
+/// - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+/// - `source` must be valid for reads of `source_len` bytes of valid UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_compile(
+    _ctx: *mut StatorContext,
+    source: *const c_char,
+    source_len: usize,
+) -> *mut StatorScript {
+    if source.is_null() {
+        let script = Box::new(StatorScript {
+            bytecodes: None,
+            error: Some(c"null source pointer".into()),
+        });
+        return Box::into_raw(script);
+    }
+
+    // SAFETY: caller guarantees `source` is valid for `source_len` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(source as *const u8, source_len) };
+    let src = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            let script = Box::new(StatorScript {
+                bytecodes: None,
+                error: Some(c"source is not valid UTF-8".into()),
+            });
+            return Box::into_raw(script);
+        }
+    };
+
+    // Parse then compile.
+    let result =
+        parser::parse(src).and_then(|program| BytecodeGenerator::compile_program(&program));
+
+    let script = match result {
+        Ok(bytecodes) => Box::new(StatorScript {
+            bytecodes: Some(bytecodes),
+            error: None,
+        }),
+        Err(e) => {
+            let msg = e.to_string();
+            let cstring = CString::new(msg).unwrap_or_else(|_| c"compilation error".into());
+            Box::new(StatorScript {
+                bytecodes: None,
+                error: Some(cstring),
+            })
+        }
+    };
+    Box::into_raw(script)
+}
+
+/// Return a null-terminated error message if `script` compiled with an error.
+///
+/// Returns a null pointer when `script` compiled successfully.  The returned
+/// pointer is valid as long as `script` is alive (i.e. until
+/// [`stator_script_free`] is called).
+///
+/// # Safety
+/// `script` must be a non-null pointer returned by [`stator_script_compile`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_get_error(script: *const StatorScript) -> *const c_char {
+    if script.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    match unsafe { &(*script).error } {
+        Some(cs) => cs.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+/// Print the decoded bytecode listing for `script` to standard output.
+///
+/// Each instruction is printed on a new line in the form:
+/// `  <OpcodeName> [<operand>, …]`
+///
+/// Does nothing if `script` is null or compiled with an error.
+///
+/// # Safety
+/// `script` must be either null or a valid, live [`StatorScript`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_bytecode_dump(script: *const StatorScript) {
+    if script.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    let bytecodes = match unsafe { &(*script).bytecodes } {
+        Some(b) => b,
+        None => return,
+    };
+    match decode(bytecodes.bytecodes()) {
+        Ok(instructions) => {
+            for instr in &instructions {
+                let operand_strs: Vec<String> = instr
+                    .operands
+                    .iter()
+                    .map(|op| format_operand(*op))
+                    .collect();
+                if operand_strs.is_empty() {
+                    println!("  {:?}", instr.opcode);
+                } else {
+                    println!("  {:?} {}", instr.opcode, operand_strs.join(", "));
+                }
+            }
+        }
+        Err(e) => {
+            println!("  <decode error: {e}>");
+        }
+    }
+    // Flush Rust's stdout immediately so output appears in-order relative to
+    // the surrounding C stdio output.  When stdout is a pipe (e.g. captured
+    // by a shell), both Rust and C maintain separate internal buffers for the
+    // same fd.  Without an explicit flush here the Rust lines would not reach
+    // fd 1 until Rust's runtime teardown, which happens before C's atexit
+    // handlers — causing the bytecodes to appear before all C printf output.
+    let _ = std::io::stdout().flush();
+}
+
+/// Format a single [`Operand`] for human-readable bytecode listing.
+///
+/// Conventions:
+/// - `Register(r)`: non-negative values become `r{n}` (local/temp registers);
+///   negative values stored as two's-complement `u32` become `a{n}` (argument
+///   registers, where `n = !r`).
+/// - `Immediate(v)`: printed as a signed integer.
+/// - `ConstantPoolIdx(i)`: printed as `[{i}]`.
+/// - `FeedbackSlot(s)`: printed as `slot({s})`.
+/// - All other variants use a descriptive prefix followed by the raw value.
+fn format_operand(op: Operand) -> String {
+    match op {
+        Operand::Register(r) => {
+            // Negative register indices (stored as two's-complement u32)
+            // represent parameter registers.
+            let signed = r as i32;
+            if signed < 0 {
+                format!("a{}", !signed)
+            } else {
+                format!("r{r}")
+            }
+        }
+        Operand::RegisterCount(n) => format!("count({n})"),
+        Operand::Immediate(v) => format!("{v}"),
+        Operand::ConstantPoolIdx(i) => format!("[{i}]"),
+        Operand::FeedbackSlot(s) => format!("slot({s})"),
+        Operand::RuntimeId(id) => format!("rt({id})"),
+        Operand::JumpOffset(o) => format!("{o:+}"),
+        Operand::Flag(f) => format!("#{f}"),
+    }
+}
+
+/// Return the number of bytecode instructions in a successfully compiled script.
+///
+/// Returns 0 if `script` is null, compiled with an error, or the bytecode
+/// stream cannot be decoded.
+///
+/// # Safety
+/// `script` must be either null or a valid, live [`StatorScript`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_bytecode_count(script: *const StatorScript) -> usize {
+    if script.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    let bytecodes = match unsafe { &(*script).bytecodes } {
+        Some(b) => b,
+        None => return 0,
+    };
+    decode(bytecodes.bytecodes())
+        .map(|instrs| instrs.len())
+        .unwrap_or(0)
+}
+
+/// Free a [`StatorScript`] previously returned by [`stator_script_compile`].
+///
+/// # Safety
+/// `script` must be a non-null pointer returned by [`stator_script_compile`]
+/// and must not be used again after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_free(script: *mut StatorScript) {
+    if !script.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw` in
+        // `stator_script_compile`.
+        drop(unsafe { Box::from_raw(script) });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,5 +897,91 @@ mod tests {
         unsafe { stator_isolate_gc(iso.as_ptr()) };
         // SAFETY: `iso` is valid.
         unsafe { stator_gc_collect(iso.as_ptr()) };
+    }
+
+    // ── Script / Phase 2 ─────────────────────────────────────────────────────
+
+    /// Helper: compile a source string and return the `StatorScript` pointer.
+    ///
+    /// The returned pointer must be freed with `stator_script_free`.
+    fn compile_src(src: &str) -> *mut StatorScript {
+        let bytes = src.as_bytes();
+        // SAFETY: null ctx is permitted; `bytes` is valid UTF-8.
+        unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn test_script_compile_simple_returns_nonnull() {
+        let script = compile_src("var x = 1 + 2;");
+        assert!(!script.is_null());
+        // SAFETY: `script` was just returned by `stator_script_compile`.
+        unsafe { stator_script_free(script) };
+    }
+
+    #[test]
+    fn test_script_compile_no_error_on_valid_source() {
+        let script = compile_src("var x = 1 + 2;");
+        // SAFETY: `script` is non-null and live.
+        let err_ptr = unsafe { stator_script_get_error(script) };
+        assert!(err_ptr.is_null(), "expected no error");
+        // SAFETY: `script` is non-null and live.
+        unsafe { stator_script_free(script) };
+    }
+
+    #[test]
+    fn test_script_compile_error_on_syntax_error() {
+        let script = compile_src("var = ;");
+        // SAFETY: `script` is non-null and live.
+        let err_ptr = unsafe { stator_script_get_error(script) };
+        assert!(!err_ptr.is_null(), "expected an error");
+        // SAFETY: returned pointer is valid while `script` is alive.
+        let msg = unsafe { CStr::from_ptr(err_ptr) }.to_str().unwrap();
+        assert!(
+            msg.contains("SyntaxError"),
+            "expected 'SyntaxError' in {msg:?}"
+        );
+        // SAFETY: `script` is non-null and live.
+        unsafe { stator_script_free(script) };
+    }
+
+    #[test]
+    fn test_script_bytecode_count_nonzero_on_success() {
+        let script = compile_src("var x = 1 + 2;");
+        // SAFETY: `script` is non-null and live.
+        let count = unsafe { stator_script_bytecode_count(script) };
+        assert!(count > 0, "expected bytecodes, got 0");
+        // SAFETY: `script` is non-null and live.
+        unsafe { stator_script_free(script) };
+    }
+
+    #[test]
+    fn test_script_bytecode_count_zero_on_error() {
+        let script = compile_src("var = ;");
+        // SAFETY: `script` is non-null and live.
+        let count = unsafe { stator_script_bytecode_count(script) };
+        assert_eq!(count, 0, "expected 0 bytecodes on error");
+        // SAFETY: `script` is non-null and live.
+        unsafe { stator_script_free(script) };
+    }
+
+    #[test]
+    fn test_script_free_null_is_safe() {
+        // SAFETY: null is documented as a no-op.
+        unsafe { stator_script_free(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_bytecode_dump_does_not_crash() {
+        let script = compile_src("var x = 1 + 2;");
+        // SAFETY: `script` is non-null and live.
+        unsafe { stator_bytecode_dump(script) };
+        // SAFETY: `script` is non-null and live.
+        unsafe { stator_script_free(script) };
     }
 }
