@@ -14,7 +14,10 @@
 //!   ~174 opcodes matching V8 Ignition semantics, operand encoding, and
 //!   encode/decode utilities.  [`bytecode::bytecode_array`] provides the
 //!   compact [`bytecode::bytecode_array::BytecodeArray`] type with constant
-//!   pool and source-position table.
+//!   pool and source-position table.  [`bytecode::register`] provides the
+//!   [`bytecode::register::Register`] type and
+//!   [`bytecode::register::RegisterAllocator`] for register assignment during
+//!   compilation.
 
 /// Bytecode instruction set and encode/decode utilities.
 pub mod bytecode;
