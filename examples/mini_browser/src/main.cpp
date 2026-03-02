@@ -58,7 +58,7 @@ static void compile_and_report(StatorContext *ctx,
         std::printf("[tab] ERROR: %s\n", err);
     } else {
         size_t count = stator_script_bytecode_count(script);
-        std::printf("[tab] OK \xe2\x80\x94 %zu bytecode(s) generated\n", count);
+        std::printf("[tab] OK -- %zu bytecode(s) generated\n", count);
         if (dump_code) {
             std::printf("[tab] bytecodes:\n");
             stator_bytecode_dump(script);

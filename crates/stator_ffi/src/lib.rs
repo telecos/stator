@@ -605,6 +605,15 @@ pub unsafe extern "C" fn stator_bytecode_dump(script: *const StatorScript) {
 }
 
 /// Format a single [`Operand`] for human-readable bytecode listing.
+///
+/// Conventions:
+/// - `Register(r)`: non-negative values become `r{n}` (local/temp registers);
+///   negative values stored as two's-complement `u32` become `a{n}` (argument
+///   registers, where `n = !r`).
+/// - `Immediate(v)`: printed as a signed integer.
+/// - `ConstantPoolIdx(i)`: printed as `[{i}]`.
+/// - `FeedbackSlot(s)`: printed as `slot({s})`.
+/// - All other variants use a descriptive prefix followed by the raw value.
 fn format_operand(op: Operand) -> String {
     match op {
         Operand::Register(r) => {

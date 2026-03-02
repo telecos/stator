@@ -101,25 +101,26 @@ impl<'src> Parser<'src> {
     fn expect(&mut self, kind: TokenKind) -> StatorResult<Token> {
         if self.current.kind != kind {
             let span = self.current.span;
-            return Err(StatorError::SyntaxError(format!(
-                "at {}:{} \u{2014} expected {:?}, got {:?}",
-                span.start.line, span.start.column, kind, self.current.kind
-            )));
+            return Err(Self::make_error(
+                span,
+                &format!("expected {kind:?}, got {:?}", self.current.kind),
+            ));
         }
         self.bump()
     }
 
     /// Build a [`StatorError::SyntaxError`] anchored at the current token.
     fn error(&self, msg: &str) -> StatorError {
-        let span = self.current.span;
-        StatorError::SyntaxError(format!(
-            "at {}:{} \u{2014} {}",
-            span.start.line, span.start.column, msg
-        ))
+        Self::make_error(self.current.span, msg)
     }
 
     /// Build a [`StatorError::SyntaxError`] anchored at the given span.
     fn error_at(span: Span, msg: &str) -> StatorError {
+        Self::make_error(span, msg)
+    }
+
+    /// Construct a [`StatorError::SyntaxError`] with the canonical position format.
+    fn make_error(span: Span, msg: &str) -> StatorError {
         StatorError::SyntaxError(format!(
             "at {}:{} \u{2014} {}",
             span.start.line, span.start.column, msg
