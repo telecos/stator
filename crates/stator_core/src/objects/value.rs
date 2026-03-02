@@ -7,6 +7,9 @@
 //! [`to_number`][JsValue::to_number] (§7.1.4), and
 //! [`to_js_string`][JsValue::to_js_string] (§7.1.17).
 
+use std::rc::Rc;
+
+use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::error::{StatorError, StatorResult};
 use crate::gc::trace::{Trace, Tracer};
 use crate::objects::heap_object::HeapObject;
@@ -14,7 +17,8 @@ use crate::objects::heap_object::HeapObject;
 /// Any ECMAScript value.
 ///
 /// Primitive variants carry their data inline; `Object` holds a raw pointer to
-/// a GC-managed [`HeapObject`].
+/// a GC-managed [`HeapObject`]; `Function` holds a reference-counted
+/// [`BytecodeArray`] representing a callable closure.
 ///
 /// # Safety – `Object` variant
 ///
@@ -42,6 +46,11 @@ pub enum JsValue {
     Object(*mut HeapObject),
     /// A JavaScript `BigInt` value (represented as a 128-bit signed integer).
     BigInt(i128),
+    /// A callable JavaScript function backed by a [`BytecodeArray`] closure.
+    ///
+    /// The [`Rc`] allows function values to be cheaply cloned and shared
+    /// without copying the bytecode.
+    Function(Rc<BytecodeArray>),
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -114,6 +123,12 @@ impl JsValue {
     pub fn is_bigint(&self) -> bool {
         matches!(self, Self::BigInt(_))
     }
+
+    /// Returns `true` if this value is a callable function.
+    #[inline]
+    pub fn is_function(&self) -> bool {
+        matches!(self, Self::Function(_))
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -141,7 +156,7 @@ impl JsValue {
             Self::Smi(n) => *n != 0,
             Self::HeapNumber(n) => !n.is_nan() && *n != 0.0,
             Self::String(s) => !s.is_empty(),
-            Self::Symbol(_) | Self::Object(_) => true,
+            Self::Symbol(_) | Self::Object(_) | Self::Function(_) => true,
             Self::BigInt(n) => *n != 0,
         }
     }
@@ -189,6 +204,9 @@ impl JsValue {
             Self::BigInt(_) => Err(StatorError::TypeError(
                 "Cannot convert a BigInt value to a number".to_string(),
             )),
+            Self::Function(_) => Err(StatorError::TypeError(
+                "Cannot convert a Function value to a number".to_string(),
+            )),
         }
     }
 
@@ -225,6 +243,7 @@ impl JsValue {
                 "Cannot convert an Object to a string without ToPrimitive".to_string(),
             )),
             Self::BigInt(n) => Ok(n.to_string()),
+            Self::Function(_) => Ok("function () {}".to_string()),
         }
     }
 }
@@ -237,7 +256,8 @@ impl Trace for JsValue {
     /// Report any GC-managed heap pointer embedded in this value to the tracer.
     ///
     /// Only the [`JsValue::Object`] variant holds a raw heap pointer; all
-    /// primitive variants carry no GC reference and are silently ignored.
+    /// primitive variants and [`JsValue::Function`] carry no GC reference and
+    /// are silently ignored.
     fn trace(&self, tracer: &mut Tracer) {
         if let Self::Object(ptr) = self {
             // SAFETY: Object pointers must refer to live, GC-managed HeapObjects.
