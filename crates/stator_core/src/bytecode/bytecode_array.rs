@@ -58,6 +58,8 @@ pub enum ConstantPoolEntry {
     Null,
     /// The JavaScript `undefined` literal.
     Undefined,
+    /// A compiled nested function or closure.
+    Function(Box<BytecodeArray>),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -100,7 +102,7 @@ impl SourcePosition {
 /// The raw bytes are the V8 Ignition-style encoding produced by
 /// [`bytecodes::encode`].  Use [`BytecodeArray::instructions`] to decode them
 /// back into a [`Vec<Instruction>`] when needed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BytecodeArray {
     /// The encoded bytecode stream.
     bytecodes: Vec<u8>,

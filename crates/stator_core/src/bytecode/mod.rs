@@ -9,9 +9,14 @@
 //! - [`register`] — [`register::Register`] virtual-register type and
 //!   [`register::RegisterAllocator`] for register assignment during
 //!   compilation.
+//! - [`bytecode_generator`] — [`bytecode_generator::BytecodeGenerator`]:
+//!   AST-to-bytecode compiler that produces a [`bytecode_array::BytecodeArray`]
+//!   from a [`crate::parser::ast::Program`].
 
 /// Compact bytecode storage with constant pool and source-position table.
 pub mod bytecode_array;
+/// Bytecode generator: compiles a JavaScript AST into a [`bytecode_array::BytecodeArray`].
+pub mod bytecode_generator;
 /// Bytecode instruction set, operand encoding, and encode/decode utilities.
 pub mod bytecodes;
 /// Virtual register type and register allocator for bytecode compilation.
