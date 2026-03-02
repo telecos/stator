@@ -61,3 +61,33 @@ jobs:
           cargo +nightly fuzz run fuzz_property_ops
           fuzz/corpus/fuzz_property_ops
           -- -max_total_time=10
+
+      - name: Smoke-test fuzz_scanner
+        run: >
+          cargo +nightly fuzz run fuzz_scanner
+          fuzz/corpus/fuzz_scanner
+          -- -max_total_time=10
+
+      - name: Smoke-test fuzz_parser
+        run: >
+          cargo +nightly fuzz run fuzz_parser
+          fuzz/corpus/fuzz_parser
+          -- -max_total_time=10
+
+      - name: Smoke-test fuzz_parser_utf8
+        run: >
+          cargo +nightly fuzz run fuzz_parser_utf8
+          fuzz/corpus/fuzz_parser_utf8
+          -- -max_total_time=10
+
+      - name: Smoke-test fuzz_bytecode_compiler
+        run: >
+          cargo +nightly fuzz run fuzz_bytecode_compiler
+          fuzz/corpus/fuzz_bytecode_compiler
+          -- -max_total_time=10
+
+      - name: Smoke-test fuzz_bytecode_roundtrip
+        run: >
+          cargo +nightly fuzz run fuzz_bytecode_roundtrip
+          fuzz/corpus/fuzz_bytecode_roundtrip
+          -- -max_total_time=10

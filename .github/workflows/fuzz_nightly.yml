@@ -62,6 +62,36 @@ jobs:
           fuzz/corpus/fuzz_property_ops
           -- -max_total_time=600
 
+      - name: Run fuzz_scanner (10 min)
+        run: >
+          cargo +nightly fuzz run fuzz_scanner
+          fuzz/corpus/fuzz_scanner
+          -- -max_total_time=600
+
+      - name: Run fuzz_parser (10 min)
+        run: >
+          cargo +nightly fuzz run fuzz_parser
+          fuzz/corpus/fuzz_parser
+          -- -max_total_time=600
+
+      - name: Run fuzz_parser_utf8 (10 min)
+        run: >
+          cargo +nightly fuzz run fuzz_parser_utf8
+          fuzz/corpus/fuzz_parser_utf8
+          -- -max_total_time=600
+
+      - name: Run fuzz_bytecode_compiler (10 min)
+        run: >
+          cargo +nightly fuzz run fuzz_bytecode_compiler
+          fuzz/corpus/fuzz_bytecode_compiler
+          -- -max_total_time=600
+
+      - name: Run fuzz_bytecode_roundtrip (10 min)
+        run: >
+          cargo +nightly fuzz run fuzz_bytecode_roundtrip
+          fuzz/corpus/fuzz_bytecode_roundtrip
+          -- -max_total_time=600
+
       - name: Archive corpus
         uses: actions/upload-artifact@v4
         with:

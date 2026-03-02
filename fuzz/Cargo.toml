@@ -42,3 +42,33 @@ name = "fuzz_property_ops"
 path = "fuzz_targets/fuzz_property_ops.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_scanner"
+path = "fuzz_targets/fuzz_scanner.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_parser"
+path = "fuzz_targets/fuzz_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_parser_utf8"
+path = "fuzz_targets/fuzz_parser_utf8.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_bytecode_compiler"
+path = "fuzz_targets/fuzz_bytecode_compiler.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_bytecode_roundtrip"
+path = "fuzz_targets/fuzz_bytecode_roundtrip.rs"
+test = false
+doc = false
