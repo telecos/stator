@@ -10,12 +10,15 @@
 //!   needed) and `parameter_count`.
 //! - Optional **source-position table** that maps bytecode offsets back to
 //!   source line/column pairs for stack traces and debugger support.
+//! - A **feedback metadata** descriptor that lists the [`FeedbackSlotKind`] for
+//!   every inline-cache slot allocated by the compiler.
 //!
 //! # Example
 //!
 //! ```
 //! use stator_core::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
 //! use stator_core::bytecode::bytecodes::{Instruction, Operand, Opcode, encode};
+//! use stator_core::bytecode::feedback::FeedbackMetadata;
 //!
 //! // Build a tiny function: load constant 0 (42.0), return.
 //! let instructions = vec![
@@ -25,7 +28,7 @@
 //! let bytes = encode(&instructions);
 //!
 //! let pool = vec![ConstantPoolEntry::Number(42.0)];
-//! let array = BytecodeArray::new(bytes, pool, 1, 0, vec![]);
+//! let array = BytecodeArray::new(bytes, pool, 1, 0, vec![], FeedbackMetadata::empty());
 //!
 //! assert_eq!(array.parameter_count(), 0);
 //! assert_eq!(array.frame_size(), 1);
@@ -36,6 +39,7 @@
 //! ```
 
 use crate::bytecode::bytecodes::{self, Instruction};
+use crate::bytecode::feedback::FeedbackMetadata;
 use crate::error::StatorResult;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -114,6 +118,8 @@ pub struct BytecodeArray {
     parameter_count: u32,
     /// Sparse mapping from bytecode offsets to source locations.
     source_positions: Vec<SourcePosition>,
+    /// Compile-time description of all inline-cache feedback slots.
+    feedback_metadata: FeedbackMetadata,
 }
 
 impl BytecodeArray {
@@ -125,12 +131,15 @@ impl BytecodeArray {
     /// - `frame_size` — number of virtual registers needed at runtime.
     /// - `parameter_count` — number of formal parameters.
     /// - `source_positions` — optional source-position table (may be empty).
+    /// - `feedback_metadata` — inline-cache slot descriptor produced by the
+    ///   compiler (use [`FeedbackMetadata::empty`] when there are no IC slots).
     pub fn new(
         bytecodes: Vec<u8>,
         constant_pool: Vec<ConstantPoolEntry>,
         frame_size: u32,
         parameter_count: u32,
         source_positions: Vec<SourcePosition>,
+        feedback_metadata: FeedbackMetadata,
     ) -> Self {
         Self {
             bytecodes,
@@ -138,6 +147,7 @@ impl BytecodeArray {
             frame_size,
             parameter_count,
             source_positions,
+            feedback_metadata,
         }
     }
 
@@ -164,6 +174,11 @@ impl BytecodeArray {
     /// The source-position table (may be empty if debug info was stripped).
     pub fn source_positions(&self) -> &[SourcePosition] {
         &self.source_positions
+    }
+
+    /// The compile-time feedback metadata for all inline-cache slots.
+    pub fn feedback_metadata(&self) -> &FeedbackMetadata {
+        &self.feedback_metadata
     }
 
     /// Decode the bytecode stream and return the list of [`Instruction`]s.
@@ -202,6 +217,7 @@ impl BytecodeArray {
 mod tests {
     use super::*;
     use crate::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
+    use crate::bytecode::feedback::FeedbackMetadata;
 
     fn make_simple_array() -> BytecodeArray {
         // load smi 7 → r0, return
@@ -211,7 +227,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let bytes = encode(&instructions);
-        BytecodeArray::new(bytes, vec![], 1, 0, vec![])
+        BytecodeArray::new(bytes, vec![], 1, 0, vec![], FeedbackMetadata::empty())
     }
 
     #[test]
@@ -248,7 +264,7 @@ mod tests {
             ConstantPoolEntry::Null,
             ConstantPoolEntry::Undefined,
         ];
-        let array = BytecodeArray::new(bytes, pool, 0, 1, vec![]);
+        let array = BytecodeArray::new(bytes, pool, 0, 1, vec![], FeedbackMetadata::empty());
 
         assert_eq!(array.constant_pool().len(), 5);
         assert_eq!(
@@ -280,6 +296,7 @@ mod tests {
                 SourcePosition::new(4, 2, 5),
                 SourcePosition::new(8, 3, 1),
             ],
+            FeedbackMetadata::empty(),
         );
 
         assert_eq!(
@@ -309,7 +326,31 @@ mod tests {
     #[test]
     fn test_instructions_decode_error() {
         // Truncated LdaSmi (opcode only, no operand byte) → decode error.
-        let array = BytecodeArray::new(vec![Opcode::LdaSmi as u8], vec![], 0, 0, vec![]);
+        let array = BytecodeArray::new(
+            vec![Opcode::LdaSmi as u8],
+            vec![],
+            0,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+        );
         assert!(array.instructions().is_err());
+    }
+
+    #[test]
+    fn test_feedback_metadata_stored_in_array() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        let metadata =
+            FeedbackMetadata::new(vec![FeedbackSlotKind::Call, FeedbackSlotKind::LoadProperty]);
+        let array = BytecodeArray::new(vec![], vec![], 0, 0, vec![], metadata);
+        assert_eq!(array.feedback_metadata().slot_count(), 2);
+        assert_eq!(
+            array.feedback_metadata().kind_of(0),
+            Some(FeedbackSlotKind::Call)
+        );
+        assert_eq!(
+            array.feedback_metadata().kind_of(1),
+            Some(FeedbackSlotKind::LoadProperty)
+        );
     }
 }
