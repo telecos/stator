@@ -1,0 +1,20 @@
+coverage:
+  precision: 2
+  round: down
+  range: "60...100"
+  status:
+    project:
+      default:
+        # Fail if overall coverage drops by more than 2% compared to main.
+        target: auto
+        threshold: 2%
+    patch:
+      default:
+        # Require at least 60% coverage for lines changed in a PR.
+        target: 60%
+        threshold: 0%
+
+comment:
+  layout: "reach,diff,flags,files"
+  behavior: default
+  require_changes: false
