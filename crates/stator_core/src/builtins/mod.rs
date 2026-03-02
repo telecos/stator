@@ -10,3 +10,5 @@
 pub mod array;
 /// ECMAScript §20.1 `Object` built-in static methods.
 pub mod object;
+/// ECMAScript §22.1 `String` built-in static methods and prototype equivalents.
+pub mod string;
