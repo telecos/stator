@@ -6,13 +6,161 @@
 //! [`to_boolean`][JsValue::to_boolean] (§7.1.2),
 //! [`to_number`][JsValue::to_number] (§7.1.4), and
 //! [`to_js_string`][JsValue::to_js_string] (§7.1.17).
+//!
+//! This module also defines the generator and iterator support types used by
+//! the bytecode interpreter and built-in iterators:
+//!
+//! - [`GeneratorStatus`] / [`GeneratorState`] / [`GeneratorStep`] — the
+//!   low-level execution state for generator functions (see
+//!   [`crate::interpreter::Interpreter::run_generator_step`]).
+//! - [`NativeIterator`] — a Rust-level iterator that wraps a pre-collected
+//!   `Vec<JsValue>` and is surfaced as [`JsValue::Iterator`].
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::error::{StatorError, StatorResult};
 use crate::gc::trace::{Trace, Tracer};
 use crate::objects::heap_object::HeapObject;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Generator support types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Lifecycle status of a JavaScript generator object.
+///
+/// Maps to V8's `JSGeneratorObject::ResumeMode` / `GeneratorState` integers:
+/// `Executing` = −2, `Completed` = −1, `SuspendedAtStart` = 0,
+/// `SuspendedAtYield` = 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratorStatus {
+    /// The generator function has not yet been advanced by `.next()`.
+    SuspendedAtStart,
+    /// The generator is paused at a `yield` expression.
+    SuspendedAtYield,
+    /// The generator is currently executing (re-entrancy is invalid).
+    Executing,
+    /// The generator function returned; iteration is complete.
+    Completed,
+}
+
+impl GeneratorStatus {
+    /// Integer encoding compatible with V8's `GetGeneratorState` / `SetGeneratorState`.
+    pub fn to_smi(self) -> i32 {
+        match self {
+            Self::Executing => -2,
+            Self::Completed => -1,
+            Self::SuspendedAtStart => 0,
+            Self::SuspendedAtYield => 1,
+        }
+    }
+
+    /// Decode from the integer produced by [`Self::to_smi`].
+    ///
+    /// Any value that does not map to a known status is treated as
+    /// `SuspendedAtYield`.
+    pub fn from_smi(n: i32) -> Self {
+        match n {
+            -2 => Self::Executing,
+            -1 => Self::Completed,
+            0 => Self::SuspendedAtStart,
+            _ => Self::SuspendedAtYield,
+        }
+    }
+}
+
+/// The saved execution state of a suspended JavaScript generator.
+///
+/// Holds all data needed to resume execution of a generator function after it
+/// has been suspended at a `yield` expression or before the first `.next()`
+/// call.
+///
+/// Use [`GeneratorState::new`] to create a fresh generator, then drive it
+/// with [`crate::interpreter::Interpreter::run_generator_step`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratorState {
+    /// Bytecode for the generator function body.
+    pub bytecode_array: BytecodeArray,
+    /// Saved register file at the point of suspension (empty before the
+    /// first [`crate::bytecode::bytecodes::Opcode::SuspendGenerator`]).
+    pub registers: Vec<JsValue>,
+    /// Instruction index to resume from; `0` = start of function body.
+    pub resume_pc: usize,
+    /// Current lifecycle status.
+    pub status: GeneratorStatus,
+}
+
+impl GeneratorState {
+    /// Create a new generator ready to execute `bytecode_array` from the
+    /// beginning on the first call to
+    /// [`crate::interpreter::Interpreter::run_generator_step`].
+    pub fn new(bytecode_array: BytecodeArray) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self {
+            bytecode_array,
+            registers: Vec::new(),
+            resume_pc: 0,
+            status: GeneratorStatus::SuspendedAtStart,
+        }))
+    }
+}
+
+/// The result of running one step of a generator via
+/// [`crate::interpreter::Interpreter::run_generator_step`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum GeneratorStep {
+    /// The generator suspended at a `yield` expression; the contained value
+    /// is the yielded result.  The generator may be resumed.
+    Yield(JsValue),
+    /// The generator's function body returned; the contained value is the
+    /// final return value.  The generator is now exhausted.
+    Return(JsValue),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Native iterator
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A Rust-level iterator over a pre-collected sequence of [`JsValue`]s.
+///
+/// Built-in iterators for `Array`, `String`, `Map`, and `Set` are represented
+/// as a `NativeIterator` wrapped in [`JsValue::Iterator`].  The iterator
+/// advances by incrementing an internal index into the item vector.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeIterator {
+    /// The items to iterate over, collected eagerly.
+    pub items: Vec<JsValue>,
+    /// Zero-based index of the next item to yield.
+    pub index: usize,
+}
+
+impl NativeIterator {
+    /// Create a `NativeIterator` from a pre-collected item vector.
+    pub fn from_items(items: Vec<JsValue>) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self { items, index: 0 }))
+    }
+
+    /// Create a `NativeIterator` that yields the individual Unicode scalar
+    /// values of `s` as single-character strings.
+    pub fn from_string(s: &str) -> Rc<RefCell<Self>> {
+        let items = s.chars().map(|c| JsValue::String(c.to_string())).collect();
+        Rc::new(RefCell::new(Self { items, index: 0 }))
+    }
+
+    /// Advance the iterator.
+    ///
+    /// Returns `Some(value)` if there are remaining items, or `None` when
+    /// the sequence is exhausted.
+    pub fn next_item(&mut self) -> Option<JsValue> {
+        if self.index < self.items.len() {
+            let val = self.items[self.index].clone();
+            self.index += 1;
+            Some(val)
+        } else {
+            None
+        }
+    }
+}
 
 /// Any ECMAScript value.
 ///
@@ -21,6 +169,8 @@ use crate::objects::heap_object::HeapObject;
 /// [`BytecodeArray`] representing a callable closure; `Array` holds a
 /// reference-counted vector used by built-in combinators (e.g. `Promise.all`)
 /// that need to produce array values without allocating on the GC heap.
+/// `Generator` wraps a suspended generator function's execution state.
+/// `Iterator` wraps a [`NativeIterator`] over a pre-collected sequence.
 ///
 /// # Safety – `Object` variant
 ///
@@ -58,6 +208,19 @@ pub enum JsValue {
     /// Used by built-in combinators such as `Promise.all` that need to return
     /// array values without interacting with the GC heap.
     Array(Rc<Vec<JsValue>>),
+    /// A JavaScript generator object holding the suspended execution state of
+    /// a generator function.
+    ///
+    /// Generators are produced by calling a function compiled with
+    /// `is_generator = true`; they are iterable (they are their own
+    /// `@@iterator`) and are advanced by the [`Opcode::IteratorNext`] opcode
+    /// or by [`crate::interpreter::Interpreter::run_generator_step`].
+    Generator(Rc<RefCell<GeneratorState>>),
+    /// A built-in iterator over a pre-collected sequence (Array, String, …).
+    ///
+    /// Created by the [`Opcode::GetIterator`] opcode when the iterable is a
+    /// [`JsValue::Array`] or [`JsValue::String`].
+    Iterator(Rc<RefCell<NativeIterator>>),
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -142,6 +305,18 @@ impl JsValue {
     pub fn is_array(&self) -> bool {
         matches!(self, Self::Array(_))
     }
+
+    /// Returns `true` if this value is a generator object ([`Generator`][JsValue::Generator]).
+    #[inline]
+    pub fn is_generator(&self) -> bool {
+        matches!(self, Self::Generator(_))
+    }
+
+    /// Returns `true` if this value is a native iterator ([`Iterator`][JsValue::Iterator]).
+    #[inline]
+    pub fn is_iterator(&self) -> bool {
+        matches!(self, Self::Iterator(_))
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -169,7 +344,12 @@ impl JsValue {
             Self::Smi(n) => *n != 0,
             Self::HeapNumber(n) => !n.is_nan() && *n != 0.0,
             Self::String(s) => !s.is_empty(),
-            Self::Symbol(_) | Self::Object(_) | Self::Function(_) | Self::Array(_) => true,
+            Self::Symbol(_)
+            | Self::Object(_)
+            | Self::Function(_)
+            | Self::Array(_)
+            | Self::Generator(_)
+            | Self::Iterator(_) => true,
             Self::BigInt(n) => *n != 0,
         }
     }
@@ -223,6 +403,12 @@ impl JsValue {
             Self::Array(_) => Err(StatorError::TypeError(
                 "Cannot convert an Array value to a number".to_string(),
             )),
+            Self::Generator(_) => Err(StatorError::TypeError(
+                "Cannot convert a Generator value to a number".to_string(),
+            )),
+            Self::Iterator(_) => Err(StatorError::TypeError(
+                "Cannot convert an Iterator value to a number".to_string(),
+            )),
         }
     }
 
@@ -271,6 +457,8 @@ impl JsValue {
                     .collect();
                 Ok(parts?.join(","))
             }
+            Self::Generator(_) => Ok("[object Generator]".to_string()),
+            Self::Iterator(_) => Ok("[object Array Iterator]".to_string()),
         }
     }
 }
@@ -284,8 +472,10 @@ impl Trace for JsValue {
     ///
     /// The [`JsValue::Object`] variant holds a raw heap pointer that is
     /// reported directly.  [`JsValue::Array`] may contain nested `Object`
-    /// values, so each element is traced recursively.  All other variants
-    /// carry no GC reference and are silently ignored.
+    /// values, so each element is traced recursively.  [`JsValue::Generator`]
+    /// traces the saved register file.  [`JsValue::Iterator`] traces its item
+    /// vector.  All other variants carry no GC reference and are silently
+    /// ignored.
     fn trace(&self, tracer: &mut Tracer) {
         match self {
             Self::Object(ptr) => {
@@ -296,6 +486,16 @@ impl Trace for JsValue {
             }
             Self::Array(items) => {
                 for item in items.iter() {
+                    item.trace(tracer);
+                }
+            }
+            Self::Generator(state) => {
+                for reg in &state.borrow().registers {
+                    reg.trace(tracer);
+                }
+            }
+            Self::Iterator(iter) => {
+                for item in &iter.borrow().items {
                     item.trace(tracer);
                 }
             }

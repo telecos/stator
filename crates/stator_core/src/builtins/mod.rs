@@ -8,6 +8,9 @@
 
 /// ECMAScript §23.1 `Array` built-in static methods and prototype equivalents.
 pub mod array;
+/// ECMAScript §27 Iterator and Generator protocol: `Symbol.iterator`,
+/// `IteratorRecord`, and built-in iterators for `Array`, `String`, `Map`, `Set`.
+pub mod iterator;
 /// ECMAScript §24.1 `Map` built-in — insertion-ordered key-value collection.
 pub mod map;
 /// ECMAScript §21.3 `Math` built-in static methods.

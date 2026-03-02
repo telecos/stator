@@ -445,6 +445,12 @@ pub enum Opcode {
     GetIterator,
     /// Obtain an async iterator. `[iterable, load_slot, call_slot]`
     GetAsyncIterator,
+    /// Advance an iterator one step. `[iterator_reg, value_out_reg]`
+    ///
+    /// Stores the next value into `value_out_reg` and puts the `done` boolean
+    /// into the accumulator.  When the iterator is exhausted, `value_out_reg`
+    /// is set to `undefined` and the accumulator is `true`.
+    IteratorNext,
 
     // ── Control flow ──────────────────────────────────────────────────────
     /// Back-edge jump (loop). `[offset, loop_depth, slot]`
@@ -746,6 +752,7 @@ impl Opcode {
             // Iterators
             Opcode::GetIterator => &[Register, FeedbackSlot, FeedbackSlot],
             Opcode::GetAsyncIterator => &[Register, FeedbackSlot, FeedbackSlot],
+            Opcode::IteratorNext => &[Register, Register],
 
             // Jumps
             Opcode::JumpLoop => &[JumpOffset, Immediate, FeedbackSlot],
