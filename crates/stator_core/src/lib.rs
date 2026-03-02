@@ -12,7 +12,9 @@
 //!   ([`parser::preparser`])
 //! - [`bytecode`] — Bytecode instruction set ([`bytecode::bytecodes`]):
 //!   ~174 opcodes matching V8 Ignition semantics, operand encoding, and
-//!   encode/decode utilities.
+//!   encode/decode utilities.  [`bytecode::bytecode_array`] provides the
+//!   compact [`bytecode::bytecode_array::BytecodeArray`] type with constant
+//!   pool and source-position table.
 
 /// Bytecode instruction set and encode/decode utilities.
 pub mod bytecode;
