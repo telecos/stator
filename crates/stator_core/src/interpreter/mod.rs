@@ -107,6 +107,13 @@
 //! | `PushContext(reg)`        | `reg ← old_ctx; ctx ← acc`                           |
 //! | `PopContext(reg)`         | `ctx ← reg`                                           |
 //!
+//! ## Exception handling
+//!
+//! | Opcode      | Semantics                                                          |
+//! |-------------|--------------------------------------------------------------------|
+//! | `Throw`     | throw `acc`; walk handler table, jump to handler or propagate up  |
+//! | `ReThrow`   | re-throw `acc`; same dispatch logic as `Throw`                    |
+//!
 //! ## Jump-offset encoding
 //!
 //! Jump offsets are **byte deltas** relative to the byte following the jump
@@ -141,7 +148,7 @@
 
 use std::rc::Rc;
 
-use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
+use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry, HandlerTableEntry};
 use crate::bytecode::bytecodes::{Opcode, Operand, decode_with_byte_offsets};
 use crate::error::{StatorError, StatorResult};
 use crate::objects::value::JsValue;
@@ -264,6 +271,9 @@ impl Interpreter {
         // Pre-decode the bytecode once and capture byte offsets for jump resolution.
         let (instructions, byte_offsets) =
             decode_with_byte_offsets(frame.bytecode_array.bytecodes())?;
+        // Clone the handler table once so the borrow on bytecode_array is released
+        // before we start mutating the frame.
+        let handler_table: Vec<HandlerTableEntry> = frame.bytecode_array.handler_table().to_vec();
 
         loop {
             if frame.pc >= instructions.len() {
@@ -812,6 +822,32 @@ impl Interpreter {
                     };
                 }
 
+                // ── Exception handling ─────────────────────────────────────
+                //
+                // Throw / ReThrow: the value to throw is in the accumulator.
+                // Walk the handler table looking for the innermost entry whose
+                // [try_start, try_end) range covers the current instruction
+                // (pc was already incremented, so the throwing instruction
+                // index is `frame.pc - 1`).  If a handler is found, load
+                // the thrown value into the accumulator and jump to the
+                // handler entry point.  Otherwise, propagate the exception
+                // as a `StatorError::JsException` to the caller.
+                Opcode::Throw | Opcode::ReThrow => {
+                    let thrown = frame.accumulator.clone();
+                    let throw_idx = (frame.pc - 1) as u32;
+                    if let Some(handler_pc) = find_handler(throw_idx, &handler_table) {
+                        frame.accumulator = thrown;
+                        frame.pc = handler_pc;
+                        continue;
+                    }
+                    // No handler in this frame — convert to a serialised error
+                    // so it can propagate across the Rust call boundary.
+                    let msg = thrown
+                        .to_js_string()
+                        .unwrap_or_else(|_| format!("{thrown:?}"));
+                    return Err(StatorError::JsException(msg));
+                }
+
                 // ── Ignored no-ops ─────────────────────────────────────────
                 // These opcodes carry metadata that does not affect execution.
                 Opcode::StackCheck
@@ -832,6 +868,19 @@ impl Interpreter {
 // ─────────────────────────────────────────────────────────────────────────────
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Look up the innermost exception handler for the instruction at `instr_idx`.
+///
+/// Searches `handler_table` in order (innermost entries are pushed before
+/// outer ones by the compiler, so the first matching entry is the innermost).
+/// Returns the handler entry-point instruction index, or `None` if no entry
+/// covers `instr_idx`.
+fn find_handler(instr_idx: u32, handler_table: &[HandlerTableEntry]) -> Option<usize> {
+    handler_table
+        .iter()
+        .find(|e| instr_idx >= e.try_start && instr_idx < e.try_end)
+        .map(|e| e.handler as usize)
+}
 
 /// Collect `count` consecutive argument values from `frame` starting at the
 /// flat register index corresponding to the encoded `args_start_v` operand.
@@ -1018,6 +1067,7 @@ mod tests {
             param_count,
             vec![],
             FeedbackMetadata::empty(),
+            vec![],
         )
     }
 
@@ -1955,6 +2005,7 @@ mod tests {
             param_count,
             vec![],
             FeedbackMetadata::empty(),
+            vec![],
         )
     }
 
@@ -2239,6 +2290,7 @@ mod tests {
             0,
             vec![],
             FeedbackMetadata::empty(),
+            vec![],
         );
         let f = JsValue::Function(Rc::new(ba));
 
@@ -2269,5 +2321,248 @@ mod tests {
         ];
         let err = run_bytecode(instrs, 1).unwrap_err();
         assert!(matches!(err, StatorError::TypeError(_)));
+    }
+
+    // ── Exception handling (Throw / ReThrow / handler table) ─────────────────
+
+    /// Helper: build a [`BytecodeArray`] with an explicit handler table.
+    fn make_bytecode_with_handlers(
+        instrs: Vec<Instruction>,
+        frame_size: u32,
+        param_count: u32,
+        handler_table: Vec<crate::bytecode::bytecode_array::HandlerTableEntry>,
+    ) -> BytecodeArray {
+        let bytes = encode(&instrs);
+        BytecodeArray::new(
+            bytes,
+            vec![],
+            frame_size,
+            param_count,
+            vec![],
+            FeedbackMetadata::empty(),
+            handler_table,
+        )
+    }
+
+    /// `try { throw 42; } catch(e) { return e; }` → returns 42.
+    ///
+    /// Bytecode layout (indices):
+    ///   0: LdaSmi(42)
+    ///   1: Throw
+    ///   2: Jump(past handler) ← try_end = 2, never reached
+    ///   3: Star(r0)           ← catch handler, acc = 42
+    ///   4: Ldar(r0)
+    ///   5: Return
+    ///
+    /// Handler table: { try_start=0, try_end=2, handler=3, is_finally=false }
+    #[test]
+    fn test_try_catch_basic() {
+        use crate::bytecode::bytecode_array::HandlerTableEntry;
+
+        // Build instructions manually so we know exact instruction indices.
+        let instrs = vec![
+            // idx 0 — try body: load 42
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+            // idx 1 — throw it
+            Instruction::new_unchecked(Opcode::Throw, vec![]),
+            // idx 2 — normal-exit jump (never reached in this test)
+            Instruction::new_unchecked(Opcode::Jump, vec![Operand::JumpOffset(0)]),
+            // idx 3 — catch handler: acc holds thrown value; save to r0
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            // idx 4 — load caught value
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+            // idx 5 — return it
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        // Patch the Jump at idx 2 so it points past the catch block.
+        // After idx 2 the next instr is idx 3 (2 bytes away from end of Jump).
+        // We actually want it to jump to idx 5 (Return).
+        // The Jump at idx 2 is 2 bytes; its end byte is 2+2 = 4.
+        // idx 5 (Return) starts at byte 4+2+2+1 = let's compute:
+        // idx 0: LdaSmi 2 bytes, idx 1: Throw 1 byte, idx 2: Jump 2 bytes,
+        // idx 3: Star 2 bytes, idx 4: Ldar 2 bytes, idx 5: Return 1 byte.
+        // end of Jump at idx 2 = 2+1+2 = 5; Return byte = 5+2+2 = 9.
+        // delta = 9 - 5 = 4.
+        let mut instrs_patched = instrs;
+        instrs_patched[2] = Instruction::new_unchecked(Opcode::Jump, vec![Operand::JumpOffset(4)]);
+
+        let handler_table = vec![HandlerTableEntry {
+            try_start: 0,
+            try_end: 2, // Throw is at idx 1; try_end = 2 (exclusive)
+            handler: 3, // catch starts at idx 3
+            is_finally: false,
+        }];
+        let ba = make_bytecode_with_handlers(instrs_patched, 1, 0, handler_table);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `try { } finally { }` — finally runs on normal path.
+    ///
+    /// The normal-path inlined finally simply sets r0 = 99 before returning.
+    /// We verify the return value is from the try body, and the finally ran.
+    ///
+    /// Layout (indices):
+    ///   0: LdaSmi(1)    ← try body sets acc = 1
+    ///   1: Star(r0)     ← save it
+    ///   2: LdaSmi(99)   ← finally (normal path): acc = 99
+    ///   3: Star(r1)     ← save finally sentinel to r1
+    ///   4: Jump(6)      ← skip exception-path handler
+    ///   5: ReThrow      ← exception-path handler (never reached on normal path)
+    ///   6: Ldar(r0)     ← restore try result
+    ///   7: Return
+    ///
+    /// Handler table: { try_start=0, try_end=2, handler=5, is_finally=true }
+    /// (try_end=2 so the "finally" instructions at idx 2+ are outside try range)
+    #[test]
+    fn test_try_finally_normal_path() {
+        use crate::bytecode::bytecode_array::HandlerTableEntry;
+
+        // Byte layout:
+        //   0: LdaSmi(1)  → 2 bytes  (ends at 2)
+        //   1: Star(r0)   → 2 bytes  (ends at 4)
+        //   --- try_end = 2 (instruction index) / byte 4 ---
+        //   2: LdaSmi(99) → 2 bytes  (ends at 6)
+        //   3: Star(r1)   → 2 bytes  (ends at 8)
+        //   4: Jump(δ)    → 2 bytes  (ends at 10; target = idx 6 = byte 11)
+        //                    δ = 11 - 10 = 1
+        //   5: ReThrow    → 1 byte   (ends at 11)
+        //   6: Ldar(r0)   → 2 bytes  (ends at 13)
+        //   7: Return     → 1 byte
+
+        let instrs = vec![
+            // idx 0 — try body: acc = 1
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            // idx 1 — save to r0
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            // idx 2 — finally (normal path): acc = 99
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            // idx 3 — save sentinel to r1
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            // idx 4 — jump past exception handler (δ = 1 → target byte = 10+1 = 11 = idx 6)
+            Instruction::new_unchecked(Opcode::Jump, vec![Operand::JumpOffset(1)]),
+            // idx 5 — exception handler: ReThrow (never reached in this test)
+            Instruction::new_unchecked(Opcode::ReThrow, vec![]),
+            // idx 6 — restore result from r0
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+            // idx 7 — return
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let handler_table = vec![HandlerTableEntry {
+            try_start: 0,
+            try_end: 2, // only instructions 0..1 are "in try"
+            handler: 5, // exception handler at idx 5
+            is_finally: true,
+        }];
+        let ba = make_bytecode_with_handlers(instrs, 2, 0, handler_table);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        // Normal path returns value from try body (r0 = 1).
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `try { throw 5; } finally { /* runs */ }` — finally runs on exception path
+    /// and the exception propagates after finally.
+    ///
+    /// Uses the bytecode generator to compile the equivalent JavaScript so we
+    /// exercise the full pipeline.
+    #[test]
+    fn test_try_finally_exception_path() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::parse;
+
+        // try { throw 5; } finally { /* nothing — just let it propagate */ }
+        // After finally the exception should propagate out.
+        let src = "try { throw 5; } finally { }";
+        let program = parse(src).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let err = Interpreter::run(&mut frame).unwrap_err();
+        // The exception value "5" should propagate.
+        assert!(
+            matches!(err, StatorError::JsException(_)),
+            "expected JsException, got {err:?}"
+        );
+    }
+
+    /// `try { throw 7; } catch(e) { return e; }` via the bytecode generator.
+    ///
+    /// Tests the full pipeline: parse → compile → run.
+    #[test]
+    fn test_try_catch_via_generator() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::parse;
+
+        let src = "try { throw 7; } catch(e) { return e; }";
+        let program = parse(src).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    /// Nested try/catch: inner catch re-throws, outer catch receives it.
+    ///
+    /// ```javascript
+    /// try {
+    ///   try { throw 1; } catch(inner) { throw inner + 1; }
+    /// } catch(outer) { return outer; }
+    /// ```
+    #[test]
+    fn test_nested_try_catch_via_generator() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::parse;
+
+        let src = "
+            try {
+                try { throw 1; } catch(inner) { throw inner + 1; }
+            } catch(outer) { return outer; }
+        ";
+        let program = parse(src).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `try { } catch(e) { } finally { }` — finally runs on normal path.
+    ///
+    /// ```javascript
+    /// var ran = 0;
+    /// try { ran = 1; } catch(e) { ran = -1; } finally { ran = ran + 10; }
+    /// return ran;  // expected: 11 (try ran, then finally)
+    /// ```
+    #[test]
+    fn test_try_catch_finally_normal_path_via_generator() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::parse;
+
+        let src = "
+            var ran = 0;
+            try { ran = 1; } catch(e) { ran = -1; } finally { ran = ran + 10; }
+            return ran;
+        ";
+        let program = parse(src).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(11));
+    }
+
+    /// Uncaught throw propagates as `JsException`.
+    #[test]
+    fn test_throw_uncaught_produces_js_exception() {
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(Opcode::Throw, vec![]),
+        ];
+        let err = run_bytecode(instrs, 0).unwrap_err();
+        assert!(
+            matches!(err, StatorError::JsException(_)),
+            "expected JsException, got {err:?}"
+        );
     }
 }

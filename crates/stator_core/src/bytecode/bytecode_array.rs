@@ -28,7 +28,7 @@
 //! let bytes = encode(&instructions);
 //!
 //! let pool = vec![ConstantPoolEntry::Number(42.0)];
-//! let array = BytecodeArray::new(bytes, pool, 1, 0, vec![], FeedbackMetadata::empty());
+//! let array = BytecodeArray::new(bytes, pool, 1, 0, vec![], FeedbackMetadata::empty(), vec![]);
 //!
 //! assert_eq!(array.parameter_count(), 0);
 //! assert_eq!(array.frame_size(), 1);
@@ -41,6 +41,38 @@
 use crate::bytecode::bytecodes::{self, Instruction};
 use crate::bytecode::feedback::FeedbackMetadata;
 use crate::error::StatorResult;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HandlerTableEntry
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A single entry in a function's exception handler table.
+///
+/// Each entry describes a contiguous range of bytecode instructions (by
+/// zero-based instruction *index* in the pre-decoded list) that is protected
+/// by a catch or finally handler.
+///
+/// When the interpreter encounters a `Throw` or `ReThrow` instruction it walks
+/// the handler table to find the first entry whose `[try_start, try_end)` range
+/// contains the current program counter.  The innermost handler always appears
+/// earlier in the table (it is pushed before outer handlers during compilation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandlerTableEntry {
+    /// Instruction index of the first instruction covered by this handler
+    /// (inclusive).
+    pub try_start: u32,
+    /// Instruction index one past the last instruction covered by this handler
+    /// (exclusive).
+    pub try_end: u32,
+    /// Instruction index of the handler entry point (first instruction of the
+    /// catch or finally block).
+    pub handler: u32,
+    /// `true` for a `finally` handler; `false` for a `catch` handler.
+    ///
+    /// When `true` the interpreter saves the thrown value before entering the
+    /// handler so the finally block can re-throw it with `ReThrow`.
+    pub is_finally: bool,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ConstantPoolEntry
@@ -120,6 +152,8 @@ pub struct BytecodeArray {
     source_positions: Vec<SourcePosition>,
     /// Compile-time description of all inline-cache feedback slots.
     feedback_metadata: FeedbackMetadata,
+    /// Per-function exception handler table.
+    handler_table: Vec<HandlerTableEntry>,
 }
 
 impl BytecodeArray {
@@ -133,6 +167,9 @@ impl BytecodeArray {
     /// - `source_positions` — optional source-position table (may be empty).
     /// - `feedback_metadata` — inline-cache slot descriptor produced by the
     ///   compiler (use [`FeedbackMetadata::empty`] when there are no IC slots).
+    /// - `handler_table` — exception handler entries for `try`/`catch`/`finally`
+    ///   (use an empty `Vec` when there are no try blocks).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bytecodes: Vec<u8>,
         constant_pool: Vec<ConstantPoolEntry>,
@@ -140,6 +177,7 @@ impl BytecodeArray {
         parameter_count: u32,
         source_positions: Vec<SourcePosition>,
         feedback_metadata: FeedbackMetadata,
+        handler_table: Vec<HandlerTableEntry>,
     ) -> Self {
         Self {
             bytecodes,
@@ -148,6 +186,7 @@ impl BytecodeArray {
             parameter_count,
             source_positions,
             feedback_metadata,
+            handler_table,
         }
     }
 
@@ -179,6 +218,15 @@ impl BytecodeArray {
     /// The compile-time feedback metadata for all inline-cache slots.
     pub fn feedback_metadata(&self) -> &FeedbackMetadata {
         &self.feedback_metadata
+    }
+
+    /// The per-function exception handler table.
+    ///
+    /// Each entry maps a `[try_start, try_end)` instruction-index range to a
+    /// handler entry point.  Entries are ordered so that the innermost handler
+    /// for any given instruction always appears before outer handlers.
+    pub fn handler_table(&self) -> &[HandlerTableEntry] {
+        &self.handler_table
     }
 
     /// Decode the bytecode stream and return the list of [`Instruction`]s.
@@ -227,7 +275,15 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let bytes = encode(&instructions);
-        BytecodeArray::new(bytes, vec![], 1, 0, vec![], FeedbackMetadata::empty())
+        BytecodeArray::new(
+            bytes,
+            vec![],
+            1,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        )
     }
 
     #[test]
@@ -264,7 +320,8 @@ mod tests {
             ConstantPoolEntry::Null,
             ConstantPoolEntry::Undefined,
         ];
-        let array = BytecodeArray::new(bytes, pool, 0, 1, vec![], FeedbackMetadata::empty());
+        let array =
+            BytecodeArray::new(bytes, pool, 0, 1, vec![], FeedbackMetadata::empty(), vec![]);
 
         assert_eq!(array.constant_pool().len(), 5);
         assert_eq!(
@@ -297,6 +354,7 @@ mod tests {
                 SourcePosition::new(8, 3, 1),
             ],
             FeedbackMetadata::empty(),
+            vec![],
         );
 
         assert_eq!(
@@ -333,6 +391,7 @@ mod tests {
             0,
             vec![],
             FeedbackMetadata::empty(),
+            vec![],
         );
         assert!(array.instructions().is_err());
     }
@@ -342,7 +401,7 @@ mod tests {
         use crate::bytecode::feedback::FeedbackSlotKind;
         let metadata =
             FeedbackMetadata::new(vec![FeedbackSlotKind::Call, FeedbackSlotKind::LoadProperty]);
-        let array = BytecodeArray::new(vec![], vec![], 0, 0, vec![], metadata);
+        let array = BytecodeArray::new(vec![], vec![], 0, 0, vec![], metadata, vec![]);
         assert_eq!(array.feedback_metadata().slot_count(), 2);
         assert_eq!(
             array.feedback_metadata().kind_of(0),

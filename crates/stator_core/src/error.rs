@@ -28,6 +28,12 @@ pub enum StatorError {
     /// An internal engine error that should not occur in normal operation.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// A JavaScript exception was thrown and propagated out of the current frame
+    /// without being caught.  The inner string is the debug representation of
+    /// the thrown value, kept to avoid a dependency cycle.
+    #[error("Uncaught exception: {0}")]
+    JsException(String),
 }
 
 /// Convenient `Result` alias for fallible engine operations.
