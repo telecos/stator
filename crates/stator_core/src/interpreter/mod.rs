@@ -1102,7 +1102,11 @@ impl Interpreter {
 
         let (bytecode_array, saved_registers, resume_pc) = {
             let gs = state.borrow();
-            (gs.bytecode_array.clone(), gs.registers.clone(), gs.resume_pc)
+            (
+                gs.bytecode_array.clone(),
+                gs.registers.clone(),
+                gs.resume_pc,
+            )
         };
 
         let param_count = bytecode_array.parameter_count() as usize;
@@ -2906,26 +2910,22 @@ mod tests {
         let gs = GeneratorState::new(ba);
 
         // First .next() → yields 1
-        let step1 =
-            Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
+        let step1 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
         assert_eq!(step1, GeneratorStep::Yield(JsValue::Smi(1)));
         assert_eq!(gs.borrow().status, GeneratorStatus::SuspendedAtYield);
 
         // Second .next() → yields 2
-        let step2 =
-            Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 2 ok");
+        let step2 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 2 ok");
         assert_eq!(step2, GeneratorStep::Yield(JsValue::Smi(2)));
         assert_eq!(gs.borrow().status, GeneratorStatus::SuspendedAtYield);
 
         // Third .next() → done, returns undefined
-        let step3 =
-            Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 3 ok");
+        let step3 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 3 ok");
         assert_eq!(step3, GeneratorStep::Return(JsValue::Undefined));
         assert_eq!(gs.borrow().status, GeneratorStatus::Completed);
 
         // Calling step on a completed generator always returns Return(undefined).
-        let step4 =
-            Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 4 ok");
+        let step4 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 4 ok");
         assert_eq!(step4, GeneratorStep::Return(JsValue::Undefined));
     }
 
@@ -2977,13 +2977,11 @@ mod tests {
         let gs = GeneratorState::new(ba);
 
         // First .next() → yields 10
-        let step1 =
-            Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
+        let step1 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
         assert_eq!(step1, GeneratorStep::Yield(JsValue::Smi(10)));
 
         // Second .next(5) → sends 5 as the yield result; function returns 5 + 1 = 6
-        let step2 =
-            Interpreter::run_generator_step(&gs, JsValue::Smi(5)).expect("step 2 ok");
+        let step2 = Interpreter::run_generator_step(&gs, JsValue::Smi(5)).expect("step 2 ok");
         assert_eq!(step2, GeneratorStep::Return(JsValue::Smi(6)));
     }
 
@@ -3034,14 +3032,12 @@ mod tests {
         let gs = GeneratorState::new(ba);
 
         // Model "async call": first .next() runs until the await point.
-        let step1 =
-            Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
+        let step1 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
         // The function awaited 42 (yielded it).
         assert_eq!(step1, GeneratorStep::Yield(JsValue::Smi(42)));
 
         // Model "microtask resolution": the promise resolved with 7.
-        let step2 =
-            Interpreter::run_generator_step(&gs, JsValue::Smi(7)).expect("step 2 ok");
+        let step2 = Interpreter::run_generator_step(&gs, JsValue::Smi(7)).expect("step 2 ok");
         // async function returned 7 + 1 = 8.
         assert_eq!(step2, GeneratorStep::Return(JsValue::Smi(8)));
     }
@@ -3146,11 +3142,13 @@ mod tests {
 
         // First step: SwitchOnGeneratorState falls through (resume_pc==0),
         // runs LdaSmi 1, yields 1, and saves resume_pc=3 (ResumeGenerator).
-        let step1 =
-            Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
+        let step1 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
         assert_eq!(step1, GeneratorStep::Yield(JsValue::Smi(1)));
         let resume_pc_after_first = gs.borrow().resume_pc;
-        assert_eq!(resume_pc_after_first, 3, "resume_pc should point to ResumeGenerator");
+        assert_eq!(
+            resume_pc_after_first, 3,
+            "resume_pc should point to ResumeGenerator"
+        );
 
         // Directly test the SwitchOnGeneratorState jump: run from PC 0
         // with resume_pc=3 already set in the generator state.  The switch
