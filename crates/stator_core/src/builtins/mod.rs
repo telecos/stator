@@ -8,6 +8,10 @@
 
 /// ECMAScript §23.1 `Array` built-in static methods and prototype equivalents.
 pub mod array;
+/// ECMAScript §21.3 `Math` built-in static methods.
+pub mod math;
+/// ECMAScript §21.1 `Number` built-in static methods and prototype equivalents.
+pub mod number;
 /// ECMAScript §20.1 `Object` built-in static methods.
 pub mod object;
 /// ECMAScript §22.1 `String` built-in static methods and prototype equivalents.
