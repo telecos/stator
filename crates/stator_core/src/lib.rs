@@ -20,6 +20,10 @@
 //!   compilation.  [`bytecode::bytecode_generator`] provides the
 //!   [`bytecode::bytecode_generator::BytecodeGenerator`] that compiles a
 //!   JavaScript AST into a [`bytecode::bytecode_array::BytecodeArray`].
+//!   [`bytecode::feedback`] provides [`bytecode::feedback::FeedbackVector`],
+//!   [`bytecode::feedback::FeedbackMetadata`],
+//!   [`bytecode::feedback::FeedbackSlotKind`], and
+//!   [`bytecode::feedback::InlineCacheState`] for inline-cache feedback.
 
 /// Bytecode instruction set and encode/decode utilities.
 pub mod bytecode;

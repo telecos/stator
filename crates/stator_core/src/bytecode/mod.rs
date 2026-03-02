@@ -12,6 +12,9 @@
 //! - [`bytecode_generator`] — [`bytecode_generator::BytecodeGenerator`]:
 //!   AST-to-bytecode compiler that produces a [`bytecode_array::BytecodeArray`]
 //!   from a [`crate::parser::ast::Program`].
+//! - [`feedback`] — [`feedback::FeedbackVector`], [`feedback::FeedbackMetadata`],
+//!   [`feedback::FeedbackSlotKind`], and [`feedback::InlineCacheState`]: inline
+//!   cache feedback slots allocated during compilation and updated at runtime.
 
 /// Compact bytecode storage with constant pool and source-position table.
 pub mod bytecode_array;
@@ -19,5 +22,7 @@ pub mod bytecode_array;
 pub mod bytecode_generator;
 /// Bytecode instruction set, operand encoding, and encode/decode utilities.
 pub mod bytecodes;
+/// Feedback vectors and inline-cache state for adaptive optimisation.
+pub mod feedback;
 /// Virtual register type and register allocator for bytecode compilation.
 pub mod register;
