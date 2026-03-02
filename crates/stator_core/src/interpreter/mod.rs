@@ -12,8 +12,7 @@
 //!
 //! # Supported opcodes
 //!
-//! The initial implementation handles the core arithmetic and register-move
-//! subset of the Stator/Ignition instruction set:
+//! ## Load / Store
 //!
 //! | Opcode                 | Semantics                                |
 //! |------------------------|------------------------------------------|
@@ -26,13 +25,64 @@
 //! | `LdaConstant(k)`       | `acc ← constant_pool[k]`                 |
 //! | `Ldar(reg)`            | `acc ← reg`                              |
 //! | `Star(reg)`            | `reg ← acc`                              |
+//!
+//! ## Arithmetic
+//!
+//! | Opcode                 | Semantics                                |
+//! |------------------------|------------------------------------------|
 //! | `Add(reg, _)`          | `acc ← acc + reg`                        |
 //! | `Sub(reg, _)`          | `acc ← acc − reg`                        |
 //! | `Mul(reg, _)`          | `acc ← acc × reg`                        |
 //! | `Div(reg, _)`          | `acc ← acc ÷ reg`                        |
-//! | `TestEqual(reg, _)`    | `acc ← acc == reg`  (abstract equality)  |
-//! | `TestEqualStrict(r,_)` | `acc ← acc === reg` (strict equality)    |
-//! | `Return`               | halt; return `acc`                       |
+//! | `Mod(reg, _)`          | `acc ← acc % reg`                        |
+//! | `Inc(_)`               | `acc ← acc + 1`                          |
+//! | `Dec(_)`               | `acc ← acc − 1`                          |
+//!
+//! ## Comparison
+//!
+//! | Opcode                    | Semantics                             |
+//! |---------------------------|---------------------------------------|
+//! | `TestEqual(reg, _)`       | `acc ← acc == reg`  (abstract eq)    |
+//! | `TestNotEqual(reg, _)`    | `acc ← acc != reg`  (abstract neq)   |
+//! | `TestEqualStrict(reg, _)` | `acc ← acc === reg` (strict eq)      |
+//! | `TestLessThan(reg, _)`    | `acc ← acc < reg`                    |
+//! | `TestGreaterThan(reg, _)` | `acc ← acc > reg`                    |
+//! | `TestLessThanOrEqual(r,_)`| `acc ← acc <= reg`                   |
+//! | `TestGreaterThanOrEqual`  | `acc ← acc >= reg`                   |
+//! | `TestNull`                | `acc ← acc === null`                 |
+//! | `TestUndefined`           | `acc ← acc === undefined`            |
+//!
+//! ## Logical / Boolean
+//!
+//! | Opcode                 | Semantics                                |
+//! |------------------------|------------------------------------------|
+//! | `LogicalNot`           | `acc ← !acc` (boolean-only)              |
+//! | `ToBooleanLogicalNot`  | `acc ← !ToBoolean(acc)`                  |
+//!
+//! ## Control flow
+//!
+//! | Opcode                    | Semantics                                              |
+//! |---------------------------|--------------------------------------------------------|
+//! | `Jump(offset)`            | unconditional forward/backward jump                   |
+//! | `JumpLoop(offset,…)`      | back-edge jump (loop repeat)                          |
+//! | `JumpIfTrue(offset)`      | jump if `acc === true`                                |
+//! | `JumpIfFalse(offset)`     | jump if `acc === false`                               |
+//! | `JumpIfToBooleanTrue`     | jump if `ToBoolean(acc)` is truthy                    |
+//! | `JumpIfToBooleanFalse`    | jump if `ToBoolean(acc)` is falsy                     |
+//! | `JumpIfNull(offset)`      | jump if `acc === null`                                |
+//! | `JumpIfNotNull(offset)`   | jump if `acc !== null`                                |
+//! | `JumpIfUndefined(offset)` | jump if `acc === undefined`                           |
+//! | `JumpIfNotUndefined`      | jump if `acc !== undefined`                           |
+//! | `JumpIfUndefinedOrNull`   | jump if `acc === null \|\| acc === undefined`          |
+//! | `Return`                  | halt; return `acc`                                    |
+//!
+//! ## Jump-offset encoding
+//!
+//! Jump offsets are **byte deltas** relative to the byte following the jump
+//! instruction.  Positive values jump forward; negative values jump backward.
+//! At runtime the interpreter pre-computes a byte-offset table for all
+//! instructions and uses binary search to convert a target byte offset back to
+//! an instruction index.
 //!
 //! # Register layout
 //!
@@ -52,13 +102,14 @@
 //!
 //! # Dispatch strategy
 //!
-//! Instructions are pre-decoded once by [`BytecodeArray::instructions`] into a
-//! `Vec<Instruction>`.  The main loop fetches one [`Instruction`] per
-//! iteration, advances the program counter, then dispatches on the
-//! [`Opcode`] via an exhaustive `match`.
+//! Instructions are pre-decoded once by
+//! [`crate::bytecode::bytecodes::decode_with_byte_offsets`] into a
+//! `Vec<Instruction>` and a parallel byte-offset table.  The main loop fetches
+//! one [`Instruction`] per iteration, advances the program counter, then
+//! dispatches on the [`Opcode`] via an exhaustive `match`.
 
 use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
-use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
+use crate::bytecode::bytecodes::{Opcode, Operand, decode_with_byte_offsets};
 use crate::error::{StatorError, StatorResult};
 use crate::objects::value::JsValue;
 
@@ -177,8 +228,9 @@ impl Interpreter {
     /// - an unimplemented opcode is encountered, or
     /// - a type error occurs during arithmetic.
     pub fn run(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
-        // Pre-decode the bytecode once; the dispatch loop indexes into this.
-        let instructions: Vec<Instruction> = frame.bytecode_array.instructions()?;
+        // Pre-decode the bytecode once and capture byte offsets for jump resolution.
+        let (instructions, byte_offsets) =
+            decode_with_byte_offsets(frame.bytecode_array.bytecodes())?;
 
         loop {
             if frame.pc >= instructions.len() {
@@ -239,6 +291,16 @@ impl Interpreter {
                     let val = frame.accumulator.clone();
                     frame.write_reg(v, val)?;
                 }
+                Opcode::Mov => {
+                    let Operand::Register(src) = instr.operands[0] else {
+                        return Err(err_bad_operand("Mov", 0));
+                    };
+                    let Operand::Register(dst) = instr.operands[1] else {
+                        return Err(err_bad_operand("Mov", 1));
+                    };
+                    let val = frame.read_reg(src)?.clone();
+                    frame.write_reg(dst, val)?;
+                }
 
                 // ── Arithmetic ─────────────────────────────────────────────
                 //
@@ -280,6 +342,25 @@ impl Interpreter {
                     let rhs_n = rhs.to_number()?;
                     frame.accumulator = number_to_jsvalue(lhs_n / rhs_n);
                 }
+                Opcode::Mod => {
+                    let Operand::Register(v) = instr.operands[0] else {
+                        return Err(err_bad_operand("Mod", 0));
+                    };
+                    let rhs = frame.read_reg(v)?.clone();
+                    let lhs_n = frame.accumulator.to_number()?;
+                    let rhs_n = rhs.to_number()?;
+                    frame.accumulator = number_to_jsvalue(lhs_n % rhs_n);
+                }
+                Opcode::Inc => {
+                    // operands[0] is a FeedbackSlot, ignored at runtime.
+                    let n = frame.accumulator.to_number()?;
+                    frame.accumulator = number_to_jsvalue(n + 1.0);
+                }
+                Opcode::Dec => {
+                    // operands[0] is a FeedbackSlot, ignored at runtime.
+                    let n = frame.accumulator.to_number()?;
+                    frame.accumulator = number_to_jsvalue(n - 1.0);
+                }
 
                 // ── Comparisons ────────────────────────────────────────────
                 Opcode::TestEqual => {
@@ -290,6 +371,14 @@ impl Interpreter {
                     let result = abstract_eq(&frame.accumulator, &rhs);
                     frame.accumulator = JsValue::Boolean(result);
                 }
+                Opcode::TestNotEqual => {
+                    let Operand::Register(v) = instr.operands[0] else {
+                        return Err(err_bad_operand("TestNotEqual", 0));
+                    };
+                    let rhs = frame.read_reg(v)?.clone();
+                    let result = !abstract_eq(&frame.accumulator, &rhs);
+                    frame.accumulator = JsValue::Boolean(result);
+                }
                 Opcode::TestEqualStrict => {
                     let Operand::Register(v) = instr.operands[0] else {
                         return Err(err_bad_operand("TestEqualStrict", 0));
@@ -298,8 +387,154 @@ impl Interpreter {
                     let result = strict_eq(&frame.accumulator, &rhs);
                     frame.accumulator = JsValue::Boolean(result);
                 }
+                Opcode::TestLessThan => {
+                    let Operand::Register(v) = instr.operands[0] else {
+                        return Err(err_bad_operand("TestLessThan", 0));
+                    };
+                    let rhs = frame.read_reg(v)?.clone();
+                    let result = js_less_than(&frame.accumulator, &rhs)?;
+                    frame.accumulator = JsValue::Boolean(result);
+                }
+                Opcode::TestGreaterThan => {
+                    let Operand::Register(v) = instr.operands[0] else {
+                        return Err(err_bad_operand("TestGreaterThan", 0));
+                    };
+                    let rhs = frame.read_reg(v)?.clone();
+                    // a > b  ≡  b < a
+                    let result = js_less_than(&rhs, &frame.accumulator)?;
+                    frame.accumulator = JsValue::Boolean(result);
+                }
+                Opcode::TestLessThanOrEqual => {
+                    let Operand::Register(v) = instr.operands[0] else {
+                        return Err(err_bad_operand("TestLessThanOrEqual", 0));
+                    };
+                    let rhs = frame.read_reg(v)?.clone();
+                    // a <= b  ≡  !(b < a)
+                    let result = !js_less_than(&rhs, &frame.accumulator)?;
+                    frame.accumulator = JsValue::Boolean(result);
+                }
+                Opcode::TestGreaterThanOrEqual => {
+                    let Operand::Register(v) = instr.operands[0] else {
+                        return Err(err_bad_operand("TestGreaterThanOrEqual", 0));
+                    };
+                    let rhs = frame.read_reg(v)?.clone();
+                    // a >= b  ≡  !(a < b)
+                    let result = !js_less_than(&frame.accumulator, &rhs)?;
+                    frame.accumulator = JsValue::Boolean(result);
+                }
+                Opcode::TestNull => {
+                    frame.accumulator = JsValue::Boolean(frame.accumulator.is_null());
+                }
+                Opcode::TestUndefined => {
+                    frame.accumulator = JsValue::Boolean(frame.accumulator.is_undefined());
+                }
+
+                // ── Logical / Boolean ──────────────────────────────────────
+                Opcode::LogicalNot => {
+                    // `!acc` — the compiler emits this when acc is already a
+                    // boolean.  We coerce via ToBoolean for safety.
+                    frame.accumulator = JsValue::Boolean(!frame.accumulator.to_boolean());
+                }
+                Opcode::ToBooleanLogicalNot => {
+                    // `!ToBoolean(acc)` — explicit coercion before negation.
+                    frame.accumulator = JsValue::Boolean(!frame.accumulator.to_boolean());
+                }
 
                 // ── Control flow ───────────────────────────────────────────
+                Opcode::Jump => {
+                    let Operand::JumpOffset(delta) = instr.operands[0] else {
+                        return Err(err_bad_operand("Jump", 0));
+                    };
+                    frame.pc = resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                }
+                // JumpLoop [offset, loop_depth, slot] — same as unconditional Jump.
+                Opcode::JumpLoop => {
+                    let Operand::JumpOffset(delta) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpLoop", 0));
+                    };
+                    frame.pc = resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                }
+                Opcode::JumpIfTrue => {
+                    let Operand::JumpOffset(delta) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfTrue", 0));
+                    };
+                    if matches!(frame.accumulator, JsValue::Boolean(true)) {
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+                Opcode::JumpIfFalse => {
+                    let Operand::JumpOffset(delta) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfFalse", 0));
+                    };
+                    if matches!(frame.accumulator, JsValue::Boolean(false)) {
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+                Opcode::JumpIfToBooleanTrue => {
+                    let Operand::JumpOffset(delta) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfToBooleanTrue", 0));
+                    };
+                    if frame.accumulator.to_boolean() {
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+                Opcode::JumpIfToBooleanFalse => {
+                    let Operand::JumpOffset(delta) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfToBooleanFalse", 0));
+                    };
+                    if !frame.accumulator.to_boolean() {
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+                Opcode::JumpIfNull => {
+                    let Operand::JumpOffset(delta) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfNull", 0));
+                    };
+                    if frame.accumulator.is_null() {
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+                Opcode::JumpIfNotNull => {
+                    let Operand::JumpOffset(delta) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfNotNull", 0));
+                    };
+                    if !frame.accumulator.is_null() {
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+                Opcode::JumpIfUndefined => {
+                    let Operand::JumpOffset(delta) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfUndefined", 0));
+                    };
+                    if frame.accumulator.is_undefined() {
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+                Opcode::JumpIfNotUndefined => {
+                    let Operand::JumpOffset(delta) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfNotUndefined", 0));
+                    };
+                    if !frame.accumulator.is_undefined() {
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+                Opcode::JumpIfUndefinedOrNull => {
+                    let Operand::JumpOffset(delta) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfUndefinedOrNull", 0));
+                    };
+                    if frame.accumulator.is_nullish() {
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
                 Opcode::Return => {
                     return Ok(frame.accumulator.clone());
                 }
@@ -324,6 +559,32 @@ impl Interpreter {
 // ─────────────────────────────────────────────────────────────────────────────
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve a [`Operand::JumpOffset`] delta to an instruction index.
+///
+/// `pc_after_jump` is the current program counter **after** incrementing past
+/// the jump instruction.  `byte_offsets[pc_after_jump]` is the byte offset
+/// that marks the end of the jump instruction, which is the reference point
+/// for the signed `delta`.
+///
+/// `instr_count` is `instructions.len()`; only the first `instr_count` entries
+/// of `byte_offsets` are valid instruction starts.
+fn resolve_jump(
+    pc_after_jump: usize,
+    delta: i32,
+    byte_offsets: &[usize],
+    instr_count: usize,
+) -> StatorResult<usize> {
+    let end_byte = byte_offsets[pc_after_jump];
+    let target_byte = (end_byte as i64 + delta as i64) as usize;
+    byte_offsets[..instr_count]
+        .binary_search(&target_byte)
+        .map_err(|_| {
+            StatorError::Internal(format!(
+                "jump target byte offset {target_byte} is not at an instruction boundary"
+            ))
+        })
+}
 
 /// Convert a constant-pool entry to a [`JsValue`].
 fn constant_to_value(entry: &ConstantPoolEntry) -> JsValue {
@@ -363,6 +624,23 @@ fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
         let r = rhs.to_number()?;
         Ok(number_to_jsvalue(l + r))
     }
+}
+
+/// ECMAScript §7.2.11 **Abstract Relational Comparison** (`<`).
+///
+/// Returns `false` when either operand is `NaN` (consistent with IEEE 754).
+/// String operands are compared lexicographically; all other combinations
+/// convert to numbers first.
+fn js_less_than(lhs: &JsValue, rhs: &JsValue) -> StatorResult<bool> {
+    if let (JsValue::String(a), JsValue::String(b)) = (lhs, rhs) {
+        return Ok(a < b);
+    }
+    let l = lhs.to_number()?;
+    let r = rhs.to_number()?;
+    if l.is_nan() || r.is_nan() {
+        return Ok(false);
+    }
+    Ok(l < r)
 }
 
 /// ECMAScript §7.2.13 **Abstract Equality Comparison** (`==`).
@@ -799,5 +1077,569 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, StatorError::Internal(_)));
+    }
+
+    // ── Jump (unconditional) ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_jump_forward_skips_instructions() {
+        // Jump with offset 2 skips the next 2-byte instruction (LdaSmi(99)).
+        // Byte layout:
+        //   [0] LdaSmi(1)   → 2 bytes (opcode + narrow immediate)
+        //   [2] Jump(2)     → 2 bytes (opcode + narrow offset)
+        //   [4] LdaSmi(99)  → 2 bytes ← skipped; end-of-jump=4, target=4+2=6
+        //   [6] Return      → 1 byte
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+                // Jump 2 bytes forward, skipping LdaSmi(99).
+                Instruction::new_unchecked(Opcode::Jump, vec![Operand::JumpOffset(2)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        // LdaSmi(99) is skipped; acc stays 1.
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_jump_if_to_boolean_false_taken_skips_instruction() {
+        // When acc is falsy the jump is taken and LdaSmi(99) is skipped.
+        // Byte layout:
+        //   [0] LdaSmi(42)             → 2 bytes  (acc = 42)
+        //   [2] Star(r0)               → 2 bytes  (r0 = 42)
+        //   [4] LdaFalse               → 1 byte   (acc = false)
+        //   [5] JumpIfToBooleanFalse(2)→ 2 bytes  end=7; if taken target=9
+        //   [7] LdaSmi(99)             → 2 bytes  ← skipped when jump taken
+        //   [9] Ldar(r0)               → 2 bytes  (acc = 42)
+        //  [11] Return                 → 1 byte
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaFalse, vec![]),
+                Instruction::new_unchecked(
+                    Opcode::JumpIfToBooleanFalse,
+                    vec![Operand::JumpOffset(2)],
+                ),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+                Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            1,
+        )
+        .unwrap();
+        // Jump taken (false is falsy): LdaSmi(99) skipped, Ldar(r0)=42 returned.
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_jump_if_to_boolean_false_not_taken() {
+        // When acc is truthy the jump is NOT taken and execution falls through.
+        // Same byte layout as above but with LdaTrue instead of LdaFalse.
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaTrue, vec![]),
+                Instruction::new_unchecked(
+                    Opcode::JumpIfToBooleanFalse,
+                    vec![Operand::JumpOffset(2)],
+                ),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+                Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            1,
+        )
+        .unwrap();
+        // Jump NOT taken (true is truthy): LdaSmi(99) executes, then Ldar(r0)=42.
+        // Both LdaSmi(99) and Ldar(r0) execute, so acc = 42 at return.
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    // ── Comparison opcodes ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_less_than() {
+        // 3 < 5 → true
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(3)]),
+                Instruction::new_unchecked(
+                    Opcode::TestLessThan,
+                    vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            1,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+
+        // 7 < 3 → false
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(3)]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(7)]),
+                Instruction::new_unchecked(
+                    Opcode::TestLessThan,
+                    vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            1,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_greater_than() {
+        // 7 > 3 → true
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(3)]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(7)]),
+                Instruction::new_unchecked(
+                    Opcode::TestGreaterThan,
+                    vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            1,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_less_than_or_equal() {
+        // 5 <= 5 → true
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
+                Instruction::new_unchecked(
+                    Opcode::TestLessThanOrEqual,
+                    vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            1,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_greater_than_or_equal() {
+        // 5 >= 6 → false
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(6)]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
+                Instruction::new_unchecked(
+                    Opcode::TestGreaterThanOrEqual,
+                    vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            1,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_not_equal() {
+        // 3 != 5 → true
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(3)]),
+                Instruction::new_unchecked(
+                    Opcode::TestNotEqual,
+                    vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            1,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_test_null_and_undefined() {
+        // null → true for TestNull
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaNull, vec![]),
+                Instruction::new_unchecked(Opcode::TestNull, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+
+        // 42 → false for TestUndefined
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+                Instruction::new_unchecked(Opcode::TestUndefined, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── Inc / Dec / Mod ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_inc_and_dec() {
+        // inc: 5 → 6
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
+                Instruction::new_unchecked(Opcode::Inc, vec![Operand::FeedbackSlot(0)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+
+        // dec: 5 → 4
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
+                Instruction::new_unchecked(Opcode::Dec, vec![Operand::FeedbackSlot(0)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_mod() {
+        // 10 % 3 = 1
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(3)]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(10)]),
+                Instruction::new_unchecked(
+                    Opcode::Mod,
+                    vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            1,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    // ── LogicalNot / ToBooleanLogicalNot ─────────────────────────────────────
+
+    #[test]
+    fn test_logical_not() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaTrue, vec![]),
+                Instruction::new_unchecked(Opcode::LogicalNot, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_to_boolean_logical_not() {
+        // !0 → true
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaZero, vec![]),
+                Instruction::new_unchecked(Opcode::ToBooleanLogicalNot, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── End-to-end: compiler → interpreter ──────────────────────────────────
+    //
+    // These tests use BytecodeGenerator to compile a hand-built AST, then run
+    // the resulting BytecodeArray through the interpreter.
+
+    /// Compile `stmts` as a top-level script and run the resulting bytecode.
+    fn compile_and_run(stmts: Vec<crate::parser::ast::Stmt>) -> StatorResult<JsValue> {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::ast::{Program, ProgramItem, SourceType};
+
+        let program = Program {
+            loc: span(),
+            source_type: SourceType::Script,
+            body: stmts.into_iter().map(ProgramItem::Stmt).collect(),
+        };
+        let ba = BytecodeGenerator::compile_program(&program)?;
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        Interpreter::run(&mut frame)
+    }
+
+    fn span() -> crate::parser::scanner::Span {
+        use crate::parser::scanner::{Position, Span};
+        let p = Position {
+            offset: 0,
+            line: 1,
+            column: 1,
+        };
+        Span { start: p, end: p }
+    }
+
+    fn num_expr(v: f64) -> crate::parser::ast::Expr {
+        use crate::parser::ast::{Expr, NumLit};
+        Expr::Num(NumLit {
+            loc: span(),
+            value: v,
+            raw: v.to_string(),
+        })
+    }
+
+    fn ident_expr(name: &str) -> crate::parser::ast::Expr {
+        use crate::parser::ast::{Expr, Ident};
+        Expr::Ident(Ident {
+            loc: span(),
+            name: name.to_owned(),
+        })
+    }
+
+    fn return_stmt(arg: Option<crate::parser::ast::Expr>) -> crate::parser::ast::Stmt {
+        use crate::parser::ast::{ReturnStmt, Stmt};
+        Stmt::Return(ReturnStmt {
+            loc: span(),
+            argument: arg.map(Box::new),
+        })
+    }
+
+    fn var_let(name: &str, init: crate::parser::ast::Expr) -> crate::parser::ast::Stmt {
+        use crate::parser::ast::{Pat, Stmt, VarDecl, VarDeclarator, VarKind};
+        Stmt::VarDecl(VarDecl {
+            loc: span(),
+            kind: VarKind::Let,
+            declarators: vec![VarDeclarator {
+                loc: span(),
+                id: Pat::Ident(crate::parser::ast::Ident {
+                    loc: span(),
+                    name: name.to_owned(),
+                }),
+                init: Some(Box::new(init)),
+            }],
+        })
+    }
+
+    fn binary(
+        op: crate::parser::ast::BinaryOp,
+        lhs: crate::parser::ast::Expr,
+        rhs: crate::parser::ast::Expr,
+    ) -> crate::parser::ast::Expr {
+        use crate::parser::ast::{BinaryExpr, Expr};
+        Expr::Binary(Box::new(BinaryExpr {
+            loc: span(),
+            op,
+            left: Box::new(lhs),
+            right: Box::new(rhs),
+        }))
+    }
+
+    fn assign_expr(
+        name: &str,
+        op: crate::parser::ast::AssignOp,
+        rhs: crate::parser::ast::Expr,
+    ) -> crate::parser::ast::Expr {
+        use crate::parser::ast::{AssignExpr, AssignTarget, Expr, Ident};
+        Expr::Assign(Box::new(AssignExpr {
+            loc: span(),
+            op,
+            left: AssignTarget::Expr(Box::new(Expr::Ident(Ident {
+                loc: span(),
+                name: name.to_owned(),
+            }))),
+            right: Box::new(rhs),
+        }))
+    }
+
+    /// Test: if/else branching — return "big" if x > 5, else "small".
+    #[test]
+    fn test_e2e_if_else_branching() {
+        use crate::parser::ast::{BinaryOp, IfStmt, ReturnStmt, Stmt};
+
+        // let x = 10;
+        // if (x > 5) { return 1; } else { return 0; }
+        let x_val = 10.0;
+        let stmts = vec![
+            var_let("x", num_expr(x_val)),
+            Stmt::If(IfStmt {
+                loc: span(),
+                test: Box::new(binary(BinaryOp::Gt, ident_expr("x"), num_expr(5.0))),
+                consequent: Box::new(Stmt::Return(ReturnStmt {
+                    loc: span(),
+                    argument: Some(Box::new(num_expr(1.0))),
+                })),
+                alternate: Some(Box::new(Stmt::Return(ReturnStmt {
+                    loc: span(),
+                    argument: Some(Box::new(num_expr(0.0))),
+                }))),
+            }),
+        ];
+
+        let result = compile_and_run(stmts).unwrap();
+        assert_eq!(result, JsValue::Smi(1)); // x=10 > 5, so return 1
+
+        // Now with x = 3 (less than 5)
+        let stmts2 = vec![
+            var_let("x", num_expr(3.0)),
+            Stmt::If(IfStmt {
+                loc: span(),
+                test: Box::new(binary(BinaryOp::Gt, ident_expr("x"), num_expr(5.0))),
+                consequent: Box::new(Stmt::Return(ReturnStmt {
+                    loc: span(),
+                    argument: Some(Box::new(num_expr(1.0))),
+                })),
+                alternate: Some(Box::new(Stmt::Return(ReturnStmt {
+                    loc: span(),
+                    argument: Some(Box::new(num_expr(0.0))),
+                }))),
+            }),
+        ];
+        let result2 = compile_and_run(stmts2).unwrap();
+        assert_eq!(result2, JsValue::Smi(0)); // x=3 <= 5, so return 0
+    }
+
+    /// Test: for loop computing the sum 0+1+2+…+9 = 45.
+    #[test]
+    fn test_e2e_for_loop_sum() {
+        use crate::parser::ast::{
+            AssignOp, BinaryOp, BlockStmt, ExprStmt, ForInit, ForStmt, Stmt, UpdateExpr, UpdateOp,
+            VarDecl, VarDeclarator, VarKind,
+        };
+
+        // let sum = 0;
+        // for (let i = 0; i < 10; i++) { sum += i; }
+        // return sum;
+        let stmts = vec![
+            var_let("sum", num_expr(0.0)),
+            Stmt::For(ForStmt {
+                loc: span(),
+                init: Some(ForInit::VarDecl(VarDecl {
+                    loc: span(),
+                    kind: VarKind::Let,
+                    declarators: vec![VarDeclarator {
+                        loc: span(),
+                        id: crate::parser::ast::Pat::Ident(crate::parser::ast::Ident {
+                            loc: span(),
+                            name: "i".to_owned(),
+                        }),
+                        init: Some(Box::new(num_expr(0.0))),
+                    }],
+                })),
+                test: Some(Box::new(binary(
+                    BinaryOp::Lt,
+                    ident_expr("i"),
+                    num_expr(10.0),
+                ))),
+                update: Some(Box::new(crate::parser::ast::Expr::Update(Box::new(
+                    UpdateExpr {
+                        loc: span(),
+                        op: UpdateOp::Increment,
+                        prefix: false,
+                        argument: Box::new(ident_expr("i")),
+                    },
+                )))),
+                body: Box::new(Stmt::Block(BlockStmt {
+                    loc: span(),
+                    body: vec![Stmt::Expr(ExprStmt {
+                        loc: span(),
+                        expr: Box::new(assign_expr("sum", AssignOp::AddAssign, ident_expr("i"))),
+                    })],
+                })),
+            }),
+            return_stmt(Some(ident_expr("sum"))),
+        ];
+
+        let result = compile_and_run(stmts).unwrap();
+        assert_eq!(result, JsValue::Smi(45)); // 0+1+…+9 = 45
+    }
+
+    /// Test: while loop with break — count up to 5 then stop.
+    #[test]
+    fn test_e2e_while_with_break() {
+        use crate::parser::ast::{
+            BinaryOp, BlockStmt, BreakStmt, ExprStmt, IfStmt, Stmt, UpdateExpr, UpdateOp, WhileStmt,
+        };
+
+        // let n = 0;
+        // while (true) { if (n >= 5) break; n++; }
+        // return n;
+        let stmts = vec![
+            var_let("n", num_expr(0.0)),
+            Stmt::While(WhileStmt {
+                loc: span(),
+                test: Box::new(crate::parser::ast::Expr::Bool(
+                    crate::parser::ast::BoolLit {
+                        loc: span(),
+                        value: true,
+                    },
+                )),
+                body: Box::new(Stmt::Block(BlockStmt {
+                    loc: span(),
+                    body: vec![
+                        Stmt::If(IfStmt {
+                            loc: span(),
+                            test: Box::new(binary(BinaryOp::GtEq, ident_expr("n"), num_expr(5.0))),
+                            consequent: Box::new(Stmt::Break(BreakStmt {
+                                loc: span(),
+                                label: None,
+                            })),
+                            alternate: None,
+                        }),
+                        Stmt::Expr(ExprStmt {
+                            loc: span(),
+                            expr: Box::new(crate::parser::ast::Expr::Update(Box::new(
+                                UpdateExpr {
+                                    loc: span(),
+                                    op: UpdateOp::Increment,
+                                    prefix: false,
+                                    argument: Box::new(ident_expr("n")),
+                                },
+                            ))),
+                        }),
+                    ],
+                })),
+            }),
+            return_stmt(Some(ident_expr("n"))),
+        ];
+
+        let result = compile_and_run(stmts).unwrap();
+        assert_eq!(result, JsValue::Smi(5));
     }
 }

@@ -960,15 +960,31 @@ pub fn encode(instructions: &[Instruction]) -> Vec<u8> {
     out
 }
 
-/// Decode a byte stream produced by [`encode`] back into [`Instruction`]s.
+/// Decode a byte stream produced by [`encode`] back into [`Instruction`]s,
+/// also returning the byte offset of each instruction and a trailing end-of-stream
+/// offset.
+///
+/// The returned `byte_offsets` vector has length `instructions.len() + 1`:
+/// - `byte_offsets[i]` is the byte offset (from the start of `bytes`) of
+///   instruction `i` (including any preceding [`Opcode::Wide`] /
+///   [`Opcode::ExtraWide`] prefix).
+/// - `byte_offsets[n]` (where `n = instructions.len()`) equals `bytes.len()`.
+///
+/// These offsets are the same as the table produced during jump resolution in
+/// the compiler, so `byte_offsets[i + 1]` gives the end byte of instruction `i`.
+/// Jump handlers use this to convert a [`Operand::JumpOffset`] delta back to
+/// an instruction index.
 ///
 /// Returns an error if the stream is truncated, contains an unknown opcode,
 /// or has any other structural inconsistency.
-pub fn decode(bytes: &[u8]) -> StatorResult<Vec<Instruction>> {
+pub fn decode_with_byte_offsets(bytes: &[u8]) -> StatorResult<(Vec<Instruction>, Vec<usize>)> {
     let mut instructions = Vec::new();
+    let mut byte_offsets = Vec::new();
     let mut pos = 0usize;
 
     while pos < bytes.len() {
+        let instr_start = pos;
+
         // Check for a width prefix.
         let width = match Opcode::try_from_u8(bytes[pos])? {
             Opcode::Wide => {
@@ -1004,10 +1020,20 @@ pub fn decode(bytes: &[u8]) -> StatorResult<Vec<Instruction>> {
         for &op_type in op_types {
             operands.push(read_operand(bytes, &mut pos, op_type, width)?);
         }
+        byte_offsets.push(instr_start);
         instructions.push(Instruction::new_unchecked(opcode, operands));
     }
 
-    Ok(instructions)
+    byte_offsets.push(pos); // sentinel: total byte length
+    Ok((instructions, byte_offsets))
+}
+
+/// Decode a byte stream produced by [`encode`] back into [`Instruction`]s.
+///
+/// Returns an error if the stream is truncated, contains an unknown opcode,
+/// or has any other structural inconsistency.
+pub fn decode(bytes: &[u8]) -> StatorResult<Vec<Instruction>> {
+    Ok(decode_with_byte_offsets(bytes)?.0)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
