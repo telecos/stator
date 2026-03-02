@@ -8,6 +8,8 @@ pub mod js_function;
 pub mod js_object;
 /// Hidden class ([`map::Map`]) and instance-type tag for heap objects.
 pub mod map;
+/// JavaScript `RegExp` object with ECMAScript flag and built-in method support.
+pub mod regexp;
 /// JavaScript string types with multiple internal representations.
 pub mod string;
 /// Tagged pointer representation for JavaScript values.
