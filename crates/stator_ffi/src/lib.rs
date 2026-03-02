@@ -466,3 +466,223 @@ pub unsafe extern "C" fn stator_heap_capacity(isolate: *const StatorIsolate) -> 
     // to report the total young-space footprint (from-space + to-space).
     unsafe { (*isolate).heap.young_space.capacity() * 2 }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CStr;
+
+    /// Helper: create an isolate and automatically destroy it after the test.
+    struct IsolateGuard(*mut StatorIsolate);
+
+    impl IsolateGuard {
+        fn new() -> Self {
+            Self(stator_isolate_create())
+        }
+
+        fn as_ptr(&self) -> *mut StatorIsolate {
+            self.0
+        }
+    }
+
+    impl Drop for IsolateGuard {
+        fn drop(&mut self) {
+            // SAFETY: pointer was created by `stator_isolate_create` in this guard.
+            unsafe { stator_isolate_destroy(self.0) };
+        }
+    }
+
+    #[test]
+    fn test_isolate_create_returns_nonnull() {
+        let iso = IsolateGuard::new();
+        assert!(!iso.as_ptr().is_null());
+    }
+
+    #[test]
+    fn test_isolate_destroy_null_is_safe() {
+        // SAFETY: passing null is explicitly documented as a no-op.
+        unsafe { stator_isolate_destroy(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_value_new_number_roundtrip() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is non-null and live.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 3.14) };
+        assert!(!val.is_null());
+        // SAFETY: `val` is non-null and live.
+        let n = unsafe { stator_value_as_number(val) };
+        assert!((n - 3.14).abs() < f64::EPSILON);
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_new_string_roundtrip() {
+        let iso = IsolateGuard::new();
+        let s = b"hello\0";
+        // SAFETY: `iso` is valid; `s` pointer is valid for 5 bytes.
+        let val = unsafe { stator_value_new_string(iso.as_ptr(), s.as_ptr() as *const c_char, 5) };
+        assert!(!val.is_null());
+        // SAFETY: `val` is non-null and live.
+        let ptr = unsafe { stator_value_as_string(val) };
+        // SAFETY: returned pointer is valid while `val` is alive.
+        let got = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert_eq!(got, "hello");
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_type_number() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        // SAFETY: `val` is non-null and live.
+        let type_ptr = unsafe { stator_value_type(val) };
+        // SAFETY: returned pointer is static.
+        let type_str = unsafe { CStr::from_ptr(type_ptr) }.to_str().unwrap();
+        assert_eq!(type_str, "number");
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_type_string() {
+        let iso = IsolateGuard::new();
+        let s = b"x\0";
+        // SAFETY: `iso` is valid; `s` pointer is valid for 1 byte.
+        let val = unsafe { stator_value_new_string(iso.as_ptr(), s.as_ptr() as *const c_char, 1) };
+        // SAFETY: `val` is non-null and live.
+        let type_ptr = unsafe { stator_value_type(val) };
+        // SAFETY: returned pointer is static.
+        let type_str = unsafe { CStr::from_ptr(type_ptr) }.to_str().unwrap();
+        assert_eq!(type_str, "string");
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_type_null_returns_undefined() {
+        // SAFETY: null is explicitly documented to return "undefined".
+        let type_ptr = unsafe { stator_value_type(std::ptr::null()) };
+        // SAFETY: returned pointer is static.
+        let type_str = unsafe { CStr::from_ptr(type_ptr) }.to_str().unwrap();
+        assert_eq!(type_str, "undefined");
+    }
+
+    #[test]
+    fn test_value_as_number_on_string_returns_nan() {
+        let iso = IsolateGuard::new();
+        let s = b"hello\0";
+        // SAFETY: `iso` is valid; `s` pointer is valid for 5 bytes.
+        let val = unsafe { stator_value_new_string(iso.as_ptr(), s.as_ptr() as *const c_char, 5) };
+        // SAFETY: `val` is non-null and live.
+        let n = unsafe { stator_value_as_number(val) };
+        assert!(n.is_nan());
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_new_number_null_isolate_returns_null() {
+        // SAFETY: null isolate is documented to return null.
+        let val = unsafe { stator_value_new_number(std::ptr::null_mut(), 1.0) };
+        assert!(val.is_null());
+    }
+
+    #[test]
+    fn test_live_object_count_tracks_values() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 0);
+        // SAFETY: `iso` is valid.
+        let v1 = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        // SAFETY: `iso` is valid.
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 1);
+        // SAFETY: `iso` is valid.
+        let v2 = unsafe { stator_value_new_number(iso.as_ptr(), 2.0) };
+        // SAFETY: `iso` is valid.
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 2);
+        // SAFETY: `v1` is non-null and live.
+        unsafe { stator_value_destroy(v1) };
+        // SAFETY: `iso` is valid.
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 1);
+        // SAFETY: `v2` is non-null and live.
+        unsafe { stator_value_destroy(v2) };
+        // SAFETY: `iso` is valid.
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 0);
+    }
+
+    #[test]
+    fn test_object_set_and_get_number_property() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        assert!(!obj.is_null());
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 42.0) };
+        let key = c"answer";
+        // SAFETY: all pointers are valid.
+        unsafe { stator_object_set(obj, key.as_ptr(), val) };
+        // SAFETY: `obj` and `key` are valid.
+        let got = unsafe { stator_object_get(obj, key.as_ptr()) };
+        assert!(!got.is_null());
+        // SAFETY: `got` is non-null and live.
+        let n = unsafe { stator_value_as_number(got) };
+        assert!((n - 42.0).abs() < f64::EPSILON);
+        // SAFETY: all pointers are non-null and live.
+        unsafe {
+            stator_value_destroy(val);
+            stator_value_destroy(got);
+            stator_object_destroy(obj);
+        }
+    }
+
+    #[test]
+    fn test_object_get_missing_property_returns_null() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let key = c"missing";
+        // SAFETY: `obj` and `key` are valid.
+        let got = unsafe { stator_object_get(obj, key.as_ptr()) };
+        assert!(got.is_null());
+        // SAFETY: `obj` is non-null and live.
+        unsafe { stator_object_destroy(obj) };
+    }
+
+    #[test]
+    fn test_context_create_and_destroy() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_destroy(ctx) };
+    }
+
+    #[test]
+    fn test_context_null_isolate_returns_null() {
+        // SAFETY: null isolate is documented to return null.
+        let ctx = unsafe { stator_context_new(std::ptr::null_mut()) };
+        assert!(ctx.is_null());
+    }
+
+    #[test]
+    fn test_heap_capacity_nonzero() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let cap = unsafe { stator_heap_capacity(iso.as_ptr()) };
+        assert!(cap > 0);
+    }
+
+    #[test]
+    fn test_gc_collect_does_not_crash() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        unsafe { stator_isolate_gc(iso.as_ptr()) };
+        // SAFETY: `iso` is valid.
+        unsafe { stator_gc_collect(iso.as_ptr()) };
+    }
+}
