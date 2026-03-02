@@ -76,6 +76,37 @@
 //! | `JumpIfUndefinedOrNull`   | jump if `acc === null \|\| acc === undefined`          |
 //! | `Return`                  | halt; return `acc`                                    |
 //!
+//! ## Closure creation
+//!
+//! | Opcode                    | Semantics                                              |
+//! |---------------------------|--------------------------------------------------------|
+//! | `CreateClosure(k,_,_)`    | `acc ← Function(constant_pool[k])`                    |
+//!
+//! ## Function calls
+//!
+//! | Opcode                       | Semantics                                           |
+//! |------------------------------|-----------------------------------------------------|
+//! | `CallAnyReceiver(f,a,n,_)`   | `acc ← f(a, a+1, …, a+n−1)` (undefined receiver)  |
+//! | `CallUndefinedReceiver0(f,_)` | `acc ← f()` (zero args)                            |
+//! | `CallUndefinedReceiver1(f,a,_)` | `acc ← f(a)` (one arg)                           |
+//! | `CallUndefinedReceiver2(f,a,b,_)` | `acc ← f(a, b)` (two args)                    |
+//! | `CallProperty(f,recv,n,_)`   | method call; `this` = `recv`, `n` args after `f`   |
+//! | `CallWithSpread(f,a,n,_)`    | same as `CallAnyReceiver` (spread pre-evaluated)   |
+//!
+//! ## Construct
+//!
+//! | Opcode                       | Semantics                                           |
+//! |------------------------------|-----------------------------------------------------|
+//! | `Construct(f,a,n,_)`         | `acc ← new f(a, …, a+n−1)` (P3: returns body acc) |
+//! | `ConstructWithSpread(f,a,n,_)` | same as `Construct`                               |
+//!
+//! ## Context management
+//!
+//! | Opcode                    | Semantics                                              |
+//! |---------------------------|--------------------------------------------------------|
+//! | `PushContext(reg)`        | `reg ← old_ctx; ctx ← acc`                           |
+//! | `PopContext(reg)`         | `ctx ← reg`                                           |
+//!
 //! ## Jump-offset encoding
 //!
 //! Jump offsets are **byte deltas** relative to the byte following the jump
@@ -107,6 +138,8 @@
 //! `Vec<Instruction>` and a parallel byte-offset table.  The main loop fetches
 //! one [`Instruction`] per iteration, advances the program counter, then
 //! dispatches on the [`Opcode`] via an exhaustive `match`.
+
+use std::rc::Rc;
 
 use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
 use crate::bytecode::bytecodes::{Opcode, Operand, decode_with_byte_offsets};
@@ -539,6 +572,246 @@ impl Interpreter {
                     return Ok(frame.accumulator.clone());
                 }
 
+                // ── Closure creation ───────────────────────────────────────
+                // CreateClosure [func_idx, slot, flags]: load a BytecodeArray
+                // from the constant pool and wrap it as a callable function
+                // value.  The slot and flags operands are feedback-vector
+                // metadata and are ignored at runtime.
+                Opcode::CreateClosure => {
+                    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("CreateClosure", 0));
+                    };
+                    let entry = frame.bytecode_array.get_constant(idx).ok_or_else(|| {
+                        StatorError::Internal(format!(
+                            "CreateClosure: constant pool index {idx} out of bounds"
+                        ))
+                    })?;
+                    let ConstantPoolEntry::Function(ba) = entry else {
+                        return Err(StatorError::Internal(
+                            "CreateClosure: constant pool entry is not a Function".into(),
+                        ));
+                    };
+                    frame.accumulator = JsValue::Function(Rc::new((**ba).clone()));
+                }
+
+                // ── Function calls ─────────────────────────────────────────
+                //
+                // Convention for all Call* opcodes:
+                //   – The callee register holds a JsValue::Function.
+                //   – Arguments are collected from consecutive registers and
+                //     passed into a fresh InterpreterFrame.
+                //   – The result of the recursive Interpreter::run call is
+                //     placed in the accumulator.
+                //
+                // CallAnyReceiver [callable, args_start, args_count, slot]:
+                //   Plain call with undefined receiver.  args_start is the
+                //   first argument register; arguments occupy the next
+                //   args_count consecutive registers.
+                Opcode::CallAnyReceiver => {
+                    let Operand::Register(callee_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("CallAnyReceiver", 0));
+                    };
+                    let Operand::Register(args_start_v) = instr.operands[1] else {
+                        return Err(err_bad_operand("CallAnyReceiver", 1));
+                    };
+                    let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+                        return Err(err_bad_operand("CallAnyReceiver", 2));
+                    };
+                    let callee = frame.read_reg(callee_v)?.clone();
+                    let JsValue::Function(ba) = callee else {
+                        return Err(StatorError::TypeError(format!(
+                            "CallAnyReceiver: callee is not a function (got {callee:?})"
+                        )));
+                    };
+                    let args = collect_args(frame, args_start_v, arg_count)?;
+                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
+                    frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                }
+
+                // CallUndefinedReceiver0 [callable, slot]:
+                //   Call with undefined receiver and zero arguments.
+                Opcode::CallUndefinedReceiver0 => {
+                    let Operand::Register(callee_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("CallUndefinedReceiver0", 0));
+                    };
+                    let callee = frame.read_reg(callee_v)?.clone();
+                    let JsValue::Function(ba) = callee else {
+                        return Err(StatorError::TypeError(format!(
+                            "CallUndefinedReceiver0: callee is not a function (got {callee:?})"
+                        )));
+                    };
+                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), vec![]);
+                    frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                }
+
+                // CallUndefinedReceiver1 [callable, arg1, slot]:
+                //   Call with undefined receiver and one argument.
+                Opcode::CallUndefinedReceiver1 => {
+                    let Operand::Register(callee_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("CallUndefinedReceiver1", 0));
+                    };
+                    let Operand::Register(arg1_v) = instr.operands[1] else {
+                        return Err(err_bad_operand("CallUndefinedReceiver1", 1));
+                    };
+                    let callee = frame.read_reg(callee_v)?.clone();
+                    let JsValue::Function(ba) = callee else {
+                        return Err(StatorError::TypeError(format!(
+                            "CallUndefinedReceiver1: callee is not a function (got {callee:?})"
+                        )));
+                    };
+                    let arg1 = frame.read_reg(arg1_v)?.clone();
+                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), vec![arg1]);
+                    frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                }
+
+                // CallUndefinedReceiver2 [callable, arg1, arg2, slot]:
+                //   Call with undefined receiver and two arguments.
+                Opcode::CallUndefinedReceiver2 => {
+                    let Operand::Register(callee_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("CallUndefinedReceiver2", 0));
+                    };
+                    let Operand::Register(arg1_v) = instr.operands[1] else {
+                        return Err(err_bad_operand("CallUndefinedReceiver2", 1));
+                    };
+                    let Operand::Register(arg2_v) = instr.operands[2] else {
+                        return Err(err_bad_operand("CallUndefinedReceiver2", 2));
+                    };
+                    let callee = frame.read_reg(callee_v)?.clone();
+                    let JsValue::Function(ba) = callee else {
+                        return Err(StatorError::TypeError(format!(
+                            "CallUndefinedReceiver2: callee is not a function (got {callee:?})"
+                        )));
+                    };
+                    let arg1 = frame.read_reg(arg1_v)?.clone();
+                    let arg2 = frame.read_reg(arg2_v)?.clone();
+                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), vec![arg1, arg2]);
+                    frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                }
+
+                // CallProperty [callable, recv, args_count, slot]:
+                //   Method call.  The receiver ("this") is in the register
+                //   immediately before the callee register in the register
+                //   file.  Arguments occupy the args_count consecutive
+                //   registers starting one past the callee register.
+                //   The receiver is stored in the callee frame's context so
+                //   that the callee can read it if needed.
+                Opcode::CallProperty => {
+                    let Operand::Register(callee_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("CallProperty", 0));
+                    };
+                    let Operand::Register(recv_v) = instr.operands[1] else {
+                        return Err(err_bad_operand("CallProperty", 1));
+                    };
+                    let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+                        return Err(err_bad_operand("CallProperty", 2));
+                    };
+                    let callee = frame.read_reg(callee_v)?.clone();
+                    let JsValue::Function(ba) = callee else {
+                        return Err(StatorError::TypeError(format!(
+                            "CallProperty: callee is not a function (got {callee:?})"
+                        )));
+                    };
+                    let this_val = frame.read_reg(recv_v)?.clone();
+                    // Arguments reside in the registers immediately following
+                    // the callee register in the flat register file.
+                    let callee_flat = frame.reg_index(callee_v)?;
+                    let args = (0..arg_count as usize)
+                        .map(|i| frame.registers[callee_flat + 1 + i].clone())
+                        .collect::<Vec<_>>();
+                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
+                    callee_frame.context = Some(this_val);
+                    frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                }
+
+                // CallWithSpread [callable, args_start, args_count, slot]:
+                //   Call with a spread argument.  For the interpreter's
+                //   purposes we treat this identically to CallAnyReceiver;
+                //   the spread expansion has already been resolved by the
+                //   compiler into the argument registers.
+                Opcode::CallWithSpread => {
+                    let Operand::Register(callee_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("CallWithSpread", 0));
+                    };
+                    let Operand::Register(args_start_v) = instr.operands[1] else {
+                        return Err(err_bad_operand("CallWithSpread", 1));
+                    };
+                    let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+                        return Err(err_bad_operand("CallWithSpread", 2));
+                    };
+                    let callee = frame.read_reg(callee_v)?.clone();
+                    let JsValue::Function(ba) = callee else {
+                        return Err(StatorError::TypeError(format!(
+                            "CallWithSpread: callee is not a function (got {callee:?})"
+                        )));
+                    };
+                    let args = collect_args(frame, args_start_v, arg_count)?;
+                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
+                    frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                }
+
+                // ── Construct ──────────────────────────────────────────────
+                //
+                // Construct [constructor, args_start, args_count, slot]:
+                //   `new constructor(args…)`.  For the P3 interpreter we
+                //   execute the constructor bytecode and return whatever
+                //   value it produces (full object construction with prototype
+                //   wiring is deferred to a later phase).
+                Opcode::Construct | Opcode::ConstructWithSpread => {
+                    let Operand::Register(ctor_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("Construct", 0));
+                    };
+                    let Operand::Register(args_start_v) = instr.operands[1] else {
+                        return Err(err_bad_operand("Construct", 1));
+                    };
+                    let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+                        return Err(err_bad_operand("Construct", 2));
+                    };
+                    let ctor = frame.read_reg(ctor_v)?.clone();
+                    let JsValue::Function(ba) = ctor else {
+                        return Err(StatorError::TypeError(format!(
+                            "Construct: constructor is not a function (got {ctor:?})"
+                        )));
+                    };
+                    let args = collect_args(frame, args_start_v, arg_count)?;
+                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
+                    frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                }
+
+                // ── Context management ─────────────────────────────────────
+                //
+                // PushContext [reg]: the accumulator holds the new context
+                //   value; the old context is saved into `reg` so it can be
+                //   restored later by PopContext.
+                //
+                //   Registers hold `JsValue`, not `Option<JsValue>`, so an
+                //   absent context is encoded as `JsValue::Undefined` in the
+                //   saved register.  PopContext inverts this by mapping
+                //   `Undefined` back to `None`.
+                Opcode::PushContext => {
+                    let Operand::Register(v) = instr.operands[0] else {
+                        return Err(err_bad_operand("PushContext", 0));
+                    };
+                    // Encode None as Undefined so it can be stored in a register.
+                    let old_ctx = frame.context.take().unwrap_or(JsValue::Undefined);
+                    frame.write_reg(v, old_ctx)?;
+                    frame.context = Some(frame.accumulator.clone());
+                }
+
+                // PopContext [reg]: restore the context that was previously
+                //   saved in `reg` by PushContext.
+                //   `Undefined` in the register means there was no context.
+                Opcode::PopContext => {
+                    let Operand::Register(v) = instr.operands[0] else {
+                        return Err(err_bad_operand("PopContext", 0));
+                    };
+                    let saved = frame.read_reg(v)?.clone();
+                    frame.context = if saved.is_undefined() {
+                        None
+                    } else {
+                        Some(saved)
+                    };
+                }
+
                 // ── Ignored no-ops ─────────────────────────────────────────
                 // These opcodes carry metadata that does not affect execution.
                 Opcode::StackCheck
@@ -559,6 +832,30 @@ impl Interpreter {
 // ─────────────────────────────────────────────────────────────────────────────
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Collect `count` consecutive argument values from `frame` starting at the
+/// flat register index corresponding to the encoded `args_start_v` operand.
+///
+/// Used by the `CallAnyReceiver`, `CallWithSpread`, and `Construct` handlers.
+fn collect_args(
+    frame: &InterpreterFrame,
+    args_start_v: u32,
+    count: u32,
+) -> StatorResult<Vec<JsValue>> {
+    if count == 0 {
+        return Ok(vec![]);
+    }
+    let start_flat = frame.reg_index(args_start_v)?;
+    let end_flat = start_flat + count as usize;
+    if end_flat > frame.registers.len() {
+        return Err(StatorError::Internal(format!(
+            "collect_args: register range {start_flat}..{end_flat} out of bounds \
+             (registers.len={})",
+            frame.registers.len()
+        )));
+    }
+    Ok(frame.registers[start_flat..end_flat].to_vec())
+}
 
 /// Resolve a [`Operand::JumpOffset`] delta to an instruction index.
 ///
@@ -594,8 +891,7 @@ fn constant_to_value(entry: &ConstantPoolEntry) -> JsValue {
         ConstantPoolEntry::Boolean(b) => JsValue::Boolean(*b),
         ConstantPoolEntry::Null => JsValue::Null,
         ConstantPoolEntry::Undefined => JsValue::Undefined,
-        // Closures/functions are not executable as plain values here.
-        ConstantPoolEntry::Function(_) => JsValue::Undefined,
+        ConstantPoolEntry::Function(ba) => JsValue::Function(Rc::new((**ba).clone())),
     }
 }
 
@@ -1641,5 +1937,337 @@ mod tests {
 
         let result = compile_and_run(stmts).unwrap();
         assert_eq!(result, JsValue::Smi(5));
+    }
+
+    // ── Function calls and closures (P3) ─────────────────────────────────────
+
+    /// Helper: build a BytecodeArray with an explicit constant pool.
+    fn make_bytecode_with_pool(
+        instrs: Vec<Instruction>,
+        pool: Vec<ConstantPoolEntry>,
+        frame_size: u32,
+        param_count: u32,
+    ) -> BytecodeArray {
+        BytecodeArray::new(
+            encode(&instrs),
+            pool,
+            frame_size,
+            param_count,
+            vec![],
+            FeedbackMetadata::empty(),
+        )
+    }
+
+    /// Low-level test: manually build an `add(a, b)` function, create a
+    /// closure with `CreateClosure`, and invoke it with `CallAnyReceiver`.
+    ///
+    /// Simulates: `function add(a, b) { return a + b; } ; return add(3, 4);`
+    #[test]
+    fn test_create_closure_and_call_any_receiver() {
+        // ── Inner function: add(a, b) { return a + b; } ─────────────────────
+        //
+        // param[0] = a → encoded register (-1i32 as u32)
+        // param[1] = b → encoded register (-2i32 as u32)
+        // r0 = local register used as RHS of Add.
+        let param0_v: u32 = (-1i32) as u32;
+        let param1_v: u32 = (-2i32) as u32;
+
+        let inner_instrs = vec![
+            // acc = b (param[1])
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(param1_v)]),
+            // r0 = b
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            // acc = a (param[0])
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(param0_v)]),
+            // acc = a + r0 (= a + b)
+            Instruction::new_unchecked(
+                Opcode::Add,
+                vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let inner_ba = make_bytecode(inner_instrs, 1, 2); // frame_size=1, param_count=2
+
+        // ── Outer script ────────────────────────────────────────────────────
+        //
+        // constant pool: [Function(inner_ba)]
+        // r0 = closure, r1 = arg0 (3), r2 = arg1 (4)
+        let outer_instrs = vec![
+            // acc = JsValue::Function(inner_ba)
+            Instruction::new_unchecked(
+                Opcode::CreateClosure,
+                vec![
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                    Operand::Flag(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            // arg0 = 3
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(3)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            // arg1 = 4
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(4)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
+            // acc = add(3, 4)
+            Instruction::new_unchecked(
+                Opcode::CallAnyReceiver,
+                vec![
+                    Operand::Register(0),      // callee = r0
+                    Operand::Register(1),      // args_start = r1
+                    Operand::RegisterCount(2), // arg_count = 2
+                    Operand::FeedbackSlot(1),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let pool = vec![ConstantPoolEntry::Function(Box::new(inner_ba))];
+        let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
+        let mut frame = InterpreterFrame::new(outer_ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    /// End-to-end: compile `function add(a, b) { return a + b; }; return add(3, 4);`
+    /// using the bytecode generator and execute it.
+    #[test]
+    fn test_e2e_function_call_two_args() {
+        use crate::parser::ast::{BinaryOp, BlockStmt, CallExpr, Expr, FnDecl, Param, Pat, Stmt};
+
+        // function add(a, b) { return a + b; }
+        let fn_decl = Stmt::FnDecl(Box::new(FnDecl {
+            loc: span(),
+            id: Some(crate::parser::ast::Ident {
+                loc: span(),
+                name: "add".to_owned(),
+            }),
+            is_async: false,
+            is_generator: false,
+            params: vec![
+                Param {
+                    loc: span(),
+                    pat: Pat::Ident(crate::parser::ast::Ident {
+                        loc: span(),
+                        name: "a".to_owned(),
+                    }),
+                    default: None,
+                },
+                Param {
+                    loc: span(),
+                    pat: Pat::Ident(crate::parser::ast::Ident {
+                        loc: span(),
+                        name: "b".to_owned(),
+                    }),
+                    default: None,
+                },
+            ],
+            body: BlockStmt {
+                loc: span(),
+                body: vec![return_stmt(Some(binary(
+                    BinaryOp::Add,
+                    ident_expr("a"),
+                    ident_expr("b"),
+                )))],
+            },
+        }));
+
+        // return add(3, 4);
+        let call_stmt = return_stmt(Some(Expr::Call(Box::new(CallExpr {
+            loc: span(),
+            callee: Box::new(ident_expr("add")),
+            arguments: vec![num_expr(3.0), num_expr(4.0)],
+        }))));
+
+        let result = compile_and_run(vec![fn_decl, call_stmt]).unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    /// End-to-end: call a zero-argument function.
+    ///
+    /// `function f() { return 42; }; return f();`
+    #[test]
+    fn test_e2e_function_call_no_args() {
+        use crate::parser::ast::{BlockStmt, CallExpr, Expr, FnDecl, Stmt};
+
+        let fn_decl = Stmt::FnDecl(Box::new(FnDecl {
+            loc: span(),
+            id: Some(crate::parser::ast::Ident {
+                loc: span(),
+                name: "f".to_owned(),
+            }),
+            is_async: false,
+            is_generator: false,
+            params: vec![],
+            body: BlockStmt {
+                loc: span(),
+                body: vec![return_stmt(Some(num_expr(42.0)))],
+            },
+        }));
+
+        let call_stmt = return_stmt(Some(Expr::Call(Box::new(CallExpr {
+            loc: span(),
+            callee: Box::new(ident_expr("f")),
+            arguments: vec![],
+        }))));
+
+        let result = compile_and_run(vec![fn_decl, call_stmt]).unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// End-to-end: function that uses a single parameter in a multiply.
+    ///
+    /// `function double(n) { return n * 2; }; return double(21);`
+    #[test]
+    fn test_e2e_function_call_one_arg() {
+        use crate::parser::ast::{BinaryOp, BlockStmt, CallExpr, Expr, FnDecl, Param, Pat, Stmt};
+
+        let fn_decl = Stmt::FnDecl(Box::new(FnDecl {
+            loc: span(),
+            id: Some(crate::parser::ast::Ident {
+                loc: span(),
+                name: "double".to_owned(),
+            }),
+            is_async: false,
+            is_generator: false,
+            params: vec![Param {
+                loc: span(),
+                pat: Pat::Ident(crate::parser::ast::Ident {
+                    loc: span(),
+                    name: "n".to_owned(),
+                }),
+                default: None,
+            }],
+            body: BlockStmt {
+                loc: span(),
+                body: vec![return_stmt(Some(binary(
+                    BinaryOp::Mul,
+                    ident_expr("n"),
+                    num_expr(2.0),
+                )))],
+            },
+        }));
+
+        let call_stmt = return_stmt(Some(Expr::Call(Box::new(CallExpr {
+            loc: span(),
+            callee: Box::new(ident_expr("double")),
+            arguments: vec![num_expr(21.0)],
+        }))));
+
+        let result = compile_and_run(vec![fn_decl, call_stmt]).unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// End-to-end: `new` constructor call.
+    ///
+    /// `function Box(v) { return v + 1; }; return new Box(41);`
+    ///
+    /// The P3 interpreter executes the constructor body and returns whatever
+    /// it produces (full prototype-chain wiring is deferred).
+    #[test]
+    fn test_e2e_construct_returns_constructor_value() {
+        use crate::parser::ast::{BinaryOp, BlockStmt, Expr, FnDecl, NewExpr, Param, Pat, Stmt};
+
+        let fn_decl = Stmt::FnDecl(Box::new(FnDecl {
+            loc: span(),
+            id: Some(crate::parser::ast::Ident {
+                loc: span(),
+                name: "Box".to_owned(),
+            }),
+            is_async: false,
+            is_generator: false,
+            params: vec![Param {
+                loc: span(),
+                pat: Pat::Ident(crate::parser::ast::Ident {
+                    loc: span(),
+                    name: "v".to_owned(),
+                }),
+                default: None,
+            }],
+            body: BlockStmt {
+                loc: span(),
+                body: vec![return_stmt(Some(binary(
+                    BinaryOp::Add,
+                    ident_expr("v"),
+                    num_expr(1.0),
+                )))],
+            },
+        }));
+
+        let new_stmt = return_stmt(Some(Expr::New(Box::new(NewExpr {
+            loc: span(),
+            callee: Box::new(ident_expr("Box")),
+            arguments: vec![num_expr(41.0)],
+        }))));
+
+        let result = compile_and_run(vec![fn_decl, new_stmt]).unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Low-level test: `PushContext` saves the old context into a register
+    /// and installs the accumulator as the new context; `PopContext` restores.
+    #[test]
+    fn test_push_pop_context() {
+        // Bytecode:
+        //   LdaSmi 99      ; acc = 99 (will become new context)
+        //   PushContext r0 ; r0 = old ctx (undefined), frame.context = Some(Smi(99))
+        //   LdaSmi 7       ; acc = 7 (some work inside the context)
+        //   PopContext r0  ; frame.context = None (restored from r0=undefined)
+        //   Return         ; return 7
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(Opcode::PushContext, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(7)]),
+            Instruction::new_unchecked(Opcode::PopContext, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let result = run_bytecode(instrs, 1).unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    /// `JsValue::Function` should be truthy, non-callable via `to_number`,
+    /// and stringify to `"function () {}"`.
+    #[test]
+    fn test_js_value_function_properties() {
+        use crate::bytecode::bytecode_array::BytecodeArray;
+        use crate::bytecode::bytecodes::encode;
+        use std::rc::Rc;
+
+        let ba = BytecodeArray::new(
+            encode(&[Instruction::new_unchecked(Opcode::Return, vec![])]),
+            vec![],
+            0,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+        );
+        let f = JsValue::Function(Rc::new(ba));
+
+        assert!(f.to_boolean());
+        assert!(f.is_function());
+        assert!(f.to_number().is_err());
+        assert_eq!(f.to_js_string().unwrap(), "function () {}");
+    }
+
+    /// Calling a non-function value with `CallAnyReceiver` should produce a
+    /// `TypeError`.
+    #[test]
+    fn test_call_non_function_is_type_error() {
+        // r0 = 42 (a Smi, not a function); then CallAnyReceiver r0, r0, 0, slot
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::CallAnyReceiver,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(0),
+                    Operand::RegisterCount(0),
+                    Operand::FeedbackSlot(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let err = run_bytecode(instrs, 1).unwrap_err();
+        assert!(matches!(err, StatorError::TypeError(_)));
     }
 }
