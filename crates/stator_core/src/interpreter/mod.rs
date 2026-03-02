@@ -114,6 +114,24 @@
 //! | `Throw`     | throw `acc`; walk handler table, jump to handler or propagate up  |
 //! | `ReThrow`   | re-throw `acc`; same dispatch logic as `Throw`                    |
 //!
+//! ## Generators / Async
+//!
+//! | Opcode                       | Semantics                                                   |
+//! |------------------------------|-------------------------------------------------------------|
+//! | `SuspendGenerator(…)`        | yield `acc`; save registers + PC; exit loop via `suspend_result` |
+//! | `ResumeGenerator(…)`         | restore registers from `GeneratorState`; acc = sent value   |
+//! | `GetGeneratorState(gen)`     | `acc ← generator.status` as Smi (−2/−1/0/1)                |
+//! | `SetGeneratorState(gen)`     | `generator.status ← acc` (Smi)                              |
+//! | `SwitchOnGeneratorState(gen)`| jump to `resume_pc` if generator was previously suspended   |
+//!
+//! Generator execution is driven by [`Interpreter::run_generator_step`], which
+//! attaches a [`GeneratorState`] to the frame and interprets the body until a
+//! `SuspendGenerator` or `Return` instruction is reached.
+//!
+//! Async functions desugar to generators: each `await` compiles to a `yield`,
+//! and the caller of `run_generator_step` plays the role of the microtask
+//! queue, resolving awaited values by passing them as the `input` argument.
+//!
 //! ## Jump-offset encoding
 //!
 //! Jump offsets are **byte deltas** relative to the byte following the jump
@@ -146,12 +164,105 @@
 //! one [`Instruction`] per iteration, advances the program counter, then
 //! dispatches on the [`Opcode`] via an exhaustive `match`.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry, HandlerTableEntry};
 use crate::bytecode::bytecodes::{Opcode, Operand, decode_with_byte_offsets};
 use crate::error::{StatorError, StatorResult};
 use crate::objects::value::JsValue;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GeneratorStatus / GeneratorState / GeneratorStep
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Lifecycle status of a JavaScript generator object.
+///
+/// Maps to V8's `JSGeneratorObject::ResumeMode` / `GeneratorState` integers:
+/// `Executing` = −2, `Completed` = −1, `SuspendedAtStart` = 0,
+/// `SuspendedAtYield` = 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratorStatus {
+    /// The generator function has not yet been advanced by `.next()`.
+    SuspendedAtStart,
+    /// The generator is paused at a `yield` expression.
+    SuspendedAtYield,
+    /// The generator is currently executing (re-entrancy is invalid).
+    Executing,
+    /// The generator function returned; iteration is complete.
+    Completed,
+}
+
+impl GeneratorStatus {
+    /// Integer encoding compatible with V8's `GetGeneratorState` / `SetGeneratorState`.
+    fn to_smi(self) -> i32 {
+        match self {
+            Self::Executing => -2,
+            Self::Completed => -1,
+            Self::SuspendedAtStart => 0,
+            Self::SuspendedAtYield => 1,
+        }
+    }
+
+    /// Decode from the integer produced by [`Self::to_smi`].
+    ///
+    /// Any value that does not map to a known status is treated as
+    /// `SuspendedAtYield`.
+    fn from_smi(n: i32) -> Self {
+        match n {
+            -2 => Self::Executing,
+            -1 => Self::Completed,
+            0 => Self::SuspendedAtStart,
+            _ => Self::SuspendedAtYield,
+        }
+    }
+}
+
+/// The saved execution state of a suspended JavaScript generator.
+///
+/// Holds all data needed to resume execution of a generator function after it
+/// has been suspended at a `yield` expression or before the first `.next()`
+/// call.
+///
+/// Use [`GeneratorState::new`] to create a fresh generator, then drive it
+/// with [`Interpreter::run_generator_step`].
+#[derive(Debug, Clone)]
+pub struct GeneratorState {
+    /// Bytecode for the generator function body.
+    pub bytecode_array: BytecodeArray,
+    /// Saved register file at the point of suspension (empty before the
+    /// first [`Opcode::SuspendGenerator`]).
+    pub registers: Vec<JsValue>,
+    /// Instruction index to resume from; `0` = start of function body.
+    pub resume_pc: usize,
+    /// Current lifecycle status.
+    pub status: GeneratorStatus,
+}
+
+impl GeneratorState {
+    /// Create a new generator ready to execute `bytecode_array` from the
+    /// beginning on the first call to [`Interpreter::run_generator_step`].
+    pub fn new(bytecode_array: BytecodeArray) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self {
+            bytecode_array,
+            registers: Vec::new(),
+            resume_pc: 0,
+            status: GeneratorStatus::SuspendedAtStart,
+        }))
+    }
+}
+
+/// The result of running one step of a generator via
+/// [`Interpreter::run_generator_step`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum GeneratorStep {
+    /// The generator suspended at a `yield` expression; the contained value
+    /// is the yielded result.  The generator may be resumed.
+    Yield(JsValue),
+    /// The generator's function body returned; the contained value is the
+    /// final return value.  The generator is now exhausted.
+    Return(JsValue),
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // InterpreterFrame
@@ -179,6 +290,12 @@ pub struct InterpreterFrame {
     pub pc: usize,
     /// Scope context for variable lookup (placeholder for future closure support).
     pub context: Option<JsValue>,
+    /// Set by [`Opcode::SuspendGenerator`] to carry the yielded value back to
+    /// [`Interpreter::run_generator_step`].  `None` during normal execution.
+    pub suspend_result: Option<JsValue>,
+    /// The generator state object attached to this frame, if it is executing
+    /// a generator function body.  `None` for ordinary (non-generator) frames.
+    pub generator_state: Option<Rc<RefCell<GeneratorState>>>,
 }
 
 impl InterpreterFrame {
@@ -202,6 +319,8 @@ impl InterpreterFrame {
             accumulator: JsValue::Undefined,
             pc: 0,
             context: None,
+            suspend_result: None,
+            generator_state: None,
         }
     }
 
@@ -854,6 +973,97 @@ impl Interpreter {
                 | Opcode::SetExpressionPosition
                 | Opcode::SetExpressionPositionFromEnd => {}
 
+                // ── Generators / Async ─────────────────────────────────────
+                //
+                // SuspendGenerator [gen, regs_start, regs_count, suspend_id]:
+                //   Yield a value from a generator function.
+                //
+                //   The yield value is whatever is currently in the accumulator.
+                //   When a generator_state is attached to the frame, the full
+                //   register file is saved back into it and the resume PC is
+                //   recorded so execution can continue from after this instruction
+                //   on the next call to `run_generator_step`.  The yielded value is
+                //   signalled to `run_generator_step` via `frame.suspend_result`,
+                //   then the interpreter loop exits early.
+                Opcode::SuspendGenerator => {
+                    let yield_val = frame.accumulator.clone();
+
+                    // Save state into the attached GeneratorState (if any).
+                    if let Some(gs_rc) = frame.generator_state.as_ref() {
+                        let mut gs = gs_rc.borrow_mut();
+                        // Save the full register file so that ResumeGenerator
+                        // can restore it on the next step.
+                        gs.registers.clone_from(&frame.registers);
+                        // frame.pc was already advanced past this instruction.
+                        gs.resume_pc = frame.pc;
+                        gs.status = GeneratorStatus::SuspendedAtYield;
+                    }
+
+                    frame.suspend_result = Some(yield_val.clone());
+                    return Ok(yield_val);
+                }
+
+                // ResumeGenerator [gen, regs_start, regs_count]:
+                //   Restore the register file from the generator state saved by a
+                //   prior SuspendGenerator.  The accumulator is left untouched: it
+                //   already holds the value sent by the caller of `.next(value)`.
+                Opcode::ResumeGenerator => {
+                    if let Some(gs_rc) = frame.generator_state.as_ref() {
+                        let mut gs = gs_rc.borrow_mut();
+                        // Restore the saved registers into the frame.
+                        // The saved register file has the same length as the frame
+                        // (set by SuspendGenerator from frame.registers.clone()), so
+                        // the min() only protects against a fresh generator where
+                        // gs.registers is empty (resume_pc == 0).
+                        let count = gs.registers.len().min(frame.registers.len());
+                        frame.registers[..count].clone_from_slice(&gs.registers[..count]);
+                        gs.status = GeneratorStatus::Executing;
+                    }
+                    // Accumulator keeps the resume value supplied by run_generator_step.
+                }
+
+                // GetGeneratorState [gen]:
+                //   Load the generator's lifecycle state as a Smi into the
+                //   accumulator.  Encoding: Executing=−2, Completed=−1,
+                //   SuspendedAtStart=0, SuspendedAtYield=1.
+                Opcode::GetGeneratorState => {
+                    frame.accumulator = if let Some(gs_rc) = frame.generator_state.as_ref() {
+                        JsValue::Smi(gs_rc.borrow().status.to_smi())
+                    } else {
+                        JsValue::Smi(GeneratorStatus::Completed.to_smi())
+                    };
+                }
+
+                // SetGeneratorState [gen]:
+                //   Write the Smi in the accumulator back to the generator's state.
+                Opcode::SetGeneratorState => {
+                    if let Some(gs_rc) = frame.generator_state.as_ref()
+                        && let JsValue::Smi(n) = frame.accumulator
+                    {
+                        gs_rc.borrow_mut().status = GeneratorStatus::from_smi(n);
+                    }
+                }
+
+                // SwitchOnGeneratorState [gen]:
+                //   At the beginning of a generator function, dispatch execution to
+                //   the saved resume point when the generator has been previously
+                //   suspended.  If the generator is fresh (resume_pc == 0), fall
+                //   through to the next instruction (start of the function body).
+                //
+                //   Note: when called via `run_generator_step`, the frame's PC is
+                //   already set to `resume_pc`, so this instruction only fires on
+                //   the first call (when resume_pc == 0) and falls through.  It
+                //   becomes useful when the generator bytecode is always entered
+                //   from PC 0 (the V8 pattern).
+                Opcode::SwitchOnGeneratorState => {
+                    if let Some(gs_rc) = frame.generator_state.as_ref() {
+                        let resume_pc = gs_rc.borrow().resume_pc;
+                        if resume_pc > 0 {
+                            frame.pc = resume_pc;
+                        }
+                    }
+                }
+
                 // ── Unimplemented ──────────────────────────────────────────
                 other => {
                     return Err(StatorError::Internal(format!(
@@ -861,6 +1071,72 @@ impl Interpreter {
                     )));
                 }
             }
+        }
+    }
+
+    /// Execute one step of a generator function.
+    ///
+    /// Restores the execution state from `state`, initialises the accumulator to
+    /// `input` (the value passed to `.next()`), and runs the interpreter loop
+    /// until the generator suspends at a `yield` expression or its function
+    /// body returns.
+    ///
+    /// # Return value
+    ///
+    /// - [`GeneratorStep::Yield`] — a `SuspendGenerator` instruction was
+    ///   reached; the generator state is updated and can be resumed with
+    ///   another call.
+    /// - [`GeneratorStep::Return`] — a `Return` instruction was reached; the
+    ///   generator is marked [`GeneratorStatus::Completed`].
+    ///
+    /// Calling this method on an already-completed generator immediately
+    /// returns `Ok(GeneratorStep::Return(JsValue::Undefined))`.
+    pub fn run_generator_step(
+        state: &Rc<RefCell<GeneratorState>>,
+        input: JsValue,
+    ) -> StatorResult<GeneratorStep> {
+        // Short-circuit for exhausted generators.
+        if state.borrow().status == GeneratorStatus::Completed {
+            return Ok(GeneratorStep::Return(JsValue::Undefined));
+        }
+
+        let (bytecode_array, saved_registers, resume_pc) = {
+            let gs = state.borrow();
+            (
+                gs.bytecode_array.clone(),
+                gs.registers.clone(),
+                gs.resume_pc,
+            )
+        };
+
+        let param_count = bytecode_array.parameter_count() as usize;
+        let frame_size = bytecode_array.frame_size() as usize;
+        let total = param_count + frame_size;
+
+        // Restore the saved register file, padding with Undefined if this is
+        // the first step (saved_registers is empty).
+        let mut registers = saved_registers;
+        registers.resize(total, JsValue::Undefined);
+
+        let mut frame = InterpreterFrame {
+            bytecode_array,
+            registers,
+            accumulator: input,
+            pc: resume_pc,
+            context: None,
+            suspend_result: None,
+            generator_state: Some(Rc::clone(state)),
+        };
+
+        state.borrow_mut().status = GeneratorStatus::Executing;
+
+        let return_val = Interpreter::run(&mut frame)?;
+
+        if let Some(yield_val) = frame.suspend_result {
+            Ok(GeneratorStep::Yield(yield_val))
+        } else {
+            state.borrow_mut().status = GeneratorStatus::Completed;
+            Ok(GeneratorStep::Return(return_val))
         }
     }
 }
@@ -2564,5 +2840,325 @@ mod tests {
             matches!(err, StatorError::JsException(_)),
             "expected JsException, got {err:?}"
         );
+    }
+
+    // ── Generators (SuspendGenerator / ResumeGenerator) ─────────────────────
+
+    /// Helper: encode `Register(0)` as the generator-register operand.
+    const GEN_REG: Operand = Operand::Register(0);
+
+    /// Build bytecode that simulates `function*(){ yield 1; yield 2; }`.
+    ///
+    /// Register layout: r0 is the generator object register (unused for state
+    /// here since we save 0 registers; the GeneratorState is tracked externally
+    /// by `run_generator_step`).
+    ///
+    /// ```text
+    /// [0] LdaSmi 1
+    /// [1] SuspendGenerator r0 r0 0 0   ← yield 1, resume_pc = 2
+    /// [2] ResumeGenerator  r0 r0 0     ← restore (nop), acc = next's arg
+    /// [3] LdaSmi 2
+    /// [4] SuspendGenerator r0 r0 0 1   ← yield 2, resume_pc = 5
+    /// [5] ResumeGenerator  r0 r0 0
+    /// [6] LdaUndefined
+    /// [7] Return                        ← done
+    /// ```
+    fn gen_bytecode_yield_1_yield_2() -> BytecodeArray {
+        let instrs = vec![
+            // yield 1
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(
+                Opcode::SuspendGenerator,
+                vec![
+                    GEN_REG,
+                    GEN_REG,
+                    Operand::RegisterCount(0),
+                    Operand::Immediate(0),
+                ],
+            ),
+            // resume point 1
+            Instruction::new_unchecked(
+                Opcode::ResumeGenerator,
+                vec![GEN_REG, GEN_REG, Operand::RegisterCount(0)],
+            ),
+            // yield 2
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(2)]),
+            Instruction::new_unchecked(
+                Opcode::SuspendGenerator,
+                vec![
+                    GEN_REG,
+                    GEN_REG,
+                    Operand::RegisterCount(0),
+                    Operand::Immediate(1),
+                ],
+            ),
+            // resume point 2
+            Instruction::new_unchecked(
+                Opcode::ResumeGenerator,
+                vec![GEN_REG, GEN_REG, Operand::RegisterCount(0)],
+            ),
+            Instruction::new_unchecked(Opcode::LdaUndefined, vec![]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        make_bytecode(instrs, 1, 0) // frame_size=1 (r0), no params
+    }
+
+    #[test]
+    fn test_generator_yield_sequence() {
+        // Drives: function*() { yield 1; yield 2; }
+        let ba = gen_bytecode_yield_1_yield_2();
+        let gs = GeneratorState::new(ba);
+
+        // First .next() → yields 1
+        let step1 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
+        assert_eq!(step1, GeneratorStep::Yield(JsValue::Smi(1)));
+        assert_eq!(gs.borrow().status, GeneratorStatus::SuspendedAtYield);
+
+        // Second .next() → yields 2
+        let step2 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 2 ok");
+        assert_eq!(step2, GeneratorStep::Yield(JsValue::Smi(2)));
+        assert_eq!(gs.borrow().status, GeneratorStatus::SuspendedAtYield);
+
+        // Third .next() → done, returns undefined
+        let step3 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 3 ok");
+        assert_eq!(step3, GeneratorStep::Return(JsValue::Undefined));
+        assert_eq!(gs.borrow().status, GeneratorStatus::Completed);
+
+        // Calling step on a completed generator always returns Return(undefined).
+        let step4 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 4 ok");
+        assert_eq!(step4, GeneratorStep::Return(JsValue::Undefined));
+    }
+
+    #[test]
+    fn test_generator_send_value() {
+        // Drives: function*() { const x = yield 10; return x + 1; }
+        //
+        // The value sent on the second .next() becomes the result of the yield
+        // expression (via the accumulator after ResumeGenerator).
+        //
+        // Bytecode:
+        //   [0] LdaSmi 10
+        //   [1] SuspendGenerator r0 r0 0 0   ← yield 10, resume_pc=2
+        //   [2] ResumeGenerator  r0 r0 0      ← acc = sent_value
+        //   [3] Star r1                       ← x = sent_value
+        //   [4] LdaSmi 1
+        //   [5] Star r2                       ← save 1 to r2
+        //   [6] Ldar r1                       ← acc = x
+        //   [7] Add r2 slot0                  ← acc = x + 1
+        //   [8] Return
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(10)]),
+            Instruction::new_unchecked(
+                Opcode::SuspendGenerator,
+                vec![
+                    GEN_REG,
+                    GEN_REG,
+                    Operand::RegisterCount(0),
+                    Operand::Immediate(0),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::ResumeGenerator,
+                vec![GEN_REG, GEN_REG, Operand::RegisterCount(0)],
+            ),
+            // x = sent_value (acc)
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            // acc = x + 1
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(
+                Opcode::Add,
+                vec![Operand::Register(2), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode(instrs, 3, 0); // r0, r1, r2
+        let gs = GeneratorState::new(ba);
+
+        // First .next() → yields 10
+        let step1 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
+        assert_eq!(step1, GeneratorStep::Yield(JsValue::Smi(10)));
+
+        // Second .next(5) → sends 5 as the yield result; function returns 5 + 1 = 6
+        let step2 = Interpreter::run_generator_step(&gs, JsValue::Smi(5)).expect("step 2 ok");
+        assert_eq!(step2, GeneratorStep::Return(JsValue::Smi(6)));
+    }
+
+    // ── Async / Await (desugared to generator) ───────────────────────────────
+
+    /// Test that async/await semantics can be modelled as a generator.
+    ///
+    /// `async function asyncAdd() { const x = await 42; return x + 1; }`
+    ///
+    /// Desugars to a generator where `await` becomes `yield`:
+    /// - `.next()` runs until the first `yield`, producing the awaited value.
+    /// - The event-loop resolves the promise and calls `.next(resolved)`.
+    /// - The generator returns `resolved + 1`.
+    #[test]
+    fn test_async_function_as_generator() {
+        // Bytecode (same shape as test_generator_send_value, different constants):
+        //   yield 42            ← models `await Promise.resolve(42)`
+        //   acc = sent_value    ← models promise resolution
+        //   return acc + 1
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+            Instruction::new_unchecked(
+                Opcode::SuspendGenerator,
+                vec![
+                    GEN_REG,
+                    GEN_REG,
+                    Operand::RegisterCount(0),
+                    Operand::Immediate(0),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::ResumeGenerator,
+                vec![GEN_REG, GEN_REG, Operand::RegisterCount(0)],
+            ),
+            // x = resolved_value (acc after ResumeGenerator)
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            // return x + 1
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(
+                Opcode::Add,
+                vec![Operand::Register(2), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode(instrs, 3, 0);
+        let gs = GeneratorState::new(ba);
+
+        // Model "async call": first .next() runs until the await point.
+        let step1 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
+        // The function awaited 42 (yielded it).
+        assert_eq!(step1, GeneratorStep::Yield(JsValue::Smi(42)));
+
+        // Model "microtask resolution": the promise resolved with 7.
+        let step2 = Interpreter::run_generator_step(&gs, JsValue::Smi(7)).expect("step 2 ok");
+        // async function returned 7 + 1 = 8.
+        assert_eq!(step2, GeneratorStep::Return(JsValue::Smi(8)));
+    }
+
+    // ── GetGeneratorState / SetGeneratorState ────────────────────────────────
+
+    #[test]
+    fn test_get_generator_state_initial() {
+        // GetGeneratorState on a fresh generator returns SuspendedAtStart (0).
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::GetGeneratorState, vec![GEN_REG]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode(instrs, 1, 0);
+        let gs = GeneratorState::new(ba.clone());
+
+        // Attach generator state and run one step (not a generator step — direct frame).
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        frame.generator_state = Some(Rc::clone(&gs));
+        let result = Interpreter::run(&mut frame).unwrap();
+        // SuspendedAtStart = 0
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_set_generator_state_completed() {
+        // SetGeneratorState sets the generator status to whatever integer is in acc.
+        let instrs = vec![
+            // acc = -1 (Completed)
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(-1)]),
+            Instruction::new_unchecked(Opcode::SetGeneratorState, vec![GEN_REG]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode(instrs, 1, 0);
+        let gs = GeneratorState::new(ba.clone());
+
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        frame.generator_state = Some(Rc::clone(&gs));
+        Interpreter::run(&mut frame).unwrap();
+
+        assert_eq!(gs.borrow().status, GeneratorStatus::Completed);
+    }
+
+    // ── SwitchOnGeneratorState ───────────────────────────────────────────────
+
+    #[test]
+    fn test_switch_on_generator_state_fresh_falls_through() {
+        // When the generator has never been suspended (resume_pc == 0),
+        // SwitchOnGeneratorState is a no-op and execution falls through.
+        //
+        // Bytecode:
+        //   [0] SwitchOnGeneratorState r0   ← fresh: no-op, fall through
+        //   [1] LdaSmi 99
+        //   [2] Return                      ← should return 99
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::SwitchOnGeneratorState, vec![GEN_REG]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode(instrs, 1, 0);
+        let gs = GeneratorState::new(ba.clone());
+
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        frame.generator_state = Some(Rc::clone(&gs));
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_switch_on_generator_state_suspended_jumps() {
+        // When the generator was previously suspended, SwitchOnGeneratorState
+        // jumps directly to the saved resume_pc, bypassing any code before it.
+        //
+        // Bytecode:
+        //   [0] SwitchOnGeneratorState r0   ← if resume_pc>0: jump there
+        //   [1] LdaSmi 1                    ← skipped when jumped over
+        //   [2] SuspendGenerator r0 r0 0 0  ← saves resume_pc=3
+        //   [3] ResumeGenerator  r0 r0 0
+        //   [4] LdaSmi 2                    ← runs after jump
+        //   [5] Return
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::SwitchOnGeneratorState, vec![GEN_REG]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(
+                Opcode::SuspendGenerator,
+                vec![
+                    GEN_REG,
+                    GEN_REG,
+                    Operand::RegisterCount(0),
+                    Operand::Immediate(0),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::ResumeGenerator,
+                vec![GEN_REG, GEN_REG, Operand::RegisterCount(0)],
+            ),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(2)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode(instrs, 1, 0);
+        let gs = GeneratorState::new(ba.clone());
+
+        // First step: SwitchOnGeneratorState falls through (resume_pc==0),
+        // runs LdaSmi 1, yields 1, and saves resume_pc=3 (ResumeGenerator).
+        let step1 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
+        assert_eq!(step1, GeneratorStep::Yield(JsValue::Smi(1)));
+        let resume_pc_after_first = gs.borrow().resume_pc;
+        assert_eq!(
+            resume_pc_after_first, 3,
+            "resume_pc should point to ResumeGenerator"
+        );
+
+        // Directly test the SwitchOnGeneratorState jump: run from PC 0
+        // with resume_pc=3 already set in the generator state.  The switch
+        // should jump to instruction 3, bypassing LdaSmi 1 and SuspendGenerator.
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        gs.borrow_mut().status = GeneratorStatus::SuspendedAtYield;
+        frame.generator_state = Some(Rc::clone(&gs));
+        let result = Interpreter::run(&mut frame).unwrap();
+        // SwitchOnGeneratorState jumped to 3 (ResumeGenerator → no-op),
+        // then LdaSmi 2, then Return → 2.
+        assert_eq!(result, JsValue::Smi(2));
     }
 }

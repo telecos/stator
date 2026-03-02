@@ -583,6 +583,9 @@ pub enum Opcode {
     SuspendGenerator,
     /// Write the state of a generator object. `[generator]`
     SetGeneratorState,
+    /// Dispatch to the generator's saved resume point, or fall through if
+    /// the generator has not yet been suspended. `[generator]`
+    SwitchOnGeneratorState,
 
     // ── Encoding prefixes ─────────────────────────────────────────────────
     /// Prefix: all operands in the following instruction use 2-byte (wide) encoding.
@@ -819,6 +822,7 @@ impl Opcode {
             Opcode::GetGeneratorState => &[Register],
             Opcode::SuspendGenerator => &[Register, Register, RegisterCount, Immediate],
             Opcode::SetGeneratorState => &[Register],
+            Opcode::SwitchOnGeneratorState => &[Register],
 
             // Prefixes / trap — no operands of their own
             Opcode::Wide | Opcode::ExtraWide | Opcode::Illegal => &[],
