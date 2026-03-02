@@ -60,6 +60,7 @@
 
 use std::rc::Rc;
 
+use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::bytecode::feedback::{FeedbackVector, InlineCacheState};
 use crate::error::StatorResult;
 use crate::objects::js_object::JsObject;
@@ -372,14 +373,16 @@ impl PropertyStoreIc {
 /// responsible for executing the callee.  Call [`record`](CallIc::record)
 /// before or after each call at the site to keep the IC state current.
 ///
-/// Callee identity is determined by the raw pointer address of the
+/// Callee identity is determined by the raw pointer of the
 /// [`Rc`]-managed [`BytecodeArray`](crate::bytecode::bytecode_array::BytecodeArray):
 /// two `JsValue::Function` values are considered the *same* callee iff they
-/// share the same underlying `Rc` allocation.
+/// share the same underlying `Rc` allocation.  Raw pointers are compared with
+/// [`std::ptr::eq`] rather than casting to `usize`, which keeps the
+/// comparison Miri-safe.
 #[derive(Debug, Default)]
 pub struct CallIc {
-    /// Raw `Rc` pointer addresses of observed callees.
-    callee_ids: Vec<usize>,
+    /// Raw pointers to the `BytecodeArray` backing store of each observed callee.
+    callee_ids: Vec<*const BytecodeArray>,
 }
 
 impl CallIc {
@@ -411,14 +414,14 @@ impl CallIc {
             }
 
             Some(InlineCacheState::Monomorphic) => {
-                if !self.callee_ids.contains(&id) {
+                if !self.callee_ids.iter().any(|&p| std::ptr::eq(p, id)) {
                     self.callee_ids.push(id);
                     feedback.transition(slot, InlineCacheState::Polymorphic);
                 }
             }
 
             Some(InlineCacheState::Polymorphic) => {
-                if !self.callee_ids.contains(&id) {
+                if !self.callee_ids.iter().any(|&p| std::ptr::eq(p, id)) {
                     if self.callee_ids.len() >= POLY_MAX {
                         self.callee_ids.clear();
                         feedback.transition(slot, InlineCacheState::Megamorphic);
@@ -444,14 +447,15 @@ impl CallIc {
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Extract a stable numeric identity for a `JsValue::Function` callee.
+/// Extract a stable pointer identity for a `JsValue::Function` callee.
 ///
-/// Returns the raw pointer of the `Rc<BytecodeArray>` as a `usize` so that
-/// two `Function` values backed by the same `Rc` allocation compare equal.
-/// Returns `None` for any non-`Function` value.
-fn callee_identity(callee: &JsValue) -> Option<usize> {
+/// Returns the raw `*const BytecodeArray` pointer from the underlying `Rc`
+/// so that two `Function` values backed by the same `Rc` allocation compare
+/// equal via [`std::ptr::eq`].  This avoids a pointer-to-integer cast, keeping
+/// the implementation Miri-safe.  Returns `None` for any non-`Function` value.
+fn callee_identity(callee: &JsValue) -> Option<*const BytecodeArray> {
     if let JsValue::Function(rc) = callee {
-        Some(Rc::as_ptr(rc) as usize)
+        Some(Rc::as_ptr(rc))
     } else {
         None
     }
