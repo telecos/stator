@@ -8,3 +8,22 @@
 fn main() {
     println!("st8: Stator JavaScript shell (not yet implemented)");
 }
+
+#[cfg(test)]
+mod tests {
+    use stator_core::parser::scanner::{Scanner, TokenKind};
+
+    #[test]
+    fn test_shell_scanner_tokenises_number_literal() {
+        let mut s = Scanner::new("42");
+        let tok = s.next_token().unwrap();
+        assert_eq!(tok.kind, TokenKind::NumericLiteral);
+    }
+
+    #[test]
+    fn test_shell_scanner_tokenises_identifier() {
+        let mut s = Scanner::new("foo");
+        let tok = s.next_token().unwrap();
+        assert_eq!(tok.kind, TokenKind::Identifier);
+    }
+}
