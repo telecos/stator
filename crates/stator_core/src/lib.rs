@@ -10,6 +10,9 @@
 //! - [`parser`] — Lexer ([`parser::scanner`]), AST ([`parser::ast`]), and
 //!   scope analysis ([`parser::scope`]), and lazy parsing
 //!   ([`parser::preparser`])
+//! - [`interpreter`] — Bytecode interpreter ([`interpreter::Interpreter`]):
+//!   fetch-decode-dispatch loop, [`interpreter::InterpreterFrame`] activation
+//!   frame, and arithmetic/comparison opcode handlers.
 //! - [`bytecode`] — Bytecode instruction set ([`bytecode::bytecodes`]):
 //!   ~174 opcodes matching V8 Ignition semantics, operand encoding, and
 //!   encode/decode utilities.  [`bytecode::bytecode_array`] provides the
@@ -31,6 +34,8 @@ pub mod bytecode;
 pub mod error;
 /// Garbage collector infrastructure: heap, tracing, and handle scopes.
 pub mod gc;
+/// Bytecode interpreter: fetch-decode-dispatch loop and activation frame.
+pub mod interpreter;
 /// JavaScript value representation and heap object types.
 pub mod objects;
 /// JavaScript parser infrastructure (lexer and AST node definitions).
