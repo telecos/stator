@@ -1,0 +1,333 @@
+//! ECMAScript §24.2 `Set` built-in.
+//!
+//! Provides [`JsSet`], a collection of unique values that preserves insertion
+//! order and uses the **SameValueZero** comparison algorithm for membership
+//! tests (identical to `===` except that `NaN` is considered equal to itself
+//! and `-0` is considered equal to `+0`).
+//!
+//! # Naming convention
+//!
+//! Each function is prefixed `set_` to avoid ambiguity with similarly-named
+//! standard-library items.
+//!
+//! # References
+//!
+//! * ECMAScript 2025 Language Specification §24.2 — *The Set Objects*
+
+use crate::objects::value::JsValue;
+
+use super::util::same_value_zero;
+
+// ── JsSet ─────────────────────────────────────────────────────────────────────
+
+/// A JavaScript `Set` object per ECMAScript §24.2.
+///
+/// Values are stored in a [`Vec`] in insertion order, matching the ECMAScript
+/// requirement that `Set` operations iterate in insertion order.  Membership
+/// tests use a linear scan with [`same_value_zero`] comparison.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_has, set_size};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut s = set_new();
+/// set_add(&mut s, JsValue::Smi(1));
+/// set_add(&mut s, JsValue::Smi(1)); // duplicate — ignored
+/// assert_eq!(set_size(&s), 1);
+/// assert!(set_has(&s, &JsValue::Smi(1)));
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct JsSet {
+    /// Values stored in insertion order.  Duplicates are never inserted.
+    values: Vec<JsValue>,
+}
+
+// ── Constructors ──────────────────────────────────────────────────────────────
+
+/// ECMAScript §24.2.1.1 `new Set()`.
+///
+/// Creates an empty [`JsSet`].
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_size};
+///
+/// let s = set_new();
+/// assert_eq!(set_size(&s), 0);
+/// ```
+pub fn set_new() -> JsSet {
+    JsSet::default()
+}
+
+// ── set_add ───────────────────────────────────────────────────────────────────
+
+/// ECMAScript §24.2.3.1 `Set.prototype.add(value)`.
+///
+/// Adds `value` to the set if no `SameValueZero`-equal value is already
+/// present.  If a matching value already exists this is a no-op.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_size};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut s = set_new();
+/// set_add(&mut s, JsValue::Smi(5));
+/// set_add(&mut s, JsValue::Smi(5));
+/// assert_eq!(set_size(&s), 1);
+/// ```
+pub fn set_add(set: &mut JsSet, value: JsValue) {
+    if !set.values.iter().any(|v| same_value_zero(v, &value)) {
+        set.values.push(value);
+    }
+}
+
+// ── set_has ───────────────────────────────────────────────────────────────────
+
+/// ECMAScript §24.2.3.6 `Set.prototype.has(value)`.
+///
+/// Returns `true` if a `SameValueZero`-equal value is present in the set.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_has};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut s = set_new();
+/// set_add(&mut s, JsValue::Boolean(true));
+/// assert!(set_has(&s, &JsValue::Boolean(true)));
+/// assert!(!set_has(&s, &JsValue::Boolean(false)));
+/// ```
+pub fn set_has(set: &JsSet, value: &JsValue) -> bool {
+    set.values.iter().any(|v| same_value_zero(v, value))
+}
+
+// ── set_delete ────────────────────────────────────────────────────────────────
+
+/// ECMAScript §24.2.3.4 `Set.prototype.delete(value)`.
+///
+/// Removes the first value that is `SameValueZero`-equal to `value`.  Returns
+/// `true` if a value was removed, `false` if `value` was not found.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_delete, set_size};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut s = set_new();
+/// set_add(&mut s, JsValue::Smi(3));
+/// assert!(set_delete(&mut s, &JsValue::Smi(3)));
+/// assert!(!set_delete(&mut s, &JsValue::Smi(3)));
+/// assert_eq!(set_size(&s), 0);
+/// ```
+pub fn set_delete(set: &mut JsSet, value: &JsValue) -> bool {
+    if let Some(pos) = set.values.iter().position(|v| same_value_zero(v, value)) {
+        set.values.remove(pos);
+        true
+    } else {
+        false
+    }
+}
+
+// ── set_clear ─────────────────────────────────────────────────────────────────
+
+/// ECMAScript §24.2.3.2 `Set.prototype.clear()`.
+///
+/// Removes all values from the set.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_clear, set_size};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut s = set_new();
+/// set_add(&mut s, JsValue::Smi(1));
+/// set_clear(&mut s);
+/// assert_eq!(set_size(&s), 0);
+/// ```
+pub fn set_clear(set: &mut JsSet) {
+    set.values.clear();
+}
+
+// ── set_size ──────────────────────────────────────────────────────────────────
+
+/// ECMAScript §24.2.3.9 `Set.prototype.size` (getter).
+///
+/// Returns the number of values currently in the set.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_size};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut s = set_new();
+/// set_add(&mut s, JsValue::Smi(10));
+/// assert_eq!(set_size(&s), 1);
+/// ```
+pub fn set_size(set: &JsSet) -> usize {
+    set.values.len()
+}
+
+// ── set_for_each ──────────────────────────────────────────────────────────────
+
+/// ECMAScript §24.2.3.5 `Set.prototype.forEach(callback)`.
+///
+/// Calls `callback(value)` for each value in insertion order.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_for_each};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut s = set_new();
+/// set_add(&mut s, JsValue::Smi(1));
+/// set_add(&mut s, JsValue::Smi(2));
+/// let mut out = Vec::new();
+/// set_for_each(&s, |v| out.push(v.clone()));
+/// assert_eq!(out, vec![JsValue::Smi(1), JsValue::Smi(2)]);
+/// ```
+pub fn set_for_each(set: &JsSet, mut callback: impl FnMut(&JsValue)) {
+    for v in &set.values {
+        callback(v);
+    }
+}
+
+// ── set_values ────────────────────────────────────────────────────────────────
+
+/// ECMAScript §24.2.3.10 `Set.prototype.values()`.
+///
+/// Returns all values in insertion order.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_values};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut s = set_new();
+/// set_add(&mut s, JsValue::Smi(7));
+/// set_add(&mut s, JsValue::Smi(3));
+/// assert_eq!(set_values(&s), vec![JsValue::Smi(7), JsValue::Smi(3)]);
+/// ```
+pub fn set_values(set: &JsSet) -> Vec<JsValue> {
+    set.values.clone()
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── set_add / set_has / set_size ──────────────────────────────────────────
+
+    #[test]
+    fn test_set_add_unique_values() {
+        let mut s = set_new();
+        set_add(&mut s, JsValue::Smi(1));
+        set_add(&mut s, JsValue::Smi(2));
+        assert_eq!(set_size(&s), 2);
+    }
+
+    #[test]
+    fn test_set_add_ignores_duplicates() {
+        let mut s = set_new();
+        set_add(&mut s, JsValue::Smi(1));
+        set_add(&mut s, JsValue::Smi(1));
+        assert_eq!(set_size(&s), 1);
+    }
+
+    #[test]
+    fn test_set_has_present_value() {
+        let mut s = set_new();
+        set_add(&mut s, JsValue::Boolean(false));
+        assert!(set_has(&s, &JsValue::Boolean(false)));
+    }
+
+    #[test]
+    fn test_set_has_absent_value() {
+        let s = set_new();
+        assert!(!set_has(&s, &JsValue::Null));
+    }
+
+    // ── set_delete ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_delete_existing_value() {
+        let mut s = set_new();
+        set_add(&mut s, JsValue::Smi(42));
+        assert!(set_delete(&mut s, &JsValue::Smi(42)));
+        assert_eq!(set_size(&s), 0);
+    }
+
+    #[test]
+    fn test_set_delete_missing_value_returns_false() {
+        let mut s = set_new();
+        assert!(!set_delete(&mut s, &JsValue::Smi(1)));
+    }
+
+    // ── set_clear ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_clear() {
+        let mut s = set_new();
+        set_add(&mut s, JsValue::Smi(1));
+        set_add(&mut s, JsValue::Smi(2));
+        set_clear(&mut s);
+        assert_eq!(set_size(&s), 0);
+    }
+
+    // ── iteration order ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_insertion_order_preserved() {
+        let mut s = set_new();
+        set_add(&mut s, JsValue::Smi(3));
+        set_add(&mut s, JsValue::Smi(1));
+        set_add(&mut s, JsValue::Smi(2));
+        assert_eq!(
+            set_values(&s),
+            vec![JsValue::Smi(3), JsValue::Smi(1), JsValue::Smi(2)]
+        );
+    }
+
+    // ── set_for_each ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_for_each_visits_all_values() {
+        let mut s = set_new();
+        set_add(&mut s, JsValue::Smi(10));
+        set_add(&mut s, JsValue::Smi(20));
+        let mut out = Vec::new();
+        set_for_each(&s, |v| out.push(v.clone()));
+        assert_eq!(out, vec![JsValue::Smi(10), JsValue::Smi(20)]);
+    }
+
+    // ── SameValueZero edge cases ──────────────────────────────────────────────
+
+    #[test]
+    fn test_set_nan_deduplication() {
+        let mut s = set_new();
+        set_add(&mut s, JsValue::HeapNumber(f64::NAN));
+        set_add(&mut s, JsValue::HeapNumber(f64::NAN));
+        assert_eq!(set_size(&s), 1);
+        assert!(set_has(&s, &JsValue::HeapNumber(f64::NAN)));
+    }
+
+    #[test]
+    fn test_set_negative_zero_deduplication() {
+        let mut s = set_new();
+        set_add(&mut s, JsValue::HeapNumber(0.0_f64));
+        set_add(&mut s, JsValue::HeapNumber(-0.0_f64));
+        assert_eq!(set_size(&s), 1);
+    }
+}
