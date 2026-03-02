@@ -15,6 +15,9 @@
 //! - [`feedback`] — [`feedback::FeedbackVector`], [`feedback::FeedbackMetadata`],
 //!   [`feedback::FeedbackSlotKind`], and [`feedback::InlineCacheState`]: inline
 //!   cache feedback slots allocated during compilation and updated at runtime.
+//! - [`source_positions`] — [`source_positions::SourcePositionTable`] and
+//!   [`source_positions::SourcePositionEntry`]: maps bytecode offsets to source
+//!   locations for stack traces, debugger stepping, and source maps.
 
 /// Compact bytecode storage with constant pool and source-position table.
 pub mod bytecode_array;
@@ -26,3 +29,6 @@ pub mod bytecodes;
 pub mod feedback;
 /// Virtual register type and register allocator for bytecode compilation.
 pub mod register;
+/// Source-position table: maps bytecode offsets to source locations for stack
+/// traces, debugger stepping, and source maps.
+pub mod source_positions;
