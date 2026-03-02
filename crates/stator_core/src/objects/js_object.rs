@@ -287,6 +287,36 @@ impl JsObject {
         }
     }
 
+    /// Read a fast-mode named property by its zero-based descriptor index.
+    ///
+    /// Returns `None` if the object is in slow (dictionary) mode or `index`
+    /// is out of range.  This is intended for use by the inline-cache runtime,
+    /// which caches the fast index after verifying the object's hidden-class
+    /// shape.
+    pub fn get_fast_property_at_index(&self, index: usize) -> Option<JsValue> {
+        if let NamedProperties::Fast(ref values) = self.named_properties {
+            values.get(index).cloned()
+        } else {
+            None
+        }
+    }
+
+    /// Write a fast-mode named property by its zero-based descriptor index.
+    ///
+    /// Returns `true` on success.  Returns `false` if the object is in slow
+    /// mode, `index` is out of range, or the existing value slot does not
+    /// exist (i.e., the descriptor exists but the value array is shorter than
+    /// expected).  Intended for the inline-cache runtime fast path.
+    pub fn set_fast_property_at_index(&mut self, index: usize, value: JsValue) -> bool {
+        if let NamedProperties::Fast(ref mut values) = self.named_properties
+            && index < values.len()
+        {
+            values[index] = value;
+            return true;
+        }
+        false
+    }
+
     // ── Prototype-chain traversal (ECMAScript §10.1) ──────────────────────────
 
     /// ECMAScript §10.1.8 `[[Get]]`.

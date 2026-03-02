@@ -36,6 +36,8 @@ pub mod bytecode;
 pub mod error;
 /// Garbage collector infrastructure: heap, tracing, and handle scopes.
 pub mod gc;
+/// Inline-cache runtime: property load/store fast paths and call-site tracking.
+pub mod ic;
 /// Bytecode interpreter: fetch-decode-dispatch loop and activation frame.
 pub mod interpreter;
 /// JavaScript value representation and heap object types.
