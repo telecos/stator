@@ -104,6 +104,9 @@ pub struct JsObject {
     elements: Vec<JsValue>,
     /// Prototype object, or `None` for base objects.
     prototype: Option<Rc<RefCell<JsObject>>>,
+    /// Whether new own properties may be added to this object (ECMAScript
+    /// `[[Extensible]]` internal slot, §10.1).  Defaults to `true`.
+    extensible: bool,
 }
 
 impl JsObject {
@@ -114,6 +117,7 @@ impl JsObject {
             named_properties: NamedProperties::Fast(Box::new(SmallVec::new())),
             elements: Vec::new(),
             prototype: None,
+            extensible: true,
         }
     }
 
@@ -128,6 +132,7 @@ impl JsObject {
             named_properties: NamedProperties::Fast(Box::new(SmallVec::new())),
             elements: Vec::new(),
             prototype: None,
+            extensible: true,
         }
     }
 
@@ -138,6 +143,7 @@ impl JsObject {
             named_properties: NamedProperties::Fast(Box::new(SmallVec::new())),
             elements: Vec::new(),
             prototype: Some(prototype),
+            extensible: true,
         }
     }
 
@@ -159,6 +165,48 @@ impl JsObject {
     /// Sets (or removes) the prototype of this object.
     pub fn set_prototype(&mut self, prototype: Option<Rc<RefCell<JsObject>>>) {
         self.prototype = prototype;
+    }
+
+    /// Returns `true` if new own properties may be added to this object
+    /// (ECMAScript `[[Extensible]]` internal slot, §10.1).
+    pub fn is_extensible(&self) -> bool {
+        self.extensible
+    }
+
+    /// Marks this object as non-extensible: no new own properties may be
+    /// added after this call (ECMAScript `[[PreventExtensions]]`, §10.1.3).
+    ///
+    /// Existing properties are unaffected.
+    pub fn prevent_extensions(&mut self) {
+        self.extensible = false;
+    }
+
+    /// Returns the names of all own named (string-keyed) properties in
+    /// insertion order for fast-mode objects, or an unspecified order for
+    /// slow-mode objects.
+    pub fn own_property_keys(&self) -> Vec<String> {
+        match &self.named_properties {
+            NamedProperties::Fast(_) => self
+                .map
+                .descriptors()
+                .iter()
+                .map(|d| d.key().to_string())
+                .collect(),
+            NamedProperties::Slow(map) => map.keys().cloned().collect(),
+        }
+    }
+
+    /// Returns the value **and** attribute flags of an own named property, or
+    /// `None` if the property does not exist on this object.
+    ///
+    /// Corresponds to ECMAScript `[[GetOwnProperty]]` (§10.1.5).
+    pub fn get_own_property_descriptor(&self, key: &str) -> Option<(JsValue, PropertyAttributes)> {
+        match &self.named_properties {
+            NamedProperties::Fast(values) => self
+                .fast_index_and_attrs(key)
+                .and_then(|(i, attrs)| values.get(i).map(|v| (v.clone(), attrs))),
+            NamedProperties::Slow(map) => map.get(key).map(|e| (e.value.clone(), e.attributes)),
+        }
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -316,6 +364,13 @@ impl JsObject {
                 )));
             }
 
+            // Reject new properties when the object is non-extensible.
+            if !self.extensible {
+                return Err(StatorError::TypeError(format!(
+                    "Cannot add property '{key}' to a non-extensible object"
+                )));
+            }
+
             // Create a new own property.
             let fast_len = match &self.named_properties {
                 NamedProperties::Fast(v) => Some(v.len()),
@@ -394,7 +449,12 @@ impl JsObject {
                 map.insert(key.to_string(), SlowProperty::new(value, attributes));
             }
         } else {
-            // New property: insert it.
+            // New property: reject if non-extensible.
+            if !self.extensible {
+                return Err(StatorError::TypeError(format!(
+                    "Cannot define property '{key}' on a non-extensible object"
+                )));
+            }
             let fast_len = match &self.named_properties {
                 NamedProperties::Fast(v) => Some(v.len()),
                 NamedProperties::Slow(_) => None,
