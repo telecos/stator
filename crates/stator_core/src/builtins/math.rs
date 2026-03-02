@@ -471,22 +471,29 @@ pub fn math_atan2(y: f64, x: f64) -> f64 {
 pub fn math_random() -> f64 {
     use std::cell::Cell;
 
+    // Under Miri the OS-level thread-local machinery (`pthread_key_create`) is
+    // blocked in isolation mode even for types without a destructor.  Use a
+    // `const`-init static with a fixed seed so Miri can run this code without
+    // any syscalls.
+    #[cfg(miri)]
     thread_local! {
-        static STATE: Cell<u64> = Cell::new({
-            // Under Miri, `clock_gettime` is not available in isolation mode;
-            // use a deterministic fixed seed instead.
-            #[cfg(miri)]
-            { 12_345_678_901_234_567_u64 }
-            #[cfg(not(miri))]
-            {
-                use std::time::{SystemTime, UNIX_EPOCH};
+        static STATE: Cell<u64> = const { Cell::new(12_345_678_901_234_567_u64) };
+    }
+    #[cfg(not(miri))]
+    thread_local! {
+        static STATE: Cell<u64> = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            Cell::new(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map(|d| d.subsec_nanos() as u64 ^ (d.as_secs().wrapping_mul(6_364_136_223_846_793_005)))
+                    .map(|d| {
+                        d.subsec_nanos() as u64
+                            ^ (d.as_secs().wrapping_mul(6_364_136_223_846_793_005))
+                    })
                     .unwrap_or(12_345_678_901_234_567)
-                    | 1 // ensure non-zero
-            }
-        });
+                    | 1, // ensure non-zero
+            )
+        };
     }
 
     STATE.with(|s| {
