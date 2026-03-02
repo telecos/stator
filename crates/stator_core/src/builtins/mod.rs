@@ -18,6 +18,10 @@ pub mod number;
 pub mod object;
 /// ECMAScript §27 `Promise` built-in and microtask queue.
 pub mod promise;
+/// ECMAScript §28.2 `Proxy` built-in and §10.5 invariant enforcement.
+pub mod proxy;
+/// ECMAScript §28.1 `Reflect` built-in static methods.
+pub mod reflect;
 /// ECMAScript §24.2 `Set` built-in — insertion-ordered unique-value collection.
 pub mod set;
 /// ECMAScript §22.1 `String` built-in static methods and prototype equivalents.
