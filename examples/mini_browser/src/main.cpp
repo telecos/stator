@@ -1,20 +1,76 @@
 /**
- * mini_browser — Demonstrates Stator object allocation and GC.
+ * mini_browser — Demonstrates Stator JavaScript parsing and bytecode
+ * compilation (Phase 2).
  *
- * This sample exercises the Phase 1 GC and object model:
+ * This sample exercises both the Phase 1 object model and the Phase 2
+ * compilation pipeline:
  *
- *   1. Create an isolate and a JS context.
- *   2. Allocate a number value, a string value, and an object with properties.
- *   3. Print their types and values via FFI.
- *   4. Trigger GC while handles are held — objects survive.
- *   5. Release all handles, trigger GC — objects are reclaimed.
- *   6. Print final heap statistics.
+ *   Phase 1 — GC / object model:
+ *     1. Create an isolate and a JS context.
+ *     2. Allocate a number value, a string value, and an object with
+ *        properties.
+ *     3. Print their types and values via FFI.
+ *     4. Trigger GC while handles are held — objects survive.
+ *     5. Release all handles, trigger GC — objects are reclaimed.
+ *     6. Print final heap statistics.
+ *
+ *   Phase 2 — JavaScript parsing + bytecode compilation:
+ *     7. Simulate extracting inline <script> content from an HTML page.
+ *     8. Compile each script fragment with stator_script_compile().
+ *     9. Report success (bytecode count) or failure (error message).
+ *    10. Dump the bytecode listing for a simple arithmetic script.
+ *    11. Demonstrate error reporting for malformed JavaScript.
  */
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "stator.h"
+
+/* -------------------------------------------------------------------------
+ * Helpers
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Compile one JavaScript snippet, print a pass/fail summary, optionally dump
+ * bytecodes, and then free the script handle.
+ *
+ * @param ctx        The active Stator context (may be NULL).
+ * @param source     Null-terminated JavaScript source string.
+ * @param dump_code  When non-zero, print the bytecode listing on success.
+ */
+static void compile_and_report(StatorContext *ctx,
+                                const char   *source,
+                                int           dump_code)
+{
+    std::printf("[tab] compiling: %s\n", source);
+
+    StatorScript *script = stator_script_compile(ctx, source,
+                                                 std::strlen(source));
+    if (!script) {
+        std::printf("[tab] ERROR: internal allocation failure\n");
+        return;
+    }
+
+    const char *err = stator_script_get_error(script);
+    if (err) {
+        std::printf("[tab] ERROR: %s\n", err);
+    } else {
+        size_t count = stator_script_bytecode_count(script);
+        std::printf("[tab] OK \xe2\x80\x94 %zu bytecode(s) generated\n", count);
+        if (dump_code) {
+            std::printf("[tab] bytecodes:\n");
+            stator_bytecode_dump(script);
+        }
+    }
+
+    stator_script_free(script);
+}
+
+/* -------------------------------------------------------------------------
+ * main
+ * ------------------------------------------------------------------------- */
 
 int main() {
     StatorIsolate *isolate = stator_isolate_create();
@@ -23,10 +79,9 @@ int main() {
         return 1;
     }
 
+    /* ── Phase 1: GC / object model ─────────────────────────────────────── */
+
     /* 1. Create a context ------------------------------------------------- */
-    /* The context is the execution environment for JS code.  In this Phase 1
-     * demo it is not yet wired to a script evaluator, but creating it via the
-     * FFI ensures the lifecycle API (create / destroy) is exercised. */
     StatorContext *ctx = stator_context_new(isolate);
     std::printf("[tab] created context\n");
 
@@ -75,8 +130,28 @@ int main() {
     std::printf("[tab] heap: %zu bytes used / %zu bytes capacity\n",
                 stator_heap_used(isolate), stator_heap_capacity(isolate));
 
+    /* ── Phase 2: JavaScript parsing + bytecode compilation ─────────────── */
+
+    std::printf("\n[tab] --- Phase 2: JavaScript parsing demo ---\n\n");
+
+    /*
+     * Simulate inline <script> fragments extracted from an HTML document:
+     *
+     *   <script>var x = 1 + 2;</script>
+     *   <script>var = ;</script>          <!-- intentional syntax error -->
+     */
+
+    /* 7 & 8 & 9 & 10. Compile a valid arithmetic expression and dump its
+     *                  bytecodes.  --------------------------------------- */
+    compile_and_report(ctx, "var x = 1 + 2;", /* dump_code= */ 1);
+
+    std::printf("\n");
+
+    /* 11. Demonstrate error reporting for malformed JavaScript. ----------- */
+    compile_and_report(ctx, "var = ;", /* dump_code= */ 0);
+
+    /* ── Cleanup ─────────────────────────────────────────────────────────── */
     stator_context_destroy(ctx);
     stator_isolate_destroy(isolate);
     return 0;
 }
-
