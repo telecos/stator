@@ -14,5 +14,7 @@ pub mod math;
 pub mod number;
 /// ECMAScript §20.1 `Object` built-in static methods.
 pub mod object;
+/// ECMAScript §27 `Promise` built-in and microtask queue.
+pub mod promise;
 /// ECMAScript §22.1 `String` built-in static methods and prototype equivalents.
 pub mod string;

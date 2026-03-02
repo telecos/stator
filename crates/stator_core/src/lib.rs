@@ -28,7 +28,7 @@
 //!   [`bytecode::feedback::FeedbackSlotKind`], and
 //!   [`bytecode::feedback::InlineCacheState`] for inline-cache feedback.
 
-/// Built-in JavaScript object static methods (`Object`, …).
+/// Built-in JavaScript object static methods (`Object`, `Promise`, …).
 pub mod builtins;
 /// Bytecode instruction set and encode/decode utilities.
 pub mod bytecode;

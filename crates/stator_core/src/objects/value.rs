@@ -18,7 +18,9 @@ use crate::objects::heap_object::HeapObject;
 ///
 /// Primitive variants carry their data inline; `Object` holds a raw pointer to
 /// a GC-managed [`HeapObject`]; `Function` holds a reference-counted
-/// [`BytecodeArray`] representing a callable closure.
+/// [`BytecodeArray`] representing a callable closure; `Array` holds a
+/// reference-counted vector used by built-in combinators (e.g. `Promise.all`)
+/// that need to produce array values without allocating on the GC heap.
 ///
 /// # Safety – `Object` variant
 ///
@@ -51,6 +53,11 @@ pub enum JsValue {
     /// The [`Rc`] allows function values to be cheaply cloned and shared
     /// without copying the bytecode.
     Function(Rc<BytecodeArray>),
+    /// A lightweight JavaScript array backed by a reference-counted [`Vec`].
+    ///
+    /// Used by built-in combinators such as `Promise.all` that need to return
+    /// array values without interacting with the GC heap.
+    Array(Rc<Vec<JsValue>>),
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -129,6 +136,12 @@ impl JsValue {
     pub fn is_function(&self) -> bool {
         matches!(self, Self::Function(_))
     }
+
+    /// Returns `true` if this value is a lightweight array ([`Array`][JsValue::Array]).
+    #[inline]
+    pub fn is_array(&self) -> bool {
+        matches!(self, Self::Array(_))
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -156,7 +169,7 @@ impl JsValue {
             Self::Smi(n) => *n != 0,
             Self::HeapNumber(n) => !n.is_nan() && *n != 0.0,
             Self::String(s) => !s.is_empty(),
-            Self::Symbol(_) | Self::Object(_) | Self::Function(_) => true,
+            Self::Symbol(_) | Self::Object(_) | Self::Function(_) | Self::Array(_) => true,
             Self::BigInt(n) => *n != 0,
         }
     }
@@ -207,6 +220,9 @@ impl JsValue {
             Self::Function(_) => Err(StatorError::TypeError(
                 "Cannot convert a Function value to a number".to_string(),
             )),
+            Self::Array(_) => Err(StatorError::TypeError(
+                "Cannot convert an Array value to a number".to_string(),
+            )),
         }
     }
 
@@ -244,6 +260,17 @@ impl JsValue {
             )),
             Self::BigInt(n) => Ok(n.to_string()),
             Self::Function(_) => Ok("function () {}".to_string()),
+            Self::Array(items) => {
+                // ECMAScript §23.1.3.30 Array.prototype.toString → join with ","
+                let parts: StatorResult<Vec<String>> = items
+                    .iter()
+                    .map(|v| match v {
+                        Self::Null | Self::Undefined => Ok(String::new()),
+                        other => other.to_js_string(),
+                    })
+                    .collect();
+                Ok(parts?.join(","))
+            }
         }
     }
 }
@@ -255,15 +282,24 @@ impl JsValue {
 impl Trace for JsValue {
     /// Report any GC-managed heap pointer embedded in this value to the tracer.
     ///
-    /// Only the [`JsValue::Object`] variant holds a raw heap pointer; all
-    /// primitive variants and [`JsValue::Function`] carry no GC reference and
-    /// are silently ignored.
+    /// The [`JsValue::Object`] variant holds a raw heap pointer that is
+    /// reported directly.  [`JsValue::Array`] may contain nested `Object`
+    /// values, so each element is traced recursively.  All other variants
+    /// carry no GC reference and are silently ignored.
     fn trace(&self, tracer: &mut Tracer) {
-        if let Self::Object(ptr) = self {
-            // SAFETY: Object pointers must refer to live, GC-managed HeapObjects.
-            // The caller is responsible for ensuring the value is not used after
-            // a collection that may have freed or moved the object.
-            unsafe { tracer.mark_raw(*ptr as *mut u8) };
+        match self {
+            Self::Object(ptr) => {
+                // SAFETY: Object pointers must refer to live, GC-managed HeapObjects.
+                // The caller is responsible for ensuring the value is not used after
+                // a collection that may have freed or moved the object.
+                unsafe { tracer.mark_raw(*ptr as *mut u8) };
+            }
+            Self::Array(items) => {
+                for item in items.iter() {
+                    item.trace(tracer);
+                }
+            }
+            _ => {}
         }
     }
 }
