@@ -359,4 +359,141 @@ mod tests {
         assert!(Monomorphic < Polymorphic);
         assert!(Polymorphic < Megamorphic);
     }
+
+    // ── FeedbackSlotKind coverage ───────────────────────────────────────────
+
+    #[test]
+    fn test_all_slot_kind_variants_round_trip() {
+        // Every FeedbackSlotKind variant should survive a metadata round-trip.
+        let all_kinds = vec![
+            FeedbackSlotKind::Call,
+            FeedbackSlotKind::LoadProperty,
+            FeedbackSlotKind::StoreProperty,
+            FeedbackSlotKind::KeyedLoadProperty,
+            FeedbackSlotKind::KeyedStoreProperty,
+            FeedbackSlotKind::BinaryOp,
+            FeedbackSlotKind::Compare,
+            FeedbackSlotKind::ForIn,
+            FeedbackSlotKind::TypeOf,
+            FeedbackSlotKind::CreateClosure,
+            FeedbackSlotKind::LoadGlobal,
+            FeedbackSlotKind::StoreGlobal,
+            FeedbackSlotKind::InstanceOf,
+            FeedbackSlotKind::BinaryOpInc,
+            FeedbackSlotKind::UnaryOp,
+            FeedbackSlotKind::Literal,
+        ];
+        let metadata = FeedbackMetadata::new(all_kinds.clone());
+        assert_eq!(metadata.slot_count(), 16);
+        for (i, &expected) in all_kinds.iter().enumerate() {
+            assert_eq!(metadata.kind_of(i as u32), Some(expected));
+        }
+        // Beyond the end is None.
+        assert_eq!(metadata.kind_of(16), None);
+    }
+
+    #[test]
+    fn test_metadata_slot_kinds_nonempty() {
+        let m = make_metadata();
+        let kinds = m.slot_kinds();
+        assert_eq!(kinds.len(), 3);
+        assert_eq!(kinds[0], FeedbackSlotKind::Call);
+        assert_eq!(kinds[1], FeedbackSlotKind::LoadProperty);
+        assert_eq!(kinds[2], FeedbackSlotKind::BinaryOp);
+    }
+
+    #[test]
+    fn test_metadata_equality() {
+        let a = FeedbackMetadata::new(vec![FeedbackSlotKind::Call, FeedbackSlotKind::Compare]);
+        let b = FeedbackMetadata::new(vec![FeedbackSlotKind::Call, FeedbackSlotKind::Compare]);
+        let c = FeedbackMetadata::new(vec![FeedbackSlotKind::Call]);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    // ── Transition edge cases ───────────────────────────────────────────────
+
+    #[test]
+    fn test_transition_same_state_returns_false() {
+        let m = FeedbackMetadata::new(vec![FeedbackSlotKind::BinaryOp]);
+        let mut v = FeedbackVector::new(&m);
+
+        // Transition to the current state (Uninitialized → Uninitialized) is
+        // a no-op and returns false.
+        assert!(!v.transition(0, InlineCacheState::Uninitialized));
+        assert_eq!(v.get_state(0), Some(InlineCacheState::Uninitialized));
+
+        v.set_state(0, InlineCacheState::Polymorphic);
+        // Transition to the same state returns false.
+        assert!(!v.transition(0, InlineCacheState::Polymorphic));
+        assert_eq!(v.get_state(0), Some(InlineCacheState::Polymorphic));
+    }
+
+    #[test]
+    fn test_transition_out_of_range_returns_false() {
+        let m = FeedbackMetadata::new(vec![FeedbackSlotKind::Call]);
+        let mut v = FeedbackVector::new(&m);
+        assert!(!v.transition(99, InlineCacheState::Megamorphic));
+    }
+
+    #[test]
+    fn test_set_state_allows_downgrade() {
+        // Unlike `transition`, `set_state` permits arbitrary state changes.
+        let m = FeedbackMetadata::new(vec![FeedbackSlotKind::Compare]);
+        let mut v = FeedbackVector::new(&m);
+        v.set_state(0, InlineCacheState::Megamorphic);
+        assert!(v.set_state(0, InlineCacheState::Uninitialized));
+        assert_eq!(v.get_state(0), Some(InlineCacheState::Uninitialized));
+    }
+
+    #[test]
+    fn test_full_transition_chain() {
+        // Verify the canonical Uninitialized → Mono → Poly → Mega path.
+        let m = FeedbackMetadata::new(vec![FeedbackSlotKind::LoadProperty]);
+        let mut v = FeedbackVector::new(&m);
+
+        assert_eq!(v.get_state(0), Some(InlineCacheState::Uninitialized));
+
+        assert!(v.transition(0, InlineCacheState::Monomorphic));
+        assert_eq!(v.get_state(0), Some(InlineCacheState::Monomorphic));
+
+        assert!(v.transition(0, InlineCacheState::Polymorphic));
+        assert_eq!(v.get_state(0), Some(InlineCacheState::Polymorphic));
+
+        assert!(v.transition(0, InlineCacheState::Megamorphic));
+        assert_eq!(v.get_state(0), Some(InlineCacheState::Megamorphic));
+
+        // Already at Megamorphic — any transition should return false.
+        assert!(!v.transition(0, InlineCacheState::Megamorphic));
+        assert!(!v.transition(0, InlineCacheState::Polymorphic));
+    }
+
+    #[test]
+    fn test_vector_slot_count_matches_metadata() {
+        for n in [0usize, 1, 5, 100] {
+            let kinds = vec![FeedbackSlotKind::BinaryOp; n];
+            let m = FeedbackMetadata::new(kinds);
+            let v = FeedbackVector::new(&m);
+            assert_eq!(v.slot_count(), n as u32);
+            assert_eq!(v.slot_count(), m.slot_count());
+        }
+    }
+
+    #[test]
+    fn test_vector_set_state_all_slots() {
+        // Verify every slot can be independently set.
+        let m = FeedbackMetadata::new(vec![
+            FeedbackSlotKind::Call,
+            FeedbackSlotKind::LoadProperty,
+            FeedbackSlotKind::Compare,
+        ]);
+        let mut v = FeedbackVector::new(&m);
+        v.set_state(0, InlineCacheState::Monomorphic);
+        v.set_state(1, InlineCacheState::Polymorphic);
+        v.set_state(2, InlineCacheState::Megamorphic);
+
+        assert_eq!(v.get_state(0), Some(InlineCacheState::Monomorphic));
+        assert_eq!(v.get_state(1), Some(InlineCacheState::Polymorphic));
+        assert_eq!(v.get_state(2), Some(InlineCacheState::Megamorphic));
+    }
 }

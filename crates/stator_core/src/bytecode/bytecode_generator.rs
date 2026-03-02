@@ -2630,4 +2630,479 @@ mod tests {
         assert!(!decoded.is_empty());
         assert_eq!(decoded.last().unwrap().opcode, Opcode::Return);
     }
+
+    // ── Feedback slot allocation tests ────────────────────────────────────
+    //
+    // These tests verify that the compiler emits the correct FeedbackSlotKind
+    // for each IC-bearing instruction category, and that the slot indices
+    // embedded in the bytecode operands match the metadata.
+
+    /// Extract a helper that filters slot kinds from compiled metadata.
+    fn slot_kinds_for(prog: &Program) -> Vec<crate::bytecode::feedback::FeedbackSlotKind> {
+        let arr = BytecodeGenerator::compile_program(prog).unwrap();
+        arr.feedback_metadata().slot_kinds().to_vec()
+    }
+
+    #[test]
+    fn test_feedback_slots_binary_add() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        // `return x + y` where x, y are locals → one BinaryOp slot.
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "x", Some(num_expr(1.0))),
+            var_decl_stmt(VarKind::Let, "y", Some(num_expr(2.0))),
+            return_stmt(Some(Expr::Binary(Box::new(BinaryExpr {
+                loc: span(),
+                op: BinaryOp::Add,
+                left: Box::new(ident_expr("x")),
+                right: Box::new(ident_expr("y")),
+            })))),
+        ]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::BinaryOp),
+            "expected BinaryOp slot, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_comparison_lt() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        // `x < y` → one Compare slot.
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "x", Some(num_expr(1.0))),
+            var_decl_stmt(VarKind::Let, "y", Some(num_expr(2.0))),
+            return_stmt(Some(Expr::Binary(Box::new(BinaryExpr {
+                loc: span(),
+                op: BinaryOp::Lt,
+                left: Box::new(ident_expr("x")),
+                right: Box::new(ident_expr("y")),
+            })))),
+        ]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::Compare),
+            "expected Compare slot, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_global_load() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        // Reference to undeclared `console` → LoadGlobal slot.
+        let prog = make_program(vec![return_stmt(Some(ident_expr("console")))]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::LoadGlobal),
+            "expected LoadGlobal slot, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_global_store() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        use crate::parser::ast::{AssignExpr, AssignOp, AssignTarget};
+        // `x = 1` where x is undeclared → StoreGlobal slot.
+        let prog = make_program(vec![Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(Expr::Assign(Box::new(AssignExpr {
+                loc: span(),
+                op: AssignOp::Assign,
+                left: AssignTarget::Expr(Box::new(ident_expr("x"))),
+                right: Box::new(num_expr(1.0)),
+            }))),
+        })]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::StoreGlobal),
+            "expected StoreGlobal slot, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_function_call() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        use crate::parser::ast::CallExpr;
+        // `f(1, 2)` → Call slot (+ LoadGlobal for `f`).
+        let prog = make_program(vec![Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(Expr::Call(Box::new(CallExpr {
+                loc: span(),
+                callee: Box::new(ident_expr("f")),
+                arguments: vec![num_expr(1.0), num_expr(2.0)],
+            }))),
+        })]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::Call),
+            "expected Call slot, got {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&FeedbackSlotKind::LoadGlobal),
+            "expected LoadGlobal slot for callee, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_named_property_load() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        use crate::parser::ast::MemberExpr;
+        // `obj.name` → LoadProperty slot.
+        let prog = make_program(vec![return_stmt(Some(Expr::Member(Box::new(
+            MemberExpr {
+                loc: span(),
+                object: Box::new(ident_expr("obj")),
+                property: crate::parser::ast::MemberProp::Ident(ident("name")),
+                is_computed: false,
+            },
+        ))))]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::LoadProperty),
+            "expected LoadProperty slot, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_named_property_store() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        use crate::parser::ast::{AssignExpr, AssignOp, AssignTarget, MemberExpr};
+        // `obj.x = 1` → StoreProperty slot.
+        let prog = make_program(vec![Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(Expr::Assign(Box::new(AssignExpr {
+                loc: span(),
+                op: AssignOp::Assign,
+                left: AssignTarget::Expr(Box::new(Expr::Member(Box::new(MemberExpr {
+                    loc: span(),
+                    object: Box::new(ident_expr("obj")),
+                    property: crate::parser::ast::MemberProp::Ident(ident("x")),
+                    is_computed: false,
+                })))),
+                right: Box::new(num_expr(1.0)),
+            }))),
+        })]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::StoreProperty),
+            "expected StoreProperty slot, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_keyed_property_load() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        use crate::parser::ast::MemberExpr;
+        // `obj[key]` → KeyedLoadProperty slot.
+        let prog = make_program(vec![return_stmt(Some(Expr::Member(Box::new(
+            MemberExpr {
+                loc: span(),
+                object: Box::new(ident_expr("obj")),
+                property: crate::parser::ast::MemberProp::Computed(Box::new(ident_expr("key"))),
+                is_computed: true,
+            },
+        ))))]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::KeyedLoadProperty),
+            "expected KeyedLoadProperty slot, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_keyed_property_store() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        use crate::parser::ast::{AssignExpr, AssignOp, AssignTarget, MemberExpr};
+        // `obj[key] = 1` → KeyedStoreProperty slot.
+        let prog = make_program(vec![Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(Expr::Assign(Box::new(AssignExpr {
+                loc: span(),
+                op: AssignOp::Assign,
+                left: AssignTarget::Expr(Box::new(Expr::Member(Box::new(MemberExpr {
+                    loc: span(),
+                    object: Box::new(ident_expr("obj")),
+                    property: crate::parser::ast::MemberProp::Computed(Box::new(ident_expr("key"))),
+                    is_computed: true,
+                })))),
+                right: Box::new(num_expr(1.0)),
+            }))),
+        })]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::KeyedStoreProperty),
+            "expected KeyedStoreProperty slot, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_fn_decl() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        // `function add(a, b) { return a + b; }` → CreateClosure slot.
+        let body = BlockStmt {
+            loc: span(),
+            body: vec![return_stmt(Some(Expr::Binary(Box::new(BinaryExpr {
+                loc: span(),
+                op: BinaryOp::Add,
+                left: Box::new(ident_expr("a")),
+                right: Box::new(ident_expr("b")),
+            }))))],
+        };
+        let prog = make_program(vec![Stmt::FnDecl(Box::new(FnDecl {
+            loc: span(),
+            id: Some(ident("add")),
+            is_async: false,
+            is_generator: false,
+            params: vec![
+                Param {
+                    loc: span(),
+                    pat: Pat::Ident(ident("a")),
+                    default: None,
+                },
+                Param {
+                    loc: span(),
+                    pat: Pat::Ident(ident("b")),
+                    default: None,
+                },
+            ],
+            body,
+        }))]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::CreateClosure),
+            "expected CreateClosure slot, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_typeof() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        use crate::parser::ast::UnaryExpr;
+        // `typeof x` → TypeOf slot.
+        let prog = make_program(vec![return_stmt(Some(Expr::Unary(Box::new(UnaryExpr {
+            loc: span(),
+            op: crate::parser::ast::UnaryOp::Typeof,
+            argument: Box::new(ident_expr("x")),
+        }))))]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::TypeOf),
+            "expected TypeOf slot, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_unary_negate() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        use crate::parser::ast::UnaryExpr;
+        // `-x` → UnaryOp slot.
+        let prog = make_program(vec![return_stmt(Some(Expr::Unary(Box::new(UnaryExpr {
+            loc: span(),
+            op: crate::parser::ast::UnaryOp::Minus,
+            argument: Box::new(ident_expr("x")),
+        }))))]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::UnaryOp),
+            "expected UnaryOp slot, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_increment() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        use crate::parser::ast::UpdateExpr;
+        // `i++` → BinaryOpInc slot.
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "i", Some(num_expr(0.0))),
+            Stmt::Expr(ExprStmt {
+                loc: span(),
+                expr: Box::new(Expr::Update(Box::new(UpdateExpr {
+                    loc: span(),
+                    op: crate::parser::ast::UpdateOp::Increment,
+                    prefix: false,
+                    argument: Box::new(ident_expr("i")),
+                }))),
+            }),
+        ]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::BinaryOpInc),
+            "expected BinaryOpInc slot, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_decrement() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        use crate::parser::ast::UpdateExpr;
+        // `--i` → BinaryOpInc slot (same kind as increment).
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "i", Some(num_expr(5.0))),
+            Stmt::Expr(ExprStmt {
+                loc: span(),
+                expr: Box::new(Expr::Update(Box::new(UpdateExpr {
+                    loc: span(),
+                    op: crate::parser::ast::UpdateOp::Decrement,
+                    prefix: true,
+                    argument: Box::new(ident_expr("i")),
+                }))),
+            }),
+        ]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::BinaryOpInc),
+            "expected BinaryOpInc slot for decrement, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_array_literal() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        use crate::parser::ast::ArrayExpr;
+        // `[1, 2, 3]` → at least one Literal slot (CreateEmptyArrayLiteral)
+        // plus KeyedStoreProperty slots for StaInArrayLiteral.
+        let prog = make_program(vec![return_stmt(Some(Expr::Array(Box::new(ArrayExpr {
+            loc: span(),
+            elements: vec![
+                Some(num_expr(1.0)),
+                Some(num_expr(2.0)),
+                Some(num_expr(3.0)),
+            ],
+        }))))]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::Literal),
+            "expected Literal slot for array creation, got {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&FeedbackSlotKind::KeyedStoreProperty),
+            "expected KeyedStoreProperty slot for StaInArrayLiteral, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_strict_not_equal() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        // `a !== b` → one Compare slot (TestEqualStrict + LogicalNot).
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "a", Some(num_expr(1.0))),
+            var_decl_stmt(VarKind::Let, "b", Some(num_expr(2.0))),
+            return_stmt(Some(Expr::Binary(Box::new(BinaryExpr {
+                loc: span(),
+                op: BinaryOp::StrictNotEq,
+                left: Box::new(ident_expr("a")),
+                right: Box::new(ident_expr("b")),
+            })))),
+        ]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::Compare),
+            "expected Compare slot for !==, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slot_indices_embedded_in_bytecode() {
+        // Verify that the FeedbackSlot operands in the encoded bytecode are
+        // consecutive indices 0, 1, 2, … and match the metadata slot count.
+        use crate::bytecode::bytecodes::Operand;
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "x", Some(num_expr(1.0))),
+            var_decl_stmt(VarKind::Let, "y", Some(num_expr(2.0))),
+            // Two binary ops → two distinct FeedbackSlot operands.
+            var_decl_stmt(
+                VarKind::Let,
+                "a",
+                Some(Expr::Binary(Box::new(BinaryExpr {
+                    loc: span(),
+                    op: BinaryOp::Add,
+                    left: Box::new(ident_expr("x")),
+                    right: Box::new(ident_expr("y")),
+                }))),
+            ),
+            return_stmt(Some(Expr::Binary(Box::new(BinaryExpr {
+                loc: span(),
+                op: BinaryOp::Mul,
+                left: Box::new(ident_expr("x")),
+                right: Box::new(ident_expr("y")),
+            })))),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instructions = arr.instructions().expect("valid bytecode");
+
+        // Collect all FeedbackSlot operand values used in the bytecode.
+        let mut slot_indices: Vec<u32> = instructions
+            .iter()
+            .flat_map(|instr| &instr.operands)
+            .filter_map(|op| {
+                if let Operand::FeedbackSlot(idx) = op {
+                    Some(*idx)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        slot_indices.sort_unstable();
+        slot_indices.dedup();
+
+        let slot_count = arr.feedback_metadata().slot_count();
+        // Every embedded slot index must be within [0, slot_count).
+        for &idx in &slot_indices {
+            assert!(
+                idx < slot_count,
+                "slot index {idx} >= metadata slot_count {slot_count}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_feedback_metadata_no_slots_for_constant_only_program() {
+        // A program that only loads constants and returns has no IC sites,
+        // so the feedback metadata should be empty.
+        let prog = make_program(vec![return_stmt(Some(num_expr(42.0)))]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        assert_eq!(arr.feedback_metadata().slot_count(), 0);
+    }
+
+    #[test]
+    fn test_feedback_metadata_instanceof() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        // `x instanceof Array` → InstanceOf slot.
+        let prog = make_program(vec![return_stmt(Some(Expr::Binary(Box::new(
+            BinaryExpr {
+                loc: span(),
+                op: BinaryOp::Instanceof,
+                left: Box::new(ident_expr("x")),
+                right: Box::new(ident_expr("Array")),
+            },
+        ))))]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::InstanceOf),
+            "expected InstanceOf slot, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_vector_from_compiled_array() {
+        // End-to-end: compile a program, build a FeedbackVector from the
+        // resulting metadata, and verify states start Uninitialized.
+        use crate::bytecode::feedback::{FeedbackVector, InlineCacheState};
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "x", Some(num_expr(1.0))),
+            return_stmt(Some(Expr::Binary(Box::new(BinaryExpr {
+                loc: span(),
+                op: BinaryOp::Add,
+                left: Box::new(ident_expr("x")),
+                right: Box::new(num_expr(2.0)),
+            })))),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let metadata = arr.feedback_metadata();
+        let vector = FeedbackVector::new(metadata);
+        assert_eq!(vector.slot_count(), metadata.slot_count());
+        for i in 0..vector.slot_count() {
+            assert_eq!(vector.get_state(i), Some(InlineCacheState::Uninitialized));
+        }
+    }
 }
