@@ -17,7 +17,9 @@
 //!   pool and source-position table.  [`bytecode::register`] provides the
 //!   [`bytecode::register::Register`] type and
 //!   [`bytecode::register::RegisterAllocator`] for register assignment during
-//!   compilation.
+//!   compilation.  [`bytecode::bytecode_generator`] provides the
+//!   [`bytecode::bytecode_generator::BytecodeGenerator`] that compiles a
+//!   JavaScript AST into a [`bytecode::bytecode_array::BytecodeArray`].
 
 /// Bytecode instruction set and encode/decode utilities.
 pub mod bytecode;
