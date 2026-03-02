@@ -458,7 +458,7 @@ impl JsValue {
                 Ok(parts?.join(","))
             }
             Self::Generator(_) => Ok("[object Generator]".to_string()),
-            Self::Iterator(_) => Ok("[object Array Iterator]".to_string()),
+            Self::Iterator(_) => Ok("[object Iterator]".to_string()),
         }
     }
 }

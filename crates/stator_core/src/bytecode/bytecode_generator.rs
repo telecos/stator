@@ -2235,7 +2235,8 @@ impl FunctionCompiler {
         self.loop_stack.pop();
         self.pop_scope();
 
-        // Release temporaries in LIFO order (val_reg last-allocated → first).
+        // Release temporaries in reverse allocation order (val_reg was allocated
+        // after iter_reg, so it must be released first).
         self.allocator
             .release_temporary(val_reg)
             .map_err(|e| StatorError::Internal(e.to_string()))?;
