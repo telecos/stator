@@ -10,7 +10,7 @@
 //! `_create` functions and must release them with the corresponding `_destroy`
 //! function.
 
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::io::Write as _;
 
 use stator_core::bytecode::bytecode_array::BytecodeArray;
@@ -680,6 +680,214 @@ pub unsafe extern "C" fn stator_script_free(script: *mut StatorScript) {
     }
 }
 
+// ── Platform vtable ───────────────────────────────────────────────────────────
+
+/// C-compatible vtable that embedders fill in to customise engine behaviour.
+///
+/// All fields are optional (`Option<…>`).  When a field is `None` the engine
+/// falls back to a default (no-op or zero).
+///
+/// # Safety requirements for callers
+/// Every function pointer, if set, must remain valid for the entire lifetime of
+/// the owning [`StatorPlatform`].  Calling [`stator_platform_destroy`] on the
+/// platform is the only safe point at which the function pointers may be
+/// invalidated.
+#[repr(C)]
+pub struct StatorPlatformVTable {
+    /// Return the number of worker threads available for background work.
+    ///
+    /// May be `None`; in that case the engine defaults to `0`.
+    pub number_of_worker_threads: Option<unsafe extern "C" fn() -> u32>,
+
+    /// Schedule `task` for execution on a platform thread.
+    ///
+    /// The platform takes ownership of `task`.  May be `None` (tasks are
+    /// silently dropped).
+    pub post_task: Option<unsafe extern "C" fn(task: *mut c_void)>,
+
+    /// Return a monotonically increasing time in seconds.
+    ///
+    /// May be `None`; the engine returns `0.0` when unset.
+    pub monotonically_increasing_time: Option<unsafe extern "C" fn() -> f64>,
+
+    /// Return the current wall-clock time in milliseconds since the Unix epoch.
+    ///
+    /// May be `None`; the engine returns `0.0` when unset.
+    pub current_clock_time_millis: Option<unsafe extern "C" fn() -> f64>,
+}
+
+/// Rust-side wrapper around a [`StatorPlatformVTable`] that implements the
+/// [`stator_core::platform::Platform`] trait.
+struct VTablePlatformImpl {
+    vtable: StatorPlatformVTable,
+}
+
+// SAFETY: The vtable function pointers are inherently thread-safe (they are
+// stateless C function pointers, not closures); the embedder is responsible
+// for ensuring any global state they access is thread-safe.
+unsafe impl Send for VTablePlatformImpl {}
+
+impl stator_core::platform::Platform for VTablePlatformImpl {
+    fn number_of_worker_threads(&self) -> u32 {
+        // SAFETY: The vtable pointer is valid for the lifetime of the platform.
+        self.vtable
+            .number_of_worker_threads
+            .map_or(0, |f| unsafe { f() })
+    }
+
+    unsafe fn post_task(&self, task: *mut c_void) {
+        if let Some(f) = self.vtable.post_task {
+            // SAFETY: caller upholds the `post_task` contract; the vtable
+            // pointer is valid for the lifetime of the platform.
+            unsafe { f(task) };
+        }
+    }
+
+    fn monotonically_increasing_time(&self) -> f64 {
+        // SAFETY: The vtable pointer is valid for the lifetime of the platform.
+        self.vtable
+            .monotonically_increasing_time
+            .map_or(0.0, |f| unsafe { f() })
+    }
+
+    fn current_clock_time_millis(&self) -> f64 {
+        // SAFETY: The vtable pointer is valid for the lifetime of the platform.
+        self.vtable
+            .current_clock_time_millis
+            .map_or(0.0, |f| unsafe { f() })
+    }
+}
+
+/// An opaque handle to an embedder-provided platform implementation.
+///
+/// Created by [`stator_platform_new`] and destroyed by
+/// [`stator_platform_destroy`].
+pub struct StatorPlatform {
+    inner: Box<dyn stator_core::platform::Platform>,
+}
+
+/// Create a new platform from an embedder-supplied vtable.
+///
+/// The vtable is copied by value; the caller does not need to keep the
+/// original `StatorPlatformVTable` alive after this call returns.
+///
+/// Returns a null pointer if `vtable` is null.  The caller must eventually
+/// pass the returned pointer to [`stator_platform_destroy`].
+///
+/// # Safety
+/// - `vtable` must be either null or a valid, readable pointer to a
+///   [`StatorPlatformVTable`].
+/// - All non-null function pointers stored in the vtable must remain callable
+///   for the entire lifetime of the returned [`StatorPlatform`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_platform_new(
+    vtable: *const StatorPlatformVTable,
+) -> *mut StatorPlatform {
+    if vtable.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `vtable` is a valid, readable pointer.
+    let copied = unsafe {
+        StatorPlatformVTable {
+            number_of_worker_threads: (*vtable).number_of_worker_threads,
+            post_task: (*vtable).post_task,
+            monotonically_increasing_time: (*vtable).monotonically_increasing_time,
+            current_clock_time_millis: (*vtable).current_clock_time_millis,
+        }
+    };
+    Box::into_raw(Box::new(StatorPlatform {
+        inner: Box::new(VTablePlatformImpl { vtable: copied }),
+    }))
+}
+
+/// Destroy a platform previously created with [`stator_platform_new`].
+///
+/// After this call the pointer is invalid and must not be used.
+///
+/// # Safety
+/// - `platform` must be a non-null pointer returned by `stator_platform_new`.
+/// - `platform` must not be used again after this call.
+/// - This function must not be called more than once for the same pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_platform_destroy(platform: *mut StatorPlatform) {
+    if !platform.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw` in `stator_platform_new`.
+        drop(unsafe { Box::from_raw(platform) });
+    }
+}
+
+/// Return the number of worker threads reported by `platform`.
+///
+/// Returns `0` when `platform` is null or the vtable entry was not set.
+///
+/// # Safety
+/// `platform` must be either null or a valid, live [`StatorPlatform`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_platform_number_of_worker_threads(
+    platform: *const StatorPlatform,
+) -> u32 {
+    if platform.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `platform` is valid.
+    unsafe { (*platform).inner.number_of_worker_threads() }
+}
+
+/// Schedule `task` for execution on `platform`.
+///
+/// Does nothing when `platform` is null, `task` is null, or the vtable entry
+/// was not set.
+///
+/// # Safety
+/// - `platform` must be either null or a valid, live [`StatorPlatform`] pointer.
+/// - `task` must be a non-null pointer whose lifetime the caller manages;
+///   ownership of `task` is transferred to the platform on this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_platform_post_task(
+    platform: *const StatorPlatform,
+    task: *mut c_void,
+) {
+    if platform.is_null() || task.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees both pointers are valid.
+    unsafe { (*platform).inner.post_task(task) };
+}
+
+/// Return the monotonically increasing time (seconds) from `platform`.
+///
+/// Returns `0.0` when `platform` is null or the vtable entry was not set.
+///
+/// # Safety
+/// `platform` must be either null or a valid, live [`StatorPlatform`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_platform_monotonically_increasing_time(
+    platform: *const StatorPlatform,
+) -> f64 {
+    if platform.is_null() {
+        return 0.0;
+    }
+    // SAFETY: caller guarantees `platform` is valid.
+    unsafe { (*platform).inner.monotonically_increasing_time() }
+}
+
+/// Return the current clock time in milliseconds from `platform`.
+///
+/// Returns `0.0` when `platform` is null or the vtable entry was not set.
+///
+/// # Safety
+/// `platform` must be either null or a valid, live [`StatorPlatform`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_platform_current_clock_time_millis(
+    platform: *const StatorPlatform,
+) -> f64 {
+    if platform.is_null() {
+        return 0.0;
+    }
+    // SAFETY: caller guarantees `platform` is valid.
+    unsafe { (*platform).inner.current_clock_time_millis() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -983,5 +1191,162 @@ mod tests {
         unsafe { stator_bytecode_dump(script) };
         // SAFETY: `script` is non-null and live.
         unsafe { stator_script_free(script) };
+    }
+
+    // ── Platform vtable ───────────────────────────────────────────────────────
+
+    /// C callback: returns a fixed thread count of 4.
+    unsafe extern "C" fn cb_worker_threads() -> u32 {
+        4
+    }
+
+    /// C callback: returns a fixed monotonic time.
+    unsafe extern "C" fn cb_monotonic_time() -> f64 {
+        1.5
+    }
+
+    /// C callback: returns a fixed clock time.
+    unsafe extern "C" fn cb_clock_millis() -> f64 {
+        1_000.0
+    }
+
+    /// C callback for post_task: stores the task pointer in a global so tests
+    /// can verify it was received.
+    static LAST_TASK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn cb_post_task(task: *mut c_void) {
+        LAST_TASK.store(task as usize, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn test_platform_new_returns_nonnull() {
+        let vtable = StatorPlatformVTable {
+            number_of_worker_threads: Some(cb_worker_threads),
+            post_task: Some(cb_post_task),
+            monotonically_increasing_time: Some(cb_monotonic_time),
+            current_clock_time_millis: Some(cb_clock_millis),
+        };
+        // SAFETY: `vtable` is a valid, fully-initialised vtable.
+        let platform = unsafe { stator_platform_new(&raw const vtable) };
+        assert!(!platform.is_null());
+        // SAFETY: `platform` is non-null and live.
+        unsafe { stator_platform_destroy(platform) };
+    }
+
+    #[test]
+    fn test_platform_null_vtable_returns_null() {
+        // SAFETY: null vtable is documented to return null.
+        let platform = unsafe { stator_platform_new(std::ptr::null()) };
+        assert!(platform.is_null());
+    }
+
+    #[test]
+    fn test_platform_destroy_null_is_safe() {
+        // SAFETY: null is documented as a no-op.
+        unsafe { stator_platform_destroy(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_platform_number_of_worker_threads_callback() {
+        let vtable = StatorPlatformVTable {
+            number_of_worker_threads: Some(cb_worker_threads),
+            post_task: None,
+            monotonically_increasing_time: None,
+            current_clock_time_millis: None,
+        };
+        // SAFETY: `vtable` is a valid pointer.
+        let platform = unsafe { stator_platform_new(&raw const vtable) };
+        assert!(!platform.is_null());
+        // SAFETY: `platform` is non-null and live.
+        let threads = unsafe { stator_platform_number_of_worker_threads(platform) };
+        assert_eq!(threads, 4);
+        // SAFETY: `platform` is non-null and live.
+        unsafe { stator_platform_destroy(platform) };
+    }
+
+    #[test]
+    fn test_platform_monotonically_increasing_time_callback() {
+        let vtable = StatorPlatformVTable {
+            number_of_worker_threads: None,
+            post_task: None,
+            monotonically_increasing_time: Some(cb_monotonic_time),
+            current_clock_time_millis: None,
+        };
+        // SAFETY: `vtable` is a valid pointer.
+        let platform = unsafe { stator_platform_new(&raw const vtable) };
+        // SAFETY: `platform` is non-null and live.
+        let t = unsafe { stator_platform_monotonically_increasing_time(platform) };
+        assert!((t - 1.5).abs() < f64::EPSILON);
+        // SAFETY: `platform` is non-null and live.
+        unsafe { stator_platform_destroy(platform) };
+    }
+
+    #[test]
+    fn test_platform_current_clock_time_millis_callback() {
+        let vtable = StatorPlatformVTable {
+            number_of_worker_threads: None,
+            post_task: None,
+            monotonically_increasing_time: None,
+            current_clock_time_millis: Some(cb_clock_millis),
+        };
+        // SAFETY: `vtable` is a valid pointer.
+        let platform = unsafe { stator_platform_new(&raw const vtable) };
+        // SAFETY: `platform` is non-null and live.
+        let ms = unsafe { stator_platform_current_clock_time_millis(platform) };
+        assert!((ms - 1_000.0).abs() < f64::EPSILON);
+        // SAFETY: `platform` is non-null and live.
+        unsafe { stator_platform_destroy(platform) };
+    }
+
+    #[test]
+    fn test_platform_post_task_callback() {
+        let vtable = StatorPlatformVTable {
+            number_of_worker_threads: None,
+            post_task: Some(cb_post_task),
+            monotonically_increasing_time: None,
+            current_clock_time_millis: None,
+        };
+        // SAFETY: `vtable` is a valid pointer.
+        let platform = unsafe { stator_platform_new(&raw const vtable) };
+        let sentinel = 0xDEAD_BEEFusize as *mut c_void;
+        // Reset global before the call.
+        LAST_TASK.store(0, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: `platform` is non-null and live; `sentinel` is a valid (if
+        // fake) task pointer for the purposes of this test.
+        unsafe { stator_platform_post_task(platform, sentinel) };
+        assert_eq!(
+            LAST_TASK.load(std::sync::atomic::Ordering::SeqCst),
+            sentinel as usize,
+            "post_task callback should have stored the sentinel pointer"
+        );
+        // SAFETY: `platform` is non-null and live.
+        unsafe { stator_platform_destroy(platform) };
+    }
+
+    #[test]
+    fn test_platform_none_callbacks_return_defaults() {
+        let vtable = StatorPlatformVTable {
+            number_of_worker_threads: None,
+            post_task: None,
+            monotonically_increasing_time: None,
+            current_clock_time_millis: None,
+        };
+        // SAFETY: `vtable` is a valid pointer.
+        let platform = unsafe { stator_platform_new(&raw const vtable) };
+        // SAFETY: `platform` is non-null and live.
+        assert_eq!(
+            unsafe { stator_platform_number_of_worker_threads(platform) },
+            0
+        );
+        assert!(
+            (unsafe { stator_platform_monotonically_increasing_time(platform) } - 0.0).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (unsafe { stator_platform_current_clock_time_millis(platform) } - 0.0).abs()
+                < f64::EPSILON
+        );
+        // SAFETY: `platform` is non-null and live.
+        unsafe { stator_platform_destroy(platform) };
     }
 }

@@ -44,5 +44,7 @@ pub mod interpreter;
 pub mod objects;
 /// JavaScript parser infrastructure (lexer and AST node definitions).
 pub mod parser;
+/// Platform abstraction for embedder-provided task scheduling and timing.
+pub mod platform;
 /// Bump-pointer region allocator for compiler temporaries.
 pub mod zone;
