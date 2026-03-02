@@ -6,5 +6,7 @@
 //! [`JsValue`][crate::objects::value::JsValue] types and do **not** touch the
 //! GC heap or the interpreter; they can therefore be unit-tested in isolation.
 
+/// ECMAScript §23.1 `Array` built-in static methods and prototype equivalents.
+pub mod array;
 /// ECMAScript §20.1 `Object` built-in static methods.
 pub mod object;
