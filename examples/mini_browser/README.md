@@ -5,17 +5,18 @@ content layer) would use the Stator JavaScript engine via its C FFI API.
 
 ## What it does
 
-The sample simulates the lifecycle of two browser tabs, each owning its own
-Stator *isolate*:
+The sample exercises the Phase 1 GC and object model to simulate a browser tab
+lifecycle:
 
-1. **Create isolate** — one engine instance per tab.
-2. **Parse HTML** — a trivial `<script>` extractor pulls inline scripts out of
-   a raw HTML string.
-3. **Execute scripts** — the extracted script source is passed to the engine
-   *(stubbed until the interpreter is implemented)*.
-4. **GC** — a minor collection is triggered after the page load to reclaim
-   short-lived heap objects.
-5. **Destroy isolate** — all resources are released when the tab closes.
+1. **Create isolate and context** — one engine instance and execution context.
+2. **Allocate values** — a number, a string, and an object with named
+   properties are created via the FFI.
+3. **Inspect values** — types and contents are read back through the API.
+4. **GC with live handles** — a minor collection is triggered; objects survive
+   because handles are still held.
+5. **Release handles, GC again** — handles are destroyed and a second GC
+   confirms all objects are reclaimed.
+6. **Print heap stats** — final bytes-used and capacity are reported.
 
 ## Prerequisites
 
@@ -62,35 +63,14 @@ cmake --build build
 ./build/mini_browser
 ```
 
-Expected output (once the interpreter is wired up the `(not yet implemented)`
-lines will be replaced with actual results):
+Expected output:
 
 ```
-=== Stator mini-browser (placeholder) ===
-
-[tab] opening   https://example.com/page-a
-[tab] loading   https://example.com/page-a
-[tab] parsed    HTML document
-[tab] found     1 inline script(s)
-[tab] executing script[0]: console.log('page A loaded');
-[tab] (script execution not yet implemented)
-[tab] gc        collecting nursery
-[tab] loaded    https://example.com/page-a
-[tab] closing   https://example.com/page-a
-
-[tab] opening   https://example.com/page-b
-[tab] loading   https://example.com/page-b
-[tab] parsed    HTML document
-[tab] found     2 inline script(s)
-[tab] executing script[0]: const x = 1 + 2;
-[tab] (script execution not yet implemented)
-[tab] executing script[1]: console.log('x =', x);
-[tab] (script execution not yet implemented)
-[tab] gc        collecting nursery
-[tab] loaded    https://example.com/page-b
-[tab] closing   https://example.com/page-b
-
-Done.
+[tab] created context
+[tab] allocated: number(42), string("hello"), object{x: 1, y: 2}
+[tab] GC: 3 objects survived (held by handles)
+[tab] released handles, GC: 0 objects (all reclaimed)
+[tab] heap: 0 bytes used / 8388608 bytes capacity
 ```
 
 ## File layout
@@ -110,13 +90,20 @@ examples/mini_browser/
 | Function | Description |
 |---|---|
 | `stator_isolate_create()` | Allocate a new engine instance |
-| `stator_isolate_gc()` | Trigger a minor GC on the isolate heap |
-| `stator_isolate_destroy()` | Release all isolate resources |
-
-Future API additions (planned, not yet implemented):
-
-| Function | Description |
-|---|---|
-| `stator_context_create(isolate)` | Create a JS execution context |
-| `stator_context_eval(ctx, src, len)` | Execute a JavaScript source string |
-| `stator_context_destroy(ctx)` | Release context resources |
+| `stator_context_new(isolate)` | Create an execution context |
+| `stator_value_new_number(isolate, val)` | Create a number value handle |
+| `stator_value_new_string(isolate, data, len)` | Create a string value handle |
+| `stator_object_new(isolate)` | Create an empty object handle |
+| `stator_object_set(obj, key, val)` | Set a named property |
+| `stator_object_get(obj, key)` | Get a named property as a new value handle |
+| `stator_value_type(val)` | Return the type name (`"number"` or `"string"`) |
+| `stator_value_as_number(val)` | Extract the numeric value |
+| `stator_value_as_string(val)` | Extract the string contents |
+| `stator_gc_collect(isolate)` | Trigger a minor GC |
+| `stator_live_object_count(isolate)` | Count live embedder-held handles |
+| `stator_heap_used(isolate)` | Young-generation bytes currently in use |
+| `stator_heap_capacity(isolate)` | Total young-generation capacity |
+| `stator_value_destroy(val)` | Release a value handle |
+| `stator_object_destroy(obj)` | Release an object handle |
+| `stator_context_destroy(ctx)` | Release a context |
+| `stator_isolate_destroy(isolate)` | Release all isolate resources |
