@@ -166,6 +166,15 @@ struct FunctionCompiler {
     slot_kinds: Vec<FeedbackSlotKind>,
     /// Per-function exception handler table entries.
     handler_table: Vec<HandlerTableEntry>,
+    /// `true` when compiling a `function*` generator body.
+    ///
+    /// Affects `finalize` (marks the [`BytecodeArray`] with
+    /// [`BytecodeArray::with_generator_flag`]) and enables `yield` /
+    /// `yield*` compilation.
+    is_generator: bool,
+    /// Counter used to generate unique `suspend_id` immediates for each
+    /// [`Opcode::SuspendGenerator`] instruction in this function.
+    yield_suspend_id: u32,
 }
 
 impl FunctionCompiler {
@@ -186,6 +195,8 @@ impl FunctionCompiler {
             param_count,
             slot_kinds: Vec::new(),
             handler_table: Vec::new(),
+            is_generator: false,
+            yield_suspend_id: 0,
         };
         for (i, param) in params.iter().enumerate() {
             match &param.pat {
@@ -374,9 +385,10 @@ impl FunctionCompiler {
             }
             Stmt::Empty(_) => Ok(()),
             Stmt::Switch(s) => self.compile_switch(s),
-            Stmt::ForIn(_) | Stmt::ForOf(_) | Stmt::With(_) | Stmt::ClassDecl(_) => Err(
-                StatorError::Internal(format!("{} is not yet supported", stmt_kind(stmt))),
-            ),
+            Stmt::ForIn(_) | Stmt::With(_) | Stmt::ClassDecl(_) => Err(StatorError::Internal(
+                format!("{} is not yet supported", stmt_kind(stmt)),
+            )),
+            Stmt::ForOf(s) => self.compile_for_of(s),
         }
     }
 
@@ -422,12 +434,12 @@ impl FunctionCompiler {
     /// resulting [`BytecodeArray`] to the constant pool, emit `CreateClosure`,
     /// and bind the name to the resulting register.
     fn compile_fn_decl(&mut self, decl: &FnDecl) -> StatorResult<()> {
-        if decl.is_generator || decl.is_async {
+        if decl.is_async && !decl.is_generator {
             return Err(StatorError::Internal(
-                "generator and async functions are not yet supported".into(),
+                "async functions are not yet supported".into(),
             ));
         }
-        let func_array = compile_function(&decl.params, &decl.body)?;
+        let func_array = compile_function(&decl.params, &decl.body, decl.is_generator)?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         // Emit CreateClosure: [func_idx, slot, flags]
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
@@ -876,9 +888,15 @@ impl FunctionCompiler {
             Expr::New(n) => self.compile_new(n),
 
             // ── Async / generators ────────────────────────────────────────
-            Expr::Yield(_) | Expr::Await(_) => Err(StatorError::Internal(
-                "yield/await are not yet supported".into(),
-            )),
+            Expr::Yield(y) => {
+                if !self.is_generator {
+                    return Err(StatorError::Internal(
+                        "yield expression outside of a generator function".into(),
+                    ));
+                }
+                self.compile_yield(y)
+            }
+            Expr::Await(_) => Err(StatorError::Internal("await is not yet supported".into())),
 
             Expr::TaggedTemplate(_) => Err(StatorError::Internal(
                 "tagged template literals are not yet supported".into(),
@@ -1655,12 +1673,12 @@ impl FunctionCompiler {
 
     /// Compile a function expression.
     fn compile_fn_expr(&mut self, f: &FnExpr) -> StatorResult<()> {
-        if f.is_generator || f.is_async {
+        if f.is_async && !f.is_generator {
             return Err(StatorError::Internal(
-                "generator and async functions are not yet supported".into(),
+                "async function expressions are not yet supported".into(),
             ));
         }
-        let func_array = compile_function(&f.params, &f.body)?;
+        let func_array = compile_function(&f.params, &f.body, f.is_generator)?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
@@ -1693,7 +1711,7 @@ impl FunctionCompiler {
                 }
             }
         };
-        let func_array = compile_function(&a.params, &body_block)?;
+        let func_array = compile_function(&a.params, &body_block, false)?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
@@ -1950,6 +1968,309 @@ impl FunctionCompiler {
         Ok(())
     }
 
+    // ── Generator / yield ────────────────────────────────────────────────────
+
+    /// Compile a `yield [argument]` expression.
+    ///
+    /// Emits:
+    /// 1. The argument expression (or `LdaUndefined` if absent).
+    /// 2. `SuspendGenerator` — suspends the generator with the current acc as
+    ///    the yielded value.
+    /// 3. `ResumeGenerator` — on the next `.next(sent)` call, restores the
+    ///    register file; accumulator becomes the `sent` value (result of the
+    ///    yield expression).
+    fn compile_yield(&mut self, expr: &crate::parser::ast::YieldExpr) -> StatorResult<()> {
+        // Evaluate the yielded value.
+        if let Some(arg) = &expr.argument {
+            if expr.delegate {
+                return self.compile_yield_star(arg);
+            }
+            self.compile_expr(arg)?;
+        } else {
+            self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+        }
+
+        // Dummy register used by generator opcodes (interpreter ignores it).
+        let dummy = Operand::Register(0);
+
+        // SuspendGenerator [gen, regs_start, regs_count, suspend_id]
+        let suspend_id = self.yield_suspend_id;
+        self.yield_suspend_id += 1;
+        self.emit(Instruction::new_unchecked(
+            Opcode::SuspendGenerator,
+            vec![
+                dummy,
+                dummy,
+                Operand::RegisterCount(0),
+                Operand::Immediate(suspend_id as i32),
+            ],
+        ));
+
+        // ResumeGenerator [gen, regs_start, regs_count]
+        // After this, acc = value sent by caller's .next(sent).
+        self.emit(Instruction::new_unchecked(
+            Opcode::ResumeGenerator,
+            vec![dummy, dummy, Operand::RegisterCount(0)],
+        ));
+
+        Ok(())
+    }
+
+    /// Compile a `yield* expr` (delegating yield).
+    ///
+    /// Iterates the inner iterable and re-yields each value to the outer
+    /// caller.  The accumulator is set to `undefined` when delegation
+    /// completes (simplified — does not propagate the inner return value).
+    fn compile_yield_star(&mut self, expr: &crate::parser::ast::Expr) -> StatorResult<()> {
+        // Evaluate the inner iterable → acc.
+        self.compile_expr(expr)?;
+
+        // GetIterator [iterable_reg, load_slot, call_slot]
+        let iterable_reg = self.allocator.allocate_temporary();
+        self.emit_star(iterable_reg);
+        let load_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+        let call_slot = self.alloc_slot(FeedbackSlotKind::Call);
+        self.emit(Instruction::new_unchecked(
+            Opcode::GetIterator,
+            vec![to_reg_op(iterable_reg), load_slot, call_slot],
+        ));
+        self.allocator
+            .release_temporary(iterable_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+
+        // Save the iterator.
+        let iter_reg = self.allocator.allocate_temporary();
+        self.emit_star(iter_reg);
+
+        // Allocate value register for IteratorNext output.
+        let val_reg = self.allocator.allocate_temporary();
+
+        // Loop labels.
+        let loop_lbl = self.new_label();
+        let done_lbl = self.new_label();
+
+        // Bind loop start.
+        self.bind_label(loop_lbl);
+
+        // IteratorNext [iter_reg, val_reg] → val_reg = value, acc = done
+        self.emit(Instruction::new_unchecked(
+            Opcode::IteratorNext,
+            vec![to_reg_op(iter_reg), to_reg_op(val_reg)],
+        ));
+
+        // Jump to done if acc (done flag) is truthy.
+        self.emit_jump_if_true_to(done_lbl);
+
+        // Not done — yield the inner value.
+        let dummy = Operand::Register(0);
+        self.emit_ldar(val_reg);
+
+        let suspend_id = self.yield_suspend_id;
+        self.yield_suspend_id += 1;
+        self.emit(Instruction::new_unchecked(
+            Opcode::SuspendGenerator,
+            vec![
+                dummy,
+                dummy,
+                Operand::RegisterCount(0),
+                Operand::Immediate(suspend_id as i32),
+            ],
+        ));
+        self.emit(Instruction::new_unchecked(
+            Opcode::ResumeGenerator,
+            vec![dummy, dummy, Operand::RegisterCount(0)],
+        ));
+
+        // Jump back to loop start.
+        self.emit_jump_loop_to(loop_lbl);
+
+        // done_lbl: delegation complete.
+        self.bind_label(done_lbl);
+
+        self.allocator
+            .release_temporary(val_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        self.allocator
+            .release_temporary(iter_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+
+        // Result of `yield*` is the inner generator's return value.
+        // Simplified: leave undefined in acc (the done record's value is in
+        // val_reg which was already released; we emit LdaUndefined here).
+        self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+        Ok(())
+    }
+
+    // ── for-of ────────────────────────────────────────────────────────────────
+
+    /// Compile a `for (left of right) body` statement.
+    ///
+    /// Emits `GetIterator` + `IteratorNext` loop:
+    /// ```text
+    /// <compile right>
+    /// Star r_iterable
+    /// GetIterator r_iterable, …
+    /// Star r_iter
+    /// loop_start:
+    ///   IteratorNext r_iter, r_val   // acc = done flag
+    ///   JumpIfToBooleanTrue exit
+    ///   Ldar r_val
+    ///   Star r_x                     // bind loop variable
+    ///   <body>
+    ///   JumpLoop loop_start
+    /// exit:
+    /// ```
+    fn compile_for_of(&mut self, stmt: &crate::parser::ast::ForOfStmt) -> StatorResult<()> {
+        use crate::parser::ast::ForInOfLeft;
+
+        // Open the loop's own scope early so that the loop variable is defined
+        // as a local BEFORE any temporaries are allocated.  This ensures the
+        // register allocator assigns the variable a lower index than the iter/val
+        // temporaries and avoids LIFO-order conflicts during `release_temporary`.
+        self.push_scope();
+
+        // If the left-hand side declares a new variable, pre-allocate its
+        // local register now (before any temporaries are allocated below).
+        let loop_var_reg: Option<Register> = match &stmt.left {
+            ForInOfLeft::VarDecl(decl) => {
+                if decl.declarators.len() == 1 {
+                    match &decl.declarators[0].id {
+                        crate::parser::ast::Pat::Ident(id) => Some(self.define_local(&id.name)),
+                        _ => {
+                            return Err(StatorError::Internal(
+                                "destructuring in for-of is not yet supported".into(),
+                            ));
+                        }
+                    }
+                } else if decl.declarators.is_empty() {
+                    None
+                } else {
+                    return Err(StatorError::Internal(
+                        "multiple declarators in for-of are not supported".into(),
+                    ));
+                }
+            }
+            ForInOfLeft::Pat(_) => None, // existing variable — no new allocation
+        };
+
+        // Evaluate the right-hand (iterable) expression → acc.
+        self.compile_expr(&stmt.right)?;
+
+        // Store iterable in a temporary register for GetIterator, then release.
+        let iterable_reg = self.allocator.allocate_temporary();
+        self.emit_star(iterable_reg);
+        let op = if stmt.is_await {
+            Opcode::GetAsyncIterator
+        } else {
+            Opcode::GetIterator
+        };
+        let load_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+        let call_slot = self.alloc_slot(FeedbackSlotKind::Call);
+        self.emit(Instruction::new_unchecked(
+            op,
+            vec![to_reg_op(iterable_reg), load_slot, call_slot],
+        ));
+        self.allocator
+            .release_temporary(iterable_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+
+        // Save iterator in a temporary register.
+        let iter_reg = self.allocator.allocate_temporary();
+        self.emit_star(iter_reg);
+
+        // Allocate value-output register for IteratorNext.
+        let val_reg = self.allocator.allocate_temporary();
+
+        // Loop labels.
+        let loop_lbl = self.new_label();
+        let break_lbl = self.new_label();
+        self.loop_stack.push((loop_lbl, break_lbl));
+
+        // Bind loop start.
+        self.bind_label(loop_lbl);
+
+        // IteratorNext [iter_reg, val_reg] → val_reg = value, acc = done
+        self.emit(Instruction::new_unchecked(
+            Opcode::IteratorNext,
+            vec![to_reg_op(iter_reg), to_reg_op(val_reg)],
+        ));
+
+        // Jump to break if done.
+        self.emit_jump_if_true_to(break_lbl);
+
+        // Bind loop variable.
+        match &stmt.left {
+            ForInOfLeft::VarDecl(_) => {
+                // Loop variable was pre-allocated above.
+                if let Some(reg) = loop_var_reg {
+                    self.emit_ldar(val_reg);
+                    self.emit_star(reg);
+                }
+            }
+            ForInOfLeft::Pat(pat) => match pat {
+                crate::parser::ast::Pat::Ident(id) => {
+                    let reg = self.lookup_var(&id.name).ok_or_else(|| {
+                        StatorError::Internal(format!("for-of: undefined variable '{}'", id.name))
+                    })?;
+                    self.emit_ldar(val_reg);
+                    self.emit_star(reg);
+                }
+                _ => {
+                    return Err(StatorError::Internal(
+                        "destructuring in for-of is not yet supported".into(),
+                    ));
+                }
+            },
+        }
+
+        // Compile the loop body (no extra scope — scope was opened above).
+        self.compile_stmt(&stmt.body)?;
+
+        // Back-edge jump.
+        self.emit_jump_loop_to(loop_lbl);
+
+        // Bind break target.
+        self.bind_label(break_lbl);
+
+        self.loop_stack.pop();
+        self.pop_scope();
+
+        // Release temporaries in reverse allocation order (val_reg was allocated
+        // after iter_reg, so it must be released first).
+        self.allocator
+            .release_temporary(val_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        self.allocator
+            .release_temporary(iter_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Emit a `JumpIfToBooleanTrue` to `label_idx` (forward or backward).
+    fn emit_jump_if_true_to(&mut self, label_idx: usize) {
+        let jump_idx = self.instructions.len();
+        self.labels[label_idx].refs.push(jump_idx);
+        self.emit(Instruction::new_unchecked(
+            Opcode::JumpIfToBooleanTrue,
+            vec![Operand::JumpOffset(0)],
+        ));
+    }
+
+    /// Emit a `JumpLoop` (back-edge) to `label_idx`.
+    fn emit_jump_loop_to(&mut self, label_idx: usize) {
+        let jump_idx = self.instructions.len();
+        self.labels[label_idx].refs.push(jump_idx);
+        self.emit(Instruction::new_unchecked(
+            Opcode::JumpLoop,
+            vec![
+                Operand::JumpOffset(0),
+                Operand::Immediate(0),
+                Operand::FeedbackSlot(0),
+            ],
+        ));
+    }
+
     // ── Finalization ─────────────────────────────────────────────────────────
 
     /// Resolve all jump offsets and encode the instruction stream into a
@@ -1972,7 +2293,7 @@ impl FunctionCompiler {
         let frame_size = self.allocator.frame_size();
         let bytes = encode(&self.instructions);
         let feedback_metadata = FeedbackMetadata::new(self.slot_kinds);
-        Ok(BytecodeArray::new(
+        let ba = BytecodeArray::new(
             bytes,
             self.constant_pool,
             frame_size,
@@ -1980,7 +2301,8 @@ impl FunctionCompiler {
             self.source_positions,
             feedback_metadata,
             self.handler_table,
-        ))
+        );
+        Ok(ba.with_generator_flag(self.is_generator))
     }
 }
 
@@ -2037,11 +2359,28 @@ fn resolve_jumps(instructions: &mut [Instruction], labels: &[Label]) -> StatorRe
 
 /// Compile a function body with the given parameter list into a
 /// [`BytecodeArray`].
+///
+/// When `is_generator` is `true`:
+/// - The produced [`BytecodeArray`] is marked with
+///   [`BytecodeArray::with_generator_flag(true)`][BytecodeArray::with_generator_flag].
+/// - A [`Opcode::SwitchOnGeneratorState`] prologue is emitted before the body
+///   so that resumed executions jump directly to the saved resume point.
 fn compile_function(
     params: &[crate::parser::ast::Param],
     body: &BlockStmt,
+    is_generator: bool,
 ) -> StatorResult<BytecodeArray> {
     let mut compiler = FunctionCompiler::new(params)?;
+    compiler.is_generator = is_generator;
+
+    // Generator prologue: jump to the saved resume point on re-entry.
+    if is_generator {
+        compiler.emit(Instruction::new_unchecked(
+            Opcode::SwitchOnGeneratorState,
+            vec![Operand::Register(0)],
+        ));
+    }
+
     // Hoist function declarations to the top of the scope.
     for stmt in &body.body {
         if let Stmt::FnDecl(decl) = stmt {
@@ -2061,7 +2400,6 @@ fn compile_function(
 fn stmt_kind(stmt: &Stmt) -> &'static str {
     match stmt {
         Stmt::ForIn(_) => "for-in",
-        Stmt::ForOf(_) => "for-of",
         Stmt::With(_) => "with",
         Stmt::ClassDecl(_) => "class declaration",
         _ => "statement",
@@ -2616,6 +2954,7 @@ mod tests {
                 },
             ],
             &body,
+            false,
         )
         .unwrap();
         assert_eq!(inner.parameter_count(), 2);
@@ -3180,6 +3519,292 @@ mod tests {
         assert_eq!(vector.slot_count(), metadata.slot_count());
         for i in 0..vector.slot_count() {
             assert_eq!(vector.get_state(i), Some(InlineCacheState::Uninitialized));
+        }
+    }
+
+    // ── Generator functions + yield ───────────────────────────────────────────
+
+    /// Helper: build a `FnDecl` for a generator function.
+    fn make_generator_fn_decl(name: &str, body: Vec<Stmt>) -> FnDecl {
+        use crate::parser::ast::FnDecl;
+        FnDecl {
+            loc: span(),
+            id: Some(ident(name)),
+            params: vec![],
+            body: BlockStmt { loc: span(), body },
+            is_generator: true,
+            is_async: false,
+        }
+    }
+
+    /// Helper: build a yield expression statement.
+    fn yield_stmt(arg: Option<Expr>, delegate: bool) -> Stmt {
+        use crate::parser::ast::{ExprStmt, YieldExpr};
+        Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(Expr::Yield(Box::new(YieldExpr {
+                loc: span(),
+                delegate,
+                argument: arg.map(Box::new),
+            }))),
+        })
+    }
+
+    #[test]
+    fn test_generator_function_compiles() {
+        // `function* gen() { yield 1; yield 2; }`
+        let decl = make_generator_fn_decl(
+            "gen",
+            vec![
+                yield_stmt(Some(num_expr(1.0)), false),
+                yield_stmt(Some(num_expr(2.0)), false),
+            ],
+        );
+        let prog = make_program(vec![Stmt::FnDecl(Box::new(decl))]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        // Top-level: CreateClosure + implicit return
+        assert!(instrs.iter().any(|i| i.opcode == Opcode::CreateClosure));
+        // The closure itself must be in the constant pool.
+        let pool = arr.constant_pool();
+        assert!(!pool.is_empty());
+        // The nested function should be a generator.
+        if let crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) = &pool[0] {
+            assert!(
+                ba.is_generator(),
+                "nested function must be marked as generator"
+            );
+            let inner_instrs = ba.instructions().unwrap();
+            // Generator body must start with SwitchOnGeneratorState.
+            assert_eq!(
+                inner_instrs[0].opcode,
+                Opcode::SwitchOnGeneratorState,
+                "generator body must begin with SwitchOnGeneratorState"
+            );
+            // Must contain SuspendGenerator pairs.
+            assert!(
+                inner_instrs
+                    .iter()
+                    .any(|i| i.opcode == Opcode::SuspendGenerator),
+                "generator body must contain SuspendGenerator"
+            );
+            assert!(
+                inner_instrs
+                    .iter()
+                    .any(|i| i.opcode == Opcode::ResumeGenerator),
+                "generator body must contain ResumeGenerator"
+            );
+        } else {
+            panic!("constant pool[0] should be a Function (generator body)");
+        }
+    }
+
+    /// Compile-and-run a program, returning the final accumulator value.
+    fn run(prog: &Program) -> crate::objects::value::JsValue {
+        use crate::interpreter::{Interpreter, InterpreterFrame};
+        let arr = BytecodeGenerator::compile_program(prog).unwrap();
+        let mut frame = InterpreterFrame::new(arr, vec![]);
+        Interpreter::run(&mut frame).unwrap()
+    }
+
+    #[test]
+    fn test_generator_call_returns_generator_value() {
+        // `function* gen() { yield 1; } return gen();`
+        use crate::objects::value::JsValue;
+        let decl = make_generator_fn_decl("gen", vec![yield_stmt(Some(num_expr(1.0)), false)]);
+        let prog = make_program(vec![
+            Stmt::FnDecl(Box::new(decl)),
+            Stmt::Return(ReturnStmt {
+                loc: span(),
+                argument: Some(Box::new(Expr::Call(Box::new(
+                    crate::parser::ast::CallExpr {
+                        loc: span(),
+                        callee: Box::new(ident_expr("gen")),
+                        arguments: vec![],
+                    },
+                )))),
+            }),
+        ]);
+        let result = run(&prog);
+        assert!(
+            matches!(result, JsValue::Generator(_)),
+            "calling a generator function must return JsValue::Generator, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_for_of_array_sum() {
+        // Build bytecode manually to test IteratorNext:
+        //   function(iter) { let sum = 0; for each val in iter: sum += val; return sum; }
+        // Register layout:
+        //   param[0] = iterator  (encoded as (-1i32) as u32 = 0xFFFF_FFFF)
+        //   local r0 = sum
+        //   local r1 = value-from-IteratorNext
+        use crate::bytecode::bytecode_array::BytecodeArray;
+        use crate::bytecode::bytecodes::{Instruction, Operand, decode_with_byte_offsets, encode};
+        use crate::bytecode::feedback::FeedbackMetadata;
+        use crate::interpreter::{Interpreter, InterpreterFrame};
+        use crate::objects::value::{JsValue, NativeIterator};
+
+        // param[0] register (iterator) — negative register encoding for param index 0
+        let param0 = Operand::Register((-1i32) as u32);
+        // local registers
+        let sum_reg = Operand::Register(0); // r0
+        let val_reg = Operand::Register(1); // r1
+        let slot0 = Operand::FeedbackSlot(0);
+
+        let instrs = vec![
+            // sum = 0
+            Instruction::new_unchecked(Opcode::LdaZero, vec![]),
+            Instruction::new_unchecked(Opcode::Star, vec![sum_reg]),
+            // loop: IteratorNext param0 r1 → r1=value, acc=done
+            Instruction::new_unchecked(Opcode::IteratorNext, vec![param0, val_reg]),
+            // if done, jump to return
+            Instruction::new_unchecked(Opcode::JumpIfToBooleanTrue, vec![Operand::JumpOffset(0)]),
+            // acc = val + sum; sum = acc
+            Instruction::new_unchecked(Opcode::Ldar, vec![val_reg]),
+            Instruction::new_unchecked(Opcode::Add, vec![sum_reg, slot0]),
+            Instruction::new_unchecked(Opcode::Star, vec![sum_reg]),
+            // JumpLoop back to instr 2
+            Instruction::new_unchecked(
+                Opcode::JumpLoop,
+                vec![
+                    Operand::JumpOffset(0),
+                    Operand::Immediate(0),
+                    Operand::FeedbackSlot(0),
+                ],
+            ),
+            // return sum
+            Instruction::new_unchecked(Opcode::Ldar, vec![sum_reg]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        // Resolve jump offsets.
+        let initial_bytes = encode(&instrs);
+        let (_, offsets) = decode_with_byte_offsets(&initial_bytes).unwrap();
+        let mut resolved = instrs.clone();
+        // instr 3: JumpIfToBooleanTrue → target = instr 8
+        let end3 = offsets[4];
+        let tgt8 = offsets[8];
+        resolved[3].operands[0] = Operand::JumpOffset(tgt8 as i32 - end3 as i32);
+        // instr 7: JumpLoop → target = instr 2
+        let end7 = offsets[8];
+        let tgt2 = offsets[2];
+        resolved[7].operands[0] = Operand::JumpOffset(tgt2 as i32 - end7 as i32);
+
+        let bytes = encode(&resolved);
+        let ba = BytecodeArray::new(
+            bytes,
+            vec![],
+            2, // frame_size = 2 locals (r0=sum, r1=val)
+            1, // parameter_count = 1 (param[0] = iterator)
+            vec![],
+            FeedbackMetadata::new(vec![crate::bytecode::feedback::FeedbackSlotKind::BinaryOp]),
+            vec![],
+        );
+
+        let iter = JsValue::Iterator(NativeIterator::from_items(vec![
+            JsValue::Smi(1),
+            JsValue::Smi(2),
+            JsValue::Smi(3),
+        ]));
+        let mut frame = InterpreterFrame::new(ba, vec![iter]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(
+            result,
+            JsValue::Smi(6),
+            "for-of sum over [1,2,3] should be 6"
+        );
+    }
+
+    // ── for-of via AST compilation (array literal not yet available) ──────────
+
+    #[test]
+    fn test_for_of_compiles_with_get_iterator_opcode() {
+        // `for (const x of someVar) { }` — verify the compiler emits GetIterator.
+        use crate::parser::ast::{ForInOfLeft, ForOfStmt, VarDecl, VarDeclarator, VarKind};
+        let prog = make_program(vec![Stmt::ForOf(ForOfStmt {
+            loc: span(),
+            is_await: false,
+            left: ForInOfLeft::VarDecl(VarDecl {
+                loc: span(),
+                kind: VarKind::Const,
+                declarators: vec![VarDeclarator {
+                    loc: span(),
+                    id: Pat::Ident(ident("x")),
+                    init: None,
+                }],
+            }),
+            right: Box::new(ident_expr("someArr")),
+            body: Box::new(Stmt::Empty(crate::parser::ast::EmptyStmt { loc: span() })),
+        })]);
+        // Must compile without error.
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::GetIterator),
+            "for-of must emit GetIterator"
+        );
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::IteratorNext),
+            "for-of must emit IteratorNext"
+        );
+    }
+
+    // ── yield delegation (yield*) ─────────────────────────────────────────────
+
+    #[test]
+    fn test_yield_star_compiles() {
+        // `function* outer() { yield* inner; }` — verify compilation emits
+        // GetIterator + IteratorNext + SuspendGenerator in the inner bytecode.
+        use crate::parser::ast::{FnDecl, YieldExpr};
+        let decl = FnDecl {
+            loc: span(),
+            id: Some(ident("outer")),
+            params: vec![],
+            body: BlockStmt {
+                loc: span(),
+                body: vec![Stmt::Expr(ExprStmt {
+                    loc: span(),
+                    expr: Box::new(Expr::Yield(Box::new(YieldExpr {
+                        loc: span(),
+                        delegate: true,
+                        argument: Some(Box::new(ident_expr("inner"))),
+                    }))),
+                })],
+            },
+            is_generator: true,
+            is_async: false,
+        };
+        let prog = make_program(vec![Stmt::FnDecl(Box::new(decl))]);
+        // Must compile without error.
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let pool = arr.constant_pool();
+        assert!(
+            !pool.is_empty(),
+            "generator function should be in constant pool"
+        );
+        if let crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) = &pool[0] {
+            assert!(ba.is_generator());
+            let inner_instrs = ba.instructions().unwrap();
+            assert!(
+                inner_instrs.iter().any(|i| i.opcode == Opcode::GetIterator),
+                "yield* must emit GetIterator"
+            );
+            assert!(
+                inner_instrs
+                    .iter()
+                    .any(|i| i.opcode == Opcode::IteratorNext),
+                "yield* must emit IteratorNext"
+            );
+            assert!(
+                inner_instrs
+                    .iter()
+                    .any(|i| i.opcode == Opcode::SuspendGenerator),
+                "yield* must emit SuspendGenerator to re-yield values"
+            );
+        } else {
+            panic!("constant pool[0] should be a Function");
         }
     }
 }

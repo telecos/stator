@@ -154,6 +154,13 @@ pub struct BytecodeArray {
     feedback_metadata: FeedbackMetadata,
     /// Per-function exception handler table.
     handler_table: Vec<HandlerTableEntry>,
+    /// `true` if this bytecode belongs to a generator function (`function*`).
+    ///
+    /// When a generator function is *called*, the interpreter creates a fresh
+    /// [`crate::objects::value::GeneratorState`] and returns it as
+    /// [`crate::objects::value::JsValue::Generator`] without executing the
+    /// body immediately.
+    is_generator: bool,
 }
 
 impl BytecodeArray {
@@ -187,7 +194,28 @@ impl BytecodeArray {
             source_positions,
             feedback_metadata,
             handler_table,
+            is_generator: false,
         }
+    }
+
+    /// Mark this [`BytecodeArray`] as belonging to a generator function.
+    ///
+    /// Returns `self` so this can be chained onto [`BytecodeArray::new`]:
+    /// ```
+    /// # use stator_core::bytecode::bytecode_array::BytecodeArray;
+    /// # use stator_core::bytecode::feedback::FeedbackMetadata;
+    /// let ba = BytecodeArray::new(vec![], vec![], 0, 0, vec![], FeedbackMetadata::empty(), vec![])
+    ///     .with_generator_flag(true);
+    /// assert!(ba.is_generator());
+    /// ```
+    pub fn with_generator_flag(mut self, flag: bool) -> Self {
+        self.is_generator = flag;
+        self
+    }
+
+    /// Returns `true` if this bytecode belongs to a `function*` generator.
+    pub fn is_generator(&self) -> bool {
+        self.is_generator
     }
 
     /// The raw encoded bytecode bytes.

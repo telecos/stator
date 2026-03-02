@@ -172,97 +172,9 @@ use crate::bytecode::bytecodes::{Opcode, Operand, decode_with_byte_offsets};
 use crate::error::{StatorError, StatorResult};
 use crate::objects::value::JsValue;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GeneratorStatus / GeneratorState / GeneratorStep
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Lifecycle status of a JavaScript generator object.
-///
-/// Maps to V8's `JSGeneratorObject::ResumeMode` / `GeneratorState` integers:
-/// `Executing` = −2, `Completed` = −1, `SuspendedAtStart` = 0,
-/// `SuspendedAtYield` = 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GeneratorStatus {
-    /// The generator function has not yet been advanced by `.next()`.
-    SuspendedAtStart,
-    /// The generator is paused at a `yield` expression.
-    SuspendedAtYield,
-    /// The generator is currently executing (re-entrancy is invalid).
-    Executing,
-    /// The generator function returned; iteration is complete.
-    Completed,
-}
-
-impl GeneratorStatus {
-    /// Integer encoding compatible with V8's `GetGeneratorState` / `SetGeneratorState`.
-    fn to_smi(self) -> i32 {
-        match self {
-            Self::Executing => -2,
-            Self::Completed => -1,
-            Self::SuspendedAtStart => 0,
-            Self::SuspendedAtYield => 1,
-        }
-    }
-
-    /// Decode from the integer produced by [`Self::to_smi`].
-    ///
-    /// Any value that does not map to a known status is treated as
-    /// `SuspendedAtYield`.
-    fn from_smi(n: i32) -> Self {
-        match n {
-            -2 => Self::Executing,
-            -1 => Self::Completed,
-            0 => Self::SuspendedAtStart,
-            _ => Self::SuspendedAtYield,
-        }
-    }
-}
-
-/// The saved execution state of a suspended JavaScript generator.
-///
-/// Holds all data needed to resume execution of a generator function after it
-/// has been suspended at a `yield` expression or before the first `.next()`
-/// call.
-///
-/// Use [`GeneratorState::new`] to create a fresh generator, then drive it
-/// with [`Interpreter::run_generator_step`].
-#[derive(Debug, Clone)]
-pub struct GeneratorState {
-    /// Bytecode for the generator function body.
-    pub bytecode_array: BytecodeArray,
-    /// Saved register file at the point of suspension (empty before the
-    /// first [`Opcode::SuspendGenerator`]).
-    pub registers: Vec<JsValue>,
-    /// Instruction index to resume from; `0` = start of function body.
-    pub resume_pc: usize,
-    /// Current lifecycle status.
-    pub status: GeneratorStatus,
-}
-
-impl GeneratorState {
-    /// Create a new generator ready to execute `bytecode_array` from the
-    /// beginning on the first call to [`Interpreter::run_generator_step`].
-    pub fn new(bytecode_array: BytecodeArray) -> Rc<RefCell<Self>> {
-        Rc::new(RefCell::new(Self {
-            bytecode_array,
-            registers: Vec::new(),
-            resume_pc: 0,
-            status: GeneratorStatus::SuspendedAtStart,
-        }))
-    }
-}
-
-/// The result of running one step of a generator via
-/// [`Interpreter::run_generator_step`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum GeneratorStep {
-    /// The generator suspended at a `yield` expression; the contained value
-    /// is the yielded result.  The generator may be resumed.
-    Yield(JsValue),
-    /// The generator's function body returned; the contained value is the
-    /// final return value.  The generator is now exhausted.
-    Return(JsValue),
-}
+// Re-export generator types and bring them into scope so external code can
+// import them from `stator_core::interpreter` (backwards-compatible path).
+pub use crate::objects::value::{GeneratorState, GeneratorStatus, GeneratorStep, NativeIterator};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // InterpreterFrame
@@ -727,10 +639,11 @@ impl Interpreter {
                 //
                 // Convention for all Call* opcodes:
                 //   – The callee register holds a JsValue::Function.
-                //   – Arguments are collected from consecutive registers and
-                //     passed into a fresh InterpreterFrame.
-                //   – The result of the recursive Interpreter::run call is
-                //     placed in the accumulator.
+                //   – If the function is a generator (`ba.is_generator()` is
+                //     true), a fresh GeneratorState is created and returned
+                //     as JsValue::Generator without executing the body.
+                //   – Otherwise, arguments are collected, a new frame is
+                //     created, and the interpreter runs the body.
                 //
                 // CallAnyReceiver [callable, args_start, args_count, slot]:
                 //   Plain call with undefined receiver.  args_start is the
@@ -752,9 +665,13 @@ impl Interpreter {
                             "CallAnyReceiver: callee is not a function (got {callee:?})"
                         )));
                     };
-                    let args = collect_args(frame, args_start_v, arg_count)?;
-                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
-                    frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                    if ba.is_generator() {
+                        frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
+                    } else {
+                        let args = collect_args(frame, args_start_v, arg_count)?;
+                        let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
+                        frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                    }
                 }
 
                 // CallUndefinedReceiver0 [callable, slot]:
@@ -769,8 +686,12 @@ impl Interpreter {
                             "CallUndefinedReceiver0: callee is not a function (got {callee:?})"
                         )));
                     };
-                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), vec![]);
-                    frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                    if ba.is_generator() {
+                        frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
+                    } else {
+                        let mut callee_frame = InterpreterFrame::new((*ba).clone(), vec![]);
+                        frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                    }
                 }
 
                 // CallUndefinedReceiver1 [callable, arg1, slot]:
@@ -788,9 +709,13 @@ impl Interpreter {
                             "CallUndefinedReceiver1: callee is not a function (got {callee:?})"
                         )));
                     };
-                    let arg1 = frame.read_reg(arg1_v)?.clone();
-                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), vec![arg1]);
-                    frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                    if ba.is_generator() {
+                        frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
+                    } else {
+                        let arg1 = frame.read_reg(arg1_v)?.clone();
+                        let mut callee_frame = InterpreterFrame::new((*ba).clone(), vec![arg1]);
+                        frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                    }
                 }
 
                 // CallUndefinedReceiver2 [callable, arg1, arg2, slot]:
@@ -811,10 +736,15 @@ impl Interpreter {
                             "CallUndefinedReceiver2: callee is not a function (got {callee:?})"
                         )));
                     };
-                    let arg1 = frame.read_reg(arg1_v)?.clone();
-                    let arg2 = frame.read_reg(arg2_v)?.clone();
-                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), vec![arg1, arg2]);
-                    frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                    if ba.is_generator() {
+                        frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
+                    } else {
+                        let arg1 = frame.read_reg(arg1_v)?.clone();
+                        let arg2 = frame.read_reg(arg2_v)?.clone();
+                        let mut callee_frame =
+                            InterpreterFrame::new((*ba).clone(), vec![arg1, arg2]);
+                        frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                    }
                 }
 
                 // CallProperty [callable, recv, args_count, slot]:
@@ -972,6 +902,102 @@ impl Interpreter {
                 Opcode::StackCheck
                 | Opcode::SetExpressionPosition
                 | Opcode::SetExpressionPositionFromEnd => {}
+
+                // ── Iterators ──────────────────────────────────────────────
+                //
+                // GetIterator [iterable_reg, load_slot, call_slot]:
+                //   Obtain a sync iterator from the iterable in `iterable_reg`.
+                //
+                //   Supported iterables:
+                //   - JsValue::Array   → NativeIterator over the array elements
+                //   - JsValue::String  → NativeIterator over Unicode characters
+                //   - JsValue::Generator → generators are their own iterators
+                //   - JsValue::Iterator → pass through unchanged
+                //
+                //   The result is placed in the accumulator.
+                Opcode::GetIterator => {
+                    let Operand::Register(iter_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("GetIterator", 0));
+                    };
+                    let iterable = frame.read_reg(iter_v)?.clone();
+                    frame.accumulator = match iterable {
+                        JsValue::Array(items) => {
+                            let items_vec: Vec<JsValue> = (*items).clone();
+                            JsValue::Iterator(NativeIterator::from_items(items_vec))
+                        }
+                        JsValue::String(ref s) => JsValue::Iterator(NativeIterator::from_string(s)),
+                        // Generators and existing iterators pass through unchanged.
+                        JsValue::Generator(_) | JsValue::Iterator(_) => iterable,
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "GetIterator: value is not iterable (got {other:?})"
+                            )));
+                        }
+                    };
+                }
+
+                // GetAsyncIterator [iterable_reg, load_slot, call_slot]:
+                //   Async variant — behaves identically to GetIterator for all
+                //   currently-supported iterable types.
+                Opcode::GetAsyncIterator => {
+                    let Operand::Register(iter_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("GetAsyncIterator", 0));
+                    };
+                    let iterable = frame.read_reg(iter_v)?.clone();
+                    frame.accumulator = match iterable {
+                        JsValue::Array(items) => {
+                            let items_vec: Vec<JsValue> = (*items).clone();
+                            JsValue::Iterator(NativeIterator::from_items(items_vec))
+                        }
+                        JsValue::String(ref s) => JsValue::Iterator(NativeIterator::from_string(s)),
+                        JsValue::Generator(_) | JsValue::Iterator(_) => iterable,
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "GetAsyncIterator: value is not iterable (got {other:?})"
+                            )));
+                        }
+                    };
+                }
+
+                // IteratorNext [iterator_reg, value_out_reg]:
+                //   Advance the iterator stored in `iterator_reg` by one step.
+                //
+                //   Semantics:
+                //   - `value_out_reg ← next value` (or `undefined` when done)
+                //   - `acc ← done` (a `JsValue::Boolean`)
+                //
+                //   Supported iterator types:
+                //   - JsValue::Iterator (NativeIterator)
+                //   - JsValue::Generator (runs one generator step via
+                //     `run_generator_step`)
+                Opcode::IteratorNext => {
+                    let Operand::Register(iter_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("IteratorNext", 0));
+                    };
+                    let Operand::Register(value_out_v) = instr.operands[1] else {
+                        return Err(err_bad_operand("IteratorNext", 1));
+                    };
+                    let iter = frame.read_reg(iter_v)?.clone();
+                    let (value, done) = match iter {
+                        JsValue::Iterator(ni) => match ni.borrow_mut().next_item() {
+                            Some(v) => (v, false),
+                            None => (JsValue::Undefined, true),
+                        },
+                        JsValue::Generator(ref gs) => {
+                            match Interpreter::run_generator_step(gs, JsValue::Undefined)? {
+                                GeneratorStep::Yield(v) => (v, false),
+                                GeneratorStep::Return(v) => (v, true),
+                            }
+                        }
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "IteratorNext: value is not an iterator (got {other:?})"
+                            )));
+                        }
+                    };
+                    frame.write_reg(value_out_v, value)?;
+                    frame.accumulator = JsValue::Boolean(done);
+                }
 
                 // ── Generators / Async ─────────────────────────────────────
                 //
