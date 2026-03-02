@@ -11,8 +11,22 @@ permissions:
 
 jobs:
   fuzz-smoke:
-    name: Fuzz smoke tests (10 s each)
+    name: Smoke-test ${{ matrix.target }} (10 s)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_tagged_value
+          - fuzz_heap_alloc
+          - fuzz_handle_scope
+          - fuzz_gc_stress
+          - fuzz_property_ops
+          - fuzz_scanner
+          - fuzz_parser
+          - fuzz_parser_utf8
+          - fuzz_bytecode_compiler
+          - fuzz_bytecode_roundtrip
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -23,71 +37,17 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "fuzz"
+          shared-key: "fuzz-${{ matrix.target }}"
           workspaces: "fuzz -> target"
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
 
-      - name: Build fuzz targets
-        run: cargo +nightly fuzz build
+      - name: Build fuzz target
+        run: cargo +nightly fuzz build ${{ matrix.target }}
 
-      - name: Smoke-test fuzz_tagged_value
+      - name: Smoke-test ${{ matrix.target }}
         run: >
-          cargo +nightly fuzz run fuzz_tagged_value
-          fuzz/corpus/fuzz_tagged_value
-          -- -max_total_time=10
-
-      - name: Smoke-test fuzz_heap_alloc
-        run: >
-          cargo +nightly fuzz run fuzz_heap_alloc
-          fuzz/corpus/fuzz_heap_alloc
-          -- -max_total_time=10
-
-      - name: Smoke-test fuzz_handle_scope
-        run: >
-          cargo +nightly fuzz run fuzz_handle_scope
-          fuzz/corpus/fuzz_handle_scope
-          -- -max_total_time=10
-
-      - name: Smoke-test fuzz_gc_stress
-        run: >
-          cargo +nightly fuzz run fuzz_gc_stress
-          fuzz/corpus/fuzz_gc_stress
-          -- -max_total_time=10
-
-      - name: Smoke-test fuzz_property_ops
-        run: >
-          cargo +nightly fuzz run fuzz_property_ops
-          fuzz/corpus/fuzz_property_ops
-          -- -max_total_time=10
-
-      - name: Smoke-test fuzz_scanner
-        run: >
-          cargo +nightly fuzz run fuzz_scanner
-          fuzz/corpus/fuzz_scanner
-          -- -max_total_time=10
-
-      - name: Smoke-test fuzz_parser
-        run: >
-          cargo +nightly fuzz run fuzz_parser
-          fuzz/corpus/fuzz_parser
-          -- -max_total_time=10
-
-      - name: Smoke-test fuzz_parser_utf8
-        run: >
-          cargo +nightly fuzz run fuzz_parser_utf8
-          fuzz/corpus/fuzz_parser_utf8
-          -- -max_total_time=10
-
-      - name: Smoke-test fuzz_bytecode_compiler
-        run: >
-          cargo +nightly fuzz run fuzz_bytecode_compiler
-          fuzz/corpus/fuzz_bytecode_compiler
-          -- -max_total_time=10
-
-      - name: Smoke-test fuzz_bytecode_roundtrip
-        run: >
-          cargo +nightly fuzz run fuzz_bytecode_roundtrip
-          fuzz/corpus/fuzz_bytecode_roundtrip
+          cargo +nightly fuzz run ${{ matrix.target }}
+          fuzz/corpus/${{ matrix.target }}
           -- -max_total_time=10
