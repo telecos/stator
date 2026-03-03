@@ -63,6 +63,29 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  diff_test:
+    name: Differential testing (st8 vs d8)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "diff-test"
+
+      - name: Build st8
+        run: cargo build --package st8
+
+      - name: Run differential tests on corpus (PR subset)
+        run: |
+          bash scripts/diff_test.sh --corpus tests/diff_corpus \
+            --st8 target/debug/st8
+
   mini_browser:
     name: mini_browser output
     runs-on: ubuntu-latest
