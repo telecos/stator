@@ -115,12 +115,101 @@ typedef struct StatorPlatformVTable {
 StatorIsolate *stator_isolate_create(void);
 
 /**
+ * Create a new Stator isolate (V8-compatible spelling).
+ *
+ * Equivalent to stator_isolate_create().  The caller owns the returned pointer
+ * and must eventually pass it to stator_isolate_dispose().
+ *
+ * Returns NULL on allocation failure (extremely rare in practice).
+ */
+StatorIsolate *stator_isolate_new(void);
+
+/**
  * Destroy an isolate and release all associated resources.
  *
  * @param isolate  A non-NULL pointer previously returned by
  *                 stator_isolate_create().  Must not be used after this call.
  */
 void stator_isolate_destroy(StatorIsolate *isolate);
+
+/**
+ * Dispose an isolate and release all associated resources
+ * (V8-compatible spelling).
+ *
+ * Equivalent to stator_isolate_destroy().
+ *
+ * @param isolate  A non-NULL pointer previously returned by
+ *                 stator_isolate_new().  Must not be used after this call.
+ */
+void stator_isolate_dispose(StatorIsolate *isolate);
+
+/**
+ * Mark the isolate as entered on the current thread.
+ *
+ * Each call to stator_isolate_enter() must be matched by a call to
+ * stator_isolate_exit().  Does nothing when isolate is NULL.
+ *
+ * @param isolate  A valid, non-NULL isolate pointer.
+ */
+void stator_isolate_enter(StatorIsolate *isolate);
+
+/**
+ * Unmark the isolate as entered on the current thread.
+ *
+ * Must be called once for every preceding stator_isolate_enter() call.
+ * Does nothing when isolate is NULL.
+ *
+ * @param isolate  A valid, non-NULL isolate pointer.
+ */
+void stator_isolate_exit(StatorIsolate *isolate);
+
+/**
+ * Store an opaque embedder-defined pointer at the given slot index.
+ *
+ * Slots are zero-indexed and grow on demand.  Storing NULL clears a slot.
+ * Does nothing when isolate is NULL.
+ *
+ * @param isolate  A valid, non-NULL isolate pointer.
+ * @param slot     Zero-based slot index.
+ * @param data     The pointer to store (may be NULL).
+ */
+void stator_isolate_set_data(StatorIsolate *isolate, uint32_t slot, void *data);
+
+/**
+ * Retrieve the embedder-defined pointer stored at the given slot index.
+ *
+ * Returns NULL when isolate is NULL or the slot has not been set.
+ *
+ * @param isolate  A valid isolate pointer, or NULL.
+ * @param slot     Zero-based slot index.
+ * @return         The stored pointer, or NULL.
+ */
+void *stator_isolate_get_data(const StatorIsolate *isolate, uint32_t slot);
+
+/**
+ * Record exception as the pending exception on the isolate.
+ *
+ * The caller retains ownership of exception; the isolate holds a raw pointer
+ * only.  Does nothing when isolate is NULL.
+ *
+ * @param isolate    A valid, non-NULL isolate pointer.
+ * @param exception  A valid StatorValue pointer to record as pending (may be
+ *                   NULL to clear).
+ */
+void stator_isolate_throw_exception(StatorIsolate *isolate, StatorValue *exception);
+
+/**
+ * Return the context most recently made current on isolate.
+ *
+ * A context is made current when it is created via stator_context_new() and
+ * cleared when it is destroyed via stator_context_destroy().
+ *
+ * Returns NULL when isolate is NULL or no context is currently active.
+ *
+ * @param isolate  A valid isolate pointer, or NULL.
+ * @return         The current StatorContext*, or NULL.
+ */
+StatorContext *stator_isolate_get_current_context(const StatorIsolate *isolate);
 
 /* -------------------------------------------------------------------------
  * Heap / GC
