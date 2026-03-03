@@ -139,3 +139,21 @@ name = "fuzz_ffi_sequence"
 path = "fuzz_targets/fuzz_ffi_sequence.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_baseline_compile"
+path = "fuzz_targets/fuzz_baseline_compile.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_jit_correctness"
+path = "fuzz_targets/fuzz_jit_correctness.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_deopt"
+path = "fuzz_targets/fuzz_deopt.rs"
+test = false
+doc = false
