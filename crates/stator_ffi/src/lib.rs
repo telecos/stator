@@ -1465,6 +1465,147 @@ pub unsafe extern "C" fn stator_object_get(
     Box::into_raw(Box::new(StatorValue { inner, isolate }))
 }
 
+/// Return `true` if `obj` has a property with the given `key` (own or
+/// inherited via the prototype chain).
+///
+/// Returns `false` if any argument is null.
+///
+/// # Safety
+/// - `obj` must be a valid, live [`StatorObject`] pointer.
+/// - `key` must be a valid, null-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_has(obj: *const StatorObject, key: *const c_char) -> bool {
+    if obj.is_null() || key.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `key` is a valid null-terminated string.
+    let key_str = unsafe { CStr::from_ptr(key) }.to_string_lossy();
+    // SAFETY: caller guarantees `obj` is valid.
+    unsafe { (*obj).inner.has_property(&key_str) }
+}
+
+/// Delete the named property `key` from `obj`.
+///
+/// Returns `true` if the property was successfully deleted (or did not exist),
+/// `false` if the deletion fails (e.g. the property is non-configurable, the
+/// object is non-extensible in a way that prevents deletion, or any argument
+/// is null).
+///
+/// # Safety
+/// - `obj` must be a valid, live [`StatorObject`] pointer.
+/// - `key` must be a valid, null-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_delete(obj: *mut StatorObject, key: *const c_char) -> bool {
+    if obj.is_null() || key.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `key` is a valid null-terminated string.
+    let key_str = unsafe { CStr::from_ptr(key) }.to_string_lossy();
+    // SAFETY: caller guarantees `obj` is valid.
+    // `delete_own_property` returns `Ok(false)` when the property is
+    // non-configurable and `Err(_)` on internal engine errors; both cases
+    // map to `false` here, consistent with ECMAScript's [[Delete]] semantics.
+    unsafe { (*obj).inner.delete_own_property(&key_str).unwrap_or(false) }
+}
+
+/// An opaque snapshot of the own property names of a JavaScript object.
+///
+/// Created by [`stator_object_get_property_names`] and freed by
+/// [`stator_property_names_destroy`].  The individual name strings are owned
+/// by this snapshot and remain valid until it is destroyed.
+pub struct StatorPropertyNames {
+    /// The property names as null-terminated C strings.
+    names: Vec<CString>,
+}
+
+/// Collect the own enumerable property names of `obj` into a new
+/// [`StatorPropertyNames`] snapshot.
+///
+/// Returns a null pointer if `obj` is null.  The caller must eventually pass
+/// the returned pointer to [`stator_property_names_destroy`].
+///
+/// # Safety
+/// `obj` must be a valid, live [`StatorObject`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_get_property_names(
+    obj: *const StatorObject,
+) -> *mut StatorPropertyNames {
+    if obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `obj` is valid.
+    let keys = unsafe { (*obj).inner.own_property_keys() };
+    let names = keys
+        .into_iter()
+        .map(|k| {
+            // Truncate at the first embedded NUL byte to produce a valid
+            // null-terminated string; `from_vec_unchecked` skips the NUL-byte
+            // check performed by `CString::new`, so we must do it manually.
+            let valid_len = k.as_bytes().iter().position(|&b| b == 0).unwrap_or(k.len());
+            // SAFETY: `&k.as_bytes()[..valid_len]` contains no NUL bytes.
+            unsafe { CString::from_vec_unchecked(k.as_bytes()[..valid_len].to_vec()) }
+        })
+        .collect();
+    Box::into_raw(Box::new(StatorPropertyNames { names }))
+}
+
+/// Return the number of property names in `names`.
+///
+/// Returns `0` if `names` is null.
+///
+/// # Safety
+/// `names` must be either null or a valid, live [`StatorPropertyNames`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_property_names_count(names: *const StatorPropertyNames) -> usize {
+    if names.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `names` is valid.
+    unsafe { (*names).names.len() }
+}
+
+/// Return a pointer to the null-terminated property name at position `index`.
+///
+/// The returned pointer is valid for as long as `names` is alive and has not
+/// been destroyed.  Returns a null pointer if `names` is null or `index` is
+/// out of range.
+///
+/// # Safety
+/// `names` must be either null or a valid, live [`StatorPropertyNames`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_property_names_get(
+    names: *const StatorPropertyNames,
+    index: usize,
+) -> *const c_char {
+    if names.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `names` is valid.
+    let names_ref = unsafe { &*names };
+    names_ref
+        .names
+        .get(index)
+        .map_or(std::ptr::null(), |s| s.as_ptr())
+}
+
+/// Destroy a [`StatorPropertyNames`] snapshot previously returned by
+/// [`stator_object_get_property_names`].
+///
+/// After this call the pointer and all name pointers obtained from it are
+/// invalid and must not be used.
+///
+/// # Safety
+/// `names` must be a non-null pointer returned by
+/// `stator_object_get_property_names` and must not be used again after this
+/// call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_property_names_destroy(names: *mut StatorPropertyNames) {
+    if !names.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw`.
+        drop(unsafe { Box::from_raw(names) });
+    }
+}
+
 // ── GC / heap stats ───────────────────────────────────────────────────────────
 
 /// Trigger a minor (young-generation) GC on the isolate heap.
@@ -2955,6 +3096,210 @@ mod tests {
         assert!(got.is_null());
         // SAFETY: `obj` is non-null and live.
         unsafe { stator_object_destroy(obj) };
+    }
+
+    // ── stator_object_has ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_object_has_existing_property_returns_true() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        let key = c"x";
+        // SAFETY: all pointers are valid.
+        unsafe { stator_object_set(obj, key.as_ptr(), val) };
+        // SAFETY: `obj` and `key` are valid.
+        assert!(unsafe { stator_object_has(obj, key.as_ptr()) });
+        // SAFETY: all pointers are non-null and live.
+        unsafe {
+            stator_value_destroy(val);
+            stator_object_destroy(obj);
+        }
+    }
+
+    #[test]
+    fn test_object_has_missing_property_returns_false() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let key = c"nope";
+        // SAFETY: `obj` and `key` are valid; property has not been set.
+        assert!(!unsafe { stator_object_has(obj, key.as_ptr()) });
+        // SAFETY: `obj` is non-null and live.
+        unsafe { stator_object_destroy(obj) };
+    }
+
+    #[test]
+    fn test_object_has_null_obj_returns_false() {
+        let key = c"k";
+        // SAFETY: null obj is documented to return false.
+        assert!(!unsafe { stator_object_has(std::ptr::null(), key.as_ptr()) });
+    }
+
+    // ── stator_object_delete ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_object_delete_existing_property() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 7.0) };
+        let key = c"y";
+        // SAFETY: all pointers are valid.
+        unsafe { stator_object_set(obj, key.as_ptr(), val) };
+        // Verify the property exists before deletion.
+        assert!(unsafe { stator_object_has(obj, key.as_ptr()) });
+        // SAFETY: `obj` and `key` are valid.
+        let deleted = unsafe { stator_object_delete(obj, key.as_ptr()) };
+        assert!(deleted);
+        // Property should no longer be present.
+        assert!(!unsafe { stator_object_has(obj, key.as_ptr()) });
+        // SAFETY: all pointers are non-null and live.
+        unsafe {
+            stator_value_destroy(val);
+            stator_object_destroy(obj);
+        }
+    }
+
+    #[test]
+    fn test_object_delete_missing_property_returns_true() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let key = c"nonexistent";
+        // Deleting a property that never existed is a no-op success.
+        let result = unsafe { stator_object_delete(obj, key.as_ptr()) };
+        assert!(result);
+        // SAFETY: `obj` is non-null and live.
+        unsafe { stator_object_destroy(obj) };
+    }
+
+    #[test]
+    fn test_object_delete_null_obj_returns_false() {
+        let key = c"k";
+        // SAFETY: null obj is documented to return false.
+        assert!(!unsafe { stator_object_delete(std::ptr::null_mut(), key.as_ptr()) });
+    }
+
+    // ── stator_object_get_property_names ──────────────────────────────────────
+
+    #[test]
+    fn test_object_get_property_names_empty_object() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        // SAFETY: `obj` is non-null and live.
+        let names = unsafe { stator_object_get_property_names(obj) };
+        assert!(!names.is_null());
+        // SAFETY: `names` is non-null and live.
+        assert_eq!(unsafe { stator_property_names_count(names) }, 0);
+        // SAFETY: `names` is non-null and live.
+        unsafe { stator_property_names_destroy(names) };
+        // SAFETY: `obj` is non-null and live.
+        unsafe { stator_object_destroy(obj) };
+    }
+
+    #[test]
+    fn test_object_get_property_names_returns_all_keys() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let v1 = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        let v2 = unsafe { stator_value_new_number(iso.as_ptr(), 2.0) };
+        let ka = c"alpha";
+        let kb = c"beta";
+        // SAFETY: all pointers are valid.
+        unsafe {
+            stator_object_set(obj, ka.as_ptr(), v1);
+            stator_object_set(obj, kb.as_ptr(), v2);
+        }
+        // SAFETY: `obj` is valid.
+        let names = unsafe { stator_object_get_property_names(obj) };
+        assert!(!names.is_null());
+        // SAFETY: `names` is non-null and live.
+        let count = unsafe { stator_property_names_count(names) };
+        assert_eq!(count, 2);
+        // Collect the returned names and verify both keys are present.
+        let mut got: Vec<String> = Vec::new();
+        for i in 0..count {
+            // SAFETY: `names` is valid; `i` is within range.
+            let ptr = unsafe { stator_property_names_get(names, i) };
+            assert!(!ptr.is_null());
+            // SAFETY: `ptr` is a valid null-terminated string owned by `names`.
+            let s = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_owned();
+            got.push(s);
+        }
+        got.sort();
+        assert_eq!(got, vec!["alpha", "beta"]);
+        // SAFETY: all pointers are non-null and live.
+        unsafe {
+            stator_property_names_destroy(names);
+            stator_value_destroy(v1);
+            stator_value_destroy(v2);
+            stator_object_destroy(obj);
+        }
+    }
+
+    #[test]
+    fn test_object_get_property_names_after_delete() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        let v = unsafe { stator_value_new_number(iso.as_ptr(), 99.0) };
+        let key = c"temp";
+        // SAFETY: all pointers are valid.
+        unsafe { stator_object_set(obj, key.as_ptr(), v) };
+        // SAFETY: `obj` and `key` are valid.
+        unsafe { stator_object_delete(obj, key.as_ptr()) };
+        // SAFETY: `obj` is valid.
+        let names = unsafe { stator_object_get_property_names(obj) };
+        assert!(!names.is_null());
+        // SAFETY: `names` is non-null and live.
+        assert_eq!(unsafe { stator_property_names_count(names) }, 0);
+        // SAFETY: all pointers are non-null and live.
+        unsafe {
+            stator_property_names_destroy(names);
+            stator_value_destroy(v);
+            stator_object_destroy(obj);
+        }
+    }
+
+    #[test]
+    fn test_property_names_get_out_of_range_returns_null() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let obj = unsafe { stator_object_new(iso.as_ptr()) };
+        // SAFETY: `obj` is valid.
+        let names = unsafe { stator_object_get_property_names(obj) };
+        assert!(!names.is_null());
+        // SAFETY: `names` is non-null and live; index 0 is out of range for an
+        // empty snapshot.
+        assert!(unsafe { stator_property_names_get(names, 0) }.is_null());
+        // SAFETY: all pointers are non-null and live.
+        unsafe {
+            stator_property_names_destroy(names);
+            stator_object_destroy(obj);
+        }
+    }
+
+    #[test]
+    fn test_object_get_property_names_null_returns_null() {
+        // SAFETY: null obj is documented to return null.
+        let names = unsafe { stator_object_get_property_names(std::ptr::null()) };
+        assert!(names.is_null());
+    }
+
+    #[test]
+    fn test_property_names_count_null_returns_zero() {
+        // SAFETY: null names is documented to return 0.
+        assert_eq!(unsafe { stator_property_names_count(std::ptr::null()) }, 0);
+    }
+
+    #[test]
+    fn test_property_names_get_null_names_returns_null() {
+        // SAFETY: null names is documented to return null.
+        assert!(unsafe { stator_property_names_get(std::ptr::null(), 0) }.is_null());
     }
 
     #[test]

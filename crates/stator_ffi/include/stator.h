@@ -80,6 +80,15 @@ typedef struct StatorObject StatorObject;
 typedef struct StatorPlatform StatorPlatform;
 
 /**
+ * An opaque snapshot of the own property names of a JavaScript object.
+ *
+ * Created by [`stator_object_get_property_names`] and freed by
+ * [`stator_property_names_destroy`].  The individual name strings are owned
+ * by this snapshot and remain valid until it is destroyed.
+ */
+typedef struct StatorPropertyNames StatorPropertyNames;
+
+/**
  * The outcome of a `stator_script_compile` call.
  *
  * Created by [`stator_script_compile`] and released by [`stator_script_free`].
@@ -790,6 +799,80 @@ void stator_object_set(struct StatorObject *obj, const char *key, const struct S
  * - `key` must be a valid, null-terminated C string.
  */
 struct StatorValue *stator_object_get(const struct StatorObject *obj, const char *key);
+
+/**
+ * Return `true` if `obj` has a property with the given `key` (own or
+ * inherited via the prototype chain).
+ *
+ * Returns `false` if any argument is null.
+ *
+ * # Safety
+ * - `obj` must be a valid, live [`StatorObject`] pointer.
+ * - `key` must be a valid, null-terminated C string.
+ */
+bool stator_object_has(const struct StatorObject *obj, const char *key);
+
+/**
+ * Delete the named property `key` from `obj`.
+ *
+ * Returns `true` if the property was successfully deleted (or did not exist),
+ * `false` if the deletion fails (e.g. the property is non-configurable, the
+ * object is non-extensible in a way that prevents deletion, or any argument
+ * is null).
+ *
+ * # Safety
+ * - `obj` must be a valid, live [`StatorObject`] pointer.
+ * - `key` must be a valid, null-terminated C string.
+ */
+bool stator_object_delete(struct StatorObject *obj, const char *key);
+
+/**
+ * Collect the own enumerable property names of `obj` into a new
+ * [`StatorPropertyNames`] snapshot.
+ *
+ * Returns a null pointer if `obj` is null.  The caller must eventually pass
+ * the returned pointer to [`stator_property_names_destroy`].
+ *
+ * # Safety
+ * `obj` must be a valid, live [`StatorObject`] pointer.
+ */
+struct StatorPropertyNames *stator_object_get_property_names(const struct StatorObject *obj);
+
+/**
+ * Return the number of property names in `names`.
+ *
+ * Returns `0` if `names` is null.
+ *
+ * # Safety
+ * `names` must be either null or a valid, live [`StatorPropertyNames`] pointer.
+ */
+size_t stator_property_names_count(const struct StatorPropertyNames *names);
+
+/**
+ * Return a pointer to the null-terminated property name at position `index`.
+ *
+ * The returned pointer is valid for as long as `names` is alive and has not
+ * been destroyed.  Returns a null pointer if `names` is null or `index` is
+ * out of range.
+ *
+ * # Safety
+ * `names` must be either null or a valid, live [`StatorPropertyNames`] pointer.
+ */
+const char *stator_property_names_get(const struct StatorPropertyNames *names, size_t index);
+
+/**
+ * Destroy a [`StatorPropertyNames`] snapshot previously returned by
+ * [`stator_object_get_property_names`].
+ *
+ * After this call the pointer and all name pointers obtained from it are
+ * invalid and must not be used.
+ *
+ * # Safety
+ * `names` must be a non-null pointer returned by
+ * `stator_object_get_property_names` and must not be used again after this
+ * call.
+ */
+void stator_property_names_destroy(struct StatorPropertyNames *names);
 
 /**
  * Trigger a minor (young-generation) GC on the isolate heap.
