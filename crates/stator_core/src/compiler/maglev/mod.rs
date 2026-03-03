@@ -15,3 +15,5 @@ pub mod graph_builder;
 pub mod ir;
 /// Optimisation passes: constant folding, DCE, redundant-CheckMaps removal.
 pub mod optimizer;
+/// Linear-scan register allocator over [`ir::MaglevGraph`].
+pub mod regalloc;
