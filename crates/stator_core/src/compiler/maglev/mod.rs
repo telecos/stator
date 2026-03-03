@@ -9,6 +9,9 @@
 //!   [`crate::bytecode::feedback::FeedbackVector`] and emits a
 //!   [`ir::MaglevGraph`] with speculative type guards.
 
+/// Code generator: walk register-allocated [`ir::MaglevGraph`] and emit
+/// x86-64 machine code.
+pub mod codegen;
 /// Bytecode-to-IR graph builder.
 pub mod graph_builder;
 /// Typed IR node definitions for the Maglev compiler.
