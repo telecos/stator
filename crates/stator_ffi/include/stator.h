@@ -39,6 +39,14 @@ typedef struct StatorIsolate StatorIsolate;
 typedef struct StatorObject StatorObject;
 
 /**
+ * An opaque handle to an embedder-provided platform implementation.
+ *
+ * Created by [`stator_platform_new`] and destroyed by
+ * [`stator_platform_destroy`].
+ */
+typedef struct StatorPlatform StatorPlatform;
+
+/**
  * The outcome of a `stator_script_compile` call.
  *
  * Created by [`stator_script_compile`] and released by [`stator_script_free`].
@@ -53,6 +61,46 @@ typedef struct StatorScript StatorScript;
  * parent isolate is incremented on creation and decremented on destruction.
  */
 typedef struct StatorValue StatorValue;
+
+/**
+ * C-compatible vtable that embedders fill in to customise engine behaviour.
+ *
+ * All fields are optional (`Option<…>`).  When a field is `None` the engine
+ * falls back to a default (no-op or zero).
+ *
+ * # Safety requirements for callers
+ * Every function pointer, if set, must remain valid for the entire lifetime of
+ * the owning [`StatorPlatform`].  Calling [`stator_platform_destroy`] on the
+ * platform is the only safe point at which the function pointers may be
+ * invalidated.
+ */
+typedef struct StatorPlatformVTable {
+  /**
+   * Return the number of worker threads available for background work.
+   *
+   * May be `None`; in that case the engine defaults to `0`.
+   */
+  uint32_t (*number_of_worker_threads)(void);
+  /**
+   * Schedule `task` for execution on a platform thread.
+   *
+   * The platform takes ownership of `task`.  May be `None` (tasks are
+   * silently dropped).
+   */
+  void (*post_task)(void *task);
+  /**
+   * Return a monotonically increasing time in seconds.
+   *
+   * May be `None`; the engine returns `0.0` when unset.
+   */
+  double (*monotonically_increasing_time)(void);
+  /**
+   * Return the current wall-clock time in milliseconds since the Unix epoch.
+   *
+   * May be `None`; the engine returns `0.0` when unset.
+   */
+  double (*current_clock_time_millis)(void);
+} StatorPlatformVTable;
 
 #ifdef __cplusplus
 extern "C" {
@@ -329,6 +377,78 @@ size_t stator_script_bytecode_count(const struct StatorScript *script);
  * and must not be used again after this call.
  */
 void stator_script_free(struct StatorScript *script);
+
+/**
+ * Create a new platform from an embedder-supplied vtable.
+ *
+ * The vtable is copied by value; the caller does not need to keep the
+ * original `StatorPlatformVTable` alive after this call returns.
+ *
+ * Returns a null pointer if `vtable` is null.  The caller must eventually
+ * pass the returned pointer to [`stator_platform_destroy`].
+ *
+ * # Safety
+ * - `vtable` must be either null or a valid, readable pointer to a
+ *   [`StatorPlatformVTable`].
+ * - All non-null function pointers stored in the vtable must remain callable
+ *   for the entire lifetime of the returned [`StatorPlatform`].
+ */
+struct StatorPlatform *stator_platform_new(const struct StatorPlatformVTable *vtable);
+
+/**
+ * Destroy a platform previously created with [`stator_platform_new`].
+ *
+ * After this call the pointer is invalid and must not be used.
+ *
+ * # Safety
+ * - `platform` must be a non-null pointer returned by `stator_platform_new`.
+ * - `platform` must not be used again after this call.
+ * - This function must not be called more than once for the same pointer.
+ */
+void stator_platform_destroy(struct StatorPlatform *platform);
+
+/**
+ * Return the number of worker threads reported by `platform`.
+ *
+ * Returns `0` when `platform` is null or the vtable entry was not set.
+ *
+ * # Safety
+ * `platform` must be either null or a valid, live [`StatorPlatform`] pointer.
+ */
+uint32_t stator_platform_number_of_worker_threads(const struct StatorPlatform *platform);
+
+/**
+ * Schedule `task` for execution on `platform`.
+ *
+ * Does nothing when `platform` is null, `task` is null, or the vtable entry
+ * was not set.
+ *
+ * # Safety
+ * - `platform` must be either null or a valid, live [`StatorPlatform`] pointer.
+ * - `task` must be a non-null pointer whose lifetime the caller manages;
+ *   ownership of `task` is transferred to the platform on this call.
+ */
+void stator_platform_post_task(const struct StatorPlatform *platform, void *task);
+
+/**
+ * Return the monotonically increasing time (seconds) from `platform`.
+ *
+ * Returns `0.0` when `platform` is null or the vtable entry was not set.
+ *
+ * # Safety
+ * `platform` must be either null or a valid, live [`StatorPlatform`] pointer.
+ */
+double stator_platform_monotonically_increasing_time(const struct StatorPlatform *platform);
+
+/**
+ * Return the current clock time in milliseconds from `platform`.
+ *
+ * Returns `0.0` when `platform` is null or the vtable entry was not set.
+ *
+ * # Safety
+ * `platform` must be either null or a valid, live [`StatorPlatform`] pointer.
+ */
+double stator_platform_current_clock_time_millis(const struct StatorPlatform *platform);
 
 #ifdef __cplusplus
 }  // extern "C"
