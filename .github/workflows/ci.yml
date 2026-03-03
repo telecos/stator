@@ -93,9 +93,52 @@ jobs:
       - name: Verify mini_browser output
         run: |
           actual=$(examples/mini_browser/build/mini_browser)
-          expected=$(printf '[tab] created context\n[tab] allocated: number(42), string("hello"), object{x: 1, y: 2}\n[tab] GC: 3 objects survived (held by handles)\n[tab] released handles, GC: 0 objects (all reclaimed)\n[tab] heap: 0 bytes used / 8388608 bytes capacity\n\n[tab] --- Phase 2: JavaScript parsing demo ---\n\n[tab] compiling: var x = 1 + 2;\n[tab] OK -- 7 bytecode(s) generated\n[tab] bytecodes:\n  LdaSmi 2\n  Star r1\n  LdaSmi 1\n  Add r1, slot(0)\n  Star r0\n  LdaUndefined\n  Return\n\n[tab] compiling: var = ;\n[tab] ERROR: SyntaxError: at 1:5 \xe2\x80\x94 expected identifier')
-          if [ "$actual" != "$expected" ]; then
-            echo "Output mismatch!"
-            printf 'Expected:\n%s\n\nActual:\n%s\n' "$expected" "$actual"
+
+          # Helper: fail if a string is not present in the output.
+          check_contains() {
+            if ! printf '%s' "$actual" | grep -qF "$1"; then
+              printf 'Missing expected output: %s\n' "$1"
+              printf 'Actual output:\n%s\n' "$actual"
+              exit 1
+            fi
+          }
+
+          # ── Phase 1: GC / object model ──────────────────────────────────
+          check_contains '[tab] created context'
+          check_contains '[tab] allocated: number(42), string("hello"), object{x: 1, y: 2}'
+          check_contains '[tab] GC: 3 objects survived (held by handles)'
+          check_contains '[tab] released handles, GC: 0 objects (all reclaimed)'
+          check_contains '[tab] heap: 0 bytes used / 8388608 bytes capacity'
+
+          # ── Phase 2: JavaScript parsing + bytecode compilation ──────────
+          check_contains '[tab] --- Phase 2: JavaScript parsing demo ---'
+          check_contains '[tab] compiling: var x = 1 + 2;'
+          check_contains '[tab] OK -- 6 bytecode(s) generated'
+          check_contains '  LdaSmi 2'
+          check_contains '  Star r1'
+          check_contains '  LdaSmi 1'
+          check_contains '  Add r1, slot(0)'
+          check_contains '  Star r0'
+          check_contains '  Return'
+          check_contains '[tab] ERROR: SyntaxError: at 1:5'
+
+          # LdaUndefined must NOT appear in the bytecode dump for a top-level
+          # program (programs now return their completion value directly).
+          if printf '%s' "$actual" | grep -qF 'LdaUndefined'; then
+            printf 'Unexpected LdaUndefined in bytecode dump\n'
+            printf 'Actual output:\n%s\n' "$actual"
             exit 1
           fi
+
+          # ── Phase 3: JavaScript execution ───────────────────────────────
+          check_contains '[tab] --- Phase 3: JavaScript execution demo ---'
+          check_contains '[tab] registered native console.log'
+          check_contains "page A loaded"
+          check_contains "x = 3"
+          # Fibonacci and factorial results (timing varies so we match prefix only)
+          check_contains '[tab] result: 55'
+          check_contains '[tab] result: 3628800'
+          # try/catch demo
+          check_contains '[tab] result: false'
+          # Uncaught exception demo
+          check_contains '[tab] UNCAUGHT: (exception)'
