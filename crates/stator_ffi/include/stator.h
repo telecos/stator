@@ -34,6 +34,25 @@ typedef struct StatorContext StatorContext;
 typedef struct StatorEscapableHandleScope StatorEscapableHandleScope;
 
 /**
+ * Call-site information passed to a function-template callback.
+ *
+ * The lifetime of a `StatorFunctionCallbackInfo` value is limited to the
+ * duration of the native callback invocation; the embedder must not store the
+ * pointer beyond that.
+ */
+typedef struct StatorFunctionCallbackInfo StatorFunctionCallbackInfo;
+
+/**
+ * An opaque function template handle.
+ *
+ * A function template associates a C callback with an isolate so that
+ * [`stator_function_template_get_function`] can produce a [`StatorValue`]
+ * representing the function, which can then be installed into a context's
+ * global environment via [`stator_context_global_set`].
+ */
+typedef struct StatorFunctionTemplate StatorFunctionTemplate;
+
+/**
  * An opaque handle scope that manages the lifetime of [`StatorValue`] handles
  * created while the scope is open.
  *
@@ -115,6 +134,16 @@ typedef struct StatorValue StatorValue;
 typedef struct StatorValue *(*StatorNativeCallback)(struct StatorContext *ctx,
                                                     const struct StatorValue *const *args,
                                                     int32_t argc);
+
+/**
+ * C-callable function-template callback signature.
+ *
+ * The callback receives a pointer to a [`StatorFunctionCallbackInfo`] which
+ * provides access to the call arguments and isolate.  It must return either
+ * a new [`StatorValue`] (the caller — i.e. the engine wrapper — owns it and
+ * frees it automatically) or a null pointer (treated as `undefined`).
+ */
+typedef struct StatorValue *(*StatorFunctionTemplateCallback)(const struct StatorFunctionCallbackInfo*);
 
 /**
  * C-compatible vtable that embedders fill in to customise engine behaviour.
@@ -1135,6 +1164,107 @@ bool stator_value_strict_equals(const struct StatorValue *a, const struct Stator
 void stator_register_native_function(struct StatorContext *ctx,
                                      const char *name,
                                      StatorNativeCallback callback);
+
+/**
+ * Return the number of arguments passed to this call.
+ *
+ * Returns `0` when `info` is null.
+ *
+ * # Safety
+ * `info` must be either null or a valid pointer to a live
+ * [`StatorFunctionCallbackInfo`].
+ */
+int32_t stator_function_callback_info_length(const struct StatorFunctionCallbackInfo *info);
+
+/**
+ * Return a pointer to the argument at position `index`.
+ *
+ * The returned pointer is valid only for the duration of the callback
+ * invocation.  Returns a null pointer if `info` is null or `index` is out of
+ * range.
+ *
+ * # Safety
+ * `info` must be either null or a valid pointer to a live
+ * [`StatorFunctionCallbackInfo`].
+ */
+const struct StatorValue *stator_function_callback_info_get(const struct StatorFunctionCallbackInfo *info,
+                                                            int32_t index);
+
+/**
+ * Return the isolate associated with this call.
+ *
+ * Returns a null pointer if `info` is null.
+ *
+ * # Safety
+ * `info` must be either null or a valid pointer to a live
+ * [`StatorFunctionCallbackInfo`].
+ */
+struct StatorIsolate *stator_function_callback_info_get_isolate(const struct StatorFunctionCallbackInfo *info);
+
+/**
+ * Create a new function template associated with `isolate`.
+ *
+ * Returns a null pointer if `isolate` is null.  The caller must eventually
+ * pass the returned pointer to [`stator_function_template_destroy`].
+ *
+ * # Safety
+ * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `callback` must remain valid for the lifetime of the template.
+ */
+struct StatorFunctionTemplate *stator_function_template_new(struct StatorIsolate *isolate,
+                                                            StatorFunctionTemplateCallback callback);
+
+/**
+ * Destroy a function template previously created with
+ * [`stator_function_template_new`].
+ *
+ * Does nothing if `tmpl` is null.
+ *
+ * # Safety
+ * `tmpl` must be a non-null pointer returned by
+ * [`stator_function_template_new`] and must not be used again after this call.
+ */
+void stator_function_template_destroy(struct StatorFunctionTemplate *tmpl);
+
+/**
+ * Produce a [`StatorValue`] representing the function described by `tmpl`.
+ *
+ * The returned value has type `"function"` and can be installed into a
+ * context's global environment via [`stator_context_global_set`], after which
+ * JavaScript code run with [`stator_script_run`] can call it as a global
+ * function.
+ *
+ * Returns a null pointer if `tmpl` is null.  The caller owns the returned
+ * pointer and must eventually pass it to [`stator_value_destroy`] (or let a
+ * handle scope manage it).
+ *
+ * # Safety
+ * `tmpl` must be either null or a valid, live [`StatorFunctionTemplate`]
+ * pointer.
+ */
+struct StatorValue *stator_function_template_get_function(const struct StatorFunctionTemplate *tmpl,
+                                                          struct StatorContext *_ctx);
+
+/**
+ * Install a value into the context's global environment under `name`.
+ *
+ * After this call, JavaScript code running via [`stator_script_run`] can
+ * reference `name` as a global variable.  For function values (created via
+ * [`stator_function_template_get_function`] or
+ * [`stator_value_new_*`][stator_value_new_number]), the callable is installed
+ * so that scripts can invoke it.
+ *
+ * Does nothing if `ctx` or `name` is null.  A null `val` installs
+ * `undefined`.
+ *
+ * # Safety
+ * - `ctx` must be a valid, live [`StatorContext`] pointer.
+ * - `name` must be a valid, null-terminated C string.
+ * - `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+void stator_context_global_set(struct StatorContext *ctx,
+                               const char *name,
+                               const struct StatorValue *val);
 
 /**
  * Open a new handle scope on `isolate`.
