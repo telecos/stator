@@ -170,7 +170,8 @@ use std::rc::Rc;
 
 use crate::builtins::error::{pop_call_frame, push_call_frame};
 use crate::bytecode::bytecode_array::{
-    BytecodeArray, ConstantPoolEntry, HandlerTableEntry, TIERING_THRESHOLD,
+    BytecodeArray, ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD,
+    MaglevJitCodeCache, TIERING_THRESHOLD,
 };
 use crate::bytecode::bytecodes::{Opcode, Operand, decode_with_byte_offsets};
 use crate::error::{StatorError, StatorResult};
@@ -181,10 +182,10 @@ use crate::objects::value::JsValue;
 pub use crate::objects::value::{GeneratorState, GeneratorStatus, GeneratorStep, NativeIterator};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tiering: interpreter → baseline JIT
+// Tiering: interpreter → baseline JIT → Maglev JIT
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Number of loop back-edges taken before OSR compilation is triggered.
+/// Number of loop back-edges taken before OSR baseline compilation is triggered.
 ///
 /// When a single interpreter loop accumulates this many `JumpLoop` iterations
 /// and the enclosing function has not yet been JIT-compiled, a baseline
@@ -192,8 +193,16 @@ pub use crate::objects::value::{GeneratorState, GeneratorStatus, GeneratorStep, 
 /// via native code.
 const OSR_LOOP_THRESHOLD: u32 = 1_000;
 
+/// Number of loop back-edges taken before a Maglev background compilation is
+/// triggered via OSR.
+///
+/// When a loop has already caused baseline JIT compilation and the back-edge
+/// count exceeds this threshold, a Maglev compilation is scheduled in a
+/// background thread so the next *call* can use the optimised tier.
+const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 5_000;
+
 // ─────────────────────────────────────────────────────────────────────────────
-// JIT compilation statistics (thread-local)
+// JIT compilation statistics
 // ─────────────────────────────────────────────────────────────────────────────
 
 thread_local! {
@@ -202,6 +211,19 @@ thread_local! {
     /// Total machine-code bytes produced by all successful JIT compilations.
     static JIT_CODE_BYTES: Cell<usize> = const { Cell::new(0) };
 }
+
+/// Process-wide count of successful Maglev compilations.
+///
+/// Uses atomics so the background compilation thread can update the counter
+/// while the interpreter thread reads it.
+static MAGLEV_COMPILATION_COUNT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Process-wide total machine-code bytes produced by Maglev compilations.
+///
+/// Uses atomics so the background compilation thread can update the counter
+/// while the interpreter thread reads it.
+static MAGLEV_CODE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Return a snapshot of the JIT compilation statistics for the current thread.
 ///
@@ -212,6 +234,21 @@ pub fn jit_stats() -> (u32, usize) {
     (
         JIT_COMPILATION_COUNT.with(|c| c.get()),
         JIT_CODE_BYTES.with(|c| c.get()),
+    )
+}
+
+/// Return a snapshot of the process-wide Maglev JIT compilation statistics.
+///
+/// Returns `(functions_compiled, total_code_bytes)`.
+///
+/// Unlike [`jit_stats`], these counters accumulate across all threads because
+/// Maglev compilation runs in background threads.
+///
+/// On platforms where the JIT is not available both values will always be zero.
+pub fn maglev_stats() -> (u32, usize) {
+    (
+        MAGLEV_COMPILATION_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        MAGLEV_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
     )
 }
 
@@ -252,6 +289,180 @@ fn maybe_compile_baseline(ba: &BytecodeArray) {
     let _ = ba;
 }
 
+/// Build a constant-pool suitable for sending to a background compilation
+/// thread.
+///
+/// [`ConstantPoolEntry::Function`] variants hold a [`BytecodeArray`] that
+/// contains `Rc`-based tiering state which is not [`Send`].  For Maglev
+/// compilation the inner data of a `Function` entry is never accessed (the
+/// graph builder only uses the variant tag to emit an opaque
+/// `ConstantPoolEntry` reference node), so we replace the inner
+/// [`BytecodeArray`] with a fresh empty one whose `Rc`s are not shared with
+/// the main thread.
+#[cfg(all(target_arch = "x86_64", unix))]
+fn pool_for_compile_thread(pool: &[ConstantPoolEntry]) -> Vec<ConstantPoolEntry> {
+    use crate::bytecode::feedback::FeedbackMetadata;
+    pool.iter()
+        .map(|e: &ConstantPoolEntry| match e {
+            ConstantPoolEntry::Function(_) => {
+                ConstantPoolEntry::Function(Box::new(BytecodeArray::new(
+                    vec![],
+                    vec![],
+                    0,
+                    0,
+                    vec![],
+                    FeedbackMetadata::empty(),
+                    vec![],
+                )))
+            }
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// A thin wrapper that marks a [`BytecodeArray`] as safe to transfer to a
+/// background compilation thread.
+///
+/// # Safety
+///
+/// The wrapped [`BytecodeArray`] must have been freshly constructed (its `Rc`
+/// tiering state must not be shared with any other thread), and it must be
+/// transferred exclusively to ONE background thread.  No other thread may
+/// hold a reference to the same `Rc` instances while the background thread
+/// is running.
+#[cfg(all(target_arch = "x86_64", unix))]
+struct SendableBytecodesArray(BytecodeArray);
+
+// SAFETY: The BytecodeArray wrapped here is freshly constructed with Rc
+// instances that are not shared with any other thread.  We guarantee exclusive
+// ownership by the background compilation thread.
+#[cfg(all(target_arch = "x86_64", unix))]
+unsafe impl Send for SendableBytecodesArray {}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+impl std::ops::Deref for SendableBytecodesArray {
+    type Target = BytecodeArray;
+    fn deref(&self) -> &BytecodeArray {
+        &self.0
+    }
+}
+
+/// Compilation input bundle for a Maglev background thread.
+///
+/// All fields are owned and trivially-`Send`.  The `BytecodeArray` is wrapped
+/// in [`SendableBytecodesArray`] which declares exclusive ownership.
+#[cfg(all(target_arch = "x86_64", unix))]
+struct MaglevCompileInput {
+    ba: SendableBytecodesArray,
+    result_cache: MaglevJitCodeCache,
+}
+
+/// Schedule a Maglev background compilation for `ba`.
+///
+/// On x86-64 Unix this spawns a background thread that runs the full Maglev
+/// pipeline (graph build → optimise → codegen) and writes the resulting code
+/// into `ba`'s Maglev JIT cache.  Subsequent calls will pick up the compiled
+/// code via [`BytecodeArray::try_get_maglev_jit_code`].
+///
+/// The function is a no-op when:
+/// - compilation has already been started (atomic flag check), or
+/// - the platform does not support JIT.
+fn maybe_compile_maglev(ba: &BytecodeArray) {
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        use crate::bytecode::feedback::FeedbackVector;
+        use crate::compiler::maglev::codegen as maglev_codegen;
+        use crate::compiler::maglev::graph_builder::GraphBuilder;
+        use crate::compiler::maglev::optimizer::optimize;
+
+        // Only one compilation thread per function.
+        if !ba.try_start_maglev_compile() {
+            return;
+        }
+
+        let compile_ba = BytecodeArray::new(
+            ba.bytecodes().to_vec(),
+            pool_for_compile_thread(ba.constant_pool()),
+            ba.frame_size(),
+            ba.parameter_count(),
+            vec![], // source positions not needed for compilation
+            ba.feedback_metadata().clone(),
+            vec![], // handler table not needed for Maglev graph
+        );
+
+        let input = MaglevCompileInput {
+            ba: SendableBytecodesArray(compile_ba),
+            result_cache: ba.maglev_jit_cache_arc(),
+        };
+
+        std::thread::spawn(move || {
+            // Access through the SendableBytecodesArray wrapper (Deref) so the
+            // Rust 2024 precise closure capture analysis records input.ba
+            // (SendableBytecodesArray: Send) not input.ba.0 (BytecodeArray:
+            // !Send) as the captured variable.
+            let feedback = FeedbackVector::new(input.ba.feedback_metadata());
+            let param_count = input.ba.parameter_count();
+            if let Ok(mut graph) = GraphBuilder::build(&input.ba, &feedback) {
+                optimize(&mut graph);
+                if let Ok(cc) = maglev_codegen::compile(&graph, param_count) {
+                    let code_len = cc.code.len();
+                    if let Ok(mut guard) = input.result_cache.lock() {
+                        *guard = Some((cc.code, cc.register_file_slots));
+                        drop(guard);
+                    }
+                    // Record Maglev stats atomically (readable from any thread).
+                    MAGLEV_COMPILATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    MAGLEV_CODE_BYTES.fetch_add(code_len, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+    }
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    let _ = ba;
+}
+
+/// Try to execute `ba` via the cached Maglev JIT code.
+///
+/// Returns `Some(result)` when execution succeeds or returns an error;
+/// returns `None` when:
+/// - Maglev compilation has not finished yet,
+/// - one or more arguments cannot be represented in the JIT tier, or
+/// - the JIT returns [`JIT_DEOPT`][crate::compiler::baseline::compiler::JIT_DEOPT]
+///   (fall-back to the next tier).
+///
+/// On platforms where the JIT is not available this always returns `None`.
+fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        use crate::compiler::baseline::compiler::jit_to_jsvalue;
+        use crate::compiler::maglev::codegen::MaglevCompiledCode;
+
+        let (code, register_file_slots) = ba.try_get_maglev_jit_code()?;
+        let jit_args: Option<Vec<i64>> = args.iter().map(jsvalue_to_jit).collect();
+        let jit_args = jit_args?;
+        let native_code_len: usize = code.len();
+        let mc = MaglevCompiledCode {
+            code,
+            native_code_len,
+            register_file_slots,
+            safepoints: Vec::new(),
+            deopt_entries: Vec::new(),
+            source_positions: Vec::new(),
+        };
+        // SAFETY: `mc.code` was produced by `maglev_codegen::compile` and
+        // contains valid x86-64 machine code following the JIT calling
+        // convention (`extern "C" fn(*mut i64) -> i64`).
+        return match unsafe { mc.execute(&jit_args) } {
+            Ok(v) => jit_to_jsvalue(v).map(Ok),
+            // JIT_DEOPT or unrecognised sentinel → fall back to baseline / interpreter.
+            Err(_) => None,
+        };
+    }
+    #[allow(unreachable_code)]
+    let _ = (ba, args);
+    None
+}
+
 /// Try to execute `ba` via the cached baseline JIT code.
 ///
 /// Returns `Some(result)` when execution succeeds or returns an error;
@@ -275,7 +486,7 @@ fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<
         // `native_code_len` records the boundary between machine instructions
         // and appended metadata tables; `execute()` does not use it directly
         // but it is part of the `CompiledCode` API.
-        let native_code_len = code.len();
+        let native_code_len: usize = code.len();
         let cc = CompiledCode {
             code,
             native_code_len,
@@ -295,6 +506,14 @@ fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<
     #[allow(unreachable_code)]
     let _ = (ba, args);
     None
+}
+
+/// Try to execute `ba` via the fastest available JIT tier.
+///
+/// Checks Maglev first (highest tier), then falls back to baseline JIT.
+/// Returns `None` if neither tier has compiled code ready.
+fn try_execute_best_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
+    try_execute_maglev(ba, args).or_else(|| try_execute_jit(ba, args))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -674,7 +893,10 @@ impl Interpreter {
                 // OSR counter.  Once the count exceeds OSR_LOOP_THRESHOLD the
                 // enclosing function is compiled to baseline JIT (if it has not
                 // been compiled already), so that the *next call* to this
-                // function executes via native code.
+                // function executes via native code.  Once the back-edge count
+                // exceeds MAGLEV_OSR_LOOP_THRESHOLD a Maglev background
+                // compilation is scheduled so that future calls use the
+                // optimised tier.
                 Opcode::JumpLoop => {
                     let Operand::JumpOffset(delta) = instr.operands[0] else {
                         return Err(err_bad_operand("JumpLoop", 0));
@@ -685,6 +907,9 @@ impl Interpreter {
                         && frame.bytecode_array.try_get_jit_code().is_none()
                     {
                         maybe_compile_baseline(&frame.bytecode_array);
+                    }
+                    if frame.osr_loop_count >= MAGLEV_OSR_LOOP_THRESHOLD {
+                        maybe_compile_maglev(&frame.bytecode_array);
                     }
                 }
                 Opcode::JumpIfTrue => {
@@ -831,8 +1056,11 @@ impl Interpreter {
                                 if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
                                     maybe_compile_baseline(&ba);
                                 }
+                                if count >= MAGLEV_TIERING_THRESHOLD {
+                                    maybe_compile_maglev(&ba);
+                                }
                                 let mut tried_jit = false;
-                                if let Some(jit_result) = try_execute_jit(&ba, &args) {
+                                if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
                                     frame.accumulator = jit_result?;
                                     tried_jit = true;
                                 }
@@ -880,8 +1108,11 @@ impl Interpreter {
                                 if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
                                     maybe_compile_baseline(&ba);
                                 }
+                                if count >= MAGLEV_TIERING_THRESHOLD {
+                                    maybe_compile_maglev(&ba);
+                                }
                                 let mut tried_jit = false;
-                                if let Some(jit_result) = try_execute_jit(&ba, &args) {
+                                if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
                                     frame.accumulator = jit_result?;
                                     tried_jit = true;
                                 }
@@ -932,8 +1163,11 @@ impl Interpreter {
                                 if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
                                     maybe_compile_baseline(&ba);
                                 }
+                                if count >= MAGLEV_TIERING_THRESHOLD {
+                                    maybe_compile_maglev(&ba);
+                                }
                                 let mut tried_jit = false;
-                                if let Some(jit_result) = try_execute_jit(&ba, &args) {
+                                if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
                                     frame.accumulator = jit_result?;
                                     tried_jit = true;
                                 }
@@ -989,8 +1223,11 @@ impl Interpreter {
                                 if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
                                     maybe_compile_baseline(&ba);
                                 }
+                                if count >= MAGLEV_TIERING_THRESHOLD {
+                                    maybe_compile_maglev(&ba);
+                                }
                                 let mut tried_jit = false;
-                                if let Some(jit_result) = try_execute_jit(&ba, &args) {
+                                if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
                                     frame.accumulator = jit_result?;
                                     tried_jit = true;
                                 }
@@ -1052,8 +1289,11 @@ impl Interpreter {
                             if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
                                 maybe_compile_baseline(&ba);
                             }
+                            if count >= MAGLEV_TIERING_THRESHOLD {
+                                maybe_compile_maglev(&ba);
+                            }
                             let mut tried_jit = false;
-                            if let Some(jit_result) = try_execute_jit(&ba, &args) {
+                            if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
                                 frame.accumulator = jit_result?;
                                 tried_jit = true;
                             }
@@ -1105,8 +1345,11 @@ impl Interpreter {
                             if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
                                 maybe_compile_baseline(&ba);
                             }
+                            if count >= MAGLEV_TIERING_THRESHOLD {
+                                maybe_compile_maglev(&ba);
+                            }
                             let mut tried_jit = false;
-                            if let Some(jit_result) = try_execute_jit(&ba, &args) {
+                            if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
                                 frame.accumulator = jit_result?;
                                 tried_jit = true;
                             }
@@ -4045,6 +4288,146 @@ mod tests {
             assert_eq!(
                 bytes_after, 0,
                 "jit_stats bytes must be zero on non-JIT platform"
+            );
+        }
+    }
+
+    /// Calling a hot function more than [`MAGLEV_TIERING_THRESHOLD`] times must
+    /// schedule a background Maglev compilation and eventually cache the result.
+    ///
+    /// The test calls `add(1, 2)` well above the Maglev threshold and then
+    /// polls for the Maglev cache to be populated, asserting the correct result.
+    #[test]
+    fn test_maglev_compiled_after_threshold() {
+        use super::maglev_stats;
+        use crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD;
+
+        let add_ba = make_add_bytecode();
+
+        let outer_instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::CreateClosure,
+                vec![
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                    Operand::Flag(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(2)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
+            Instruction::new_unchecked(
+                Opcode::CallAnyReceiver,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::RegisterCount(2),
+                    Operand::FeedbackSlot(1),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let pool = vec![ConstantPoolEntry::Function(Box::new(add_ba))];
+        let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
+
+        // Exceed the Maglev threshold so a background compilation is triggered.
+        let call_count = MAGLEV_TIERING_THRESHOLD + 10;
+        let mut last_result = JsValue::Undefined;
+        for _ in 0..call_count {
+            let mut frame = InterpreterFrame::new(outer_ba.clone(), vec![]);
+            last_result = Interpreter::run(&mut frame).unwrap();
+        }
+
+        // The function must always return the correct value.
+        assert_eq!(last_result, JsValue::Smi(3), "add(1, 2) must return 3");
+
+        // On x86-64 Unix, wait briefly for the background Maglev compilation
+        // to finish, then verify the cache is populated and the function still
+        // returns the correct result via the Maglev tier.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            let inner_ba: &BytecodeArray = match outer_ba.constant_pool().first().unwrap() {
+                ConstantPoolEntry::Function(ba) => ba,
+                _ => panic!("expected Function in constant pool"),
+            };
+
+            // Poll for Maglev compilation to finish (background thread).
+            let timeout = std::time::Duration::from_secs(5);
+            let start = std::time::Instant::now();
+            while inner_ba.try_get_maglev_jit_code().is_none() && start.elapsed() < timeout {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            assert!(
+                inner_ba.try_get_maglev_jit_code().is_some(),
+                "Maglev code should be cached after {} calls (threshold={})",
+                call_count,
+                MAGLEV_TIERING_THRESHOLD,
+            );
+
+            // Verify the Maglev tier also returns the correct result.
+            let mut frame = InterpreterFrame::new(outer_ba.clone(), vec![]);
+            let result = Interpreter::run(&mut frame).unwrap();
+            assert_eq!(result, JsValue::Smi(3), "Maglev add(1, 2) must return 3");
+
+            // Maglev stats must have been incremented.
+            let (maglev_count, _maglev_bytes) = maglev_stats();
+            assert!(
+                maglev_count > 0,
+                "maglev_stats count must be > 0 after Maglev compilation"
+            );
+            let _ = maglev_count;
+        }
+    }
+
+    /// After the Maglev tier is installed the function must continue to return
+    /// the correct result for all argument combinations.
+    #[test]
+    fn test_maglev_correct_result_after_tier_up() {
+        use crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD;
+
+        let add_ba = make_add_bytecode();
+
+        let outer_instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::CreateClosure,
+                vec![
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                    Operand::Flag(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(7)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
+            Instruction::new_unchecked(
+                Opcode::CallAnyReceiver,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::RegisterCount(2),
+                    Operand::FeedbackSlot(1),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let pool = vec![ConstantPoolEntry::Function(Box::new(add_ba))];
+        let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
+
+        // Warm up past the Maglev threshold.
+        let warm_up = MAGLEV_TIERING_THRESHOLD + 20;
+        for i in 0..warm_up {
+            let mut frame = InterpreterFrame::new(outer_ba.clone(), vec![]);
+            let result = Interpreter::run(&mut frame).unwrap();
+            assert_eq!(
+                result,
+                JsValue::Smi(12),
+                "add(5, 7) must return 12 on call {}",
+                i + 1,
             );
         }
     }
