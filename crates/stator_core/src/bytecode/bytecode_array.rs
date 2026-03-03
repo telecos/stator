@@ -38,6 +38,9 @@
 //! assert_eq!(decoded.len(), 2);
 //! ```
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
 use crate::bytecode::bytecodes::{self, Instruction};
 use crate::bytecode::feedback::FeedbackMetadata;
 use crate::error::StatorResult;
@@ -132,13 +135,28 @@ impl SourcePosition {
 // BytecodeArray
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Shared JIT code cache stored in a [`BytecodeArray`].
+///
+/// Contains the raw x86-64 machine code bytes produced by the baseline
+/// compiler and the number of `i64` register-file slots required by the
+/// generated code.  The outer [`Rc`] allows all clones of a [`BytecodeArray`]
+/// to share the same cache without copying.
+type JitCodeCache = Rc<RefCell<Option<(Vec<u8>, usize)>>>;
+
 /// An immutable, compact representation of the bytecode for a single
 /// JavaScript function.
 ///
 /// The raw bytes are the V8 Ignition-style encoding produced by
 /// [`bytecodes::encode`].  Use [`BytecodeArray::instructions`] to decode them
 /// back into a [`Vec<Instruction>`] when needed.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// In addition to the static bytecode and metadata, a `BytecodeArray` carries
+/// **tiering state** that is shared across all clones via [`Rc`]:
+///
+/// - An *invocation counter* that is incremented on every call.
+/// - A *JIT code cache* that stores the baseline-compiled machine code once
+///   the invocation count reaches [`TIERING_THRESHOLD`].
+#[derive(Debug, Clone)]
 pub struct BytecodeArray {
     /// The encoded bytecode stream.
     bytecodes: Vec<u8>,
@@ -161,6 +179,43 @@ pub struct BytecodeArray {
     /// [`crate::objects::value::JsValue::Generator`] without executing the
     /// body immediately.
     is_generator: bool,
+    // ─── Tiering state (shared across clones via Rc) ──────────────────────────
+    /// Number of times this function has been invoked.
+    ///
+    /// Wrapped in `Rc<Cell<_>>` so that every clone of this `BytecodeArray`
+    /// (including copies moved into interpreter frames or nested closures)
+    /// contributes to the same counter.  When the count reaches
+    /// [`TIERING_THRESHOLD`] the interpreter triggers baseline JIT compilation.
+    invocation_count: Rc<Cell<u32>>,
+    /// Cached baseline-JIT machine code and register-file slot count.
+    ///
+    /// Stores `(code_bytes, register_file_slots)` produced by
+    /// [`BaselineCompiler`][crate::compiler::baseline::compiler::BaselineCompiler].
+    /// `None` until tiering has been triggered and compilation succeeded.
+    jit_code: JitCodeCache,
+}
+
+/// Invocation-count threshold that triggers baseline JIT compilation.
+///
+/// When a function's `invocation_count` reaches this value the interpreter
+/// requests a baseline-compiled version; all subsequent calls that can be
+/// represented in the current JIT tier execute via native code.
+pub const TIERING_THRESHOLD: u32 = 100;
+
+impl PartialEq for BytecodeArray {
+    /// Two [`BytecodeArray`]s are equal when their static bytecode and metadata
+    /// are identical.  The tiering state (`invocation_count`, `jit_code`) is
+    /// intentionally excluded from the comparison.
+    fn eq(&self, other: &Self) -> bool {
+        self.bytecodes == other.bytecodes
+            && self.constant_pool == other.constant_pool
+            && self.frame_size == other.frame_size
+            && self.parameter_count == other.parameter_count
+            && self.source_positions == other.source_positions
+            && self.feedback_metadata == other.feedback_metadata
+            && self.handler_table == other.handler_table
+            && self.is_generator == other.is_generator
+    }
 }
 
 impl BytecodeArray {
@@ -195,6 +250,8 @@ impl BytecodeArray {
             feedback_metadata,
             handler_table,
             is_generator: false,
+            invocation_count: Rc::new(Cell::new(0)),
+            jit_code: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -282,6 +339,47 @@ impl BytecodeArray {
             .source_positions
             .partition_point(|sp| sp.bytecode_offset <= bytecode_offset);
         idx.checked_sub(1).map(|i| &self.source_positions[i])
+    }
+
+    // ─── Tiering helpers ──────────────────────────────────────────────────────
+
+    /// Atomically increment the invocation counter and return the **new** value.
+    ///
+    /// All clones of this [`BytecodeArray`] share the same counter via the
+    /// inner [`Rc`], so every copy — whether still held in a
+    /// [`JsValue::Function`][crate::objects::value::JsValue] or already moved
+    /// into an [`crate::interpreter::InterpreterFrame`] — increments the same
+    /// counter.
+    pub fn increment_invocation_count(&self) -> u32 {
+        let new = self.invocation_count.get().saturating_add(1);
+        self.invocation_count.set(new);
+        new
+    }
+
+    /// Returns the current invocation count without modifying it.
+    pub fn invocation_count(&self) -> u32 {
+        self.invocation_count.get()
+    }
+
+    /// Store baseline-JIT machine code produced by the compiler.
+    ///
+    /// `code` is the raw x86-64 code buffer (including metadata tables
+    /// appended by [`BaselineCompiler`][crate::compiler::baseline::compiler::BaselineCompiler]).
+    /// `register_file_slots` is the number of `i64` slots required by the
+    /// JIT's register file (`parameter_count + frame_size`).
+    ///
+    /// All clones of this [`BytecodeArray`] share the same JIT cache.
+    pub fn store_jit_code(&self, code: Vec<u8>, register_file_slots: usize) {
+        *self.jit_code.borrow_mut() = Some((code, register_file_slots));
+    }
+
+    /// Returns a clone of the cached JIT machine code and register-file slot
+    /// count, or `None` if baseline compilation has not been triggered yet.
+    ///
+    /// The caller is responsible for ensuring that the code bytes are executed
+    /// only on the platform and CPU that produced them.
+    pub fn try_get_jit_code(&self) -> Option<(Vec<u8>, usize)> {
+        self.jit_code.borrow().clone()
     }
 }
 
