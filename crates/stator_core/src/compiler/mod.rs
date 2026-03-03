@@ -9,6 +9,8 @@
 //!   - [`maglev::ir`] — Typed IR node types ([`maglev::ir::ValueNode`],
 //!     [`maglev::ir::ControlNode`], [`maglev::ir::BasicBlock`],
 //!     [`maglev::ir::MaglevGraph`]).
+//!   - [`maglev::graph_builder`] — Bytecode-to-IR graph builder
+//!     ([`maglev::graph_builder::GraphBuilder`]).
 
 /// Non-optimising baseline JIT compiler.
 pub mod baseline;
