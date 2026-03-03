@@ -723,6 +723,18 @@ impl MacroAssembler {
         self.buf.push(cc.jcc_byte());
         self.emit_rel32_for_label(label);
     }
+
+    // ── Low-level byte access (crate-internal) ────────────────────────────────
+
+    /// Append a single raw byte to the code buffer.
+    ///
+    /// Used by higher-level instruction encoders that require precise control
+    /// over the emitted bytes (e.g., `AND r64, r/m64` and `OR r64, r/m64`
+    /// which are not included in the standard instruction set of this
+    /// assembler).
+    pub(crate) fn emit_byte(&mut self, b: u8) {
+        self.buf.push(b);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

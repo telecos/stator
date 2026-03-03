@@ -11,6 +11,11 @@
 //!     [`maglev::ir::MaglevGraph`]).
 //!   - [`maglev::graph_builder`] — Bytecode-to-IR graph builder
 //!     ([`maglev::graph_builder::GraphBuilder`]).
+//!   - [`maglev::optimizer`] — Optimisation passes (constant folding, DCE,
+//!     redundant-CheckMaps removal).
+//!   - [`maglev::regalloc`] — Linear-scan register allocator.
+//!   - [`maglev::codegen`] — Code generator: walks a register-allocated
+//!     [`maglev::ir::MaglevGraph`] and emits x86-64 machine code.
 
 /// Non-optimising baseline JIT compiler.
 pub mod baseline;
