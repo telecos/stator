@@ -21,4 +21,5 @@ smallvec = "1.15.1"
 parking_lot = "0.12.5"
 thiserror = "2.0.18"
 regress = "0.10.5"
+libc = "0.2"
 criterion = { version = "0.8.2", features = ["html_reports"] }
