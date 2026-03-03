@@ -475,6 +475,105 @@ struct StatorValue *stator_value_new_map_tag(struct StatorIsolate *isolate);
 struct StatorValue *stator_value_new_set_tag(struct StatorIsolate *isolate);
 
 /**
+ * Create a new string value from a UTF-8 byte buffer of `len` bytes.
+ *
+ * This is the V8-style spelling of [`stator_value_new_string`].  `data` need
+ * not be null-terminated; `len` bytes are copied.  Any embedded null bytes
+ * cause the string to be truncated at the first such byte.  Returns a null
+ * pointer if `isolate` or `data` is null.
+ *
+ * # Safety
+ * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `data` must be valid for reads of `len` bytes and must point to valid
+ *   UTF-8 data.
+ */
+struct StatorValue *stator_string_new_from_utf8(struct StatorIsolate *isolate,
+                                                const char *data,
+                                                size_t len);
+
+/**
+ * Return the number of UTF-8 bytes required to represent `val`.
+ *
+ * Returns `0` when `val` is null or not a string.  The returned length does
+ * **not** include a terminating null byte.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+size_t stator_string_utf8_length(const struct StatorValue *val);
+
+/**
+ * Write the UTF-8 representation of `val` into `buf`.
+ *
+ * At most `buf_size` bytes are written.  The output is **not**
+ * null-terminated (unlike `stator_value_as_string`).  If `nchars_ref` is
+ * non-null, `*nchars_ref` is set to the number of bytes written.  Returns
+ * the number of bytes written, or `0` when `val` is null or not a string or
+ * `buf` is null.
+ *
+ * # Safety
+ * - `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * - `buf` must be valid for writes of `buf_size` bytes (unless null).
+ * - `nchars_ref` must be either null or a valid pointer to a `usize`.
+ */
+size_t stator_string_write_utf8(const struct StatorValue *val,
+                                char *buf,
+                                size_t buf_size,
+                                size_t *nchars_ref);
+
+/**
+ * Create a new number value (V8-style spelling of [`stator_value_new_number`]).
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_number_new(struct StatorIsolate *isolate, double val);
+
+/**
+ * Create a new integer value from a signed 64-bit integer.
+ *
+ * The value is stored as an ECMAScript `Number` (IEEE 754 double).  Values
+ * outside the safe-integer range (`±2⁵³−1`) may lose precision.  Returns a
+ * null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_integer_new(struct StatorIsolate *isolate, int64_t val);
+
+/**
+ * Create a new boolean value (V8-style spelling of [`stator_value_new_boolean`]).
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_boolean_new(struct StatorIsolate *isolate, bool val);
+
+/**
+ * Create a new `undefined` value (V8-style spelling of [`stator_value_new_undefined`]).
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_undefined_new(struct StatorIsolate *isolate);
+
+/**
+ * Create a new `null` value (V8-style spelling of [`stator_value_new_null`]).
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_null_new(struct StatorIsolate *isolate);
+
+/**
  * Destroy a value and decrement the isolate's live-object counter.
  *
  * # Safety

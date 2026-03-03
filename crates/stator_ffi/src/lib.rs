@@ -842,6 +842,166 @@ pub unsafe extern "C" fn stator_value_new_set_tag(isolate: *mut StatorIsolate) -
     v
 }
 
+// ── V8-style typed constructors ───────────────────────────────────────────────
+
+/// Create a new string value from a UTF-8 byte buffer of `len` bytes.
+///
+/// This is the V8-style spelling of [`stator_value_new_string`].  `data` need
+/// not be null-terminated; `len` bytes are copied.  Any embedded null bytes
+/// cause the string to be truncated at the first such byte.  Returns a null
+/// pointer if `isolate` or `data` is null.
+///
+/// # Safety
+/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `data` must be valid for reads of `len` bytes and must point to valid
+///   UTF-8 data.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_string_new_from_utf8(
+    isolate: *mut StatorIsolate,
+    data: *const c_char,
+    len: usize,
+) -> *mut StatorValue {
+    // SAFETY: delegated to `stator_value_new_string`.
+    unsafe { stator_value_new_string(isolate, data, len) }
+}
+
+/// Return the number of UTF-8 bytes required to represent `val`.
+///
+/// Returns `0` when `val` is null or not a string.  The returned length does
+/// **not** include a terminating null byte.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_string_utf8_length(val: *const StatorValue) -> usize {
+    if val.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::Str(cs) => cs.as_bytes().len(),
+        _ => 0,
+    }
+}
+
+/// Write the UTF-8 representation of `val` into `buf`.
+///
+/// At most `buf_size` bytes are written.  The output is **not**
+/// null-terminated (unlike `stator_value_as_string`).  If `nchars_ref` is
+/// non-null, `*nchars_ref` is set to the number of bytes written.  Returns
+/// the number of bytes written, or `0` when `val` is null or not a string or
+/// `buf` is null.
+///
+/// # Safety
+/// - `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// - `buf` must be valid for writes of `buf_size` bytes (unless null).
+/// - `nchars_ref` must be either null or a valid pointer to a `usize`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_string_write_utf8(
+    val: *const StatorValue,
+    buf: *mut c_char,
+    buf_size: usize,
+    nchars_ref: *mut usize,
+) -> usize {
+    if val.is_null() || buf.is_null() {
+        if !nchars_ref.is_null() {
+            // SAFETY: caller guarantees `nchars_ref` is valid.
+            unsafe { *nchars_ref = 0 };
+        }
+        return 0;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    let bytes = match unsafe { &(*val).inner } {
+        StatorValueInner::Str(cs) => cs.as_bytes(),
+        _ => {
+            if !nchars_ref.is_null() {
+                // SAFETY: caller guarantees `nchars_ref` is valid.
+                unsafe { *nchars_ref = 0 };
+            }
+            return 0;
+        }
+    };
+    let n = bytes.len().min(buf_size);
+    // SAFETY: `buf` is valid for `buf_size` bytes; `n <= buf_size`.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buf, n) };
+    if !nchars_ref.is_null() {
+        // SAFETY: caller guarantees `nchars_ref` is valid.
+        unsafe { *nchars_ref = n };
+    }
+    n
+}
+
+/// Create a new number value (V8-style spelling of [`stator_value_new_number`]).
+///
+/// Returns a null pointer if `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_number_new(
+    isolate: *mut StatorIsolate,
+    val: f64,
+) -> *mut StatorValue {
+    // SAFETY: delegated to `stator_value_new_number`.
+    unsafe { stator_value_new_number(isolate, val) }
+}
+
+/// Create a new integer value from a signed 64-bit integer.
+///
+/// The value is stored as an ECMAScript `Number` (IEEE 754 double).  Values
+/// outside the safe-integer range (`±2⁵³−1`) may lose precision.  Returns a
+/// null pointer if `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_integer_new(
+    isolate: *mut StatorIsolate,
+    val: i64,
+) -> *mut StatorValue {
+    // SAFETY: delegated to `stator_value_new_number`.
+    unsafe { stator_value_new_number(isolate, val as f64) }
+}
+
+/// Create a new boolean value (V8-style spelling of [`stator_value_new_boolean`]).
+///
+/// Returns a null pointer if `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_boolean_new(
+    isolate: *mut StatorIsolate,
+    val: bool,
+) -> *mut StatorValue {
+    // SAFETY: delegated to `stator_value_new_boolean`.
+    unsafe { stator_value_new_boolean(isolate, val) }
+}
+
+/// Create a new `undefined` value (V8-style spelling of [`stator_value_new_undefined`]).
+///
+/// Returns a null pointer if `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_undefined_new(isolate: *mut StatorIsolate) -> *mut StatorValue {
+    // SAFETY: delegated to `stator_value_new_undefined`.
+    unsafe { stator_value_new_undefined(isolate) }
+}
+
+/// Create a new `null` value (V8-style spelling of [`stator_value_new_null`]).
+///
+/// Returns a null pointer if `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_null_new(isolate: *mut StatorIsolate) -> *mut StatorValue {
+    // SAFETY: delegated to `stator_value_new_null`.
+    unsafe { stator_value_new_null(isolate) }
+}
+
 /// Destroy a value and decrement the isolate's live-object counter.
 ///
 /// # Safety
@@ -4850,5 +5010,216 @@ mod tests {
         assert!(unsafe { stator_value_strict_equals(a, std::ptr::null()) });
         // SAFETY: `a` is non-null and live.
         unsafe { stator_value_destroy(a) };
+    }
+
+    // ── stator_string_new_from_utf8 / stator_string_utf8_length / stator_string_write_utf8 ──
+
+    #[test]
+    fn test_string_new_from_utf8_roundtrip_ascii() {
+        let iso = IsolateGuard::new();
+        let src = b"hello";
+        // SAFETY: `iso` is valid; `src` is valid for 5 bytes.
+        let val = unsafe {
+            stator_string_new_from_utf8(iso.as_ptr(), src.as_ptr() as *const c_char, src.len())
+        };
+        assert!(!val.is_null());
+        // SAFETY: `val` is non-null and live.
+        let len = unsafe { stator_string_utf8_length(val) };
+        assert_eq!(len, 5);
+        let mut buf = [0u8; 16];
+        let mut nchars: usize = 0;
+        // SAFETY: `val` is non-null; `buf` is valid for 16 bytes; `nchars` is valid.
+        let written = unsafe {
+            stator_string_write_utf8(
+                val,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len(),
+                &raw mut nchars,
+            )
+        };
+        assert_eq!(written, 5);
+        assert_eq!(nchars, 5);
+        assert_eq!(&buf[..5], b"hello");
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_string_new_from_utf8_roundtrip_multibyte() {
+        let iso = IsolateGuard::new();
+        // "café" in UTF-8: c, a, f, é(2 bytes) → 5 bytes total
+        let src = "café".as_bytes();
+        // SAFETY: `iso` is valid; `src` is valid UTF-8.
+        let val = unsafe {
+            stator_string_new_from_utf8(iso.as_ptr(), src.as_ptr() as *const c_char, src.len())
+        };
+        assert!(!val.is_null());
+        // SAFETY: `val` is non-null and live.
+        let len = unsafe { stator_string_utf8_length(val) };
+        assert_eq!(len, src.len());
+        let mut buf = vec![0u8; src.len()];
+        let mut nchars: usize = 0;
+        // SAFETY: `val` is non-null; `buf` is valid; `nchars` is valid.
+        let written = unsafe {
+            stator_string_write_utf8(
+                val,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len(),
+                &raw mut nchars,
+            )
+        };
+        assert_eq!(written, src.len());
+        assert_eq!(nchars, src.len());
+        assert_eq!(&buf[..], src);
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_string_write_utf8_truncates_to_buf_size() {
+        let iso = IsolateGuard::new();
+        let src = b"abcdef";
+        // SAFETY: `iso` is valid; `src` is valid for 6 bytes.
+        let val = unsafe {
+            stator_string_new_from_utf8(iso.as_ptr(), src.as_ptr() as *const c_char, src.len())
+        };
+        assert!(!val.is_null());
+        let mut buf = [0u8; 3];
+        let mut nchars: usize = 0;
+        // SAFETY: `val` is non-null; `buf` is valid for 3 bytes; `nchars` is valid.
+        let written = unsafe {
+            stator_string_write_utf8(
+                val,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len(),
+                &raw mut nchars,
+            )
+        };
+        // Only 3 bytes fit in the buffer.
+        assert_eq!(written, 3);
+        assert_eq!(nchars, 3);
+        assert_eq!(&buf[..], b"abc");
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_string_utf8_length_non_string_returns_zero() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 42.0) };
+        // SAFETY: `val` is non-null and live.
+        assert_eq!(unsafe { stator_string_utf8_length(val) }, 0);
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_string_write_utf8_null_val_returns_zero() {
+        let mut buf = [0u8; 8];
+        let mut nchars: usize = 99;
+        // SAFETY: `val` is null (documented as returning 0); `buf` is valid.
+        let written = unsafe {
+            stator_string_write_utf8(
+                std::ptr::null(),
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len(),
+                &raw mut nchars,
+            )
+        };
+        assert_eq!(written, 0);
+        assert_eq!(nchars, 0);
+    }
+
+    // ── stator_number_new / stator_integer_new ────────────────────────────────
+
+    #[test]
+    fn test_number_new_roundtrip() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_number_new(iso.as_ptr(), 2.718) };
+        assert!(!val.is_null());
+        // SAFETY: `val` is non-null and live.
+        let n = unsafe { stator_value_as_number(val) };
+        assert!((n - 2.718).abs() < f64::EPSILON);
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_integer_new_roundtrip() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_integer_new(iso.as_ptr(), 42) };
+        assert!(!val.is_null());
+        // SAFETY: `val` is non-null and live.
+        assert!(unsafe { stator_value_is_number(val) });
+        let n = unsafe { stator_value_as_number(val) };
+        assert_eq!(n, 42.0);
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_integer_new_negative() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_integer_new(iso.as_ptr(), -7) };
+        assert!(!val.is_null());
+        // SAFETY: `val` is non-null and live.
+        let n = unsafe { stator_value_as_number(val) };
+        assert_eq!(n, -7.0);
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    // ── stator_boolean_new / stator_undefined_new / stator_null_new ──────────
+
+    #[test]
+    fn test_boolean_new_true() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_boolean_new(iso.as_ptr(), true) };
+        assert!(!val.is_null());
+        // SAFETY: `val` is non-null and live.
+        assert!(unsafe { stator_value_is_boolean(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_boolean_new_false() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_boolean_new(iso.as_ptr(), false) };
+        assert!(!val.is_null());
+        // SAFETY: `val` is non-null and live.
+        assert!(unsafe { stator_value_is_boolean(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_undefined_new() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_undefined_new(iso.as_ptr()) };
+        assert!(!val.is_null());
+        // SAFETY: `val` is non-null and live.
+        assert!(unsafe { stator_value_is_undefined(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_null_new() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_null_new(iso.as_ptr()) };
+        assert!(!val.is_null());
+        // SAFETY: `val` is non-null and live.
+        assert!(unsafe { stator_value_is_null(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
     }
 }
