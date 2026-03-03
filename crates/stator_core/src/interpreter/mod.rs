@@ -165,6 +165,7 @@
 //! dispatches on the [`Opcode`] via an exhaustive `match`.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::builtins::error::{pop_call_frame, push_call_frame};
@@ -175,7 +176,46 @@ use crate::objects::value::JsValue;
 
 // Re-export generator types and bring them into scope so external code can
 // import them from `stator_core::interpreter` (backwards-compatible path).
-pub use crate::objects::value::{GeneratorState, GeneratorStatus, GeneratorStep, NativeIterator};
+pub use crate::objects::value::{
+    GeneratorState, GeneratorStatus, GeneratorStep, NativeFn, NativeIterator,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Global object (thread-local)
+// ─────────────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    /// Thread-local global variable table.
+    ///
+    /// Populated by the embedder (e.g. `st8`) before running any script.
+    /// Looked up by the [`Opcode::LdaGlobal`] handler and written by the
+    /// [`Opcode::StaGlobal`] handler.
+    static GLOBALS: RefCell<HashMap<String, JsValue>> = RefCell::new(HashMap::new());
+}
+
+/// Register a global variable that will be visible to all scripts executed on
+/// this thread via the [`Opcode::LdaGlobal`] opcode.
+///
+/// Overwrites any previous binding for the same `name`.
+pub fn set_global(name: String, value: JsValue) {
+    GLOBALS.with(|g| g.borrow_mut().insert(name, value));
+}
+
+/// Read a global variable by name.
+///
+/// Returns `JsValue::Undefined` when the name is not bound.
+pub fn get_global(name: &str) -> JsValue {
+    GLOBALS.with(|g| g.borrow().get(name).cloned().unwrap_or(JsValue::Undefined))
+}
+
+/// Remove all entries from the thread-local globals map.
+///
+/// Useful for isolating independent script executions on the same thread,
+/// for example between test cases.  After calling this function, any script
+/// that references previously-registered globals will see `undefined`.
+pub fn clear_globals() {
+    GLOBALS.with(|g| g.borrow_mut().clear());
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // InterpreterFrame
@@ -350,6 +390,55 @@ impl Interpreter {
                         StatorError::Internal(format!("constant pool index {idx} out of bounds"))
                     })?;
                     frame.accumulator = constant_to_value(entry);
+                }
+
+                // LdaGlobal [name_idx, slot]: load a global variable by name.
+                // The name is stored as a String constant pool entry.
+                // Returns `undefined` for unknown globals.
+                Opcode::LdaGlobal | Opcode::LdaGlobalInsideTypeof => {
+                    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("LdaGlobal", 0));
+                    };
+                    let name = frame
+                        .bytecode_array
+                        .get_constant(idx)
+                        .and_then(|e| {
+                            if let ConstantPoolEntry::String(s) = e {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or_else(|| {
+                            StatorError::Internal(format!(
+                                "LdaGlobal: constant pool index {idx} is not a string"
+                            ))
+                        })?;
+                    frame.accumulator = get_global(&name);
+                }
+
+                // StaGlobal [name_idx, slot]: store the accumulator into a
+                // global variable.  The name is a String constant pool entry.
+                Opcode::StaGlobal => {
+                    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("StaGlobal", 0));
+                    };
+                    let name = frame
+                        .bytecode_array
+                        .get_constant(idx)
+                        .and_then(|e| {
+                            if let ConstantPoolEntry::String(s) = e {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or_else(|| {
+                            StatorError::Internal(format!(
+                                "StaGlobal: constant pool index {idx} is not a string"
+                            ))
+                        })?;
+                    set_global(name, frame.accumulator.clone());
                 }
 
                 // ── Register moves ─────────────────────────────────────────
@@ -661,20 +750,29 @@ impl Interpreter {
                         return Err(err_bad_operand("CallAnyReceiver", 2));
                     };
                     let callee = frame.read_reg(callee_v)?.clone();
-                    let JsValue::Function(ba) = callee else {
-                        return Err(StatorError::TypeError(format!(
-                            "CallAnyReceiver: callee is not a function (got {callee:?})"
-                        )));
-                    };
-                    if ba.is_generator() {
-                        frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
-                    } else {
-                        let args = collect_args(frame, args_start_v, arg_count)?;
-                        let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
-                        push_call_frame("<anonymous>");
-                        let result = Interpreter::run(&mut callee_frame);
-                        pop_call_frame();
-                        frame.accumulator = result?;
+                    match callee {
+                        JsValue::NativeFunction(ref nf) => {
+                            let args = collect_args(frame, args_start_v, arg_count)?;
+                            frame.accumulator = (nf.0)(&args)?;
+                        }
+                        JsValue::Function(ref ba) => {
+                            if ba.is_generator() {
+                                frame.accumulator =
+                                    JsValue::Generator(GeneratorState::new((**ba).clone()));
+                            } else {
+                                let args = collect_args(frame, args_start_v, arg_count)?;
+                                let mut callee_frame = InterpreterFrame::new((**ba).clone(), args);
+                                push_call_frame("<anonymous>");
+                                let result = Interpreter::run(&mut callee_frame);
+                                pop_call_frame();
+                                frame.accumulator = result?;
+                            }
+                        }
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "CallAnyReceiver: callee is not a function (got {other:?})"
+                            )));
+                        }
                     }
                 }
 
@@ -685,19 +783,28 @@ impl Interpreter {
                         return Err(err_bad_operand("CallUndefinedReceiver0", 0));
                     };
                     let callee = frame.read_reg(callee_v)?.clone();
-                    let JsValue::Function(ba) = callee else {
-                        return Err(StatorError::TypeError(format!(
-                            "CallUndefinedReceiver0: callee is not a function (got {callee:?})"
-                        )));
-                    };
-                    if ba.is_generator() {
-                        frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
-                    } else {
-                        let mut callee_frame = InterpreterFrame::new((*ba).clone(), vec![]);
-                        push_call_frame("<anonymous>");
-                        let result = Interpreter::run(&mut callee_frame);
-                        pop_call_frame();
-                        frame.accumulator = result?;
+                    match callee {
+                        JsValue::NativeFunction(ref nf) => {
+                            frame.accumulator = (nf.0)(&[])?;
+                        }
+                        JsValue::Function(ref ba) => {
+                            if ba.is_generator() {
+                                frame.accumulator =
+                                    JsValue::Generator(GeneratorState::new((**ba).clone()));
+                            } else {
+                                let mut callee_frame =
+                                    InterpreterFrame::new((**ba).clone(), vec![]);
+                                push_call_frame("<anonymous>");
+                                let result = Interpreter::run(&mut callee_frame);
+                                pop_call_frame();
+                                frame.accumulator = result?;
+                            }
+                        }
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "CallUndefinedReceiver0: callee is not a function (got {other:?})"
+                            )));
+                        }
                     }
                 }
 
@@ -711,20 +818,30 @@ impl Interpreter {
                         return Err(err_bad_operand("CallUndefinedReceiver1", 1));
                     };
                     let callee = frame.read_reg(callee_v)?.clone();
-                    let JsValue::Function(ba) = callee else {
-                        return Err(StatorError::TypeError(format!(
-                            "CallUndefinedReceiver1: callee is not a function (got {callee:?})"
-                        )));
-                    };
-                    if ba.is_generator() {
-                        frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
-                    } else {
-                        let arg1 = frame.read_reg(arg1_v)?.clone();
-                        let mut callee_frame = InterpreterFrame::new((*ba).clone(), vec![arg1]);
-                        push_call_frame("<anonymous>");
-                        let result = Interpreter::run(&mut callee_frame);
-                        pop_call_frame();
-                        frame.accumulator = result?;
+                    match callee {
+                        JsValue::NativeFunction(ref nf) => {
+                            let arg1 = frame.read_reg(arg1_v)?.clone();
+                            frame.accumulator = (nf.0)(&[arg1])?;
+                        }
+                        JsValue::Function(ref ba) => {
+                            if ba.is_generator() {
+                                frame.accumulator =
+                                    JsValue::Generator(GeneratorState::new((**ba).clone()));
+                            } else {
+                                let arg1 = frame.read_reg(arg1_v)?.clone();
+                                let mut callee_frame =
+                                    InterpreterFrame::new((**ba).clone(), vec![arg1]);
+                                push_call_frame("<anonymous>");
+                                let result = Interpreter::run(&mut callee_frame);
+                                pop_call_frame();
+                                frame.accumulator = result?;
+                            }
+                        }
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "CallUndefinedReceiver1: callee is not a function (got {other:?})"
+                            )));
+                        }
                     }
                 }
 
@@ -741,22 +858,32 @@ impl Interpreter {
                         return Err(err_bad_operand("CallUndefinedReceiver2", 2));
                     };
                     let callee = frame.read_reg(callee_v)?.clone();
-                    let JsValue::Function(ba) = callee else {
-                        return Err(StatorError::TypeError(format!(
-                            "CallUndefinedReceiver2: callee is not a function (got {callee:?})"
-                        )));
-                    };
-                    if ba.is_generator() {
-                        frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
-                    } else {
-                        let arg1 = frame.read_reg(arg1_v)?.clone();
-                        let arg2 = frame.read_reg(arg2_v)?.clone();
-                        let mut callee_frame =
-                            InterpreterFrame::new((*ba).clone(), vec![arg1, arg2]);
-                        push_call_frame("<anonymous>");
-                        let result = Interpreter::run(&mut callee_frame);
-                        pop_call_frame();
-                        frame.accumulator = result?;
+                    match callee {
+                        JsValue::NativeFunction(ref nf) => {
+                            let arg1 = frame.read_reg(arg1_v)?.clone();
+                            let arg2 = frame.read_reg(arg2_v)?.clone();
+                            frame.accumulator = (nf.0)(&[arg1, arg2])?;
+                        }
+                        JsValue::Function(ref ba) => {
+                            if ba.is_generator() {
+                                frame.accumulator =
+                                    JsValue::Generator(GeneratorState::new((**ba).clone()));
+                            } else {
+                                let arg1 = frame.read_reg(arg1_v)?.clone();
+                                let arg2 = frame.read_reg(arg2_v)?.clone();
+                                let mut callee_frame =
+                                    InterpreterFrame::new((**ba).clone(), vec![arg1, arg2]);
+                                push_call_frame("<anonymous>");
+                                let result = Interpreter::run(&mut callee_frame);
+                                pop_call_frame();
+                                frame.accumulator = result?;
+                            }
+                        }
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "CallUndefinedReceiver2: callee is not a function (got {other:?})"
+                            )));
+                        }
                     }
                 }
 
@@ -778,24 +905,35 @@ impl Interpreter {
                         return Err(err_bad_operand("CallProperty", 2));
                     };
                     let callee = frame.read_reg(callee_v)?.clone();
-                    let JsValue::Function(ba) = callee else {
-                        return Err(StatorError::TypeError(format!(
-                            "CallProperty: callee is not a function (got {callee:?})"
-                        )));
-                    };
-                    let this_val = frame.read_reg(recv_v)?.clone();
-                    // Arguments reside in the registers immediately following
-                    // the callee register in the flat register file.
-                    let callee_flat = frame.reg_index(callee_v)?;
-                    let args = (0..arg_count as usize)
-                        .map(|i| frame.registers[callee_flat + 1 + i].clone())
-                        .collect::<Vec<_>>();
-                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
-                    callee_frame.context = Some(this_val);
-                    push_call_frame("<anonymous>");
-                    let result = Interpreter::run(&mut callee_frame);
-                    pop_call_frame();
-                    frame.accumulator = result?;
+                    match callee {
+                        JsValue::NativeFunction(ref nf) => {
+                            let callee_flat = frame.reg_index(callee_v)?;
+                            let args = (0..arg_count as usize)
+                                .map(|i| frame.registers[callee_flat + 1 + i].clone())
+                                .collect::<Vec<_>>();
+                            frame.accumulator = (nf.0)(&args)?;
+                        }
+                        JsValue::Function(ref ba) => {
+                            let this_val = frame.read_reg(recv_v)?.clone();
+                            // Arguments reside in the registers immediately following
+                            // the callee register in the flat register file.
+                            let callee_flat = frame.reg_index(callee_v)?;
+                            let args = (0..arg_count as usize)
+                                .map(|i| frame.registers[callee_flat + 1 + i].clone())
+                                .collect::<Vec<_>>();
+                            let mut callee_frame = InterpreterFrame::new((**ba).clone(), args);
+                            callee_frame.context = Some(this_val);
+                            push_call_frame("<anonymous>");
+                            let result = Interpreter::run(&mut callee_frame);
+                            pop_call_frame();
+                            frame.accumulator = result?;
+                        }
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "CallProperty: callee is not a function (got {other:?})"
+                            )));
+                        }
+                    }
                 }
 
                 // CallWithSpread [callable, args_start, args_count, slot]:
@@ -814,17 +952,25 @@ impl Interpreter {
                         return Err(err_bad_operand("CallWithSpread", 2));
                     };
                     let callee = frame.read_reg(callee_v)?.clone();
-                    let JsValue::Function(ba) = callee else {
-                        return Err(StatorError::TypeError(format!(
-                            "CallWithSpread: callee is not a function (got {callee:?})"
-                        )));
-                    };
-                    let args = collect_args(frame, args_start_v, arg_count)?;
-                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
-                    push_call_frame("<anonymous>");
-                    let result = Interpreter::run(&mut callee_frame);
-                    pop_call_frame();
-                    frame.accumulator = result?;
+                    match callee {
+                        JsValue::NativeFunction(ref nf) => {
+                            let args = collect_args(frame, args_start_v, arg_count)?;
+                            frame.accumulator = (nf.0)(&args)?;
+                        }
+                        JsValue::Function(ref ba) => {
+                            let args = collect_args(frame, args_start_v, arg_count)?;
+                            let mut callee_frame = InterpreterFrame::new((**ba).clone(), args);
+                            push_call_frame("<anonymous>");
+                            let result = Interpreter::run(&mut callee_frame);
+                            pop_call_frame();
+                            frame.accumulator = result?;
+                        }
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "CallWithSpread: callee is not a function (got {other:?})"
+                            )));
+                        }
+                    }
                 }
 
                 // ── Construct ──────────────────────────────────────────────
@@ -845,17 +991,25 @@ impl Interpreter {
                         return Err(err_bad_operand("Construct", 2));
                     };
                     let ctor = frame.read_reg(ctor_v)?.clone();
-                    let JsValue::Function(ba) = ctor else {
-                        return Err(StatorError::TypeError(format!(
-                            "Construct: constructor is not a function (got {ctor:?})"
-                        )));
-                    };
-                    let args = collect_args(frame, args_start_v, arg_count)?;
-                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
-                    push_call_frame("<anonymous>");
-                    let result = Interpreter::run(&mut callee_frame);
-                    pop_call_frame();
-                    frame.accumulator = result?;
+                    match ctor {
+                        JsValue::NativeFunction(ref nf) => {
+                            let args = collect_args(frame, args_start_v, arg_count)?;
+                            frame.accumulator = (nf.0)(&args)?;
+                        }
+                        JsValue::Function(ref ba) => {
+                            let args = collect_args(frame, args_start_v, arg_count)?;
+                            let mut callee_frame = InterpreterFrame::new((**ba).clone(), args);
+                            push_call_frame("<anonymous>");
+                            let result = Interpreter::run(&mut callee_frame);
+                            pop_call_frame();
+                            frame.accumulator = result?;
+                        }
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "Construct: constructor is not a function (got {other:?})"
+                            )));
+                        }
+                    }
                 }
 
                 // ── Context management ─────────────────────────────────────

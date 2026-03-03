@@ -998,6 +998,7 @@ fn js_value_to_json_inner(
         JsValue::Undefined
         | JsValue::Symbol(_)
         | JsValue::Function(_)
+        | JsValue::NativeFunction(_)
         | JsValue::Generator(_)
         | JsValue::Iterator(_)
         | JsValue::Error(_) => Ok(None),

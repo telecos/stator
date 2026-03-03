@@ -26,6 +26,42 @@ use crate::gc::trace::{Trace, Tracer};
 use crate::objects::heap_object::HeapObject;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// NativeFn wrapper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Type alias for the boxed native function signature.
+type NativeFnBody = Rc<dyn Fn(&[JsValue]) -> StatorResult<JsValue>>;
+
+/// A host-supplied native function that can be called from JavaScript.
+///
+/// Wraps an `Rc<dyn Fn>` so that native functions can be stored as
+/// [`JsValue::NativeFunction`] values and called by the interpreter.
+/// Two `NativeFn` values are never considered equal to each other.
+pub struct NativeFn(pub NativeFnBody);
+
+impl std::fmt::Debug for NativeFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<native function>")
+    }
+}
+
+impl Clone for NativeFn {
+    fn clone(&self) -> Self {
+        NativeFn(Rc::clone(&self.0))
+    }
+}
+
+impl PartialEq for NativeFn {
+    fn eq(&self, _other: &Self) -> bool {
+        // Native functions are never considered equal to each other, even when
+        // comparing a value with itself.  JavaScript does not support structural
+        // equality of function objects; only reference equality matters, and
+        // the `JsValue` layer does not expose pointer-identity comparison.
+        false
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Generator support types
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -204,6 +240,11 @@ pub enum JsValue {
     /// The [`Rc`] allows function values to be cheaply cloned and shared
     /// without copying the bytecode.
     Function(Rc<BytecodeArray>),
+    /// A host-supplied native function callable from JavaScript.
+    ///
+    /// Used by embedders (e.g. `st8`) to inject built-in functions such as
+    /// `print` into the JavaScript global scope.
+    NativeFunction(NativeFn),
     /// A lightweight JavaScript array backed by a reference-counted [`Vec`].
     ///
     /// Used by built-in combinators such as `Promise.all` that need to return
@@ -301,10 +342,10 @@ impl JsValue {
         matches!(self, Self::BigInt(_))
     }
 
-    /// Returns `true` if this value is a callable function.
+    /// Returns `true` if this value is a callable function (bytecode or native).
     #[inline]
     pub fn is_function(&self) -> bool {
-        matches!(self, Self::Function(_))
+        matches!(self, Self::Function(_) | Self::NativeFunction(_))
     }
 
     /// Returns `true` if this value is a lightweight array ([`Array`][JsValue::Array]).
@@ -360,6 +401,7 @@ impl JsValue {
             Self::Symbol(_)
             | Self::Object(_)
             | Self::Function(_)
+            | Self::NativeFunction(_)
             | Self::Array(_)
             | Self::Error(_)
             | Self::Generator(_)
@@ -411,7 +453,7 @@ impl JsValue {
             Self::BigInt(_) => Err(StatorError::TypeError(
                 "Cannot convert a BigInt value to a number".to_string(),
             )),
-            Self::Function(_) => Err(StatorError::TypeError(
+            Self::Function(_) | Self::NativeFunction(_) => Err(StatorError::TypeError(
                 "Cannot convert a Function value to a number".to_string(),
             )),
             Self::Array(_) => Err(StatorError::TypeError(
@@ -462,7 +504,7 @@ impl JsValue {
                 "Cannot convert an Object to a string without ToPrimitive".to_string(),
             )),
             Self::BigInt(n) => Ok(n.to_string()),
-            Self::Function(_) => Ok("function () {}".to_string()),
+            Self::Function(_) | Self::NativeFunction(_) => Ok("function () {}".to_string()),
             Self::Array(items) => {
                 // ECMAScript §23.1.3.30 Array.prototype.toString → join with ","
                 let parts: StatorResult<Vec<String>> = items

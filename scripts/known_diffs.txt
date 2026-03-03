@@ -1,0 +1,19 @@
+# known_diffs.txt — Documented intentional divergences between st8 and d8
+#
+# Each line lists a test filename (or glob) whose output is known to differ
+# from d8.  These are categorised as KNOWN_DIFF rather than BUG.
+#
+# Format:
+#   <filename_or_glob>   # optional comment explaining the divergence
+#
+# ── Known divergences ────────────────────────────────────────────────────────
+
+# String literals are stored with their surrounding quote characters in the
+# Stator scanner (raw token value).  This means print("hello") outputs
+# `"hello"` in st8 but `hello` in d8.  Tracked as a future parser fix.
+strings.js
+
+# Closure variable capture across function scope boundaries is not yet
+# implemented.  Closures that read free variables from an outer function
+# scope will see `undefined` instead of the captured value.
+# Tests using such patterns are listed here when added to the corpus.
