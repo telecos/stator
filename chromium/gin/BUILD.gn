@@ -1,0 +1,69 @@
+# chromium/gin/BUILD.gn — GN build file for Chromium's gin JS embedding layer.
+#
+# The GN arg `js_engine` selects the underlying JavaScript engine backend:
+#
+#   js_engine = "v8"     (default) — use the canonical V8 engine.
+#   js_engine = "stator" — use the Stator engine via //chromium:stator_bridge.
+#
+# Building with Stator:
+#
+#   gn gen out/stator --args='js_engine="stator"'
+#   ninja -C out/stator gin_js_engine_test
+
+declare_args() {
+  # JavaScript engine backend.  Supported values: "v8", "stator".
+  js_engine = "v8"
+}
+
+assert(js_engine == "v8" || js_engine == "stator",
+       "js_engine must be \"v8\" or \"stator\", got: $js_engine")
+
+# ---------------------------------------------------------------------------
+# Propagate a preprocessor define so C++ code can branch on the engine.
+# ---------------------------------------------------------------------------
+if (js_engine == "stator") {
+  config("js_engine_config") {
+    defines = [ "GIN_ENGINE_STATOR=1" ]
+  }
+} else {
+  config("js_engine_config") {
+    defines = [ "GIN_ENGINE_V8=1" ]
+  }
+}
+
+# ---------------------------------------------------------------------------
+# gin — the JavaScript embedding library.
+#
+# When js_engine = "stator" the stator_bridge source_set provides the v8::
+# namespace shim, replacing the real V8 dependency.
+# ---------------------------------------------------------------------------
+source_set("gin") {
+  public_configs = [ ":js_engine_config" ]
+
+  if (js_engine == "stator") {
+    deps = [ "//chromium:stator_bridge" ]
+  } else {
+    deps = [ "//v8" ]
+  }
+}
+
+# ---------------------------------------------------------------------------
+# gin_js_engine_test — smoke-test binary.
+#
+# Acceptance criterion: `ninja -C out/stator gin_js_engine_test` succeeds
+# (GN generates build files with js_engine=stator and Stator links into the
+# test binary).  The binary exits 0 after evaluating `1 + 2` and asserting
+# the result equals 3.
+# ---------------------------------------------------------------------------
+executable("gin_js_engine_test") {
+  testonly = true
+  sources = [ "gin_js_engine_test.cc" ]
+
+  configs += [ ":js_engine_config" ]
+
+  if (js_engine == "stator") {
+    deps = [ "//chromium:stator_bridge" ]
+  } else {
+    deps = [ "//v8" ]
+  }
+}
