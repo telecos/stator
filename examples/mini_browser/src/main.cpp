@@ -399,6 +399,87 @@ int main() {
     }
     v8iso->Dispose();
 
+    /* ── Phase 5: JIT compilation and tiering demo ───────────────────────────── */
+
+    std::printf("\n[tab] --- Phase 5: JIT compilation / tiering demo ---\n\n");
+
+    /*
+     * Compile a script that defines and calls sum(1..1000000).
+     * The inner loop iterates 1 000 000 times, so the OSR back-edge counter
+     * exceeds OSR_LOOP_THRESHOLD (1 000) within the very first call.  After
+     * that call the baseline JIT compiler caches machine code for sum(), and
+     * every subsequent call executes via native code.
+     */
+    const char *sum_src =
+        "function sum(n) {"
+        "  var s = 0;"
+        "  var i = 1;"
+        "  while (i <= n) { s = s + i; i = i + 1; }"
+        "  return s;"
+        "}"
+        "sum(1000000);";
+
+    StatorScript *sum_script =
+        stator_script_compile(ctx, sum_src, std::strlen(sum_src));
+    if (!sum_script || stator_script_get_error(sum_script)) {
+        std::printf("[tab] ERROR: failed to compile sum script\n");
+        if (sum_script) stator_script_free(sum_script);
+    } else {
+        /* Snapshot stats before the first run. */
+        StatorCompilationStats stats_before = {};
+        stator_isolate_get_stats(isolate, &stats_before);
+
+        /* Iteration 1 — interpreted (triggers OSR → JIT compiles sum). */
+        auto t0 = std::chrono::high_resolution_clock::now();
+        StatorValue *r1 = stator_script_run(sum_script, ctx);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double ms1 =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        std::printf("[tab] running sum(1..1000000) — iteration 1 (interpreted)"
+                    ": %.1fms\n", ms1);
+
+        /* Check whether tiering fired during the first run. */
+        StatorCompilationStats stats_after = {};
+        stator_isolate_get_stats(isolate, &stats_after);
+        uint32_t new_fns =
+            stats_after.jit_functions_compiled -
+            stats_before.jit_functions_compiled;
+        size_t new_bytes =
+            stats_after.jit_code_bytes - stats_before.jit_code_bytes;
+        bool jit_available = (new_fns > 0);
+        if (jit_available) {
+            std::printf("[tab] [tier-up] sum() compiled to baseline JIT"
+                        " (code: %zu bytes)\n", new_bytes);
+        }
+
+        /* Iteration 2 — executes via JIT on supported platforms. */
+        auto t2 = std::chrono::high_resolution_clock::now();
+        StatorValue *r2 = stator_script_run(sum_script, ctx);
+        auto t3 = std::chrono::high_resolution_clock::now();
+        double ms2 =
+            std::chrono::duration<double, std::milli>(t3 - t2).count();
+
+        const char *tier2 = jit_available ? "baseline JIT" : "interpreted";
+        std::printf("[tab] running sum(1..1000000) — iteration 2 (%s)"
+                    ": %.1fms\n", tier2, ms2);
+
+        if (jit_available && ms2 > 0.0) {
+            std::printf("[tab] speedup: %.1fx\n", ms1 / ms2);
+        }
+
+        StatorCompilationStats stats_final = {};
+        stator_isolate_get_stats(isolate, &stats_final);
+        std::printf("[tab] stats: %u function(s) JIT-compiled,"
+                    " %zu bytes machine code\n",
+                    stats_final.jit_functions_compiled,
+                    stats_final.jit_code_bytes);
+
+        if (r1) stator_value_destroy(r1);
+        if (r2) stator_value_destroy(r2);
+        stator_script_free(sum_script);
+    }
+
     /* ── Cleanup ─────────────────────────────────────────────────────────── */
     stator_context_destroy(ctx);
     stator_isolate_destroy(isolate);

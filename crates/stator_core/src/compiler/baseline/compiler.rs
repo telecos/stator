@@ -113,7 +113,10 @@ pub fn jit_to_jsvalue(v: i64) -> Option<crate::objects::value::JsValue> {
     } else if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
         Some(JsValue::Smi(v as i32))
     } else {
-        None
+        // Large integer outside Smi range: promote to HeapNumber (f64).
+        // All integers up to 2^53 are exactly representable as f64, so
+        // arithmetic results that overflow i32 can be returned faithfully.
+        Some(JsValue::HeapNumber(v as f64))
     }
 }
 

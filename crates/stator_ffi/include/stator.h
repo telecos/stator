@@ -124,6 +124,27 @@ typedef struct StatorScript StatorScript;
 typedef struct StatorValue StatorValue;
 
 /**
+ * Compilation tier statistics for an isolate.
+ *
+ * Filled in by `stator_isolate_get_stats`.  All counts are thread-local
+ * totals accumulated since the process started (or since the last
+ * interpreter reset on this thread).
+ *
+ * On platforms where the baseline JIT is not available (non-x86-64 or
+ * non-Unix), all fields will always be zero.
+ */
+typedef struct StatorCompilationStats {
+  /**
+   * Number of JavaScript functions that have been compiled to baseline JIT.
+   */
+  uint32_t jit_functions_compiled;
+  /**
+   * Total bytes of machine code produced by the baseline JIT compiler.
+   */
+  size_t jit_code_bytes;
+} StatorCompilationStats;
+
+/**
  * C-callable native-function signature.
  *
  * The callback receives the active context, an array of `argc` argument
@@ -310,6 +331,25 @@ struct StatorContext *stator_isolate_get_current_context(const struct StatorIsol
  * `isolate` must be a non-null, valid pointer to a live `StatorIsolate`.
  */
 void stator_isolate_gc(struct StatorIsolate *isolate);
+
+/**
+ * Fill `*stats` with the current compilation tier statistics.
+ *
+ * Reports the cumulative number of baseline-JIT-compiled functions and the
+ * total machine-code bytes produced on this thread since the process started.
+ *
+ * On platforms where the baseline JIT is not available all counts will be
+ * zero.
+ *
+ * Does nothing when `stats` is null.
+ *
+ * # Safety
+ * - `isolate` must be either null or a valid, live `StatorIsolate` pointer.
+ * - `stats` must be a non-null, properly aligned pointer to a
+ *   `StatorCompilationStats` that is valid for writes.
+ */
+void stator_isolate_get_stats(const struct StatorIsolate *_isolate,
+                              struct StatorCompilationStats *stats);
 
 /**
  * Create a new context associated with `isolate`.

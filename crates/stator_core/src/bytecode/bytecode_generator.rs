@@ -504,7 +504,7 @@ impl FunctionCompiler {
         self.compile_expr(&s.test)?;
         self.emit_jump(Opcode::JumpIfToBooleanFalse, loop_end);
         self.compile_stmt(&s.body)?;
-        self.emit_jump(Opcode::Jump, loop_start);
+        self.emit_jump_loop_to(loop_start);
         self.bind_label(loop_end);
 
         self.loop_stack.pop();
@@ -524,7 +524,8 @@ impl FunctionCompiler {
         self.compile_stmt(&s.body)?;
         self.bind_label(cond_label);
         self.compile_expr(&s.test)?;
-        self.emit_jump(Opcode::JumpIfToBooleanTrue, loop_start);
+        self.emit_jump(Opcode::JumpIfToBooleanFalse, loop_end);
+        self.emit_jump_loop_to(loop_start);
         self.bind_label(loop_end);
 
         self.loop_stack.pop();
@@ -567,7 +568,7 @@ impl FunctionCompiler {
             self.compile_expr(update)?;
         }
 
-        self.emit_jump(Opcode::Jump, loop_start);
+        self.emit_jump_loop_to(loop_start);
         self.bind_label(loop_end);
 
         self.loop_stack.pop();
@@ -2781,9 +2782,9 @@ mod tests {
         ]);
         let arr = BytecodeGenerator::compile_program(&prog).unwrap();
         let instrs = arr.instructions().unwrap();
-        // Must contain a backwards jump (negative offset).
+        // Must contain a JumpLoop back-edge.
         let has_back_jump = instrs.iter().any(|i| {
-            i.opcode == Opcode::Jump
+            i.opcode == Opcode::JumpLoop
                 && i.operands
                     .first()
                     .map(|o| matches!(o, Operand::JumpOffset(v) if *v < 0))
@@ -2900,11 +2901,7 @@ mod tests {
         ]);
         let arr = BytecodeGenerator::compile_program(&prog).unwrap();
         let instrs = arr.instructions().unwrap();
-        assert!(
-            instrs
-                .iter()
-                .any(|i| i.opcode == Opcode::JumpIfToBooleanTrue)
-        );
+        assert!(instrs.iter().any(|i| i.opcode == Opcode::JumpLoop));
     }
 
     // ── Phase 3: functions + closures + calls ─────────────────────────────

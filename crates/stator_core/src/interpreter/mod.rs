@@ -164,7 +164,7 @@
 //! one [`Instruction`] per iteration, advances the program counter, then
 //! dispatches on the [`Opcode`] via an exhaustive `match`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -191,6 +191,29 @@ pub use crate::objects::value::{GeneratorState, GeneratorStatus, GeneratorStep, 
 /// compilation is requested so the next *call* to that function executes
 /// via native code.
 const OSR_LOOP_THRESHOLD: u32 = 1_000;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JIT compilation statistics (thread-local)
+// ─────────────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    /// Number of successful baseline JIT compilations in this thread.
+    static JIT_COMPILATION_COUNT: Cell<u32> = const { Cell::new(0) };
+    /// Total machine-code bytes produced by all successful JIT compilations.
+    static JIT_CODE_BYTES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Return a snapshot of the JIT compilation statistics for the current thread.
+///
+/// Returns `(functions_compiled, total_code_bytes)`.
+///
+/// On platforms where the JIT is not available both values will always be zero.
+pub fn jit_stats() -> (u32, usize) {
+    (
+        JIT_COMPILATION_COUNT.with(|c| c.get()),
+        JIT_CODE_BYTES.with(|c| c.get()),
+    )
+}
 
 /// Convert a [`JsValue`] to its JIT `i64` representation.
 ///
@@ -219,7 +242,10 @@ fn maybe_compile_baseline(ba: &BytecodeArray) {
     {
         use crate::compiler::baseline::compiler::BaselineCompiler;
         if let Ok(cc) = BaselineCompiler::compile(ba) {
+            let code_len = cc.code.len();
             ba.store_jit_code(cc.code, cc.register_file_slots);
+            JIT_COMPILATION_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+            JIT_CODE_BYTES.with(|c| c.set(c.get().saturating_add(code_len)));
         }
     }
     #[cfg(not(all(target_arch = "x86_64", unix)))]
