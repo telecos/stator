@@ -24,3 +24,4 @@ regress.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+libc = "0.2"
