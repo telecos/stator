@@ -116,6 +116,15 @@ extern "C" {
 struct StatorIsolate *stator_isolate_create(void);
 
 /**
+ * Create a new isolate.
+ *
+ * This is the preferred spelling for the V8-compatible lifecycle API.
+ * Equivalent to [`stator_isolate_create`].  The returned pointer must
+ * eventually be passed to [`stator_isolate_dispose`].
+ */
+struct StatorIsolate *stator_isolate_new(void);
+
+/**
  * Destroy an isolate previously created with [`stator_isolate_create`].
  *
  * After this call the pointer is invalid and must not be used.
@@ -126,6 +135,90 @@ struct StatorIsolate *stator_isolate_create(void);
  * - This function must not be called more than once for the same pointer.
  */
 void stator_isolate_destroy(struct StatorIsolate *isolate);
+
+/**
+ * Dispose an isolate previously created with [`stator_isolate_new`].
+ *
+ * This is the preferred spelling for the V8-compatible lifecycle API.
+ * Equivalent to [`stator_isolate_destroy`].
+ *
+ * # Safety
+ * - `isolate` must be a non-null pointer returned by `stator_isolate_new`.
+ * - `isolate` must not be used again after this call.
+ * - This function must not be called more than once for the same pointer.
+ */
+void stator_isolate_dispose(struct StatorIsolate *isolate);
+
+/**
+ * Mark `isolate` as entered on the current thread.
+ *
+ * Each call to `stator_isolate_enter` must be balanced by a corresponding
+ * call to [`stator_isolate_exit`].  Does nothing when `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+void stator_isolate_enter(struct StatorIsolate *isolate);
+
+/**
+ * Unmark `isolate` as entered on the current thread.
+ *
+ * Must be called once for every preceding [`stator_isolate_enter`] call.
+ * Does nothing when `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+void stator_isolate_exit(struct StatorIsolate *isolate);
+
+/**
+ * Store an opaque embedder-defined pointer at `slot` on the isolate.
+ *
+ * Slots are zero-indexed.  Storing `NULL` at a slot is permitted and
+ * equivalent to clearing it.  Does nothing when `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+void stator_isolate_set_data(struct StatorIsolate *isolate, uint32_t slot, void *data);
+
+/**
+ * Retrieve the embedder-defined pointer previously stored at `slot`.
+ *
+ * Returns a null pointer when `isolate` is null or `slot` has not been set.
+ *
+ * # Safety
+ * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ */
+void *stator_isolate_get_data(const struct StatorIsolate *isolate, uint32_t slot);
+
+/**
+ * Record `exception` as the pending exception on `isolate`.
+ *
+ * At most one pending exception is stored at a time; a subsequent call
+ * replaces the previous value.  Does nothing when `isolate` is null.
+ *
+ * The caller retains ownership of `exception`; the isolate only holds a
+ * raw pointer and does not free it.
+ *
+ * # Safety
+ * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `exception` must be either null or a valid, live [`StatorValue`] pointer
+ *   that outlives the pending-exception window.
+ */
+void stator_isolate_throw_exception(struct StatorIsolate *isolate, struct StatorValue *exception);
+
+/**
+ * Return the context most recently made current on `isolate`.
+ *
+ * Returns a null pointer when `isolate` is null or no context has been made
+ * current (i.e. no context has been created on this isolate yet, or the
+ * most recent one was destroyed).
+ *
+ * # Safety
+ * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ */
+struct StatorContext *stator_isolate_get_current_context(const struct StatorIsolate *isolate);
 
 /**
  * Trigger a minor (young-generation) garbage collection on the isolate's heap.
@@ -141,6 +234,10 @@ void stator_isolate_gc(struct StatorIsolate *isolate);
  * Returns a null pointer if `isolate` is null.  The caller must eventually
  * pass the returned pointer to [`stator_context_destroy`].
  *
+ * Creating a context automatically makes it the current context on `isolate`
+ * (equivalent to entering it).  Destroying the context via
+ * [`stator_context_destroy`] clears the current-context slot when it matches.
+ *
  * # Safety
  * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
  */
@@ -148,6 +245,9 @@ struct StatorContext *stator_context_new(struct StatorIsolate *isolate);
 
 /**
  * Destroy a context previously created with [`stator_context_new`].
+ *
+ * If `ctx` is the current context on its associated isolate, the
+ * current-context slot is cleared (set to null).
  *
  * # Safety
  * `ctx` must be a non-null pointer returned by `stator_context_new` and must

@@ -32,7 +32,25 @@ pub struct StatorIsolate {
     /// by the embedder.  Incremented on `_new_*` / `_object_new`, decremented
     /// on `_destroy`.
     live_objects: usize,
+    /// Per-slot embedder data.  Grows on demand; slots not yet set hold null.
+    /// The pointers are owned by the embedder and are not freed by the isolate.
+    embedder_data: Vec<*mut c_void>,
+    /// Number of times the isolate has been entered without a matching exit.
+    enter_count: u32,
+    /// The context most recently set as current via [`stator_context_new`] or
+    /// cleared via [`stator_context_destroy`].  Non-owning; the context is
+    /// owned by the embedder and must outlive the isolate or be destroyed first.
+    current_context: *mut StatorContext,
+    /// Pending exception stored by [`stator_isolate_throw_exception`].
+    /// Non-owning; the value is owned by the embedder.  `None` means no
+    /// pending exception is set.
+    pending_exception: Option<*mut StatorValue>,
 }
+
+// SAFETY: `StatorIsolate` contains raw pointer fields that are only ever
+// accessed on the owning thread; the embedder is responsible for external
+// synchronisation if the isolate is passed across threads.
+unsafe impl Send for StatorIsolate {}
 
 /// Create a new isolate.
 ///
@@ -44,7 +62,21 @@ pub extern "C" fn stator_isolate_create() -> *mut StatorIsolate {
     Box::into_raw(Box::new(StatorIsolate {
         heap: Heap::new(),
         live_objects: 0,
+        embedder_data: Vec::new(),
+        enter_count: 0,
+        current_context: std::ptr::null_mut(),
+        pending_exception: None,
     }))
+}
+
+/// Create a new isolate.
+///
+/// This is the preferred spelling for the V8-compatible lifecycle API.
+/// Equivalent to [`stator_isolate_create`].  The returned pointer must
+/// eventually be passed to [`stator_isolate_dispose`].
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_isolate_new() -> *mut StatorIsolate {
+    stator_isolate_create()
 }
 
 /// Destroy an isolate previously created with [`stator_isolate_create`].
@@ -61,6 +93,148 @@ pub unsafe extern "C" fn stator_isolate_destroy(isolate: *mut StatorIsolate) {
         // SAFETY: pointer was created by `Box::into_raw` in `stator_isolate_create`.
         drop(unsafe { Box::from_raw(isolate) });
     }
+}
+
+/// Dispose an isolate previously created with [`stator_isolate_new`].
+///
+/// This is the preferred spelling for the V8-compatible lifecycle API.
+/// Equivalent to [`stator_isolate_destroy`].
+///
+/// # Safety
+/// - `isolate` must be a non-null pointer returned by `stator_isolate_new`.
+/// - `isolate` must not be used again after this call.
+/// - This function must not be called more than once for the same pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_dispose(isolate: *mut StatorIsolate) {
+    // SAFETY: same requirements as `stator_isolate_destroy`.
+    unsafe { stator_isolate_destroy(isolate) };
+}
+
+/// Mark `isolate` as entered on the current thread.
+///
+/// Each call to `stator_isolate_enter` must be balanced by a corresponding
+/// call to [`stator_isolate_exit`].  Does nothing when `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_enter(isolate: *mut StatorIsolate) {
+    if !isolate.is_null() {
+        // SAFETY: caller guarantees `isolate` is valid.
+        unsafe { (*isolate).enter_count = (*isolate).enter_count.saturating_add(1) };
+    }
+}
+
+/// Unmark `isolate` as entered on the current thread.
+///
+/// Must be called once for every preceding [`stator_isolate_enter`] call.
+/// Does nothing when `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_exit(isolate: *mut StatorIsolate) {
+    if !isolate.is_null() {
+        // SAFETY: caller guarantees `isolate` is valid.
+        unsafe { (*isolate).enter_count = (*isolate).enter_count.saturating_sub(1) };
+    }
+}
+
+/// Store an opaque embedder-defined pointer at `slot` on the isolate.
+///
+/// Slots are zero-indexed.  Storing `NULL` at a slot is permitted and
+/// equivalent to clearing it.  Does nothing when `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_set_data(
+    isolate: *mut StatorIsolate,
+    slot: u32,
+    data: *mut c_void,
+) {
+    if isolate.is_null() {
+        return;
+    }
+    let slot = slot as usize;
+    // SAFETY: caller guarantees `isolate` is valid.
+    let slots = unsafe { &mut (*isolate).embedder_data };
+    if slot >= slots.len() {
+        slots.resize(slot + 1, std::ptr::null_mut());
+    }
+    slots[slot] = data;
+}
+
+/// Retrieve the embedder-defined pointer previously stored at `slot`.
+///
+/// Returns a null pointer when `isolate` is null or `slot` has not been set.
+///
+/// # Safety
+/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_get_data(
+    isolate: *const StatorIsolate,
+    slot: u32,
+) -> *mut c_void {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    let slot = slot as usize;
+    // SAFETY: caller guarantees `isolate` is valid.
+    let slots = unsafe { &(*isolate).embedder_data };
+    if slot < slots.len() {
+        slots[slot]
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+/// Record `exception` as the pending exception on `isolate`.
+///
+/// At most one pending exception is stored at a time; a subsequent call
+/// replaces the previous value.  Does nothing when `isolate` is null.
+///
+/// The caller retains ownership of `exception`; the isolate only holds a
+/// raw pointer and does not free it.
+///
+/// # Safety
+/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `exception` must be either null or a valid, live [`StatorValue`] pointer
+///   that outlives the pending-exception window.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_throw_exception(
+    isolate: *mut StatorIsolate,
+    exception: *mut StatorValue,
+) {
+    if !isolate.is_null() {
+        // SAFETY: caller guarantees `isolate` is valid.
+        unsafe {
+            (*isolate).pending_exception = if exception.is_null() {
+                None
+            } else {
+                Some(exception)
+            }
+        };
+    }
+}
+
+/// Return the context most recently made current on `isolate`.
+///
+/// Returns a null pointer when `isolate` is null or no context has been made
+/// current (i.e. no context has been created on this isolate yet, or the
+/// most recent one was destroyed).
+///
+/// # Safety
+/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_get_current_context(
+    isolate: *const StatorIsolate,
+) -> *mut StatorContext {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe { (*isolate).current_context }
 }
 
 /// Trigger a minor (young-generation) garbage collection on the isolate's heap.
@@ -95,6 +269,10 @@ unsafe impl Send for StatorContext {}
 /// Returns a null pointer if `isolate` is null.  The caller must eventually
 /// pass the returned pointer to [`stator_context_destroy`].
 ///
+/// Creating a context automatically makes it the current context on `isolate`
+/// (equivalent to entering it).  Destroying the context via
+/// [`stator_context_destroy`] clears the current-context slot when it matches.
+///
 /// # Safety
 /// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
 #[unsafe(no_mangle)]
@@ -102,10 +280,16 @@ pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut
     if isolate.is_null() {
         return std::ptr::null_mut();
     }
-    Box::into_raw(Box::new(StatorContext { _isolate: isolate }))
+    let ctx = Box::into_raw(Box::new(StatorContext { _isolate: isolate }));
+    // SAFETY: caller guarantees `isolate` is valid; `ctx` was just created.
+    unsafe { (*isolate).current_context = ctx };
+    ctx
 }
 
 /// Destroy a context previously created with [`stator_context_new`].
+///
+/// If `ctx` is the current context on its associated isolate, the
+/// current-context slot is cleared (set to null).
 ///
 /// # Safety
 /// `ctx` must be a non-null pointer returned by `stator_context_new` and must
@@ -113,6 +297,17 @@ pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_context_destroy(ctx: *mut StatorContext) {
     if !ctx.is_null() {
+        // SAFETY: caller guarantees `ctx` is valid.
+        let isolate = unsafe { (*ctx)._isolate };
+        if !isolate.is_null() {
+            // SAFETY: `isolate` is valid for the lifetime of any context
+            // created from it; the caller must not have already destroyed it.
+            unsafe {
+                if (*isolate).current_context == ctx {
+                    (*isolate).current_context = std::ptr::null_mut();
+                }
+            }
+        }
         // SAFETY: pointer was created by `Box::into_raw` in `stator_context_new`.
         drop(unsafe { Box::from_raw(ctx) });
     }
@@ -1105,6 +1300,206 @@ mod tests {
         unsafe { stator_isolate_gc(iso.as_ptr()) };
         // SAFETY: `iso` is valid.
         unsafe { stator_gc_collect(iso.as_ptr()) };
+    }
+
+    // ── Isolate lifecycle (Phase 4) ───────────────────────────────────────────
+
+    #[test]
+    fn test_isolate_new_returns_nonnull() {
+        let iso = stator_isolate_new();
+        assert!(!iso.is_null());
+        // SAFETY: `iso` was just returned by `stator_isolate_new`.
+        unsafe { stator_isolate_dispose(iso) };
+    }
+
+    #[test]
+    fn test_isolate_dispose_null_is_safe() {
+        // SAFETY: null is documented as a no-op.
+        unsafe { stator_isolate_dispose(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_isolate_enter_exit_roundtrip() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        unsafe { stator_isolate_enter(iso.as_ptr()) };
+        // SAFETY: `iso` is valid.
+        unsafe { stator_isolate_exit(iso.as_ptr()) };
+        // No assertion needed — the test passes if it does not panic or crash.
+    }
+
+    #[test]
+    fn test_isolate_enter_null_is_safe() {
+        // SAFETY: null is documented as a no-op.
+        unsafe { stator_isolate_enter(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_isolate_exit_null_is_safe() {
+        // SAFETY: null is documented as a no-op.
+        unsafe { stator_isolate_exit(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_isolate_exit_without_enter_does_not_underflow() {
+        let iso = IsolateGuard::new();
+        // Calling exit without a matching enter must not panic or underflow.
+        // SAFETY: `iso` is valid.
+        unsafe { stator_isolate_exit(iso.as_ptr()) };
+        // SAFETY: `iso` is valid.
+        unsafe { stator_isolate_exit(iso.as_ptr()) };
+    }
+
+    #[test]
+    fn test_isolate_set_get_data_roundtrip() {
+        let iso = IsolateGuard::new();
+        let sentinel = 0xDEAD_BEEFusize as *mut c_void;
+        // SAFETY: `iso` is valid; `sentinel` is a valid (if fake) data pointer.
+        unsafe { stator_isolate_set_data(iso.as_ptr(), 0, sentinel) };
+        // SAFETY: `iso` is valid.
+        let got = unsafe { stator_isolate_get_data(iso.as_ptr(), 0) };
+        assert_eq!(got, sentinel);
+    }
+
+    #[test]
+    fn test_isolate_set_get_data_multiple_slots() {
+        let iso = IsolateGuard::new();
+        let a = 0x1111usize as *mut c_void;
+        let b = 0x2222usize as *mut c_void;
+        // SAFETY: `iso` is valid.
+        unsafe { stator_isolate_set_data(iso.as_ptr(), 0, a) };
+        unsafe { stator_isolate_set_data(iso.as_ptr(), 2, b) };
+        // Slot 1 was never set and must be null.
+        assert_eq!(unsafe { stator_isolate_get_data(iso.as_ptr(), 0) }, a);
+        assert_eq!(
+            unsafe { stator_isolate_get_data(iso.as_ptr(), 1) },
+            std::ptr::null_mut()
+        );
+        assert_eq!(unsafe { stator_isolate_get_data(iso.as_ptr(), 2) }, b);
+    }
+
+    #[test]
+    fn test_isolate_get_data_unset_slot_returns_null() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid; slot 99 has never been set.
+        let got = unsafe { stator_isolate_get_data(iso.as_ptr(), 99) };
+        assert!(got.is_null());
+    }
+
+    #[test]
+    fn test_isolate_get_data_null_isolate_returns_null() {
+        // SAFETY: null isolate is documented to return null.
+        let got = unsafe { stator_isolate_get_data(std::ptr::null(), 0) };
+        assert!(got.is_null());
+    }
+
+    #[test]
+    fn test_isolate_set_data_null_isolate_is_safe() {
+        // SAFETY: null isolate is documented as a no-op.
+        unsafe {
+            stator_isolate_set_data(std::ptr::null_mut(), 0, 0xDEADusize as *mut c_void);
+        }
+    }
+
+    #[test]
+    fn test_isolate_throw_exception_stores_value() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 42.0) };
+        assert!(!val.is_null());
+        // SAFETY: `iso` and `val` are valid.
+        unsafe { stator_isolate_throw_exception(iso.as_ptr(), val) };
+        // Verify the exception is recorded (access through the struct directly
+        // in the test module is intentional — tests are in the same crate).
+        // SAFETY: `iso` is valid.
+        let recorded = unsafe { (*iso.as_ptr()).pending_exception };
+        assert_eq!(recorded, Some(val));
+        // Clean up.
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_isolate_throw_exception_null_isolate_is_safe() {
+        // SAFETY: null is documented as a no-op.
+        unsafe { stator_isolate_throw_exception(std::ptr::null_mut(), std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_isolate_get_current_context_null_isolate_returns_null() {
+        // SAFETY: null isolate is documented to return null.
+        let ctx = unsafe { stator_isolate_get_current_context(std::ptr::null()) };
+        assert!(ctx.is_null());
+    }
+
+    #[test]
+    fn test_isolate_get_current_context_set_by_context_new() {
+        let iso = IsolateGuard::new();
+        // Before any context is created the current context must be null.
+        // SAFETY: `iso` is valid.
+        assert!(unsafe { stator_isolate_get_current_context(iso.as_ptr()) }.is_null());
+
+        // Creating a context makes it the current one.
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+        // SAFETY: `iso` is valid.
+        let current = unsafe { stator_isolate_get_current_context(iso.as_ptr()) };
+        assert_eq!(current, ctx);
+
+        // Destroying the context clears the current-context slot.
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_destroy(ctx) };
+        // SAFETY: `iso` is valid.
+        assert!(unsafe { stator_isolate_get_current_context(iso.as_ptr()) }.is_null());
+    }
+
+    #[test]
+    fn test_full_isolate_lifecycle() {
+        // Exercises the full V8-style isolate lifecycle in one test.
+        let iso = stator_isolate_new();
+        assert!(!iso.is_null());
+
+        // Enter the isolate.
+        // SAFETY: `iso` is valid.
+        unsafe { stator_isolate_enter(iso) };
+
+        // Create a context — it becomes current.
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso) };
+        assert!(!ctx.is_null());
+        // SAFETY: `iso` is valid.
+        assert_eq!(unsafe { stator_isolate_get_current_context(iso) }, ctx);
+
+        // Store and retrieve embedder data.
+        let tag = 0xCAFEusize as *mut c_void;
+        // SAFETY: `iso` is valid; `tag` is a valid data pointer for this test.
+        unsafe { stator_isolate_set_data(iso, 0, tag) };
+        assert_eq!(unsafe { stator_isolate_get_data(iso, 0) }, tag);
+
+        // Throw an exception value.
+        // SAFETY: `iso` is valid.
+        let exc = unsafe { stator_value_new_number(iso, -1.0) };
+        // SAFETY: `iso` and `exc` are valid.
+        unsafe { stator_isolate_throw_exception(iso, exc) };
+
+        // Destroy the context.
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_destroy(ctx) };
+        // SAFETY: `iso` is valid.
+        assert!(unsafe { stator_isolate_get_current_context(iso) }.is_null());
+
+        // Exit the isolate.
+        // SAFETY: `iso` is valid.
+        unsafe { stator_isolate_exit(iso) };
+
+        // Clean up exception value before disposing.
+        // SAFETY: `exc` is non-null and live.
+        unsafe { stator_value_destroy(exc) };
+
+        // Dispose — must not crash.
+        // SAFETY: `iso` is non-null and live.
+        unsafe { stator_isolate_dispose(iso) };
     }
 
     // ── Script / Phase 2 ─────────────────────────────────────────────────────
