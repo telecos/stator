@@ -430,6 +430,10 @@ enum StatorValueInner {
     Object,
     /// A callable JavaScript function (bytecode or native).
     Function,
+    /// A native function created via a [`StatorFunctionTemplate`], carrying
+    /// its callable [`NativeFn`] so it can be installed into a context and
+    /// called from JavaScript.
+    NativeFunctionValue(NativeFn),
     /// A JavaScript array.
     Array,
     /// A JavaScript `Date` object.
@@ -1041,7 +1045,9 @@ pub unsafe extern "C" fn stator_value_type(val: *const StatorValue) -> *const c_
         StatorValueInner::Undefined => c"undefined".as_ptr(),
         StatorValueInner::Null => c"object".as_ptr(),
         StatorValueInner::Boolean(_) => c"boolean".as_ptr(),
-        StatorValueInner::Function => c"function".as_ptr(),
+        StatorValueInner::Function | StatorValueInner::NativeFunctionValue(_) => {
+            c"function".as_ptr()
+        }
         StatorValueInner::Object
         | StatorValueInner::Array
         | StatorValueInner::Date
@@ -1076,6 +1082,7 @@ pub unsafe extern "C" fn stator_value_as_number(val: *const StatorValue) -> f64 
         }
         StatorValueInner::Object
         | StatorValueInner::Function
+        | StatorValueInner::NativeFunctionValue(_)
         | StatorValueInner::Array
         | StatorValueInner::Date
         | StatorValueInner::RegExp
@@ -1106,6 +1113,7 @@ pub unsafe extern "C" fn stator_value_as_string(val: *const StatorValue) -> *con
         | StatorValueInner::Boolean(_)
         | StatorValueInner::Object
         | StatorValueInner::Function
+        | StatorValueInner::NativeFunctionValue(_)
         | StatorValueInner::Array
         | StatorValueInner::Date
         | StatorValueInner::RegExp
@@ -1219,7 +1227,10 @@ pub unsafe extern "C" fn stator_value_is_function(val: *const StatorValue) -> bo
         return false;
     }
     // SAFETY: caller guarantees `val` is valid.
-    matches!(unsafe { &(*val).inner }, StatorValueInner::Function)
+    matches!(
+        unsafe { &(*val).inner },
+        StatorValueInner::Function | StatorValueInner::NativeFunctionValue(_)
+    )
 }
 
 /// Returns `true` if `val` is a JavaScript array.
@@ -2129,6 +2140,7 @@ pub unsafe extern "C" fn stator_value_to_boolean(val: *const StatorValue) -> boo
         // All object-like values are truthy.
         StatorValueInner::Object
         | StatorValueInner::Function
+        | StatorValueInner::NativeFunctionValue(_)
         | StatorValueInner::Array
         | StatorValueInner::Date
         | StatorValueInner::RegExp
@@ -2311,6 +2323,265 @@ pub unsafe extern "C" fn stator_register_native_function(
     }
 }
 
+// ── FunctionTemplate (Phase 4) ────────────────────────────────────────────────
+
+/// C-callable function-template callback signature.
+///
+/// The callback receives a pointer to a [`StatorFunctionCallbackInfo`] which
+/// provides access to the call arguments and isolate.  It must return either
+/// a new [`StatorValue`] (the caller — i.e. the engine wrapper — owns it and
+/// frees it automatically) or a null pointer (treated as `undefined`).
+type StatorFunctionTemplateCallback =
+    unsafe extern "C" fn(*const StatorFunctionCallbackInfo) -> *mut StatorValue;
+
+/// Call-site information passed to a function-template callback.
+///
+/// The lifetime of a `StatorFunctionCallbackInfo` value is limited to the
+/// duration of the native callback invocation; the embedder must not store the
+/// pointer beyond that.
+pub struct StatorFunctionCallbackInfo {
+    /// Temporary argument values valid for the duration of the call.
+    args: Vec<StatorValue>,
+    /// The isolate this call is happening on.
+    isolate: *mut StatorIsolate,
+}
+
+// SAFETY: `StatorFunctionCallbackInfo` contains raw pointer fields that are
+// only ever accessed on the owning thread; the embedder is responsible for
+// external synchronisation if the value is transferred across threads.
+unsafe impl Send for StatorFunctionCallbackInfo {}
+
+/// Return the number of arguments passed to this call.
+///
+/// Returns `0` when `info` is null.
+///
+/// # Safety
+/// `info` must be either null or a valid pointer to a live
+/// [`StatorFunctionCallbackInfo`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_callback_info_length(
+    info: *const StatorFunctionCallbackInfo,
+) -> i32 {
+    if info.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `info` is valid.
+    unsafe { (*info).args.len() as i32 }
+}
+
+/// Return a pointer to the argument at position `index`.
+///
+/// The returned pointer is valid only for the duration of the callback
+/// invocation.  Returns a null pointer if `info` is null or `index` is out of
+/// range.
+///
+/// # Safety
+/// `info` must be either null or a valid pointer to a live
+/// [`StatorFunctionCallbackInfo`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_callback_info_get(
+    info: *const StatorFunctionCallbackInfo,
+    index: i32,
+) -> *const StatorValue {
+    if info.is_null() || index < 0 {
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `info` is valid.
+    let args = unsafe { &(*info).args };
+    let idx = index as usize;
+    if idx >= args.len() {
+        return std::ptr::null();
+    }
+    &args[idx] as *const StatorValue
+}
+
+/// Return the isolate associated with this call.
+///
+/// Returns a null pointer if `info` is null.
+///
+/// # Safety
+/// `info` must be either null or a valid pointer to a live
+/// [`StatorFunctionCallbackInfo`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_callback_info_get_isolate(
+    info: *const StatorFunctionCallbackInfo,
+) -> *mut StatorIsolate {
+    if info.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `info` is valid.
+    unsafe { (*info).isolate }
+}
+
+/// An opaque function template handle.
+///
+/// A function template associates a C callback with an isolate so that
+/// [`stator_function_template_get_function`] can produce a [`StatorValue`]
+/// representing the function, which can then be installed into a context's
+/// global environment via [`stator_context_global_set`].
+pub struct StatorFunctionTemplate {
+    isolate: *mut StatorIsolate,
+    callback: StatorFunctionTemplateCallback,
+}
+
+// SAFETY: `StatorFunctionTemplate` contains raw pointer fields that are only
+// ever accessed on the owning thread; the embedder is responsible for external
+// synchronisation if the template is transferred across threads.
+unsafe impl Send for StatorFunctionTemplate {}
+
+/// Create a new function template associated with `isolate`.
+///
+/// Returns a null pointer if `isolate` is null.  The caller must eventually
+/// pass the returned pointer to [`stator_function_template_destroy`].
+///
+/// # Safety
+/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `callback` must remain valid for the lifetime of the template.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_template_new(
+    isolate: *mut StatorIsolate,
+    callback: StatorFunctionTemplateCallback,
+) -> *mut StatorFunctionTemplate {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    Box::into_raw(Box::new(StatorFunctionTemplate { isolate, callback }))
+}
+
+/// Destroy a function template previously created with
+/// [`stator_function_template_new`].
+///
+/// Does nothing if `tmpl` is null.
+///
+/// # Safety
+/// `tmpl` must be a non-null pointer returned by
+/// [`stator_function_template_new`] and must not be used again after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_template_destroy(tmpl: *mut StatorFunctionTemplate) {
+    if !tmpl.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw`.
+        drop(unsafe { Box::from_raw(tmpl) });
+    }
+}
+
+/// Produce a [`StatorValue`] representing the function described by `tmpl`.
+///
+/// The returned value has type `"function"` and can be installed into a
+/// context's global environment via [`stator_context_global_set`], after which
+/// JavaScript code run with [`stator_script_run`] can call it as a global
+/// function.
+///
+/// Returns a null pointer if `tmpl` is null.  The caller owns the returned
+/// pointer and must eventually pass it to [`stator_value_destroy`] (or let a
+/// handle scope manage it).
+///
+/// # Safety
+/// `tmpl` must be either null or a valid, live [`StatorFunctionTemplate`]
+/// pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_function_template_get_function(
+    tmpl: *const StatorFunctionTemplate,
+    _ctx: *mut StatorContext,
+) -> *mut StatorValue {
+    if tmpl.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `tmpl` is valid.
+    let isolate = unsafe { (*tmpl).isolate };
+    let callback = unsafe { (*tmpl).callback };
+
+    // Build a NativeFn closure that wraps the C callback.
+    let native: NativeFn = Rc::new(move |args: Vec<JsValue>| {
+        // Convert JsValue args into temporary StatorValue structs on the stack.
+        let c_vals: Vec<StatorValue> = args
+            .iter()
+            .map(|v| StatorValue {
+                inner: jsvalue_to_stator_value_inner(v),
+                isolate: std::ptr::null_mut(),
+            })
+            .collect();
+
+        let info = StatorFunctionCallbackInfo {
+            args: c_vals,
+            isolate,
+        };
+
+        // SAFETY: `callback` is valid for the lifetime of the template (per
+        // the FFI contract).  `info` is a local variable live for this call.
+        let ret = unsafe { callback(&raw const info) };
+
+        if ret.is_null() {
+            Ok(JsValue::Undefined)
+        } else {
+            // Convert the returned StatorValue to JsValue, then free it.
+            // SAFETY: `ret` was allocated by `Box::into_raw` in the callback.
+            let owned = unsafe { Box::from_raw(ret) };
+            Ok(stator_value_inner_to_jsvalue(&owned.inner))
+        }
+    });
+
+    if !isolate.is_null() {
+        // SAFETY: isolate is valid.
+        unsafe { (*isolate).live_objects += 1 };
+    }
+    let val = Box::into_raw(Box::new(StatorValue {
+        inner: StatorValueInner::NativeFunctionValue(native),
+        isolate,
+    }));
+    // Register with the active handle scope, if any.
+    // SAFETY: `isolate` is valid; `active_handle_scope` is either null or a
+    // valid live scope pointer.
+    if !isolate.is_null() {
+        unsafe {
+            let scope = (*isolate).active_handle_scope;
+            if !scope.is_null() {
+                (*scope).handles.push(val);
+            }
+        }
+    }
+    val
+}
+
+/// Install a value into the context's global environment under `name`.
+///
+/// After this call, JavaScript code running via [`stator_script_run`] can
+/// reference `name` as a global variable.  For function values (created via
+/// [`stator_function_template_get_function`] or
+/// [`stator_value_new_*`][stator_value_new_number]), the callable is installed
+/// so that scripts can invoke it.
+///
+/// Does nothing if `ctx` or `name` is null.  A null `val` installs
+/// `undefined`.
+///
+/// # Safety
+/// - `ctx` must be a valid, live [`StatorContext`] pointer.
+/// - `name` must be a valid, null-terminated C string.
+/// - `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_context_global_set(
+    ctx: *mut StatorContext,
+    name: *const c_char,
+    val: *const StatorValue,
+) {
+    if ctx.is_null() || name.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `name` is a valid C string.
+    let name_str = unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned();
+
+    let jsval = if val.is_null() {
+        JsValue::Undefined
+    } else {
+        // SAFETY: caller guarantees `val` is valid.
+        stator_value_inner_to_jsvalue(unsafe { &(*val).inner })
+    };
+
+    // SAFETY: ctx is valid.
+    unsafe { (*ctx).globals.borrow_mut().insert(name_str, jsval) };
+}
+
 /// Convert a [`StatorValueInner`] to a number following ECMAScript §7.1.4 **ToNumber**.
 ///
 /// Object-like tags (`Object`, `Function`, `Array`, `Date`, `RegExp`,
@@ -2368,6 +2639,7 @@ fn value_inner_to_number(inner: &StatorValueInner) -> f64 {
         }
         StatorValueInner::Object
         | StatorValueInner::Function
+        | StatorValueInner::NativeFunctionValue(_)
         | StatorValueInner::Array
         | StatorValueInner::Date
         | StatorValueInner::RegExp
@@ -2401,7 +2673,9 @@ fn value_inner_to_js_string(inner: &StatorValueInner) -> String {
         }
         StatorValueInner::Str(cs) => cs.to_string_lossy().into_owned(),
         StatorValueInner::Object => "[object Object]".to_owned(),
-        StatorValueInner::Function => "function () { [native code] }".to_owned(),
+        StatorValueInner::Function | StatorValueInner::NativeFunctionValue(_) => {
+            "function () { [native code] }".to_owned()
+        }
         StatorValueInner::Array => "".to_owned(),
         StatorValueInner::Date => "[object Date]".to_owned(),
         StatorValueInner::RegExp => "(?:)".to_owned(),
@@ -2442,6 +2716,12 @@ fn stator_value_inner_to_jsvalue(inner: &StatorValueInner) -> JsValue {
         StatorValueInner::Function => {
             // Return a no-op native function to preserve the callable nature.
             JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined)))
+        }
+        StatorValueInner::NativeFunctionValue(native) => {
+            // Share the same callable closure with the interpreter.  The Rc
+            // allows both the StatorValue handle and the context globals map to
+            // reference the same NativeFn without requiring ownership transfer.
+            JsValue::NativeFunction(Rc::clone(native))
         }
         StatorValueInner::Array => JsValue::Array(Rc::new(vec![])),
     }
@@ -5566,5 +5846,271 @@ mod tests {
         assert!(unsafe { stator_value_is_null(val) });
         // SAFETY: `val` is non-null and live.
         unsafe { stator_value_destroy(val) };
+    }
+
+    // ── FunctionTemplate / Phase 4 ────────────────────────────────────────────
+
+    #[test]
+    fn test_function_template_new_returns_nonnull() {
+        let iso = IsolateGuard::new();
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+        // SAFETY: `iso` is valid; `noop` is a valid function pointer.
+        let tmpl = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        assert!(!tmpl.is_null());
+        // SAFETY: `tmpl` is non-null and live.
+        unsafe { stator_function_template_destroy(tmpl) };
+    }
+
+    #[test]
+    fn test_function_template_null_isolate_returns_null() {
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+        // SAFETY: null isolate is documented to return null.
+        let tmpl = unsafe { stator_function_template_new(std::ptr::null_mut(), noop) };
+        assert!(tmpl.is_null());
+    }
+
+    #[test]
+    fn test_function_template_destroy_null_is_safe() {
+        // SAFETY: null is documented as a no-op.
+        unsafe { stator_function_template_destroy(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_function_template_get_function_returns_function_value() {
+        let iso = IsolateGuard::new();
+        unsafe extern "C" fn noop(_info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            std::ptr::null_mut()
+        }
+        // SAFETY: `iso` is valid.
+        let tmpl = unsafe { stator_function_template_new(iso.as_ptr(), noop) };
+        assert!(!tmpl.is_null());
+        // SAFETY: `tmpl` is non-null and live; null ctx is allowed.
+        let fn_val = unsafe { stator_function_template_get_function(tmpl, std::ptr::null_mut()) };
+        assert!(!fn_val.is_null());
+        // SAFETY: `fn_val` is non-null and live.
+        assert!(unsafe { stator_value_is_function(fn_val) });
+        // type() should report "function".
+        // SAFETY: `fn_val` is non-null and live.
+        let type_ptr = unsafe { stator_value_type(fn_val) };
+        let type_str = unsafe { CStr::from_ptr(type_ptr) }.to_str().unwrap();
+        assert_eq!(type_str, "function");
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            stator_value_destroy(fn_val);
+            stator_function_template_destroy(tmpl);
+        }
+    }
+
+    #[test]
+    fn test_function_callback_info_length_and_get() {
+        let iso = IsolateGuard::new();
+        // This callback reads its arguments and stores the count in a global.
+        static ARG_COUNT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+        static ARG0_VALUE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        unsafe extern "C" fn recorder(info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            // SAFETY: `info` is valid for the duration of this call.
+            let len = unsafe { stator_function_callback_info_length(info) };
+            ARG_COUNT.store(len, std::sync::atomic::Ordering::SeqCst);
+            if len > 0 {
+                // SAFETY: `info` is valid; index 0 is in range.
+                let arg = unsafe { stator_function_callback_info_get(info, 0) };
+                if !arg.is_null() {
+                    // SAFETY: `arg` is valid for this call.
+                    let n = unsafe { stator_value_as_number(arg) };
+                    ARG0_VALUE.store(n as i64, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            std::ptr::null_mut()
+        }
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        // SAFETY: `iso` is valid; `recorder` is a valid function pointer.
+        let tmpl = unsafe { stator_function_template_new(iso.as_ptr(), recorder) };
+        // SAFETY: `tmpl` and `ctx` are valid.
+        let fn_val = unsafe { stator_function_template_get_function(tmpl, ctx) };
+        // Install the function into the context as "rec".
+        let name = c"rec";
+        // SAFETY: `ctx` and `fn_val` are valid; `name` is a valid C string.
+        unsafe { stator_context_global_set(ctx, name.as_ptr(), fn_val) };
+        // SAFETY: `fn_val` is non-null and live.
+        unsafe { stator_value_destroy(fn_val) };
+
+        // Run a script that calls rec(99).
+        let src = b"rec(99)";
+        // SAFETY: null ctx is allowed for compile; `src` is valid UTF-8.
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        assert!(!script.is_null());
+        // SAFETY: `script` and `ctx` are valid.
+        let result = unsafe { stator_script_run(script, ctx) };
+        // The callback returns null → undefined; result may be null or undefined.
+        if !result.is_null() {
+            // SAFETY: `result` is non-null and live.
+            unsafe { stator_value_destroy(result) };
+        }
+
+        // Verify that the callback was invoked with one argument equal to 99.
+        assert_eq!(ARG_COUNT.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(ARG0_VALUE.load(std::sync::atomic::Ordering::SeqCst), 99);
+
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            stator_script_free(script);
+            stator_function_template_destroy(tmpl);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_function_template_get_function_called_returns_value() {
+        let iso = IsolateGuard::new();
+        // Callback: returns the first argument doubled.
+        unsafe extern "C" fn double_it(
+            info: *const StatorFunctionCallbackInfo,
+        ) -> *mut StatorValue {
+            // SAFETY: `info` is valid for this call.
+            let isolate = unsafe { stator_function_callback_info_get_isolate(info) };
+            let arg = unsafe { stator_function_callback_info_get(info, 0) };
+            let n = if arg.is_null() {
+                0.0
+            } else {
+                // SAFETY: `arg` is valid for this call.
+                unsafe { stator_value_as_number(arg) }
+            };
+            // SAFETY: `isolate` is valid.
+            let ret = unsafe { stator_value_new_number(isolate, n * 2.0) };
+            ret
+        }
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        // SAFETY: `iso` is valid; `double_it` is a valid function pointer.
+        let tmpl = unsafe { stator_function_template_new(iso.as_ptr(), double_it) };
+        // SAFETY: `tmpl` and `ctx` are valid.
+        let fn_val = unsafe { stator_function_template_get_function(tmpl, ctx) };
+        let name = c"dbl";
+        // SAFETY: all pointers are valid.
+        unsafe { stator_context_global_set(ctx, name.as_ptr(), fn_val) };
+        // SAFETY: `fn_val` is non-null and live.
+        unsafe { stator_value_destroy(fn_val) };
+
+        // Run a script that calls dbl(21) and uses the result.
+        let src = b"dbl(21)";
+        // SAFETY: `src` is valid UTF-8.
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        assert!(!script.is_null());
+        // SAFETY: `script` and `ctx` are valid.
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null(), "expected a result from dbl(21)");
+        // SAFETY: `result` is non-null and live.
+        let n = unsafe { stator_value_as_number(result) };
+        assert!(
+            (n - 42.0).abs() < f64::EPSILON,
+            "expected dbl(21) == 42.0, got {n}"
+        );
+
+        // SAFETY: all pointers are non-null and live.
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_function_template_destroy(tmpl);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_script_compile_and_run_with_context() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let src = b"1 + 2";
+        // SAFETY: `ctx` is valid; `src` is valid UTF-8.
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        assert!(!script.is_null());
+        // SAFETY: `script` is non-null and live.
+        let err = unsafe { stator_script_get_error(script) };
+        assert!(err.is_null(), "unexpected compile error");
+        // SAFETY: `script` and `ctx` are both valid.
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null(), "expected a result");
+        // SAFETY: `result` is non-null and live.
+        let n = unsafe { stator_value_as_number(result) };
+        assert!((n - 3.0).abs() < f64::EPSILON, "expected 3.0, got {n}");
+        // SAFETY: all pointers are non-null and live.
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_context_global_set_function_then_script_run() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+
+        unsafe extern "C" fn add_one(info: *const StatorFunctionCallbackInfo) -> *mut StatorValue {
+            // SAFETY: `info` is valid.
+            let isolate = unsafe { stator_function_callback_info_get_isolate(info) };
+            let arg = unsafe { stator_function_callback_info_get(info, 0) };
+            let n = if arg.is_null() {
+                0.0
+            } else {
+                // SAFETY: `arg` is valid.
+                unsafe { stator_value_as_number(arg) }
+            };
+            // SAFETY: `isolate` is valid.
+            unsafe { stator_value_new_number(isolate, n + 1.0) }
+        }
+
+        // SAFETY: `iso` is valid.
+        let tmpl = unsafe { stator_function_template_new(iso.as_ptr(), add_one) };
+        // SAFETY: `tmpl` and `ctx` are valid.
+        let fn_val = unsafe { stator_function_template_get_function(tmpl, ctx) };
+        let name = c"addOne";
+        // SAFETY: all pointers are valid.
+        unsafe { stator_context_global_set(ctx, name.as_ptr(), fn_val) };
+        // SAFETY: `fn_val` is non-null.
+        unsafe { stator_value_destroy(fn_val) };
+
+        let src = b"addOne(41)";
+        // SAFETY: `src` is valid UTF-8.
+        let script = unsafe {
+            stator_script_compile(
+                std::ptr::null_mut(),
+                src.as_ptr() as *const c_char,
+                src.len(),
+            )
+        };
+        // SAFETY: `script` and `ctx` are valid.
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null());
+        // SAFETY: `result` is non-null and live.
+        let n = unsafe { stator_value_as_number(result) };
+        assert!((n - 42.0).abs() < f64::EPSILON, "expected 42.0, got {n}");
+
+        // SAFETY: all pointers are non-null and live.
+        unsafe {
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_function_template_destroy(tmpl);
+            stator_context_destroy(ctx);
+        }
     }
 }
