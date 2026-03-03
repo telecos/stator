@@ -175,6 +175,10 @@ struct FunctionCompiler {
     /// Counter used to generate unique `suspend_id` immediates for each
     /// [`Opcode::SuspendGenerator`] instruction in this function.
     yield_suspend_id: u32,
+    /// `true` when compiling the top-level program body (as opposed to a
+    /// nested function).  Top-level function declarations are also stored
+    /// as globals via `StaGlobal` so that recursive calls can find them.
+    is_program: bool,
 }
 
 impl FunctionCompiler {
@@ -197,6 +201,7 @@ impl FunctionCompiler {
             handler_table: Vec::new(),
             is_generator: false,
             yield_suspend_id: 0,
+            is_program: false,
         };
         for (i, param) in params.iter().enumerate() {
             match &param.pat {
@@ -451,6 +456,19 @@ impl FunctionCompiler {
         if let Some(id) = &decl.id {
             let reg = self.define_local(&id.name);
             self.emit_star(reg);
+            // Top-level function declarations are also stored as globals so
+            // that recursive calls via `LdaGlobal` can find them.
+            if self.is_program {
+                let name_idx = self.add_string(&id.name);
+                let sta_slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
+                // Re-load the value from the local register first so the
+                // accumulator holds the function when StaGlobal executes.
+                self.emit_ldar(reg);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::StaGlobal,
+                    vec![Operand::ConstantPoolIdx(name_idx), sta_slot],
+                ));
+            }
         }
         Ok(())
     }
@@ -2277,13 +2295,17 @@ impl FunctionCompiler {
     /// [`BytecodeArray`].
     fn finalize(mut self) -> StatorResult<BytecodeArray> {
         // Ensure every function ends with an implicit `return undefined`.
+        // For top-level programs (is_program = true) we preserve the last
+        // completion value in the accumulator instead (ECMAScript §15.2.3.1).
         let needs_implicit_return = self
             .instructions
             .last()
             .map(|i| i.opcode != Opcode::Return)
             .unwrap_or(true);
         if needs_implicit_return {
-            self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+            if !self.is_program {
+                self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+            }
             self.emit(Instruction::new_unchecked(Opcode::Return, vec![]));
         }
 
@@ -2440,6 +2462,7 @@ impl BytecodeGenerator {
     /// function that wraps all the program's statements.
     pub fn compile_program(program: &Program) -> StatorResult<BytecodeArray> {
         let mut compiler = FunctionCompiler::new(&[])?;
+        compiler.is_program = true;
 
         // Hoist function declarations to the top.
         for item in &program.body {

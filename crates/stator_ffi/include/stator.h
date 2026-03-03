@@ -63,6 +63,18 @@ typedef struct StatorScript StatorScript;
 typedef struct StatorValue StatorValue;
 
 /**
+ * C-callable native-function signature.
+ *
+ * The callback receives the active context, an array of `argc` argument
+ * pointers (owned by the Rust side; **do not free them**), and the count.
+ * It must return either a new [`StatorValue`] (caller must free it) or a
+ * null pointer (treated as `undefined`).
+ */
+typedef struct StatorValue *(*StatorNativeCallback)(struct StatorContext *ctx,
+                                                    const struct StatorValue *const *args,
+                                                    int32_t argc);
+
+/**
  * C-compatible vtable that embedders fill in to customise engine behaviour.
  *
  * All fields are optional (`Option<…>`).  When a field is `None` the engine
@@ -516,6 +528,62 @@ size_t stator_script_bytecode_count(const struct StatorScript *script);
  * and must not be used again after this call.
  */
 void stator_script_free(struct StatorScript *script);
+
+/**
+ * Execute a compiled script in `ctx` and return the result as a
+ * [`StatorValue`].
+ *
+ * The script must have been successfully compiled (i.e.
+ * [`stator_script_get_error`] returns null).  If the script produces an
+ * exception the call returns null.
+ *
+ * The caller must pass the returned pointer to [`stator_value_destroy`] when
+ * done, or ignore a null return.
+ *
+ * # Safety
+ * - `script` must be a non-null pointer returned by [`stator_script_compile`].
+ * - `ctx` must be a valid, live [`StatorContext`] pointer, or null (in which
+ *   case an empty global environment is used).
+ */
+struct StatorValue *stator_script_run(const struct StatorScript *script, struct StatorContext *ctx);
+
+/**
+ * Convert the value `val` to a UTF-8 string and write it into `buf`.
+ *
+ * At most `buf_len` bytes (including the NUL terminator) are written.
+ * Returns the number of bytes written **excluding** the NUL terminator, or
+ * `-1` on error.  Returns `0` when `val` is null (writes `""` and a NUL).
+ *
+ * # Safety
+ * - `val` must be either null or a valid, live [`StatorValue`] pointer.
+ * - `buf` must be valid for writes of `buf_len` bytes, or null when
+ *   `buf_len` is 0 (in which case only the required length is returned).
+ */
+int32_t stator_value_to_string_utf8(const struct StatorValue *val, char *buf, size_t buf_len);
+
+/**
+ * Register a native function named `name` on `ctx`.
+ *
+ * After registration, JavaScript code running via [`stator_script_run`] can
+ * call `name(…)` as a global function.  The C `callback` is invoked with the
+ * active context, an array of argument pointers (valid only for the duration
+ * of the call), and the argument count.
+ *
+ * The name `"console"` has special semantics: if not yet defined it creates a
+ * plain object; the function is then installed as `console.<method>` where
+ * `<method>` is derived from the dot notation in `name`.  For example,
+ * `name = "console.log"` registers `log` on the `console` object.
+ *
+ * Does nothing when `ctx` or `name` is null.
+ *
+ * # Safety
+ * - `ctx` must be a valid, live [`StatorContext`] pointer.
+ * - `name` must be a valid, null-terminated C string.
+ * - `callback` must remain callable for the lifetime of `ctx`.
+ */
+void stator_register_native_function(struct StatorContext *ctx,
+                                     const char *name,
+                                     StatorNativeCallback callback);
 
 /**
  * Create a new platform from an embedder-supplied vtable.

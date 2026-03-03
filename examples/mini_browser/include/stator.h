@@ -483,6 +483,81 @@ size_t stator_script_bytecode_count(const StatorScript *script);
 void stator_script_free(StatorScript *script);
 
 /* -------------------------------------------------------------------------
+ * Script execution (Phase 3: JavaScript actually runs)
+ * ------------------------------------------------------------------------- */
+
+/**
+ * C-callable native-function signature.
+ *
+ * Called by the engine when JavaScript code invokes a function registered via
+ * stator_register_native_function().
+ *
+ * @param ctx   The active execution context.
+ * @param args  Array of `argc` argument value pointers.  The pointers are
+ *              valid only for the duration of this call; do **not** free them.
+ * @param argc  Number of arguments in @p args.
+ * @return      A new StatorValue* (caller must eventually free it) or NULL to
+ *              return `undefined` to JavaScript.
+ */
+typedef StatorValue *(*StatorNativeCallback)(StatorContext *ctx,
+                                             const StatorValue *const *args,
+                                             int argc);
+
+/**
+ * Execute a compiled script in the given context and return the result.
+ *
+ * The script must have compiled without errors (stator_script_get_error()
+ * must return NULL).  On success the return value is a new StatorValue* that
+ * the caller must pass to stator_value_destroy() when done.  Returns NULL
+ * when the script is NULL, compiled with an error, or an uncaught JavaScript
+ * exception occurs during execution.
+ *
+ * @param script  A non-NULL, successfully compiled StatorScript*.
+ * @param ctx     The execution context (may be NULL for a bare evaluation
+ *                with an empty global environment).
+ * @return        A new StatorValue* for the script's completion value, or
+ *                NULL on failure / uncaught exception.
+ */
+StatorValue *stator_script_run(StatorScript *script, StatorContext *ctx);
+
+/**
+ * Convert the value `val` to a UTF-8 string and write it into `buf`.
+ *
+ * At most `buf_len` bytes (including the NUL terminator) are written.
+ * Returns the number of bytes written **excluding** the NUL terminator, or
+ * -1 on internal error.  Returns 0 and writes `""` when `val` is NULL.
+ *
+ * Pass `buf = NULL` and `buf_len = 0` to query the required buffer size
+ * without writing any data.
+ *
+ * @param val      A valid StatorValue pointer, or NULL.
+ * @param buf      Destination buffer, or NULL when querying the size.
+ * @param buf_len  Size of @p buf in bytes (must be at least 1 to receive a
+ *                 NUL-terminated string).
+ * @return         Bytes written (excluding NUL), or -1 on error.
+ */
+int stator_value_to_string_utf8(const StatorValue *val, char *buf, size_t buf_len);
+
+/**
+ * Register a native C function as a global on the execution context.
+ *
+ * After registration, JavaScript code run via stator_script_run() may call
+ * the function by @p name.  Use dot notation to install a method on a
+ * namespace object: `"console.log"` installs `log` on the `console` global.
+ *
+ * Does nothing when @p ctx or @p name is NULL.
+ *
+ * @param ctx       A valid, non-NULL StatorContext*.
+ * @param name      Null-terminated function name, e.g. `"print"` or
+ *                  `"console.log"`.
+ * @param callback  The C function to invoke.  Must remain callable for the
+ *                  lifetime of @p ctx.
+ */
+void stator_register_native_function(StatorContext    *ctx,
+                                     const char       *name,
+                                     StatorNativeCallback callback);
+
+/* -------------------------------------------------------------------------
  * Platform (embedder-provided task scheduling and timing)
  * ------------------------------------------------------------------------- */
 

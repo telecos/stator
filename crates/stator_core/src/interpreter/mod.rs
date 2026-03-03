@@ -165,6 +165,7 @@
 //! dispatches on the [`Opcode`] via an exhaustive `match`.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::builtins::error::{pop_call_frame, push_call_frame};
@@ -209,6 +210,10 @@ pub struct InterpreterFrame {
     /// The generator state object attached to this frame, if it is executing
     /// a generator function body.  `None` for ordinary (non-generator) frames.
     pub generator_state: Option<Rc<RefCell<GeneratorState>>>,
+    /// Shared global-variable environment.  The top-level script frame owns a
+    /// fresh map; inner function frames inherit the same `Rc` so that globals
+    /// written by a called function are visible back in the caller.
+    pub global_env: Rc<RefCell<HashMap<String, JsValue>>>,
 }
 
 impl InterpreterFrame {
@@ -234,7 +239,22 @@ impl InterpreterFrame {
             context: None,
             suspend_result: None,
             generator_state: None,
+            global_env: Rc::new(RefCell::new(HashMap::new())),
         }
+    }
+
+    /// Create a new frame that shares the given global environment.
+    ///
+    /// Used by the interpreter when calling a function so that the callee can
+    /// access the same globals as the top-level script.
+    pub fn new_with_globals(
+        bytecode_array: BytecodeArray,
+        args: Vec<JsValue>,
+        global_env: Rc<RefCell<HashMap<String, JsValue>>>,
+    ) -> Self {
+        let mut frame = Self::new(bytecode_array, args);
+        frame.global_env = global_env;
+        frame
     }
 
     /// Map an encoded register-operand value to a flat index into
@@ -661,20 +681,33 @@ impl Interpreter {
                         return Err(err_bad_operand("CallAnyReceiver", 2));
                     };
                     let callee = frame.read_reg(callee_v)?.clone();
-                    let JsValue::Function(ba) = callee else {
-                        return Err(StatorError::TypeError(format!(
-                            "CallAnyReceiver: callee is not a function (got {callee:?})"
-                        )));
-                    };
-                    if ba.is_generator() {
-                        frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
-                    } else {
-                        let args = collect_args(frame, args_start_v, arg_count)?;
-                        let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
-                        push_call_frame("<anonymous>");
-                        let result = Interpreter::run(&mut callee_frame);
-                        pop_call_frame();
-                        frame.accumulator = result?;
+                    match callee {
+                        JsValue::Function(ba) => {
+                            if ba.is_generator() {
+                                frame.accumulator =
+                                    JsValue::Generator(GeneratorState::new((*ba).clone()));
+                            } else {
+                                let args = collect_args(frame, args_start_v, arg_count)?;
+                                let mut callee_frame = InterpreterFrame::new_with_globals(
+                                    (*ba).clone(),
+                                    args,
+                                    Rc::clone(&frame.global_env),
+                                );
+                                push_call_frame("<anonymous>");
+                                let result = Interpreter::run(&mut callee_frame);
+                                pop_call_frame();
+                                frame.accumulator = result?;
+                            }
+                        }
+                        JsValue::NativeFunction(f) => {
+                            let args = collect_args(frame, args_start_v, arg_count)?;
+                            frame.accumulator = f(args)?;
+                        }
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "CallAnyReceiver: callee is not a function (got {other:?})"
+                            )));
+                        }
                     }
                 }
 
@@ -685,19 +718,31 @@ impl Interpreter {
                         return Err(err_bad_operand("CallUndefinedReceiver0", 0));
                     };
                     let callee = frame.read_reg(callee_v)?.clone();
-                    let JsValue::Function(ba) = callee else {
-                        return Err(StatorError::TypeError(format!(
-                            "CallUndefinedReceiver0: callee is not a function (got {callee:?})"
-                        )));
-                    };
-                    if ba.is_generator() {
-                        frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
-                    } else {
-                        let mut callee_frame = InterpreterFrame::new((*ba).clone(), vec![]);
-                        push_call_frame("<anonymous>");
-                        let result = Interpreter::run(&mut callee_frame);
-                        pop_call_frame();
-                        frame.accumulator = result?;
+                    match callee {
+                        JsValue::Function(ba) => {
+                            if ba.is_generator() {
+                                frame.accumulator =
+                                    JsValue::Generator(GeneratorState::new((*ba).clone()));
+                            } else {
+                                let mut callee_frame = InterpreterFrame::new_with_globals(
+                                    (*ba).clone(),
+                                    vec![],
+                                    Rc::clone(&frame.global_env),
+                                );
+                                push_call_frame("<anonymous>");
+                                let result = Interpreter::run(&mut callee_frame);
+                                pop_call_frame();
+                                frame.accumulator = result?;
+                            }
+                        }
+                        JsValue::NativeFunction(f) => {
+                            frame.accumulator = f(vec![])?;
+                        }
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "CallUndefinedReceiver0: callee is not a function (got {other:?})"
+                            )));
+                        }
                     }
                 }
 
@@ -711,20 +756,33 @@ impl Interpreter {
                         return Err(err_bad_operand("CallUndefinedReceiver1", 1));
                     };
                     let callee = frame.read_reg(callee_v)?.clone();
-                    let JsValue::Function(ba) = callee else {
-                        return Err(StatorError::TypeError(format!(
-                            "CallUndefinedReceiver1: callee is not a function (got {callee:?})"
-                        )));
-                    };
-                    if ba.is_generator() {
-                        frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
-                    } else {
-                        let arg1 = frame.read_reg(arg1_v)?.clone();
-                        let mut callee_frame = InterpreterFrame::new((*ba).clone(), vec![arg1]);
-                        push_call_frame("<anonymous>");
-                        let result = Interpreter::run(&mut callee_frame);
-                        pop_call_frame();
-                        frame.accumulator = result?;
+                    match callee {
+                        JsValue::Function(ba) => {
+                            if ba.is_generator() {
+                                frame.accumulator =
+                                    JsValue::Generator(GeneratorState::new((*ba).clone()));
+                            } else {
+                                let arg1 = frame.read_reg(arg1_v)?.clone();
+                                let mut callee_frame = InterpreterFrame::new_with_globals(
+                                    (*ba).clone(),
+                                    vec![arg1],
+                                    Rc::clone(&frame.global_env),
+                                );
+                                push_call_frame("<anonymous>");
+                                let result = Interpreter::run(&mut callee_frame);
+                                pop_call_frame();
+                                frame.accumulator = result?;
+                            }
+                        }
+                        JsValue::NativeFunction(f) => {
+                            let arg1 = frame.read_reg(arg1_v)?.clone();
+                            frame.accumulator = f(vec![arg1])?;
+                        }
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "CallUndefinedReceiver1: callee is not a function (got {other:?})"
+                            )));
+                        }
                     }
                 }
 
@@ -741,22 +799,35 @@ impl Interpreter {
                         return Err(err_bad_operand("CallUndefinedReceiver2", 2));
                     };
                     let callee = frame.read_reg(callee_v)?.clone();
-                    let JsValue::Function(ba) = callee else {
-                        return Err(StatorError::TypeError(format!(
-                            "CallUndefinedReceiver2: callee is not a function (got {callee:?})"
-                        )));
-                    };
-                    if ba.is_generator() {
-                        frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
-                    } else {
-                        let arg1 = frame.read_reg(arg1_v)?.clone();
-                        let arg2 = frame.read_reg(arg2_v)?.clone();
-                        let mut callee_frame =
-                            InterpreterFrame::new((*ba).clone(), vec![arg1, arg2]);
-                        push_call_frame("<anonymous>");
-                        let result = Interpreter::run(&mut callee_frame);
-                        pop_call_frame();
-                        frame.accumulator = result?;
+                    match callee {
+                        JsValue::Function(ba) => {
+                            if ba.is_generator() {
+                                frame.accumulator =
+                                    JsValue::Generator(GeneratorState::new((*ba).clone()));
+                            } else {
+                                let arg1 = frame.read_reg(arg1_v)?.clone();
+                                let arg2 = frame.read_reg(arg2_v)?.clone();
+                                let mut callee_frame = InterpreterFrame::new_with_globals(
+                                    (*ba).clone(),
+                                    vec![arg1, arg2],
+                                    Rc::clone(&frame.global_env),
+                                );
+                                push_call_frame("<anonymous>");
+                                let result = Interpreter::run(&mut callee_frame);
+                                pop_call_frame();
+                                frame.accumulator = result?;
+                            }
+                        }
+                        JsValue::NativeFunction(f) => {
+                            let arg1 = frame.read_reg(arg1_v)?.clone();
+                            let arg2 = frame.read_reg(arg2_v)?.clone();
+                            frame.accumulator = f(vec![arg1, arg2])?;
+                        }
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "CallUndefinedReceiver2: callee is not a function (got {other:?})"
+                            )));
+                        }
                     }
                 }
 
@@ -778,24 +849,35 @@ impl Interpreter {
                         return Err(err_bad_operand("CallProperty", 2));
                     };
                     let callee = frame.read_reg(callee_v)?.clone();
-                    let JsValue::Function(ba) = callee else {
-                        return Err(StatorError::TypeError(format!(
-                            "CallProperty: callee is not a function (got {callee:?})"
-                        )));
-                    };
-                    let this_val = frame.read_reg(recv_v)?.clone();
                     // Arguments reside in the registers immediately following
                     // the callee register in the flat register file.
                     let callee_flat = frame.reg_index(callee_v)?;
                     let args = (0..arg_count as usize)
                         .map(|i| frame.registers[callee_flat + 1 + i].clone())
                         .collect::<Vec<_>>();
-                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
-                    callee_frame.context = Some(this_val);
-                    push_call_frame("<anonymous>");
-                    let result = Interpreter::run(&mut callee_frame);
-                    pop_call_frame();
-                    frame.accumulator = result?;
+                    match callee {
+                        JsValue::Function(ba) => {
+                            let this_val = frame.read_reg(recv_v)?.clone();
+                            let mut callee_frame = InterpreterFrame::new_with_globals(
+                                (*ba).clone(),
+                                args,
+                                Rc::clone(&frame.global_env),
+                            );
+                            callee_frame.context = Some(this_val);
+                            push_call_frame("<anonymous>");
+                            let result = Interpreter::run(&mut callee_frame);
+                            pop_call_frame();
+                            frame.accumulator = result?;
+                        }
+                        JsValue::NativeFunction(f) => {
+                            frame.accumulator = f(args)?;
+                        }
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "CallProperty: callee is not a function (got {other:?})"
+                            )));
+                        }
+                    }
                 }
 
                 // CallWithSpread [callable, args_start, args_count, slot]:
@@ -814,17 +896,29 @@ impl Interpreter {
                         return Err(err_bad_operand("CallWithSpread", 2));
                     };
                     let callee = frame.read_reg(callee_v)?.clone();
-                    let JsValue::Function(ba) = callee else {
-                        return Err(StatorError::TypeError(format!(
-                            "CallWithSpread: callee is not a function (got {callee:?})"
-                        )));
-                    };
-                    let args = collect_args(frame, args_start_v, arg_count)?;
-                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
-                    push_call_frame("<anonymous>");
-                    let result = Interpreter::run(&mut callee_frame);
-                    pop_call_frame();
-                    frame.accumulator = result?;
+                    match callee {
+                        JsValue::Function(ba) => {
+                            let args = collect_args(frame, args_start_v, arg_count)?;
+                            let mut callee_frame = InterpreterFrame::new_with_globals(
+                                (*ba).clone(),
+                                args,
+                                Rc::clone(&frame.global_env),
+                            );
+                            push_call_frame("<anonymous>");
+                            let result = Interpreter::run(&mut callee_frame);
+                            pop_call_frame();
+                            frame.accumulator = result?;
+                        }
+                        JsValue::NativeFunction(f) => {
+                            let args = collect_args(frame, args_start_v, arg_count)?;
+                            frame.accumulator = f(args)?;
+                        }
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "CallWithSpread: callee is not a function (got {other:?})"
+                            )));
+                        }
+                    }
                 }
 
                 // ── Construct ──────────────────────────────────────────────
@@ -845,17 +939,29 @@ impl Interpreter {
                         return Err(err_bad_operand("Construct", 2));
                     };
                     let ctor = frame.read_reg(ctor_v)?.clone();
-                    let JsValue::Function(ba) = ctor else {
-                        return Err(StatorError::TypeError(format!(
-                            "Construct: constructor is not a function (got {ctor:?})"
-                        )));
-                    };
-                    let args = collect_args(frame, args_start_v, arg_count)?;
-                    let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
-                    push_call_frame("<anonymous>");
-                    let result = Interpreter::run(&mut callee_frame);
-                    pop_call_frame();
-                    frame.accumulator = result?;
+                    match ctor {
+                        JsValue::Function(ba) => {
+                            let args = collect_args(frame, args_start_v, arg_count)?;
+                            let mut callee_frame = InterpreterFrame::new_with_globals(
+                                (*ba).clone(),
+                                args,
+                                Rc::clone(&frame.global_env),
+                            );
+                            push_call_frame("<anonymous>");
+                            let result = Interpreter::run(&mut callee_frame);
+                            pop_call_frame();
+                            frame.accumulator = result?;
+                        }
+                        JsValue::NativeFunction(f) => {
+                            let args = collect_args(frame, args_start_v, arg_count)?;
+                            frame.accumulator = f(args)?;
+                        }
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "Construct: constructor is not a function (got {other:?})"
+                            )));
+                        }
+                    }
                 }
 
                 // ── Context management ─────────────────────────────────────
@@ -922,6 +1028,81 @@ impl Interpreter {
                 Opcode::StackCheck
                 | Opcode::SetExpressionPosition
                 | Opcode::SetExpressionPositionFromEnd => {}
+
+                // ── Global variable access ──────────────────────────────────
+                //
+                // LdaGlobal [name_idx, feedback_slot]:
+                //   Load the global variable named by the string at
+                //   `constant_pool[name_idx]` into the accumulator.
+                //   Produces `undefined` when the name is not found.
+                Opcode::LdaGlobal | Opcode::LdaGlobalInsideTypeof => {
+                    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("LdaGlobal", 0));
+                    };
+                    let name = match frame.bytecode_array.get_constant(name_idx) {
+                        Some(ConstantPoolEntry::String(s)) => s.clone(),
+                        _ => {
+                            return Err(StatorError::Internal(
+                                "LdaGlobal: constant is not a string".into(),
+                            ));
+                        }
+                    };
+                    frame.accumulator = frame
+                        .global_env
+                        .borrow()
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined);
+                }
+
+                // StaGlobal [name_idx, feedback_slot]:
+                //   Store the accumulator to the global variable named by
+                //   `constant_pool[name_idx]`.
+                Opcode::StaGlobal => {
+                    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("StaGlobal", 0));
+                    };
+                    let name = match frame.bytecode_array.get_constant(name_idx) {
+                        Some(ConstantPoolEntry::String(s)) => s.clone(),
+                        _ => {
+                            return Err(StatorError::Internal(
+                                "StaGlobal: constant is not a string".into(),
+                            ));
+                        }
+                    };
+                    let val = frame.accumulator.clone();
+                    frame.global_env.borrow_mut().insert(name, val);
+                }
+
+                // LdaNamedProperty [object_reg, name_idx, feedback_slot]:
+                //   Load the named property from the object in `object_reg`.
+                //   Supports `PlainObject` (property map) and falls back to
+                //   `undefined` for other value types.
+                Opcode::LdaNamedProperty => {
+                    let Operand::Register(obj_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("LdaNamedProperty", 0));
+                    };
+                    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+                        return Err(err_bad_operand("LdaNamedProperty", 1));
+                    };
+                    let prop_name = match frame.bytecode_array.get_constant(name_idx) {
+                        Some(ConstantPoolEntry::String(s)) => s.clone(),
+                        _ => {
+                            return Err(StatorError::Internal(
+                                "LdaNamedProperty: property name is not a string".into(),
+                            ));
+                        }
+                    };
+                    let obj = frame.read_reg(obj_v)?.clone();
+                    frame.accumulator = match obj {
+                        JsValue::PlainObject(ref map) => map
+                            .borrow()
+                            .get(&prop_name)
+                            .cloned()
+                            .unwrap_or(JsValue::Undefined),
+                        _ => JsValue::Undefined,
+                    };
+                }
 
                 // ── Iterators ──────────────────────────────────────────────
                 //
@@ -1172,6 +1353,7 @@ impl Interpreter {
             context: None,
             suspend_result: None,
             generator_state: Some(Rc::clone(state)),
+            global_env: Rc::new(RefCell::new(std::collections::HashMap::new())),
         };
 
         state.borrow_mut().status = GeneratorStatus::Executing;
@@ -1255,10 +1437,17 @@ fn resolve_jump(
 }
 
 /// Convert a constant-pool entry to a [`JsValue`].
+///
+/// String entries that represent JavaScript string literals (i.e. those whose
+/// raw source text is surrounded by `'…'`, `"…"`, or backtick `` `…` ``)
+/// are decoded: the surrounding delimiters are stripped and standard escape
+/// sequences (`\\`, `\'`, `\"`, `\n`, `\r`, `\t`) are expanded.  Plain
+/// identifier strings (property names, variable names) are stored without
+/// delimiters and are returned as-is.
 fn constant_to_value(entry: &ConstantPoolEntry) -> JsValue {
     match entry {
         ConstantPoolEntry::Number(n) => number_to_jsvalue(*n),
-        ConstantPoolEntry::String(s) => JsValue::String(s.clone()),
+        ConstantPoolEntry::String(s) => JsValue::String(decode_string_constant(s)),
         ConstantPoolEntry::Boolean(b) => JsValue::Boolean(*b),
         ConstantPoolEntry::Null => JsValue::Null,
         ConstantPoolEntry::Undefined => JsValue::Undefined,
@@ -1266,9 +1455,51 @@ fn constant_to_value(entry: &ConstantPoolEntry) -> JsValue {
     }
 }
 
-/// Produce a [`JsValue`] for a numeric result: use [`JsValue::Smi`] if the
-/// value is an exact integer that fits in `i32`, otherwise
-/// [`JsValue::HeapNumber`].
+/// Decode a constant-pool string entry into its runtime string value.
+///
+/// The scanner stores string literal tokens as raw source text including the
+/// surrounding quote characters (e.g. `"'hello world'"` for `'hello world'`).
+/// At runtime, the `LdaConstant` opcode must strip the delimiters and expand
+/// escape sequences so that the string value is the *content* of the literal.
+///
+/// Plain strings (property names, identifier names) have no surrounding
+/// delimiters and are returned unchanged.
+fn decode_string_constant(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    if bytes.len() < 2 {
+        return raw.to_owned();
+    }
+    let (_, inner) = match bytes[0] {
+        b'\'' | b'"' | b'`' if bytes[bytes.len() - 1] == bytes[0] => {
+            (bytes[0], &raw[1..raw.len() - 1])
+        }
+        _ => return raw.to_owned(),
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('\\') => out.push('\\'),
+                Some('\'') => out.push('\''),
+                Some('"') => out.push('"'),
+                Some('`') => out.push('`'),
+                Some('0') => out.push('\0'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
 fn number_to_jsvalue(n: f64) -> JsValue {
     if n.is_finite() && n.fract() == 0.0 && (i32::MIN as f64..=i32::MAX as f64).contains(&n) {
         JsValue::Smi(n as i32)

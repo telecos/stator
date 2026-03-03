@@ -17,6 +17,7 @@
 //!   `Vec<JsValue>` and is surfaced as [`JsValue::Iterator`].
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::builtins::error::JsError;
@@ -163,6 +164,12 @@ impl NativeIterator {
     }
 }
 
+/// Signature for a native Rust function callable from JavaScript.
+///
+/// Receives the list of positional arguments and returns a [`JsValue`] result.
+/// Used by [`JsValue::NativeFunction`].
+pub type NativeFn = Rc<dyn Fn(Vec<JsValue>) -> StatorResult<JsValue>>;
+
 /// Any ECMAScript value.
 ///
 /// Primitive variants carry their data inline; `Object` holds a raw pointer to
@@ -172,6 +179,8 @@ impl NativeIterator {
 /// that need to produce array values without allocating on the GC heap.
 /// `Generator` wraps a suspended generator function's execution state.
 /// `Iterator` wraps a [`NativeIterator`] over a pre-collected sequence.
+/// `NativeFunction` wraps an embedder-provided Rust closure.
+/// `PlainObject` wraps a simple property map for lightweight object creation.
 ///
 /// # Safety – `Object` variant
 ///
@@ -179,7 +188,7 @@ impl NativeIterator {
 /// the engine heap.  It is the caller's responsibility to ensure the object
 /// outlives the `JsValue` that wraps it and that no GC compaction has
 /// invalidated the pointer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone)]
 pub enum JsValue {
     /// The ECMAScript `undefined` primitive.
     Undefined,
@@ -228,6 +237,70 @@ pub enum JsValue {
     /// `RangeError`, `ReferenceError`, `SyntaxError`, `URIError`, `EvalError`,
     /// and `AggregateError`.
     Error(Rc<JsError>),
+    /// A native Rust function callable from JavaScript.
+    ///
+    /// Used to expose host-provided functionality (e.g. `console.log`,
+    /// `print`) to JavaScript code without compiling a bytecode body.
+    NativeFunction(NativeFn),
+    /// A lightweight property map representing a plain JavaScript object.
+    ///
+    /// Provides named-property access without going through the GC heap.
+    /// Used to construct host objects (e.g. `console`) that carry
+    /// [`NativeFunction`][Self::NativeFunction] properties.
+    PlainObject(Rc<RefCell<HashMap<String, JsValue>>>),
+}
+
+// Manual Debug impl: NativeFunction can't derive Debug (dyn Fn).
+impl std::fmt::Debug for JsValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Undefined => write!(f, "Undefined"),
+            Self::Null => write!(f, "Null"),
+            Self::Boolean(b) => write!(f, "Boolean({b})"),
+            Self::Smi(n) => write!(f, "Smi({n})"),
+            Self::HeapNumber(n) => write!(f, "HeapNumber({n})"),
+            Self::String(s) => write!(f, "String({s:?})"),
+            Self::Symbol(id) => write!(f, "Symbol({id})"),
+            Self::Object(ptr) => write!(f, "Object({ptr:?})"),
+            Self::BigInt(n) => write!(f, "BigInt({n})"),
+            Self::Function(ba) => write!(f, "Function({ba:?})"),
+            Self::Array(arr) => write!(f, "Array({arr:?})"),
+            Self::Generator(g) => write!(f, "Generator({g:?})"),
+            Self::Iterator(i) => write!(f, "Iterator({i:?})"),
+            Self::Error(e) => write!(f, "Error({e:?})"),
+            Self::NativeFunction(_) => write!(f, "NativeFunction"),
+            Self::PlainObject(map) => write!(f, "PlainObject({map:?})"),
+        }
+    }
+}
+
+// Manual PartialEq: NativeFunction uses Rc pointer equality.
+impl PartialEq for JsValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Undefined, Self::Undefined) => true,
+            (Self::Null, Self::Null) => true,
+            (Self::Boolean(a), Self::Boolean(b)) => a == b,
+            (Self::Smi(a), Self::Smi(b)) => a == b,
+            (Self::HeapNumber(a), Self::HeapNumber(b)) => a == b,
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::Symbol(a), Self::Symbol(b)) => a == b,
+            // Object identity — `JsValue::Object` holds a raw `*mut HeapObject`
+            // pointer; equality is pointer equality (same allocation).
+            (Self::Object(a), Self::Object(b)) => std::ptr::eq(*a, *b),
+            (Self::BigInt(a), Self::BigInt(b)) => a == b,
+            // Reference types: compare contents (matching the original derive behaviour).
+            (Self::Function(a), Self::Function(b)) => a == b,
+            (Self::Array(a), Self::Array(b)) => a == b,
+            (Self::Generator(a), Self::Generator(b)) => Rc::ptr_eq(a, b),
+            (Self::Iterator(a), Self::Iterator(b)) => Rc::ptr_eq(a, b),
+            (Self::Error(a), Self::Error(b)) => Rc::ptr_eq(a, b),
+            // NativeFunction has no comparable content; use pointer identity.
+            (Self::NativeFunction(a), Self::NativeFunction(b)) => Rc::ptr_eq(a, b),
+            (Self::PlainObject(a), Self::PlainObject(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -304,7 +377,7 @@ impl JsValue {
     /// Returns `true` if this value is a callable function.
     #[inline]
     pub fn is_function(&self) -> bool {
-        matches!(self, Self::Function(_))
+        matches!(self, Self::Function(_) | Self::NativeFunction(_))
     }
 
     /// Returns `true` if this value is a lightweight array ([`Array`][JsValue::Array]).
@@ -363,7 +436,9 @@ impl JsValue {
             | Self::Array(_)
             | Self::Error(_)
             | Self::Generator(_)
-            | Self::Iterator(_) => true,
+            | Self::Iterator(_)
+            | Self::NativeFunction(_)
+            | Self::PlainObject(_) => true,
             Self::BigInt(n) => *n != 0,
         }
     }
@@ -426,6 +501,12 @@ impl JsValue {
             Self::Error(_) => Err(StatorError::TypeError(
                 "Cannot convert an Error value to a number".to_string(),
             )),
+            Self::NativeFunction(_) => Err(StatorError::TypeError(
+                "Cannot convert a NativeFunction value to a number".to_string(),
+            )),
+            Self::PlainObject(_) => Err(StatorError::TypeError(
+                "Cannot convert an Object to a number without ToPrimitive".to_string(),
+            )),
         }
     }
 
@@ -477,6 +558,8 @@ impl JsValue {
             Self::Generator(_) => Ok("[object Generator]".to_string()),
             Self::Iterator(_) => Ok("[object Iterator]".to_string()),
             Self::Error(e) => Ok(e.to_error_string()),
+            Self::NativeFunction(_) => Ok("function () { [native code] }".to_string()),
+            Self::PlainObject(_) => Ok("[object Object]".to_string()),
         }
     }
 }

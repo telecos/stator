@@ -1028,6 +1028,9 @@ fn js_value_to_json_inner(
         // Object values are inaccessible without a GC context; emit an empty
         // object to indicate the value is object-shaped.
         JsValue::Object(_) => Ok(Some(JsonValue::Object(Rc::new(RefCell::new(Vec::new()))))),
+        // NativeFunction and PlainObject are not JSON-serializable.
+        JsValue::NativeFunction(_) => Ok(None),
+        JsValue::PlainObject(_) => Ok(Some(JsonValue::Object(Rc::new(RefCell::new(Vec::new()))))),
     }
 }
 

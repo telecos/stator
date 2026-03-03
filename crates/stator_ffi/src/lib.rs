@@ -10,15 +10,19 @@
 //! `_create` functions and must release them with the corresponding `_destroy`
 //! function.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::io::Write as _;
+use std::rc::Rc;
 
 use stator_core::bytecode::bytecode_array::BytecodeArray;
 use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_core::bytecode::bytecodes::{Operand, decode};
 use stator_core::gc::heap::Heap;
+use stator_core::interpreter::{Interpreter, InterpreterFrame};
 use stator_core::objects::js_object::JsObject;
-use stator_core::objects::value::JsValue;
+use stator_core::objects::value::{JsValue, NativeFn};
 use stator_core::parser;
 
 /// An opaque isolate handle.
@@ -264,6 +268,12 @@ pub struct StatorContext {
     /// receive a non-owning pointer via [`stator_context_global`] and must
     /// **not** call [`stator_object_destroy`] on it.
     global: StatorObject,
+    /// Shared global-variable environment for script execution.
+    ///
+    /// Populated by [`stator_register_native_function`] and consumed by
+    /// [`stator_script_run`].  The map owns [`JsValue`] values (including
+    /// [`JsValue::NativeFunction`] and [`JsValue::PlainObject`] wrappers).
+    pub(crate) globals: Rc<RefCell<HashMap<String, JsValue>>>,
 }
 
 // SAFETY: `StatorContext` only holds a pointer that is valid for the lifetime
@@ -293,6 +303,7 @@ pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut
             inner: JsObject::new(),
             isolate,
         },
+        globals: Rc::new(RefCell::new(HashMap::new())),
     }));
     // SAFETY: caller guarantees `isolate` is valid; `ctx` was just created.
     unsafe { (*isolate).current_context = ctx };
@@ -403,6 +414,10 @@ enum StatorValueInner {
     Number(f64),
     /// A UTF-8 string stored as a null-terminated C string for easy FFI access.
     Str(CString),
+    /// The ECMAScript `undefined` value.
+    Undefined,
+    /// A JavaScript boolean (`true` or `false`).
+    Boolean(bool),
 }
 
 /// An opaque handle to a JavaScript value (number or string).
@@ -509,6 +524,8 @@ pub unsafe extern "C" fn stator_value_type(val: *const StatorValue) -> *const c_
     match unsafe { &(*val).inner } {
         StatorValueInner::Number(_) => c"number".as_ptr(),
         StatorValueInner::Str(_) => c"string".as_ptr(),
+        StatorValueInner::Undefined => c"undefined".as_ptr(),
+        StatorValueInner::Boolean(_) => c"boolean".as_ptr(),
     }
 }
 
@@ -525,7 +542,14 @@ pub unsafe extern "C" fn stator_value_as_number(val: *const StatorValue) -> f64 
     // SAFETY: caller guarantees `val` is valid.
     match unsafe { &(*val).inner } {
         StatorValueInner::Number(n) => *n,
-        StatorValueInner::Str(_) => f64::NAN,
+        StatorValueInner::Str(_) | StatorValueInner::Undefined => f64::NAN,
+        StatorValueInner::Boolean(b) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
     }
 }
 
@@ -544,7 +568,9 @@ pub unsafe extern "C" fn stator_value_as_string(val: *const StatorValue) -> *con
     // SAFETY: caller guarantees `val` is valid.
     match unsafe { &(*val).inner } {
         StatorValueInner::Str(cs) => cs.as_ptr(),
-        StatorValueInner::Number(_) => c"".as_ptr(),
+        StatorValueInner::Number(_)
+        | StatorValueInner::Undefined
+        | StatorValueInner::Boolean(_) => c"".as_ptr(),
     }
 }
 
@@ -623,10 +649,7 @@ pub unsafe extern "C" fn stator_object_set(
     // SAFETY: caller guarantees `key` is a valid null-terminated string.
     let key_str = unsafe { CStr::from_ptr(key) }.to_string_lossy();
     // SAFETY: caller guarantees `val` is valid.
-    let js_val = match unsafe { &(*val).inner } {
-        StatorValueInner::Number(n) => JsValue::HeapNumber(*n),
-        StatorValueInner::Str(cs) => JsValue::String(cs.to_string_lossy().into_owned()),
-    };
+    let js_val = stator_value_inner_to_jsvalue(unsafe { &(*val).inner });
     // SAFETY: caller guarantees `obj` is valid.
     let _ = unsafe { (*obj).inner.set_property(&key_str, js_val) };
 }
@@ -954,6 +977,279 @@ pub unsafe extern "C" fn stator_script_free(script: *mut StatorScript) {
         // SAFETY: pointer was created by `Box::into_raw` in
         // `stator_script_compile`.
         drop(unsafe { Box::from_raw(script) });
+    }
+}
+
+// ── Script execution (Phase 3) ────────────────────────────────────────────────
+
+/// C-callable native-function signature.
+///
+/// The callback receives the active context, an array of `argc` argument
+/// pointers (owned by the Rust side; **do not free them**), and the count.
+/// It must return either a new [`StatorValue`] (caller must free it) or a
+/// null pointer (treated as `undefined`).
+type StatorNativeCallback = unsafe extern "C" fn(
+    ctx: *mut StatorContext,
+    args: *const *const StatorValue,
+    argc: i32,
+) -> *mut StatorValue;
+
+/// Execute a compiled script in `ctx` and return the result as a
+/// [`StatorValue`].
+///
+/// The script must have been successfully compiled (i.e.
+/// [`stator_script_get_error`] returns null).  If the script produces an
+/// exception the call returns null.
+///
+/// The caller must pass the returned pointer to [`stator_value_destroy`] when
+/// done, or ignore a null return.
+///
+/// # Safety
+/// - `script` must be a non-null pointer returned by [`stator_script_compile`].
+/// - `ctx` must be a valid, live [`StatorContext`] pointer, or null (in which
+///   case an empty global environment is used).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_run(
+    script: *const StatorScript,
+    ctx: *mut StatorContext,
+) -> *mut StatorValue {
+    if script.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    let bytecodes = match unsafe { &(*script).bytecodes } {
+        Some(b) => b.clone(),
+        None => return std::ptr::null_mut(),
+    };
+
+    // Borrow the global environment from the context (if any).
+    let global_env = if !ctx.is_null() {
+        // SAFETY: caller guarantees `ctx` is valid.
+        Rc::clone(unsafe { &(*ctx).globals })
+    } else {
+        Rc::new(RefCell::new(HashMap::new()))
+    };
+
+    let mut frame = InterpreterFrame::new_with_globals(bytecodes, vec![], global_env);
+    match Interpreter::run(&mut frame) {
+        Ok(val) => {
+            // Wrap the result in a StatorValue.  Use the isolate from the
+            // context when available; null isolate means the handle is
+            // "untracked" (live_objects is not incremented).
+            let isolate = if ctx.is_null() {
+                std::ptr::null_mut()
+            } else {
+                // SAFETY: ctx is valid.
+                unsafe { (*ctx)._isolate }
+            };
+            let inner = jsvalue_to_stator_value_inner(&val);
+            if !isolate.is_null() {
+                // SAFETY: isolate is valid.
+                unsafe { (*isolate).live_objects += 1 };
+            }
+            Box::into_raw(Box::new(StatorValue { inner, isolate }))
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Convert the value `val` to a UTF-8 string and write it into `buf`.
+///
+/// At most `buf_len` bytes (including the NUL terminator) are written.
+/// Returns the number of bytes written **excluding** the NUL terminator, or
+/// `-1` on error.  Returns `0` when `val` is null (writes `""` and a NUL).
+///
+/// # Safety
+/// - `val` must be either null or a valid, live [`StatorValue`] pointer.
+/// - `buf` must be valid for writes of `buf_len` bytes, or null when
+///   `buf_len` is 0 (in which case only the required length is returned).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_to_string_utf8(
+    val: *const StatorValue,
+    buf: *mut c_char,
+    buf_len: usize,
+) -> i32 {
+    let s = if val.is_null() {
+        "undefined".to_owned()
+    } else {
+        // SAFETY: caller guarantees `val` is valid.
+        match unsafe { &(*val).inner } {
+            StatorValueInner::Number(n) => {
+                if n.is_nan() {
+                    "NaN".to_owned()
+                } else if n.is_infinite() {
+                    if *n > 0.0 {
+                        "Infinity".to_owned()
+                    } else {
+                        "-Infinity".to_owned()
+                    }
+                } else if *n == 0.0 {
+                    "0".to_owned()
+                } else {
+                    format!("{n}")
+                }
+            }
+            StatorValueInner::Str(cs) => cs.to_string_lossy().into_owned(),
+            StatorValueInner::Undefined => "undefined".to_owned(),
+            StatorValueInner::Boolean(b) => if *b { "true" } else { "false" }.to_owned(),
+        }
+    };
+    if buf.is_null() || buf_len == 0 {
+        return s.len() as i32;
+    }
+    let bytes = s.as_bytes();
+    // Copy at most buf_len-1 bytes so there is always room for a NUL.
+    let copy_len = bytes.len().min(buf_len - 1);
+    // SAFETY: buf is valid for buf_len bytes; we only write copy_len + 1.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buf, copy_len);
+        *buf.add(copy_len) = 0;
+    }
+    copy_len as i32
+}
+
+/// Register a native function named `name` on `ctx`.
+///
+/// After registration, JavaScript code running via [`stator_script_run`] can
+/// call `name(…)` as a global function.  The C `callback` is invoked with the
+/// active context, an array of argument pointers (valid only for the duration
+/// of the call), and the argument count.
+///
+/// The name `"console"` has special semantics: if not yet defined it creates a
+/// plain object; the function is then installed as `console.<method>` where
+/// `<method>` is derived from the dot notation in `name`.  For example,
+/// `name = "console.log"` registers `log` on the `console` object.
+///
+/// Does nothing when `ctx` or `name` is null.
+///
+/// # Safety
+/// - `ctx` must be a valid, live [`StatorContext`] pointer.
+/// - `name` must be a valid, null-terminated C string.
+/// - `callback` must remain callable for the lifetime of `ctx`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_register_native_function(
+    ctx: *mut StatorContext,
+    name: *const c_char,
+    callback: StatorNativeCallback,
+) {
+    if ctx.is_null() || name.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `name` is a valid C string.
+    let name_str = unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned();
+
+    // Build a Rust closure that wraps the C callback.
+    let ctx_ptr = ctx;
+    let native: NativeFn = Rc::new(move |args: Vec<JsValue>| {
+        // Convert JsValue args to temporary StatorValue* for the C side.
+        let c_vals: Vec<StatorValue> = args
+            .iter()
+            .map(|v| StatorValue {
+                inner: jsvalue_to_stator_value_inner(v),
+                isolate: std::ptr::null_mut(),
+            })
+            .collect();
+        let c_ptrs: Vec<*const StatorValue> =
+            c_vals.iter().map(|v| v as *const StatorValue).collect();
+
+        // SAFETY: the callback is valid for the lifetime of `ctx` (per the
+        // FFI contract), and the argument pointers are valid for this call.
+        let ret = unsafe { callback(ctx_ptr, c_ptrs.as_ptr(), c_ptrs.len() as i32) };
+
+        if ret.is_null() {
+            Ok(JsValue::Undefined)
+        } else {
+            // Convert returned StatorValue to JsValue, then free it.
+            // SAFETY: `ret` was allocated by Box::into_raw in the callback.
+            let owned = unsafe { Box::from_raw(ret) };
+            Ok(stator_value_inner_to_jsvalue(&owned.inner))
+        }
+    });
+
+    // SAFETY: ctx is valid.
+    let globals = unsafe { Rc::clone(&(*ctx).globals) };
+
+    // Check whether the name contains a dot (e.g. "console.log").
+    if let Some(dot) = name_str.find('.') {
+        let obj_name = &name_str[..dot];
+        let method_name = &name_str[dot + 1..];
+
+        let mut env = globals.borrow_mut();
+        // Insert the parent object if it doesn't exist yet.
+        let obj = env
+            .entry(obj_name.to_owned())
+            .or_insert_with(|| JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new()))))
+            .clone();
+        drop(env); // release borrow before we potentially re-borrow
+
+        if let JsValue::PlainObject(ref map) = obj {
+            map.borrow_mut()
+                .insert(method_name.to_owned(), JsValue::NativeFunction(native));
+        }
+        // Ensure the (possibly newly-created) object is stored back.
+        globals.borrow_mut().insert(obj_name.to_owned(), obj);
+    } else {
+        globals
+            .borrow_mut()
+            .insert(name_str, JsValue::NativeFunction(native));
+    }
+}
+
+/// Convert a [`StatorValueInner`] to a [`JsValue`].
+///
+/// This is the counterpart to [`jsvalue_to_stator_value_inner`] and is used
+/// when converting values returned from C native callbacks back to Rust.
+fn stator_value_inner_to_jsvalue(inner: &StatorValueInner) -> JsValue {
+    match inner {
+        StatorValueInner::Number(n) => {
+            // Represent exact integers that fit in i32 as Smi for efficiency.
+            if n.fract() == 0.0
+                && n.is_finite()
+                && (*n >= i32::MIN as f64)
+                && (*n <= i32::MAX as f64)
+            {
+                JsValue::Smi(*n as i32)
+            } else {
+                JsValue::HeapNumber(*n)
+            }
+        }
+        StatorValueInner::Str(cs) => JsValue::String(cs.to_string_lossy().into_owned()),
+        StatorValueInner::Undefined => JsValue::Undefined,
+        StatorValueInner::Boolean(b) => JsValue::Boolean(*b),
+    }
+}
+
+/// Convert a [`JsValue`] to the inner storage type used by [`StatorValue`].
+fn jsvalue_to_stator_value_inner(v: &JsValue) -> StatorValueInner {
+    match v {
+        JsValue::Undefined | JsValue::Null => StatorValueInner::Undefined,
+        JsValue::Boolean(b) => StatorValueInner::Boolean(*b),
+        JsValue::Smi(n) => StatorValueInner::Number(f64::from(*n)),
+        JsValue::HeapNumber(n) => StatorValueInner::Number(*n),
+        JsValue::String(s) => {
+            // Truncate at the first embedded NUL byte (CString requirement).
+            let valid_len = s.as_bytes().iter().position(|&b| b == 0).unwrap_or(s.len());
+            // SAFETY: `&s.as_bytes()[..valid_len]` contains no NUL bytes.
+            unsafe {
+                StatorValueInner::Str(CString::from_vec_unchecked(
+                    s.as_bytes()[..valid_len].to_vec(),
+                ))
+            }
+        }
+        other => {
+            let s = other
+                .to_js_string()
+                .unwrap_or_else(|_| "undefined".to_owned());
+            let valid_len = s.as_bytes().iter().position(|&b| b == 0).unwrap_or(s.len());
+            // SAFETY: `&s.as_bytes()[..valid_len]` contains no NUL bytes.
+            unsafe {
+                StatorValueInner::Str(CString::from_vec_unchecked(
+                    s.as_bytes()[..valid_len].to_vec(),
+                ))
+            }
+        }
     }
 }
 
