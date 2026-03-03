@@ -258,6 +258,52 @@ pub unsafe extern "C" fn stator_isolate_gc(isolate: *mut StatorIsolate) {
     }
 }
 
+/// Compilation tier statistics for an isolate.
+///
+/// Filled in by `stator_isolate_get_stats`.  All counts are thread-local
+/// totals accumulated since the process started (or since the last
+/// interpreter reset on this thread).
+///
+/// On platforms where the baseline JIT is not available (non-x86-64 or
+/// non-Unix), all fields will always be zero.
+#[repr(C)]
+pub struct StatorCompilationStats {
+    /// Number of JavaScript functions that have been compiled to baseline JIT.
+    pub jit_functions_compiled: u32,
+    /// Total bytes of machine code produced by the baseline JIT compiler.
+    pub jit_code_bytes: usize,
+}
+
+/// Fill `*stats` with the current compilation tier statistics.
+///
+/// Reports the cumulative number of baseline-JIT-compiled functions and the
+/// total machine-code bytes produced on this thread since the process started.
+///
+/// On platforms where the baseline JIT is not available all counts will be
+/// zero.
+///
+/// Does nothing when `stats` is null.
+///
+/// # Safety
+/// - `isolate` must be either null or a valid, live `StatorIsolate` pointer.
+/// - `stats` must be a non-null, properly aligned pointer to a
+///   `StatorCompilationStats` that is valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_get_stats(
+    _isolate: *const StatorIsolate,
+    stats: *mut StatorCompilationStats,
+) {
+    if stats.is_null() {
+        return;
+    }
+    let (count, bytes) = stator_core::interpreter::jit_stats();
+    // SAFETY: caller guarantees `stats` is valid for writes.
+    unsafe {
+        (*stats).jit_functions_compiled = count;
+        (*stats).jit_code_bytes = bytes;
+    }
+}
+
 // ── Context ──────────────────────────────────────────────────────────────────
 
 /// An opaque context handle.
@@ -6156,5 +6202,30 @@ mod tests {
             stator_function_template_destroy(tmpl);
             stator_context_destroy(ctx);
         }
+    }
+
+    /// `stator_isolate_get_stats` must return valid (non-crashing) stats and
+    /// fill the struct with zero or positive counts.
+    #[test]
+    fn test_isolate_get_stats_fills_struct() {
+        let iso = IsolateGuard::new();
+        let mut stats = StatorCompilationStats {
+            jit_functions_compiled: 0xff,
+            jit_code_bytes: 0xdeadbeef,
+        };
+        // SAFETY: `iso` is valid; `stats` is a valid mutable reference.
+        unsafe { stator_isolate_get_stats(iso.as_ptr(), &mut stats as *mut _) };
+
+        // The function must have overwritten the sentinel values.
+        assert_ne!(stats.jit_functions_compiled, 0xff, "stats must be filled");
+        assert_ne!(stats.jit_code_bytes, 0xdeadbeef, "stats must be filled");
+    }
+
+    /// `stator_isolate_get_stats` with a null `stats` pointer must not crash.
+    #[test]
+    fn test_isolate_get_stats_null_stats_is_safe() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid; null stats pointer is explicitly handled.
+        unsafe { stator_isolate_get_stats(iso.as_ptr(), std::ptr::null_mut()) };
     }
 }

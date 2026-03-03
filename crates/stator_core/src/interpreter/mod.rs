@@ -164,7 +164,7 @@
 //! one [`Instruction`] per iteration, advances the program counter, then
 //! dispatches on the [`Opcode`] via an exhaustive `match`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -191,6 +191,29 @@ pub use crate::objects::value::{GeneratorState, GeneratorStatus, GeneratorStep, 
 /// compilation is requested so the next *call* to that function executes
 /// via native code.
 const OSR_LOOP_THRESHOLD: u32 = 1_000;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JIT compilation statistics (thread-local)
+// ─────────────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    /// Number of successful baseline JIT compilations in this thread.
+    static JIT_COMPILATION_COUNT: Cell<u32> = const { Cell::new(0) };
+    /// Total machine-code bytes produced by all successful JIT compilations.
+    static JIT_CODE_BYTES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Return a snapshot of the JIT compilation statistics for the current thread.
+///
+/// Returns `(functions_compiled, total_code_bytes)`.
+///
+/// On platforms where the JIT is not available both values will always be zero.
+pub fn jit_stats() -> (u32, usize) {
+    (
+        JIT_COMPILATION_COUNT.with(|c| c.get()),
+        JIT_CODE_BYTES.with(|c| c.get()),
+    )
+}
 
 /// Convert a [`JsValue`] to its JIT `i64` representation.
 ///
@@ -219,7 +242,10 @@ fn maybe_compile_baseline(ba: &BytecodeArray) {
     {
         use crate::compiler::baseline::compiler::BaselineCompiler;
         if let Ok(cc) = BaselineCompiler::compile(ba) {
+            let code_len = cc.code.len();
             ba.store_jit_code(cc.code, cc.register_file_slots);
+            JIT_COMPILATION_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+            JIT_CODE_BYTES.with(|c| c.set(c.get().saturating_add(code_len)));
         }
     }
     #[cfg(not(all(target_arch = "x86_64", unix)))]
@@ -3948,5 +3974,78 @@ mod tests {
             looper_ba.try_get_jit_code().is_some(),
             "OSR: JIT code should be cached after a long-running loop"
         );
+    }
+
+    /// `jit_stats()` must be updated when a function is compiled to baseline
+    /// JIT.  The test captures a snapshot before and after triggering
+    /// compilation and asserts that the counters increase on x86-64 Unix.
+    #[test]
+    fn test_jit_stats_updated_after_compilation() {
+        use super::jit_stats;
+        use crate::bytecode::bytecode_array::TIERING_THRESHOLD;
+
+        let add_ba = make_add_bytecode();
+        let outer_instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::CreateClosure,
+                vec![
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                    Operand::Flag(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(2)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
+            Instruction::new_unchecked(
+                Opcode::CallAnyReceiver,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::RegisterCount(2),
+                    Operand::FeedbackSlot(1),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let pool = vec![ConstantPoolEntry::Function(Box::new(add_ba))];
+        let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
+
+        let (count_before, bytes_before) = jit_stats();
+
+        // Call enough times to cross the tiering threshold and trigger JIT.
+        for _ in 0..(TIERING_THRESHOLD + 10) {
+            let mut frame = InterpreterFrame::new(outer_ba.clone(), vec![]);
+            Interpreter::run(&mut frame).unwrap();
+        }
+
+        let (count_after, bytes_after) = jit_stats();
+
+        // On x86-64 Unix the stats must increase; on other platforms both
+        // counters remain zero.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            assert!(
+                count_after > count_before,
+                "jit_stats().0 must increase after tiering (before={count_before}, after={count_after})"
+            );
+            assert!(
+                bytes_after > bytes_before,
+                "jit_stats().1 must increase after tiering (before={bytes_before}, after={bytes_after})"
+            );
+        }
+        #[cfg(not(all(target_arch = "x86_64", unix)))]
+        {
+            assert_eq!(
+                count_after, 0,
+                "jit_stats count must be zero on non-JIT platform"
+            );
+            assert_eq!(
+                bytes_after, 0,
+                "jit_stats bytes must be zero on non-JIT platform"
+            );
+        }
     }
 }

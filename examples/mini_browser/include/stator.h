@@ -262,6 +262,38 @@ void stator_isolate_gc(StatorIsolate *isolate);
 void stator_gc_collect(StatorIsolate *isolate);
 
 /**
+ * Compilation tier statistics for an isolate.
+ *
+ * Filled in by stator_isolate_get_stats().  All counts are thread-local
+ * totals accumulated since the process started.
+ *
+ * On platforms where the baseline JIT is not available (non-x86-64 or
+ * non-Unix), all fields will always be zero.
+ */
+typedef struct StatorCompilationStats {
+    /** Number of JavaScript functions compiled to baseline JIT. */
+    uint32_t jit_functions_compiled;
+    /** Total bytes of machine code produced by the baseline JIT compiler. */
+    size_t   jit_code_bytes;
+} StatorCompilationStats;
+
+/**
+ * Fill *stats with the current compilation tier statistics.
+ *
+ * Reports the cumulative number of baseline-JIT-compiled functions and the
+ * total machine-code bytes produced on this thread since the process started.
+ * On platforms where the JIT is unavailable all counts will be zero.
+ *
+ * Does nothing when stats is NULL.
+ *
+ * @param isolate  A valid isolate pointer (may be NULL; the parameter exists
+ *                 for API consistency — stats are thread-local).
+ * @param stats    A non-NULL pointer to a StatorCompilationStats to fill.
+ */
+void stator_isolate_get_stats(const StatorIsolate    *isolate,
+                              StatorCompilationStats *stats);
+
+/**
  * Return the number of live embedder-owned value/object handles on the
  * isolate.  After a GC cycle this reflects how many objects survive because
  * they are still held by live handles.

@@ -113,7 +113,10 @@ pub fn jit_to_jsvalue(v: i64) -> Option<crate::objects::value::JsValue> {
     } else if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
         Some(JsValue::Smi(v as i32))
     } else {
-        None
+        // Large integer outside Smi range: promote to HeapNumber (f64).
+        // All integers up to 2^53 are exactly representable as f64, so
+        // arithmetic results that overflow i32 can be returned faithfully.
+        Some(JsValue::HeapNumber(v as f64))
     }
 }
 
@@ -1755,7 +1758,6 @@ mod tests {
     #[test]
     fn test_simulate_gc_stack_scan() {
         // Simulate what the GC would do at a safepoint:
-        //   1. Find the CompiledCode for the currently-executing JIT frame.
         //   2. Use the PC (code_offset) to look up the SafepointEntry.
         //   3. Read gc_map to determine which register-file slots hold GC roots.
         // In the current Smi-only JIT, gc_map must always be zero (no roots).
@@ -1787,5 +1789,41 @@ mod tests {
             .find(|e| e.code_offset == sp0.code_offset)
             .expect("parsed safepoint lookup must succeed");
         assert_eq!(found_parsed.gc_map, 0);
+    }
+
+    /// `jit_to_jsvalue` must promote i64 values outside the i32 range to
+    /// `HeapNumber` so that large-integer JIT results (e.g. sum 1..1_000_000)
+    /// are returned correctly without deoptimizing.
+    #[test]
+    fn test_jit_to_jsvalue_large_integer() {
+        use crate::objects::value::JsValue;
+        // A value that fits in i32 must remain a Smi.
+        assert_eq!(jit_to_jsvalue(42), Some(JsValue::Smi(42)));
+        assert_eq!(
+            jit_to_jsvalue(i32::MAX as i64),
+            Some(JsValue::Smi(i32::MAX))
+        );
+        assert_eq!(
+            jit_to_jsvalue(i32::MIN as i64),
+            Some(JsValue::Smi(i32::MIN))
+        );
+
+        // A value outside the i32 range must be promoted to HeapNumber.
+        let large: i64 = (i32::MAX as i64) + 1;
+        match jit_to_jsvalue(large) {
+            Some(JsValue::HeapNumber(n)) => {
+                assert!((n - large as f64).abs() < 1.0, "HeapNumber value mismatch");
+            }
+            other => panic!("expected HeapNumber, got {:?}", other),
+        }
+
+        // 500_000_500_000 — the result of sum(1..1_000_000).
+        let sum_result: i64 = 500_000_500_000;
+        match jit_to_jsvalue(sum_result) {
+            Some(JsValue::HeapNumber(n)) => {
+                assert!((n - sum_result as f64).abs() < 1.0);
+            }
+            other => panic!("expected HeapNumber for large sum, got {:?}", other),
+        }
     }
 }
