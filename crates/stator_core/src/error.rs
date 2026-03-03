@@ -25,6 +25,10 @@ pub enum StatorError {
     #[error("RangeError: {0}")]
     RangeError(String),
 
+    /// A JavaScript URIError was raised (malformed URI in encodeURI / decodeURI).
+    #[error("URIError: {0}")]
+    URIError(String),
+
     /// An internal engine error that should not occur in normal operation.
     #[error("internal error: {0}")]
     Internal(String),

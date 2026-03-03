@@ -10,6 +10,10 @@
 pub mod array;
 /// ECMAScript §20.5 `Error` built-in and error hierarchy (`TypeError`, `RangeError`, etc.).
 pub mod error;
+/// ECMAScript §19 global object properties and global functions (`isNaN`, `isFinite`,
+/// `parseInt`, `parseFloat`, `encodeURI`, `decodeURI`, `encodeURIComponent`,
+/// `decodeURIComponent`, `eval`, and the `NaN`/`Infinity`/`undefined` constants).
+pub mod global;
 /// ECMAScript §27 Iterator and Generator protocol: `Symbol.iterator`,
 /// `IteratorRecord`, and built-in iterators for `Array`, `String`, `Map`, `Set`.
 pub mod iterator;
