@@ -4378,7 +4378,6 @@ mod tests {
                 maglev_count > 0,
                 "maglev_stats count must be > 0 after Maglev compilation"
             );
-            let _ = maglev_count;
         }
     }
 
