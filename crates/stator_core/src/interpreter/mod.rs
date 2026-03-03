@@ -169,7 +169,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::builtins::error::{pop_call_frame, push_call_frame};
-use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry, HandlerTableEntry};
+use crate::bytecode::bytecode_array::{
+    BytecodeArray, ConstantPoolEntry, HandlerTableEntry, TIERING_THRESHOLD,
+};
 use crate::bytecode::bytecodes::{Opcode, Operand, decode_with_byte_offsets};
 use crate::error::{StatorError, StatorResult};
 use crate::objects::value::JsValue;
@@ -177,6 +179,97 @@ use crate::objects::value::JsValue;
 // Re-export generator types and bring them into scope so external code can
 // import them from `stator_core::interpreter` (backwards-compatible path).
 pub use crate::objects::value::{GeneratorState, GeneratorStatus, GeneratorStep, NativeIterator};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tiering: interpreter → baseline JIT
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Number of loop back-edges taken before OSR compilation is triggered.
+///
+/// When a single interpreter loop accumulates this many `JumpLoop` iterations
+/// and the enclosing function has not yet been JIT-compiled, a baseline
+/// compilation is requested so the next *call* to that function executes
+/// via native code.
+const OSR_LOOP_THRESHOLD: u32 = 1_000;
+
+/// Convert a [`JsValue`] to its JIT `i64` representation.
+///
+/// Returns `None` for values that the current baseline tier cannot represent
+/// (strings, objects, arrays, etc.).  These cause a graceful fall-back to the
+/// interpreter.
+#[cfg(all(target_arch = "x86_64", unix))]
+fn jsvalue_to_jit(v: &JsValue) -> Option<i64> {
+    use crate::compiler::baseline::compiler::{JIT_FALSE, JIT_NULL, JIT_TRUE, JIT_UNDEFINED};
+    match v {
+        JsValue::Smi(n) => Some(*n as i64),
+        JsValue::Boolean(b) => Some(if *b { JIT_TRUE } else { JIT_FALSE }),
+        JsValue::Undefined => Some(JIT_UNDEFINED),
+        JsValue::Null => Some(JIT_NULL),
+        _ => None,
+    }
+}
+
+/// Request baseline JIT compilation for `ba` and cache the result.
+///
+/// On supported platforms (x86-64 Unix) this calls [`BaselineCompiler::compile`]
+/// and stores the output via [`BytecodeArray::store_jit_code`].  On other
+/// platforms this is a no-op.
+fn maybe_compile_baseline(ba: &BytecodeArray) {
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        use crate::compiler::baseline::compiler::BaselineCompiler;
+        if let Ok(cc) = BaselineCompiler::compile(ba) {
+            ba.store_jit_code(cc.code, cc.register_file_slots);
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    let _ = ba;
+}
+
+/// Try to execute `ba` via the cached baseline JIT code.
+///
+/// Returns `Some(result)` when execution succeeds or returns an error;
+/// returns `None` when:
+/// - no JIT code has been compiled yet,
+/// - one or more arguments cannot be represented in the JIT tier, or
+/// - the JIT returns [`JIT_DEOPT`][crate::compiler::baseline::compiler::JIT_DEOPT]
+///   (fall-back to interpreter).
+///
+/// On platforms where the JIT is not available this always returns `None`.
+fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        use crate::compiler::baseline::compiler::{
+            CompiledCode, DeoptEntry, SafepointEntry, jit_to_jsvalue,
+        };
+        let (code, register_file_slots) = ba.try_get_jit_code()?;
+        let jit_args: Option<Vec<i64>> = args.iter().map(jsvalue_to_jit).collect();
+        let jit_args = jit_args?;
+        // Capture the code length before moving `code` into the struct.
+        // `native_code_len` records the boundary between machine instructions
+        // and appended metadata tables; `execute()` does not use it directly
+        // but it is part of the `CompiledCode` API.
+        let native_code_len = code.len();
+        let cc = CompiledCode {
+            code,
+            native_code_len,
+            register_file_slots,
+            safepoints: Vec::<SafepointEntry>::new(),
+            deopt_entries: Vec::<DeoptEntry>::new(),
+        };
+        // SAFETY: `cc.code` was produced by `BaselineCompiler::compile` and
+        // contains valid x86-64 machine code following the JIT calling
+        // convention (`extern "C" fn(*mut i64) -> i64`).
+        return match unsafe { cc.execute(&jit_args) } {
+            Ok(v) => jit_to_jsvalue(v).map(Ok),
+            // JIT_DEOPT or unrecognised sentinel → fall back to interpreter.
+            Err(_) => None,
+        };
+    }
+    #[allow(unreachable_code)]
+    let _ = (ba, args);
+    None
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // InterpreterFrame
@@ -214,6 +307,12 @@ pub struct InterpreterFrame {
     /// fresh map; inner function frames inherit the same `Rc` so that globals
     /// written by a called function are visible back in the caller.
     pub global_env: Rc<RefCell<HashMap<String, JsValue>>>,
+    /// OSR (on-stack replacement) loop back-edge counter.
+    ///
+    /// Incremented by every `JumpLoop` instruction.  When this exceeds
+    /// [`OSR_LOOP_THRESHOLD`] and the function has not yet been JIT-compiled,
+    /// baseline compilation is triggered so the next *call* uses native code.
+    osr_loop_count: u32,
 }
 
 impl InterpreterFrame {
@@ -240,6 +339,7 @@ impl InterpreterFrame {
             suspend_result: None,
             generator_state: None,
             global_env: Rc::new(RefCell::new(HashMap::new())),
+            osr_loop_count: 0,
         }
     }
 
@@ -543,11 +643,23 @@ impl Interpreter {
                     frame.pc = resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
                 }
                 // JumpLoop [offset, loop_depth, slot] — same as unconditional Jump.
+                //
+                // OSR (on-stack replacement): every back-edge increments the
+                // OSR counter.  Once the count exceeds OSR_LOOP_THRESHOLD the
+                // enclosing function is compiled to baseline JIT (if it has not
+                // been compiled already), so that the *next call* to this
+                // function executes via native code.
                 Opcode::JumpLoop => {
                     let Operand::JumpOffset(delta) = instr.operands[0] else {
                         return Err(err_bad_operand("JumpLoop", 0));
                     };
                     frame.pc = resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    frame.osr_loop_count = frame.osr_loop_count.saturating_add(1);
+                    if frame.osr_loop_count >= OSR_LOOP_THRESHOLD
+                        && frame.bytecode_array.try_get_jit_code().is_none()
+                    {
+                        maybe_compile_baseline(&frame.bytecode_array);
+                    }
                 }
                 Opcode::JumpIfTrue => {
                     let Operand::JumpOffset(delta) = instr.operands[0] else {
@@ -688,15 +800,27 @@ impl Interpreter {
                                     JsValue::Generator(GeneratorState::new((*ba).clone()));
                             } else {
                                 let args = collect_args(frame, args_start_v, arg_count)?;
-                                let mut callee_frame = InterpreterFrame::new_with_globals(
-                                    (*ba).clone(),
-                                    args,
-                                    Rc::clone(&frame.global_env),
-                                );
-                                push_call_frame("<anonymous>");
-                                let result = Interpreter::run(&mut callee_frame);
-                                pop_call_frame();
-                                frame.accumulator = result?;
+                                // ── Tiering ──────────────────────────────────
+                                let count = ba.increment_invocation_count();
+                                if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
+                                    maybe_compile_baseline(&ba);
+                                }
+                                let mut tried_jit = false;
+                                if let Some(jit_result) = try_execute_jit(&ba, &args) {
+                                    frame.accumulator = jit_result?;
+                                    tried_jit = true;
+                                }
+                                if !tried_jit {
+                                    let mut callee_frame = InterpreterFrame::new_with_globals(
+                                        (*ba).clone(),
+                                        args,
+                                        Rc::clone(&frame.global_env),
+                                    );
+                                    push_call_frame("<anonymous>");
+                                    let result = Interpreter::run(&mut callee_frame);
+                                    pop_call_frame();
+                                    frame.accumulator = result?;
+                                }
                             }
                         }
                         JsValue::NativeFunction(f) => {
@@ -724,15 +848,28 @@ impl Interpreter {
                                 frame.accumulator =
                                     JsValue::Generator(GeneratorState::new((*ba).clone()));
                             } else {
-                                let mut callee_frame = InterpreterFrame::new_with_globals(
-                                    (*ba).clone(),
-                                    vec![],
-                                    Rc::clone(&frame.global_env),
-                                );
-                                push_call_frame("<anonymous>");
-                                let result = Interpreter::run(&mut callee_frame);
-                                pop_call_frame();
-                                frame.accumulator = result?;
+                                let args: Vec<JsValue> = vec![];
+                                // ── Tiering ──────────────────────────────────
+                                let count = ba.increment_invocation_count();
+                                if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
+                                    maybe_compile_baseline(&ba);
+                                }
+                                let mut tried_jit = false;
+                                if let Some(jit_result) = try_execute_jit(&ba, &args) {
+                                    frame.accumulator = jit_result?;
+                                    tried_jit = true;
+                                }
+                                if !tried_jit {
+                                    let mut callee_frame = InterpreterFrame::new_with_globals(
+                                        (*ba).clone(),
+                                        args,
+                                        Rc::clone(&frame.global_env),
+                                    );
+                                    push_call_frame("<anonymous>");
+                                    let result = Interpreter::run(&mut callee_frame);
+                                    pop_call_frame();
+                                    frame.accumulator = result?;
+                                }
                             }
                         }
                         JsValue::NativeFunction(f) => {
@@ -763,15 +900,28 @@ impl Interpreter {
                                     JsValue::Generator(GeneratorState::new((*ba).clone()));
                             } else {
                                 let arg1 = frame.read_reg(arg1_v)?.clone();
-                                let mut callee_frame = InterpreterFrame::new_with_globals(
-                                    (*ba).clone(),
-                                    vec![arg1],
-                                    Rc::clone(&frame.global_env),
-                                );
-                                push_call_frame("<anonymous>");
-                                let result = Interpreter::run(&mut callee_frame);
-                                pop_call_frame();
-                                frame.accumulator = result?;
+                                let args = vec![arg1];
+                                // ── Tiering ──────────────────────────────────
+                                let count = ba.increment_invocation_count();
+                                if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
+                                    maybe_compile_baseline(&ba);
+                                }
+                                let mut tried_jit = false;
+                                if let Some(jit_result) = try_execute_jit(&ba, &args) {
+                                    frame.accumulator = jit_result?;
+                                    tried_jit = true;
+                                }
+                                if !tried_jit {
+                                    let mut callee_frame = InterpreterFrame::new_with_globals(
+                                        (*ba).clone(),
+                                        args,
+                                        Rc::clone(&frame.global_env),
+                                    );
+                                    push_call_frame("<anonymous>");
+                                    let result = Interpreter::run(&mut callee_frame);
+                                    pop_call_frame();
+                                    frame.accumulator = result?;
+                                }
                             }
                         }
                         JsValue::NativeFunction(f) => {
@@ -807,15 +957,28 @@ impl Interpreter {
                             } else {
                                 let arg1 = frame.read_reg(arg1_v)?.clone();
                                 let arg2 = frame.read_reg(arg2_v)?.clone();
-                                let mut callee_frame = InterpreterFrame::new_with_globals(
-                                    (*ba).clone(),
-                                    vec![arg1, arg2],
-                                    Rc::clone(&frame.global_env),
-                                );
-                                push_call_frame("<anonymous>");
-                                let result = Interpreter::run(&mut callee_frame);
-                                pop_call_frame();
-                                frame.accumulator = result?;
+                                let args = vec![arg1, arg2];
+                                // ── Tiering ──────────────────────────────────
+                                let count = ba.increment_invocation_count();
+                                if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
+                                    maybe_compile_baseline(&ba);
+                                }
+                                let mut tried_jit = false;
+                                if let Some(jit_result) = try_execute_jit(&ba, &args) {
+                                    frame.accumulator = jit_result?;
+                                    tried_jit = true;
+                                }
+                                if !tried_jit {
+                                    let mut callee_frame = InterpreterFrame::new_with_globals(
+                                        (*ba).clone(),
+                                        args,
+                                        Rc::clone(&frame.global_env),
+                                    );
+                                    push_call_frame("<anonymous>");
+                                    let result = Interpreter::run(&mut callee_frame);
+                                    pop_call_frame();
+                                    frame.accumulator = result?;
+                                }
                             }
                         }
                         JsValue::NativeFunction(f) => {
@@ -858,16 +1021,28 @@ impl Interpreter {
                     match callee {
                         JsValue::Function(ba) => {
                             let this_val = frame.read_reg(recv_v)?.clone();
-                            let mut callee_frame = InterpreterFrame::new_with_globals(
-                                (*ba).clone(),
-                                args,
-                                Rc::clone(&frame.global_env),
-                            );
-                            callee_frame.context = Some(this_val);
-                            push_call_frame("<anonymous>");
-                            let result = Interpreter::run(&mut callee_frame);
-                            pop_call_frame();
-                            frame.accumulator = result?;
+                            // ── Tiering ──────────────────────────────────────
+                            let count = ba.increment_invocation_count();
+                            if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
+                                maybe_compile_baseline(&ba);
+                            }
+                            let mut tried_jit = false;
+                            if let Some(jit_result) = try_execute_jit(&ba, &args) {
+                                frame.accumulator = jit_result?;
+                                tried_jit = true;
+                            }
+                            if !tried_jit {
+                                let mut callee_frame = InterpreterFrame::new_with_globals(
+                                    (*ba).clone(),
+                                    args,
+                                    Rc::clone(&frame.global_env),
+                                );
+                                callee_frame.context = Some(this_val);
+                                push_call_frame("<anonymous>");
+                                let result = Interpreter::run(&mut callee_frame);
+                                pop_call_frame();
+                                frame.accumulator = result?;
+                            }
                         }
                         JsValue::NativeFunction(f) => {
                             frame.accumulator = f(args)?;
@@ -899,15 +1074,27 @@ impl Interpreter {
                     match callee {
                         JsValue::Function(ba) => {
                             let args = collect_args(frame, args_start_v, arg_count)?;
-                            let mut callee_frame = InterpreterFrame::new_with_globals(
-                                (*ba).clone(),
-                                args,
-                                Rc::clone(&frame.global_env),
-                            );
-                            push_call_frame("<anonymous>");
-                            let result = Interpreter::run(&mut callee_frame);
-                            pop_call_frame();
-                            frame.accumulator = result?;
+                            // ── Tiering ──────────────────────────────────────
+                            let count = ba.increment_invocation_count();
+                            if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
+                                maybe_compile_baseline(&ba);
+                            }
+                            let mut tried_jit = false;
+                            if let Some(jit_result) = try_execute_jit(&ba, &args) {
+                                frame.accumulator = jit_result?;
+                                tried_jit = true;
+                            }
+                            if !tried_jit {
+                                let mut callee_frame = InterpreterFrame::new_with_globals(
+                                    (*ba).clone(),
+                                    args,
+                                    Rc::clone(&frame.global_env),
+                                );
+                                push_call_frame("<anonymous>");
+                                let result = Interpreter::run(&mut callee_frame);
+                                pop_call_frame();
+                                frame.accumulator = result?;
+                            }
                         }
                         JsValue::NativeFunction(f) => {
                             let args = collect_args(frame, args_start_v, arg_count)?;
@@ -1382,6 +1569,7 @@ impl Interpreter {
             suspend_result: None,
             generator_state: Some(Rc::clone(state)),
             global_env: Rc::new(RefCell::new(std::collections::HashMap::new())),
+            osr_loop_count: 0,
         };
 
         state.borrow_mut().status = GeneratorStatus::Executing;
@@ -3479,5 +3667,286 @@ mod tests {
         // SwitchOnGeneratorState jumped to 3 (ResumeGenerator → no-op),
         // then LdaSmi 2, then Return → 2.
         assert_eq!(result, JsValue::Smi(2));
+    }
+
+    // ── Tiering: interpreter → baseline JIT ─────────────────────────────────
+
+    /// Build the `add(a, b)` inner bytecode used by tiering tests.
+    ///
+    /// Implements `function add(a, b) { return a + b; }` where both parameters
+    /// are Smi integers — values the JIT tier can handle natively.
+    fn make_add_bytecode() -> BytecodeArray {
+        let param0_v: u32 = (-1i32) as u32;
+        let param1_v: u32 = (-2i32) as u32;
+        let instrs = vec![
+            // r0 = b (param[1])
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(param1_v)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            // acc = a (param[0])
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(param0_v)]),
+            // acc = a + r0
+            Instruction::new_unchecked(
+                Opcode::Add,
+                vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        make_bytecode(instrs, 1, 2) // frame_size=1, param_count=2
+    }
+
+    /// Calling a function more than [`TIERING_THRESHOLD`] times must trigger
+    /// baseline JIT compilation and cache the compiled code in the shared
+    /// [`BytecodeArray`].
+    ///
+    /// The test calls `add(1, 2)` 110 times (> threshold of 100) and then
+    /// asserts that JIT code has been stored in the bytecode array's cache.
+    #[test]
+    fn test_tiering_jit_compiled_after_threshold() {
+        use crate::bytecode::bytecode_array::TIERING_THRESHOLD;
+
+        let add_ba = make_add_bytecode();
+
+        // Build a tiny outer script that calls `add` once:
+        //   r0 = <function>, r1 = arg1, r2 = arg2
+        //   acc = CallAnyReceiver(r0, r1, 2, slot0) → result
+        //   Return acc
+        let outer_instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::CreateClosure,
+                vec![
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                    Operand::Flag(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(2)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
+            Instruction::new_unchecked(
+                Opcode::CallAnyReceiver,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::RegisterCount(2),
+                    Operand::FeedbackSlot(1),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let pool = vec![ConstantPoolEntry::Function(Box::new(add_ba))];
+        let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
+
+        // Call add(1, 2) enough times to cross the tiering threshold.
+        let call_count = TIERING_THRESHOLD + 10;
+        let mut last_result = JsValue::Undefined;
+        for _ in 0..call_count {
+            let mut frame = InterpreterFrame::new(outer_ba.clone(), vec![]);
+            last_result = Interpreter::run(&mut frame).unwrap();
+        }
+
+        // Regardless of JIT availability the interpreter result must be correct.
+        assert_eq!(last_result, JsValue::Smi(3), "add(1, 2) must return 3");
+
+        // On x86-64 Unix the baseline JIT should have been compiled and cached.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            // Each outer_ba call creates a fresh closure via CreateClosure which
+            // clones the inner BytecodeArray. All those clones share the same
+            // Rc tiering state, so the invocation counter and JIT cache are
+            // visible through any clone.
+            let inner_ba: &BytecodeArray = match outer_ba.constant_pool().first().unwrap() {
+                ConstantPoolEntry::Function(ba) => ba,
+                _ => panic!("expected Function in constant pool"),
+            };
+            assert!(
+                inner_ba.try_get_jit_code().is_some(),
+                "JIT code should be cached after {} calls (threshold={})",
+                call_count,
+                TIERING_THRESHOLD,
+            );
+        }
+    }
+
+    /// After tiering is triggered the function must continue to return the
+    /// correct result — whether executed by the JIT or the interpreter
+    /// fallback.
+    #[test]
+    fn test_tiering_correct_result_after_jit() {
+        use crate::bytecode::bytecode_array::TIERING_THRESHOLD;
+
+        let add_ba = make_add_bytecode();
+
+        let outer_instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::CreateClosure,
+                vec![
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                    Operand::Flag(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(10)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(20)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
+            Instruction::new_unchecked(
+                Opcode::CallAnyReceiver,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::RegisterCount(2),
+                    Operand::FeedbackSlot(1),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let pool = vec![ConstantPoolEntry::Function(Box::new(add_ba))];
+        let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
+
+        // Warm up past the threshold, then verify the result is still correct.
+        let warm_up = TIERING_THRESHOLD + 20;
+        for i in 0..warm_up {
+            let mut frame = InterpreterFrame::new(outer_ba.clone(), vec![]);
+            let result = Interpreter::run(&mut frame).unwrap();
+            assert_eq!(
+                result,
+                JsValue::Smi(30),
+                "add(10, 20) must return 30 on call {}",
+                i + 1,
+            );
+        }
+    }
+
+    /// Calling a function containing a long-running loop must trigger OSR
+    /// compilation: the JIT code cache should be populated after
+    /// [`OSR_LOOP_THRESHOLD`] back-edges even if the function was only called
+    /// once.
+    #[test]
+    fn test_tiering_osr_loop_triggers_compilation() {
+        // Build: function looper() { let i = 0; while (i < 2000) { i++; } return i; }
+        //
+        // Bytecode (r0 = i):
+        //   LdaZero
+        //   Star r0
+        // loop_start:
+        //   Ldar r0
+        //   LdaSmi 2000
+        //   Star r1
+        //   TestLessThan r1 slot0
+        //   JumpIfFalse → exit
+        //   Ldar r0
+        //   Inc slot1
+        //   Star r0
+        //   JumpLoop → loop_start
+        // exit:
+        //   Ldar r0
+        //   Return
+        //
+        // We rely on JumpLoop to bump osr_loop_count past OSR_LOOP_THRESHOLD.
+
+        let r0: u32 = 0;
+        let r1: u32 = 1;
+        let instrs = vec![
+            // [0] acc = 0
+            Instruction::new_unchecked(Opcode::LdaZero, vec![]),
+            // [1] r0 = 0
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(r0)]),
+            // [2] acc = r0
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(r0)]),
+            // [3] r1 = 2000
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(2000)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(r1)]),
+            // [5] acc = r0
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(r0)]),
+            // [6] acc = acc < r1  (i < 2000)
+            Instruction::new_unchecked(
+                Opcode::TestLessThan,
+                vec![Operand::Register(r1), Operand::FeedbackSlot(0)],
+            ),
+            // [7] if !acc → exit (offset computed below)
+            Instruction::new_unchecked(Opcode::JumpIfFalse, vec![Operand::JumpOffset(0)]),
+            // [8] acc = r0
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(r0)]),
+            // [9] acc++
+            Instruction::new_unchecked(Opcode::Inc, vec![Operand::FeedbackSlot(1)]),
+            // [10] r0 = acc
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(r0)]),
+            // [11] JumpLoop back to [2]
+            Instruction::new_unchecked(
+                Opcode::JumpLoop,
+                vec![
+                    Operand::JumpOffset(0),
+                    Operand::Immediate(0),
+                    Operand::FeedbackSlot(2),
+                ],
+            ),
+            // [12] acc = r0
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(r0)]),
+            // [13] Return
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        // Encode the instructions, then patch the jump offsets using the
+        // byte-offset table produced by decode_with_byte_offsets.
+        use crate::bytecode::bytecodes::{decode_with_byte_offsets, encode};
+        let raw = encode(&instrs);
+        let (_, offsets) = decode_with_byte_offsets(&raw).unwrap();
+
+        // JumpIfFalse at instruction [7] must jump to instruction [12].
+        // delta = offset[12] - offset[8]   (offset after the jump instruction)
+        let jump_if_false_delta = offsets[12] as i32 - offsets[8] as i32;
+        // JumpLoop at instruction [11] must jump back to instruction [2].
+        // delta = offset[2] - offset[12]
+        let jump_loop_delta = offsets[2] as i32 - offsets[12] as i32;
+
+        let patched_instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaZero, vec![]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(r0)]),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(r0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(2000)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(r1)]),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(r0)]),
+            Instruction::new_unchecked(
+                Opcode::TestLessThan,
+                vec![Operand::Register(r1), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(
+                Opcode::JumpIfFalse,
+                vec![Operand::JumpOffset(jump_if_false_delta)],
+            ),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(r0)]),
+            Instruction::new_unchecked(Opcode::Inc, vec![Operand::FeedbackSlot(1)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(r0)]),
+            Instruction::new_unchecked(
+                Opcode::JumpLoop,
+                vec![
+                    Operand::JumpOffset(jump_loop_delta),
+                    Operand::Immediate(0),
+                    Operand::FeedbackSlot(2),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(r0)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let looper_ba = make_bytecode(patched_instrs, 2, 0); // frame_size=2, param_count=0
+
+        // Run the loop function once; it iterates 2000 times which exceeds
+        // OSR_LOOP_THRESHOLD (1000), so a compilation should be triggered.
+        let mut frame = InterpreterFrame::new(looper_ba.clone(), vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+
+        // The loop result must be correct.
+        assert_eq!(result, JsValue::Smi(2000), "loop should count to 2000");
+
+        // On x86-64 Unix, OSR should have triggered JIT compilation.
+        // The looper_ba and the frame's clone share the same Rc jit_code.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        assert!(
+            looper_ba.try_get_jit_code().is_some(),
+            "OSR: JIT code should be cached after a long-running loop"
+        );
     }
 }
