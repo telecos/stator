@@ -19,6 +19,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::builtins::error::JsError;
 use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::error::{StatorError, StatorResult};
 use crate::gc::trace::{Trace, Tracer};
@@ -221,6 +222,12 @@ pub enum JsValue {
     /// Created by the [`Opcode::GetIterator`] opcode when the iterable is a
     /// [`JsValue::Array`] or [`JsValue::String`].
     Iterator(Rc<RefCell<NativeIterator>>),
+    /// A JavaScript `Error` object with `name`, `message`, and `stack` properties.
+    ///
+    /// Covers all eight ECMAScript error types: `Error`, `TypeError`,
+    /// `RangeError`, `ReferenceError`, `SyntaxError`, `URIError`, `EvalError`,
+    /// and `AggregateError`.
+    Error(Rc<JsError>),
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -317,6 +324,12 @@ impl JsValue {
     pub fn is_iterator(&self) -> bool {
         matches!(self, Self::Iterator(_))
     }
+
+    /// Returns `true` if this value is a JavaScript `Error` object ([`Error`][JsValue::Error]).
+    #[inline]
+    pub fn is_error(&self) -> bool {
+        matches!(self, Self::Error(_))
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -348,6 +361,7 @@ impl JsValue {
             | Self::Object(_)
             | Self::Function(_)
             | Self::Array(_)
+            | Self::Error(_)
             | Self::Generator(_)
             | Self::Iterator(_) => true,
             Self::BigInt(n) => *n != 0,
@@ -409,6 +423,9 @@ impl JsValue {
             Self::Iterator(_) => Err(StatorError::TypeError(
                 "Cannot convert an Iterator value to a number".to_string(),
             )),
+            Self::Error(_) => Err(StatorError::TypeError(
+                "Cannot convert an Error value to a number".to_string(),
+            )),
         }
     }
 
@@ -459,6 +476,7 @@ impl JsValue {
             }
             Self::Generator(_) => Ok("[object Generator]".to_string()),
             Self::Iterator(_) => Ok("[object Iterator]".to_string()),
+            Self::Error(e) => Ok(e.to_error_string()),
         }
     }
 }
@@ -499,6 +517,10 @@ impl Trace for JsValue {
                     item.trace(tracer);
                 }
             }
+            // JsError (including AggregateError inner errors) contains no raw
+            // GC heap pointers — only Strings, Rc-reference-counted JsErrors,
+            // and an ErrorKind enum.  Nothing to report to the tracer.
+            Self::Error(_) => {}
             _ => {}
         }
     }

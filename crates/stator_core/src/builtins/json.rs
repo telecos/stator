@@ -999,7 +999,8 @@ fn js_value_to_json_inner(
         | JsValue::Symbol(_)
         | JsValue::Function(_)
         | JsValue::Generator(_)
-        | JsValue::Iterator(_) => Ok(None),
+        | JsValue::Iterator(_)
+        | JsValue::Error(_) => Ok(None),
         JsValue::Null => Ok(Some(JsonValue::Null)),
         JsValue::Boolean(b) => Ok(Some(JsonValue::Bool(*b))),
         JsValue::Smi(n) => Ok(Some(JsonValue::Number(f64::from(*n)))),
