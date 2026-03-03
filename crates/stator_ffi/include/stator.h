@@ -836,6 +836,101 @@ struct StatorValue *stator_script_run(const struct StatorScript *script, struct 
 int32_t stator_value_to_string_utf8(const struct StatorValue *val, char *buf, size_t buf_len);
 
 /**
+ * Coerce `val` to a number following ECMAScript §7.1.4 **ToNumber**.
+ *
+ * | Value type | Result |
+ * |---|---|
+ * | `undefined` (or null pointer) | `NaN` |
+ * | `null` | `+0` |
+ * | `true` | `1` |
+ * | `false` | `+0` |
+ * | number | the number itself |
+ * | string | parsed numeric value; `NaN` if unparseable |
+ * | object / function / … | `NaN` |
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+double stator_value_to_number(const struct StatorValue *val);
+
+/**
+ * Coerce `val` to a string following ECMAScript §7.1.17 **ToString** and
+ * return it as a new [`StatorValue`] of string type.
+ *
+ * The caller owns the returned pointer and must pass it to
+ * [`stator_value_destroy`] (or let a handle scope manage it).
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+struct StatorValue *stator_value_to_string(struct StatorIsolate *isolate,
+                                           const struct StatorValue *val);
+
+/**
+ * Coerce `val` to a signed 32-bit integer following ECMAScript §7.1.7
+ * **ToInt32**.
+ *
+ * Applies `ToNumber` first, then reduces modulo 2³² and maps to the signed
+ * range `[−2³¹, 2³¹−1]`.  `NaN`, `±0`, and `±Infinity` all convert to `0`.
+ *
+ * Returns `0` when `val` is null.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+int32_t stator_value_to_int32(const struct StatorValue *val);
+
+/**
+ * Coerce `val` to an unsigned 32-bit integer following ECMAScript §7.1.8
+ * **ToUint32**.
+ *
+ * Applies `ToNumber` first, then reduces modulo 2³².  `NaN`, `±0`, and
+ * `±Infinity` all convert to `0`.
+ *
+ * Returns `0` when `val` is null.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+uint32_t stator_value_to_uint32(const struct StatorValue *val);
+
+/**
+ * Coerce `val` to a boolean following ECMAScript §7.1.2 **ToBoolean**.
+ *
+ * Falsy values: `undefined`, `null`, `false`, `+0`, `-0`, `NaN`, `""`.
+ * Everything else is truthy.  A null pointer is treated as `undefined` and
+ * returns `false`.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_to_boolean(const struct StatorValue *val);
+
+/**
+ * Test whether `a === b` following ECMAScript §7.2.15 **IsStrictlyEqual**.
+ *
+ * Rules:
+ * - Different types → `false`.
+ * - `undefined === undefined` → `true`.
+ * - `null === null` → `true`.
+ * - Numbers: `NaN !== NaN`; `+0 === -0`.
+ * - Strings: byte-for-byte equality.
+ * - Booleans: value equality.
+ * - Object / function / array / … : `false` (no shared identity in FFI
+ *   handles; two distinct handles are never the same object).
+ *
+ * Both null pointers are treated as `undefined`.
+ *
+ * # Safety
+ * `a` and `b` must each be either null or a valid, live [`StatorValue`]
+ * pointer.
+ */
+bool stator_value_strict_equals(const struct StatorValue *a, const struct StatorValue *b);
+
+/**
  * Register a native function named `name` on `ctx`.
  *
  * After registration, JavaScript code running via [`stator_script_run`] can
