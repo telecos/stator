@@ -1104,7 +1104,35 @@ impl Interpreter {
                     };
                 }
 
-                // ── Iterators ──────────────────────────────────────────────
+                // StaNamedProperty [object_reg, name_idx, feedback_slot]:
+                //   Store the accumulator into the named property on the object
+                //   held in `object_reg`.  Supports `PlainObject` (property
+                //   map); stores to other value types are silently discarded.
+                //   The accumulator is unchanged (assignment returns its RHS).
+                Opcode::StaNamedProperty => {
+                    let Operand::Register(obj_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("StaNamedProperty", 0));
+                    };
+                    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+                        return Err(err_bad_operand("StaNamedProperty", 1));
+                    };
+                    let prop_name = match frame.bytecode_array.get_constant(name_idx) {
+                        Some(ConstantPoolEntry::String(s)) => s.clone(),
+                        _ => {
+                            return Err(StatorError::Internal(
+                                "StaNamedProperty: property name is not a string".into(),
+                            ));
+                        }
+                    };
+                    let val = frame.accumulator.clone();
+                    let obj = frame.read_reg(obj_v)?.clone();
+                    if let JsValue::PlainObject(ref map) = obj {
+                        map.borrow_mut().insert(prop_name, val);
+                    }
+                    // Accumulator stays unchanged: the assignment's completion
+                    // value is the stored value (already in the accumulator).
+                }
+
                 //
                 // GetIterator [iterable_reg, load_slot, call_slot]:
                 //   Obtain a sync iterator from the iterable in `iterable_reg`.

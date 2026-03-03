@@ -165,3 +165,10 @@ jobs:
           check_contains '[tab] result: false'
           # Uncaught exception demo
           check_contains '[tab] UNCAUGHT: (exception)'
+
+          # ── Phase 4: v8-compatible API demo ─────────────────────────────
+          check_contains '[tab] using v8-compatible API'
+          check_contains '[tab] created v8::Isolate, v8::Context'
+          check_contains '[tab] registered document.getElementById'
+          check_contains '[tab] executing: var el = document.getElementById'
+          check_contains "[tab] DOM update: #title.textContent = 'Hello!'"

@@ -2506,14 +2506,37 @@ pub unsafe extern "C" fn stator_function_template_get_function(
             isolate,
         };
 
+        // Temporarily disable the active handle scope so that any
+        // StatorValue created inside the callback (e.g. via
+        // stator_value_new_object) is NOT auto-registered with an outer
+        // scope.  Without this, the callback-created value would be owned
+        // by both the outer scope and the Box::from_raw below, causing a
+        // double-free when the scope later calls stator_value_destroy.
+        let saved_scope = if !isolate.is_null() {
+            // SAFETY: isolate is valid; we restore the scope pointer below.
+            let s = unsafe { (*isolate).active_handle_scope };
+            unsafe { (*isolate).active_handle_scope = std::ptr::null_mut() };
+            s
+        } else {
+            std::ptr::null_mut()
+        };
+
         // SAFETY: `callback` is valid for the lifetime of the template (per
         // the FFI contract).  `info` is a local variable live for this call.
         let ret = unsafe { callback(&raw const info) };
+
+        // Restore the handle scope.
+        if !isolate.is_null() {
+            // SAFETY: isolate is valid; saved_scope was obtained from it.
+            unsafe { (*isolate).active_handle_scope = saved_scope };
+        }
 
         if ret.is_null() {
             Ok(JsValue::Undefined)
         } else {
             // Convert the returned StatorValue to JsValue, then free it.
+            // The handle scope was disabled during the callback, so `ret`
+            // is not scope-owned: taking ownership via Box::from_raw is safe.
             // SAFETY: `ret` was allocated by `Box::into_raw` in the callback.
             let owned = unsafe { Box::from_raw(ret) };
             Ok(stator_value_inner_to_jsvalue(&owned.inner))
@@ -2579,7 +2602,28 @@ pub unsafe extern "C" fn stator_context_global_set(
     };
 
     // SAFETY: ctx is valid.
-    unsafe { (*ctx).globals.borrow_mut().insert(name_str, jsval) };
+    let globals = unsafe { Rc::clone(&(*ctx).globals) };
+
+    // Support dot-notation (e.g. "document.getElementById") by creating a
+    // nested PlainObject for the parent, mirroring stator_register_native_function.
+    if let Some(dot) = name_str.find('.') {
+        let obj_name = &name_str[..dot];
+        let method_name = &name_str[dot + 1..];
+
+        let mut env = globals.borrow_mut();
+        let obj = env
+            .entry(obj_name.to_owned())
+            .or_insert_with(|| JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new()))))
+            .clone();
+        drop(env);
+
+        if let JsValue::PlainObject(ref map) = obj {
+            map.borrow_mut().insert(method_name.to_owned(), jsval);
+        }
+        globals.borrow_mut().insert(obj_name.to_owned(), obj);
+    } else {
+        globals.borrow_mut().insert(name_str, jsval);
+    }
 }
 
 /// Convert a [`StatorValueInner`] to a number following ECMAScript §7.1.4 **ToNumber**.
