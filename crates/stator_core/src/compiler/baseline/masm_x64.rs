@@ -34,6 +34,56 @@
 use std::fmt;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CondCode
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A condition code for [`MacroAssembler::jcc`] and [`MacroAssembler::setcc_al`].
+///
+/// All conditions are **signed** comparisons, consistent with the use-case of
+/// comparing JavaScript integer (Smi) values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CondCode {
+    /// Equal (`ZF = 1`).
+    Equal,
+    /// Not equal (`ZF = 0`).
+    NotEqual,
+    /// Less-than, signed (`SF ≠ OF`).
+    Less,
+    /// Less-than-or-equal, signed (`ZF = 1 or SF ≠ OF`).
+    LessEq,
+    /// Greater-than, signed (`ZF = 0 and SF = OF`).
+    Greater,
+    /// Greater-than-or-equal, signed (`SF = OF`).
+    GreaterEq,
+}
+
+impl CondCode {
+    /// Second opcode byte for the `SETCC` (0F 9x) family.
+    pub(crate) fn setcc_byte(self) -> u8 {
+        match self {
+            Self::Equal => 0x94,
+            Self::NotEqual => 0x95,
+            Self::Less => 0x9C,
+            Self::LessEq => 0x9E,
+            Self::Greater => 0x9F,
+            Self::GreaterEq => 0x9D,
+        }
+    }
+
+    /// Second opcode byte for the near `Jcc` (0F 8x) family.
+    pub(crate) fn jcc_byte(self) -> u8 {
+        match self {
+            Self::Equal => 0x84,
+            Self::NotEqual => 0x85,
+            Self::Less => 0x8C,
+            Self::LessEq => 0x8E,
+            Self::Greater => 0x8F,
+            Self::GreaterEq => 0x8D,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Reg64
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -545,6 +595,133 @@ impl MacroAssembler {
     pub fn pop(&mut self, reg: Reg64) {
         self.emit_rex_b_only(reg);
         self.buf.push(0x58 | reg.enc());
+    }
+
+    // ── Extended arithmetic ──────────────────────────────────────────────────
+
+    /// `XOR dst, src` — bitwise exclusive-or of two 64-bit registers.
+    ///
+    /// Encoding: `REX.W 33 /r` (XOR r64, r/m64).
+    pub fn xor_rr(&mut self, dst: Reg64, src: Reg64) {
+        self.emit_rex_wrb(dst, src);
+        self.buf.push(0x33);
+        self.emit_modrm_rr(dst, src);
+    }
+
+    /// `XOR dst, imm` — bitwise XOR with a sign-extended 32-bit immediate.
+    ///
+    /// Uses the 4-byte `REX.W 83 /6 imm8` form when `imm` fits in a signed
+    /// byte, and the 7-byte `REX.W 81 /6 imm32` form otherwise.
+    pub fn xor_ri(&mut self, dst: Reg64, imm: i32) {
+        self.emit_rex_wrb(Reg64::Rax, dst);
+        if (i8::MIN as i32..=i8::MAX as i32).contains(&imm) {
+            self.buf.push(0x83);
+            self.emit_modrm_digit(6, dst);
+            self.buf.push(imm as i8 as u8);
+        } else {
+            self.buf.push(0x81);
+            self.emit_modrm_digit(6, dst);
+            self.emit_i32(imm);
+        }
+    }
+
+    /// `IMUL dst, src` — signed multiply, two-operand form (`dst *= src`).
+    ///
+    /// Encoding: `REX.W 0F AF /r` (IMUL r64, r/m64).
+    pub fn imul_rr(&mut self, dst: Reg64, src: Reg64) {
+        self.emit_rex_wrb(dst, src);
+        self.buf.push(0x0F);
+        self.buf.push(0xAF);
+        self.emit_modrm_rr(dst, src);
+    }
+
+    /// `NEG dst` — two's-complement negation of a 64-bit register.
+    ///
+    /// Encoding: `REX.W F7 /3`.
+    pub fn neg_r(&mut self, dst: Reg64) {
+        self.emit_rex_wrb(Reg64::Rax, dst);
+        self.buf.push(0xF7);
+        self.emit_modrm_digit(3, dst);
+    }
+
+    /// `TEST lhs, rhs` — set CPU flags for `lhs & rhs` without storing the
+    /// result.
+    ///
+    /// Encoding: `REX.W 85 /r` (TEST r/m64, r64).
+    pub fn test_rr(&mut self, lhs: Reg64, rhs: Reg64) {
+        self.emit_rex_wrb(rhs, lhs);
+        self.buf.push(0x85);
+        self.emit_modrm_rr(rhs, lhs);
+    }
+
+    // ── Memory access (base + disp32) ────────────────────────────────────────
+
+    /// Emit ModRM (mod=10) plus an optional SIB byte, then a 32-bit
+    /// displacement.
+    ///
+    /// When `base.enc() == 4` (RSP or R12), a SIB byte of `0x24` is required
+    /// (scale=0, index=no-index, base=4).
+    fn emit_modrm_base_disp32(&mut self, reg_field: Reg64, base: Reg64, disp: i32) {
+        if base.enc() == 4 {
+            // r/m=4 signals SIB; REX.B extends SIB.base (not ModRM.r/m).
+            self.buf.push(0x80 | (reg_field.enc() << 3) | 4);
+            self.buf.push(0x24); // SIB: scale=0, index=4(none), base=4
+        } else {
+            self.buf.push(0x80 | (reg_field.enc() << 3) | base.enc());
+        }
+        self.emit_i32(disp);
+    }
+
+    /// `MOV dst, [base + disp32]` — load a 64-bit value from memory.
+    ///
+    /// Encoding: `REX.W [REX.R] [REX.B] 8B /r` with ModRM mod=10.
+    pub fn mov_load_base_disp32(&mut self, dst: Reg64, base: Reg64, disp: i32) {
+        self.emit_rex_wrb(dst, base);
+        self.buf.push(0x8B);
+        self.emit_modrm_base_disp32(dst, base, disp);
+    }
+
+    /// `MOV [base + disp32], src` — store a 64-bit register to memory.
+    ///
+    /// Encoding: `REX.W [REX.R] [REX.B] 89 /r` with ModRM mod=10.
+    pub fn mov_store_base_disp32(&mut self, base: Reg64, disp: i32, src: Reg64) {
+        self.emit_rex_wrb(src, base);
+        self.buf.push(0x89);
+        self.emit_modrm_base_disp32(src, base, disp);
+    }
+
+    // ── Conditional instructions ─────────────────────────────────────────────
+
+    /// `SETCC AL` — set `AL` to `1` if the condition is satisfied, `0`
+    /// otherwise.
+    ///
+    /// Encoding: `0F 9x C0` (no REX needed for `AL`).
+    pub fn setcc_al(&mut self, cc: CondCode) {
+        self.buf.push(0x0F);
+        self.buf.push(cc.setcc_byte());
+        // ModRM: mod=11, reg=0 (opcode extension), r/m=0 (AL).
+        self.buf.push(0xC0);
+    }
+
+    /// `MOVZX dst, AL` — zero-extend `AL` (byte) into a 64-bit register.
+    ///
+    /// Encoding: `REX.W [REX.R] 0F B6 /r` with `r/m=0` (AL).
+    pub fn movzx_r64_al(&mut self, dst: Reg64) {
+        let r_bit = if dst.needs_rex() { 0x04 } else { 0 };
+        self.buf.push(0x48 | r_bit); // REX.W [+ REX.R]
+        self.buf.push(0x0F);
+        self.buf.push(0xB6);
+        // ModRM: mod=11, reg=dst.enc(), r/m=0 (AL).
+        self.buf.push(0xC0 | (dst.enc() << 3));
+    }
+
+    /// `Jcc label` — conditional near jump (32-bit displacement).
+    ///
+    /// Encoding: `0F 8x rel32`.
+    pub fn jcc(&mut self, cc: CondCode, label: &mut Label) {
+        self.buf.push(0x0F);
+        self.buf.push(cc.jcc_byte());
+        self.emit_rel32_for_label(label);
     }
 }
 
