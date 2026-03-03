@@ -1,0 +1,8 @@
+# Known intentional differences between st8 (Stator) and d8 (V8).
+#
+# Format: one entry per line, consisting of a test file basename (without .js)
+# followed by a colon and a human-readable explanation.  Lines beginning with
+# '#' and blank lines are ignored by the diff_test.sh script.
+#
+# Example:
+#   error_messages: Stator uses different wording for TypeError messages
