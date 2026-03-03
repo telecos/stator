@@ -13,3 +13,5 @@
 pub mod graph_builder;
 /// Typed IR node definitions for the Maglev compiler.
 pub mod ir;
+/// Optimisation passes: constant folding, DCE, redundant-CheckMaps removal.
+pub mod optimizer;
