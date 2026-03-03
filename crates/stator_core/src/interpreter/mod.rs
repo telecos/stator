@@ -167,6 +167,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::builtins::error::{pop_call_frame, push_call_frame};
 use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry, HandlerTableEntry};
 use crate::bytecode::bytecodes::{Opcode, Operand, decode_with_byte_offsets};
 use crate::error::{StatorError, StatorResult};
@@ -670,7 +671,10 @@ impl Interpreter {
                     } else {
                         let args = collect_args(frame, args_start_v, arg_count)?;
                         let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
-                        frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                        push_call_frame("<anonymous>");
+                        let result = Interpreter::run(&mut callee_frame);
+                        pop_call_frame();
+                        frame.accumulator = result?;
                     }
                 }
 
@@ -690,7 +694,10 @@ impl Interpreter {
                         frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
                     } else {
                         let mut callee_frame = InterpreterFrame::new((*ba).clone(), vec![]);
-                        frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                        push_call_frame("<anonymous>");
+                        let result = Interpreter::run(&mut callee_frame);
+                        pop_call_frame();
+                        frame.accumulator = result?;
                     }
                 }
 
@@ -714,7 +721,10 @@ impl Interpreter {
                     } else {
                         let arg1 = frame.read_reg(arg1_v)?.clone();
                         let mut callee_frame = InterpreterFrame::new((*ba).clone(), vec![arg1]);
-                        frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                        push_call_frame("<anonymous>");
+                        let result = Interpreter::run(&mut callee_frame);
+                        pop_call_frame();
+                        frame.accumulator = result?;
                     }
                 }
 
@@ -743,7 +753,10 @@ impl Interpreter {
                         let arg2 = frame.read_reg(arg2_v)?.clone();
                         let mut callee_frame =
                             InterpreterFrame::new((*ba).clone(), vec![arg1, arg2]);
-                        frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                        push_call_frame("<anonymous>");
+                        let result = Interpreter::run(&mut callee_frame);
+                        pop_call_frame();
+                        frame.accumulator = result?;
                     }
                 }
 
@@ -779,7 +792,10 @@ impl Interpreter {
                         .collect::<Vec<_>>();
                     let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
                     callee_frame.context = Some(this_val);
-                    frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                    push_call_frame("<anonymous>");
+                    let result = Interpreter::run(&mut callee_frame);
+                    pop_call_frame();
+                    frame.accumulator = result?;
                 }
 
                 // CallWithSpread [callable, args_start, args_count, slot]:
@@ -805,7 +821,10 @@ impl Interpreter {
                     };
                     let args = collect_args(frame, args_start_v, arg_count)?;
                     let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
-                    frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                    push_call_frame("<anonymous>");
+                    let result = Interpreter::run(&mut callee_frame);
+                    pop_call_frame();
+                    frame.accumulator = result?;
                 }
 
                 // ── Construct ──────────────────────────────────────────────
@@ -833,7 +852,10 @@ impl Interpreter {
                     };
                     let args = collect_args(frame, args_start_v, arg_count)?;
                     let mut callee_frame = InterpreterFrame::new((*ba).clone(), args);
-                    frame.accumulator = Interpreter::run(&mut callee_frame)?;
+                    push_call_frame("<anonymous>");
+                    let result = Interpreter::run(&mut callee_frame);
+                    pop_call_frame();
+                    frame.accumulator = result?;
                 }
 
                 // ── Context management ─────────────────────────────────────
@@ -889,11 +911,9 @@ impl Interpreter {
                         frame.pc = handler_pc;
                         continue;
                     }
-                    // No handler in this frame — convert to a serialised error
-                    // so it can propagate across the Rust call boundary.
-                    let msg = thrown
-                        .to_js_string()
-                        .unwrap_or_else(|_| format!("{thrown:?}"));
+                    // No handler in this frame — serialise the thrown value and
+                    // propagate it as a `StatorError::JsException` to the caller.
+                    let msg = error_message_from_value(&thrown);
                     return Err(StatorError::JsException(msg));
                 }
 
@@ -1346,6 +1366,20 @@ fn err_bad_operand(opcode_name: &'static str, operand_index: usize) -> StatorErr
     StatorError::Internal(format!(
         "{opcode_name}: unexpected operand kind at index {operand_index}"
     ))
+}
+
+/// Convert a thrown JavaScript value to a human-readable error message string.
+///
+/// `Error` objects format as `"name: message"` (or just `"name"` for an empty
+/// message).  All other values are converted via [`JsValue::to_js_string`];
+/// when that conversion itself fails the debug representation is used instead.
+fn error_message_from_value(value: &JsValue) -> String {
+    match value {
+        JsValue::Error(e) => e.to_error_string(),
+        other => other
+            .to_js_string()
+            .unwrap_or_else(|_| format!("{other:?}")),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

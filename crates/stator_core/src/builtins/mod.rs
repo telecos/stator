@@ -8,6 +8,8 @@
 
 /// ECMAScript §23.1 `Array` built-in static methods and prototype equivalents.
 pub mod array;
+/// ECMAScript §20.5 `Error` built-in and error hierarchy (`TypeError`, `RangeError`, etc.).
+pub mod error;
 /// ECMAScript §27 Iterator and Generator protocol: `Symbol.iterator`,
 /// `IteratorRecord`, and built-in iterators for `Array`, `String`, `Map`, `Set`.
 pub mod iterator;
