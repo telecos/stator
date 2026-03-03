@@ -281,6 +281,42 @@ StatorContext *stator_context_new(StatorIsolate *isolate);
  */
 void stator_context_destroy(StatorContext *ctx);
 
+/**
+ * Mark `ctx` as entered on the current thread.
+ *
+ * Each call to stator_context_enter() must be matched by a call to
+ * stator_context_exit().  Entering a context makes it the current context
+ * on its associated isolate.  Does nothing when ctx is NULL.
+ *
+ * @param ctx  A valid context pointer, or NULL.
+ */
+void stator_context_enter(StatorContext *ctx);
+
+/**
+ * Unmark `ctx` as entered on the current thread.
+ *
+ * Must be called once for every preceding stator_context_enter() call.
+ * When the enter count reaches zero the context is no longer current on its
+ * associated isolate.  Does nothing when ctx is NULL.
+ *
+ * @param ctx  A valid context pointer, or NULL.
+ */
+void stator_context_exit(StatorContext *ctx);
+
+/**
+ * Return a non-owning pointer to the global object of `ctx`.
+ *
+ * The returned pointer is valid for as long as `ctx` is alive.  The caller
+ * must NOT pass the returned pointer to stator_object_destroy(); the global
+ * object is owned by the context.
+ *
+ * Returns NULL when ctx is NULL.
+ *
+ * @param ctx  A valid context pointer, or NULL.
+ * @return     A pointer to the context's global StatorObject, or NULL.
+ */
+StatorObject *stator_context_global(StatorContext *ctx);
+
 /* -------------------------------------------------------------------------
  * Value lifecycle
  * ------------------------------------------------------------------------- */
