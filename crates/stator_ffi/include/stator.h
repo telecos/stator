@@ -365,11 +365,121 @@ struct StatorValue *stator_value_new_string(struct StatorIsolate *isolate,
                                             size_t len);
 
 /**
+ * Create a new boolean value.
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_value_new_boolean(struct StatorIsolate *isolate, bool val);
+
+/**
+ * Create a new `undefined` value.
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_value_new_undefined(struct StatorIsolate *isolate);
+
+/**
+ * Create a new `null` value.
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_value_new_null(struct StatorIsolate *isolate);
+
+/**
+ * Create a new plain-object value.
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_value_new_object(struct StatorIsolate *isolate);
+
+/**
+ * Create a new function-tagged value.
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_value_new_function_tag(struct StatorIsolate *isolate);
+
+/**
+ * Create a new array-tagged value.
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_value_new_array_tag(struct StatorIsolate *isolate);
+
+/**
+ * Create a new `Date`-tagged value.
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_value_new_date_tag(struct StatorIsolate *isolate);
+
+/**
+ * Create a new `RegExp`-tagged value.
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_value_new_regexp_tag(struct StatorIsolate *isolate);
+
+/**
+ * Create a new `Promise`-tagged value.
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_value_new_promise_tag(struct StatorIsolate *isolate);
+
+/**
+ * Create a new `Map`-tagged value.
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_value_new_map_tag(struct StatorIsolate *isolate);
+
+/**
+ * Create a new `Set`-tagged value.
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_value_new_set_tag(struct StatorIsolate *isolate);
+
+/**
  * Destroy a value and decrement the isolate's live-object counter.
  *
  * # Safety
- * `val` must be a non-null pointer returned by `stator_value_new_number` or
- * `stator_value_new_string` and must not be used again after this call.
+ * `val` must be a non-null pointer returned by any `stator_value_new_*`
+ * function and must not be used again after this call.
  */
 void stator_value_destroy(struct StatorValue *val);
 
@@ -404,6 +514,137 @@ double stator_value_as_number(const struct StatorValue *val);
  * `val` must be either null or a valid, live [`StatorValue`] pointer.
  */
 const char *stator_value_as_string(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` is the ECMAScript `undefined` value.
+ *
+ * A null `val` pointer is treated as `undefined` and also returns `true`.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_undefined(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` is the ECMAScript `null` value.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_null(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` holds a JavaScript string.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_string(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` holds a JavaScript number.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_number(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` holds a JavaScript boolean.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_boolean(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` is a JavaScript object (excludes `null`).
+ *
+ * Arrays, dates, regexps, promises, maps, and sets are all objects in
+ * ECMAScript and therefore also return `true`.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_object(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` is a callable JavaScript function.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_function(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` is a JavaScript array.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_array(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` is a number whose value is a signed 32-bit integer.
+ *
+ * A value is considered an int32 when it is a finite number equal to its own
+ * `ToInt32` conversion: i.e. it is an integer in the range `[−2³¹, 2³¹−1]`.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_int32(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` is a number whose value is an unsigned 32-bit integer.
+ *
+ * A value is considered a uint32 when it is a finite number equal to its own
+ * `ToUint32` conversion: i.e. it is an integer in the range `[0, 2³²−1]`.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_uint32(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` is a JavaScript `Date` object.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_date(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` is a JavaScript `RegExp` object.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_regexp(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` is a JavaScript `Promise` object.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_promise(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` is a JavaScript `Map` object.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_map(const struct StatorValue *val);
+
+/**
+ * Returns `true` if `val` is a JavaScript `Set` object.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_set(const struct StatorValue *val);
 
 /**
  * Create a new, empty JavaScript object.
