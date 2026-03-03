@@ -72,3 +72,39 @@ name = "fuzz_bytecode_roundtrip"
 path = "fuzz_targets/fuzz_bytecode_roundtrip.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_interpreter"
+path = "fuzz_targets/fuzz_interpreter.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_eval"
+path = "fuzz_targets/fuzz_eval.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_json_parse"
+path = "fuzz_targets/fuzz_json_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_regexp"
+path = "fuzz_targets/fuzz_regexp.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_builtins_array"
+path = "fuzz_targets/fuzz_builtins_array.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_builtins_string"
+path = "fuzz_targets/fuzz_builtins_string.rs"
+test = false
+doc = false
