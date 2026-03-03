@@ -1,0 +1,144 @@
+# chromium/BUILD.gn — GN build integration for the Stator JavaScript engine.
+#
+# This file is intended to be placed (or symlinked) inside a Chromium source
+# checkout so that Stator can be used as a drop-in replacement for V8 when
+# building with `js_engine = "stator"`.
+#
+# Assumed vendoring location inside a Chromium checkout:
+#
+#   //third_party/stator/                  ← stator repository root
+#   //third_party/stator/chromium/         ← this directory
+#
+# The two targets provided here are consumed by gin/BUILD.gn:
+#
+#   rust_library("stator_core")  — compiles crates/stator_core (rlib)
+#   rust_library("stator")       — compiles crates/stator_ffi  (staticlib)
+#   source_set("stator_bridge")  — C++17 shim: v8:: namespace over stator.h
+
+import("//build/rust/rust_library.gni")
+
+# ---------------------------------------------------------------------------
+# stator_core — pure Rust interpreter, bytecode compiler, GC, and builtins.
+# ---------------------------------------------------------------------------
+rust_library("stator_core") {
+  crate_name = "stator_core"
+  crate_root = "//third_party/stator/crates/stator_core/src/lib.rs"
+  edition = "2024"
+
+  sources = [
+    "//third_party/stator/crates/stator_core/src/builtins/array.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/error.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/global.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/iterator.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/json.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/map.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/math.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/mod.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/number.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/object.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/promise.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/proxy.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/reflect.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/set.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/string.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/util.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/weak_map.rs",
+    "//third_party/stator/crates/stator_core/src/builtins/weak_set.rs",
+    "//third_party/stator/crates/stator_core/src/bytecode/bytecode_array.rs",
+    "//third_party/stator/crates/stator_core/src/bytecode/bytecode_generator.rs",
+    "//third_party/stator/crates/stator_core/src/bytecode/bytecodes.rs",
+    "//third_party/stator/crates/stator_core/src/bytecode/feedback.rs",
+    "//third_party/stator/crates/stator_core/src/bytecode/mod.rs",
+    "//third_party/stator/crates/stator_core/src/bytecode/register.rs",
+    "//third_party/stator/crates/stator_core/src/bytecode/source_positions.rs",
+    "//third_party/stator/crates/stator_core/src/compiler/baseline/compiler.rs",
+    "//third_party/stator/crates/stator_core/src/compiler/baseline/masm_x64.rs",
+    "//third_party/stator/crates/stator_core/src/compiler/baseline/mod.rs",
+    "//third_party/stator/crates/stator_core/src/compiler/mod.rs",
+    "//third_party/stator/crates/stator_core/src/error.rs",
+    "//third_party/stator/crates/stator_core/src/gc/handle.rs",
+    "//third_party/stator/crates/stator_core/src/gc/heap.rs",
+    "//third_party/stator/crates/stator_core/src/gc/mark_sweep_compact.rs",
+    "//third_party/stator/crates/stator_core/src/gc/mod.rs",
+    "//third_party/stator/crates/stator_core/src/gc/scavenger.rs",
+    "//third_party/stator/crates/stator_core/src/gc/trace.rs",
+    "//third_party/stator/crates/stator_core/src/gc/write_barrier.rs",
+    "//third_party/stator/crates/stator_core/src/ic/mod.rs",
+    "//third_party/stator/crates/stator_core/src/interpreter/mod.rs",
+    "//third_party/stator/crates/stator_core/src/lib.rs",
+    "//third_party/stator/crates/stator_core/src/objects/heap_object.rs",
+    "//third_party/stator/crates/stator_core/src/objects/js_array.rs",
+    "//third_party/stator/crates/stator_core/src/objects/js_function.rs",
+    "//third_party/stator/crates/stator_core/src/objects/js_object.rs",
+    "//third_party/stator/crates/stator_core/src/objects/map.rs",
+    "//third_party/stator/crates/stator_core/src/objects/mod.rs",
+    "//third_party/stator/crates/stator_core/src/objects/regexp.rs",
+    "//third_party/stator/crates/stator_core/src/objects/string.rs",
+    "//third_party/stator/crates/stator_core/src/objects/tagged.rs",
+    "//third_party/stator/crates/stator_core/src/objects/value.rs",
+    "//third_party/stator/crates/stator_core/src/parser/ast.rs",
+    "//third_party/stator/crates/stator_core/src/parser/mod.rs",
+    "//third_party/stator/crates/stator_core/src/parser/preparser.rs",
+    "//third_party/stator/crates/stator_core/src/parser/recursive_descent.rs",
+    "//third_party/stator/crates/stator_core/src/parser/scanner.rs",
+    "//third_party/stator/crates/stator_core/src/parser/scope.rs",
+    "//third_party/stator/crates/stator_core/src/platform.rs",
+    "//third_party/stator/crates/stator_core/src/zone/mod.rs",
+  ]
+
+  # Chromium's vendored copies of stator_core's dependencies.  Adjust these
+  # paths to match wherever the crates are vendored in //third_party.
+  deps = [
+    "//third_party/rust/bumpalo/v3:lib",
+    "//third_party/rust/bitflags/v2:lib",
+    "//third_party/rust/log/v0_4:lib",
+    "//third_party/rust/parking_lot/v0_12:lib",
+    "//third_party/rust/regress/v0_10:lib",
+    "//third_party/rust/smallvec/v1:lib",
+    "//third_party/rust/thiserror/v2:lib",
+  ]
+}
+
+# ---------------------------------------------------------------------------
+# stator — C-ABI FFI surface (stator_ffi crate).  Links stator_core and
+# exposes the stable C API used by stator_bridge.
+#
+# The GN target is named "stator" (the public-facing engine name); the Rust
+# crate is named "stator_ffi" (set via crate_name below) to match the Cargo
+# workspace.
+# ---------------------------------------------------------------------------
+rust_library("stator") {
+  crate_name = "stator_ffi"
+  crate_root = "//third_party/stator/crates/stator_ffi/src/lib.rs"
+  edition = "2024"
+
+  sources = [
+    "//third_party/stator/crates/stator_ffi/src/lib.rs",
+  ]
+
+  deps = [
+    ":stator_core",
+    "//third_party/rust/log/v0_4:lib",
+  ]
+
+  # stator_ffi contains unsafe blocks required by the C FFI boundary.
+  allow_unsafe = true
+}
+
+# ---------------------------------------------------------------------------
+# stator_bridge — C++17 shim that exposes the v8:: namespace over stator.h.
+#
+# Consumers add this to deps instead of "//v8" when js_engine = "stator".
+# The public include path exposes both stator.h and v8_compat.h.
+# ---------------------------------------------------------------------------
+source_set("stator_bridge") {
+  sources = [ "stator_bridge.cc" ]
+
+  public_configs = [ ":stator_bridge_include" ]
+
+  deps = [ ":stator" ]
+}
+
+config("stator_bridge_include") {
+  include_dirs = [ "//third_party/stator/crates/stator_ffi/include" ]
+}
