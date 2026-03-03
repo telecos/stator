@@ -28,6 +28,9 @@ jobs:
       - name: Build st8 (release)
         run: cargo build --package st8 --release
 
+      - name: Add st8 to PATH
+        run: echo "${{ github.workspace }}/target/release" >> "$GITHUB_PATH"
+
       - name: Install d8 (V8 shell)
         # Try to install d8 from the jsvu tool.  If the install fails (e.g. on
         # a restricted network), the step is allowed to fail; diff_test.sh
@@ -42,8 +45,6 @@ jobs:
           ln -sf "$HOME/.jsvu/bin/v8" "$HOME/.jsvu/bin/d8" || true
 
       - name: Run differential tests (PR subset — tests/diff/)
-        env:
-          PATH: ${{ github.workspace }}/target/release:$PATH
         run: |
           chmod +x scripts/diff_test.sh
           scripts/diff_test.sh --corpus tests/diff
@@ -68,6 +69,9 @@ jobs:
       - name: Build st8 (release)
         run: cargo build --package st8 --release
 
+      - name: Add st8 to PATH
+        run: echo "${{ github.workspace }}/target/release" >> "$GITHUB_PATH"
+
       - name: Install d8 (V8 shell)
         continue-on-error: true
         run: |
@@ -77,8 +81,6 @@ jobs:
           ln -sf "$HOME/.jsvu/bin/v8" "$HOME/.jsvu/bin/d8" || true
 
       - name: Run full corpus differential tests
-        env:
-          PATH: ${{ github.workspace }}/target/release:$PATH
         run: |
           chmod +x scripts/diff_test.sh
           # PR subset first
