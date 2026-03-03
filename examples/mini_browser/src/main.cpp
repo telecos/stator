@@ -35,12 +35,41 @@
 #include <cstring>
 
 #include "stator.h"
+#include "v8_compat.h"
 
 /* -------------------------------------------------------------------------
  * Global context pointer (used by native callbacks)
  * ------------------------------------------------------------------------- */
 
 static StatorContext *g_ctx = nullptr;
+
+/* -------------------------------------------------------------------------
+ * Phase 4 globals: mock DOM state for getElementById demo
+ * ------------------------------------------------------------------------- */
+
+/** Last element ID requested via document.getElementById() from JS. */
+static char g_dom_element_id[64] = {};
+
+/**
+ * Native implementation of document.getElementById (Phase 4 v8-compat demo).
+ *
+ * Stores the requested element ID in g_dom_element_id and returns a plain
+ * object that JavaScript can set properties on (e.g. el.textContent).
+ */
+static StatorValue *get_element_by_id_cb(const StatorFunctionCallbackInfo *info)
+{
+    int argc = stator_function_callback_info_length(info);
+    if (argc > 0) {
+        const StatorValue *arg = stator_function_callback_info_get(info, 0);
+        const char *id = stator_value_as_string(arg);
+        std::strncpy(g_dom_element_id, id,
+                     sizeof(g_dom_element_id) - 1);
+        g_dom_element_id[sizeof(g_dom_element_id) - 1] = '\0';
+    }
+    /* Return an empty plain object so JS can set textContent on it. */
+    StatorIsolate *iso = stator_function_callback_info_get_isolate(info);
+    return stator_value_new_object(iso);
+}
 
 /* -------------------------------------------------------------------------
  * Native console.log implementation
@@ -310,6 +339,65 @@ int main() {
 
     /* Uncaught exception: throw propagates to the host as a NULL result. */
     execute_script(ctx, "throw 'uncaught error';", /* time= */ 0);
+
+    /* ── Phase 4: v8-compatible API demo ─────────────────────────────────── */
+
+    std::printf("\n[tab] --- Phase 4: v8-compatible API demo ---\n\n");
+    std::printf("[tab] using v8-compatible API\n");
+
+    /* Create isolate and context through the v8:: compatibility layer.
+     * The HandleScope is kept in a nested block so it is destroyed (and its
+     * owned values freed) before v8iso->Dispose() tears down the isolate. */
+    v8::Isolate *v8iso = v8::Isolate::New();
+    {
+        v8::HandleScope v8hs(v8iso);
+        v8::Context    *v8ctx = v8::Context::New(v8iso);
+        std::printf("[tab] created v8::Isolate, v8::Context\n");
+
+        /* Register document.getElementById via FunctionTemplate::New(). */
+        v8::FunctionTemplate *elem_tmpl =
+            v8::FunctionTemplate::New(v8iso, get_element_by_id_cb);
+        elem_tmpl->Install(v8ctx, "document.getElementById");
+        std::printf("[tab] registered document.getElementById\n");
+
+        /* Execute the mock DOM script.
+         *
+         * el = document.getElementById('title')  → C++ stores "title" in
+         *                                           g_dom_element_id and returns
+         *                                           an empty plain object.
+         * el.textContent = 'Hello!'              → stores 'Hello!' on the object;
+         *                                           the assignment expression is
+         *                                           the program's completion value.
+         *
+         * After stator_script_run() returns 'Hello!' we combine it with the
+         * captured element ID to print the DOM update message, demonstrating
+         * the full JS → C++ → JS callback round-trip.
+         */
+        const char *dom_source =
+            "var el = document.getElementById('title');"
+            " el.textContent = 'Hello!';";
+        std::printf("[tab] executing: %s\n", dom_source);
+
+        g_dom_element_id[0] = '\0';
+        v8::Script *dom_script = v8::Script::Compile(v8ctx, dom_source);
+        if (dom_script) {
+            StatorValue *result = dom_script->Run(v8ctx);
+            if (result && g_dom_element_id[0] != '\0' &&
+                std::strcmp(stator_value_type(result), "string") == 0) {
+                const char *text = stator_value_as_string(result);
+                std::printf("[tab] DOM update: #%s.textContent = '%s'\n",
+                            g_dom_element_id, text);
+            }
+            if (result) stator_value_destroy(result);
+            delete dom_script;
+        }
+
+        /* Release Phase 4 resources (context and template before scope). */
+        delete elem_tmpl;
+        delete v8ctx;
+        /* v8hs goes out of scope here, closing the handle scope cleanly. */
+    }
+    v8iso->Dispose();
 
     /* ── Cleanup ─────────────────────────────────────────────────────────── */
     stator_context_destroy(ctx);

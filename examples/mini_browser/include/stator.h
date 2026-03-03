@@ -584,6 +584,154 @@ void stator_register_native_function(StatorContext    *ctx,
                                      StatorNativeCallback callback);
 
 /* -------------------------------------------------------------------------
+ * Value construction (Phase 4 additions)
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Create a new plain-object value.
+ *
+ * Returns a new StatorValue* with type "object", or NULL if isolate is NULL.
+ * The caller must eventually pass the returned pointer to
+ * stator_value_destroy() (unless it is scope-owned).
+ *
+ * @param isolate  A valid, non-NULL isolate pointer.
+ */
+StatorValue *stator_value_new_object(StatorIsolate *isolate);
+
+/* -------------------------------------------------------------------------
+ * FunctionTemplate (Phase 4: v8-compatible native function registration)
+ * ------------------------------------------------------------------------- */
+
+/**
+ * An opaque function-template handle.
+ *
+ * Associates a C callback with an isolate.  Use
+ * stator_function_template_get_function() to obtain a callable StatorValue*,
+ * then install it in a context's global environment via
+ * stator_context_global_set().
+ *
+ * Created by stator_function_template_new().
+ * Destroyed by stator_function_template_destroy().
+ */
+typedef struct StatorFunctionTemplate StatorFunctionTemplate;
+
+/**
+ * Call-site information passed to a function-template callback.
+ *
+ * The lifetime of a StatorFunctionCallbackInfo value is limited to the
+ * duration of the native callback invocation.  The embedder must not store
+ * the pointer beyond the callback's return.
+ *
+ * Use stator_function_callback_info_length() and
+ * stator_function_callback_info_get() to access arguments, and
+ * stator_function_callback_info_get_isolate() to retrieve the isolate.
+ */
+typedef struct StatorFunctionCallbackInfo StatorFunctionCallbackInfo;
+
+/**
+ * C-callable callback signature for function templates.
+ *
+ * Called by the engine when JavaScript code invokes a function created via
+ * stator_function_template_get_function().
+ *
+ * @param info  Call-site information (arguments, isolate).  Valid only for
+ *              the duration of this call.
+ * @return      A new StatorValue* (caller must eventually free it) or NULL to
+ *              return `undefined` to JavaScript.
+ */
+typedef StatorValue *(*StatorFunctionTemplateCallback)(
+    const StatorFunctionCallbackInfo *info);
+
+/**
+ * Return the number of arguments passed to this call.
+ *
+ * Returns 0 when info is NULL.
+ *
+ * @param info  A valid StatorFunctionCallbackInfo pointer, or NULL.
+ */
+int stator_function_callback_info_length(const StatorFunctionCallbackInfo *info);
+
+/**
+ * Return a pointer to the argument at position index.
+ *
+ * The returned pointer is valid only for the duration of the callback
+ * invocation.  Returns NULL if info is NULL or index is out of range.
+ *
+ * @param info   A valid StatorFunctionCallbackInfo pointer, or NULL.
+ * @param index  Zero-based argument index.
+ */
+const StatorValue *stator_function_callback_info_get(
+    const StatorFunctionCallbackInfo *info, int index);
+
+/**
+ * Return the isolate associated with this call.
+ *
+ * Returns NULL if info is NULL.
+ *
+ * @param info  A valid StatorFunctionCallbackInfo pointer, or NULL.
+ */
+StatorIsolate *stator_function_callback_info_get_isolate(
+    const StatorFunctionCallbackInfo *info);
+
+/**
+ * Create a new function template associated with isolate.
+ *
+ * Returns NULL if isolate is NULL.  The caller must eventually pass the
+ * returned pointer to stator_function_template_destroy().
+ *
+ * @param isolate   A valid, non-NULL isolate pointer.
+ * @param callback  The C function to invoke when the template's function is
+ *                  called from JavaScript.  Must remain valid for the
+ *                  lifetime of the template.
+ */
+StatorFunctionTemplate *stator_function_template_new(
+    StatorIsolate                  *isolate,
+    StatorFunctionTemplateCallback  callback);
+
+/**
+ * Destroy a function template previously created with
+ * stator_function_template_new().
+ *
+ * Does nothing if tmpl is NULL.
+ *
+ * @param tmpl  A pointer returned by stator_function_template_new(), or NULL.
+ */
+void stator_function_template_destroy(StatorFunctionTemplate *tmpl);
+
+/**
+ * Produce a callable StatorValue* representing the function described by tmpl.
+ *
+ * The returned value has type "function" and can be installed into a context's
+ * global environment via stator_context_global_set().  Returns NULL if tmpl is
+ * NULL.  The caller owns the returned pointer and must eventually pass it to
+ * stator_value_destroy().
+ *
+ * @param tmpl  A valid StatorFunctionTemplate pointer, or NULL.
+ * @param ctx   The context the function will be used in (may be NULL).
+ */
+StatorValue *stator_function_template_get_function(
+    const StatorFunctionTemplate *tmpl,
+    StatorContext                *ctx);
+
+/**
+ * Install a value into the context's global environment under name.
+ *
+ * After this call, JavaScript code running via stator_script_run() can
+ * reference name as a global variable.  Use dot notation to install a value
+ * on a namespace object: "document.getElementById" creates a `document`
+ * global (if it does not already exist) and sets its `getElementById`
+ * property.  Does nothing if ctx or name is NULL.  A null val installs
+ * undefined.
+ *
+ * @param ctx   A valid, non-NULL StatorContext*.
+ * @param name  Null-terminated variable name; dot notation supported.
+ * @param val   A valid StatorValue pointer, or NULL to install undefined.
+ */
+void stator_context_global_set(StatorContext      *ctx,
+                                const char         *name,
+                                const StatorValue  *val);
+
+/* -------------------------------------------------------------------------
  * Handle scope lifecycle
  * ------------------------------------------------------------------------- */
 
