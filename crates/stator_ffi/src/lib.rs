@@ -6203,4 +6203,29 @@ mod tests {
             stator_context_destroy(ctx);
         }
     }
+
+    /// `stator_isolate_get_stats` must return valid (non-crashing) stats and
+    /// fill the struct with zero or positive counts.
+    #[test]
+    fn test_isolate_get_stats_fills_struct() {
+        let iso = IsolateGuard::new();
+        let mut stats = StatorCompilationStats {
+            jit_functions_compiled: 0xff,
+            jit_code_bytes: 0xdeadbeef,
+        };
+        // SAFETY: `iso` is valid; `stats` is a valid mutable reference.
+        unsafe { stator_isolate_get_stats(iso.as_ptr(), &mut stats as *mut _) };
+
+        // The function must have overwritten the sentinel values.
+        assert_ne!(stats.jit_functions_compiled, 0xff, "stats must be filled");
+        assert_ne!(stats.jit_code_bytes, 0xdeadbeef, "stats must be filled");
+    }
+
+    /// `stator_isolate_get_stats` with a null `stats` pointer must not crash.
+    #[test]
+    fn test_isolate_get_stats_null_stats_is_safe() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid; null stats pointer is explicitly handled.
+        unsafe { stator_isolate_get_stats(iso.as_ptr(), std::ptr::null_mut()) };
+    }
 }
