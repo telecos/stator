@@ -582,6 +582,8 @@ int stator_value_to_string_utf8(const StatorValue *val, char *buf, size_t buf_le
 void stator_register_native_function(StatorContext    *ctx,
                                      const char       *name,
                                      StatorNativeCallback callback);
+
+/* -------------------------------------------------------------------------
  * Handle scope lifecycle
  * ------------------------------------------------------------------------- */
 

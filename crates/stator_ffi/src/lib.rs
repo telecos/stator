@@ -1275,6 +1275,9 @@ fn jsvalue_to_stator_value_inner(v: &JsValue) -> StatorValueInner {
                 ))
             }
         }
+    }
+}
+
 // ── HandleScope ───────────────────────────────────────────────────────────────
 
 /// An opaque handle scope that manages the lifetime of [`StatorValue`] handles

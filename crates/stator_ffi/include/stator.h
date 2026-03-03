@@ -617,6 +617,8 @@ int32_t stator_value_to_string_utf8(const struct StatorValue *val, char *buf, si
 void stator_register_native_function(struct StatorContext *ctx,
                                      const char *name,
                                      StatorNativeCallback callback);
+
+/**
  * Open a new handle scope on `isolate`.
  *
  * All [`StatorValue`] handles created after this call (and before the
