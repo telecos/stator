@@ -58,6 +58,27 @@ use crate::compiler::baseline::masm_x64::{CondCode, Label, MacroAssembler, Reg64
 use crate::error::{StatorError, StatorResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Table serialization constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Magic number written in the last 4 bytes of the code buffer to mark the
+/// presence of serialized safepoint and deopt tables.  ASCII `STAT` in
+/// little-endian order.
+pub const METADATA_MAGIC: u32 = 0x5441_5453;
+
+/// Size in bytes of the fixed metadata footer appended at the very end of the
+/// code buffer (3 × `u32` = 12 bytes).
+pub const FOOTER_SIZE: usize = 12;
+
+/// Serialized size of a single [`SafepointEntry`] in bytes
+/// (`code_offset u32` + `bytecode_index u32` + `gc_map u64` = 16 bytes).
+const SAFEPOINT_ENTRY_SIZE: usize = 16;
+
+/// Serialized size of a single [`DeoptEntry`] in bytes
+/// (`code_offset u32` + `bytecode_offset u32` + `liveness_map u64` = 16 bytes).
+const DEOPT_ENTRY_SIZE: usize = 16;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // JIT value sentinels
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -111,6 +132,11 @@ pub struct SafepointEntry {
     pub code_offset: u32,
     /// Index of the bytecode instruction this safepoint corresponds to.
     pub bytecode_index: u32,
+    /// Bitmask of register-file slots that hold GC-managed heap pointers at
+    /// this safepoint.  Bit `i` set means slot `i` holds a pointer that must
+    /// be reported to the garbage collector during stack scanning.
+    /// Zero for the current Smi-only JIT tier (no heap-object values).
+    pub gc_map: u64,
 }
 
 /// A single entry in the deoptimization table.
@@ -125,6 +151,11 @@ pub struct DeoptEntry {
     pub code_offset: u32,
     /// Bytecode byte offset where interpretation should resume.
     pub bytecode_offset: u32,
+    /// Bitmask of register-file slots that hold live values at this deopt
+    /// point.  Bit `i` set means slot `i` must be preserved when
+    /// reconstructing the interpreter frame.  Conservatively set to all slots
+    /// live in the current baseline tier.
+    pub liveness_map: u64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -133,18 +164,116 @@ pub struct DeoptEntry {
 
 /// The output of the [`BaselineCompiler`]: machine code bytes plus metadata.
 pub struct CompiledCode {
-    /// Emitted x86-64 machine code.
+    /// Emitted x86-64 machine code followed by the serialized safepoint and
+    /// deopt tables and a 12-byte footer.  The footer is the last
+    /// [`FOOTER_SIZE`] bytes and encodes the byte offsets of each table within
+    /// `code`, plus [`METADATA_MAGIC`] as a sanity check.
     pub code: Vec<u8>,
+    /// Number of bytes in `code` that are native machine instructions.
+    /// Bytes in `code[native_code_len..]` are metadata tables.
+    pub native_code_len: usize,
     /// Number of `i64` slots in the register file
     /// (`parameter_count + frame_size`).
     pub register_file_slots: usize,
-    /// Safepoint table (code offset → bytecode instruction index).
+    /// Safepoint table (code offset → bytecode instruction index + gc_map).
     pub safepoints: Vec<SafepointEntry>,
-    /// Deoptimization table (code offset → bytecode byte offset).
+    /// Deoptimization table (code offset → bytecode byte offset + liveness).
     pub deopt_entries: Vec<DeoptEntry>,
 }
 
+/// Internal representation of the 12-byte metadata footer.
+struct MetadataFooter {
+    safepoint_table_start: u32,
+    deopt_table_start: u32,
+}
+
 impl CompiledCode {
+    /// Look up the safepoint entry whose `code_offset` equals `offset`.
+    ///
+    /// Returns `None` if no safepoint at that exact offset is recorded.
+    pub fn find_safepoint(&self, offset: u32) -> Option<&SafepointEntry> {
+        self.safepoints.iter().find(|e| e.code_offset == offset)
+    }
+
+    /// Look up the deopt entry whose `code_offset` equals `offset`.
+    ///
+    /// Returns `None` if no deopt entry at that exact offset is recorded.
+    pub fn find_deopt(&self, offset: u32) -> Option<&DeoptEntry> {
+        self.deopt_entries.iter().find(|e| e.code_offset == offset)
+    }
+
+    /// Parse the safepoint table from a slice of serialized code bytes.
+    ///
+    /// Returns `None` if the buffer does not contain a valid footer with
+    /// [`METADATA_MAGIC`], or if the encoded table would overflow the buffer.
+    pub fn parse_safepoints(code: &[u8]) -> Option<Vec<SafepointEntry>> {
+        let footer = Self::read_footer(code)?;
+        let start = footer.safepoint_table_start as usize;
+        let data = code.get(start..)?;
+        let count = u32::from_le_bytes(data.get(..4)?.try_into().ok()?) as usize;
+        // Sanity-check: cap allocation to the number of entries that can
+        // physically fit in the remaining buffer.
+        let max_entries = data.len().saturating_sub(4) / SAFEPOINT_ENTRY_SIZE;
+        if count > max_entries {
+            return None;
+        }
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = 4 + i * SAFEPOINT_ENTRY_SIZE;
+            let e = data.get(off..off + SAFEPOINT_ENTRY_SIZE)?;
+            out.push(SafepointEntry {
+                code_offset: u32::from_le_bytes(e[0..4].try_into().ok()?),
+                bytecode_index: u32::from_le_bytes(e[4..8].try_into().ok()?),
+                gc_map: u64::from_le_bytes(e[8..16].try_into().ok()?),
+            });
+        }
+        Some(out)
+    }
+
+    /// Parse the deopt table from a slice of serialized code bytes.
+    ///
+    /// Returns `None` if the buffer does not contain a valid footer with
+    /// [`METADATA_MAGIC`], or if the encoded table would overflow the buffer.
+    pub fn parse_deopt_entries(code: &[u8]) -> Option<Vec<DeoptEntry>> {
+        let footer = Self::read_footer(code)?;
+        let start = footer.deopt_table_start as usize;
+        let data = code.get(start..)?;
+        let count = u32::from_le_bytes(data.get(..4)?.try_into().ok()?) as usize;
+        // Sanity-check: cap allocation to the number of entries that can
+        // physically fit in the remaining buffer.
+        let max_entries = data.len().saturating_sub(4) / DEOPT_ENTRY_SIZE;
+        if count > max_entries {
+            return None;
+        }
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = 4 + i * DEOPT_ENTRY_SIZE;
+            let e = data.get(off..off + DEOPT_ENTRY_SIZE)?;
+            out.push(DeoptEntry {
+                code_offset: u32::from_le_bytes(e[0..4].try_into().ok()?),
+                bytecode_offset: u32::from_le_bytes(e[4..8].try_into().ok()?),
+                liveness_map: u64::from_le_bytes(e[8..16].try_into().ok()?),
+            });
+        }
+        Some(out)
+    }
+
+    /// Read and validate the 12-byte footer at the end of `code`.
+    fn read_footer(code: &[u8]) -> Option<MetadataFooter> {
+        if code.len() < FOOTER_SIZE {
+            return None;
+        }
+        let f = &code[code.len() - FOOTER_SIZE..];
+        let magic = u32::from_le_bytes(f[8..12].try_into().ok()?);
+        if magic != METADATA_MAGIC {
+            return None;
+        }
+        Some(MetadataFooter {
+            safepoint_table_start: u32::from_le_bytes(f[0..4].try_into().ok()?),
+            deopt_table_start: u32::from_le_bytes(f[4..8].try_into().ok()?),
+        })
+    }
+
     /// Execute the compiled code on x86-64 Linux/macOS by allocating a page of
     /// read-write-execute memory with `mmap`, copying the code bytes into it,
     /// and invoking the JIT function.
@@ -253,7 +382,9 @@ impl<'a> BaselineCompiler<'a> {
     /// Compile `bytecode` to native x86-64 machine code.
     ///
     /// Returns a [`CompiledCode`] containing the emitted bytes and all
-    /// associated metadata.
+    /// associated metadata.  The safepoint and deopt tables are serialized and
+    /// appended to the code buffer after the native instructions; a 12-byte
+    /// footer records the table start offsets and [`METADATA_MAGIC`].
     pub fn compile(bytecode: &'a BytecodeArray) -> StatorResult<CompiledCode> {
         let mut c = Self {
             bytecode,
@@ -267,9 +398,39 @@ impl<'a> BaselineCompiler<'a> {
         c.compile_function()?;
         let register_file_slots =
             bytecode.parameter_count() as usize + bytecode.frame_size() as usize;
-        let code = c.masm.into_code();
+        let mut code = c.masm.into_code();
+        let native_code_len = code.len();
+
+        // ── Serialize safepoint table ────────────────────────────────────────
+        let safepoint_table_start = u32::try_from(code.len())
+            .map_err(|_| StatorError::Internal("compiled code exceeds 4 GiB limit".into()))?;
+        let sp_count = c.safepoints.len() as u32;
+        code.extend_from_slice(&sp_count.to_le_bytes());
+        for e in &c.safepoints {
+            code.extend_from_slice(&e.code_offset.to_le_bytes());
+            code.extend_from_slice(&e.bytecode_index.to_le_bytes());
+            code.extend_from_slice(&e.gc_map.to_le_bytes());
+        }
+
+        // ── Serialize deopt table ────────────────────────────────────────────
+        let deopt_table_start = u32::try_from(code.len())
+            .map_err(|_| StatorError::Internal("compiled code exceeds 4 GiB limit".into()))?;
+        let de_count = c.deopt_entries.len() as u32;
+        code.extend_from_slice(&de_count.to_le_bytes());
+        for e in &c.deopt_entries {
+            code.extend_from_slice(&e.code_offset.to_le_bytes());
+            code.extend_from_slice(&e.bytecode_offset.to_le_bytes());
+            code.extend_from_slice(&e.liveness_map.to_le_bytes());
+        }
+
+        // ── Serialize footer (last FOOTER_SIZE bytes) ────────────────────────
+        code.extend_from_slice(&safepoint_table_start.to_le_bytes());
+        code.extend_from_slice(&deopt_table_start.to_le_bytes());
+        code.extend_from_slice(&METADATA_MAGIC.to_le_bytes());
+
         Ok(CompiledCode {
             code,
+            native_code_len,
             register_file_slots,
             safepoints: c.safepoints,
             deopt_entries: c.deopt_entries,
@@ -421,13 +582,30 @@ impl<'a> BaselineCompiler<'a> {
 
     // ── Deopt helper ─────────────────────────────────────────────────────────
 
+    /// Compute a conservative liveness bitmask covering all register-file
+    /// slots for use in deopt entries.
+    ///
+    /// Sets bit `i` for every slot index `i` in `0..register_file_slots`.
+    /// This is a conservative over-approximation: the interpreter will
+    /// preserve all slots when reconstructing the frame.
+    fn all_slots_live(&self) -> u64 {
+        let slots = self.param_count + self.bytecode.frame_size() as usize;
+        if slots >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << slots).wrapping_sub(1)
+        }
+    }
+
     /// Record a deopt point at the current code position and emit a JMP to
     /// the deopt epilogue.
     fn emit_deopt(&mut self, bytecode_offset: u32) {
         let code_off = self.masm.position() as u32;
+        let liveness_map = self.all_slots_live();
         self.deopt_entries.push(DeoptEntry {
             code_offset: code_off,
             bytecode_offset,
+            liveness_map,
         });
         self.masm.jmp(&mut self.deopt_label);
     }
@@ -451,6 +629,7 @@ impl<'a> BaselineCompiler<'a> {
             self.safepoints.push(SafepointEntry {
                 code_offset: self.masm.position() as u32,
                 bytecode_index: idx as u32,
+                gc_map: 0,
             });
 
             self.compile_instruction(
@@ -1467,5 +1646,146 @@ mod tests {
             matches!(result, Err(ref e) if e.to_string().contains("deopt")),
             "expected deopt error, got: {result:?}"
         );
+    }
+
+    // ── safepoint / deopt table tests (all platforms) ────────────────────────
+
+    #[test]
+    fn test_safepoint_gc_map_is_zero_for_smi_only() {
+        // The current JIT tier only handles Smi/boolean/null/undefined values;
+        // no slot ever holds a GC-managed heap pointer → gc_map must be zero.
+        let ba = bytecode(vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(2)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ]);
+        let cc = BaselineCompiler::compile(&ba).expect("compile failed");
+        for sp in &cc.safepoints {
+            assert_eq!(sp.gc_map, 0, "no GC pointers in Smi-only JIT code");
+        }
+    }
+
+    #[test]
+    fn test_deopt_liveness_map_covers_all_slots() {
+        // 2 params + 3 locals = 5 register-file slots.
+        // The deopt liveness_map must have bits 0–4 set (= 0b1_1111 = 31).
+        let ba = BytecodeArray::new(
+            encode(&[
+                Instruction::new_unchecked(
+                    Opcode::LdaGlobal,
+                    vec![Operand::ConstantPoolIdx(0), Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ]),
+            vec![],
+            3, // frame_size = 3 locals
+            2, // parameter_count = 2 params
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        );
+        let cc = BaselineCompiler::compile(&ba).expect("compile failed");
+        assert_eq!(cc.deopt_entries.len(), 1);
+        let expected_liveness = (1u64 << 5) - 1; // bits 0..4 set
+        assert_eq!(
+            cc.deopt_entries[0].liveness_map, expected_liveness,
+            "liveness_map must cover all 5 register-file slots"
+        );
+    }
+
+    #[test]
+    fn test_native_code_len_excludes_tables() {
+        // The metadata tables are appended after the native instructions, so
+        // native_code_len must be strictly less than the total code length.
+        let ba = bytecode(vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ]);
+        let cc = BaselineCompiler::compile(&ba).expect("compile failed");
+        assert!(
+            cc.native_code_len < cc.code.len(),
+            "metadata tables must be appended after native code"
+        );
+        // The last FOOTER_SIZE bytes must contain the magic number.
+        let footer_off = cc.code.len() - FOOTER_SIZE;
+        let magic =
+            u32::from_le_bytes(cc.code[footer_off + 8..footer_off + 12].try_into().unwrap());
+        assert_eq!(
+            magic, METADATA_MAGIC,
+            "footer magic must match METADATA_MAGIC"
+        );
+    }
+
+    #[test]
+    fn test_tables_round_trip_through_serialized_code() {
+        // The safepoint and deopt tables serialized into code bytes must be
+        // parseable back to entries that are identical to the in-memory ones.
+        let ba = bytecode(vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(7)]),
+            Instruction::new_unchecked(
+                Opcode::LdaGlobal,
+                vec![Operand::ConstantPoolIdx(0), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ]);
+        let cc = BaselineCompiler::compile(&ba).expect("compile failed");
+
+        // Round-trip safepoint table.
+        let parsed_sp =
+            CompiledCode::parse_safepoints(&cc.code).expect("safepoint table must be parseable");
+        assert_eq!(parsed_sp.len(), cc.safepoints.len());
+        for (parsed, orig) in parsed_sp.iter().zip(&cc.safepoints) {
+            assert_eq!(parsed.code_offset, orig.code_offset);
+            assert_eq!(parsed.bytecode_index, orig.bytecode_index);
+            assert_eq!(parsed.gc_map, orig.gc_map);
+        }
+
+        // Round-trip deopt table.
+        let parsed_de =
+            CompiledCode::parse_deopt_entries(&cc.code).expect("deopt table must be parseable");
+        assert_eq!(parsed_de.len(), cc.deopt_entries.len());
+        for (parsed, orig) in parsed_de.iter().zip(&cc.deopt_entries) {
+            assert_eq!(parsed.code_offset, orig.code_offset);
+            assert_eq!(parsed.bytecode_offset, orig.bytecode_offset);
+            assert_eq!(parsed.liveness_map, orig.liveness_map);
+        }
+    }
+
+    #[test]
+    fn test_simulate_gc_stack_scan() {
+        // Simulate what the GC would do at a safepoint:
+        //   1. Find the CompiledCode for the currently-executing JIT frame.
+        //   2. Use the PC (code_offset) to look up the SafepointEntry.
+        //   3. Read gc_map to determine which register-file slots hold GC roots.
+        // In the current Smi-only JIT, gc_map must always be zero (no roots).
+        let ba = bytecode(vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ]);
+        let cc = BaselineCompiler::compile(&ba).expect("compile failed");
+
+        // The first safepoint is at the very first instruction.
+        let sp0 = &cc.safepoints[0];
+
+        // Simulate GC: look up safepoint by code_offset.
+        let found = cc
+            .find_safepoint(sp0.code_offset)
+            .expect("safepoint lookup must succeed");
+
+        // No GC roots in a Smi-only JIT frame.
+        assert_eq!(found.gc_map, 0, "no GC roots in Smi-only JIT frame");
+        assert_eq!(found.bytecode_index, 0);
+
+        // Also verify via the parsed tables (as the GC would use them from the
+        // serialized code bytes embedded in the Code object).
+        let parsed =
+            CompiledCode::parse_safepoints(&cc.code).expect("must parse from serialized code");
+        let found_parsed = parsed
+            .iter()
+            .find(|e| e.code_offset == sp0.code_offset)
+            .expect("parsed safepoint lookup must succeed");
+        assert_eq!(found_parsed.gc_map, 0);
     }
 }
