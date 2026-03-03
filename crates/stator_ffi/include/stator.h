@@ -256,6 +256,45 @@ struct StatorContext *stator_context_new(struct StatorIsolate *isolate);
 void stator_context_destroy(struct StatorContext *ctx);
 
 /**
+ * Mark `ctx` as entered on the current thread.
+ *
+ * Each call to `stator_context_enter` must be balanced by a corresponding
+ * call to [`stator_context_exit`].  Entering a context also makes it the
+ * current context on its associated isolate.  Does nothing when `ctx` is null.
+ *
+ * # Safety
+ * `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+ */
+void stator_context_enter(struct StatorContext *ctx);
+
+/**
+ * Unmark `ctx` as entered on the current thread.
+ *
+ * Must be called once for every preceding [`stator_context_enter`] call.
+ * When the enter count reaches zero the context is no longer recorded as
+ * current on its associated isolate.  Does nothing when `ctx` is null.
+ *
+ * # Safety
+ * `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+ */
+void stator_context_exit(struct StatorContext *ctx);
+
+/**
+ * Return a non-owning pointer to the global object of `ctx`.
+ *
+ * The returned pointer is valid for as long as `ctx` is alive.  **The caller
+ * must not pass the returned pointer to [`stator_object_destroy`]**; the
+ * global object is owned by the context and is freed when the context is
+ * destroyed via [`stator_context_destroy`].
+ *
+ * Returns a null pointer when `ctx` is null.
+ *
+ * # Safety
+ * `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+ */
+struct StatorObject *stator_context_global(struct StatorContext *ctx);
+
+/**
  * Create a new number value.
  *
  * Returns a null pointer if `isolate` is null.

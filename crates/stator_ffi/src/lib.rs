@@ -258,6 +258,12 @@ pub unsafe extern "C" fn stator_isolate_gc(isolate: *mut StatorIsolate) {
 /// [`stator_context_destroy`] when the context is no longer needed.
 pub struct StatorContext {
     _isolate: *mut StatorIsolate,
+    /// Number of times the context has been entered without a matching exit.
+    enter_count: u32,
+    /// The global object for this context.  Owned by the context; embedders
+    /// receive a non-owning pointer via [`stator_context_global`] and must
+    /// **not** call [`stator_object_destroy`] on it.
+    global: StatorObject,
 }
 
 // SAFETY: `StatorContext` only holds a pointer that is valid for the lifetime
@@ -280,7 +286,14 @@ pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut
     if isolate.is_null() {
         return std::ptr::null_mut();
     }
-    let ctx = Box::into_raw(Box::new(StatorContext { _isolate: isolate }));
+    let ctx = Box::into_raw(Box::new(StatorContext {
+        _isolate: isolate,
+        enter_count: 0,
+        global: StatorObject {
+            inner: JsObject::new(),
+            isolate,
+        },
+    }));
     // SAFETY: caller guarantees `isolate` is valid; `ctx` was just created.
     unsafe { (*isolate).current_context = ctx };
     ctx
@@ -311,6 +324,75 @@ pub unsafe extern "C" fn stator_context_destroy(ctx: *mut StatorContext) {
         // SAFETY: pointer was created by `Box::into_raw` in `stator_context_new`.
         drop(unsafe { Box::from_raw(ctx) });
     }
+}
+
+/// Mark `ctx` as entered on the current thread.
+///
+/// Each call to `stator_context_enter` must be balanced by a corresponding
+/// call to [`stator_context_exit`].  Entering a context also makes it the
+/// current context on its associated isolate.  Does nothing when `ctx` is null.
+///
+/// # Safety
+/// `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_context_enter(ctx: *mut StatorContext) {
+    if ctx.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `ctx` is valid.
+    unsafe {
+        (*ctx).enter_count = (*ctx).enter_count.saturating_add(1);
+        let isolate = (*ctx)._isolate;
+        if !isolate.is_null() {
+            (*isolate).current_context = ctx;
+        }
+    }
+}
+
+/// Unmark `ctx` as entered on the current thread.
+///
+/// Must be called once for every preceding [`stator_context_enter`] call.
+/// When the enter count reaches zero the context is no longer recorded as
+/// current on its associated isolate.  Does nothing when `ctx` is null.
+///
+/// # Safety
+/// `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_context_exit(ctx: *mut StatorContext) {
+    if ctx.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `ctx` is valid.
+    unsafe {
+        (*ctx).enter_count = (*ctx).enter_count.saturating_sub(1);
+        if (*ctx).enter_count == 0 {
+            let isolate = (*ctx)._isolate;
+            if !isolate.is_null() && (*isolate).current_context == ctx {
+                (*isolate).current_context = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+/// Return a non-owning pointer to the global object of `ctx`.
+///
+/// The returned pointer is valid for as long as `ctx` is alive.  **The caller
+/// must not pass the returned pointer to [`stator_object_destroy`]**; the
+/// global object is owned by the context and is freed when the context is
+/// destroyed via [`stator_context_destroy`].
+///
+/// Returns a null pointer when `ctx` is null.
+///
+/// # Safety
+/// `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_context_global(ctx: *mut StatorContext) -> *mut StatorObject {
+    if ctx.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `ctx` is valid; we return a pointer to the
+    // field inside the allocation, which is valid as long as `ctx` is alive.
+    unsafe { &raw mut (*ctx).global }
 }
 
 // ── Value ─────────────────────────────────────────────────────────────────────
@@ -1498,6 +1580,191 @@ mod tests {
         unsafe { stator_value_destroy(exc) };
 
         // Dispose — must not crash.
+        // SAFETY: `iso` is non-null and live.
+        unsafe { stator_isolate_dispose(iso) };
+    }
+
+    // ── Context enter / exit / global (P4) ───────────────────────────────────
+
+    #[test]
+    fn test_context_enter_makes_context_current() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+        // After `context_new` the context is already current; exit it so we
+        // can verify that `enter` restores it.
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_exit(ctx) };
+        // SAFETY: `iso` is valid.
+        assert!(unsafe { stator_isolate_get_current_context(iso.as_ptr()) }.is_null());
+        // Entering the context must make it current again.
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_enter(ctx) };
+        // SAFETY: `iso` is valid.
+        assert_eq!(
+            unsafe { stator_isolate_get_current_context(iso.as_ptr()) },
+            ctx
+        );
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_exit(ctx) };
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_destroy(ctx) };
+    }
+
+    #[test]
+    fn test_context_exit_clears_current_when_count_reaches_zero() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        // Enter twice, exit twice — current should be cleared after the last exit.
+        // SAFETY: `ctx` is valid.
+        unsafe { stator_context_enter(ctx) };
+        unsafe { stator_context_enter(ctx) };
+        unsafe { stator_context_exit(ctx) };
+        // Still entered once; should still be current.
+        // SAFETY: `iso` is valid.
+        assert_eq!(
+            unsafe { stator_isolate_get_current_context(iso.as_ptr()) },
+            ctx
+        );
+        // SAFETY: `ctx` is valid.
+        unsafe { stator_context_exit(ctx) };
+        // Enter count is now 0; context should no longer be current.
+        // SAFETY: `iso` is valid.
+        assert!(unsafe { stator_isolate_get_current_context(iso.as_ptr()) }.is_null());
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_destroy(ctx) };
+    }
+
+    #[test]
+    fn test_context_exit_without_enter_does_not_underflow() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        // Extra exits must not panic or underflow.
+        // SAFETY: `ctx` is valid.
+        unsafe { stator_context_exit(ctx) };
+        unsafe { stator_context_exit(ctx) };
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_destroy(ctx) };
+    }
+
+    #[test]
+    fn test_context_enter_null_is_safe() {
+        // SAFETY: null is documented as a no-op.
+        unsafe { stator_context_enter(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_context_exit_null_is_safe() {
+        // SAFETY: null is documented as a no-op.
+        unsafe { stator_context_exit(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_context_global_returns_nonnull() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+        // SAFETY: `ctx` is non-null and live.
+        let global = unsafe { stator_context_global(ctx) };
+        assert!(!global.is_null());
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_destroy(ctx) };
+    }
+
+    #[test]
+    fn test_context_global_null_returns_null() {
+        // SAFETY: null context is documented to return null.
+        let global = unsafe { stator_context_global(std::ptr::null_mut()) };
+        assert!(global.is_null());
+    }
+
+    #[test]
+    fn test_context_global_set_and_get_property() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        // SAFETY: `ctx` is non-null and live.
+        let global = unsafe { stator_context_global(ctx) };
+        assert!(!global.is_null());
+
+        // Store a property on the global object.
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 99.0) };
+        let key = c"answer";
+        // SAFETY: `global`, `key`, and `val` are all valid.
+        unsafe { stator_object_set(global, key.as_ptr(), val) };
+
+        // Retrieve the property from the global object.
+        // SAFETY: `global` and `key` are valid.
+        let got = unsafe { stator_object_get(global, key.as_ptr()) };
+        assert!(!got.is_null());
+        // SAFETY: `got` is non-null and live.
+        let n = unsafe { stator_value_as_number(got) };
+        assert!((n - 99.0).abs() < f64::EPSILON);
+
+        // Clean up owned handles.
+        // SAFETY: both pointers are non-null and live.
+        unsafe {
+            stator_value_destroy(val);
+            stator_value_destroy(got);
+        }
+        // Do NOT call stator_object_destroy(global) — it is owned by the context.
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_destroy(ctx) };
+    }
+
+    #[test]
+    fn test_full_context_lifecycle() {
+        // create → enter → access global → set property → exit → dispose
+        let iso = stator_isolate_new();
+        assert!(!iso.is_null());
+        // SAFETY: `iso` is valid.
+        unsafe { stator_isolate_enter(iso) };
+
+        // Create context and enter it.
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso) };
+        assert!(!ctx.is_null());
+        // SAFETY: `ctx` is valid.
+        unsafe { stator_context_enter(ctx) };
+        // SAFETY: `iso` is valid.
+        assert_eq!(unsafe { stator_isolate_get_current_context(iso) }, ctx);
+
+        // Access and use the global object.
+        // SAFETY: `ctx` is valid.
+        let global = unsafe { stator_context_global(ctx) };
+        assert!(!global.is_null());
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso, 7.0) };
+        let key = c"lucky";
+        // SAFETY: all pointers are valid.
+        unsafe { stator_object_set(global, key.as_ptr(), val) };
+        // SAFETY: `global` and `key` are valid.
+        let got = unsafe { stator_object_get(global, key.as_ptr()) };
+        assert!(!got.is_null());
+        // SAFETY: `got` is non-null and live.
+        assert!((unsafe { stator_value_as_number(got) } - 7.0).abs() < f64::EPSILON);
+        // SAFETY: both pointers are non-null and live.
+        unsafe {
+            stator_value_destroy(val);
+            stator_value_destroy(got);
+        }
+
+        // Exit and destroy context.
+        // SAFETY: `ctx` is valid.
+        unsafe { stator_context_exit(ctx) };
+        // SAFETY: `iso` is valid.
+        assert!(unsafe { stator_isolate_get_current_context(iso) }.is_null());
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_destroy(ctx) };
+
+        // Exit and dispose isolate.
+        // SAFETY: `iso` is valid.
+        unsafe { stator_isolate_exit(iso) };
         // SAFETY: `iso` is non-null and live.
         unsafe { stator_isolate_dispose(iso) };
     }
