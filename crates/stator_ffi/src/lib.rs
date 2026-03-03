@@ -404,10 +404,16 @@ pub unsafe extern "C" fn stator_context_global(ctx: *mut StatorContext) -> *mut 
 
 /// Internal storage for a [`StatorValue`].
 enum StatorValueInner {
+    /// The ECMAScript `undefined` primitive.
+    Undefined,
+    /// The ECMAScript `null` primitive.
+    Null,
     /// A double-precision floating-point number.
     Number(f64),
     /// A UTF-8 string stored as a null-terminated C string for easy FFI access.
     Str(CString),
+    /// A JavaScript boolean (`true` or `false`).
+    Boolean(bool),
 }
 
 /// An opaque handle to a JavaScript value (number or string).
@@ -498,6 +504,98 @@ pub unsafe extern "C" fn stator_value_new_string(
     val
 }
 
+/// Create a new `undefined` value.
+///
+/// Returns a null pointer if `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_new_undefined(
+    isolate: *mut StatorIsolate,
+) -> *mut StatorValue {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe { (*isolate).live_objects += 1 };
+    let val = Box::into_raw(Box::new(StatorValue {
+        inner: StatorValueInner::Undefined,
+        isolate,
+    }));
+    // Register with the active handle scope, if any.
+    // SAFETY: `isolate` is valid; `active_handle_scope` is either null or a
+    // valid live scope pointer.
+    unsafe {
+        let scope = (*isolate).active_handle_scope;
+        if !scope.is_null() {
+            (*scope).handles.push(val);
+        }
+    }
+    val
+}
+
+/// Create a new `null` value.
+///
+/// Returns a null pointer if `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_new_null(isolate: *mut StatorIsolate) -> *mut StatorValue {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe { (*isolate).live_objects += 1 };
+    let val = Box::into_raw(Box::new(StatorValue {
+        inner: StatorValueInner::Null,
+        isolate,
+    }));
+    // Register with the active handle scope, if any.
+    // SAFETY: `isolate` is valid; `active_handle_scope` is either null or a
+    // valid live scope pointer.
+    unsafe {
+        let scope = (*isolate).active_handle_scope;
+        if !scope.is_null() {
+            (*scope).handles.push(val);
+        }
+    }
+    val
+}
+
+/// Create a new boolean value.
+///
+/// Returns a null pointer if `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_new_boolean(
+    isolate: *mut StatorIsolate,
+    val: bool,
+) -> *mut StatorValue {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe { (*isolate).live_objects += 1 };
+    let result = Box::into_raw(Box::new(StatorValue {
+        inner: StatorValueInner::Boolean(val),
+        isolate,
+    }));
+    // Register with the active handle scope, if any.
+    // SAFETY: `isolate` is valid; `active_handle_scope` is either null or a
+    // valid live scope pointer.
+    unsafe {
+        let scope = (*isolate).active_handle_scope;
+        if !scope.is_null() {
+            (*scope).handles.push(result);
+        }
+    }
+    result
+}
+
 /// Destroy a value and decrement the isolate's live-object counter.
 ///
 /// # Safety
@@ -517,11 +615,18 @@ pub unsafe extern "C" fn stator_value_destroy(val: *mut StatorValue) {
     }
 }
 
-/// Return a static C string describing the type of `val`: `"number"` or
-/// `"string"`.
+/// Return a static C string describing the ECMAScript `typeof` for `val`.
 ///
-/// Returns `"undefined"` when `val` is null.  The returned pointer is valid
-/// for the lifetime of the process.
+/// | Value | Returned string |
+/// |---|---|
+/// | null pointer | `"undefined"` |
+/// | `Undefined` | `"undefined"` |
+/// | `Null` | `"object"` (per ECMAScript `typeof null === "object"`) |
+/// | `Number` | `"number"` |
+/// | `Str` | `"string"` |
+/// | `Boolean` | `"boolean"` |
+///
+/// The returned pointer is valid for the lifetime of the process.
 ///
 /// # Safety
 /// `val` must be either null or a valid, live [`StatorValue`] pointer.
@@ -532,8 +637,11 @@ pub unsafe extern "C" fn stator_value_type(val: *const StatorValue) -> *const c_
     }
     // SAFETY: caller guarantees `val` is valid.
     match unsafe { &(*val).inner } {
+        StatorValueInner::Undefined => c"undefined".as_ptr(),
+        StatorValueInner::Null => c"object".as_ptr(),
         StatorValueInner::Number(_) => c"number".as_ptr(),
         StatorValueInner::Str(_) => c"string".as_ptr(),
+        StatorValueInner::Boolean(_) => c"boolean".as_ptr(),
     }
 }
 
@@ -550,7 +658,15 @@ pub unsafe extern "C" fn stator_value_as_number(val: *const StatorValue) -> f64 
     // SAFETY: caller guarantees `val` is valid.
     match unsafe { &(*val).inner } {
         StatorValueInner::Number(n) => *n,
-        StatorValueInner::Str(_) => f64::NAN,
+        StatorValueInner::Boolean(b) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        StatorValueInner::Null => 0.0,
+        StatorValueInner::Undefined | StatorValueInner::Str(_) => f64::NAN,
     }
 }
 
@@ -569,8 +685,220 @@ pub unsafe extern "C" fn stator_value_as_string(val: *const StatorValue) -> *con
     // SAFETY: caller guarantees `val` is valid.
     match unsafe { &(*val).inner } {
         StatorValueInner::Str(cs) => cs.as_ptr(),
-        StatorValueInner::Number(_) => c"".as_ptr(),
+        StatorValueInner::Undefined
+        | StatorValueInner::Null
+        | StatorValueInner::Number(_)
+        | StatorValueInner::Boolean(_) => c"".as_ptr(),
     }
+}
+
+// ── Value type-checking predicates ───────────────────────────────────────────
+
+/// Return `true` if `val` is the ECMAScript `undefined` value.
+///
+/// A null pointer is treated as `undefined` (consistent with
+/// [`stator_value_type`]).
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_undefined(val: *const StatorValue) -> bool {
+    if val.is_null() {
+        return true;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    matches!(unsafe { &(*val).inner }, StatorValueInner::Undefined)
+}
+
+/// Return `true` if `val` is the ECMAScript `null` value.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_null(val: *const StatorValue) -> bool {
+    if val.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    matches!(unsafe { &(*val).inner }, StatorValueInner::Null)
+}
+
+/// Return `true` if `val` is a JavaScript string.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_string(val: *const StatorValue) -> bool {
+    if val.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    matches!(unsafe { &(*val).inner }, StatorValueInner::Str(_))
+}
+
+/// Return `true` if `val` is a JavaScript number.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_number(val: *const StatorValue) -> bool {
+    if val.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    matches!(unsafe { &(*val).inner }, StatorValueInner::Number(_))
+}
+
+/// Return `true` if `val` is a JavaScript boolean.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_boolean(val: *const StatorValue) -> bool {
+    if val.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    matches!(unsafe { &(*val).inner }, StatorValueInner::Boolean(_))
+}
+
+/// Return `true` if `val` is a JavaScript object (excluding `null`).
+///
+/// Always returns `false` in the current FFI surface; object values are not
+/// yet representable as [`StatorValue`] handles.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_object(_val: *const StatorValue) -> bool {
+    false
+}
+
+/// Return `true` if `val` is a callable JavaScript function.
+///
+/// Always returns `false` in the current FFI surface; function values are not
+/// yet representable as [`StatorValue`] handles.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_function(_val: *const StatorValue) -> bool {
+    false
+}
+
+/// Return `true` if `val` is a JavaScript `Array`.
+///
+/// Always returns `false` in the current FFI surface; array values are not
+/// yet representable as [`StatorValue`] handles.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_array(_val: *const StatorValue) -> bool {
+    false
+}
+
+/// Return `true` if `val` is a JavaScript number that can be represented
+/// as a 32-bit signed integer (i.e. finite, integer-valued, in the range
+/// `[−2³¹, 2³¹ − 1]`).
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_int32(val: *const StatorValue) -> bool {
+    if val.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::Number(n) => {
+            n.is_finite()
+                && n.fract() == 0.0
+                && *n >= f64::from(i32::MIN)
+                && *n <= f64::from(i32::MAX)
+        }
+        _ => false,
+    }
+}
+
+/// Return `true` if `val` is a JavaScript number that can be represented
+/// as a 32-bit unsigned integer (i.e. finite, integer-valued, in the range
+/// `[0, 2³² − 1]`).
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_uint32(val: *const StatorValue) -> bool {
+    if val.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `val` is valid.
+    match unsafe { &(*val).inner } {
+        StatorValueInner::Number(n) => {
+            n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= f64::from(u32::MAX)
+        }
+        _ => false,
+    }
+}
+
+/// Return `true` if `val` is a JavaScript `Date` object.
+///
+/// Always returns `false` in the current FFI surface; `Date` values are not
+/// yet representable as [`StatorValue`] handles.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_date(_val: *const StatorValue) -> bool {
+    false
+}
+
+/// Return `true` if `val` is a JavaScript `RegExp` object.
+///
+/// Always returns `false` in the current FFI surface; `RegExp` values are not
+/// yet representable as [`StatorValue`] handles.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_regexp(_val: *const StatorValue) -> bool {
+    false
+}
+
+/// Return `true` if `val` is a JavaScript `Promise` object.
+///
+/// Always returns `false` in the current FFI surface; `Promise` values are not
+/// yet representable as [`StatorValue`] handles.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_promise(_val: *const StatorValue) -> bool {
+    false
+}
+
+/// Return `true` if `val` is a JavaScript `Map` object.
+///
+/// Always returns `false` in the current FFI surface; `Map` values are not
+/// yet representable as [`StatorValue`] handles.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_map(_val: *const StatorValue) -> bool {
+    false
+}
+
+/// Return `true` if `val` is a JavaScript `Set` object.
+///
+/// Always returns `false` in the current FFI surface; `Set` values are not
+/// yet representable as [`StatorValue`] handles.
+///
+/// # Safety
+/// `val` must be either null or a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_value_is_set(_val: *const StatorValue) -> bool {
+    false
 }
 
 // ── Object ────────────────────────────────────────────────────────────────────
@@ -649,8 +977,11 @@ pub unsafe extern "C" fn stator_object_set(
     let key_str = unsafe { CStr::from_ptr(key) }.to_string_lossy();
     // SAFETY: caller guarantees `val` is valid.
     let js_val = match unsafe { &(*val).inner } {
+        StatorValueInner::Undefined => JsValue::Undefined,
+        StatorValueInner::Null => JsValue::Null,
         StatorValueInner::Number(n) => JsValue::HeapNumber(*n),
         StatorValueInner::Str(cs) => JsValue::String(cs.to_string_lossy().into_owned()),
+        StatorValueInner::Boolean(b) => JsValue::Boolean(*b),
     };
     // SAFETY: caller guarantees `obj` is valid.
     let _ = unsafe { (*obj).inner.set_property(&key_str, js_val) };
@@ -2525,5 +2856,387 @@ mod tests {
         // SAFETY: `escaped` is non-null and live.
         unsafe { stator_value_destroy(escaped) };
         assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 0);
+    }
+
+    // ── Value type-checking predicates (P4) ──────────────────────────────────
+
+    #[test]
+    fn test_value_is_undefined_null_ptr() {
+        // A null pointer is treated as undefined.
+        // SAFETY: null pointer is explicitly documented.
+        assert!(unsafe { stator_value_is_undefined(std::ptr::null()) });
+    }
+
+    #[test]
+    fn test_value_is_undefined_explicit_value() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_undefined(iso.as_ptr()) };
+        assert!(!val.is_null());
+        // SAFETY: `val` is non-null and live.
+        assert!(unsafe { stator_value_is_undefined(val) });
+        assert!(!unsafe { stator_value_is_null(val) });
+        assert!(!unsafe { stator_value_is_number(val) });
+        assert!(!unsafe { stator_value_is_string(val) });
+        assert!(!unsafe { stator_value_is_boolean(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_null_explicit_value() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_null(iso.as_ptr()) };
+        assert!(!val.is_null());
+        // SAFETY: `val` is non-null and live.
+        assert!(unsafe { stator_value_is_null(val) });
+        assert!(!unsafe { stator_value_is_undefined(val) });
+        assert!(!unsafe { stator_value_is_number(val) });
+        assert!(!unsafe { stator_value_is_string(val) });
+        assert!(!unsafe { stator_value_is_boolean(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_boolean_true() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_boolean(iso.as_ptr(), true) };
+        assert!(!val.is_null());
+        // SAFETY: `val` is non-null and live.
+        assert!(unsafe { stator_value_is_boolean(val) });
+        assert!(!unsafe { stator_value_is_undefined(val) });
+        assert!(!unsafe { stator_value_is_null(val) });
+        assert!(!unsafe { stator_value_is_number(val) });
+        assert!(!unsafe { stator_value_is_string(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_boolean_false() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_boolean(iso.as_ptr(), false) };
+        assert!(!val.is_null());
+        // SAFETY: `val` is non-null and live.
+        assert!(unsafe { stator_value_is_boolean(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_number_explicit_value() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 42.0) };
+        // SAFETY: `val` is non-null and live.
+        assert!(unsafe { stator_value_is_number(val) });
+        assert!(!unsafe { stator_value_is_undefined(val) });
+        assert!(!unsafe { stator_value_is_null(val) });
+        assert!(!unsafe { stator_value_is_string(val) });
+        assert!(!unsafe { stator_value_is_boolean(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_string_explicit_value() {
+        let iso = IsolateGuard::new();
+        let s = b"hello\0";
+        // SAFETY: `iso` is valid; `s` pointer is valid for 5 bytes.
+        let val = unsafe { stator_value_new_string(iso.as_ptr(), s.as_ptr() as *const c_char, 5) };
+        // SAFETY: `val` is non-null and live.
+        assert!(unsafe { stator_value_is_string(val) });
+        assert!(!unsafe { stator_value_is_undefined(val) });
+        assert!(!unsafe { stator_value_is_null(val) });
+        assert!(!unsafe { stator_value_is_number(val) });
+        assert!(!unsafe { stator_value_is_boolean(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_object_always_false() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        // SAFETY: `val` is non-null and live.
+        assert!(!unsafe { stator_value_is_object(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+        // Also check null pointer.
+        assert!(!unsafe { stator_value_is_object(std::ptr::null()) });
+    }
+
+    #[test]
+    fn test_value_is_function_always_false() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        // SAFETY: `val` is non-null and live.
+        assert!(!unsafe { stator_value_is_function(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_array_always_false() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        // SAFETY: `val` is non-null and live.
+        assert!(!unsafe { stator_value_is_array(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_int32_valid() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 100.0) };
+        // SAFETY: `val` is non-null and live.
+        assert!(unsafe { stator_value_is_int32(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_int32_negative() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), -1.0) };
+        // SAFETY: `val` is non-null and live.
+        assert!(unsafe { stator_value_is_int32(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_int32_float_is_false() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 1.5) };
+        // SAFETY: `val` is non-null and live.
+        assert!(!unsafe { stator_value_is_int32(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_int32_nan_is_false() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), f64::NAN) };
+        // SAFETY: `val` is non-null and live.
+        assert!(!unsafe { stator_value_is_int32(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_int32_boundary() {
+        let iso = IsolateGuard::new();
+        // Max i32.
+        // SAFETY: `iso` is valid.
+        let max = unsafe { stator_value_new_number(iso.as_ptr(), f64::from(i32::MAX)) };
+        // SAFETY: `max` is non-null and live.
+        assert!(unsafe { stator_value_is_int32(max) });
+        // SAFETY: `max` is non-null and live.
+        unsafe { stator_value_destroy(max) };
+        // Beyond i32 range.
+        // SAFETY: `iso` is valid.
+        let over = unsafe { stator_value_new_number(iso.as_ptr(), f64::from(i32::MAX) + 1.0) };
+        // SAFETY: `over` is non-null and live.
+        assert!(!unsafe { stator_value_is_int32(over) });
+        // SAFETY: `over` is non-null and live.
+        unsafe { stator_value_destroy(over) };
+    }
+
+    #[test]
+    fn test_value_is_uint32_valid() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 42.0) };
+        // SAFETY: `val` is non-null and live.
+        assert!(unsafe { stator_value_is_uint32(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_uint32_negative_is_false() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), -1.0) };
+        // SAFETY: `val` is non-null and live.
+        assert!(!unsafe { stator_value_is_uint32(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_uint32_boundary() {
+        let iso = IsolateGuard::new();
+        // Max u32.
+        // SAFETY: `iso` is valid.
+        let max = unsafe { stator_value_new_number(iso.as_ptr(), f64::from(u32::MAX)) };
+        // SAFETY: `max` is non-null and live.
+        assert!(unsafe { stator_value_is_uint32(max) });
+        // SAFETY: `max` is non-null and live.
+        unsafe { stator_value_destroy(max) };
+        // Zero.
+        // SAFETY: `iso` is valid.
+        let zero = unsafe { stator_value_new_number(iso.as_ptr(), 0.0) };
+        // SAFETY: `zero` is non-null and live.
+        assert!(unsafe { stator_value_is_uint32(zero) });
+        // SAFETY: `zero` is non-null and live.
+        unsafe { stator_value_destroy(zero) };
+    }
+
+    #[test]
+    fn test_value_is_date_always_false() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        // SAFETY: `val` is non-null and live.
+        assert!(!unsafe { stator_value_is_date(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_regexp_always_false() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        // SAFETY: `val` is non-null and live.
+        assert!(!unsafe { stator_value_is_regexp(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_promise_always_false() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        // SAFETY: `val` is non-null and live.
+        assert!(!unsafe { stator_value_is_promise(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_map_always_false() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        // SAFETY: `val` is non-null and live.
+        assert!(!unsafe { stator_value_is_map(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_set_always_false() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        // SAFETY: `val` is non-null and live.
+        assert!(!unsafe { stator_value_is_set(val) });
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_new_undefined_null_isolate_returns_null() {
+        // SAFETY: null isolate is documented to return null.
+        let val = unsafe { stator_value_new_undefined(std::ptr::null_mut()) };
+        assert!(val.is_null());
+    }
+
+    #[test]
+    fn test_value_new_null_null_isolate_returns_null() {
+        // SAFETY: null isolate is documented to return null.
+        let val = unsafe { stator_value_new_null(std::ptr::null_mut()) };
+        assert!(val.is_null());
+    }
+
+    #[test]
+    fn test_value_new_boolean_null_isolate_returns_null() {
+        // SAFETY: null isolate is documented to return null.
+        let val = unsafe { stator_value_new_boolean(std::ptr::null_mut(), true) };
+        assert!(val.is_null());
+    }
+
+    #[test]
+    fn test_value_type_undefined() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_undefined(iso.as_ptr()) };
+        // SAFETY: `val` is non-null and live.
+        let type_ptr = unsafe { stator_value_type(val) };
+        // SAFETY: returned pointer is static.
+        let type_str = unsafe { CStr::from_ptr(type_ptr) }.to_str().unwrap();
+        assert_eq!(type_str, "undefined");
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_type_null_value() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_null(iso.as_ptr()) };
+        // SAFETY: `val` is non-null and live.
+        let type_ptr = unsafe { stator_value_type(val) };
+        // SAFETY: returned pointer is static.
+        let type_str = unsafe { CStr::from_ptr(type_ptr) }.to_str().unwrap();
+        // typeof null === "object" in ECMAScript.
+        assert_eq!(type_str, "object");
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_type_boolean() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_boolean(iso.as_ptr(), true) };
+        // SAFETY: `val` is non-null and live.
+        let type_ptr = unsafe { stator_value_type(val) };
+        // SAFETY: returned pointer is static.
+        let type_str = unsafe { CStr::from_ptr(type_ptr) }.to_str().unwrap();
+        assert_eq!(type_str, "boolean");
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_value_is_number_null_ptr() {
+        // SAFETY: null pointer is documented.
+        assert!(!unsafe { stator_value_is_number(std::ptr::null()) });
+    }
+
+    #[test]
+    fn test_value_is_string_null_ptr() {
+        // SAFETY: null pointer is documented.
+        assert!(!unsafe { stator_value_is_string(std::ptr::null()) });
+    }
+
+    #[test]
+    fn test_value_is_int32_null_ptr() {
+        // SAFETY: null pointer is documented.
+        assert!(!unsafe { stator_value_is_int32(std::ptr::null()) });
+    }
+
+    #[test]
+    fn test_value_is_uint32_null_ptr() {
+        // SAFETY: null pointer is documented.
+        assert!(!unsafe { stator_value_is_uint32(std::ptr::null()) });
     }
 }

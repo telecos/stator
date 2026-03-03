@@ -353,6 +353,36 @@ struct StatorValue *stator_value_new_string(struct StatorIsolate *isolate,
                                             size_t len);
 
 /**
+ * Create a new `undefined` value.
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_value_new_undefined(struct StatorIsolate *isolate);
+
+/**
+ * Create a new `null` value.
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_value_new_null(struct StatorIsolate *isolate);
+
+/**
+ * Create a new boolean value.
+ *
+ * Returns a null pointer if `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorValue *stator_value_new_boolean(struct StatorIsolate *isolate, bool val);
+
+/**
  * Destroy a value and decrement the isolate's live-object counter.
  *
  * # Safety
@@ -362,11 +392,18 @@ struct StatorValue *stator_value_new_string(struct StatorIsolate *isolate,
 void stator_value_destroy(struct StatorValue *val);
 
 /**
- * Return a static C string describing the type of `val`: `"number"` or
- * `"string"`.
+ * Return a static C string describing the ECMAScript `typeof` for `val`.
  *
- * Returns `"undefined"` when `val` is null.  The returned pointer is valid
- * for the lifetime of the process.
+ * | Value | Returned string |
+ * |---|---|
+ * | null pointer | `"undefined"` |
+ * | `Undefined` | `"undefined"` |
+ * | `Null` | `"object"` (per ECMAScript `typeof null === "object"`) |
+ * | `Number` | `"number"` |
+ * | `Str` | `"string"` |
+ * | `Boolean` | `"boolean"` |
+ *
+ * The returned pointer is valid for the lifetime of the process.
  *
  * # Safety
  * `val` must be either null or a valid, live [`StatorValue`] pointer.
@@ -392,6 +429,157 @@ double stator_value_as_number(const struct StatorValue *val);
  * `val` must be either null or a valid, live [`StatorValue`] pointer.
  */
 const char *stator_value_as_string(const struct StatorValue *val);
+
+/**
+ * Return `true` if `val` is the ECMAScript `undefined` value.
+ *
+ * A null pointer is treated as `undefined` (consistent with
+ * [`stator_value_type`]).
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_undefined(const struct StatorValue *val);
+
+/**
+ * Return `true` if `val` is the ECMAScript `null` value.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_null(const struct StatorValue *val);
+
+/**
+ * Return `true` if `val` is a JavaScript string.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_string(const struct StatorValue *val);
+
+/**
+ * Return `true` if `val` is a JavaScript number.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_number(const struct StatorValue *val);
+
+/**
+ * Return `true` if `val` is a JavaScript boolean.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_boolean(const struct StatorValue *val);
+
+/**
+ * Return `true` if `val` is a JavaScript object (excluding `null`).
+ *
+ * Always returns `false` in the current FFI surface; object values are not
+ * yet representable as [`StatorValue`] handles.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_object(const struct StatorValue *_val);
+
+/**
+ * Return `true` if `val` is a callable JavaScript function.
+ *
+ * Always returns `false` in the current FFI surface; function values are not
+ * yet representable as [`StatorValue`] handles.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_function(const struct StatorValue *_val);
+
+/**
+ * Return `true` if `val` is a JavaScript `Array`.
+ *
+ * Always returns `false` in the current FFI surface; array values are not
+ * yet representable as [`StatorValue`] handles.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_array(const struct StatorValue *_val);
+
+/**
+ * Return `true` if `val` is a JavaScript number that can be represented
+ * as a 32-bit signed integer (i.e. finite, integer-valued, in the range
+ * `[−2³¹, 2³¹ − 1]`).
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_int32(const struct StatorValue *val);
+
+/**
+ * Return `true` if `val` is a JavaScript number that can be represented
+ * as a 32-bit unsigned integer (i.e. finite, integer-valued, in the range
+ * `[0, 2³² − 1]`).
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_uint32(const struct StatorValue *val);
+
+/**
+ * Return `true` if `val` is a JavaScript `Date` object.
+ *
+ * Always returns `false` in the current FFI surface; `Date` values are not
+ * yet representable as [`StatorValue`] handles.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_date(const struct StatorValue *_val);
+
+/**
+ * Return `true` if `val` is a JavaScript `RegExp` object.
+ *
+ * Always returns `false` in the current FFI surface; `RegExp` values are not
+ * yet representable as [`StatorValue`] handles.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_regexp(const struct StatorValue *_val);
+
+/**
+ * Return `true` if `val` is a JavaScript `Promise` object.
+ *
+ * Always returns `false` in the current FFI surface; `Promise` values are not
+ * yet representable as [`StatorValue`] handles.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_promise(const struct StatorValue *_val);
+
+/**
+ * Return `true` if `val` is a JavaScript `Map` object.
+ *
+ * Always returns `false` in the current FFI surface; `Map` values are not
+ * yet representable as [`StatorValue`] handles.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_map(const struct StatorValue *_val);
+
+/**
+ * Return `true` if `val` is a JavaScript `Set` object.
+ *
+ * Always returns `false` in the current FFI surface; `Set` values are not
+ * yet representable as [`StatorValue`] handles.
+ *
+ * # Safety
+ * `val` must be either null or a valid, live [`StatorValue`] pointer.
+ */
+bool stator_value_is_set(const struct StatorValue *_val);
 
 /**
  * Create a new, empty JavaScript object.
