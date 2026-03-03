@@ -40,7 +40,7 @@ typedef struct StatorValue StatorValue;
 typedef struct StatorObject StatorObject;
 
 /**
- * A compiled script handle.
+ * An opaque handle to a compiled JavaScript script.
  *
  * Returned by stator_script_compile().  Call stator_script_get_error() to
  * determine whether compilation succeeded, stator_bytecode_dump() to print
@@ -55,6 +55,32 @@ typedef struct StatorScript StatorScript;
  * Must be destroyed with stator_platform_destroy() when no longer needed.
  */
 typedef struct StatorPlatform StatorPlatform;
+
+/**
+ * An opaque handle scope that manages the lifetime of StatorValue handles.
+ *
+ * All StatorValue handles created (via stator_value_new_number() or
+ * stator_value_new_string()) while a handle scope is the innermost open scope
+ * on an isolate are automatically registered with that scope and will be freed
+ * when stator_handle_scope_close() is called.
+ *
+ * The embedder must NOT call stator_value_destroy() on scope-owned handles.
+ *
+ * Created by stator_handle_scope_new().
+ * Closed (and all owned values freed) by stator_handle_scope_close().
+ */
+typedef struct StatorHandleScope StatorHandleScope;
+
+/**
+ * An opaque escapable handle scope.
+ *
+ * Like StatorHandleScope, but allows a single value to be promoted ("escaped")
+ * into the enclosing scope via stator_escapable_handle_scope_escape().
+ *
+ * Created by stator_escapable_handle_scope_new().
+ * Closed by stator_escapable_handle_scope_close().
+ */
+typedef struct StatorEscapableHandleScope StatorEscapableHandleScope;
 
 /* -------------------------------------------------------------------------
  * Platform vtable
@@ -556,6 +582,91 @@ int stator_value_to_string_utf8(const StatorValue *val, char *buf, size_t buf_le
 void stator_register_native_function(StatorContext    *ctx,
                                      const char       *name,
                                      StatorNativeCallback callback);
+ * Handle scope lifecycle
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Open a new handle scope on isolate.
+ *
+ * All StatorValue handles created (via stator_value_new_number() or
+ * stator_value_new_string()) after this call, and before the matching
+ * stator_handle_scope_close(), are owned by the returned scope and will be
+ * freed automatically when the scope is closed.
+ *
+ * The embedder must NOT call stator_value_destroy() on scope-owned handles.
+ *
+ * Handle scopes nest: it is valid to open multiple scopes and they must be
+ * closed in LIFO order.
+ *
+ * Returns NULL if isolate is NULL.  The caller must eventually pass the
+ * returned pointer to stator_handle_scope_close().
+ *
+ * @param isolate  A valid, non-NULL isolate pointer.
+ * @return         A new StatorHandleScope*, or NULL if isolate is NULL.
+ */
+StatorHandleScope *stator_handle_scope_new(StatorIsolate *isolate);
+
+/**
+ * Close a handle scope and destroy all values registered with it.
+ *
+ * After this call, all StatorValue pointers created while scope was active
+ * are invalid.  The previous scope (if any) is restored as the active scope.
+ *
+ * Does nothing if scope is NULL.
+ *
+ * @param scope  A non-NULL pointer returned by stator_handle_scope_new().
+ *               Must be the innermost open scope.  Must not be used after
+ *               this call.
+ */
+void stator_handle_scope_close(StatorHandleScope *scope);
+
+/**
+ * Open a new escapable handle scope on isolate.
+ *
+ * Like stator_handle_scope_new(), but allows a single value to be promoted
+ * into the enclosing scope via stator_escapable_handle_scope_escape().
+ *
+ * Returns NULL if isolate is NULL.  The caller must eventually pass the
+ * returned pointer to stator_escapable_handle_scope_close().
+ *
+ * @param isolate  A valid, non-NULL isolate pointer.
+ * @return         A new StatorEscapableHandleScope*, or NULL if isolate is
+ *                 NULL.
+ */
+StatorEscapableHandleScope *stator_escapable_handle_scope_new(StatorIsolate *isolate);
+
+/**
+ * Escape val from scope, promoting it into the enclosing scope.
+ *
+ * Removes val from scope's tracked handles so it will not be destroyed when
+ * the scope is closed.  If there is an enclosing scope, val is registered
+ * there; otherwise the caller takes ownership and must eventually pass val to
+ * stator_value_destroy().
+ *
+ * Returns val unchanged (for convenient chaining), or NULL if scope or val
+ * is NULL.
+ *
+ * Each value may only be escaped once.
+ *
+ * @param scope  A valid StatorEscapableHandleScope pointer, or NULL.
+ * @param val    A non-NULL StatorValue pointer registered with scope.
+ * @return       val, or NULL if scope or val is NULL.
+ */
+StatorValue *stator_escapable_handle_scope_escape(StatorEscapableHandleScope *scope,
+                                                  StatorValue               *val);
+
+/**
+ * Close an escapable handle scope and destroy all non-escaped values.
+ *
+ * Equivalent to stator_handle_scope_close() for the escapable variant.
+ *
+ * Does nothing if scope is NULL.
+ *
+ * @param scope  A non-NULL pointer returned by
+ *               stator_escapable_handle_scope_new().  Must be the innermost
+ *               open scope.  Must not be used after this call.
+ */
+void stator_escapable_handle_scope_close(StatorEscapableHandleScope *scope);
 
 /* -------------------------------------------------------------------------
  * Platform (embedder-provided task scheduling and timing)

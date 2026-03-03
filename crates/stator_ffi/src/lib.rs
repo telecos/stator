@@ -49,6 +49,10 @@ pub struct StatorIsolate {
     /// Non-owning; the value is owned by the embedder.  `None` means no
     /// pending exception is set.
     pending_exception: Option<*mut StatorValue>,
+    /// The innermost active [`StatorHandleScope`] on this isolate, or null if
+    /// no scope is currently open.  This forms a linked list via each scope's
+    /// `previous` field.
+    active_handle_scope: *mut StatorHandleScope,
 }
 
 // SAFETY: `StatorIsolate` contains raw pointer fields that are only ever
@@ -70,6 +74,7 @@ pub extern "C" fn stator_isolate_create() -> *mut StatorIsolate {
         enter_count: 0,
         current_context: std::ptr::null_mut(),
         pending_exception: None,
+        active_handle_scope: std::ptr::null_mut(),
     }))
 }
 
@@ -450,10 +455,20 @@ pub unsafe extern "C" fn stator_value_new_number(
     }
     // SAFETY: caller guarantees `isolate` is valid.
     unsafe { (*isolate).live_objects += 1 };
-    Box::into_raw(Box::new(StatorValue {
+    let val = Box::into_raw(Box::new(StatorValue {
         inner: StatorValueInner::Number(val),
         isolate,
-    }))
+    }));
+    // Register with the active handle scope, if any.
+    // SAFETY: `isolate` is valid; `active_handle_scope` is either null or a
+    // valid live scope pointer.
+    unsafe {
+        let scope = (*isolate).active_handle_scope;
+        if !scope.is_null() {
+            (*scope).handles.push(val);
+        }
+    }
+    val
 }
 
 /// Create a new string value from a buffer of `len` bytes.
@@ -482,10 +497,20 @@ pub unsafe extern "C" fn stator_value_new_string(
     let cstring = unsafe { CString::from_vec_unchecked(bytes[..valid_len].to_vec()) };
     // SAFETY: caller guarantees `isolate` is valid.
     unsafe { (*isolate).live_objects += 1 };
-    Box::into_raw(Box::new(StatorValue {
+    let val = Box::into_raw(Box::new(StatorValue {
         inner: StatorValueInner::Str(cstring),
         isolate,
-    }))
+    }));
+    // Register with the active handle scope, if any.
+    // SAFETY: `isolate` is valid; `active_handle_scope` is either null or a
+    // valid live scope pointer.
+    unsafe {
+        let scope = (*isolate).active_handle_scope;
+        if !scope.is_null() {
+            (*scope).handles.push(val);
+        }
+    }
+    val
 }
 
 /// Destroy a value and decrement the isolate's live-object counter.
@@ -1250,6 +1275,221 @@ fn jsvalue_to_stator_value_inner(v: &JsValue) -> StatorValueInner {
                 ))
             }
         }
+// ── HandleScope ───────────────────────────────────────────────────────────────
+
+/// An opaque handle scope that manages the lifetime of [`StatorValue`] handles
+/// created while the scope is open.
+///
+/// When a handle scope is open on an isolate, any value created via
+/// [`stator_value_new_number`] or [`stator_value_new_string`] is automatically
+/// registered with the innermost open scope.  Calling
+/// [`stator_handle_scope_close`] destroys all registered values and restores
+/// the previous scope.
+///
+/// Handle scopes nest: opening a second scope while one is already open is
+/// valid; closing it restores the outer scope.
+///
+/// # Ownership
+/// Values registered with a scope are **owned by the scope**.  The embedder
+/// must **not** call [`stator_value_destroy`] on those values; doing so would
+/// result in a double-free.
+pub struct StatorHandleScope {
+    isolate: *mut StatorIsolate,
+    /// Values allocated while this scope was the active scope.
+    handles: Vec<*mut StatorValue>,
+    /// The scope that was active before this one was pushed.  Restored when
+    /// this scope is closed.
+    previous: *mut StatorHandleScope,
+}
+
+// SAFETY: `StatorHandleScope` is single-threaded; same rationale as
+// `StatorIsolate`.
+unsafe impl Send for StatorHandleScope {}
+
+/// Open a new handle scope on `isolate`.
+///
+/// All [`StatorValue`] handles created after this call (and before the
+/// corresponding [`stator_handle_scope_close`]) are owned by the returned
+/// scope and will be destroyed automatically when the scope is closed.
+///
+/// Returns a null pointer if `isolate` is null.  The caller must eventually
+/// pass the returned pointer to [`stator_handle_scope_close`].
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_handle_scope_new(
+    isolate: *mut StatorIsolate,
+) -> *mut StatorHandleScope {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    let previous = unsafe { (*isolate).active_handle_scope };
+    let scope = Box::into_raw(Box::new(StatorHandleScope {
+        isolate,
+        handles: Vec::new(),
+        previous,
+    }));
+    // SAFETY: `isolate` is valid; `scope` was just created.
+    unsafe { (*isolate).active_handle_scope = scope };
+    scope
+}
+
+/// Close a handle scope and destroy all values registered with it.
+///
+/// After this call, all [`StatorValue`] pointers that were created while
+/// `scope` was the active scope are invalid.  The previous scope (if any) is
+/// restored as the active scope on the isolate.
+///
+/// Does nothing if `scope` is null.
+///
+/// # Safety
+/// - `scope` must be a non-null pointer returned by [`stator_handle_scope_new`].
+/// - `scope` must be the *innermost* open scope on its isolate (i.e. handle
+///   scopes must be closed in LIFO order).
+/// - `scope` must not be used again after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_handle_scope_close(scope: *mut StatorHandleScope) {
+    if scope.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `scope` is valid.
+    unsafe {
+        let isolate = (*scope).isolate;
+        // Restore the previous scope on the isolate.
+        if !isolate.is_null() {
+            (*isolate).active_handle_scope = (*scope).previous;
+        }
+        // Destroy every value registered with this scope.
+        for val in (*scope).handles.drain(..) {
+            // SAFETY: each `val` was allocated by `stator_value_new_*` and is
+            // still live (the embedder must not have called `stator_value_destroy`
+            // on scope-owned values).
+            stator_value_destroy(val);
+        }
+        drop(Box::from_raw(scope));
+    }
+}
+
+// ── EscapableHandleScope ──────────────────────────────────────────────────────
+
+/// An opaque escapable handle scope.
+///
+/// Works like [`StatorHandleScope`] but allows a single value to be
+/// *escaped* — promoted into the enclosing scope (or left as an embedder-owned
+/// handle if there is no enclosing scope) — via
+/// [`stator_escapable_handle_scope_escape`].
+///
+/// Created by [`stator_escapable_handle_scope_new`] and closed (and its
+/// remaining values destroyed) by [`stator_escapable_handle_scope_close`].
+pub struct StatorEscapableHandleScope {
+    /// Inner scope that manages handle tracking and nesting.
+    inner: StatorHandleScope,
+}
+
+// SAFETY: same rationale as `StatorHandleScope`.
+unsafe impl Send for StatorEscapableHandleScope {}
+
+/// Open a new escapable handle scope on `isolate`.
+///
+/// Returns a null pointer if `isolate` is null.  The caller must eventually
+/// pass the returned pointer to [`stator_escapable_handle_scope_close`].
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_escapable_handle_scope_new(
+    isolate: *mut StatorIsolate,
+) -> *mut StatorEscapableHandleScope {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    let previous = unsafe { (*isolate).active_handle_scope };
+    let scope = Box::into_raw(Box::new(StatorEscapableHandleScope {
+        inner: StatorHandleScope {
+            isolate,
+            handles: Vec::new(),
+            previous,
+        },
+    }));
+    // Point the isolate's active scope at the inner `StatorHandleScope` so
+    // that value-creation functions register handles in this scope.
+    // SAFETY: `scope` was just created; `isolate` is valid.
+    unsafe { (*isolate).active_handle_scope = &raw mut (*scope).inner };
+    scope
+}
+
+/// Escape `val` from `scope`, promoting it into the enclosing scope.
+///
+/// Removes `val` from `scope`'s tracked handles (so it will not be destroyed
+/// when the scope is closed) and, if there is an enclosing scope, registers
+/// it there.  If there is no enclosing scope the caller takes ownership and
+/// must eventually pass `val` to [`stator_value_destroy`].
+///
+/// Returns `val` unchanged (for convenient chaining in C/C++ callers), or a
+/// null pointer if `scope` or `val` is null.
+///
+/// # Safety
+/// - `scope` must be a non-null, valid pointer to a live
+///   [`StatorEscapableHandleScope`].
+/// - `val` must be a non-null pointer that is currently registered with
+///   `scope` (i.e. it was created while `scope` was the active scope).
+/// - Each value may only be escaped once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_escapable_handle_scope_escape(
+    scope: *mut StatorEscapableHandleScope,
+    val: *mut StatorValue,
+) -> *mut StatorValue {
+    if scope.is_null() || val.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `scope` is valid.
+    unsafe {
+        // Remove `val` from this scope's handle list so it won't be destroyed
+        // when the scope closes.
+        (*scope).inner.handles.retain(|&h| h != val);
+
+        // Register `val` with the enclosing scope (if any).
+        let previous = (*scope).inner.previous;
+        if !previous.is_null() {
+            (*previous).handles.push(val);
+        }
+    }
+    val
+}
+
+/// Close an escapable handle scope and destroy all non-escaped values.
+///
+/// Equivalent in behaviour to [`stator_handle_scope_close`] for the escapable
+/// variant.
+///
+/// # Safety
+/// - `scope` must be a non-null pointer returned by
+///   [`stator_escapable_handle_scope_new`].
+/// - `scope` must be the innermost open scope on its isolate.
+/// - `scope` must not be used again after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_escapable_handle_scope_close(
+    scope: *mut StatorEscapableHandleScope,
+) {
+    if scope.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `scope` is valid.
+    unsafe {
+        let isolate = (*scope).inner.isolate;
+        // Restore the previous scope on the isolate.
+        if !isolate.is_null() {
+            (*isolate).active_handle_scope = (*scope).inner.previous;
+        }
+        // Destroy every non-escaped value registered with this scope.
+        for val in (*scope).inner.handles.drain(..) {
+            // SAFETY: same as in `stator_handle_scope_close`.
+            stator_value_destroy(val);
+        }
+        drop(Box::from_raw(scope));
     }
 }
 
@@ -2306,5 +2546,277 @@ mod tests {
         );
         // SAFETY: `platform` is non-null and live.
         unsafe { stator_platform_destroy(platform) };
+    }
+
+    // ── HandleScope ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_handle_scope_new_returns_nonnull() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let scope = unsafe { stator_handle_scope_new(iso.as_ptr()) };
+        assert!(!scope.is_null());
+        // SAFETY: `scope` is non-null and live; it is the innermost scope.
+        unsafe { stator_handle_scope_close(scope) };
+    }
+
+    #[test]
+    fn test_handle_scope_null_isolate_returns_null() {
+        // SAFETY: null isolate is documented to return null.
+        let scope = unsafe { stator_handle_scope_new(std::ptr::null_mut()) };
+        assert!(scope.is_null());
+    }
+
+    #[test]
+    fn test_handle_scope_close_null_is_safe() {
+        // SAFETY: null is documented as a no-op.
+        unsafe { stator_handle_scope_close(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_handle_scope_owns_values_and_destroys_on_close() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let scope = unsafe { stator_handle_scope_new(iso.as_ptr()) };
+        assert!(!scope.is_null());
+
+        // Create two values while the scope is active — they are scope-owned.
+        // SAFETY: `iso` is valid.
+        let v1 = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        let v2 = unsafe { stator_value_new_number(iso.as_ptr(), 2.0) };
+        assert!(!v1.is_null());
+        assert!(!v2.is_null());
+
+        // Both should be readable before the scope is closed.
+        // SAFETY: `v1` and `v2` are non-null and live.
+        assert!((unsafe { stator_value_as_number(v1) } - 1.0).abs() < f64::EPSILON);
+        assert!((unsafe { stator_value_as_number(v2) } - 2.0).abs() < f64::EPSILON);
+
+        // live_objects should be 2.
+        // SAFETY: `iso` is valid.
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 2);
+
+        // Closing the scope frees both values automatically.
+        // SAFETY: `scope` is non-null and live; it is the innermost scope.
+        unsafe { stator_handle_scope_close(scope) };
+
+        // live_objects should be back to 0.
+        // SAFETY: `iso` is valid.
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 0);
+    }
+
+    #[test]
+    fn test_handle_scope_with_string_value() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let scope = unsafe { stator_handle_scope_new(iso.as_ptr()) };
+
+        let s = b"scoped\0";
+        // SAFETY: `iso` is valid; `s` is valid for 6 bytes.
+        let val = unsafe { stator_value_new_string(iso.as_ptr(), s.as_ptr() as *const c_char, 6) };
+        assert!(!val.is_null());
+
+        // SAFETY: `val` is non-null and live.
+        let ptr = unsafe { stator_value_as_string(val) };
+        // SAFETY: returned pointer is valid while `val` is alive.
+        let got = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert_eq!(got, "scoped");
+
+        // Closing the scope frees the string value.
+        // SAFETY: `scope` is non-null and live.
+        unsafe { stator_handle_scope_close(scope) };
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 0);
+    }
+
+    #[test]
+    fn test_handle_scope_restores_previous_scope_on_close() {
+        let iso = IsolateGuard::new();
+        // Open outer scope.
+        // SAFETY: `iso` is valid.
+        let outer = unsafe { stator_handle_scope_new(iso.as_ptr()) };
+        // SAFETY: `iso` is valid; `outer` is the active scope.
+        let _ = unsafe { stator_value_new_number(iso.as_ptr(), 10.0) };
+
+        // Open inner scope — it shadows the outer.
+        // SAFETY: `iso` is valid.
+        let inner = unsafe { stator_handle_scope_new(iso.as_ptr()) };
+        // SAFETY: `iso` is valid; `inner` is the active scope.
+        let _ = unsafe { stator_value_new_number(iso.as_ptr(), 20.0) };
+
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 2);
+
+        // Close inner scope — only the inner value is destroyed; outer scope is restored.
+        // SAFETY: `inner` is non-null and live; it is the innermost scope.
+        unsafe { stator_handle_scope_close(inner) };
+        // Inner value is freed; outer value still lives (owned by outer scope).
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 1);
+        // After closing inner, the outer scope is the active scope again.
+        // SAFETY: `iso` is valid.
+        assert_eq!(
+            unsafe { (*iso.as_ptr()).active_handle_scope },
+            outer as *mut StatorHandleScope
+        );
+
+        // Close outer scope — the outer value is destroyed.
+        // SAFETY: `outer` is non-null and live; it is now the innermost scope.
+        unsafe { stator_handle_scope_close(outer) };
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 0);
+        // No active scope remains.
+        assert!(unsafe { (*iso.as_ptr()).active_handle_scope }.is_null());
+    }
+
+    #[test]
+    fn test_values_without_scope_are_embedder_owned() {
+        // When no scope is open, behavior is unchanged: the embedder must call
+        // stator_value_destroy manually.
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid; no scope is active.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 42.0) };
+        assert!(!val.is_null());
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 1);
+        // SAFETY: `val` is non-null and live.
+        unsafe { stator_value_destroy(val) };
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 0);
+    }
+
+    // ── EscapableHandleScope ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_escapable_handle_scope_new_returns_nonnull() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let scope = unsafe { stator_escapable_handle_scope_new(iso.as_ptr()) };
+        assert!(!scope.is_null());
+        // SAFETY: `scope` is non-null and live.
+        unsafe { stator_escapable_handle_scope_close(scope) };
+    }
+
+    #[test]
+    fn test_escapable_handle_scope_null_isolate_returns_null() {
+        // SAFETY: null isolate is documented to return null.
+        let scope = unsafe { stator_escapable_handle_scope_new(std::ptr::null_mut()) };
+        assert!(scope.is_null());
+    }
+
+    #[test]
+    fn test_escapable_handle_scope_close_null_is_safe() {
+        // SAFETY: null is documented as a no-op.
+        unsafe { stator_escapable_handle_scope_close(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_escapable_handle_scope_escape_promotes_to_outer_scope() {
+        let iso = IsolateGuard::new();
+        // Open outer (plain) scope.
+        // SAFETY: `iso` is valid.
+        let outer = unsafe { stator_handle_scope_new(iso.as_ptr()) };
+
+        // Open inner escapable scope.
+        // SAFETY: `iso` is valid.
+        let inner = unsafe { stator_escapable_handle_scope_new(iso.as_ptr()) };
+
+        // Create a value inside the escapable scope.
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 99.0) };
+        assert!(!val.is_null());
+
+        // Escape the value — it is promoted into `outer`.
+        // SAFETY: `inner` is valid; `val` is registered with `inner`.
+        let escaped = unsafe { stator_escapable_handle_scope_escape(inner, val) };
+        assert_eq!(escaped, val);
+
+        // Close the inner scope. `val` was escaped so it must NOT be destroyed.
+        // SAFETY: `inner` is non-null and live.
+        unsafe { stator_escapable_handle_scope_close(inner) };
+        // The value is still live (owned by the outer scope now).
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 1);
+        assert!((unsafe { stator_value_as_number(escaped) } - 99.0).abs() < f64::EPSILON);
+
+        // Close the outer scope — the escaped value is now destroyed.
+        // SAFETY: `outer` is non-null and live.
+        unsafe { stator_handle_scope_close(outer) };
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 0);
+    }
+
+    #[test]
+    fn test_escapable_handle_scope_non_escaped_values_destroyed_on_close() {
+        let iso = IsolateGuard::new();
+        // Open outer scope for the escaped value.
+        // SAFETY: `iso` is valid.
+        let outer = unsafe { stator_handle_scope_new(iso.as_ptr()) };
+
+        // Open inner escapable scope.
+        // SAFETY: `iso` is valid.
+        let inner = unsafe { stator_escapable_handle_scope_new(iso.as_ptr()) };
+
+        // Create two values — escape only one.
+        // SAFETY: `iso` is valid.
+        let keep = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        let _ = unsafe { stator_value_new_number(iso.as_ptr(), 2.0) };
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 2);
+
+        // Escape `keep` into the outer scope.
+        // SAFETY: `inner` and `keep` are valid.
+        let _ = unsafe { stator_escapable_handle_scope_escape(inner, keep) };
+
+        // Close inner scope — only the non-escaped value is destroyed.
+        // SAFETY: `inner` is valid.
+        unsafe { stator_escapable_handle_scope_close(inner) };
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 1);
+
+        // Close outer scope — `keep` (escaped) is now destroyed.
+        // SAFETY: `outer` is valid.
+        unsafe { stator_handle_scope_close(outer) };
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 0);
+    }
+
+    #[test]
+    fn test_escapable_handle_scope_escape_null_scope_returns_null() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        // SAFETY: null scope is documented to return null.
+        let result = unsafe { stator_escapable_handle_scope_escape(std::ptr::null_mut(), val) };
+        assert!(result.is_null());
+        // SAFETY: `val` is non-null and live; clean up manually.
+        unsafe { stator_value_destroy(val) };
+    }
+
+    #[test]
+    fn test_escapable_handle_scope_escape_null_val_returns_null() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let scope = unsafe { stator_escapable_handle_scope_new(iso.as_ptr()) };
+        // SAFETY: null val is documented to return null.
+        let result = unsafe { stator_escapable_handle_scope_escape(scope, std::ptr::null_mut()) };
+        assert!(result.is_null());
+        // SAFETY: `scope` is valid.
+        unsafe { stator_escapable_handle_scope_close(scope) };
+    }
+
+    #[test]
+    fn test_escapable_handle_scope_no_outer_scope_caller_owns_escaped() {
+        let iso = IsolateGuard::new();
+        // No outer scope — escaped value has no parent scope to go into.
+        // SAFETY: `iso` is valid.
+        let scope = unsafe { stator_escapable_handle_scope_new(iso.as_ptr()) };
+        // SAFETY: `iso` is valid.
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 7.0) };
+
+        // Escape with no outer scope — caller takes ownership.
+        // SAFETY: `scope` and `val` are valid.
+        let escaped = unsafe { stator_escapable_handle_scope_escape(scope, val) };
+        assert_eq!(escaped, val);
+
+        // Close the scope — `val` was escaped so it must NOT be freed here.
+        // SAFETY: `scope` is valid.
+        unsafe { stator_escapable_handle_scope_close(scope) };
+        // Value is still live; the caller owns it.
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 1);
+
+        // Caller's responsibility to destroy the escaped value.
+        // SAFETY: `escaped` is non-null and live.
+        unsafe { stator_value_destroy(escaped) };
+        assert_eq!(unsafe { stator_live_object_count(iso.as_ptr()) }, 0);
     }
 }

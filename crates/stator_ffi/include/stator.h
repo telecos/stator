@@ -21,6 +21,39 @@
 typedef struct StatorContext StatorContext;
 
 /**
+ * An opaque escapable handle scope.
+ *
+ * Works like [`StatorHandleScope`] but allows a single value to be
+ * *escaped* — promoted into the enclosing scope (or left as an embedder-owned
+ * handle if there is no enclosing scope) — via
+ * [`stator_escapable_handle_scope_escape`].
+ *
+ * Created by [`stator_escapable_handle_scope_new`] and closed (and its
+ * remaining values destroyed) by [`stator_escapable_handle_scope_close`].
+ */
+typedef struct StatorEscapableHandleScope StatorEscapableHandleScope;
+
+/**
+ * An opaque handle scope that manages the lifetime of [`StatorValue`] handles
+ * created while the scope is open.
+ *
+ * When a handle scope is open on an isolate, any value created via
+ * [`stator_value_new_number`] or [`stator_value_new_string`] is automatically
+ * registered with the innermost open scope.  Calling
+ * [`stator_handle_scope_close`] destroys all registered values and restores
+ * the previous scope.
+ *
+ * Handle scopes nest: opening a second scope while one is already open is
+ * valid; closing it restores the outer scope.
+ *
+ * # Ownership
+ * Values registered with a scope are **owned by the scope**.  The embedder
+ * must **not** call [`stator_value_destroy`] on those values; doing so would
+ * result in a double-free.
+ */
+typedef struct StatorHandleScope StatorHandleScope;
+
+/**
  * An opaque isolate handle.
  *
  * An isolate is an independent instance of the Stator engine with its own
@@ -584,6 +617,82 @@ int32_t stator_value_to_string_utf8(const struct StatorValue *val, char *buf, si
 void stator_register_native_function(struct StatorContext *ctx,
                                      const char *name,
                                      StatorNativeCallback callback);
+ * Open a new handle scope on `isolate`.
+ *
+ * All [`StatorValue`] handles created after this call (and before the
+ * corresponding [`stator_handle_scope_close`]) are owned by the returned
+ * scope and will be destroyed automatically when the scope is closed.
+ *
+ * Returns a null pointer if `isolate` is null.  The caller must eventually
+ * pass the returned pointer to [`stator_handle_scope_close`].
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorHandleScope *stator_handle_scope_new(struct StatorIsolate *isolate);
+
+/**
+ * Close a handle scope and destroy all values registered with it.
+ *
+ * After this call, all [`StatorValue`] pointers that were created while
+ * `scope` was the active scope are invalid.  The previous scope (if any) is
+ * restored as the active scope on the isolate.
+ *
+ * Does nothing if `scope` is null.
+ *
+ * # Safety
+ * - `scope` must be a non-null pointer returned by [`stator_handle_scope_new`].
+ * - `scope` must be the *innermost* open scope on its isolate (i.e. handle
+ *   scopes must be closed in LIFO order).
+ * - `scope` must not be used again after this call.
+ */
+void stator_handle_scope_close(struct StatorHandleScope *scope);
+
+/**
+ * Open a new escapable handle scope on `isolate`.
+ *
+ * Returns a null pointer if `isolate` is null.  The caller must eventually
+ * pass the returned pointer to [`stator_escapable_handle_scope_close`].
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorEscapableHandleScope *stator_escapable_handle_scope_new(struct StatorIsolate *isolate);
+
+/**
+ * Escape `val` from `scope`, promoting it into the enclosing scope.
+ *
+ * Removes `val` from `scope`'s tracked handles (so it will not be destroyed
+ * when the scope is closed) and, if there is an enclosing scope, registers
+ * it there.  If there is no enclosing scope the caller takes ownership and
+ * must eventually pass `val` to [`stator_value_destroy`].
+ *
+ * Returns `val` unchanged (for convenient chaining in C/C++ callers), or a
+ * null pointer if `scope` or `val` is null.
+ *
+ * # Safety
+ * - `scope` must be a non-null, valid pointer to a live
+ *   [`StatorEscapableHandleScope`].
+ * - `val` must be a non-null pointer that is currently registered with
+ *   `scope` (i.e. it was created while `scope` was the active scope).
+ * - Each value may only be escaped once.
+ */
+struct StatorValue *stator_escapable_handle_scope_escape(struct StatorEscapableHandleScope *scope,
+                                                         struct StatorValue *val);
+
+/**
+ * Close an escapable handle scope and destroy all non-escaped values.
+ *
+ * Equivalent in behaviour to [`stator_handle_scope_close`] for the escapable
+ * variant.
+ *
+ * # Safety
+ * - `scope` must be a non-null pointer returned by
+ *   [`stator_escapable_handle_scope_new`].
+ * - `scope` must be the innermost open scope on its isolate.
+ * - `scope` must not be used again after this call.
+ */
+void stator_escapable_handle_scope_close(struct StatorEscapableHandleScope *scope);
 
 /**
  * Create a new platform from an embedder-supplied vtable.
