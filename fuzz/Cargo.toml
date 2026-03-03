@@ -12,6 +12,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 stator_core = { path = "../crates/stator_core" }
+stator_ffi = { path = "../crates/stator_ffi" }
 
 [[bin]]
 name = "fuzz_tagged_value"
@@ -106,5 +107,35 @@ doc = false
 [[bin]]
 name = "fuzz_builtins_string"
 path = "fuzz_targets/fuzz_builtins_string.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ffi_isolate"
+path = "fuzz_targets/fuzz_ffi_isolate.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ffi_values"
+path = "fuzz_targets/fuzz_ffi_values.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ffi_objects"
+path = "fuzz_targets/fuzz_ffi_objects.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ffi_scripts"
+path = "fuzz_targets/fuzz_ffi_scripts.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ffi_sequence"
+path = "fuzz_targets/fuzz_ffi_sequence.rs"
 test = false
 doc = false
