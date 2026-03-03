@@ -1,0 +1,910 @@
+//! x86-64 macro-assembler for the Stator baseline compiler.
+//!
+//! Emits x86-64 machine code into an owned byte buffer.  The assembler
+//! supports the instructions required for a baseline JIT compiler tier: data
+//! movement, arithmetic, comparisons, control flow, and function
+//! call/return conventions.
+//!
+//! # Calling convention
+//!
+//! All helpers follow the **System V AMD64 ABI** (Linux/macOS):
+//!
+//! | Role            | Registers                   |
+//! |-----------------|-----------------------------|
+//! | Parameters 1–6  | RDI, RSI, RDX, RCX, R8, R9 |
+//! | Return value    | RAX                         |
+//! | Caller-saved    | RAX, RCX, RDX, RSI, RDI, R8–R11 |
+//! | Callee-saved    | RBX, RBP, R12–R15, RSP      |
+//!
+//! # Example
+//!
+//! ```
+//! use stator_core::compiler::baseline::masm_x64::{MacroAssembler, Reg64, Label};
+//!
+//! // Emit: fn identity(x: i64) -> i64 { x }
+//! // (SysV AMD64: first arg in RDI, return value in RAX)
+//! let mut masm = MacroAssembler::new();
+//! masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+//! masm.ret();
+//!
+//! // The emitted bytes are: REX.W MOV RAX,RDI + RET
+//! assert_eq!(masm.code(), &[0x48, 0x8B, 0xC7, 0xC3]);
+//! ```
+
+use std::fmt;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reg64
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An x86-64 general-purpose 64-bit register.
+///
+/// The `u8` discriminant is the hardware encoding (0–15).  Registers 0–7
+/// (RAX through RDI) do not require a REX extension bit; registers 8–15
+/// (R8–R15) set either REX.R (when used in the ModRM `reg` field) or REX.B
+/// (when used in the ModRM `r/m` field or as the target of a short-form
+/// opcode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Reg64 {
+    /// RAX — general-purpose / return value register.
+    Rax = 0,
+    /// RCX — general-purpose / 4th parameter (Windows ABI).
+    Rcx = 1,
+    /// RDX — general-purpose / 3rd parameter (SysV AMD64).
+    Rdx = 2,
+    /// RBX — general-purpose, callee-saved.
+    Rbx = 3,
+    /// RSP — stack pointer.
+    Rsp = 4,
+    /// RBP — frame pointer, callee-saved.
+    Rbp = 5,
+    /// RSI — 2nd parameter (SysV AMD64).
+    Rsi = 6,
+    /// RDI — 1st parameter (SysV AMD64).
+    Rdi = 7,
+    /// R8 — 5th parameter (SysV AMD64), caller-saved.
+    R8 = 8,
+    /// R9 — 6th parameter (SysV AMD64), caller-saved.
+    R9 = 9,
+    /// R10 — caller-saved scratch register.
+    R10 = 10,
+    /// R11 — caller-saved scratch register.
+    R11 = 11,
+    /// R12 — callee-saved.
+    R12 = 12,
+    /// R13 — callee-saved.
+    R13 = 13,
+    /// R14 — callee-saved.
+    R14 = 14,
+    /// R15 — callee-saved.
+    R15 = 15,
+}
+
+impl Reg64 {
+    /// The 3-bit register encoding placed in the ModRM/SIB `reg` or `r/m`
+    /// field (low 3 bits of the register number).
+    #[inline]
+    pub(crate) fn enc(self) -> u8 {
+        (self as u8) & 0x07
+    }
+
+    /// `true` if this register requires the REX extension bit (R8–R15).
+    #[inline]
+    pub(crate) fn needs_rex(self) -> bool {
+        (self as u8) >= 8
+    }
+}
+
+impl fmt::Display for Reg64 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Rax => "rax",
+            Self::Rcx => "rcx",
+            Self::Rdx => "rdx",
+            Self::Rbx => "rbx",
+            Self::Rsp => "rsp",
+            Self::Rbp => "rbp",
+            Self::Rsi => "rsi",
+            Self::Rdi => "rdi",
+            Self::R8 => "r8",
+            Self::R9 => "r9",
+            Self::R10 => "r10",
+            Self::R11 => "r11",
+            Self::R12 => "r12",
+            Self::R13 => "r13",
+            Self::R14 => "r14",
+            Self::R15 => "r15",
+        };
+        f.write_str(name)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Label
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A position in the code buffer used as a branch target.
+///
+/// A label can be:
+///
+/// - **Unbound** (the default) — not yet placed at a specific offset.
+///   Forward branches to an unbound label record a *patch site*: the 4-byte
+///   `rel32` field is filled with zeros and the offset is saved.
+/// - **Bound** — placed at a specific byte offset by
+///   [`MacroAssembler::bind_label`].  All recorded patch sites are
+///   retroactively filled with the correct signed 32-bit displacement.
+///
+/// # Example — forward jump
+///
+/// ```
+/// use stator_core::compiler::baseline::masm_x64::{MacroAssembler, Reg64, Label};
+///
+/// let mut masm = MacroAssembler::new();
+/// let mut done = Label::new();
+///
+/// // Jump unconditionally past the `mov`.
+/// masm.jmp(&mut done);
+/// masm.mov_ri(Reg64::Rax, 99); // this instruction is skipped
+/// masm.bind_label(&mut done);
+/// masm.ret();
+/// ```
+///
+/// # Example — backward jump (loop)
+///
+/// ```
+/// use stator_core::compiler::baseline::masm_x64::{MacroAssembler, Reg64, Label};
+///
+/// let mut masm = MacroAssembler::new();
+/// let mut loop_top = Label::new();
+///
+/// masm.bind_label(&mut loop_top);   // mark loop start
+/// masm.sub_ri(Reg64::Rcx, 1);       // dec loop counter
+/// masm.jne(&mut loop_top);          // branch back if non-zero
+/// masm.ret();
+/// ```
+#[derive(Debug, Default)]
+pub struct Label {
+    /// Byte offset in the code buffer, if already bound.
+    bound_offset: Option<usize>,
+    /// Offsets of the 4-byte `rel32` fields that must be patched when this
+    /// label is eventually bound.
+    patch_sites: Vec<usize>,
+}
+
+impl Label {
+    /// Create a new, unbound label.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the bound byte offset, or `None` if the label has not yet been
+    /// placed with [`MacroAssembler::bind_label`].
+    pub fn bound_offset(&self) -> Option<usize> {
+        self.bound_offset
+    }
+
+    /// Returns `true` if this label has been placed with
+    /// [`MacroAssembler::bind_label`].
+    pub fn is_bound(&self) -> bool {
+        self.bound_offset.is_some()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MacroAssembler
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// x86-64 macro-assembler.
+///
+/// Appends raw machine code bytes to an internal `Vec<u8>` buffer.  All
+/// arithmetic and data-movement instructions operate on **64-bit** operands
+/// (REX.W prefix is always emitted for those instructions).
+///
+/// # Usage
+///
+/// ```
+/// use stator_core::compiler::baseline::masm_x64::{MacroAssembler, Reg64, Label};
+///
+/// // Emit: fn add(a: i64, b: i64) -> i64 { a + b }
+/// // (SysV AMD64: a in RDI, b in RSI, result in RAX)
+/// let mut masm = MacroAssembler::new();
+/// masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+/// masm.add_rr(Reg64::Rax, Reg64::Rsi);
+/// masm.ret();
+/// assert_eq!(masm.code(), &[0x48, 0x8B, 0xC7, 0x48, 0x03, 0xC6, 0xC3]);
+/// ```
+#[derive(Debug, Default)]
+pub struct MacroAssembler {
+    buf: Vec<u8>,
+}
+
+impl MacroAssembler {
+    /// Create a new, empty assembler.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return a slice of the emitted code bytes.
+    pub fn code(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Consume the assembler and return the code buffer.
+    pub fn into_code(self) -> Vec<u8> {
+        self.buf
+    }
+
+    /// Current write position (byte offset of the next instruction to be
+    /// emitted).
+    pub fn position(&self) -> usize {
+        self.buf.len()
+    }
+
+    // ── Label support ────────────────────────────────────────────────────────
+
+    /// Bind `label` to the current position in the code buffer.
+    ///
+    /// If the label was referenced by forward branches, all pending patch sites
+    /// are retroactively filled with the correct signed 32-bit displacement.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the label has already been bound — double-binding is a
+    /// compiler bug.
+    pub fn bind_label(&mut self, label: &mut Label) {
+        assert!(label.bound_offset.is_none(), "label already bound");
+        let here = self.buf.len();
+        for site in &label.patch_sites {
+            let rel32 = (here as i32) - ((*site as i32) + 4);
+            self.buf[*site..*site + 4].copy_from_slice(&rel32.to_le_bytes());
+        }
+        label.patch_sites.clear();
+        label.bound_offset = Some(here);
+    }
+
+    // ── Low-level encoding helpers ───────────────────────────────────────────
+
+    /// Emit a REX byte with REX.W set for a two-register operand.
+    ///
+    /// REX.R is set when `reg_field` is R8–R15 (extends the ModRM `reg`
+    /// field).  REX.B is set when `rm_field` is R8–R15 (extends the ModRM
+    /// `r/m` field).  REX.X is never set (no SIB byte).
+    fn emit_rex_wrb(&mut self, reg_field: Reg64, rm_field: Reg64) {
+        let r_bit = if reg_field.needs_rex() { 0x04 } else { 0 };
+        let b_bit = if rm_field.needs_rex() { 0x01 } else { 0 };
+        // REX = 0100 W R X B  (W=1 for 64-bit operand size)
+        self.buf.push(0x48 | r_bit | b_bit);
+    }
+
+    /// Emit a REX.B-only prefix for single-register short-form instructions
+    /// (PUSH, POP).
+    ///
+    /// Only emits the byte when `reg` requires the REX extension (R8–R15).
+    fn emit_rex_b_only(&mut self, reg: Reg64) {
+        if reg.needs_rex() {
+            self.buf.push(0x41); // REX.B
+        }
+    }
+
+    /// Emit a ModRM byte with `mod=11` (register-direct), placing `reg_field`
+    /// in the `reg` bits and `rm_field` in the `r/m` bits.
+    fn emit_modrm_rr(&mut self, reg_field: Reg64, rm_field: Reg64) {
+        self.buf
+            .push(0xC0 | (reg_field.enc() << 3) | rm_field.enc());
+    }
+
+    /// Emit a ModRM byte with `mod=11` and an opcode-extension digit in the
+    /// `reg` field (`/digit` form used by immediate instructions).
+    fn emit_modrm_digit(&mut self, digit: u8, rm_field: Reg64) {
+        self.buf.push(0xC0 | (digit << 3) | rm_field.enc());
+    }
+
+    /// Emit a signed 32-bit integer in little-endian byte order.
+    fn emit_i32(&mut self, v: i32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Emit a signed 64-bit integer in little-endian byte order.
+    fn emit_i64(&mut self, v: i64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Emit the 4-byte `rel32` field for a branch to `label`.
+    ///
+    /// If the label is already bound the displacement is computed immediately.
+    /// Otherwise, four zero bytes are emitted and the offset of this field is
+    /// saved in `label.patch_sites` so that [`bind_label`] can fill it in
+    /// later.
+    ///
+    /// [`bind_label`]: MacroAssembler::bind_label
+    fn emit_rel32_for_label(&mut self, label: &mut Label) {
+        let rel32_start = self.buf.len();
+        if let Some(target) = label.bound_offset {
+            // Backward reference — displacement is known immediately.
+            let rel32 = (target as i32) - ((rel32_start as i32) + 4);
+            self.emit_i32(rel32);
+        } else {
+            // Forward reference — emit placeholder and record the patch site.
+            self.buf.extend_from_slice(&[0u8; 4]);
+            label.patch_sites.push(rel32_start);
+        }
+    }
+
+    // ── Data movement ────────────────────────────────────────────────────────
+
+    /// `MOV dst, src` — copy a 64-bit register.
+    ///
+    /// Encoding: `REX.W 8B /r` (MOV r64, r/m64).
+    pub fn mov_rr(&mut self, dst: Reg64, src: Reg64) {
+        self.emit_rex_wrb(dst, src);
+        self.buf.push(0x8B);
+        self.emit_modrm_rr(dst, src);
+    }
+
+    /// `MOV dst, imm` — load a 64-bit immediate into a register.
+    ///
+    /// Uses the 7-byte `REX.W C7 /0 imm32` (sign-extended) form when `imm`
+    /// fits in a 32-bit signed integer, and the 10-byte `REX.W B8+rd imm64`
+    /// form otherwise.
+    pub fn mov_ri(&mut self, dst: Reg64, imm: i64) {
+        if (i32::MIN as i64..=i32::MAX as i64).contains(&imm) {
+            // REX.W + C7 /0 + ModRM + imm32 (sign-extended to 64 bits).
+            // Use Rax as dummy for reg field (enc=0, needs_rex=false).
+            self.emit_rex_wrb(Reg64::Rax, dst);
+            self.buf.push(0xC7);
+            self.emit_modrm_digit(0, dst);
+            self.emit_i32(imm as i32);
+        } else {
+            // REX.W + (B8 + rd) + imm64.
+            let b_bit = if dst.needs_rex() { 0x01 } else { 0 };
+            self.buf.push(0x48 | b_bit);
+            self.buf.push(0xB8 | dst.enc());
+            self.emit_i64(imm);
+        }
+    }
+
+    /// `LEA dst, [RIP + offset]` — load a RIP-relative address.
+    ///
+    /// `offset` is the signed byte displacement from the **end** of this LEA
+    /// instruction (i.e. from the address of the next instruction).
+    ///
+    /// Encoding: `REX.W 8D /r` with `ModRM(mod=00, reg=dst, r/m=101)`.
+    /// `r/m=101` with `mod=00` selects RIP-relative addressing in 64-bit mode.
+    pub fn lea_rip_rel(&mut self, dst: Reg64, offset: i32) {
+        let r_bit = if dst.needs_rex() { 0x04 } else { 0 };
+        self.buf.push(0x48 | r_bit); // REX.W [+ REX.R]
+        self.buf.push(0x8D);
+        // ModRM: mod=00, reg=dst, r/m=101 (RIP-relative).
+        self.buf.push((dst.enc() << 3) | 0x05);
+        self.emit_i32(offset);
+    }
+
+    // ── Arithmetic ───────────────────────────────────────────────────────────
+
+    /// `ADD dst, src` — add two 64-bit registers (`dst += src`).
+    ///
+    /// Encoding: `REX.W 03 /r` (ADD r64, r/m64).
+    pub fn add_rr(&mut self, dst: Reg64, src: Reg64) {
+        self.emit_rex_wrb(dst, src);
+        self.buf.push(0x03);
+        self.emit_modrm_rr(dst, src);
+    }
+
+    /// `ADD dst, imm` — add a sign-extended 32-bit immediate to a register.
+    ///
+    /// Uses the 4-byte `REX.W 83 /0 imm8` form when `imm` fits in a signed
+    /// byte, and the 7-byte `REX.W 81 /0 imm32` form otherwise.
+    pub fn add_ri(&mut self, dst: Reg64, imm: i32) {
+        self.emit_rex_wrb(Reg64::Rax, dst);
+        if (i8::MIN as i32..=i8::MAX as i32).contains(&imm) {
+            self.buf.push(0x83);
+            self.emit_modrm_digit(0, dst);
+            self.buf.push(imm as i8 as u8);
+        } else {
+            self.buf.push(0x81);
+            self.emit_modrm_digit(0, dst);
+            self.emit_i32(imm);
+        }
+    }
+
+    /// `SUB dst, src` — subtract two 64-bit registers (`dst -= src`).
+    ///
+    /// Encoding: `REX.W 2B /r` (SUB r64, r/m64).
+    pub fn sub_rr(&mut self, dst: Reg64, src: Reg64) {
+        self.emit_rex_wrb(dst, src);
+        self.buf.push(0x2B);
+        self.emit_modrm_rr(dst, src);
+    }
+
+    /// `SUB dst, imm` — subtract a sign-extended 32-bit immediate from a
+    /// register.
+    ///
+    /// Uses the short `REX.W 83 /5 imm8` form when `imm` fits in a signed
+    /// byte.
+    pub fn sub_ri(&mut self, dst: Reg64, imm: i32) {
+        self.emit_rex_wrb(Reg64::Rax, dst);
+        if (i8::MIN as i32..=i8::MAX as i32).contains(&imm) {
+            self.buf.push(0x83);
+            self.emit_modrm_digit(5, dst);
+            self.buf.push(imm as i8 as u8);
+        } else {
+            self.buf.push(0x81);
+            self.emit_modrm_digit(5, dst);
+            self.emit_i32(imm);
+        }
+    }
+
+    // ── Comparison ───────────────────────────────────────────────────────────
+
+    /// `CMP lhs, rhs` — set CPU flags for `lhs − rhs` without storing the
+    /// result.
+    ///
+    /// Encoding: `REX.W 3B /r` (CMP r64, r/m64).
+    pub fn cmp_rr(&mut self, lhs: Reg64, rhs: Reg64) {
+        self.emit_rex_wrb(lhs, rhs);
+        self.buf.push(0x3B);
+        self.emit_modrm_rr(lhs, rhs);
+    }
+
+    /// `CMP reg, imm` — compare a register against a sign-extended 32-bit
+    /// immediate.
+    ///
+    /// Uses the short `REX.W 83 /7 imm8` form when `imm` fits in a signed
+    /// byte.
+    pub fn cmp_ri(&mut self, reg: Reg64, imm: i32) {
+        self.emit_rex_wrb(Reg64::Rax, reg);
+        if (i8::MIN as i32..=i8::MAX as i32).contains(&imm) {
+            self.buf.push(0x83);
+            self.emit_modrm_digit(7, reg);
+            self.buf.push(imm as i8 as u8);
+        } else {
+            self.buf.push(0x81);
+            self.emit_modrm_digit(7, reg);
+            self.emit_i32(imm);
+        }
+    }
+
+    // ── Control flow ─────────────────────────────────────────────────────────
+
+    /// `JMP label` — unconditional near jump to a label.
+    ///
+    /// Encoding: `E9 rel32`.
+    pub fn jmp(&mut self, label: &mut Label) {
+        self.buf.push(0xE9);
+        self.emit_rel32_for_label(label);
+    }
+
+    /// `JMP reg` — unconditional near jump through a register.
+    ///
+    /// Encoding: `[REX.B] FF /4`.
+    pub fn jmp_reg(&mut self, reg: Reg64) {
+        self.emit_rex_b_only(reg);
+        self.buf.push(0xFF);
+        self.emit_modrm_digit(4, reg);
+    }
+
+    /// `JE label` / `JZ label` — jump if equal (ZF=1).
+    ///
+    /// Encoding: `0F 84 rel32`.
+    pub fn je(&mut self, label: &mut Label) {
+        self.buf.push(0x0F);
+        self.buf.push(0x84);
+        self.emit_rel32_for_label(label);
+    }
+
+    /// `JNE label` / `JNZ label` — jump if not equal (ZF=0).
+    ///
+    /// Encoding: `0F 85 rel32`.
+    pub fn jne(&mut self, label: &mut Label) {
+        self.buf.push(0x0F);
+        self.buf.push(0x85);
+        self.emit_rel32_for_label(label);
+    }
+
+    /// `CALL reg` — call an indirect target through a register.
+    ///
+    /// Encoding: `[REX.B] FF /2`.
+    pub fn call_reg(&mut self, reg: Reg64) {
+        self.emit_rex_b_only(reg);
+        self.buf.push(0xFF);
+        self.emit_modrm_digit(2, reg);
+    }
+
+    /// `CALL label` — PC-relative call to a label.
+    ///
+    /// Encoding: `E8 rel32`.
+    pub fn call_rel(&mut self, label: &mut Label) {
+        self.buf.push(0xE8);
+        self.emit_rel32_for_label(label);
+    }
+
+    /// `RET` — near return from procedure.
+    ///
+    /// Encoding: `C3`.
+    pub fn ret(&mut self) {
+        self.buf.push(0xC3);
+    }
+
+    // ── Stack operations ─────────────────────────────────────────────────────
+
+    /// `PUSH reg` — push a 64-bit register onto the stack.
+    ///
+    /// 64-bit operand size is the default in 64-bit mode, so no REX.W is
+    /// needed.  REX.B is emitted only for R8–R15.
+    ///
+    /// Encoding: `[REX.B] 50+rd`.
+    pub fn push(&mut self, reg: Reg64) {
+        self.emit_rex_b_only(reg);
+        self.buf.push(0x50 | reg.enc());
+    }
+
+    /// `POP reg` — pop a 64-bit value from the stack into a register.
+    ///
+    /// Encoding: `[REX.B] 58+rd`.
+    pub fn pop(&mut self, reg: Reg64) {
+        self.emit_rex_b_only(reg);
+        self.buf.push(0x58 | reg.enc());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Byte-level encoding tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_ret_encoding() {
+        let mut m = MacroAssembler::new();
+        m.ret();
+        assert_eq!(m.code(), &[0xC3]);
+    }
+
+    #[test]
+    fn test_push_classic_registers() {
+        // RAX  → 50
+        // RDI  → 57  (0x50 + 7)
+        let mut m = MacroAssembler::new();
+        m.push(Reg64::Rax);
+        m.push(Reg64::Rdi);
+        assert_eq!(m.code(), &[0x50, 0x57]);
+    }
+
+    #[test]
+    fn test_push_extended_registers() {
+        // R8  → 41 50
+        // R15 → 41 57  (0x50 + 7)
+        let mut m = MacroAssembler::new();
+        m.push(Reg64::R8);
+        m.push(Reg64::R15);
+        assert_eq!(m.code(), &[0x41, 0x50, 0x41, 0x57]);
+    }
+
+    #[test]
+    fn test_pop_encoding() {
+        // RAX → 58
+        // R15 → 41 5F  (0x58 + 7)
+        let mut m = MacroAssembler::new();
+        m.pop(Reg64::Rax);
+        m.pop(Reg64::R15);
+        assert_eq!(m.code(), &[0x58, 0x41, 0x5F]);
+    }
+
+    #[test]
+    fn test_mov_rr_encoding() {
+        // mov rax, rdi  →  48 8B C7
+        let mut m = MacroAssembler::new();
+        m.mov_rr(Reg64::Rax, Reg64::Rdi);
+        assert_eq!(m.code(), &[0x48, 0x8B, 0xC7]);
+    }
+
+    #[test]
+    fn test_mov_rr_extended_src() {
+        // mov rax, r9  →  49 8B C1  (REX.B for r9)
+        let mut m = MacroAssembler::new();
+        m.mov_rr(Reg64::Rax, Reg64::R9);
+        assert_eq!(m.code(), &[0x49, 0x8B, 0xC1]);
+    }
+
+    #[test]
+    fn test_mov_rr_both_extended() {
+        // mov r11, r9  →  4D 8B D9  (REX.W|R|B)
+        let mut m = MacroAssembler::new();
+        m.mov_rr(Reg64::R11, Reg64::R9);
+        assert_eq!(m.code(), &[0x4D, 0x8B, 0xD9]);
+    }
+
+    #[test]
+    fn test_mov_ri_small_imm() {
+        // mov rdi, 42  →  48 C7 C7 2A 00 00 00  (C7/0, sign-ext imm32)
+        let mut m = MacroAssembler::new();
+        m.mov_ri(Reg64::Rdi, 42);
+        assert_eq!(m.code(), &[0x48, 0xC7, 0xC7, 0x2A, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_mov_ri_large_imm() {
+        // mov rax, 0x1_2345_6789  →  48 B8 89 67 45 23 01 00 00 00
+        let mut m = MacroAssembler::new();
+        m.mov_ri(Reg64::Rax, 0x1_2345_6789_i64);
+        assert_eq!(
+            m.code(),
+            &[0x48, 0xB8, 0x89, 0x67, 0x45, 0x23, 0x01, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn test_mov_ri_extended_reg_large_imm() {
+        // mov r9, 0x1_2345_6789  →  49 B9 89 67 45 23 01 00 00 00
+        let mut m = MacroAssembler::new();
+        m.mov_ri(Reg64::R9, 0x1_2345_6789_i64);
+        assert_eq!(
+            m.code(),
+            &[0x49, 0xB9, 0x89, 0x67, 0x45, 0x23, 0x01, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn test_add_rr_encoding() {
+        // add rax, rsi  →  48 03 C6
+        let mut m = MacroAssembler::new();
+        m.add_rr(Reg64::Rax, Reg64::Rsi);
+        assert_eq!(m.code(), &[0x48, 0x03, 0xC6]);
+    }
+
+    #[test]
+    fn test_add_ri_short_form() {
+        // add rax, 5  →  48 83 C0 05
+        let mut m = MacroAssembler::new();
+        m.add_ri(Reg64::Rax, 5);
+        assert_eq!(m.code(), &[0x48, 0x83, 0xC0, 0x05]);
+    }
+
+    #[test]
+    fn test_add_ri_long_form() {
+        // add rax, 1000  →  48 81 C0 E8 03 00 00
+        let mut m = MacroAssembler::new();
+        m.add_ri(Reg64::Rax, 1000);
+        assert_eq!(m.code(), &[0x48, 0x81, 0xC0, 0xE8, 0x03, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_sub_rr_encoding() {
+        // sub rax, rsi  →  48 2B C6
+        let mut m = MacroAssembler::new();
+        m.sub_rr(Reg64::Rax, Reg64::Rsi);
+        assert_eq!(m.code(), &[0x48, 0x2B, 0xC6]);
+    }
+
+    #[test]
+    fn test_sub_ri_short_form() {
+        // sub rsp, 32  →  48 83 EC 20
+        let mut m = MacroAssembler::new();
+        m.sub_ri(Reg64::Rsp, 32);
+        assert_eq!(m.code(), &[0x48, 0x83, 0xEC, 0x20]);
+    }
+
+    #[test]
+    fn test_cmp_rr_encoding() {
+        // cmp rax, rcx  →  48 3B C1
+        let mut m = MacroAssembler::new();
+        m.cmp_rr(Reg64::Rax, Reg64::Rcx);
+        assert_eq!(m.code(), &[0x48, 0x3B, 0xC1]);
+    }
+
+    #[test]
+    fn test_cmp_ri_short_form() {
+        // cmp rcx, 0  →  48 83 F9 00
+        let mut m = MacroAssembler::new();
+        m.cmp_ri(Reg64::Rcx, 0);
+        assert_eq!(m.code(), &[0x48, 0x83, 0xF9, 0x00]);
+    }
+
+    #[test]
+    fn test_jmp_reg_encoding() {
+        // jmp rax  →  FF E0
+        // jmp r8   →  41 FF E0
+        let mut m = MacroAssembler::new();
+        m.jmp_reg(Reg64::Rax);
+        m.jmp_reg(Reg64::R8);
+        assert_eq!(m.code(), &[0xFF, 0xE0, 0x41, 0xFF, 0xE0]);
+    }
+
+    #[test]
+    fn test_call_reg_encoding() {
+        // call rax  →  FF D0
+        let mut m = MacroAssembler::new();
+        m.call_reg(Reg64::Rax);
+        assert_eq!(m.code(), &[0xFF, 0xD0]);
+    }
+
+    #[test]
+    fn test_lea_rip_rel_encoding() {
+        // lea rax, [rip+0]  →  48 8D 05 00 00 00 00
+        let mut m = MacroAssembler::new();
+        m.lea_rip_rel(Reg64::Rax, 0);
+        assert_eq!(m.code(), &[0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    // ── Label / branch tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_forward_jmp_patched_correctly() {
+        // Emit:
+        //   jmp done        (5 bytes: E9 + rel32)
+        //   mov rax, 1      (7 bytes: REX.W C7 /0 + imm32) — skipped
+        // done:
+        //   ret             (1 byte)
+        let mut m = MacroAssembler::new();
+        let mut done = Label::new();
+
+        m.jmp(&mut done);
+        m.mov_ri(Reg64::Rax, 1);
+        m.bind_label(&mut done);
+        m.ret();
+
+        // jmp target = offset 12 (5 + 7).
+        // rel32 = 12 - (1 + 4) = 7.
+        let code = m.code();
+        assert_eq!(code[0], 0xE9);
+        let rel32 = i32::from_le_bytes([code[1], code[2], code[3], code[4]]);
+        assert_eq!(rel32, 7);
+        assert!(done.is_bound());
+        assert_eq!(done.bound_offset(), Some(12));
+    }
+
+    #[test]
+    fn test_backward_jne_loop() {
+        // Emit:
+        //   loop_top:
+        //     sub rcx, 1
+        //     jne loop_top
+        //   ret
+        let mut m = MacroAssembler::new();
+        let mut loop_top = Label::new();
+
+        m.bind_label(&mut loop_top); // offset 0
+        m.sub_ri(Reg64::Rcx, 1); // 4 bytes: 48 83 E9 01
+        m.jne(&mut loop_top); // 6 bytes: 0F 85 + rel32
+
+        // After sub_ri (4 bytes) + jne opcode bytes (2: 0F 85), rel32_start = 6.
+        // rel32 = 0 - (6 + 4) = -10.
+        let code = m.code();
+        assert_eq!(&code[0..2], &[0x48, 0x83]); // REX.W + 83
+        assert_eq!(code[4], 0x0F);
+        assert_eq!(code[5], 0x85);
+        let rel32 = i32::from_le_bytes([code[6], code[7], code[8], code[9]]);
+        assert_eq!(rel32, -10);
+    }
+
+    #[test]
+    fn test_forward_je_patched_correctly() {
+        // je target (6 bytes: 0F 84 + rel32)
+        // nop sequence (1 byte: ret used as placeholder)
+        // target:
+        let mut m = MacroAssembler::new();
+        let mut target = Label::new();
+
+        m.je(&mut target); // 6 bytes
+        m.ret(); // 1 byte (placeholder)
+        m.bind_label(&mut target);
+
+        // target = offset 7, rel32_start = 2
+        // rel32 = 7 - (2 + 4) = 1
+        let code = m.code();
+        let rel32 = i32::from_le_bytes([code[2], code[3], code[4], code[5]]);
+        assert_eq!(rel32, 1);
+    }
+
+    #[test]
+    fn test_call_rel_forward_patched() {
+        // call fn_label (5 bytes: E8 + rel32)
+        // ret            (1 byte)
+        // fn_label:
+        //   ret
+        let mut m = MacroAssembler::new();
+        let mut fn_label = Label::new();
+
+        m.call_rel(&mut fn_label);
+        m.ret();
+        m.bind_label(&mut fn_label);
+        m.ret();
+
+        // fn_label = offset 6, rel32_start = 1
+        // rel32 = 6 - (1 + 4) = 1
+        let code = m.code();
+        assert_eq!(code[0], 0xE8);
+        let rel32 = i32::from_le_bytes([code[1], code[2], code[3], code[4]]);
+        assert_eq!(rel32, 1);
+    }
+
+    #[test]
+    fn test_emit_add_function_bytes() {
+        // fn add(a: i64, b: i64) -> i64 { a + b }
+        // SysV AMD64: a in RDI, b in RSI, return in RAX
+        //   mov rax, rdi  →  48 8B C7
+        //   add rax, rsi  →  48 03 C6
+        //   ret           →  C3
+        let mut m = MacroAssembler::new();
+        m.mov_rr(Reg64::Rax, Reg64::Rdi);
+        m.add_rr(Reg64::Rax, Reg64::Rsi);
+        m.ret();
+        assert_eq!(m.code(), &[0x48, 0x8B, 0xC7, 0x48, 0x03, 0xC6, 0xC3]);
+    }
+
+    #[test]
+    fn test_reg64_display() {
+        assert_eq!(Reg64::Rax.to_string(), "rax");
+        assert_eq!(Reg64::Rdi.to_string(), "rdi");
+        assert_eq!(Reg64::R8.to_string(), "r8");
+        assert_eq!(Reg64::R15.to_string(), "r15");
+    }
+
+    #[test]
+    fn test_position_tracks_offset() {
+        let mut m = MacroAssembler::new();
+        assert_eq!(m.position(), 0);
+        m.ret();
+        assert_eq!(m.position(), 1);
+        m.push(Reg64::Rax);
+        assert_eq!(m.position(), 2);
+    }
+
+    // ── FFI execution test (x86-64 + Unix only) ───────────────────────────────
+
+    /// Call emitted machine code via a raw function pointer.
+    ///
+    /// This test allocates a page of read-write-execute memory with `mmap`,
+    /// copies the emitted bytes into it, then invokes the resulting function
+    /// pointer through Rust's `extern "C"` FFI.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn test_emit_add_and_call_via_ffi() {
+        // Emit: fn add(a: i64, b: i64) -> i64 { a + b }
+        let mut masm = MacroAssembler::new();
+        masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+        masm.add_rr(Reg64::Rax, Reg64::Rsi);
+        masm.ret();
+
+        let code = masm.into_code();
+        let size = code.len();
+
+        // Allocate a page of RWX memory and copy the code in.
+        // SAFETY: We pass valid arguments to mmap and check the return value.
+        let mem = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mem, libc::MAP_FAILED, "mmap failed");
+
+        // SAFETY:
+        // - `mem` is a valid, non-null, page-aligned pointer to `size` bytes of
+        //   RWX memory returned by mmap.
+        // - We copy exactly `size` bytes of correctly-encoded x86-64 machine
+        //   code into it.
+        // - We transmute the pointer to an `extern "C"` function type whose
+        //   signature matches the emitted calling convention (SysV AMD64).
+        // - We unmap the memory after the last call.
+        unsafe {
+            std::ptr::copy_nonoverlapping(code.as_ptr(), mem.cast::<u8>(), size);
+            let f: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(mem);
+            assert_eq!(f(3, 4), 7);
+            assert_eq!(f(-1, 1), 0);
+            assert_eq!(f(100, -50), 50);
+            assert_eq!(f(0, 0), 0);
+            assert_eq!(f(i64::MAX, 0), i64::MAX);
+            libc::munmap(mem, size);
+        }
+    }
+}

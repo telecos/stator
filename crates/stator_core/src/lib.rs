@@ -32,6 +32,8 @@
 pub mod builtins;
 /// Bytecode instruction set and encode/decode utilities.
 pub mod bytecode;
+/// JIT compiler infrastructure: baseline code generator and macro-assembler.
+pub mod compiler;
 /// Engine error types and [`StatorResult`] alias.
 pub mod error;
 /// Garbage collector infrastructure: heap, tracing, and handle scopes.

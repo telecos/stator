@@ -835,6 +835,7 @@ dependencies = [
  "bitflags",
  "bumpalo",
  "criterion",
+ "libc",
  "log",
  "parking_lot",
  "regress",
