@@ -257,10 +257,7 @@ pub enum JsonSpace {
 ///     panic!("expected array");
 /// }
 /// ```
-pub fn json_parse(
-    text: &str,
-    reviver: Option<ReviverFn<'_>>,
-) -> StatorResult<JsonValue> {
+pub fn json_parse(text: &str, reviver: Option<ReviverFn<'_>>) -> StatorResult<JsonValue> {
     let chars: Vec<char> = text.chars().collect();
     let mut parser = Parser {
         src: &chars,
