@@ -1,0 +1,7 @@
+# ThreadSanitizer suppressions for stator_core
+#
+# _Unwind_Backtrace is called by Wasmtime's CodeMemory::register_unwind_info
+# when publishing JIT-compiled code.  libgcc's unwinder uses internal global
+# tables that are not annotated for TSan but are protected by separate
+# mechanisms that TSan cannot observe.  Suppress these known false positives.
+race:_Unwind_Backtrace
