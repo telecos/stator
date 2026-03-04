@@ -1,0 +1,41 @@
+name: Test262 conformance gate
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test262:
+    name: Test262 conformance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout tc39/test262 (shallow)
+        uses: actions/checkout@v4
+        with:
+          repository: tc39/test262
+          path: test262
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "test262"
+
+      - name: Build stator_test262 (release)
+        run: cargo build --package stator_test262 --release
+
+      - name: Run Test262 suite
+        # --threshold 0.0 acts as a reporting-only gate for now.
+        # Raise this value as engine conformance improves.
+        run: |
+          ./target/release/stator_test262 \
+            --test262-dir test262 \
+            --threshold 0.0
