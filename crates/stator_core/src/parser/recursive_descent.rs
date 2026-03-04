@@ -25,11 +25,12 @@
 
 use crate::error::{StatorError, StatorResult};
 use crate::parser::ast::{
-    AssignExpr, AssignOp, AssignTarget, BinaryExpr, BinaryOp, BlockStmt, BoolLit, BreakStmt,
-    ContinueStmt, DebuggerStmt, DoWhileStmt, EmptyStmt, Expr, ExprStmt, FnDecl, ForStmt, Ident,
-    IfStmt, LogicalExpr, LogicalOp, NullLit, NumLit, Param, Pat, Program, ProgramItem, ReturnStmt,
-    SequenceExpr, SourceLocation, SourceType, Stmt, StringLit, ThrowStmt, TryStmt, UnaryExpr,
-    UnaryOp, UpdateExpr, UpdateOp, VarDecl, VarDeclarator, VarKind, WhileStmt,
+    ArrayExpr, AssignExpr, AssignOp, AssignTarget, BinaryExpr, BinaryOp, BlockStmt, BoolLit,
+    BreakStmt, ContinueStmt, DebuggerStmt, DoWhileStmt, EmptyStmt, Expr, ExprStmt, FnDecl, ForStmt,
+    Ident, IfStmt, LogicalExpr, LogicalOp, NullLit, NumLit, Param, Pat, Program, ProgramItem,
+    ReturnStmt, SequenceExpr, SourceLocation, SourceType, SpreadElement, Stmt, StringLit,
+    ThrowStmt, TryStmt, UnaryExpr, UnaryOp, UpdateExpr, UpdateOp, VarDecl, VarDeclarator, VarKind,
+    WhileStmt,
 };
 use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue};
 
@@ -970,6 +971,48 @@ impl<'src> Parser<'src> {
                 self.expect(TokenKind::RightParen)?;
                 Ok(expr)
             }
+            TokenKind::LeftBracket => {
+                let start = self.current_span();
+                self.bump()?; // consume `[`
+                let mut elements: Vec<Option<Expr>> = Vec::new();
+                while self.peek_kind() != TokenKind::RightBracket {
+                    if self.peek_kind() == TokenKind::Eof {
+                        return Err(self.error("unexpected end of input in array literal"));
+                    }
+                    if self.peek_kind() == TokenKind::Comma {
+                        // elision
+                        elements.push(None);
+                        self.bump()?;
+                        continue;
+                    }
+                    if self.peek_kind() == TokenKind::DotDotDot {
+                        let spread_start = self.current_span();
+                        self.bump()?; // consume `...`
+                        let argument = self.parse_assignment_expr()?;
+                        let arg_end = argument.loc().end;
+                        elements.push(Some(Expr::Spread(Box::new(SpreadElement {
+                            loc: SourceLocation {
+                                start: spread_start.start,
+                                end: arg_end,
+                            },
+                            argument: Box::new(argument),
+                        }))));
+                    } else {
+                        elements.push(Some(self.parse_assignment_expr()?));
+                    }
+                    if !self.eat(TokenKind::Comma)? {
+                        break;
+                    }
+                }
+                let end = self.expect(TokenKind::RightBracket)?;
+                Ok(Expr::Array(Box::new(ArrayExpr {
+                    loc: SourceLocation {
+                        start: start.start,
+                        end: end.span.end,
+                    },
+                    elements,
+                })))
+            }
             TokenKind::Function => {
                 let fn_span = self.current_span();
                 self.bump()?;
@@ -1198,5 +1241,129 @@ mod tests {
     fn test_parse_multiple_stmts() {
         let prog = parse("var a = 1; var b = 2; var c = a + b;").unwrap();
         assert_eq!(prog.body.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_array_literal_simple() {
+        let prog = parse("var a = [1, 2, 3];").unwrap();
+        assert_eq!(prog.body.len(), 1);
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(init) = &vd.declarators[0].init {
+                if let Expr::Array(arr) = init.as_ref() {
+                    assert_eq!(arr.elements.len(), 3);
+                    assert!(arr.elements.iter().all(|e| e.is_some()));
+                } else {
+                    panic!("expected Array init");
+                }
+            } else {
+                panic!("expected init");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_parse_array_literal_empty() {
+        let prog = parse("var a = [];").unwrap();
+        assert_eq!(prog.body.len(), 1);
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(init) = &vd.declarators[0].init {
+                if let Expr::Array(arr) = init.as_ref() {
+                    assert!(arr.elements.is_empty());
+                } else {
+                    panic!("expected Array init");
+                }
+            } else {
+                panic!("expected init");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_parse_array_literal_trailing_comma() {
+        let prog = parse("var a = [1, 2,];").unwrap();
+        assert_eq!(prog.body.len(), 1);
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(init) = &vd.declarators[0].init {
+                if let Expr::Array(arr) = init.as_ref() {
+                    // trailing comma must not produce an extra None (elision)
+                    assert_eq!(arr.elements.len(), 2);
+                    assert!(arr.elements.iter().all(|e| e.is_some()));
+                } else {
+                    panic!("expected Array init");
+                }
+            } else {
+                panic!("expected init");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_parse_array_literal_elision() {
+        let prog = parse("var a = [1,,3];").unwrap();
+        assert_eq!(prog.body.len(), 1);
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(init) = &vd.declarators[0].init {
+                if let Expr::Array(arr) = init.as_ref() {
+                    assert_eq!(arr.elements.len(), 3);
+                    assert!(arr.elements[0].is_some());
+                    assert!(arr.elements[1].is_none());
+                    assert!(arr.elements[2].is_some());
+                } else {
+                    panic!("expected Array init");
+                }
+            } else {
+                panic!("expected init");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_parse_array_literal_nested() {
+        let prog = parse("var a = [[1], [2]];").unwrap();
+        assert_eq!(prog.body.len(), 1);
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(init) = &vd.declarators[0].init {
+                if let Expr::Array(arr) = init.as_ref() {
+                    assert_eq!(arr.elements.len(), 2);
+                    for elem in &arr.elements {
+                        assert!(matches!(elem, Some(Expr::Array(_))));
+                    }
+                } else {
+                    panic!("expected Array init");
+                }
+            } else {
+                panic!("expected init");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_parse_array_literal_spread() {
+        let prog = parse("var a = [...b];").unwrap();
+        assert_eq!(prog.body.len(), 1);
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(init) = &vd.declarators[0].init {
+                if let Expr::Array(arr) = init.as_ref() {
+                    assert_eq!(arr.elements.len(), 1);
+                    assert!(matches!(arr.elements[0], Some(Expr::Spread(_))));
+                } else {
+                    panic!("expected Array init");
+                }
+            } else {
+                panic!("expected init");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
     }
 }
