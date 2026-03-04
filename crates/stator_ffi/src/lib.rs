@@ -3537,9 +3537,9 @@ pub unsafe extern "C" fn stator_wasm_instance_call(
         Err(_) => std::ptr::null_mut(),
     }
 }
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CStr;
 
     /// Helper: create an isolate and automatically destroy it after the test.
     struct IsolateGuard(*mut StatorIsolate);
