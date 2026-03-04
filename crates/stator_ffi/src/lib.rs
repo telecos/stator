@@ -3537,6 +3537,399 @@ pub unsafe extern "C" fn stator_wasm_instance_call(
         Err(_) => std::ptr::null_mut(),
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CDP WebSocket server
+// ─────────────────────────────────────────────────────────────────────────────
+
+use stator_core::inspector::cdp::CdpServer;
+use stator_core::inspector::debugger::{DebugAction, Debugger};
+use stator_core::interpreter::{attach_debugger, detach_debugger};
+/// An opaque handle to a CDP WebSocket server.
+///
+/// Created with [`stator_cdp_server_create`] and freed with
+/// [`stator_cdp_server_destroy`].
+pub struct StatorCdpServer {
+    server: CdpServer,
+}
+
+/// Bind a CDP WebSocket server to `127.0.0.1:<port>`.
+///
+/// Passing `port = 0` lets the OS choose a free port; use
+/// [`stator_cdp_server_local_port`] to discover the actual port.
+///
+/// Returns a non-null handle on success, or null on failure (e.g. port already
+/// in use).  The handle must eventually be freed with
+/// [`stator_cdp_server_destroy`].
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_cdp_server_create(port: u16) -> *mut StatorCdpServer {
+    let addr = format!("127.0.0.1:{port}");
+    match CdpServer::bind(addr) {
+        Ok(server) => Box::into_raw(Box::new(StatorCdpServer { server })),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Return the TCP port that `server` is bound to.
+///
+/// # Safety
+/// `server` must be a non-null pointer returned by [`stator_cdp_server_create`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_cdp_server_local_port(server: *const StatorCdpServer) -> u16 {
+    if server.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `server` is valid.
+    unsafe { &*server }
+        .server
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or(0)
+}
+
+/// Spawn a background OS thread that accepts and serves CDP connections in a
+/// loop, transferring ownership of `server` to the new thread.
+///
+/// After this call the `server` pointer is **consumed** and must **not** be
+/// passed to [`stator_cdp_server_destroy`] or any other function.  The
+/// background thread runs until the process exits.  Any per-connection errors
+/// are silently ignored.
+///
+/// Does nothing if `server` is null.
+///
+/// # Safety
+/// `server` must be null or a valid, uniquely-owned pointer returned by
+/// [`stator_cdp_server_create`] that has not already been consumed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_cdp_server_run_background(server: *mut StatorCdpServer) {
+    if server.is_null() {
+        return;
+    }
+    // Transfer ownership to the background thread.
+    // SAFETY: caller guarantees `server` is a valid, uniquely-owned pointer.
+    let boxed = unsafe { Box::from_raw(server) };
+    std::thread::spawn(move || {
+        let _ = boxed.server.accept_loop();
+    });
+}
+
+/// Free a CDP server returned by [`stator_cdp_server_create`].
+///
+/// Does nothing if `server` is null.
+///
+/// # Safety
+/// `server` must be null or a valid pointer returned by
+/// [`stator_cdp_server_create`].  Must not be called more than once for the
+/// same pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_cdp_server_destroy(server: *mut StatorCdpServer) {
+    if !server.is_null() {
+        // SAFETY: caller guarantees `server` is a valid, uniquely-owned pointer.
+        drop(unsafe { Box::from_raw(server) });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Debug session (breakpoint / step / inspect)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An opaque handle to an interactive debugging session.
+///
+/// A debug session owns both the compiled [`InterpreterFrame`] and an attached
+/// [`Debugger`], allowing the host to:
+///
+/// 1. Set breakpoints before execution starts.
+/// 2. Start execution with [`stator_debug_session_run`] — the call returns
+///    `true` when a breakpoint is hit, leaving the session in a paused state.
+/// 3. Inspect global variables with [`stator_debug_session_get_global_string`].
+/// 4. Resume with [`stator_debug_session_resume`].
+/// 5. Repeat until `run` / `resume` return `false` (execution completed).
+/// 6. Retrieve the final result with [`stator_debug_session_result`].
+///
+/// Created with [`stator_debug_session_create`] and freed with
+/// [`stator_debug_session_destroy`].
+pub struct StatorDebugSession {
+    frame: InterpreterFrame,
+    dbg: Rc<RefCell<Debugger>>,
+    /// True while the session is paused at a breakpoint / step.
+    paused: bool,
+    /// Line number reported at the last pause (1-based; 0 if unknown).
+    pause_line: u32,
+    /// Stored result after the session runs to completion.
+    result: Option<JsValue>,
+    /// Isolate used to wrap the final result as a `StatorValue`.
+    isolate: *mut StatorIsolate,
+}
+
+/// Create a new debug session for `script`.
+///
+/// Compiles `script` and prepares an interpreter frame; does **not** start
+/// execution.  Call [`stator_debug_session_set_breakpoint_at_line`] to
+/// install breakpoints, then [`stator_debug_session_run`] to begin execution.
+///
+/// Returns null if `script` or `ctx` is null, if `script` has a compile
+/// error, or if allocation fails.  The returned handle must eventually be
+/// freed with [`stator_debug_session_destroy`].
+///
+/// # Safety
+/// - `script` must be a non-null pointer returned by [`stator_script_compile`]
+///   with no compile error.
+/// - `ctx` must be a non-null pointer to a live [`StatorContext`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_debug_session_create(
+    script: *const StatorScript,
+    ctx: *mut StatorContext,
+) -> *mut StatorDebugSession {
+    if script.is_null() || ctx.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees both pointers are valid and live.
+    let script_ref = unsafe { &*script };
+    let ctx_ref = unsafe { &*ctx };
+    let bytecodes = match &script_ref.bytecodes {
+        Some(bc) => bc.clone(),
+        None => return std::ptr::null_mut(),
+    };
+    let frame = InterpreterFrame::new_with_globals(bytecodes, vec![], Rc::clone(&ctx_ref.globals));
+    let dbg = Rc::new(RefCell::new(Debugger::new()));
+    Box::into_raw(Box::new(StatorDebugSession {
+        frame,
+        dbg,
+        paused: false,
+        pause_line: 0,
+        result: None,
+        isolate: ctx_ref._isolate,
+    }))
+}
+
+/// Install a breakpoint at the given 1-based source line in `session`.
+///
+/// Returns `true` if the breakpoint was successfully mapped to a bytecode
+/// offset, `false` otherwise (e.g. the line has no executable code).
+///
+/// # Safety
+/// `session` must be a non-null pointer returned by
+/// [`stator_debug_session_create`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_debug_session_set_breakpoint_at_line(
+    session: *mut StatorDebugSession,
+    line: u32,
+) -> bool {
+    if session.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `session` is valid.
+    let s = unsafe { &mut *session };
+    s.dbg
+        .borrow_mut()
+        .set_breakpoint_at_line(&s.frame.bytecode_array, line)
+        .is_some()
+}
+
+/// Run (or continue) the session until a breakpoint is hit or execution
+/// completes.
+///
+/// Returns `true` if execution paused at a breakpoint (the session is now in
+/// a paused state and the caller may inspect variables).  Returns `false` when
+/// execution finished normally or with an uncaught exception; the final result
+/// is available via [`stator_debug_session_result`].
+///
+/// # Safety
+/// `session` must be a non-null pointer returned by
+/// [`stator_debug_session_create`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_debug_session_run(session: *mut StatorDebugSession) -> bool {
+    if session.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `session` is valid.
+    let s = unsafe { &mut *session };
+    if s.result.is_some() {
+        // Already completed.
+        return false;
+    }
+
+    attach_debugger(Rc::clone(&s.dbg));
+    let outcome = Interpreter::run(&mut s.frame);
+    detach_debugger();
+
+    match outcome {
+        Err(stator_core::error::StatorError::DebuggerPaused { .. }) => {
+            s.paused = true;
+            // Record the 1-based line from the debugger's last pause location.
+            s.pause_line = s.dbg.borrow().last_pause_line();
+            true
+        }
+        Ok(val) => {
+            s.paused = false;
+            s.result = Some(val);
+            false
+        }
+        Err(_) => {
+            s.paused = false;
+            s.result = Some(JsValue::Undefined);
+            false
+        }
+    }
+}
+
+/// Returns `true` if the session is currently paused at a breakpoint.
+///
+/// # Safety
+/// `session` must be a non-null pointer returned by
+/// [`stator_debug_session_create`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_debug_session_is_paused(
+    session: *const StatorDebugSession,
+) -> bool {
+    if session.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `session` is valid.
+    unsafe { &*session }.paused
+}
+
+/// Return the 1-based source line at which execution is currently paused, or
+/// 0 if the session is not paused.
+///
+/// # Safety
+/// `session` must be a non-null pointer returned by
+/// [`stator_debug_session_create`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_debug_session_pause_line(
+    session: *const StatorDebugSession,
+) -> u32 {
+    if session.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `session` is valid.
+    let s = unsafe { &*session };
+    if s.paused {
+        s.dbg.borrow().last_pause_line()
+    } else {
+        0
+    }
+}
+
+/// Write the string representation of the global variable `name` into `buf`
+/// (up to `buf_len − 1` bytes, always NUL-terminated).
+///
+/// Returns the number of bytes written (excluding the NUL), or `-1` if the
+/// variable does not exist or the session / buffer pointer is null.
+///
+/// # Safety
+/// - `session` must be a non-null pointer returned by
+///   [`stator_debug_session_create`].
+/// - `name` must be a valid, null-terminated C string.
+/// - `buf` must be valid for writes of at least `buf_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_debug_session_get_global_string(
+    session: *const StatorDebugSession,
+    name: *const c_char,
+    buf: *mut c_char,
+    buf_len: usize,
+) -> i32 {
+    if session.is_null() || name.is_null() || buf.is_null() || buf_len == 0 {
+        return -1;
+    }
+    // SAFETY: caller guarantees both pointers are valid.
+    let s = unsafe { &*session };
+    let key = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+    let globals = s.frame.global_env.borrow();
+    let value = match globals.get(key.as_ref()) {
+        Some(v) => v,
+        None => return -1,
+    };
+    let repr = match value.to_js_string() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let bytes = repr.as_bytes();
+    let copy_len = bytes.len().min(buf_len - 1);
+    // SAFETY: caller guarantees `buf` is valid for `buf_len` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), buf, copy_len);
+        *buf.add(copy_len) = 0;
+    }
+    copy_len as i32
+}
+
+/// Resume a paused session with a "continue" action (run until the next
+/// breakpoint or completion).
+///
+/// Equivalent to calling [`stator_debug_session_run`] after applying a
+/// `Continue` action.  Returns `true` if execution pauses again, `false` if
+/// it completes.
+///
+/// Does nothing and returns `false` if the session is not paused or `session`
+/// is null.
+///
+/// # Safety
+/// `session` must be a non-null pointer returned by
+/// [`stator_debug_session_create`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_debug_session_resume(session: *mut StatorDebugSession) -> bool {
+    if session.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `session` is valid.
+    let s = unsafe { &mut *session };
+    if !s.paused {
+        return false;
+    }
+    s.dbg.borrow_mut().apply_action(DebugAction::Continue);
+    s.paused = false;
+    // SAFETY: `session` is valid (same pointer).
+    unsafe { stator_debug_session_run(session) }
+}
+
+/// Return a new [`StatorValue`] containing the final result of a completed
+/// debug session, or null if the session has not yet completed.
+///
+/// The returned value must be freed with [`stator_value_destroy`].
+///
+/// # Safety
+/// `session` must be a non-null pointer returned by
+/// [`stator_debug_session_create`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_debug_session_result(
+    session: *const StatorDebugSession,
+) -> *mut StatorValue {
+    if session.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `session` is valid.
+    let s = unsafe { &*session };
+    let val = match &s.result {
+        Some(v) => v,
+        None => return std::ptr::null_mut(),
+    };
+    let inner = jsvalue_to_stator_value_inner(val);
+    let isolate = s.isolate;
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: isolate is known to be valid for the session's lifetime.
+    unsafe { (*isolate).live_objects += 1 };
+    Box::into_raw(Box::new(StatorValue { inner, isolate }))
+}
+
+/// Free a debug session returned by [`stator_debug_session_create`].
+///
+/// Does nothing if `session` is null.
+///
+/// # Safety
+/// `session` must be null or a valid pointer returned by
+/// [`stator_debug_session_create`].  Must not be called more than once for
+/// the same pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_debug_session_destroy(session: *mut StatorDebugSession) {
+    if !session.is_null() {
+        // SAFETY: caller guarantees `session` is a valid, uniquely-owned pointer.
+        drop(unsafe { Box::from_raw(session) });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
