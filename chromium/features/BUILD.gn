@@ -1,0 +1,27 @@
+# chromium/features/BUILD.gn — GN build file for Stator feature flags.
+#
+# This source_set provides the Chrome base::Feature declarations used to
+# gate the Stator engine at runtime.  Any Chromium component that needs to
+# check whether Stator is enabled for a given renderer context should depend
+# on this target rather than reading the `js_engine` GN arg directly.
+#
+# Usage in GN:
+#
+#   deps = [ "//third_party/stator/chromium/features" ]
+#
+# Usage in C++:
+#
+#   #include "third_party/stator/chromium/features/stator_features.h"
+#
+#   if (base::FeatureList::IsEnabled(features::kStatorEngine)) { ... }
+
+source_set("stator_features") {
+  sources = [
+    "stator_features.cc",
+    "stator_features.h",
+  ]
+
+  deps = [
+    "//base",
+  ]
+}

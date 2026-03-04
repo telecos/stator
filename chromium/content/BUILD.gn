@@ -1,0 +1,50 @@
+# chromium/content/BUILD.gn — GN build file for the Stator content-layer
+# integration components.
+#
+# This directory provides two source_sets:
+#
+#   stator_engine_selector — IsStatorEnabledFor() per-context engine selection
+#   stator_dual_engine     — RunDualEngine() differential-testing harness
+#
+# Usage in GN (from within a Chromium checkout):
+#
+#   deps = [
+#     "//third_party/stator/chromium/content:stator_engine_selector",
+#     "//third_party/stator/chromium/content:stator_dual_engine",
+#   ]
+
+# ---------------------------------------------------------------------------
+# stator_engine_selector — selects V8 vs Stator per renderer context type
+# based on the active Chrome feature flags.
+# ---------------------------------------------------------------------------
+source_set("stator_engine_selector") {
+  sources = [
+    "stator_engine_selector.cc",
+    "stator_engine_selector.h",
+  ]
+
+  deps = [
+    "//base",
+    "//third_party/stator/chromium/features:stator_features",
+  ]
+}
+
+# ---------------------------------------------------------------------------
+# stator_dual_engine — differential-testing harness.
+#
+# Runs both V8 (primary) and Stator (shadow) on the same script and compares
+# the resulting global/DOM state.  Intended for canary / dev-channel testing
+# only; gated behind the kStatorDualEngine feature flag at runtime.
+# ---------------------------------------------------------------------------
+source_set("stator_dual_engine") {
+  sources = [
+    "stator_dual_engine.cc",
+    "stator_dual_engine.h",
+  ]
+
+  deps = [
+    "//base",
+    "//third_party/stator/chromium:stator_bridge",
+    "//third_party/stator/chromium/features:stator_features",
+  ]
+}
