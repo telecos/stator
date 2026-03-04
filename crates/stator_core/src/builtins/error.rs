@@ -75,6 +75,17 @@ pub fn push_call_frame(name: impl Into<String>) {
     CALL_STACK.with(|cs| cs.borrow_mut().push(name.into()));
 }
 
+/// Return the current depth of the thread-local call stack.
+///
+/// The depth is 0 at the top-level script, 1 inside the first function call,
+/// and so on.  The debugger uses this to implement step-over and step-out:
+/// step-over pauses when the depth returns to (or below) the depth at the
+/// time the step was requested; step-out pauses when the depth drops *below*
+/// the saved depth.
+pub fn call_stack_depth() -> usize {
+    CALL_STACK.with(|cs| cs.borrow().len())
+}
+
 /// Pop the most recently pushed frame name from the thread-local call stack.
 ///
 /// Call this immediately after returning from a nested interpreter call.

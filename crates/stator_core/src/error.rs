@@ -42,6 +42,23 @@ pub enum StatorError {
     /// the thrown value, kept to avoid a dependency cycle.
     #[error("Uncaught exception: {0}")]
     JsException(String),
+
+    /// The interpreter was suspended by the debugger at the given bytecode
+    /// byte offset.
+    ///
+    /// This error is returned from [`crate::interpreter::Interpreter::run`]
+    /// when a breakpoint, `debugger;` statement, step condition, or
+    /// pause-on-exception fires.  The interpreter frame is left in a
+    /// consistent state so that execution can be resumed by calling
+    /// [`crate::interpreter::Interpreter::run`] again after applying a
+    /// [`crate::inspector::debugger::DebugAction`] via
+    /// [`crate::inspector::debugger::Debugger::apply_action`].
+    #[error("debugger paused at bytecode offset {bytecode_offset}")]
+    DebuggerPaused {
+        /// The bytecode byte offset of the instruction at which execution was
+        /// paused.
+        bytecode_offset: u32,
+    },
 }
 
 /// Convenient `Result` alias for fallible engine operations.
