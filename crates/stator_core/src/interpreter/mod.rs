@@ -871,6 +871,9 @@ impl Interpreter {
         let handler_table: Vec<HandlerTableEntry> = frame.bytecode_array.handler_table().to_vec();
 
         loop {
+            // ── CPU profiler checkpoint ────────────────────────────────────
+            crate::inspector::profiler::maybe_record_sample();
+
             if frame.pc >= instructions.len() {
                 return Err(StatorError::Internal(
                     "bytecode ended without a Return instruction".into(),

@@ -95,6 +95,16 @@ pub fn pop_call_frame() {
     });
 }
 
+/// Return a snapshot of the current JS call stack as a `Vec<String>`.
+///
+/// Each entry is a function-frame name (or `"<anonymous>"`).  The outermost
+/// caller is at index 0; the most-recently-entered frame is last.
+///
+/// Used by the CPU profiler to record samples at safe points.
+pub fn capture_call_stack() -> Vec<String> {
+    CALL_STACK.with(|cs| cs.borrow().clone())
+}
+
 /// Capture the current call stack as a formatted `stack` property string.
 ///
 /// The returned string has the format:

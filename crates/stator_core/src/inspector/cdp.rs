@@ -40,6 +40,7 @@ use tungstenite::{Message, WebSocket, accept};
 
 use crate::bytecode::bytecode_generator::BytecodeGenerator;
 use crate::error::StatorResult;
+use crate::inspector::profiler::CpuProfiler;
 use crate::interpreter::{Interpreter, InterpreterFrame};
 use crate::objects::value::JsValue;
 use crate::parser;
@@ -93,6 +94,7 @@ pub struct CdpEvent {
 pub struct CdpSession {
     ws: WebSocket<TcpStream>,
     globals: Rc<RefCell<HashMap<String, JsValue>>>,
+    profiler: CpuProfiler,
 }
 
 impl CdpSession {
@@ -101,6 +103,7 @@ impl CdpSession {
         Self {
             ws,
             globals: Rc::new(RefCell::new(HashMap::new())),
+            profiler: CpuProfiler::new(),
         }
     }
 
@@ -188,6 +191,8 @@ impl CdpSession {
 
             // ── Profiler ──────────────────────────────────────────────────
             "Profiler.enable" => Ok(json!({})),
+            "Profiler.start" => self.profiler_start(&req.params),
+            "Profiler.stop" => self.profiler_stop(),
 
             // ── HeapProfiler ──────────────────────────────────────────────
             "HeapProfiler.enable" => Ok(json!({})),
@@ -243,6 +248,29 @@ impl CdpSession {
         Ok(json!({
             "result": js_value_to_remote_object(&js_result)
         }))
+    }
+
+    // ── Profiler.start ───────────────────────────────────────────────────────
+
+    fn profiler_start(&mut self, params: &Value) -> StatorResult<Value> {
+        // Optional `samplingInterval` parameter in microseconds (default 1 ms).
+        let interval_micros = params
+            .get("samplingInterval")
+            .and_then(Value::as_u64)
+            .unwrap_or(1_000);
+        self.profiler.start(interval_micros)?;
+        Ok(json!({}))
+    }
+
+    // ── Profiler.stop ────────────────────────────────────────────────────────
+
+    fn profiler_stop(&mut self) -> StatorResult<Value> {
+        let profile = self.profiler.stop().ok_or_else(|| {
+            crate::error::StatorError::Internal("profiler was not started".into())
+        })?;
+        let profile_value = serde_json::to_value(&profile)
+            .map_err(|e| crate::error::StatorError::Internal(e.to_string()))?;
+        Ok(json!({ "profile": profile_value }))
     }
 }
 
