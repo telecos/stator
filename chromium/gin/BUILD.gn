@@ -9,6 +9,21 @@
 #
 #   gn gen out/stator --args='js_engine="stator"'
 #   ninja -C out/stator gin_js_engine_test
+#
+# Runtime feature flag (independent of the build-time `js_engine` arg)
+# ---------------------------------------------------------------------
+# The Chrome feature flag --enable-features=StatorEngine enables Stator at
+# runtime for specific renderer context types without requiring a separate
+# build.  See //third_party/stator/chromium/features/stator_features.h.
+#
+# Phased rollout (lowest to highest risk):
+#   --enable-features=StatorEngineWorkers        (dedicated workers)
+#   --enable-features=StatorEngineServiceWorkers (service workers)
+#   --enable-features=StatorEngineMainFrame      (main frame renderer)
+#   --enable-features=StatorEngine               (all of the above)
+#
+# Differential testing (canary / dev channel only):
+#   --enable-features=StatorDualEngine
 
 declare_args() {
   # JavaScript engine backend.  Supported values: "v8", "stator".
@@ -40,10 +55,16 @@ if (js_engine == "stator") {
 source_set("gin") {
   public_configs = [ ":js_engine_config" ]
 
+  deps = [
+    # Feature-flag declarations are always compiled in so that runtime checks
+    # (base::FeatureList::IsEnabled) work regardless of the build-time engine.
+    "//third_party/stator/chromium/features:stator_features",
+  ]
+
   if (js_engine == "stator") {
-    deps = [ "//chromium:stator_bridge" ]
+    deps += [ "//chromium:stator_bridge" ]
   } else {
-    deps = [ "//v8" ]
+    deps += [ "//v8" ]
   }
 }
 
