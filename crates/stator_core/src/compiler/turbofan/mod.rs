@@ -81,7 +81,7 @@ use std::collections::HashMap;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F64, I8, I32, I64};
-use cranelift_codegen::ir::{AbiParam, Function, InstBuilder, MemFlags, Signature};
+use cranelift_codegen::ir::{AbiParam, BlockArg, Function, InstBuilder, MemFlags, Signature};
 use cranelift_codegen::ir::{Block, Value};
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -96,6 +96,16 @@ use crate::error::{StatorError, StatorResult};
 /// Pre-CLIF type-specialisation passes (type narrowing, call-site
 /// specialisation, load/store elimination, escape analysis).
 pub mod specialize;
+
+/// Cranelift deoptimiser: frame reconstruction and interpreter resume.
+pub mod deopt;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Byte size of a single register-file slot (`i64`).
+const REGISTER_SLOT_BYTES: i32 = 8;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -175,8 +185,10 @@ impl TurbofanCompiledCode {
     pub unsafe fn execute(&self, args: &[i64]) -> StatorResult<i64> {
         let fn_ptr = self.module.get_finalized_function(self.func_id);
 
-        let mut regs = vec![0i64; self.register_file_slots];
-        for (i, &v) in args.iter().enumerate().take(regs.len()) {
+        // Allocate register_file_slots + 1 entries: the extra trailing slot
+        // receives the deopt-site index when the JIT triggers a deopt.
+        let mut regs = vec![0i64; self.register_file_slots + 1];
+        for (i, &v) in args.iter().enumerate().take(self.register_file_slots) {
             regs[i] = v;
         }
 
@@ -194,6 +206,65 @@ impl TurbofanCompiledCode {
             Err(StatorError::Internal("turbofan deopt".into()))
         } else {
             Ok(result)
+        }
+    }
+
+    /// Execute the compiled function, falling back to the interpreter on deopt.
+    ///
+    /// If the JIT function triggers a deoptimisation (returns [`JIT_DEOPT`]),
+    /// the register-file snapshot and the deopt-site index (written into the
+    /// trailing slot by the JIT) are captured and forwarded to
+    /// [`deopt::deoptimize_turbofan`], which reconstructs an
+    /// [`InterpreterFrame`][crate::interpreter::InterpreterFrame] and resumes
+    /// bytecode execution.
+    ///
+    /// On a successful (non-deopt) return the raw `i64` result is decoded to a
+    /// [`JsValue`][crate::objects::value::JsValue] via
+    /// [`jit_to_jsvalue`][crate::compiler::baseline::compiler::jit_to_jsvalue].
+    ///
+    /// # Safety
+    ///
+    /// The code was produced by [`compile`] from a well-formed [`MaglevGraph`].
+    /// Callers must not use this value after the owning
+    /// [`TurbofanCompiledCode`] is dropped.
+    pub unsafe fn execute_with_deopt(
+        &self,
+        bytecode_array: crate::bytecode::bytecode_array::BytecodeArray,
+        feedback: &mut FeedbackVector,
+        global_env: std::rc::Rc<
+            std::cell::RefCell<std::collections::HashMap<String, crate::objects::value::JsValue>>,
+        >,
+    ) -> StatorResult<crate::objects::value::JsValue> {
+        let fn_ptr = self.module.get_finalized_function(self.func_id);
+
+        // +1 trailing slot for the deopt-site index written by the JIT.
+        let mut regs = vec![0i64; self.register_file_slots + 1];
+
+        // SAFETY: same invariants as execute().
+        let result = unsafe {
+            let f: extern "C" fn(*mut i64) -> i64 = std::mem::transmute(fn_ptr);
+            f(regs.as_mut_ptr())
+        };
+
+        if result == JIT_DEOPT {
+            // The JIT stored the deopt-site index into the trailing slot.
+            let deopt_index = regs[self.register_file_slots] as u32;
+            let frame = deopt::TurbofanFrameState {
+                registers: regs[..self.register_file_slots].to_vec(),
+                deopt_index,
+            };
+            deopt::deoptimize_turbofan(
+                bytecode_array,
+                feedback,
+                &self.deopt_points,
+                frame,
+                global_env,
+            )
+        } else {
+            use crate::compiler::baseline::compiler::jit_to_jsvalue;
+            jit_to_jsvalue(result).ok_or_else(|| {
+                StatorError::Internal(format!("turbofan: unrecognised return value {result}"))
+            })
         }
     }
 }
@@ -344,16 +415,26 @@ struct Lowering<'a, 'b> {
     /// Cranelift SSA variable for the register-file pointer argument.
     regs_var: cranelift_frontend::Variable,
     /// Deopt epilogue block (lazily created).
+    ///
+    /// This block accepts a single `I32` parameter: the deopt-site index.
+    /// The body stores the index into the trailing register-file slot (at
+    /// byte offset `register_file_slots × 8`) and returns [`JIT_DEOPT`].
     deopt_block: Option<Block>,
     /// Next deopt-point index.
     deopt_index: u32,
+    /// Number of user-visible register-file slots (= `param_count`).
+    ///
+    /// The caller allocates one extra slot beyond this count for the
+    /// deopt-site index.  The deopt epilogue writes its `I32` parameter
+    /// (the site index) into that slot.
+    register_file_slots: u32,
 }
 
 impl<'a, 'b> Lowering<'a, 'b> {
     fn new(
         builder: &'b mut FunctionBuilder<'a>,
         graph: &'a MaglevGraph,
-        _param_count: u32,
+        param_count: u32,
         deopt_points: &'b mut Vec<DeoptPoint>,
         pointer_type: cranelift_codegen::ir::Type,
     ) -> Self {
@@ -368,6 +449,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
             regs_var,
             deopt_block: None,
             deopt_index: 0,
+            register_file_slots: param_count,
         }
     }
 
@@ -420,6 +502,16 @@ impl<'a, 'b> Lowering<'a, 'b> {
         if let Some(deopt_block) = self.deopt_block {
             self.builder.switch_to_block(deopt_block);
             self.builder.seal_block(deopt_block);
+            // The block accepts a single I32 parameter: the deopt-site index.
+            // Store it (sign-extended to I64) into the trailing register-file
+            // slot so the caller can identify which guard fired.
+            let idx_param = self.builder.block_params(deopt_block)[0];
+            let regs = self.builder.use_var(self.regs_var);
+            let slot_offset = (self.register_file_slots as i32) * REGISTER_SLOT_BYTES;
+            let idx_i64 = self.builder.ins().sextend(I64, idx_param);
+            self.builder
+                .ins()
+                .store(MemFlags::new(), idx_i64, regs, slot_offset);
             let sentinel = self.builder.ins().iconst(I64, JIT_DEOPT);
             self.builder.ins().return_(&[sentinel]);
         }
@@ -451,7 +543,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 // Parameters are stored as i64 slots in the register file.
                 // Load from regs[index].
                 let regs = self.builder.use_var(self.regs_var);
-                let byte_offset = (*index as i32) * 8;
+                let byte_offset = (*index as i32) * REGISTER_SLOT_BYTES;
                 self.builder
                     .ins()
                     .load(I64, MemFlags::new(), regs, byte_offset)
@@ -627,14 +719,18 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 bytecode_offset,
                 reason: _,
             } => {
+                let site_index = self.deopt_index;
                 self.deopt_points.push(DeoptPoint {
-                    index: self.deopt_index,
+                    index: site_index,
                     bytecode_offset: *bytecode_offset,
                     reason: "Deoptimize",
                 });
                 self.deopt_index += 1;
                 let deopt_block = self.get_or_create_deopt_block();
-                self.builder.ins().jump(deopt_block, &[]);
+                let idx_val = self.builder.ins().iconst(I32, site_index as i64);
+                self.builder
+                    .ins()
+                    .jump(deopt_block, &[BlockArg::from(idx_val)]);
             }
         }
         Ok(())
@@ -722,11 +818,16 @@ impl<'a, 'b> Lowering<'a, 'b> {
     }
 
     /// Get-or-create the shared deopt epilogue block.
+    ///
+    /// The block has a single `I32` block parameter that holds the deopt-site
+    /// index.  Every branch to this block must pass the index as an argument.
     fn get_or_create_deopt_block(&mut self) -> Block {
         if let Some(b) = self.deopt_block {
             return b;
         }
         let b = self.builder.create_block();
+        // Deopt-site index parameter (I32).
+        self.builder.append_block_param(b, I32);
         self.deopt_block = Some(b);
         b
     }
@@ -774,11 +875,17 @@ impl<'a, 'b> Lowering<'a, 'b> {
     fn emit_overflow_deopt(&mut self, overflow: Value, reason: &'static str) -> StatorResult<()> {
         let ok_block = self.builder.create_block();
         let deopt_block = self.get_or_create_deopt_block();
-        self.builder
-            .ins()
-            .brif(overflow, deopt_block, &[], ok_block, &[]);
+        let site_index = self.deopt_index;
+        let idx_val = self.builder.ins().iconst(I32, site_index as i64);
+        self.builder.ins().brif(
+            overflow,
+            deopt_block,
+            &[BlockArg::from(idx_val)],
+            ok_block,
+            &[],
+        );
         self.deopt_points.push(DeoptPoint {
-            index: self.deopt_index,
+            index: site_index,
             bytecode_offset: 0,
             reason,
         });
