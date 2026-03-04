@@ -18,7 +18,6 @@ jobs:
     env:
       RUSTFLAGS: "-Z sanitizer=thread"
       RUSTDOCFLAGS: "-Z sanitizer=thread"
-      TSAN_OPTIONS: "suppressions=scripts/tsan.supp"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -37,6 +36,8 @@ jobs:
             ${{ runner.os }}-cargo-tsan-registry-
 
       - name: Run TSAN tests – stator_core
+        env:
+          TSAN_OPTIONS: "suppressions=${{ github.workspace }}/scripts/tsan.supp"
         run: >
           cargo +nightly test
           -p stator_core
