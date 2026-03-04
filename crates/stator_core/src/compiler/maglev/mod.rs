@@ -12,6 +12,8 @@
 /// Code generator: walk register-allocated [`ir::MaglevGraph`] and emit
 /// x86-64 machine code.
 pub mod codegen;
+/// Deoptimiser: JIT → interpreter fallback on speculation failure.
+pub mod deopt;
 /// Bytecode-to-IR graph builder.
 pub mod graph_builder;
 /// Typed IR node definitions for the Maglev compiler.
