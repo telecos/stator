@@ -21,6 +21,9 @@ smallvec.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 regress.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tungstenite = { workspace = true }
 cranelift-codegen.workspace = true
 cranelift-frontend.workspace = true
 cranelift-jit.workspace = true
