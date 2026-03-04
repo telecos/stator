@@ -45,6 +45,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::bytecode::bytecodes::{self, Instruction};
 use crate::bytecode::feedback::FeedbackMetadata;
+use crate::compiler::turbofan::TurbofanCompiledCode;
 use crate::error::StatorResult;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -152,6 +153,13 @@ type JitCodeCache = Rc<RefCell<Option<(Vec<u8>, usize)>>>;
 /// the main thread.
 pub type MaglevJitCodeCache = Arc<Mutex<Option<(Vec<u8>, usize)>>>;
 
+/// Shared Turbofan JIT code cache stored in a [`BytecodeArray`].
+///
+/// Stores a fully-compiled [`TurbofanCompiledCode`] produced by the Turbofan
+/// background thread.  Uses [`Arc`] + [`Mutex`] so the background thread can
+/// write the code while the interpreter runs on the main thread.
+pub type TurbofanJitCodeCache = Arc<Mutex<Option<TurbofanCompiledCode>>>;
+
 /// Invocation-count threshold that triggers baseline JIT compilation.
 ///
 /// When a function's `invocation_count` reaches this value the interpreter
@@ -166,6 +174,15 @@ pub const TIERING_THRESHOLD: u32 = 100;
 /// compilation.  Once compilation finishes the cached Maglev code replaces
 /// the baseline tier for future calls.
 pub const MAGLEV_TIERING_THRESHOLD: u32 = 1_000;
+
+/// Invocation-count threshold that triggers Turbofan (Cranelift optimising)
+/// JIT compilation.
+///
+/// When a function's `invocation_count` reaches this value a background
+/// Turbofan compilation is scheduled.  Turbofan runs the full Maglev graph
+/// builder followed by Cranelift CLIF lowering and optimisation, producing
+/// code that is expected to reach within 90 % of peak throughput.
+pub const TURBOFAN_TIERING_THRESHOLD: u32 = 10_000;
 
 /// An immutable, compact representation of the bytecode for a single
 /// JavaScript function.
@@ -227,12 +244,23 @@ pub struct BytecodeArray {
     /// Set to `true` (via compare-exchange) when a Maglev compilation has been
     /// scheduled so that only one background thread is spawned per function.
     maglev_compile_started: Arc<AtomicBool>,
+    /// Cached Turbofan (Cranelift optimising) JIT compiled code.
+    ///
+    /// Uses [`Arc`] + [`Mutex`] so the background Turbofan compilation thread
+    /// can write results while the interpreter runs on the main thread.
+    /// `None` until Turbofan compilation finishes successfully.
+    turbofan_jit_code: TurbofanJitCodeCache,
+    /// Set to `true` (via compare-exchange) when a Turbofan compilation has
+    /// been scheduled so that only one background thread is spawned per
+    /// function.
+    turbofan_compile_started: Arc<AtomicBool>,
 }
 
 impl PartialEq for BytecodeArray {
     /// Two [`BytecodeArray`]s are equal when their static bytecode and metadata
     /// are identical.  The tiering state (`invocation_count`, `jit_code`,
-    /// `maglev_jit_code`) is intentionally excluded from the comparison.
+    /// `maglev_jit_code`, `turbofan_jit_code`) is intentionally excluded from
+    /// the comparison.
     fn eq(&self, other: &Self) -> bool {
         self.bytecodes == other.bytecodes
             && self.constant_pool == other.constant_pool
@@ -281,6 +309,8 @@ impl BytecodeArray {
             jit_code: Rc::new(RefCell::new(None)),
             maglev_jit_code: Arc::new(Mutex::new(None)),
             maglev_compile_started: Arc::new(AtomicBool::new(false)),
+            turbofan_jit_code: Arc::new(Mutex::new(None)),
+            turbofan_compile_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -434,6 +464,36 @@ impl BytecodeArray {
     /// already started or has been scheduled by another caller.
     pub fn try_start_maglev_compile(&self) -> bool {
         self.maglev_compile_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Returns `true` if Turbofan compilation has finished and compiled code
+    /// is available.
+    pub fn has_turbofan_jit_code(&self) -> bool {
+        self.turbofan_jit_code
+            .lock()
+            .ok()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Returns an [`Arc`] clone of the Turbofan JIT code cache.
+    ///
+    /// The background compilation thread receives this `Arc` and writes the
+    /// compiled [`TurbofanCompiledCode`] into it when compilation succeeds.
+    pub fn turbofan_jit_cache_arc(&self) -> TurbofanJitCodeCache {
+        Arc::clone(&self.turbofan_jit_code)
+    }
+
+    /// Attempt to atomically mark this function as having a Turbofan
+    /// compilation in flight.
+    ///
+    /// Returns `true` if the caller successfully claimed the compilation slot
+    /// (the previous state was `false`); returns `false` if a compilation was
+    /// already started or has been scheduled by another caller.
+    pub fn try_start_turbofan_compile(&self) -> bool {
+        self.turbofan_compile_started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
