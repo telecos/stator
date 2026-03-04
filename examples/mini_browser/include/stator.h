@@ -914,6 +914,99 @@ double stator_platform_monotonically_increasing_time(const StatorPlatform *platf
  */
 double stator_platform_current_clock_time_millis(const StatorPlatform *platform);
 
+/* -------------------------------------------------------------------------
+ * WebAssembly
+ * ------------------------------------------------------------------------- */
+
+/** Opaque handle to a compiled WebAssembly module. */
+typedef struct StatorWasmModule   StatorWasmModule;
+
+/** Opaque handle to a live WebAssembly module instance. */
+typedef struct StatorWasmInstance StatorWasmInstance;
+
+/**
+ * Compile a WebAssembly binary (or WAT text) into a StatorWasmModule.
+ *
+ * Returns NULL if any pointer argument is NULL, len is zero, or if the
+ * bytes are not valid WebAssembly.  The caller must free the returned
+ * handle with stator_wasm_module_destroy().
+ *
+ * @param isolate  A valid, non-NULL isolate pointer.
+ * @param bytes    Pointer to the raw .wasm bytes (or WAT text bytes).
+ * @param len      Length of the bytes buffer in bytes.
+ */
+StatorWasmModule *stator_wasm_compile(StatorIsolate *isolate,
+                                      const uint8_t *bytes,
+                                      size_t         len);
+
+/**
+ * Free a StatorWasmModule returned by stator_wasm_compile().
+ *
+ * Does nothing if module is NULL.
+ */
+void stator_wasm_module_destroy(StatorWasmModule *module);
+
+/**
+ * Instantiate a StatorWasmModule into a live StatorWasmInstance.
+ *
+ * ctx and imports are reserved for future use and may be NULL.
+ * Returns NULL if module is NULL or instantiation fails.  The caller
+ * must free the returned handle with stator_wasm_instance_destroy().
+ *
+ * @param module   A valid, non-NULL StatorWasmModule pointer.
+ * @param ctx      Reserved; pass NULL.
+ * @param imports  Reserved; must be NULL.
+ */
+StatorWasmInstance *stator_wasm_instantiate(StatorWasmModule *module,
+                                             StatorContext    *ctx,
+                                             const void       *imports);
+
+/**
+ * Free a StatorWasmInstance returned by stator_wasm_instantiate().
+ *
+ * Does nothing if instance is NULL.
+ */
+void stator_wasm_instance_destroy(StatorWasmInstance *instance);
+
+/**
+ * Call an exported WebAssembly function by name.
+ *
+ * args is an array of args_len StatorValue pointers used as Wasm
+ * arguments (NULL elements are treated as i32(0)).  A NULL args pointer
+ * with args_len == 0 means no arguments.
+ *
+ * Returns a new StatorValue (free with stator_value_destroy()) holding
+ * the first result, an undefined value for void functions, or NULL on
+ * error.
+ *
+ * @param instance  A valid, non-NULL StatorWasmInstance pointer.
+ * @param isolate   A valid, non-NULL StatorIsolate pointer.
+ * @param name      Null-terminated name of the exported function.
+ * @param args      Array of StatorValue* arguments, or NULL.
+ * @param args_len  Number of elements in args.
+ */
+StatorValue *stator_wasm_instance_call(StatorWasmInstance    *instance,
+                                        StatorIsolate         *isolate,
+                                        const char            *name,
+                                        const StatorValue *const *args,
+                                        size_t                 args_len);
+
+/**
+ * Return a NULL-terminated array of export names from instance.
+ *
+ * Each element is a heap-allocated, null-terminated C string.  The
+ * caller must free the array with stator_wasm_exports_destroy().
+ * Returns NULL if instance is NULL.
+ */
+char **stator_wasm_instance_exports(StatorWasmInstance *instance);
+
+/**
+ * Free an export-name array returned by stator_wasm_instance_exports().
+ *
+ * Does nothing if exports is NULL.
+ */
+void stator_wasm_exports_destroy(char **exports);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
