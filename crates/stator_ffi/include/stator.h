@@ -12,6 +12,14 @@
 #include <stdlib.h>
 
 /**
+ * An opaque handle to a CDP WebSocket server.
+ *
+ * Created with [`stator_cdp_server_create`] and freed with
+ * [`stator_cdp_server_destroy`].
+ */
+typedef struct StatorCdpServer StatorCdpServer;
+
+/**
  * An opaque context handle.
  *
  * A context represents an execution environment associated with an
@@ -19,6 +27,25 @@
  * [`stator_context_destroy`] when the context is no longer needed.
  */
 typedef struct StatorContext StatorContext;
+
+/**
+ * An opaque handle to an interactive debugging session.
+ *
+ * A debug session owns both the compiled [`InterpreterFrame`] and an attached
+ * [`Debugger`], allowing the host to:
+ *
+ * 1. Set breakpoints before execution starts.
+ * 2. Start execution with [`stator_debug_session_run`] — the call returns
+ *    `true` when a breakpoint is hit, leaving the session in a paused state.
+ * 3. Inspect global variables with [`stator_debug_session_get_global_string`].
+ * 4. Resume with [`stator_debug_session_resume`].
+ * 5. Repeat until `run` / `resume` return `false` (execution completed).
+ * 6. Retrieve the final result with [`stator_debug_session_result`].
+ *
+ * Created with [`stator_debug_session_create`] and freed with
+ * [`stator_debug_session_destroy`].
+ */
+typedef struct StatorDebugSession StatorDebugSession;
 
 /**
  * An opaque escapable handle scope.
@@ -1589,6 +1616,179 @@ struct StatorValue *stator_wasm_instance_call(struct StatorWasmInstance *instanc
                                               const char *name,
                                               const struct StatorValue *const *args,
                                               size_t args_len);
+
+/**
+ * Bind a CDP WebSocket server to `127.0.0.1:<port>`.
+ *
+ * Passing `port = 0` lets the OS choose a free port; use
+ * [`stator_cdp_server_local_port`] to discover the actual port.
+ *
+ * Returns a non-null handle on success, or null on failure (e.g. port already
+ * in use).  The handle must eventually be freed with
+ * [`stator_cdp_server_destroy`].
+ */
+struct StatorCdpServer *stator_cdp_server_create(uint16_t port);
+
+/**
+ * Return the TCP port that `server` is bound to.
+ *
+ * # Safety
+ * `server` must be a non-null pointer returned by [`stator_cdp_server_create`].
+ */
+uint16_t stator_cdp_server_local_port(const struct StatorCdpServer *server);
+
+/**
+ * Spawn a background OS thread that accepts and serves CDP connections in a
+ * loop, transferring ownership of `server` to the new thread.
+ *
+ * After this call the `server` pointer is **consumed** and must **not** be
+ * passed to [`stator_cdp_server_destroy`] or any other function.  The
+ * background thread runs until the process exits.  Any per-connection errors
+ * are silently ignored.
+ *
+ * Does nothing if `server` is null.
+ *
+ * # Safety
+ * `server` must be null or a valid, uniquely-owned pointer returned by
+ * [`stator_cdp_server_create`] that has not already been consumed.
+ */
+void stator_cdp_server_run_background(struct StatorCdpServer *server);
+
+/**
+ * Free a CDP server returned by [`stator_cdp_server_create`].
+ *
+ * Does nothing if `server` is null.
+ *
+ * # Safety
+ * `server` must be null or a valid pointer returned by
+ * [`stator_cdp_server_create`].  Must not be called more than once for the
+ * same pointer.
+ */
+void stator_cdp_server_destroy(struct StatorCdpServer *server);
+
+/**
+ * Create a new debug session for `script`.
+ *
+ * Compiles `script` and prepares an interpreter frame; does **not** start
+ * execution.  Call [`stator_debug_session_set_breakpoint_at_line`] to
+ * install breakpoints, then [`stator_debug_session_run`] to begin execution.
+ *
+ * Returns null if `script` or `ctx` is null, if `script` has a compile
+ * error, or if allocation fails.  The returned handle must eventually be
+ * freed with [`stator_debug_session_destroy`].
+ *
+ * # Safety
+ * - `script` must be a non-null pointer returned by [`stator_script_compile`]
+ *   with no compile error.
+ * - `ctx` must be a non-null pointer to a live [`StatorContext`].
+ */
+struct StatorDebugSession *stator_debug_session_create(const struct StatorScript *script,
+                                                       struct StatorContext *ctx);
+
+/**
+ * Install a breakpoint at the given 1-based source line in `session`.
+ *
+ * Returns `true` if the breakpoint was successfully mapped to a bytecode
+ * offset, `false` otherwise (e.g. the line has no executable code).
+ *
+ * # Safety
+ * `session` must be a non-null pointer returned by
+ * [`stator_debug_session_create`].
+ */
+bool stator_debug_session_set_breakpoint_at_line(struct StatorDebugSession *session, uint32_t line);
+
+/**
+ * Run (or continue) the session until a breakpoint is hit or execution
+ * completes.
+ *
+ * Returns `true` if execution paused at a breakpoint (the session is now in
+ * a paused state and the caller may inspect variables).  Returns `false` when
+ * execution finished normally or with an uncaught exception; the final result
+ * is available via [`stator_debug_session_result`].
+ *
+ * # Safety
+ * `session` must be a non-null pointer returned by
+ * [`stator_debug_session_create`].
+ */
+bool stator_debug_session_run(struct StatorDebugSession *session);
+
+/**
+ * Returns `true` if the session is currently paused at a breakpoint.
+ *
+ * # Safety
+ * `session` must be a non-null pointer returned by
+ * [`stator_debug_session_create`].
+ */
+bool stator_debug_session_is_paused(const struct StatorDebugSession *session);
+
+/**
+ * Return the 1-based source line at which execution is currently paused, or
+ * 0 if the session is not paused.
+ *
+ * # Safety
+ * `session` must be a non-null pointer returned by
+ * [`stator_debug_session_create`].
+ */
+uint32_t stator_debug_session_pause_line(const struct StatorDebugSession *session);
+
+/**
+ * Write the string representation of the global variable `name` into `buf`
+ * (up to `buf_len − 1` bytes, always NUL-terminated).
+ *
+ * Returns the number of bytes written (excluding the NUL), or `-1` if the
+ * variable does not exist or the session / buffer pointer is null.
+ *
+ * # Safety
+ * - `session` must be a non-null pointer returned by
+ *   [`stator_debug_session_create`].
+ * - `name` must be a valid, null-terminated C string.
+ * - `buf` must be valid for writes of at least `buf_len` bytes.
+ */
+int32_t stator_debug_session_get_global_string(const struct StatorDebugSession *session,
+                                               const char *name,
+                                               char *buf,
+                                               size_t buf_len);
+
+/**
+ * Resume a paused session with a "continue" action (run until the next
+ * breakpoint or completion).
+ *
+ * Equivalent to calling [`stator_debug_session_run`] after applying a
+ * `Continue` action.  Returns `true` if execution pauses again, `false` if
+ * it completes.
+ *
+ * Does nothing and returns `false` if the session is not paused or `session`
+ * is null.
+ *
+ * # Safety
+ * `session` must be a non-null pointer returned by
+ * [`stator_debug_session_create`].
+ */
+bool stator_debug_session_resume(struct StatorDebugSession *session);
+
+/**
+ * Return a new [`StatorValue`] containing the final result of a completed
+ * debug session, or null if the session has not yet completed.
+ *
+ * The returned value must be freed with [`stator_value_destroy`].
+ *
+ * # Safety
+ * `session` must be a non-null pointer returned by
+ * [`stator_debug_session_create`].
+ */
+struct StatorValue *stator_debug_session_result(const struct StatorDebugSession *session);
+
+/**
+ * Free a debug session returned by [`stator_debug_session_create`].
+ *
+ * Does nothing if `session` is null.
+ *
+ * # Safety
+ * `session` must be null or a valid pointer returned by
+ * [`stator_debug_session_create`].  Must not be called more than once for
+ * the same pointer.
+ */
+void stator_debug_session_destroy(struct StatorDebugSession *session);
 
 #ifdef __cplusplus
 }  // extern "C"

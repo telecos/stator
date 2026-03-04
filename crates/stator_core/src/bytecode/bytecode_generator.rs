@@ -156,6 +156,10 @@ struct FunctionCompiler {
     scopes: Vec<HashMap<String, Register>>,
     /// Source-position table (populated at expression boundaries).
     source_positions: Vec<SourcePosition>,
+    /// Pending `(instruction_index, line, column)` entries collected during
+    /// statement compilation.  Converted to byte-offset–based
+    /// [`SourcePosition`]s during [`finalize`].
+    pending_positions: Vec<(usize, u32, u32)>,
     /// Label table.
     labels: Vec<Label>,
     /// Stack of `(continue_label, break_label)` pairs for loop statements.
@@ -194,6 +198,7 @@ impl FunctionCompiler {
             allocator: RegisterAllocator::new(param_count),
             scopes: vec![HashMap::new()],
             source_positions: Vec::new(),
+            pending_positions: Vec::new(),
             labels: Vec::new(),
             loop_stack: Vec::new(),
             param_count,
@@ -362,6 +367,14 @@ impl FunctionCompiler {
 
     /// Compile a single statement, emitting bytecode into `self.instructions`.
     fn compile_stmt(&mut self, stmt: &Stmt) -> StatorResult<()> {
+        // Record the source position of each non-empty statement so that the
+        // debugger can map bytecode offsets back to line/column numbers.
+        let loc = stmt.loc();
+        if loc.start.line > 0 {
+            let instr_idx = self.instructions.len();
+            self.pending_positions
+                .push((instr_idx, loc.start.line, loc.start.column));
+        }
         match stmt {
             Stmt::Block(s) => self.compile_block(s),
             Stmt::VarDecl(s) => self.compile_var_decl(s),
@@ -2313,6 +2326,21 @@ impl FunctionCompiler {
         // Resolve jump targets.
         resolve_jumps(&mut self.instructions, &self.labels)?;
 
+        // Convert pending (instruction_index, line, column) entries to
+        // byte-offset–based SourcePositions, now that jump resolution has
+        // stabilised all instruction sizes.
+        let byte_offsets = compute_byte_offsets(&self.instructions);
+        let mut source_positions =
+            Vec::with_capacity(self.source_positions.len() + self.pending_positions.len());
+        source_positions.extend(self.source_positions);
+        for (instr_idx, line, column) in self.pending_positions {
+            if let Some(&byte_off) = byte_offsets.get(instr_idx) {
+                source_positions.push(SourcePosition::new(byte_off as u32, line, column));
+            }
+        }
+        // Keep the table sorted by bytecode offset (required by binary search).
+        source_positions.sort_by_key(|p| p.bytecode_offset);
+
         let frame_size = self.allocator.frame_size();
         let bytes = encode(&self.instructions);
         let feedback_metadata = FeedbackMetadata::new(self.slot_kinds);
@@ -2321,7 +2349,7 @@ impl FunctionCompiler {
             self.constant_pool,
             frame_size,
             self.param_count,
-            self.source_positions,
+            source_positions,
             feedback_metadata,
             self.handler_table,
         );

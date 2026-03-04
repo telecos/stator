@@ -1,9 +1,10 @@
 /**
  * mini_browser — Demonstrates Stator JavaScript parsing, bytecode
- * compilation, and end-to-end execution (Phase 3).
+ * compilation, and end-to-end execution (Phase 9).
  *
  * This sample exercises the Phase 1 object model, the Phase 2 compilation
- * pipeline, and the new Phase 3 execution layer:
+ * pipeline, Phase 3 execution, Phase 4 v8-compatible API, Phase 5 JIT,
+ * Phase 8 WebAssembly, and the new Phase 9 Chrome DevTools Protocol layer:
  *
  *   Phase 1 — GC / object model:
  *     1. Create an isolate and a JS context.
@@ -21,12 +22,20 @@
  *    10. Dump the bytecode listing for a simple arithmetic script.
  *    11. Demonstrate error reporting for malformed JavaScript.
  *
- *   Phase 3 — JavaScript execution (new):
+ *   Phase 3 — JavaScript execution:
  *    12. Register a native console.log function.
  *    13. Execute inline scripts — console.log actually prints output.
  *    14. Execute a Fibonacci and factorial benchmark.
  *    15. Demonstrate error handling: uncaught exceptions are reported.
  *    16. Show execution timing.
+ *
+ *   Phase 9 — Chrome DevTools Protocol inspector (new):
+ *    17. Start a CDP WebSocket server on port 9229 and print the DevTools URL.
+ *    18. Set a breakpoint at source line 3 of a debug script.
+ *    19. Run the script; execution pauses at the breakpoint.
+ *    20. Inspect global variables at the pause point.
+ *    21. Resume execution to completion.
+ *    22. Pass --inspect to keep the server alive for real DevTools connections.
  */
 
 #include <chrono>
@@ -220,7 +229,15 @@ static void execute_script(StatorContext *ctx,
  * main
  * ------------------------------------------------------------------------- */
 
-int main() {
+int main(int argc, char **argv) {
+    /* Check for --inspect flag */
+    bool inspect_mode = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--inspect") == 0) {
+            inspect_mode = true;
+        }
+    }
+
     StatorIsolate *isolate = stator_isolate_create();
     if (!isolate) {
         std::fprintf(stderr, "ERROR: failed to create isolate\n");
@@ -596,6 +613,111 @@ int main() {
         }
         stator_wasm_module_destroy(wasm_module);
     }
+
+    /* ── Phase 9: Chrome DevTools Protocol inspector demo ───────────────────── */
+
+    std::printf("\n[tab] --- Phase 9: Chrome DevTools Protocol demo ---\n\n");
+
+    /*
+     * Start a CDP WebSocket server on port 9229 (the Node.js / V8 default).
+     * In --inspect mode the server runs in a background thread so that a real
+     * Chrome DevTools frontend can connect while the process stays alive.
+     * Otherwise we start it, print the connection URL, and then let it go
+     * (the process will exit shortly).
+     */
+    uint16_t cdp_port = 9229;
+    StatorCdpServer *cdp_server = stator_cdp_server_create(cdp_port);
+
+    if (!cdp_server) {
+        /* Port 9229 may already be in use; fall back to an OS-assigned port. */
+        cdp_server = stator_cdp_server_create(0);
+    }
+
+    if (cdp_server) {
+        cdp_port = stator_cdp_server_local_port(cdp_server);
+        std::printf("[tab] inspector listening on ws://127.0.0.1:%u\n",
+                    static_cast<unsigned>(cdp_port));
+        std::printf("[tab] DevTools URL: devtools://devtools/bundled/js_app.html?ws=127.0.0.1:%u\n",
+                    static_cast<unsigned>(cdp_port));
+
+        if (inspect_mode) {
+            /* Transfer server ownership to a background thread. */
+            stator_cdp_server_run_background(cdp_server);
+            cdp_server = nullptr; /* consumed — do not destroy */
+            std::printf("[tab] (CDP server running in background — "
+                        "connect with Chrome DevTools)\n");
+        } else {
+            stator_cdp_server_destroy(cdp_server);
+            cdp_server = nullptr;
+        }
+    } else {
+        std::printf("[tab] WARNING: could not start CDP server\n");
+    }
+
+    /*
+     * Debugger demo — set a breakpoint, run a script, inspect variables,
+     * then resume execution.
+     *
+     * Script (uses implicit globals so that the debugger can read them back
+     * from the shared global environment):
+     *   Line 1:  x = 42;
+     *   Line 2:  y = 'hello';
+     *   Line 3:  x;           <-- breakpoint
+     *
+     * When the breakpoint fires we print both globals, then resume.
+     */
+    const char *debug_src =
+        "x = 42;\n"
+        "y = 'hello';\n"
+        "x;";
+
+    StatorScript *debug_script =
+        stator_script_compile(ctx, debug_src, std::strlen(debug_src));
+
+    if (debug_script && !stator_script_get_error(debug_script)) {
+        StatorDebugSession *sess =
+            stator_debug_session_create(debug_script, ctx);
+
+        if (sess) {
+            /* Install a breakpoint at source line 3. */
+            stator_debug_session_set_breakpoint_at_line(sess, 3);
+
+            /* Run until the breakpoint is hit. */
+            bool paused = stator_debug_session_run(sess);
+
+            if (paused) {
+                uint32_t line = stator_debug_session_pause_line(sess);
+                std::printf("[tab] executing script (paused at breakpoint"
+                            " line %u)\n", line);
+
+                /* Inspect global variables. */
+                char vx[64] = {};
+                char vy[64] = {};
+                stator_debug_session_get_global_string(sess, "x", vx, sizeof(vx));
+                stator_debug_session_get_global_string(sess, "y", vy, sizeof(vy));
+                std::printf("[tab] variables: x = %s, y = '%s'\n", vx, vy);
+
+                /* Resume to completion. */
+                stator_debug_session_resume(sess);
+                std::printf("[tab] resumed execution\n");
+            } else {
+                /* Breakpoint mapping may have failed — still print something. */
+                std::printf("[tab] executing script (no breakpoint hit)\n");
+            }
+
+            /* Optionally print the final result. */
+            StatorValue *dbg_result = stator_debug_session_result(sess);
+            if (dbg_result) {
+                char buf[64] = {};
+                stator_value_to_string_utf8(dbg_result, buf, sizeof(buf));
+                std::printf("[tab] script result: %s\n", buf);
+                stator_value_destroy(dbg_result);
+            }
+
+            stator_debug_session_destroy(sess);
+        }
+    }
+    if (debug_script) stator_script_free(debug_script);
 
     /* ── Cleanup ─────────────────────────────────────────────────────────── */
     stator_context_destroy(ctx);

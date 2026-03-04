@@ -16,6 +16,7 @@
 #ifndef STATOR_H
 #define STATOR_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -1006,6 +1007,185 @@ char **stator_wasm_instance_exports(StatorWasmInstance *instance);
  * Does nothing if exports is NULL.
  */
 void stator_wasm_exports_destroy(char **exports);
+
+/* -------------------------------------------------------------------------
+ * CDP WebSocket server (Phase 9)
+ * ------------------------------------------------------------------------- */
+
+/**
+ * An opaque handle to a Chrome DevTools Protocol (CDP) WebSocket server.
+ *
+ * Created by stator_cdp_server_create().  Once created, the server can be
+ * used in one of two ways:
+ *
+ *   - Pass it to stator_cdp_server_run_background() to hand ownership to a
+ *     background thread that will serve connections indefinitely.  The handle
+ *     must NOT be used or destroyed after this call.
+ *
+ *   - Destroy it with stator_cdp_server_destroy() without ever starting it.
+ */
+typedef struct StatorCdpServer StatorCdpServer;
+
+/**
+ * Bind a CDP WebSocket server to 127.0.0.1:<port>.
+ *
+ * Passing port = 0 lets the OS choose a free port; call
+ * stator_cdp_server_local_port() to discover the actual port.
+ *
+ * Returns a non-null handle on success, or NULL if the port is unavailable.
+ * The returned handle is owned by the caller until it is passed to
+ * stator_cdp_server_run_background() or stator_cdp_server_destroy().
+ *
+ * @param port  TCP port to listen on; 0 = OS-assigned.
+ */
+StatorCdpServer *stator_cdp_server_create(uint16_t port);
+
+/**
+ * Return the TCP port that server is currently bound to.
+ *
+ * Returns 0 if server is NULL or the port cannot be determined.
+ *
+ * @param server  A valid, non-NULL StatorCdpServer pointer.
+ */
+uint16_t stator_cdp_server_local_port(const StatorCdpServer *server);
+
+/**
+ * Spawn a background OS thread that accepts and serves CDP connections
+ * in a loop, consuming (transferring ownership of) server.
+ *
+ * After this call server is invalid and must NOT be passed to
+ * stator_cdp_server_destroy() or any other function.
+ *
+ * Does nothing if server is NULL.
+ *
+ * @param server  A valid, uniquely-owned StatorCdpServer pointer.
+ */
+void stator_cdp_server_run_background(StatorCdpServer *server);
+
+/**
+ * Free a StatorCdpServer returned by stator_cdp_server_create().
+ *
+ * Must NOT be called after stator_cdp_server_run_background() has consumed
+ * the handle.  Does nothing if server is NULL.
+ */
+void stator_cdp_server_destroy(StatorCdpServer *server);
+
+/* -------------------------------------------------------------------------
+ * Debug session (Phase 9)
+ * ------------------------------------------------------------------------- */
+
+/**
+ * An opaque handle to an interactive debugging session.
+ *
+ * A session owns both the compiled bytecode frame and an attached debugger,
+ * allowing the host to set breakpoints, step through execution, and inspect
+ * variable values.
+ *
+ * Lifecycle:
+ *   1. Create with stator_debug_session_create().
+ *   2. Install breakpoints with stator_debug_session_set_breakpoint_at_line().
+ *   3. Call stator_debug_session_run() — returns true when paused, false when
+ *      execution completes.
+ *   4. When paused, read globals with stator_debug_session_get_global_string().
+ *   5. Resume with stator_debug_session_resume() — returns true if paused again.
+ *   6. After completion, retrieve the result with stator_debug_session_result().
+ *   7. Free with stator_debug_session_destroy().
+ */
+typedef struct StatorDebugSession StatorDebugSession;
+
+/**
+ * Create a new debug session for script.
+ *
+ * Compiles script and prepares an interpreter frame; does NOT start
+ * execution.  Returns NULL if script or ctx is NULL, if script has a compile
+ * error, or on allocation failure.
+ *
+ * @param script  A non-NULL StatorScript pointer with no compile error.
+ * @param ctx     A non-NULL, live StatorContext pointer.
+ */
+StatorDebugSession *stator_debug_session_create(const StatorScript *script,
+                                                StatorContext      *ctx);
+
+/**
+ * Install a breakpoint at 1-based source line in session.
+ *
+ * Returns true if the line was mapped to a bytecode offset, false otherwise.
+ *
+ * @param session  A valid, non-NULL StatorDebugSession pointer.
+ * @param line     1-based source line number.
+ */
+bool stator_debug_session_set_breakpoint_at_line(StatorDebugSession *session,
+                                                 uint32_t            line);
+
+/**
+ * Run the session until a breakpoint is hit or execution completes.
+ *
+ * Returns true if execution paused (the caller may inspect variables and
+ * then call stator_debug_session_resume()).  Returns false when execution
+ * has completed; the result is available via stator_debug_session_result().
+ *
+ * @param session  A valid, non-NULL StatorDebugSession pointer.
+ */
+bool stator_debug_session_run(StatorDebugSession *session);
+
+/**
+ * Returns true if session is currently paused at a breakpoint.
+ *
+ * @param session  A valid, non-NULL StatorDebugSession pointer.
+ */
+bool stator_debug_session_is_paused(const StatorDebugSession *session);
+
+/**
+ * Return the 1-based source line at which execution is paused, or 0 if
+ * the session is not paused or the line is unknown.
+ *
+ * @param session  A valid, non-NULL StatorDebugSession pointer.
+ */
+uint32_t stator_debug_session_pause_line(const StatorDebugSession *session);
+
+/**
+ * Write the string representation of global variable name into buf
+ * (at most buf_len-1 bytes, always NUL-terminated).
+ *
+ * Returns the number of bytes written (excluding the NUL), or -1 if the
+ * variable does not exist or any pointer is NULL / buf_len is 0.
+ *
+ * @param session   A valid, non-NULL StatorDebugSession pointer.
+ * @param name      Null-terminated variable name.
+ * @param buf       Output buffer; at least buf_len bytes.
+ * @param buf_len   Size of buf in bytes (must be >= 1).
+ */
+int stator_debug_session_get_global_string(const StatorDebugSession *session,
+                                           const char               *name,
+                                           char                     *buf,
+                                           size_t                    buf_len);
+
+/**
+ * Resume a paused session and run until the next pause or completion.
+ *
+ * Returns true if execution pauses again, false if it completes.
+ * Does nothing and returns false if session is not paused or is NULL.
+ *
+ * @param session  A valid, non-NULL StatorDebugSession pointer.
+ */
+bool stator_debug_session_resume(StatorDebugSession *session);
+
+/**
+ * Return a new StatorValue containing the final result of a completed
+ * debug session, or NULL if the session has not yet completed.
+ *
+ * The returned value must be freed with stator_value_destroy().
+ *
+ * @param session  A valid, non-NULL StatorDebugSession pointer.
+ */
+StatorValue *stator_debug_session_result(const StatorDebugSession *session);
+
+/**
+ * Free a StatorDebugSession returned by stator_debug_session_create().
+ *
+ * Does nothing if session is NULL.
+ */
+void stator_debug_session_destroy(StatorDebugSession *session);
 
 #ifdef __cplusplus
 } /* extern "C" */

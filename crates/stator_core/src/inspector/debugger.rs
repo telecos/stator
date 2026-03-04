@@ -316,6 +316,15 @@ impl Debugger {
         self.last_pause_offset
     }
 
+    /// The 1-based source line of the most recent pause point, or `0` if
+    /// the pause did not correspond to a known breakpoint location.
+    pub fn last_pause_line(&self) -> u32 {
+        self.breakpoints
+            .get(&self.last_pause_offset)
+            .map(|bp| bp.line)
+            .unwrap_or(0)
+    }
+
     // ── Interpreter callbacks ────────────────────────────────────────────────
 
     /// Called by the interpreter **before** each instruction is fetched and
