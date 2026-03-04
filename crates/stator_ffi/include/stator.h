@@ -124,6 +124,22 @@ typedef struct StatorScript StatorScript;
 typedef struct StatorValue StatorValue;
 
 /**
+ * An opaque handle wrapping a live WebAssembly module instance.
+ *
+ * Created by [`stator_wasm_instantiate`] and freed by
+ * [`stator_wasm_instance_destroy`].
+ */
+typedef struct StatorWasmInstance StatorWasmInstance;
+
+/**
+ * An opaque handle wrapping a compiled WebAssembly module.
+ *
+ * Created by [`stator_wasm_compile`] and freed by
+ * [`stator_wasm_module_destroy`].
+ */
+typedef struct StatorWasmModule StatorWasmModule;
+
+/**
  * Compilation tier statistics for an isolate.
  *
  * Filled in by `stator_isolate_get_stats`.  All counts are thread-local
@@ -1455,6 +1471,124 @@ double stator_platform_monotonically_increasing_time(const struct StatorPlatform
  * `platform` must be either null or a valid, live [`StatorPlatform`] pointer.
  */
 double stator_platform_current_clock_time_millis(const struct StatorPlatform *platform);
+
+/**
+ * Compile a WebAssembly binary into a [`StatorWasmModule`].
+ *
+ * Returns a null pointer if `isolate` or `bytes` is null, `len` is zero, or
+ * if the bytes do not represent a valid WebAssembly module.
+ *
+ * The returned pointer must eventually be passed to
+ * [`stator_wasm_module_destroy`] to free all associated resources.
+ *
+ * # Safety
+ * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `bytes` must be valid for reads of `len` bytes.
+ */
+struct StatorWasmModule *stator_wasm_compile(struct StatorIsolate *isolate,
+                                             const uint8_t *bytes,
+                                             size_t len);
+
+/**
+ * Free a [`StatorWasmModule`] previously returned by [`stator_wasm_compile`].
+ *
+ * Does nothing when `module` is null.
+ *
+ * # Safety
+ * `module` must be either null or a valid pointer returned by
+ * [`stator_wasm_compile`] that has not been freed yet.
+ */
+void stator_wasm_module_destroy(struct StatorWasmModule *module);
+
+/**
+ * Instantiate a compiled [`StatorWasmModule`] into a live
+ * [`StatorWasmInstance`].
+ *
+ * `ctx` is accepted for future use and may be null.  `imports` is reserved for
+ * future use and **must** be null; passing a non-null value is currently
+ * ignored.
+ *
+ * Returns a null pointer if `module` is null or if instantiation fails (e.g.
+ * the module requires imports that are not provided).
+ *
+ * The returned pointer must eventually be passed to
+ * [`stator_wasm_instance_destroy`].
+ *
+ * # Safety
+ * - `module` must be a non-null, valid pointer to a live
+ *   [`StatorWasmModule`].
+ * - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+ * - `imports` must be null.
+ */
+struct StatorWasmInstance *stator_wasm_instantiate(struct StatorWasmModule *module,
+                                                   struct StatorContext *_ctx,
+                                                   const void *_imports);
+
+/**
+ * Free a [`StatorWasmInstance`] previously returned by
+ * [`stator_wasm_instantiate`].
+ *
+ * Does nothing when `instance` is null.
+ *
+ * # Safety
+ * `instance` must be either null or a valid pointer returned by
+ * [`stator_wasm_instantiate`] that has not been freed yet.
+ */
+void stator_wasm_instance_destroy(struct StatorWasmInstance *instance);
+
+/**
+ * Return a null-terminated array of export names from `instance`.
+ *
+ * Each element in the array is a heap-allocated, null-terminated UTF-8 string.
+ * The array itself is terminated by a null pointer.  The caller owns the
+ * returned array and must free it with [`stator_wasm_exports_destroy`] when
+ * it is no longer needed.
+ *
+ * Returns a null pointer if `instance` is null.
+ *
+ * # Safety
+ * `instance` must be either null or a valid, live [`StatorWasmInstance`]
+ * pointer.
+ */
+char **stator_wasm_instance_exports(struct StatorWasmInstance *instance);
+
+/**
+ * Free the export-name array returned by [`stator_wasm_instance_exports`].
+ *
+ * Does nothing when `exports` is null.
+ *
+ * # Safety
+ * `exports` must be either null or a valid pointer returned by
+ * [`stator_wasm_instance_exports`] that has not been freed yet.
+ */
+void stator_wasm_exports_destroy(char **exports);
+
+/**
+ * Call an exported WebAssembly function by name.
+ *
+ * `args` is an array of `args_len` pointers to [`StatorValue`] handles used
+ * as Wasm arguments.  Each null element is treated as `i32(0)`.  A null
+ * `args` pointer with `args_len == 0` is valid and means no arguments.
+ *
+ * Returns a new [`StatorValue`] owned by the caller (free with
+ * [`stator_value_destroy`]), or a null pointer if any required pointer
+ * parameter is null, the named export does not exist, the call traps, or the
+ * first result cannot be represented as a [`StatorValue`].  Void (zero-result)
+ * functions return `undefined`.
+ *
+ * # Safety
+ * - `instance` must be a non-null, valid pointer to a live
+ *   [`StatorWasmInstance`].
+ * - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ * - `name` must be a valid, null-terminated C string.
+ * - `args` must be valid for reads of `args_len` pointers; each non-null
+ *   element must be a valid, live [`StatorValue`] pointer.
+ */
+struct StatorValue *stator_wasm_instance_call(struct StatorWasmInstance *instance,
+                                              struct StatorIsolate *isolate,
+                                              const char *name,
+                                              const struct StatorValue *const *args,
+                                              size_t args_len);
 
 #ifdef __cplusplus
 }  // extern "C"

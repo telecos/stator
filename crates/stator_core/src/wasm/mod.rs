@@ -190,6 +190,44 @@ impl WasmInstance {
         Ok(results)
     }
 
+    /// Return the names of all exports from this instance.
+    ///
+    /// Each element is the UTF-8 name of one export (function, memory, table,
+    /// or global).
+    pub fn export_names(&mut self) -> Vec<String> {
+        self.inner
+            .exports(&mut self.store)
+            .map(|e| e.name().to_owned())
+            .collect()
+    }
+
+    /// Call an exported function by name using [`JsValue`] arguments.
+    ///
+    /// This is a convenience wrapper around [`WasmInstance::call`] that
+    /// converts the [`JsValue`] arguments to [`wasmtime::Val`] before the call
+    /// and converts the first result back to a [`JsValue`] after.  For void
+    /// functions (zero results) [`JsValue::Undefined`] is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatorError::WasmError`] if:
+    /// - An argument cannot be converted to a Wasm value.
+    /// - The named export does not exist or is not a function.
+    /// - The call traps.
+    /// - The first result cannot be converted to a [`JsValue`].
+    pub fn call_with_js_values(&mut self, name: &str, args: &[JsValue]) -> StatorResult<JsValue> {
+        let wasm_args: Vec<Val> = args
+            .iter()
+            .map(js_value_to_wasm_val)
+            .collect::<StatorResult<Vec<_>>>()?;
+        let results = self.call(name, &wasm_args)?;
+        if results.is_empty() {
+            Ok(JsValue::Undefined)
+        } else {
+            wasm_val_to_js_value(&results[0])
+        }
+    }
+
     /// Return a reference to the underlying [`wasmtime::Instance`].
     pub fn inner(&self) -> &Instance {
         &self.inner
