@@ -172,6 +172,32 @@ pub struct TurbofanCompiledCode {
     pub register_file_slots: usize,
     /// Deoptimisation sites recorded during compilation.
     pub deopt_points: Vec<DeoptPoint>,
+    /// Approximate size of the emitted machine code in bytes.
+    ///
+    /// Captured from Cranelift's [`CompiledCode::code_buffer`] before the
+    /// context is cleared.  Used only for statistics reporting.
+    pub code_size: usize,
+}
+
+// SAFETY: `TurbofanCompiledCode` is transferred from a background compilation
+// thread to the main interpreter thread via `Arc<Mutex<...>>`.  After
+// `finalize_definitions()` the `JITModule`'s internal `RefCell<symbols>` is
+// no longer mutated; the only post-transfer operation performed on the module
+// is `get_finalized_function()`, which accesses `compiled_functions` (a plain
+// `PrimaryMap`, no `RefCell`) and does NOT borrow `symbols`.  This has been
+// verified against cranelift-jit 0.129.1 (backend.rs lines 265–274).  We
+// guarantee that at most one thread calls `execute()` at a time (enforced by
+// the `Mutex` in `TurbofanJitCodeCache`).
+unsafe impl Send for TurbofanCompiledCode {}
+
+impl std::fmt::Debug for TurbofanCompiledCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurbofanCompiledCode")
+            .field("register_file_slots", &self.register_file_slots)
+            .field("deopt_points", &self.deopt_points.len())
+            .field("code_size", &self.code_size)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TurbofanCompiledCode {
@@ -385,6 +411,12 @@ impl TurbofanCodegen {
             .define_function(func_id, &mut ctx)
             .map_err(|e| StatorError::Internal(format!("define_function: {e}")))?;
 
+        // Capture the compiled code size before clearing the context.
+        let code_size = ctx
+            .compiled_code()
+            .map(|c| c.code_buffer().len())
+            .unwrap_or(0);
+
         self.module.clear_context(&mut ctx);
         self.module
             .finalize_definitions()
@@ -395,6 +427,7 @@ impl TurbofanCodegen {
             func_id,
             register_file_slots: self.param_count as usize,
             deopt_points,
+            code_size,
         })
     }
 }
@@ -673,13 +706,14 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 self.builder.append_block_param(current_block, I64)
             }
 
-            // ── Unsupported nodes: produce a placeholder ────────────────────
+            // ── Unsupported nodes: trigger deoptimisation ──────────────────
             _ => {
-                // Unsupported node kinds produce a 0 constant so that the rest
-                // of the graph can still be translated.  This is intentional:
-                // complex operations (object creation, string ops, calls, …)
-                // are best handled by the interpreter tier via deopt.
-                self.builder.ins().iconst(I64, 0)
+                // Unsupported node kinds (e.g. GenericAdd, string operations,
+                // object creation) produce the JIT_DEOPT sentinel so the
+                // caller falls back to the next lower tier.  This is
+                // intentional: complex or untyped operations are best handled
+                // by the Maglev or interpreter tier.
+                self.builder.ins().iconst(I64, JIT_DEOPT)
             }
         };
 
