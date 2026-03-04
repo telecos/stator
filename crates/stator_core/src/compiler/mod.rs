@@ -16,8 +16,18 @@
 //!   - [`maglev::regalloc`] — Linear-scan register allocator.
 //!   - [`maglev::codegen`] — Code generator: walks a register-allocated
 //!     [`maglev::ir::MaglevGraph`] and emits x86-64 machine code.
+//! - [`turbofan`] — Cranelift-backed optimising JIT backend.
+//!   - [`turbofan::compile`] — Entry-point: lower a [`maglev::ir::MaglevGraph`]
+//!     to Cranelift CLIF and produce executable native code via
+//!     [`cranelift-jit`].
+//!   - [`turbofan::JsType`] — JS value-type → Cranelift type mapping.
+//!   - [`turbofan::TurbofanCompiledCode`] — Compiled function wrapper with
+//!     execute-and-deopt support.
+//!   - [`turbofan::DeoptPoint`] — Metadata for deoptimisation sites.
 
 /// Non-optimising baseline JIT compiler.
 pub mod baseline;
 /// Maglev optimising compiler tier.
 pub mod maglev;
+/// Turbofan: Cranelift-backed optimising JIT backend.
+pub mod turbofan;
