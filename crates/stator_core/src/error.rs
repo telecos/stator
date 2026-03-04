@@ -59,6 +59,26 @@ pub enum StatorError {
         /// paused.
         bytecode_offset: u32,
     },
+
+    /// A pointer operation targeted memory outside the sandbox bounds.
+    ///
+    /// This error is returned by
+    /// [`crate::sandbox::Sandbox::check_in_bounds`] when a raw pointer
+    /// does not fall within the sandbox's reserved virtual-address range
+    /// `[sandbox_base, sandbox_base + sandbox_size)`.
+    #[error(
+        "sandbox violation: address {address:#x} is outside sandbox \
+         [{sandbox_base:#x}, {end:#x})",
+        end = sandbox_base + sandbox_size
+    )]
+    SandboxViolation {
+        /// The out-of-bounds address that triggered the violation.
+        address: usize,
+        /// Base address of the sandbox virtual-address range.
+        sandbox_base: usize,
+        /// Size of the sandbox virtual-address range in bytes.
+        sandbox_size: usize,
+    },
 }
 
 /// Convenient `Result` alias for fallible engine operations.
