@@ -25,6 +25,7 @@ cranelift-codegen.workspace = true
 cranelift-frontend.workspace = true
 cranelift-jit.workspace = true
 cranelift-module.workspace = true
+wasmtime = "42.0.1"
 
 [target.'cfg(all(target_arch = "x86_64", unix))'.dependencies]
 libc.workspace = true
