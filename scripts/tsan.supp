@@ -1,0 +1,16 @@
+# ThreadSanitizer suppressions for stator_core
+#
+# Wasmtime's concurrent module compilation pipeline (wasmtime 42.x) has
+# internal races between the write path (build_module_artifacts writing an ELF
+# artifact to an MmapVec) and the read path (publish_mmap / CodeMemory::new
+# reading the ELF header from the same region in another thread).  Both sides
+# operate on library-internal memory that is not visible to user code; these
+# are known false positives in the Wasmtime crate itself.
+race:wasmtime::compile::build_module_artifacts
+race:wasmtime::compile::runtime::publish_mmap
+
+# _Unwind_Backtrace is called by Wasmtime's CodeMemory::register_unwind_info
+# when publishing JIT-compiled code.  libgcc's unwinder uses internal global
+# tables that are not annotated for TSan but are protected by separate
+# mechanisms that TSan cannot observe.
+race:_Unwind_Backtrace

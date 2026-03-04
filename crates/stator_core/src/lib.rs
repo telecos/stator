@@ -48,5 +48,7 @@ pub mod objects;
 pub mod parser;
 /// Platform abstraction for embedder-provided task scheduling and timing.
 pub mod platform;
+/// WebAssembly backend: engine, module, and instance wrappers (Wasmtime).
+pub mod wasm;
 /// Bump-pointer region allocator for compiler temporaries.
 pub mod zone;

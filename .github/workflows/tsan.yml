@@ -36,6 +36,8 @@ jobs:
             ${{ runner.os }}-cargo-tsan-registry-
 
       - name: Run TSAN tests – stator_core
+        env:
+          TSAN_OPTIONS: "suppressions=${{ github.workspace }}/scripts/tsan.supp"
         run: >
           cargo +nightly test
           -p stator_core
