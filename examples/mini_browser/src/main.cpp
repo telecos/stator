@@ -30,6 +30,7 @@
  */
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -478,6 +479,122 @@ int main() {
         if (r1) stator_value_destroy(r1);
         if (r2) stator_value_destroy(r2);
         stator_script_free(sum_script);
+    }
+
+    /* ── Phase 8: WebAssembly execution demo ────────────────────────────── */
+
+    std::printf("\n[tab] --- Phase 8: WebAssembly execution demo ---\n\n");
+
+    /*
+     * add.wasm — pre-compiled binary for:
+     *
+     *   (module
+     *     (func (export "add") (param i32 i32) (result i32)
+     *       local.get 0
+     *       local.get 1
+     *       i32.add))
+     *
+     * Generated with: wat2wasm (or the equivalent wasmtime encoding).
+     */
+    static const uint8_t add_wasm[] = {
+        0x00, 0x61, 0x73, 0x6d, /* magic: \0asm               */
+        0x01, 0x00, 0x00, 0x00, /* version: 1                  */
+        /* type section: (i32 i32) -> i32 */
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,
+        /* function section: func[0] uses type[0] */
+        0x03, 0x02, 0x01, 0x00,
+        /* export section: "add" -> func 0 */
+        0x07, 0x07, 0x01, 0x03, 0x61, 0x64, 0x64, 0x00, 0x00,
+        /* code section: body of func 0 */
+        0x0a, 0x09, 0x01, 0x07, 0x00,
+        0x20, 0x00, /* local.get 0 */
+        0x20, 0x01, /* local.get 1 */
+        0x6a,       /* i32.add     */
+        0x0b        /* end         */
+    };
+    static const std::size_t add_wasm_size = sizeof(add_wasm);
+
+    std::printf("[tab] loaded add.wasm (%zu bytes)\n", add_wasm_size);
+
+    /* Compile the .wasm binary. */
+    StatorWasmModule *wasm_module =
+        stator_wasm_compile(isolate, add_wasm, add_wasm_size);
+    if (!wasm_module) {
+        std::printf("[tab] ERROR: stator_wasm_compile failed\n");
+    } else {
+        /* Instantiate the module. */
+        StatorWasmInstance *wasm_instance =
+            stator_wasm_instantiate(wasm_module, ctx, nullptr);
+        if (!wasm_instance) {
+            std::printf("[tab] ERROR: stator_wasm_instantiate failed\n");
+        } else {
+            std::printf("[tab] WebAssembly.instantiate: OK\n");
+
+            /* ── JS call path ─────────────────────────────────────────────
+             * Register a native JS function "wasmAdd" backed by the live
+             * Wasm instance so that JavaScript can call it.  We use a
+             * global pointer to pass the instance to the callback.
+             */
+            static StatorWasmInstance *g_wasm_instance = nullptr;
+            static StatorIsolate      *g_wasm_isolate   = nullptr;
+            g_wasm_instance = wasm_instance;
+            g_wasm_isolate  = isolate;
+
+            /* Register wasmAdd(a, b) as a native function. */
+            stator_register_native_function(
+                ctx, "wasmAdd",
+                [](StatorContext * /*c*/,
+                   const StatorValue *const *args, int argc) -> StatorValue * {
+                    /* Forward JS arguments to the Wasm "add" export. */
+                    const StatorValue *wasm_args[2] = {
+                        argc > 0 ? args[0] : nullptr,
+                        argc > 1 ? args[1] : nullptr
+                    };
+                    std::size_t nargs = static_cast<std::size_t>(
+                        (argc < 2) ? argc : 2);
+                    return stator_wasm_instance_call(
+                        g_wasm_instance, g_wasm_isolate,
+                        "add", wasm_args, nargs);
+                });
+
+            /* Execute the JS call: wasmAdd(3, 4) and print the result. */
+            const char *js_src = "wasmAdd(3, 4);";
+            StatorScript *js_script =
+                stator_script_compile(ctx, js_src, std::strlen(js_src));
+            if (js_script && !stator_script_get_error(js_script)) {
+                StatorValue *js_result = stator_script_run(js_script, ctx);
+                if (js_result) {
+                    char buf[32] = {};
+                    stator_value_to_string_utf8(js_result, buf, sizeof(buf));
+                    std::printf("[tab] JS: add(3, 4) = %s\n", buf);
+                    stator_value_destroy(js_result);
+                }
+            }
+            if (js_script) stator_script_free(js_script);
+
+            /* ── C++ direct call path ─────────────────────────────────────
+             * Call the Wasm "add" export directly from C++ via the FFI,
+             * without going through the JS interpreter.
+             */
+            StatorValue *arg3 = stator_value_new_number(isolate, 3.0);
+            StatorValue *arg4 = stator_value_new_number(isolate, 4.0);
+            const StatorValue *cpp_args[2] = {arg3, arg4};
+            StatorValue *cpp_result =
+                stator_wasm_instance_call(wasm_instance, isolate,
+                                          "add", cpp_args, 2);
+            if (cpp_result) {
+                char buf[32] = {};
+                stator_value_to_string_utf8(cpp_result, buf, sizeof(buf));
+                std::printf("[tab] C++ direct: stator_wasm_call(add, 3, 4) = %s\n",
+                            buf);
+                stator_value_destroy(cpp_result);
+            }
+            stator_value_destroy(arg3);
+            stator_value_destroy(arg4);
+
+            stator_wasm_instance_destroy(wasm_instance);
+        }
+        stator_wasm_module_destroy(wasm_module);
     }
 
     /* ── Cleanup ─────────────────────────────────────────────────────────── */
