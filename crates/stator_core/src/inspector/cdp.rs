@@ -40,6 +40,7 @@ use tungstenite::{Message, WebSocket, accept};
 
 use crate::bytecode::bytecode_generator::BytecodeGenerator;
 use crate::error::StatorResult;
+use crate::inspector::heap_snapshot::HeapSnapshotBuilder;
 use crate::inspector::profiler::CpuProfiler;
 use crate::interpreter::{Interpreter, InterpreterFrame};
 use crate::objects::value::JsValue;
@@ -196,6 +197,9 @@ impl CdpSession {
 
             // ── HeapProfiler ──────────────────────────────────────────────
             "HeapProfiler.enable" => Ok(json!({})),
+            "HeapProfiler.takeHeapSnapshot" => self.heap_profiler_take_snapshot(),
+            "HeapProfiler.startTrackingHeapObjects" => self.heap_profiler_start_tracking(),
+            "HeapProfiler.stopTrackingHeapObjects" => self.heap_profiler_stop_tracking(),
 
             // ── Unknown ───────────────────────────────────────────────────
             other => Err(crate::error::StatorError::Internal(format!(
@@ -271,6 +275,53 @@ impl CdpSession {
         let profile_value = serde_json::to_value(&profile)
             .map_err(|e| crate::error::StatorError::Internal(e.to_string()))?;
         Ok(json!({ "profile": profile_value }))
+    }
+
+    // ── HeapProfiler.takeHeapSnapshot ────────────────────────────────────────
+
+    fn heap_profiler_take_snapshot(&mut self) -> StatorResult<Value> {
+        let snapshot = HeapSnapshotBuilder::build(&self.globals.borrow());
+        let chunk = snapshot.to_json();
+        // Emit the snapshot as an addHeapSnapshotChunk event.
+        let event = json!({
+            "method": "HeapProfiler.addHeapSnapshotChunk",
+            "params": { "chunk": chunk }
+        });
+        if let Ok(s) = serde_json::to_string(&event) {
+            let _ = self.ws.send(Message::Text(s.into()));
+        }
+        // Emit reportHeapSnapshotProgress to signal completion.
+        let done_event = json!({
+            "method": "HeapProfiler.reportHeapSnapshotProgress",
+            "params": {
+                "done": snapshot.snapshot.node_count,
+                "total": snapshot.snapshot.node_count,
+                "finished": true
+            }
+        });
+        if let Ok(s) = serde_json::to_string(&done_event) {
+            let _ = self.ws.send(Message::Text(s.into()));
+        }
+        Ok(json!({}))
+    }
+
+    // ── HeapProfiler.startTrackingHeapObjects ────────────────────────────────
+
+    fn heap_profiler_start_tracking(&mut self) -> StatorResult<Value> {
+        crate::inspector::heap_snapshot::start_tracking();
+        Ok(json!({}))
+    }
+
+    // ── HeapProfiler.stopTrackingHeapObjects ─────────────────────────────────
+
+    fn heap_profiler_stop_tracking(&mut self) -> StatorResult<Value> {
+        let records = crate::inspector::heap_snapshot::stop_tracking();
+        // Return a summary of the allocation records collected.
+        let stats: Vec<Value> = records
+            .iter()
+            .map(|r| json!({ "id": r.id, "size": r.size }))
+            .collect();
+        Ok(json!({ "stats": stats }))
     }
 }
 
