@@ -9,9 +9,17 @@
 //! The compilation pipeline is:
 //!
 //! ```text
-//! BytecodeArray  →  MaglevGraph  →  Cranelift CLIF  →  native machine code
-//! (interpreter)    (graph_builder)   (this module)       (cranelift-jit)
+//! BytecodeArray  →  MaglevGraph  →  [pre-CLIF passes]  →  Cranelift CLIF  →  native machine code
+//! (interpreter)    (graph_builder)   (specialize module)   (this module)       (cranelift-jit)
 //! ```
+//!
+//! The optional pre-CLIF specialisation passes ([`specialize`]) are applied
+//! before CLIF lowering when a [`FeedbackVector`] is available.  They perform
+//! type narrowing, hot call-site specialisation, load/store elimination, and
+//! escape-analysis-based allocation sinking.
+//!
+//! Use [`compile_with_feedback`] to compile a graph with pre-CLIF
+//! specialisation enabled, or [`compile`] to skip it.
 //!
 //! # Type mapping
 //!
@@ -80,9 +88,14 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 
+use crate::bytecode::feedback::FeedbackVector;
 use crate::compiler::baseline::compiler::JIT_DEOPT;
 use crate::compiler::maglev::ir::{ControlNode, MaglevGraph, NodeId, ValueNode};
 use crate::error::{StatorError, StatorResult};
+
+/// Pre-CLIF type-specialisation passes (type narrowing, call-site
+/// specialisation, load/store elimination, escape analysis).
+pub mod specialize;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -200,6 +213,37 @@ impl TurbofanCompiledCode {
 /// the ISA cannot be initialised.
 pub fn compile(graph: &MaglevGraph, param_count: u32) -> StatorResult<TurbofanCompiledCode> {
     TurbofanCodegen::new(param_count)?.compile(graph)
+}
+
+/// Compile a [`MaglevGraph`] to native machine code via Cranelift, running the
+/// pre-CLIF specialisation passes first.
+///
+/// If `fv` is `Some`, [`specialize::run_pre_clif_passes`] is applied to a
+/// clone of `graph` before CLIF lowering.  This enables:
+/// - **type narrowing** from feedback (generic → checked-Smi / Int32 ops),
+/// - **hot call-site specialisation** (call → known-function),
+/// - **load/store elimination** (redundant field loads CSE),
+/// - **escape analysis / allocation sinking** (non-escaping allocs →
+///   virtual objects).
+///
+/// When `fv` is `None` the behaviour is identical to [`compile`].
+///
+/// # Errors
+///
+/// Returns [`StatorError::Internal`] if Cranelift code generation fails or
+/// the ISA cannot be initialised.
+pub fn compile_with_feedback(
+    graph: &MaglevGraph,
+    param_count: u32,
+    fv: Option<&FeedbackVector>,
+) -> StatorResult<TurbofanCompiledCode> {
+    if fv.is_some() {
+        let mut specialised = graph.clone();
+        specialize::run_pre_clif_passes(&mut specialised, fv);
+        TurbofanCodegen::new(param_count)?.compile(&specialised)
+    } else {
+        TurbofanCodegen::new(param_count)?.compile(graph)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

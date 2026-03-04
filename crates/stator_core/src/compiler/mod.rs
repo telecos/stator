@@ -20,6 +20,11 @@
 //!   - [`turbofan::compile`] — Entry-point: lower a [`maglev::ir::MaglevGraph`]
 //!     to Cranelift CLIF and produce executable native code via
 //!     [`cranelift-jit`].
+//!   - [`turbofan::compile_with_feedback`] — Like `compile`, but first applies
+//!     the pre-CLIF specialisation passes from [`turbofan::specialize`].
+//!   - [`turbofan::specialize`] — Pre-CLIF optimisation passes: type narrowing
+//!     from feedback, hot call-site specialisation, load/store elimination, and
+//!     escape analysis / allocation sinking.
 //!   - [`turbofan::JsType`] — JS value-type → Cranelift type mapping.
 //!   - [`turbofan::TurbofanCompiledCode`] — Compiled function wrapper with
 //!     execute-and-deopt support.
