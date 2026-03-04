@@ -33,6 +33,10 @@ pub enum StatorError {
     #[error("internal error: {0}")]
     Internal(String),
 
+    /// A WebAssembly error (compilation, instantiation, or execution failure).
+    #[error("WasmError: {0}")]
+    WasmError(String),
+
     /// A JavaScript exception was thrown and propagated out of the current frame
     /// without being caught.  The inner string is the debug representation of
     /// the thrown value, kept to avoid a dependency cycle.
