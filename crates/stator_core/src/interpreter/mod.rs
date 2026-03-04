@@ -175,11 +175,59 @@ use crate::bytecode::bytecode_array::{
 };
 use crate::bytecode::bytecodes::{Opcode, Operand, decode_with_byte_offsets};
 use crate::error::{StatorError, StatorResult};
+use crate::inspector::debugger::Debugger;
 use crate::objects::value::JsValue;
 
 // Re-export generator types and bring them into scope so external code can
 // import them from `stator_core::interpreter` (backwards-compatible path).
 pub use crate::objects::value::{GeneratorState, GeneratorStatus, GeneratorStep, NativeIterator};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Debugger integration
+// ─────────────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    /// The currently-attached debugger for this thread, if any.
+    ///
+    /// When `Some`, the interpreter checks for breakpoints and step conditions
+    /// before each instruction dispatch and calls the appropriate hook methods
+    /// on pauses.
+    static ACTIVE_DEBUGGER: RefCell<Option<Rc<RefCell<Debugger>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Attach a [`Debugger`] to the current thread's interpreter.
+///
+/// While attached, the interpreter checks for breakpoints and step conditions
+/// before each instruction dispatch.  Only one debugger can be attached per
+/// thread; calling this again replaces any previously attached debugger.
+pub fn attach_debugger(dbg: Rc<RefCell<Debugger>>) {
+    ACTIVE_DEBUGGER.with(|d| *d.borrow_mut() = Some(dbg));
+}
+
+/// Detach the [`Debugger`] from the current thread.
+///
+/// After this call, the interpreter runs without any debug checks.  It is
+/// safe to call this even if no debugger was attached.
+pub fn detach_debugger() {
+    ACTIVE_DEBUGGER.with(|d| *d.borrow_mut() = None);
+}
+
+/// Run `f` with mutable access to the currently-attached [`Debugger`], if
+/// any, and return its result wrapped in `Some`.  Returns `None` when no
+/// debugger is attached.
+///
+/// This is a convenience helper for callers that need to query or mutate the
+/// debugger after a [`StatorError::DebuggerPaused`] error.
+pub fn with_debugger<R, F: FnOnce(&mut Debugger) -> R>(f: F) -> Option<R> {
+    ACTIVE_DEBUGGER.with(|d| {
+        let opt = d.borrow();
+        opt.as_ref().map(|rc| {
+            let mut dbg = rc.borrow_mut();
+            f(&mut dbg)
+        })
+    })
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tiering: interpreter → baseline JIT → Maglev JIT → Turbofan JIT
@@ -827,6 +875,21 @@ impl Interpreter {
                 return Err(StatorError::Internal(
                     "bytecode ended without a Return instruction".into(),
                 ));
+            }
+
+            // ── Debug hook (pre-fetch) ─────────────────────────────────────
+            //
+            // Check for breakpoints and step conditions *before* fetching the
+            // next instruction so that the paused frame state reflects what is
+            // *about* to execute (the program counter still points at the
+            // instruction that would fire next).
+            let current_offset = byte_offsets[frame.pc] as u32;
+            if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
+                let opt = d.borrow();
+                opt.as_ref()
+                    .and_then(|rc| rc.borrow_mut().check_pause_at(current_offset))
+            }) {
+                return Err(pause_err);
             }
 
             // ── Fetch ──────────────────────────────────────────────────────
@@ -1645,6 +1708,31 @@ impl Interpreter {
                         frame.pc = handler_pc;
                         continue;
                     }
+                    // ── pause-on-exceptions ───────────────────────────────
+                    // When a debugger is attached with pause_on_exceptions
+                    // enabled, suspend execution *before* the exception
+                    // propagates.  Back up the program counter to the Throw
+                    // instruction so that resuming re-executes it and lets the
+                    // exception propagate normally (skip_next prevents a
+                    // double-pause on the re-execution).
+                    let throw_offset = byte_offsets[throw_idx as usize] as u32;
+                    if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
+                        let opt = d.borrow();
+                        opt.as_ref().and_then(|rc| {
+                            let mut dbg = rc.borrow_mut();
+                            // consume_exception_resume returns true on a
+                            // resume re-execution — skip the pause in that
+                            // case so the exception can propagate.
+                            if dbg.pause_on_exceptions && !dbg.consume_exception_resume() {
+                                frame.pc = throw_idx as usize; // back up
+                                Some(dbg.on_exception(throw_offset))
+                            } else {
+                                None
+                            }
+                        })
+                    }) {
+                        return Err(pause_err);
+                    }
                     // No handler in this frame — serialise the thrown value and
                     // propagate it as a `StatorError::JsException` to the caller.
                     let msg = error_message_from_value(&thrown);
@@ -1945,6 +2033,25 @@ impl Interpreter {
                             frame.pc = resume_pc;
                         }
                     }
+                }
+
+                // ── Debugger statement ─────────────────────────────────────
+                //
+                // Debugger []:
+                //   Trigger a debugger breakpoint when a debugger is attached.
+                //   When no debugger is active, this instruction is a no-op.
+                //   The program counter has already been advanced past this
+                //   instruction, so the pause fires *after* the statement.
+                Opcode::Debugger => {
+                    let stmt_offset = byte_offsets[frame.pc - 1] as u32;
+                    if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
+                        let opt = d.borrow();
+                        opt.as_ref()
+                            .map(|rc| rc.borrow_mut().on_debugger_statement(stmt_offset))
+                    }) {
+                        return Err(pause_err);
+                    }
+                    // No debugger attached: debugger; is a no-op.
                 }
 
                 // ── Unimplemented ──────────────────────────────────────────
@@ -2636,17 +2743,19 @@ mod tests {
     }
 
     #[test]
-    fn test_unimplemented_opcode_is_error() {
-        let err = run_bytecode(
+    fn test_debugger_stmt_noop_without_hook() {
+        // Without a debugger attached, `debugger;` is a no-op and execution
+        // continues normally to the Return instruction.
+        let result = run_bytecode(
             vec![
-                // Debugger is not implemented in the interpreter yet.
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
                 Instruction::new_unchecked(Opcode::Debugger, vec![]),
                 Instruction::new_unchecked(Opcode::Return, vec![]),
             ],
             0,
         )
-        .unwrap_err();
-        assert!(matches!(err, StatorError::Internal(_)));
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
     }
 
     // ── Jump (unconditional) ─────────────────────────────────────────────────
