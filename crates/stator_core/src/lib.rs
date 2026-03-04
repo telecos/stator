@@ -56,6 +56,8 @@ pub mod platform;
 /// Memory sandbox: virtual-address range reservation, pointer bounds checking,
 /// and external pointer table for non-sandbox memory.
 pub mod sandbox;
+/// Startup snapshot: binary serialization and deserialization of heap state.
+pub mod snapshot;
 /// WebAssembly backend: engine, module, and instance wrappers (Wasmtime).
 pub mod wasm;
 /// Bump-pointer region allocator for compiler temporaries.
