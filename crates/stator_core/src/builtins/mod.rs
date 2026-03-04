@@ -39,6 +39,11 @@ pub mod set;
 pub mod string;
 /// Shared utility functions (e.g. `SameValueZero`) used across built-in sub-modules.
 pub(crate) mod util;
+/// WebAssembly JavaScript API built-ins:
+/// `WebAssembly.compile`, `WebAssembly.instantiate`, `WebAssembly.validate`,
+/// and the `WebAssembly.Module`, `WebAssembly.Instance`, `WebAssembly.Memory`,
+/// `WebAssembly.Table`, and `WebAssembly.Global` constructors.
+pub mod wasm;
 /// ECMAScript §24.3 `WeakMap` built-in — object-keyed weak map with ephemeron GC semantics.
 pub mod weak_map;
 /// ECMAScript §24.4 `WeakSet` built-in — object-keyed weak set with ephemeron GC semantics.

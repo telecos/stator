@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::process;
 use std::rc::Rc;
 
+use stator_core::builtins::wasm::make_webassembly_object;
 use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_core::interpreter::{Interpreter, InterpreterFrame};
 use stator_core::objects::value::JsValue;
@@ -82,6 +83,11 @@ fn build_globals() -> Rc<RefCell<HashMap<String, JsValue>>> {
     globals
         .borrow_mut()
         .insert("console".to_string(), JsValue::PlainObject(console_obj));
+
+    // WebAssembly — full WebAssembly JS API namespace
+    globals
+        .borrow_mut()
+        .insert("WebAssembly".to_string(), make_webassembly_object());
 
     globals
 }
