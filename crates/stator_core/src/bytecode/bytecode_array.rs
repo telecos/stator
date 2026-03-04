@@ -40,6 +40,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::bytecode::bytecodes::{self, Instruction};
 use crate::bytecode::feedback::FeedbackMetadata;
@@ -143,6 +145,28 @@ impl SourcePosition {
 /// to share the same cache without copying.
 type JitCodeCache = Rc<RefCell<Option<(Vec<u8>, usize)>>>;
 
+/// Shared Maglev JIT code cache stored in a [`BytecodeArray`].
+///
+/// Uses [`Arc`] + [`Mutex`] so that the Maglev background compilation thread
+/// can write the compiled code into the cache while the interpreter runs on
+/// the main thread.
+pub type MaglevJitCodeCache = Arc<Mutex<Option<(Vec<u8>, usize)>>>;
+
+/// Invocation-count threshold that triggers baseline JIT compilation.
+///
+/// When a function's `invocation_count` reaches this value the interpreter
+/// requests a baseline-compiled version; all subsequent calls that can be
+/// represented in the current JIT tier execute via native code.
+pub const TIERING_THRESHOLD: u32 = 100;
+
+/// Invocation-count threshold that triggers Maglev JIT compilation.
+///
+/// When a function's `invocation_count` reaches this value and baseline JIT
+/// code is already present, the interpreter schedules a background Maglev
+/// compilation.  Once compilation finishes the cached Maglev code replaces
+/// the baseline tier for future calls.
+pub const MAGLEV_TIERING_THRESHOLD: u32 = 1_000;
+
 /// An immutable, compact representation of the bytecode for a single
 /// JavaScript function.
 ///
@@ -151,11 +175,12 @@ type JitCodeCache = Rc<RefCell<Option<(Vec<u8>, usize)>>>;
 /// back into a [`Vec<Instruction>`] when needed.
 ///
 /// In addition to the static bytecode and metadata, a `BytecodeArray` carries
-/// **tiering state** that is shared across all clones via [`Rc`]:
+/// **tiering state** that is shared across all clones via [`Rc`] (baseline)
+/// or [`Arc`] (Maglev, shared with the background compilation thread):
 ///
 /// - An *invocation counter* that is incremented on every call.
-/// - A *JIT code cache* that stores the baseline-compiled machine code once
-///   the invocation count reaches [`TIERING_THRESHOLD`].
+/// - A *baseline JIT code cache* once invocation count reaches [`TIERING_THRESHOLD`].
+/// - A *Maglev JIT code cache* once invocation count reaches [`MAGLEV_TIERING_THRESHOLD`].
 #[derive(Debug, Clone)]
 pub struct BytecodeArray {
     /// The encoded bytecode stream.
@@ -179,7 +204,7 @@ pub struct BytecodeArray {
     /// [`crate::objects::value::JsValue::Generator`] without executing the
     /// body immediately.
     is_generator: bool,
-    // ─── Tiering state (shared across clones via Rc) ──────────────────────────
+    // ─── Tiering state (shared across clones via Rc / Arc) ───────────────────
     /// Number of times this function has been invoked.
     ///
     /// Wrapped in `Rc<Cell<_>>` so that every clone of this `BytecodeArray`
@@ -193,19 +218,21 @@ pub struct BytecodeArray {
     /// [`BaselineCompiler`][crate::compiler::baseline::compiler::BaselineCompiler].
     /// `None` until tiering has been triggered and compilation succeeded.
     jit_code: JitCodeCache,
+    /// Cached Maglev-JIT machine code and register-file slot count.
+    ///
+    /// Uses [`Arc`] + [`Mutex`] so the background Maglev compilation thread
+    /// can write results while the interpreter runs on the main thread.
+    /// `None` until Maglev compilation finishes successfully.
+    maglev_jit_code: MaglevJitCodeCache,
+    /// Set to `true` (via compare-exchange) when a Maglev compilation has been
+    /// scheduled so that only one background thread is spawned per function.
+    maglev_compile_started: Arc<AtomicBool>,
 }
-
-/// Invocation-count threshold that triggers baseline JIT compilation.
-///
-/// When a function's `invocation_count` reaches this value the interpreter
-/// requests a baseline-compiled version; all subsequent calls that can be
-/// represented in the current JIT tier execute via native code.
-pub const TIERING_THRESHOLD: u32 = 100;
 
 impl PartialEq for BytecodeArray {
     /// Two [`BytecodeArray`]s are equal when their static bytecode and metadata
-    /// are identical.  The tiering state (`invocation_count`, `jit_code`) is
-    /// intentionally excluded from the comparison.
+    /// are identical.  The tiering state (`invocation_count`, `jit_code`,
+    /// `maglev_jit_code`) is intentionally excluded from the comparison.
     fn eq(&self, other: &Self) -> bool {
         self.bytecodes == other.bytecodes
             && self.constant_pool == other.constant_pool
@@ -252,6 +279,8 @@ impl BytecodeArray {
             is_generator: false,
             invocation_count: Rc::new(Cell::new(0)),
             jit_code: Rc::new(RefCell::new(None)),
+            maglev_jit_code: Arc::new(Mutex::new(None)),
+            maglev_compile_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -380,6 +409,33 @@ impl BytecodeArray {
     /// only on the platform and CPU that produced them.
     pub fn try_get_jit_code(&self) -> Option<(Vec<u8>, usize)> {
         self.jit_code.borrow().clone()
+    }
+
+    /// Returns a clone of the cached Maglev-JIT machine code and
+    /// register-file slot count, or `None` if Maglev compilation has not
+    /// finished yet.
+    pub fn try_get_maglev_jit_code(&self) -> Option<(Vec<u8>, usize)> {
+        self.maglev_jit_code.lock().ok()?.clone()
+    }
+
+    /// Returns an [`Arc`] clone of the Maglev JIT code cache.
+    ///
+    /// The background compilation thread receives this `Arc` and writes the
+    /// compiled code into it when compilation succeeds.
+    pub fn maglev_jit_cache_arc(&self) -> MaglevJitCodeCache {
+        Arc::clone(&self.maglev_jit_code)
+    }
+
+    /// Attempt to atomically mark this function as having a Maglev compilation
+    /// in flight.
+    ///
+    /// Returns `true` if the caller successfully claimed the compilation slot
+    /// (the previous state was `false`); returns `false` if a compilation was
+    /// already started or has been scheduled by another caller.
+    pub fn try_start_maglev_compile(&self) -> bool {
+        self.maglev_compile_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 }
 

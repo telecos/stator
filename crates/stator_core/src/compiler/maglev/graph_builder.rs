@@ -93,18 +93,34 @@ const ACCUMULATOR_REG: usize = 0;
 /// The per-block SSA environment: maps each bytecode register (plus the
 /// accumulator at slot 0) to the [`NodeId`] of the IR value currently live
 /// in that slot.
+///
+/// Slot layout (mirrors the interpreter/JIT register-file layout):
+///
+/// ```text
+/// slot 0                     = accumulator
+/// slots 1 .. 1+param_count   = parameter registers (param0 .. paramN-1)
+/// slots 1+param_count ..     = local/temporary registers (r0, r1, …)
+/// ```
+///
+/// Bytecode uses two's-complement `u32` register indices:
+/// - `v as i32 < 0`: parameter `-(v as i32 + 1)` → slot `1 + (-(v as i32 + 1))`
+/// - `v as i32 >= 0`: local register `v` → slot `1 + param_count + v`
 #[derive(Clone)]
 struct Environment {
-    /// `slots[0]` = accumulator; `slots[1 + r]` = register `r`.
+    /// `slots[0]` = accumulator; see doc comment for layout.
     slots: Vec<Option<NodeId>>,
+    /// Number of parameter registers (needed to resolve positive register
+    /// indices to their correct slot).
+    param_count: usize,
 }
 
 impl Environment {
-    /// Create an environment large enough for `frame_size` registers plus the
-    /// accumulator.
-    fn new(frame_size: usize) -> Self {
+    /// Create an environment large enough for `param_count` parameters,
+    /// `frame_size` local registers, and the accumulator.
+    fn new(param_count: usize, frame_size: usize) -> Self {
         Self {
-            slots: vec![None; 1 + frame_size],
+            slots: vec![None; 1 + param_count + frame_size],
+            param_count,
         }
     }
 
@@ -118,14 +134,27 @@ impl Environment {
         self.slots[ACCUMULATOR_REG] = Some(id);
     }
 
-    /// Read a bytecode register (`r0`, `r1`, …).
+    /// Compute the slot index for a bytecode register operand `reg`.
+    ///
+    /// - `reg as i32 < 0`: parameter register; slot = `1 + (-(reg as i32 + 1))`
+    /// - `reg as i32 >= 0`: local/temporary register; slot = `1 + param_count + reg`
+    fn slot_index(&self, reg: u32) -> usize {
+        let signed = reg as i32;
+        if signed < 0 {
+            1 + (-(signed + 1)) as usize
+        } else {
+            1 + self.param_count + signed as usize
+        }
+    }
+
+    /// Read a bytecode register.
     fn get(&self, reg: u32) -> Option<NodeId> {
-        self.slots.get(1 + reg as usize).copied().flatten()
+        self.slots.get(self.slot_index(reg)).copied().flatten()
     }
 
     /// Write a bytecode register.
     fn set(&mut self, reg: u32, id: NodeId) {
-        let idx = 1 + reg as usize;
+        let idx = self.slot_index(reg);
         if idx < self.slots.len() {
             self.slots[idx] = Some(id);
         }
@@ -173,7 +202,7 @@ impl<'a> GraphBuilder<'a> {
             bytecode,
             feedback,
             graph: MaglevGraph::new(parameter_count),
-            env: Environment::new(frame_size),
+            env: Environment::new(parameter_count as usize, frame_size),
             current_block: 0,
             block_at: HashMap::new(),
         };
@@ -186,12 +215,17 @@ impl<'a> GraphBuilder<'a> {
         builder.current_block = 0;
 
         // Emit Parameter nodes into the entry block.
+        // Store each parameter at the two's-complement register address the
+        // bytecode uses to refer to it: param[i] ↔ register -(i+1).
         for i in 0..parameter_count {
             let id = builder
                 .graph
                 .add_value_node(0, ValueNode::Parameter { index: i })
                 .ok_or_else(|| StatorError::Internal("entry block missing".into()))?;
-            builder.env.set(i, id);
+            // Register index for param[i] in the two's-complement encoding:
+            // param[0] → r[-1] = 0xFFFFFFFF, param[1] → r[-2] = 0xFFFFFFFE, …
+            let param_reg = (-(i as i32 + 1)) as u32;
+            builder.env.set(param_reg, id);
         }
 
         // Pass 2: translate instructions.
