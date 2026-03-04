@@ -21,6 +21,10 @@ smallvec.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 regress.workspace = true
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-jit.workspace = true
+cranelift-module.workspace = true
 
 [target.'cfg(all(target_arch = "x86_64", unix))'.dependencies]
 libc.workspace = true
