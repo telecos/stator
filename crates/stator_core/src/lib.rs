@@ -40,7 +40,8 @@ pub mod error;
 pub mod gc;
 /// Inline-cache runtime: property load/store fast paths and call-site tracking.
 pub mod ic;
-/// Chrome DevTools Protocol (CDP) WebSocket inspector server.
+/// Chrome DevTools Protocol (CDP) WebSocket inspector server and sampling CPU
+/// profiler.
 pub mod inspector;
 /// Bytecode interpreter: fetch-decode-dispatch loop and activation frame.
 pub mod interpreter;
