@@ -24,6 +24,7 @@ use stator_core::interpreter::{Interpreter, InterpreterFrame};
 use stator_core::objects::js_object::JsObject;
 use stator_core::objects::value::{JsValue, NativeFn};
 use stator_core::parser;
+use stator_core::wasm::{WasmEngine, WasmInstance, WasmModule};
 
 /// An opaque isolate handle.
 ///
@@ -3283,7 +3284,259 @@ pub unsafe extern "C" fn stator_platform_current_clock_time_millis(
     unsafe { (*platform).inner.current_clock_time_millis() }
 }
 
-#[cfg(test)]
+// ── WebAssembly FFI ───────────────────────────────────────────────────────────
+
+/// An opaque handle wrapping a compiled WebAssembly module.
+///
+/// Created by [`stator_wasm_compile`] and freed by
+/// [`stator_wasm_module_destroy`].
+pub struct StatorWasmModule {
+    engine: WasmEngine,
+    module: WasmModule,
+}
+
+// SAFETY: `StatorWasmModule` is single-threaded; the embedder is responsible
+// for synchronisation if passed across threads.
+unsafe impl Send for StatorWasmModule {}
+
+/// An opaque handle wrapping a live WebAssembly module instance.
+///
+/// Created by [`stator_wasm_instantiate`] and freed by
+/// [`stator_wasm_instance_destroy`].
+pub struct StatorWasmInstance {
+    instance: WasmInstance,
+}
+
+// SAFETY: `StatorWasmInstance` is single-threaded; the embedder is responsible
+// for synchronisation if passed across threads.
+unsafe impl Send for StatorWasmInstance {}
+
+/// Compile a WebAssembly binary into a [`StatorWasmModule`].
+///
+/// Returns a null pointer if `isolate` or `bytes` is null, `len` is zero, or
+/// if the bytes do not represent a valid WebAssembly module.
+///
+/// The returned pointer must eventually be passed to
+/// [`stator_wasm_module_destroy`] to free all associated resources.
+///
+/// # Safety
+/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `bytes` must be valid for reads of `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_compile(
+    isolate: *mut StatorIsolate,
+    bytes: *const u8,
+    len: usize,
+) -> *mut StatorWasmModule {
+    if isolate.is_null() || bytes.is_null() || len == 0 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `bytes` is valid for `len` bytes.
+    let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
+    let engine = WasmEngine::new();
+    match WasmModule::from_bytes(&engine, slice) {
+        Ok(module) => Box::into_raw(Box::new(StatorWasmModule { engine, module })),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Free a [`StatorWasmModule`] previously returned by [`stator_wasm_compile`].
+///
+/// Does nothing when `module` is null.
+///
+/// # Safety
+/// `module` must be either null or a valid pointer returned by
+/// [`stator_wasm_compile`] that has not been freed yet.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_module_destroy(module: *mut StatorWasmModule) {
+    if !module.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw` in `stator_wasm_compile`.
+        drop(unsafe { Box::from_raw(module) });
+    }
+}
+
+/// Instantiate a compiled [`StatorWasmModule`] into a live
+/// [`StatorWasmInstance`].
+///
+/// `ctx` is accepted for future use and may be null.  `imports` is reserved for
+/// future use and **must** be null; passing a non-null value is currently
+/// ignored.
+///
+/// Returns a null pointer if `module` is null or if instantiation fails (e.g.
+/// the module requires imports that are not provided).
+///
+/// The returned pointer must eventually be passed to
+/// [`stator_wasm_instance_destroy`].
+///
+/// # Safety
+/// - `module` must be a non-null, valid pointer to a live
+///   [`StatorWasmModule`].
+/// - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+/// - `imports` must be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_instantiate(
+    module: *mut StatorWasmModule,
+    _ctx: *mut StatorContext,
+    _imports: *const c_void,
+) -> *mut StatorWasmInstance {
+    if module.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `module` is valid.
+    let m = unsafe { &*module };
+    match WasmInstance::new(&m.engine, &m.module) {
+        Ok(instance) => Box::into_raw(Box::new(StatorWasmInstance { instance })),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Free a [`StatorWasmInstance`] previously returned by
+/// [`stator_wasm_instantiate`].
+///
+/// Does nothing when `instance` is null.
+///
+/// # Safety
+/// `instance` must be either null or a valid pointer returned by
+/// [`stator_wasm_instantiate`] that has not been freed yet.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_instance_destroy(instance: *mut StatorWasmInstance) {
+    if !instance.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw` in `stator_wasm_instantiate`.
+        drop(unsafe { Box::from_raw(instance) });
+    }
+}
+
+/// Return a null-terminated array of export names from `instance`.
+///
+/// Each element in the array is a heap-allocated, null-terminated UTF-8 string.
+/// The array itself is terminated by a null pointer.  The caller owns the
+/// returned array and must free it with [`stator_wasm_exports_destroy`] when
+/// it is no longer needed.
+///
+/// Returns a null pointer if `instance` is null.
+///
+/// # Safety
+/// `instance` must be either null or a valid, live [`StatorWasmInstance`]
+/// pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_instance_exports(
+    instance: *mut StatorWasmInstance,
+) -> *mut *mut c_char {
+    if instance.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `instance` is valid.
+    let inst = unsafe { &mut *instance };
+    let names = inst.instance.export_names();
+    // Build a null-terminated array of heap-allocated C strings.
+    let mut ptrs: Vec<*mut c_char> = names
+        .into_iter()
+        .map(|n| {
+            // Silently replace any embedded NUL bytes to satisfy CString.
+            let safe = n.replace('\0', "");
+            // SAFETY: `safe` contains no NUL bytes after the replacement above.
+            unsafe { CString::from_vec_unchecked(safe.into_bytes()) }.into_raw()
+        })
+        .collect();
+    ptrs.push(std::ptr::null_mut()); // null terminator
+    let boxed = ptrs.into_boxed_slice();
+    Box::into_raw(boxed) as *mut *mut c_char
+}
+
+/// Free the export-name array returned by [`stator_wasm_instance_exports`].
+///
+/// Does nothing when `exports` is null.
+///
+/// # Safety
+/// `exports` must be either null or a valid pointer returned by
+/// [`stator_wasm_instance_exports`] that has not been freed yet.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_exports_destroy(exports: *mut *mut c_char) {
+    if exports.is_null() {
+        return;
+    }
+    // Count elements and free each string.
+    let mut count = 0usize;
+    loop {
+        // SAFETY: we produced this array in `stator_wasm_instance_exports`.
+        let ptr = unsafe { *exports.add(count) };
+        if ptr.is_null() {
+            break;
+        }
+        // SAFETY: each non-null string was created by `CString::into_raw`.
+        drop(unsafe { CString::from_raw(ptr) });
+        count += 1;
+    }
+    // Reconstruct the boxed slice (length includes the null terminator) and
+    // drop it to free the array storage.
+    // SAFETY: this slice was produced by `Box::into_raw(boxed)` in
+    // `stator_wasm_instance_exports` with `count + 1` elements.
+    drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(exports, count + 1)) });
+}
+
+/// Call an exported WebAssembly function by name.
+///
+/// `args` is an array of `args_len` pointers to [`StatorValue`] handles used
+/// as Wasm arguments.  Each null element is treated as `i32(0)`.  A null
+/// `args` pointer with `args_len == 0` is valid and means no arguments.
+///
+/// Returns a new [`StatorValue`] owned by the caller (free with
+/// [`stator_value_destroy`]), or a null pointer if any required pointer
+/// parameter is null, the named export does not exist, the call traps, or the
+/// first result cannot be represented as a [`StatorValue`].  Void (zero-result)
+/// functions return `undefined`.
+///
+/// # Safety
+/// - `instance` must be a non-null, valid pointer to a live
+///   [`StatorWasmInstance`].
+/// - `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+/// - `name` must be a valid, null-terminated C string.
+/// - `args` must be valid for reads of `args_len` pointers; each non-null
+///   element must be a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_wasm_instance_call(
+    instance: *mut StatorWasmInstance,
+    isolate: *mut StatorIsolate,
+    name: *const c_char,
+    args: *const *const StatorValue,
+    args_len: usize,
+) -> *mut StatorValue {
+    if instance.is_null() || isolate.is_null() || name.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `name` is a valid C string.
+    let name_str = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+
+    // Convert StatorValue* arguments to JsValue.
+    let js_args: Vec<JsValue> = if args.is_null() || args_len == 0 {
+        vec![]
+    } else {
+        // SAFETY: caller guarantees `args` is valid for `args_len` pointers.
+        let ptrs = unsafe { std::slice::from_raw_parts(args, args_len) };
+        ptrs.iter()
+            .map(|&p| {
+                if p.is_null() {
+                    JsValue::Smi(0)
+                } else {
+                    // SAFETY: each non-null pointer is a valid StatorValue.
+                    stator_value_inner_to_jsvalue(unsafe { &(*p).inner })
+                }
+            })
+            .collect()
+    };
+
+    // SAFETY: caller guarantees `instance` is valid.
+    let inst = unsafe { &mut *instance };
+    match inst.instance.call_with_js_values(&name_str, &js_args) {
+        Ok(jsval) => {
+            let inner = jsvalue_to_stator_value_inner(&jsval);
+            // SAFETY: `isolate` is valid.
+            unsafe { (*isolate).live_objects += 1 };
+            Box::into_raw(Box::new(StatorValue { inner, isolate }))
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
 mod tests {
     use super::*;
     use std::ffi::CStr;
@@ -6227,5 +6480,235 @@ mod tests {
         let iso = IsolateGuard::new();
         // SAFETY: `iso` is valid; null stats pointer is explicitly handled.
         unsafe { stator_isolate_get_stats(iso.as_ptr(), std::ptr::null_mut()) };
+    }
+
+    // ── WebAssembly FFI ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_wasm_compile_null_isolate_returns_null() {
+        let bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // SAFETY: null isolate is documented to return null.
+        let m = unsafe { stator_wasm_compile(std::ptr::null_mut(), bytes.as_ptr(), bytes.len()) };
+        assert!(m.is_null());
+    }
+
+    #[test]
+    fn test_wasm_compile_null_bytes_returns_null() {
+        let iso = IsolateGuard::new();
+        // SAFETY: null bytes pointer is documented to return null.
+        let m = unsafe { stator_wasm_compile(iso.as_ptr(), std::ptr::null(), 8) };
+        assert!(m.is_null());
+    }
+
+    #[test]
+    fn test_wasm_compile_zero_len_returns_null() {
+        let iso = IsolateGuard::new();
+        let bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // SAFETY: zero len is documented to return null.
+        let m = unsafe { stator_wasm_compile(iso.as_ptr(), bytes.as_ptr(), 0) };
+        assert!(m.is_null());
+    }
+
+    #[test]
+    fn test_wasm_compile_invalid_bytes_returns_null() {
+        let iso = IsolateGuard::new();
+        let bad = b"not wasm";
+        // SAFETY: `iso` is valid; `bad` is valid for 8 bytes.
+        let m = unsafe { stator_wasm_compile(iso.as_ptr(), bad.as_ptr(), bad.len()) };
+        assert!(m.is_null());
+    }
+
+    #[test]
+    fn test_wasm_compile_valid_returns_nonnull() {
+        let iso = IsolateGuard::new();
+        let bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // SAFETY: `iso` is valid; `bytes` is a valid empty Wasm binary.
+        let m = unsafe { stator_wasm_compile(iso.as_ptr(), bytes.as_ptr(), bytes.len()) };
+        assert!(!m.is_null());
+        // SAFETY: `m` is non-null and live.
+        unsafe { stator_wasm_module_destroy(m) };
+    }
+
+    #[test]
+    fn test_wasm_module_destroy_null_is_safe() {
+        // SAFETY: null is documented as a no-op.
+        unsafe { stator_wasm_module_destroy(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_wasm_instantiate_null_module_returns_null() {
+        // SAFETY: null module is documented to return null.
+        let inst = unsafe {
+            stator_wasm_instantiate(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null())
+        };
+        assert!(inst.is_null());
+    }
+
+    #[test]
+    fn test_wasm_instantiate_valid_returns_nonnull() {
+        let iso = IsolateGuard::new();
+        let bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // SAFETY: `iso` is valid; `bytes` is a valid empty Wasm binary.
+        let m = unsafe { stator_wasm_compile(iso.as_ptr(), bytes.as_ptr(), bytes.len()) };
+        assert!(!m.is_null());
+        // SAFETY: `m` is valid; null ctx and imports are allowed.
+        let inst = unsafe { stator_wasm_instantiate(m, std::ptr::null_mut(), std::ptr::null()) };
+        assert!(!inst.is_null());
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            stator_wasm_instance_destroy(inst);
+            stator_wasm_module_destroy(m);
+        }
+    }
+
+    #[test]
+    fn test_wasm_instance_destroy_null_is_safe() {
+        // SAFETY: null is documented as a no-op.
+        unsafe { stator_wasm_instance_destroy(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_wasm_instance_exports_null_instance_returns_null() {
+        // SAFETY: null instance is documented to return null.
+        let exports = unsafe { stator_wasm_instance_exports(std::ptr::null_mut()) };
+        assert!(exports.is_null());
+    }
+
+    #[test]
+    fn test_wasm_instance_exports_empty_module() {
+        let iso = IsolateGuard::new();
+        let bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // SAFETY: all pointers are valid.
+        let m = unsafe { stator_wasm_compile(iso.as_ptr(), bytes.as_ptr(), bytes.len()) };
+        let inst = unsafe { stator_wasm_instantiate(m, std::ptr::null_mut(), std::ptr::null()) };
+        // SAFETY: `inst` is valid.
+        let exports = unsafe { stator_wasm_instance_exports(inst) };
+        assert!(!exports.is_null());
+        // The empty module has no exports; the first element must be the null terminator.
+        // SAFETY: `exports` is a valid null-terminated array.
+        let first = unsafe { *exports };
+        assert!(first.is_null(), "empty module should have no exports");
+        // SAFETY: `exports` was returned by `stator_wasm_instance_exports`.
+        unsafe { stator_wasm_exports_destroy(exports) };
+        unsafe {
+            stator_wasm_instance_destroy(inst);
+            stator_wasm_module_destroy(m);
+        }
+    }
+
+    #[test]
+    fn test_wasm_exports_destroy_null_is_safe() {
+        // SAFETY: null is documented as a no-op.
+        unsafe { stator_wasm_exports_destroy(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_wasm_compile_instantiate_exports_and_call() {
+        let iso = IsolateGuard::new();
+        // WAT text is accepted by wasmtime as a Wasm module source.
+        let wat: &[u8] = br#"
+            (module
+                (func $add (export "add") (param i32 i32) (result i32)
+                    local.get 0
+                    local.get 1
+                    i32.add))
+        "#;
+        // SAFETY: `iso` is valid; `wat` is valid WAT accepted by wasmtime.
+        let m = unsafe { stator_wasm_compile(iso.as_ptr(), wat.as_ptr(), wat.len()) };
+        assert!(!m.is_null(), "stator_wasm_compile must succeed");
+
+        // SAFETY: `m` is valid.
+        let inst = unsafe { stator_wasm_instantiate(m, std::ptr::null_mut(), std::ptr::null()) };
+        assert!(!inst.is_null(), "stator_wasm_instantiate must succeed");
+
+        // Check that "add" appears in the exports list.
+        // SAFETY: `inst` is valid.
+        let exports = unsafe { stator_wasm_instance_exports(inst) };
+        assert!(!exports.is_null());
+        let mut found = false;
+        let mut i = 0;
+        loop {
+            // SAFETY: `exports` is a valid null-terminated array.
+            let ptr = unsafe { *exports.add(i) };
+            if ptr.is_null() {
+                break;
+            }
+            // SAFETY: each non-null element is a valid C string.
+            let name = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+            if name == "add" {
+                found = true;
+            }
+            i += 1;
+        }
+        assert!(found, "'add' must appear in the exports list");
+        // SAFETY: `exports` was returned by `stator_wasm_instance_exports`.
+        unsafe { stator_wasm_exports_destroy(exports) };
+
+        // Call `add(3, 4)` and verify the result is 7.
+        let name = c"add";
+        // SAFETY: `iso` is valid.
+        let arg_a = unsafe { stator_value_new_number(iso.as_ptr(), 3.0) };
+        let arg_b = unsafe { stator_value_new_number(iso.as_ptr(), 4.0) };
+        let arg_ptrs: [*const StatorValue; 2] = [arg_a, arg_b];
+        // SAFETY: all pointers are valid.
+        let result = unsafe {
+            stator_wasm_instance_call(
+                inst,
+                iso.as_ptr(),
+                name.as_ptr(),
+                arg_ptrs.as_ptr(),
+                arg_ptrs.len(),
+            )
+        };
+        assert!(!result.is_null(), "add(3, 4) must return a value");
+        // SAFETY: `result` is non-null and live.
+        let n = unsafe { stator_value_as_number(result) };
+        assert_eq!(n, 7.0, "add(3, 4) must equal 7");
+
+        // SAFETY: all pointers are non-null and live.
+        unsafe {
+            stator_value_destroy(result);
+            stator_value_destroy(arg_a);
+            stator_value_destroy(arg_b);
+            stator_wasm_instance_destroy(inst);
+            stator_wasm_module_destroy(m);
+        }
+    }
+
+    #[test]
+    fn test_wasm_instance_call_null_instance_returns_null() {
+        let iso = IsolateGuard::new();
+        let name = c"add";
+        // SAFETY: null instance is documented to return null.
+        let result = unsafe {
+            stator_wasm_instance_call(
+                std::ptr::null_mut(),
+                iso.as_ptr(),
+                name.as_ptr(),
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn test_wasm_instance_call_missing_export_returns_null() {
+        let iso = IsolateGuard::new();
+        let bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // SAFETY: all pointers are valid.
+        let m = unsafe { stator_wasm_compile(iso.as_ptr(), bytes.as_ptr(), bytes.len()) };
+        let inst = unsafe { stator_wasm_instantiate(m, std::ptr::null_mut(), std::ptr::null()) };
+        let name = c"nonexistent";
+        // SAFETY: all pointers are valid.
+        let result = unsafe {
+            stator_wasm_instance_call(inst, iso.as_ptr(), name.as_ptr(), std::ptr::null(), 0)
+        };
+        assert!(result.is_null(), "missing export must return null");
+        // SAFETY: pointers are non-null and live.
+        unsafe {
+            stator_wasm_instance_destroy(inst);
+            stator_wasm_module_destroy(m);
+        }
     }
 }
