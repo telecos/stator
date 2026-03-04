@@ -6,6 +6,8 @@
 //! - [`error`] — Engine error types and `StatorResult` alias.
 //! - [`gc`] — Garbage collector infrastructure (heap, tracing, handles).
 //! - [`objects`] — JavaScript value representation and heap object types.
+//! - [`sandbox`] — Memory sandbox: virtual-address range reservation, pointer
+//!   bounds checking, and external pointer table.
 //! - [`zone`] — Bump-pointer region allocator for compiler temporaries.
 //! - [`parser`] — Lexer ([`parser::scanner`]), AST ([`parser::ast`]), and
 //!   scope analysis ([`parser::scope`]), and lazy parsing
@@ -51,6 +53,9 @@ pub mod objects;
 pub mod parser;
 /// Platform abstraction for embedder-provided task scheduling and timing.
 pub mod platform;
+/// Memory sandbox: virtual-address range reservation, pointer bounds checking,
+/// and external pointer table for non-sandbox memory.
+pub mod sandbox;
 /// WebAssembly backend: engine, module, and instance wrappers (Wasmtime).
 pub mod wasm;
 /// Bump-pointer region allocator for compiler temporaries.
