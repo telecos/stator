@@ -157,6 +157,7 @@ impl RegExpFlags {
 ///   starts.
 /// * `input` is the original input string.
 /// * `named_groups` contains any named capture group values keyed by name.
+/// * `indices` is populated when the `d` (hasIndices) flag is set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegExpMatch {
     /// The full matched substring.
@@ -169,6 +170,25 @@ pub struct RegExpMatch {
     pub index: usize,
     /// The input string against which the pattern was matched.
     pub input: String,
+    /// Match indices for the `d` flag (`[start, end]` pairs).
+    ///
+    /// The first element is the full match range; subsequent elements are
+    /// the capture group ranges (`None` for groups that did not participate).
+    /// Only populated when [`RegExpFlags::HAS_INDICES`] is set.
+    pub indices: Option<MatchIndices>,
+}
+
+/// Byte-offset index pairs for the `/d` (hasIndices) flag.
+///
+/// Each element is `(start, end)` as a byte-offset pair into the input string.
+/// The first element corresponds to the full match; subsequent elements are the
+/// capture groups (with `None` for groups that did not participate).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchIndices {
+    /// `[start, end]` pairs: index 0 = full match, 1.. = capture groups.
+    pub pairs: Vec<Option<(usize, usize)>>,
+    /// Named group indices keyed by group name.
+    pub groups: HashMap<String, (usize, usize)>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -333,7 +353,11 @@ impl JsRegExp {
                 if is_stateful {
                     self.last_index.set(mat.end());
                 }
-                Some(build_match(input, &mat))
+                Some(build_match(
+                    input,
+                    &mat,
+                    self.flags.contains(RegExpFlags::HAS_INDICES),
+                ))
             }
         }
     }
@@ -443,7 +467,7 @@ impl JsRegExp {
             match m {
                 None => break,
                 Some(mat) => {
-                    let rm = build_match(input, &mat);
+                    let rm = build_match(input, &mat, false);
                     // Append the portion of input before this match.
                     result.push_str(&input[last_end..rm.index]);
                     // Apply replacement.
@@ -516,6 +540,39 @@ impl JsRegExp {
         }
         parts
     }
+
+    /// ECMAScript `RegExp.prototype[Symbol.matchAll](string)`.
+    ///
+    /// Returns all successive matches as a `Vec<RegExpMatch>`, producing the
+    /// same kind of result objects that [`Self::exec`] would for each match.
+    /// This is the underlying implementation for `String.prototype.matchAll`.
+    pub fn symbol_match_all(&self, input: &str) -> Vec<RegExpMatch> {
+        let has_indices = self.flags.contains(RegExpFlags::HAS_INDICES);
+        let mut results = Vec::new();
+        let mut start = 0_usize;
+        loop {
+            if start > input.len() {
+                break;
+            }
+            let m = if self.flags.contains(RegExpFlags::STICKY) {
+                self.compiled
+                    .find_from(input, start)
+                    .next()
+                    .filter(|m| m.start() == start)
+            } else {
+                self.compiled.find_from(input, start).next()
+            };
+            match m {
+                None => break,
+                Some(mat) => {
+                    let end = mat.end();
+                    results.push(build_match(input, &mat, has_indices));
+                    start = if end > start { end } else { start + 1 };
+                }
+            }
+        }
+        results
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -556,7 +613,10 @@ fn build_regress_flags(f: RegExpFlags) -> RegressFlags {
 }
 
 /// Converts a [`regress::Match`] into a [`RegExpMatch`].
-fn build_match(input: &str, mat: &regress::Match) -> RegExpMatch {
+///
+/// When `has_indices` is `true` the [`MatchIndices`] field is populated with
+/// byte-offset pairs for the full match and each capture group.
+fn build_match(input: &str, mat: &regress::Match, has_indices: bool) -> RegExpMatch {
     let matched = input[mat.range()].to_string();
     let index = mat.start();
 
@@ -571,12 +631,28 @@ fn build_match(input: &str, mat: &regress::Match) -> RegExpMatch {
         .filter_map(|(name, range)| range.map(|r| (name.to_string(), input[r].to_string())))
         .collect();
 
+    let indices = if has_indices {
+        let mut pairs = Vec::with_capacity(1 + mat.captures.len());
+        pairs.push(Some((mat.start(), mat.end())));
+        for cap in &mat.captures {
+            pairs.push(cap.as_ref().map(|r| (r.start, r.end)));
+        }
+        let groups: HashMap<String, (usize, usize)> = mat
+            .named_groups()
+            .filter_map(|(name, range)| range.map(|r| (name.to_string(), (r.start, r.end))))
+            .collect();
+        Some(MatchIndices { pairs, groups })
+    } else {
+        None
+    };
+
     RegExpMatch {
         matched,
         captures,
         named_groups,
         index,
         input: input.to_string(),
+        indices,
     }
 }
 
