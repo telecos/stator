@@ -958,6 +958,9 @@ impl Default for V8Promise {
 // V8ObjectTemplate
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Callback type for named-property getter interceptors on [`V8ObjectTemplate`].
+pub type NamedGetterCb = Box<dyn Fn(&str) -> JsValue>;
+
 /// A template for creating JavaScript objects with predefined properties,
 /// analogous to `v8::ObjectTemplate`.
 ///
@@ -976,7 +979,7 @@ impl Default for V8Promise {
 /// ```
 pub struct V8ObjectTemplate {
     properties: HashMap<String, JsValue>,
-    named_getter: Option<Box<dyn Fn(&str) -> JsValue>>,
+    named_getter: Option<NamedGetterCb>,
 }
 
 impl V8ObjectTemplate {
