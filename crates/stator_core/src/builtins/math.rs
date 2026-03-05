@@ -101,7 +101,7 @@ pub fn math_floor(x: f64) -> f64 {
 /// ECMAScript §21.3.2.28 `Math.round(x)`.
 ///
 /// Returns the integer nearest to `x`, rounding half-way cases toward
-/// `+Infinity` (i.e. `0.5` rounds to `1`, `-0.5` rounds to `0`).
+/// `+Infinity` (i.e. `0.5` rounds to `1`, `-0.5` rounds to `-0`).
 ///
 /// # Examples
 ///
@@ -113,9 +113,13 @@ pub fn math_floor(x: f64) -> f64 {
 /// assert_eq!(math_round(1.4), 1.0);
 /// ```
 pub fn math_round(x: f64) -> f64 {
-    // ECMAScript §21.3.2.28: ties round toward +Infinity, equivalent to
-    // floor(x + 0.5).
-    (x + 0.5).floor()
+    let rounded = (x + 0.5).floor();
+    // ECMAScript §21.3.2.28: values in [-0.5, -0] must return -0.
+    if rounded == 0.0 && x.is_sign_negative() {
+        -0.0_f64
+    } else {
+        rounded
+    }
 }
 
 // ── Math.trunc ────────────────────────────────────────────────────────────────
@@ -189,7 +193,8 @@ pub fn math_max(values: &[f64]) -> f64 {
         if v.is_nan() {
             return f64::NAN;
         }
-        if v > result {
+        // ECMAScript: +0 is greater than -0.
+        if v > result || (v == 0.0 && result == 0.0 && result.is_sign_negative()) {
             result = v;
         }
     }
@@ -216,7 +221,8 @@ pub fn math_min(values: &[f64]) -> f64 {
         if v.is_nan() {
             return f64::NAN;
         }
-        if v < result {
+        // ECMAScript: -0 is less than +0.
+        if v < result || (v == 0.0 && result == 0.0 && v.is_sign_negative()) {
             result = v;
         }
     }
@@ -571,6 +577,162 @@ pub fn math_fround(x: f64) -> f64 {
     (x as f32) as f64
 }
 
+// ── Math.exp ──────────────────────────────────────────────────────────────────
+
+/// ECMAScript §21.3.2.14 `Math.exp(x)`.
+///
+/// Returns *e* raised to the power `x`.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::math::math_exp;
+///
+/// assert!((math_exp(0.0) - 1.0).abs() < 1e-15);
+/// assert!((math_exp(1.0) - std::f64::consts::E).abs() < 1e-14);
+/// assert!(math_exp(f64::NAN).is_nan());
+/// ```
+pub fn math_exp(x: f64) -> f64 {
+    x.exp()
+}
+
+// ── Math.expm1 ────────────────────────────────────────────────────────────────
+
+/// ECMAScript §21.3.2.15 `Math.expm1(x)`.
+///
+/// Returns *e*^`x` − 1, computed in a way that is accurate even when `x` is
+/// close to zero.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::math::math_expm1;
+///
+/// assert!((math_expm1(0.0) - 0.0).abs() < 1e-15);
+/// assert!(math_expm1(f64::NAN).is_nan());
+/// ```
+pub fn math_expm1(x: f64) -> f64 {
+    x.exp_m1()
+}
+
+// ── Math.log1p ────────────────────────────────────────────────────────────────
+
+/// ECMAScript §21.3.2.23 `Math.log1p(x)`.
+///
+/// Returns the natural logarithm of `1 + x`, computed in a way that is
+/// accurate even when `x` is close to zero.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::math::math_log1p;
+///
+/// assert!((math_log1p(0.0) - 0.0).abs() < 1e-15);
+/// assert_eq!(math_log1p(-1.0), f64::NEG_INFINITY);
+/// assert!(math_log1p(f64::NAN).is_nan());
+/// ```
+pub fn math_log1p(x: f64) -> f64 {
+    x.ln_1p()
+}
+
+// ── Math.sinh / Math.cosh / Math.tanh ─────────────────────────────────────────
+
+/// ECMAScript §21.3.2.31 `Math.sinh(x)`.
+///
+/// Returns the hyperbolic sine of `x`.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::math::math_sinh;
+///
+/// assert!((math_sinh(0.0) - 0.0).abs() < 1e-15);
+/// ```
+pub fn math_sinh(x: f64) -> f64 {
+    x.sinh()
+}
+
+/// ECMAScript §21.3.2.12 `Math.cosh(x)`.
+///
+/// Returns the hyperbolic cosine of `x`.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::math::math_cosh;
+///
+/// assert!((math_cosh(0.0) - 1.0).abs() < 1e-15);
+/// ```
+pub fn math_cosh(x: f64) -> f64 {
+    x.cosh()
+}
+
+/// ECMAScript §21.3.2.34 `Math.tanh(x)`.
+///
+/// Returns the hyperbolic tangent of `x`.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::math::math_tanh;
+///
+/// assert!((math_tanh(0.0) - 0.0).abs() < 1e-15);
+/// ```
+pub fn math_tanh(x: f64) -> f64 {
+    x.tanh()
+}
+
+// ── Math.asinh / Math.acosh / Math.atanh ──────────────────────────────────────
+
+/// ECMAScript §21.3.2.5 `Math.asinh(x)`.
+///
+/// Returns the inverse hyperbolic sine of `x`.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::math::math_asinh;
+///
+/// assert!((math_asinh(0.0) - 0.0).abs() < 1e-15);
+/// ```
+pub fn math_asinh(x: f64) -> f64 {
+    x.asinh()
+}
+
+/// ECMAScript §21.3.2.1 `Math.acosh(x)`.
+///
+/// Returns the inverse hyperbolic cosine of `x`.  Returns `NaN` for
+/// inputs less than 1.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::math::math_acosh;
+///
+/// assert!((math_acosh(1.0) - 0.0).abs() < 1e-15);
+/// assert!(math_acosh(0.5).is_nan());
+/// ```
+pub fn math_acosh(x: f64) -> f64 {
+    x.acosh()
+}
+
+/// ECMAScript §21.3.2.7 `Math.atanh(x)`.
+///
+/// Returns the inverse hyperbolic tangent of `x`.  Returns `NaN` for
+/// inputs with absolute value greater than 1.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::math::math_atanh;
+///
+/// assert!((math_atanh(0.0) - 0.0).abs() < 1e-15);
+/// assert!(math_atanh(2.0).is_nan());
+/// ```
+pub fn math_atanh(x: f64) -> f64 {
+    x.atanh()
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────────────
@@ -664,9 +826,11 @@ mod tests {
 
     #[test]
     fn test_round_negative_half() {
-        // ECMAScript: -0.5 rounds to -0 (i.e. 0), -1.5 rounds to -1.
+        // ECMAScript: -0.5 rounds to -0, -1.5 rounds to -1.
         assert_eq!(math_round(-1.5), -1.0);
-        assert_eq!(math_round(-0.5), 0.0);
+        let r = math_round(-0.5);
+        assert_eq!(r, 0.0);
+        assert!(r.is_sign_negative());
     }
 
     #[test]
@@ -984,5 +1148,152 @@ mod tests {
         // Per ECMAScript, if any value is Infinity, result is Infinity even
         // if there is a NaN.
         assert_eq!(math_hypot(&[f64::INFINITY, f64::NAN]), f64::INFINITY);
+    }
+
+    // ── math_round edge cases ────────────────────────────────────────────────
+
+    #[test]
+    fn test_round_negative_zero() {
+        // Math.round(-0) → -0
+        let r = math_round(-0.0_f64);
+        assert_eq!(r, 0.0);
+        assert!(r.is_sign_negative());
+    }
+
+    #[test]
+    fn test_round_small_negative() {
+        // Math.round(-0.3) → -0
+        let r = math_round(-0.3);
+        assert_eq!(r, 0.0);
+        assert!(r.is_sign_negative());
+    }
+
+    // ── math_max / math_min signed-zero ──────────────────────────────────────
+
+    #[test]
+    fn test_max_negative_zero_positive_zero() {
+        // Math.max(-0, +0) → +0
+        let r = math_max(&[-0.0, 0.0]);
+        assert_eq!(r, 0.0);
+        assert!(r.is_sign_positive());
+    }
+
+    #[test]
+    fn test_min_positive_zero_negative_zero() {
+        // Math.min(+0, -0) → -0
+        let r = math_min(&[0.0, -0.0]);
+        assert_eq!(r, 0.0);
+        assert!(r.is_sign_negative());
+    }
+
+    // ── math_exp ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_exp_zero() {
+        assert_eq!(math_exp(0.0), 1.0);
+    }
+
+    #[test]
+    fn test_exp_one() {
+        assert!((math_exp(1.0) - std::f64::consts::E).abs() < 1e-14);
+    }
+
+    #[test]
+    fn test_exp_nan() {
+        assert!(math_exp(f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn test_exp_infinity() {
+        assert_eq!(math_exp(f64::INFINITY), f64::INFINITY);
+        assert_eq!(math_exp(f64::NEG_INFINITY), 0.0);
+    }
+
+    // ── math_expm1 ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_expm1_zero() {
+        assert_eq!(math_expm1(0.0), 0.0);
+    }
+
+    #[test]
+    fn test_expm1_nan() {
+        assert!(math_expm1(f64::NAN).is_nan());
+    }
+
+    // ── math_log1p ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_log1p_zero() {
+        assert_eq!(math_log1p(0.0), 0.0);
+    }
+
+    #[test]
+    fn test_log1p_minus_one() {
+        assert_eq!(math_log1p(-1.0), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_log1p_nan() {
+        assert!(math_log1p(f64::NAN).is_nan());
+    }
+
+    // ── math_sinh / math_cosh / math_tanh ────────────────────────────────────
+
+    #[test]
+    fn test_sinh_zero() {
+        assert_eq!(math_sinh(0.0), 0.0);
+    }
+
+    #[test]
+    fn test_cosh_zero() {
+        assert_eq!(math_cosh(0.0), 1.0);
+    }
+
+    #[test]
+    fn test_tanh_zero() {
+        assert_eq!(math_tanh(0.0), 0.0);
+    }
+
+    #[test]
+    fn test_sinh_nan() {
+        assert!(math_sinh(f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn test_cosh_nan() {
+        assert!(math_cosh(f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn test_tanh_nan() {
+        assert!(math_tanh(f64::NAN).is_nan());
+    }
+
+    // ── math_asinh / math_acosh / math_atanh ─────────────────────────────────
+
+    #[test]
+    fn test_asinh_zero() {
+        assert_eq!(math_asinh(0.0), 0.0);
+    }
+
+    #[test]
+    fn test_acosh_one() {
+        assert!((math_acosh(1.0) - 0.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_acosh_less_than_one() {
+        assert!(math_acosh(0.5).is_nan());
+    }
+
+    #[test]
+    fn test_atanh_zero() {
+        assert_eq!(math_atanh(0.0), 0.0);
+    }
+
+    #[test]
+    fn test_atanh_out_of_range() {
+        assert!(math_atanh(2.0).is_nan());
     }
 }

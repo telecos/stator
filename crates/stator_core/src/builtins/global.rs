@@ -583,8 +583,9 @@ mod tests {
 
     #[test]
     fn test_global_parse_float_infinity() {
-        assert_eq!(global_parse_float("inf"), f64::INFINITY);
-        assert_eq!(global_parse_float("-inf"), f64::NEG_INFINITY);
+        // ECMAScript only recognises "Infinity" (capital I), not "inf".
+        assert_eq!(global_parse_float("Infinity"), f64::INFINITY);
+        assert_eq!(global_parse_float("-Infinity"), f64::NEG_INFINITY);
     }
 
     // ── global_encode_uri ────────────────────────────────────────────────────

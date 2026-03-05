@@ -29,10 +29,11 @@ use crate::builtins::global::{
 };
 use crate::builtins::math::{
     MATH_E, MATH_LN2, MATH_LN10, MATH_LOG2E, MATH_LOG10E, MATH_PI, MATH_SQRT1_2, MATH_SQRT2,
-    math_abs, math_acos, math_asin, math_atan, math_atan2, math_cbrt, math_ceil, math_clz32,
-    math_cos, math_floor, math_fround, math_hypot, math_imul, math_log, math_log2, math_log10,
-    math_max, math_min, math_pow, math_random, math_round, math_sign, math_sin, math_sqrt,
-    math_tan, math_trunc,
+    math_abs, math_acos, math_acosh, math_asin, math_asinh, math_atan, math_atan2, math_atanh,
+    math_cbrt, math_ceil, math_clz32, math_cos, math_cosh, math_exp, math_expm1, math_floor,
+    math_fround, math_hypot, math_imul, math_log, math_log1p, math_log2, math_log10, math_max,
+    math_min, math_pow, math_random, math_round, math_sign, math_sin, math_sinh, math_sqrt,
+    math_tan, math_tanh, math_trunc,
 };
 use crate::builtins::symbol::{
     SYMBOL_ASYNC_ITERATOR, SYMBOL_HAS_INSTANCE, SYMBOL_IS_CONCAT_SPREADABLE, SYMBOL_ITERATOR,
@@ -195,6 +196,42 @@ fn make_math() -> JsValue {
     props.insert(
         "atan".into(),
         native(|args| Ok(num(math_atan(arg_f64(&args, 0)?)))),
+    );
+    props.insert(
+        "sinh".into(),
+        native(|args| Ok(num(math_sinh(arg_f64(&args, 0)?)))),
+    );
+    props.insert(
+        "cosh".into(),
+        native(|args| Ok(num(math_cosh(arg_f64(&args, 0)?)))),
+    );
+    props.insert(
+        "tanh".into(),
+        native(|args| Ok(num(math_tanh(arg_f64(&args, 0)?)))),
+    );
+    props.insert(
+        "asinh".into(),
+        native(|args| Ok(num(math_asinh(arg_f64(&args, 0)?)))),
+    );
+    props.insert(
+        "acosh".into(),
+        native(|args| Ok(num(math_acosh(arg_f64(&args, 0)?)))),
+    );
+    props.insert(
+        "atanh".into(),
+        native(|args| Ok(num(math_atanh(arg_f64(&args, 0)?)))),
+    );
+    props.insert(
+        "exp".into(),
+        native(|args| Ok(num(math_exp(arg_f64(&args, 0)?)))),
+    );
+    props.insert(
+        "expm1".into(),
+        native(|args| Ok(num(math_expm1(arg_f64(&args, 0)?)))),
+    );
+    props.insert(
+        "log1p".into(),
+        native(|args| Ok(num(math_log1p(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "fround".into(),
@@ -404,6 +441,21 @@ fn make_number() -> JsValue {
             Ok(JsValue::Boolean(result))
         }),
     );
+    // Number.isSafeInteger
+    props.insert(
+        "isSafeInteger".into(),
+        native(|args| {
+            let val = args.first().unwrap_or(&JsValue::Undefined);
+            let result = match val {
+                JsValue::Smi(_) => true,
+                JsValue::HeapNumber(n) => {
+                    n.is_finite() && n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0
+                }
+                _ => false,
+            };
+            Ok(JsValue::Boolean(result))
+        }),
+    );
     // Number.parseInt
     props.insert(
         "parseInt".into(),
@@ -436,7 +488,7 @@ fn make_number() -> JsValue {
         JsValue::HeapNumber(-9_007_199_254_740_991.0),
     );
     props.insert("MAX_VALUE".into(), JsValue::HeapNumber(f64::MAX));
-    props.insert("MIN_VALUE".into(), JsValue::HeapNumber(f64::MIN_POSITIVE));
+    props.insert("MIN_VALUE".into(), JsValue::HeapNumber(5e-324));
     props.insert("EPSILON".into(), JsValue::HeapNumber(f64::EPSILON));
     props.insert(
         "POSITIVE_INFINITY".into(),

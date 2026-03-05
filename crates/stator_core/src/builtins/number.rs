@@ -27,8 +27,9 @@ pub const NUMBER_MIN_SAFE_INTEGER: f64 = -9_007_199_254_740_991.0_f64;
 /// The largest finite floating-point number representable in JavaScript.
 pub const NUMBER_MAX_VALUE: f64 = f64::MAX;
 
-/// The smallest positive floating-point number representable in JavaScript.
-pub const NUMBER_MIN_VALUE: f64 = f64::MIN_POSITIVE;
+/// The smallest positive floating-point number representable in JavaScript
+/// (the smallest subnormal, `5e-324`).
+pub const NUMBER_MIN_VALUE: f64 = 5e-324;
 
 /// The difference between 1.0 and the next representable `f64` value.
 pub const NUMBER_EPSILON: f64 = f64::EPSILON;
@@ -197,8 +198,9 @@ pub fn number_parse_int(string: &str, radix: u32) -> f64 {
 
 /// ECMAScript §21.1.2.7 `Number.parseFloat(string)`.
 ///
-/// Parses a string as an IEEE 754 double.  Returns `NaN` if the string does
-/// not represent a valid number.
+/// Parses the longest valid numeric prefix of `string` as an IEEE 754 double.
+/// Returns `NaN` if no valid prefix exists.  Recognises `"Infinity"` and
+/// `"-Infinity"` per spec.
 ///
 /// # Examples
 ///
@@ -207,14 +209,79 @@ pub fn number_parse_int(string: &str, radix: u32) -> f64 {
 ///
 /// assert_eq!(number_parse_float("3.14"), 3.14);
 /// assert_eq!(number_parse_float("  -2.5  "), -2.5);
+/// assert_eq!(number_parse_float("3.14abc"), 3.14);
+/// assert_eq!(number_parse_float("Infinity"), f64::INFINITY);
 /// assert!(number_parse_float("abc").is_nan());
 /// ```
 pub fn number_parse_float(string: &str) -> f64 {
-    let s = string.trim();
+    let s = string.trim_start();
     if s.is_empty() {
         return f64::NAN;
     }
-    s.parse::<f64>().unwrap_or(f64::NAN)
+
+    // Handle optional sign + "Infinity".
+    let (sign, rest) = match s.as_bytes().first() {
+        Some(b'+') => (1.0_f64, &s[1..]),
+        Some(b'-') => (-1.0_f64, &s[1..]),
+        _ => (1.0_f64, s),
+    };
+    if rest.starts_with("Infinity") {
+        return sign * f64::INFINITY;
+    }
+
+    // Find the longest prefix that forms a valid StrDecimalLiteral.
+    let end = float_prefix_end(s);
+    if end == 0 {
+        return f64::NAN;
+    }
+    s[..end].parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// Returns the byte-length of the longest valid numeric prefix in `s`.
+fn float_prefix_end(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut i = 0;
+
+    // Optional sign.
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        i += 1;
+    }
+
+    // Integer part.
+    let mut has_digits = false;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+        has_digits = true;
+    }
+
+    // Fractional part.
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+            has_digits = true;
+        }
+    }
+
+    if !has_digits {
+        return 0;
+    }
+    let mut end = i;
+
+    // Exponent part.
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        let mut j = i + 1;
+        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+            j += 1;
+        }
+        if j < b.len() && b[j].is_ascii_digit() {
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            end = j;
+        }
+    }
+    end
 }
 
 // ── Number.prototype.toFixed ──────────────────────────────────────────────────
@@ -252,11 +319,9 @@ pub fn number_to_fixed(value: f64, digits: u32) -> StatorResult<String> {
             "-Infinity".to_string()
         });
     }
-    // Values >= 1e21 are formatted in exponential notation by ECMAScript.
+    // Per spec §21.1.3.3: values >= 1e21 return ToString(value).
     if value.abs() >= 1e21 {
-        return Err(StatorError::RangeError(
-            "toFixed() value is too large".to_string(),
-        ));
+        return Ok(format!("{value}"));
     }
     Ok(format!("{:.prec$}", value, prec = digits as usize))
 }
@@ -644,6 +709,20 @@ mod tests {
         assert!(number_parse_float("").is_nan());
     }
 
+    #[test]
+    fn test_parse_float_prefix() {
+        // Parses the longest valid numeric prefix.
+        assert_eq!(number_parse_float("3.14abc"), 3.14);
+        assert_eq!(number_parse_float("123xyz"), 123.0);
+    }
+
+    #[test]
+    fn test_parse_float_infinity() {
+        assert_eq!(number_parse_float("Infinity"), f64::INFINITY);
+        assert_eq!(number_parse_float("-Infinity"), f64::NEG_INFINITY);
+        assert_eq!(number_parse_float("+Infinity"), f64::INFINITY);
+    }
+
     // ── number_to_fixed ──────────────────────────────────────────────────────
 
     #[test]
@@ -670,10 +749,9 @@ mod tests {
 
     #[test]
     fn test_to_fixed_large_value() {
-        assert!(matches!(
-            number_to_fixed(1e22, 2),
-            Err(StatorError::RangeError(_))
-        ));
+        // Per spec, values >= 1e21 return ToString(value), not a RangeError.
+        let s = number_to_fixed(1e22, 2).unwrap();
+        assert!(!s.is_empty());
     }
 
     // ── number_to_precision ──────────────────────────────────────────────────
@@ -820,5 +898,13 @@ mod tests {
     fn test_ieee754_max_safe_integer_plus_one_is_not_safe() {
         // 2^53 is representable but not safe because 2^53 + 1 == 2^53 in f64.
         assert!(!number_is_safe_integer(NUMBER_MAX_SAFE_INTEGER + 1.0));
+    }
+
+    #[test]
+    fn test_min_value_is_subnormal() {
+        // NUMBER_MIN_VALUE must be the smallest positive subnormal (5e-324).
+        assert!(NUMBER_MIN_VALUE > 0.0);
+        assert!(NUMBER_MIN_VALUE < f64::MIN_POSITIVE);
+        assert_eq!(NUMBER_MIN_VALUE, 5e-324);
     }
 }
