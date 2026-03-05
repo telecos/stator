@@ -442,6 +442,7 @@ fn feedback_slot_kind_to_byte(kind: FeedbackSlotKind) -> u8 {
         FeedbackSlotKind::BinaryOpInc => 13,
         FeedbackSlotKind::UnaryOp => 14,
         FeedbackSlotKind::Literal => 15,
+        FeedbackSlotKind::DefineAccessor => 16,
     }
 }
 
@@ -750,6 +751,7 @@ fn byte_to_feedback_slot_kind(b: u8) -> StatorResult<FeedbackSlotKind> {
         13 => Ok(FeedbackSlotKind::BinaryOpInc),
         14 => Ok(FeedbackSlotKind::UnaryOp),
         15 => Ok(FeedbackSlotKind::Literal),
+        16 => Ok(FeedbackSlotKind::DefineAccessor),
         other => Err(StatorError::Internal(format!(
             "snapshot: unknown FeedbackSlotKind byte {other}"
         ))),

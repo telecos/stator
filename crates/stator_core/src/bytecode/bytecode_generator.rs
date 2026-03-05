@@ -1988,15 +1988,62 @@ impl FunctionCompiler {
                     ));
                 }
             }
-            PropValue::Get(fn_expr) | PropValue::Set(fn_expr) => {
+            PropValue::Get(fn_expr) => {
                 self.compile_fn_expr(fn_expr)?;
                 if let Some(name) = key_name {
                     let name_idx = self.add_string(&name);
-                    let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+                    let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
-                        Opcode::DefineNamedOwnProperty,
+                        Opcode::DefineGetterProperty,
                         vec![to_reg_op(obj_reg), Operand::ConstantPoolIdx(name_idx), slot],
                     ));
+                } else if let PropKey::Computed(key_expr) = &p.key {
+                    let val_reg = self.allocator.allocate_temporary();
+                    self.emit_star(val_reg);
+                    self.compile_expr(key_expr)?;
+                    let key_reg = self.allocator.allocate_temporary();
+                    self.emit_star(key_reg);
+                    self.emit_ldar(val_reg);
+                    let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::DefineKeyedGetterProperty,
+                        vec![to_reg_op(obj_reg), to_reg_op(key_reg), slot],
+                    ));
+                    self.allocator
+                        .release_temporary(key_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
+                    self.allocator
+                        .release_temporary(val_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
+                }
+            }
+            PropValue::Set(fn_expr) => {
+                self.compile_fn_expr(fn_expr)?;
+                if let Some(name) = key_name {
+                    let name_idx = self.add_string(&name);
+                    let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::DefineSetterProperty,
+                        vec![to_reg_op(obj_reg), Operand::ConstantPoolIdx(name_idx), slot],
+                    ));
+                } else if let PropKey::Computed(key_expr) = &p.key {
+                    let val_reg = self.allocator.allocate_temporary();
+                    self.emit_star(val_reg);
+                    self.compile_expr(key_expr)?;
+                    let key_reg = self.allocator.allocate_temporary();
+                    self.emit_star(key_reg);
+                    self.emit_ldar(val_reg);
+                    let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::DefineKeyedSetterProperty,
+                        vec![to_reg_op(obj_reg), to_reg_op(key_reg), slot],
+                    ));
+                    self.allocator
+                        .release_temporary(key_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
+                    self.allocator
+                        .release_temporary(val_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
             }
         }
@@ -2786,9 +2833,10 @@ mod tests {
     use crate::bytecode::bytecodes::{Opcode, decode};
     use crate::parser::ast::{
         BinaryExpr, BinaryOp, BlockStmt, BoolLit, BreakStmt, CatchClause, ContinueStmt,
-        DoWhileStmt, Expr, ExprStmt, FnDecl, ForStmt, Ident, IfStmt, LabeledStmt, NullLit, NumLit,
-        Param, Pat, Program, ProgramItem, ReturnStmt, SourceType, Stmt, StringLit, ThrowStmt,
-        TryStmt, VarDecl, VarDeclarator, VarKind, WhileStmt,
+        DoWhileStmt, Expr, ExprStmt, FnDecl, FnExpr, ForStmt, Ident, IfStmt, LabeledStmt, NullLit,
+        NumLit, ObjectExpr, ObjectProp, Param, Pat, Program, ProgramItem, Prop, PropKey, PropValue,
+        ReturnStmt, SourceType, Stmt, StringLit, ThrowStmt, TryStmt, VarDecl, VarDeclarator,
+        VarKind, WhileStmt,
     };
     use crate::parser::scanner::{Position, Span};
 
@@ -4251,5 +4299,160 @@ mod tests {
         })]);
         let result = BytecodeGenerator::compile_program(&prog);
         assert!(result.is_err(), "duplicate labels must error");
+    }
+
+    // ── Getter / setter property bytecode tests ───────────────────────────
+
+    /// Helper: build an object literal expression with the given properties.
+    fn object_expr(props: Vec<ObjectProp>) -> Expr {
+        Expr::Object(Box::new(ObjectExpr {
+            loc: span(),
+            properties: props,
+        }))
+    }
+
+    /// Helper: build a getter or setter property.
+    fn accessor_prop(name: &str, kind: PropValue) -> ObjectProp {
+        ObjectProp::Prop(Box::new(Prop {
+            loc: span(),
+            key: PropKey::Ident(ident(name)),
+            is_computed: false,
+            value: kind,
+        }))
+    }
+
+    /// Helper: build a minimal FnExpr (empty body, given param count).
+    fn empty_fn_expr(param_names: &[&str]) -> FnExpr {
+        FnExpr {
+            loc: span(),
+            id: None,
+            is_async: false,
+            is_generator: false,
+            params: param_names
+                .iter()
+                .map(|n| Param {
+                    loc: span(),
+                    pat: Pat::Ident(ident(n)),
+                    default: None,
+                })
+                .collect(),
+            body: BlockStmt {
+                loc: span(),
+                body: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn test_object_getter_emits_define_getter_property() {
+        // `var o = { get x() {} };`
+        let prog = make_program(vec![var_decl_stmt(
+            VarKind::Var,
+            "o",
+            Some(object_expr(vec![accessor_prop(
+                "x",
+                PropValue::Get(empty_fn_expr(&[])),
+            )])),
+        )]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::DefineGetterProperty),
+            "expected DefineGetterProperty opcode, got {instrs:?}"
+        );
+    }
+
+    #[test]
+    fn test_object_setter_emits_define_setter_property() {
+        // `var o = { set x(v) {} };`
+        let prog = make_program(vec![var_decl_stmt(
+            VarKind::Var,
+            "o",
+            Some(object_expr(vec![accessor_prop(
+                "x",
+                PropValue::Set(empty_fn_expr(&["v"])),
+            )])),
+        )]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::DefineSetterProperty),
+            "expected DefineSetterProperty opcode, got {instrs:?}"
+        );
+    }
+
+    #[test]
+    fn test_object_computed_getter_emits_define_keyed_getter() {
+        // `var o = { get [k]() {} };`
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "k", Some(str_expr("x"))),
+            var_decl_stmt(
+                VarKind::Var,
+                "o",
+                Some(object_expr(vec![ObjectProp::Prop(Box::new(Prop {
+                    loc: span(),
+                    key: PropKey::Computed(Box::new(ident_expr("k"))),
+                    is_computed: true,
+                    value: PropValue::Get(empty_fn_expr(&[])),
+                }))])),
+            ),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::DefineKeyedGetterProperty),
+            "expected DefineKeyedGetterProperty opcode, got {instrs:?}"
+        );
+    }
+
+    #[test]
+    fn test_object_computed_setter_emits_define_keyed_setter() {
+        // `var o = { set [k](v) {} };`
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "k", Some(str_expr("x"))),
+            var_decl_stmt(
+                VarKind::Var,
+                "o",
+                Some(object_expr(vec![ObjectProp::Prop(Box::new(Prop {
+                    loc: span(),
+                    key: PropKey::Computed(Box::new(ident_expr("k"))),
+                    is_computed: true,
+                    value: PropValue::Set(empty_fn_expr(&["v"])),
+                }))])),
+            ),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::DefineKeyedSetterProperty),
+            "expected DefineKeyedSetterProperty opcode, got {instrs:?}"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_getter_setter() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        // `var o = { get x() {}, set x(v) {} };`
+        let prog = make_program(vec![var_decl_stmt(
+            VarKind::Var,
+            "o",
+            Some(object_expr(vec![
+                accessor_prop("x", PropValue::Get(empty_fn_expr(&[]))),
+                accessor_prop("x", PropValue::Set(empty_fn_expr(&["v"]))),
+            ])),
+        )]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::DefineAccessor),
+            "expected DefineAccessor slot, got {kinds:?}"
+        );
     }
 }

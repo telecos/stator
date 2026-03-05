@@ -1136,7 +1136,11 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::ShiftLeftSmi
             | Opcode::ShiftRightSmi
             | Opcode::ShiftRightLogicalSmi
-            | Opcode::BitwiseNot => {
+            | Opcode::BitwiseNot
+            | Opcode::DefineGetterProperty
+            | Opcode::DefineSetterProperty
+            | Opcode::DefineKeyedGetterProperty
+            | Opcode::DefineKeyedSetterProperty => {
                 self.emit_deopt(bytecode_offset);
             }
 

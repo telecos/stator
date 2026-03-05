@@ -5540,4 +5540,158 @@ mod tests {
             panic!("expected VarDecl");
         }
     }
+
+    // ── Object literal getter / setter parser tests ──────────────────────
+
+    #[test]
+    fn test_object_literal_getter() {
+        let prog = parse("var o = { get x() { return 1; } };").unwrap();
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(Expr::Object(obj)) = vd.declarators[0].init.as_deref() {
+                if let ObjectProp::Prop(p) = &obj.properties[0] {
+                    assert!(matches!(p.value, PropValue::Get(_)));
+                    if let PropKey::Ident(ref id) = p.key {
+                        assert_eq!(id.name, "x");
+                    } else {
+                        panic!("expected Ident key");
+                    }
+                } else {
+                    panic!("expected Prop");
+                }
+            } else {
+                panic!("expected Object expr");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_object_literal_setter() {
+        let prog = parse("var o = { set x(v) { } };").unwrap();
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(Expr::Object(obj)) = vd.declarators[0].init.as_deref() {
+                if let ObjectProp::Prop(p) = &obj.properties[0] {
+                    assert!(matches!(p.value, PropValue::Set(_)));
+                    if let PropKey::Ident(ref id) = p.key {
+                        assert_eq!(id.name, "x");
+                    } else {
+                        panic!("expected Ident key");
+                    }
+                } else {
+                    panic!("expected Prop");
+                }
+            } else {
+                panic!("expected Object expr");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_object_literal_getter_setter_pair() {
+        let prog = parse("var o = { get x() { return 1; }, set x(v) { } };").unwrap();
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(Expr::Object(obj)) = vd.declarators[0].init.as_deref() {
+                assert_eq!(obj.properties.len(), 2);
+                assert!(matches!(
+                    &obj.properties[0],
+                    ObjectProp::Prop(p) if matches!(p.value, PropValue::Get(_))
+                ));
+                assert!(matches!(
+                    &obj.properties[1],
+                    ObjectProp::Prop(p) if matches!(p.value, PropValue::Set(_))
+                ));
+            } else {
+                panic!("expected Object expr");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_object_literal_computed_getter() {
+        let prog = parse("var o = { get [\"x\"]() { return 1; } };").unwrap();
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(Expr::Object(obj)) = vd.declarators[0].init.as_deref() {
+                if let ObjectProp::Prop(p) = &obj.properties[0] {
+                    assert!(matches!(p.value, PropValue::Get(_)));
+                    assert!(p.is_computed);
+                    assert!(matches!(p.key, PropKey::Computed(_)));
+                } else {
+                    panic!("expected Prop");
+                }
+            } else {
+                panic!("expected Object expr");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_object_literal_computed_setter() {
+        let prog = parse("var o = { set [\"x\"](v) { } };").unwrap();
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(Expr::Object(obj)) = vd.declarators[0].init.as_deref() {
+                if let ObjectProp::Prop(p) = &obj.properties[0] {
+                    assert!(matches!(p.value, PropValue::Set(_)));
+                    assert!(p.is_computed);
+                    assert!(matches!(p.key, PropKey::Computed(_)));
+                } else {
+                    panic!("expected Prop");
+                }
+            } else {
+                panic!("expected Object expr");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_get_as_property_name_not_accessor() {
+        // `{ get: 1 }` — `get` is used as a property name, not accessor keyword
+        let prog = parse("var o = { get: 1 };").unwrap();
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(Expr::Object(obj)) = vd.declarators[0].init.as_deref() {
+                if let ObjectProp::Prop(p) = &obj.properties[0] {
+                    assert!(matches!(p.value, PropValue::Value(_)));
+                    if let PropKey::Ident(ref id) = p.key {
+                        assert_eq!(id.name, "get");
+                    }
+                } else {
+                    panic!("expected Prop");
+                }
+            } else {
+                panic!("expected Object expr");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_computed_getter_setter() {
+        let prog = parse("class C { get [\"x\"]() { return 1; } set [\"x\"](v) { } }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 2);
+            if let crate::parser::ast::ClassMember::Method(m) = &c.body.body[0] {
+                assert!(matches!(m.kind, crate::parser::ast::MethodKind::Get));
+                assert!(m.is_computed);
+            } else {
+                panic!("expected getter method");
+            }
+            if let crate::parser::ast::ClassMember::Method(m) = &c.body.body[1] {
+                assert!(matches!(m.kind, crate::parser::ast::MethodKind::Set));
+                assert!(m.is_computed);
+            } else {
+                panic!("expected setter method");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
 }

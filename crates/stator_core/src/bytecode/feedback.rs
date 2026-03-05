@@ -86,6 +86,9 @@ pub enum FeedbackSlotKind {
     /// An object, array, or regexp literal creation site
     /// (`CreateObjectLiteral`, `CreateArrayLiteral`, `CreateRegExpLiteral`).
     Literal,
+    /// A getter or setter definition site
+    /// (`DefineGetterProperty`, `DefineSetterProperty`, etc.).
+    DefineAccessor,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -382,14 +385,15 @@ mod tests {
             FeedbackSlotKind::BinaryOpInc,
             FeedbackSlotKind::UnaryOp,
             FeedbackSlotKind::Literal,
+            FeedbackSlotKind::DefineAccessor,
         ];
         let metadata = FeedbackMetadata::new(all_kinds.clone());
-        assert_eq!(metadata.slot_count(), 16);
+        assert_eq!(metadata.slot_count(), 17);
         for (i, &expected) in all_kinds.iter().enumerate() {
             assert_eq!(metadata.kind_of(i as u32), Some(expected));
         }
         // Beyond the end is None.
-        assert_eq!(metadata.kind_of(16), None);
+        assert_eq!(metadata.kind_of(17), None);
     }
 
     #[test]
