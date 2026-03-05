@@ -28,8 +28,8 @@ use crate::builtins::finalization_registry::{
 };
 use crate::builtins::global::{
     GLOBAL_INFINITY, GLOBAL_NAN, global_decode_uri, global_decode_uri_component, global_encode_uri,
-    global_encode_uri_component, global_is_finite, global_is_nan, global_parse_float,
-    global_parse_int,
+    global_encode_uri_component, global_escape, global_is_finite, global_is_nan,
+    global_parse_float, global_parse_int, global_unescape,
 };
 use crate::builtins::iterator::{
     iterator_drop, iterator_every, iterator_filter, iterator_find, iterator_flat_map,
@@ -54,13 +54,16 @@ use crate::builtins::set::{
     set_size, set_values,
 };
 use crate::builtins::string::{
-    string_at, string_char_at, string_char_code_at, string_code_point_at, string_concat,
-    string_ends_with, string_from_char_code, string_from_code_point, string_includes,
-    string_index_of, string_is_well_formed, string_iter, string_last_index_of, string_match,
-    string_match_all, string_normalize, string_pad_end, string_pad_start, string_raw,
-    string_repeat, string_replace, string_replace_all, string_search, string_slice, string_split,
-    string_starts_with, string_substring, string_to_lower_case, string_to_upper_case,
-    string_to_well_formed, string_trim, string_trim_end, string_trim_start,
+    string_anchor, string_at, string_big, string_blink, string_bold, string_char_at,
+    string_char_code_at, string_code_point_at, string_concat, string_ends_with, string_fixed,
+    string_fontcolor, string_fontsize, string_from_char_code, string_from_code_point,
+    string_includes, string_index_of, string_is_well_formed, string_italics, string_iter,
+    string_last_index_of, string_link, string_match, string_match_all, string_normalize,
+    string_pad_end, string_pad_start, string_raw, string_repeat, string_replace,
+    string_replace_all, string_search, string_slice, string_small, string_split,
+    string_starts_with, string_strike, string_sub, string_substr, string_substring, string_sup,
+    string_to_lower_case, string_to_upper_case, string_to_well_formed, string_trim,
+    string_trim_end, string_trim_start,
 };
 use crate::builtins::symbol::{
     SYMBOL_ASYNC_ITERATOR, SYMBOL_HAS_INSTANCE, SYMBOL_IS_CONCAT_SPREADABLE, SYMBOL_ITERATOR,
@@ -938,6 +941,28 @@ fn make_object() -> JsValue {
             // PlainObject has no symbol-keyed properties.
             Ok(JsValue::Array(Rc::new(vec![])))
         }),
+    );
+
+    // ── Object.prototype ─────────────────────────────────────────────────
+    let mut obj_proto: HashMap<String, JsValue> = HashMap::new();
+
+    // Annex B §B.2.2.1 — Object.prototype.__proto__ (getter/setter)
+    // __proto__ getter: returns null (no prototype chain in our model).
+    obj_proto.insert("__proto__get__".into(), native(|_args| Ok(JsValue::Null)));
+    // __proto__ setter: no-op (we don't support mutable prototype chains).
+    obj_proto.insert(
+        "__proto__set__".into(),
+        native(|args| {
+            let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
+            Ok(obj)
+        }),
+    );
+    // Expose __proto__ as null for property access.
+    obj_proto.insert("__proto__".into(), JsValue::Null);
+
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(obj_proto))),
     );
 
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
@@ -3202,6 +3227,147 @@ fn make_string() -> JsValue {
         }),
     );
 
+    // ── Annex B prototype methods ───────────────────────────────────────
+
+    // substr(start, length?)
+    proto.insert(
+        "substr".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let start = args
+                .get(1)
+                .unwrap_or(&JsValue::Undefined)
+                .to_number()
+                .unwrap_or(0.0) as i64;
+            let length = match args.get(2) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+            };
+            Ok(JsValue::String(string_substr(&s, start, length)))
+        }),
+    );
+
+    // anchor(name)
+    proto.insert(
+        "anchor".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let name = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_anchor(&s, &name)))
+        }),
+    );
+
+    // big()
+    proto.insert(
+        "big".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_big(&s)))
+        }),
+    );
+
+    // blink()
+    proto.insert(
+        "blink".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_blink(&s)))
+        }),
+    );
+
+    // bold()
+    proto.insert(
+        "bold".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_bold(&s)))
+        }),
+    );
+
+    // fixed()
+    proto.insert(
+        "fixed".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_fixed(&s)))
+        }),
+    );
+
+    // fontcolor(color)
+    proto.insert(
+        "fontcolor".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let color = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_fontcolor(&s, &color)))
+        }),
+    );
+
+    // fontsize(size)
+    proto.insert(
+        "fontsize".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let size = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_fontsize(&s, &size)))
+        }),
+    );
+
+    // italics()
+    proto.insert(
+        "italics".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_italics(&s)))
+        }),
+    );
+
+    // link(url)
+    proto.insert(
+        "link".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let url = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_link(&s, &url)))
+        }),
+    );
+
+    // small()
+    proto.insert(
+        "small".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_small(&s)))
+        }),
+    );
+
+    // strike()
+    proto.insert(
+        "strike".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_strike(&s)))
+        }),
+    );
+
+    // sub()
+    proto.insert(
+        "sub".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_sub(&s)))
+        }),
+    );
+
+    // sup()
+    proto.insert(
+        "sup".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_sup(&s)))
+        }),
+    );
+
     props.insert(
         "prototype".into(),
         JsValue::PlainObject(Rc::new(RefCell::new(proto))),
@@ -3481,6 +3647,16 @@ fn make_regexp() -> JsValue {
     // Callable: new RegExp(pattern, flags)
     props.insert("__call__".into(), native(|args| regexp_construct(&args)));
 
+    // Annex B legacy static properties (stubs)
+    for i in 1..=9 {
+        props.insert(format!("${i}"), JsValue::String(String::new()));
+    }
+    props.insert("input".into(), JsValue::String(String::new()));
+    props.insert("lastMatch".into(), JsValue::String(String::new()));
+    props.insert("lastParen".into(), JsValue::String(String::new()));
+    props.insert("leftContext".into(), JsValue::String(String::new()));
+    props.insert("rightContext".into(), JsValue::String(String::new()));
+
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -3633,6 +3809,22 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(JsValue::String(global_decode_uri_component(&s)?))
+        }),
+    );
+
+    // ── Annex B global functions ─────────────────────────────────────────
+    globals.insert(
+        "escape".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(global_escape(&s)))
+        }),
+    );
+    globals.insert(
+        "unescape".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(global_unescape(&s)))
         }),
     );
 
