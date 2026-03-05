@@ -5736,7 +5736,8 @@ mod tests {
 
         assert!(f.to_boolean());
         assert!(f.is_function());
-        assert!(f.to_number().is_err());
+        // Function → ToPrimitive → "function () {}" → NaN
+        assert!(f.to_number().unwrap().is_nan());
         assert_eq!(f.to_js_string().unwrap(), "function () {}");
     }
 
