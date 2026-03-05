@@ -941,15 +941,924 @@ fn make_object() -> JsValue {
 // ── Array constructor ────────────────────────────────────────────────────────
 
 /// Build the `Array` constructor/namespace object.
+///
+/// The returned `PlainObject` carries:
+/// - `isArray` — `Array.isArray(value)`.
+/// - `from` — `Array.from(iterable)`.
+/// - `of` — `Array.of(...items)`.
+/// - `prototype` — an object with all `Array.prototype.*` methods.
 fn make_array() -> JsValue {
     let mut props: HashMap<String, JsValue> = HashMap::new();
 
+    // ── Static methods ──────────────────────────────────────────────────
+
+    // Array.isArray(value)
     props.insert(
         "isArray".into(),
         native(|args| {
             let val = args.first().unwrap_or(&JsValue::Undefined);
             Ok(JsValue::Boolean(matches!(val, JsValue::Array(_))))
         }),
+    );
+
+    // Array.from(iterable)
+    props.insert(
+        "from".into(),
+        native(|args| {
+            let iterable = args.first().unwrap_or(&JsValue::Undefined);
+            let items: Vec<JsValue> = match iterable {
+                JsValue::Array(arr) => (**arr).clone(),
+                JsValue::String(s) => s.chars().map(|c| JsValue::String(c.to_string())).collect(),
+                _ => Vec::new(),
+            };
+            Ok(JsValue::Array(Rc::new(items)))
+        }),
+    );
+
+    // Array.of(...items)
+    props.insert(
+        "of".into(),
+        native(|args| Ok(JsValue::Array(Rc::new(args)))),
+    );
+
+    // ── Prototype methods ───────────────────────────────────────────────
+    //
+    // Each method receives `(this_array, ...args)` where the first argument is
+    // the array instance (`this`), and the remaining arguments are the method's
+    // parameters.  The interpreter rewrites `arr.push(x)` into
+    // `Array.prototype.push(arr, x)` at the bytecode level.
+
+    let mut proto: HashMap<String, JsValue> = HashMap::new();
+
+    // push(...items)
+    proto.insert(
+        "push".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let mut vec = (**items).clone();
+                vec.extend_from_slice(&args[1..]);
+                Ok(JsValue::Smi(vec.len() as i32))
+            } else {
+                Ok(JsValue::Undefined)
+            }
+        }),
+    );
+
+    // pop()
+    proto.insert(
+        "pop".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                Ok(items.last().cloned().unwrap_or(JsValue::Undefined))
+            } else {
+                Ok(JsValue::Undefined)
+            }
+        }),
+    );
+
+    // shift()
+    proto.insert(
+        "shift".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                Ok(items.first().cloned().unwrap_or(JsValue::Undefined))
+            } else {
+                Ok(JsValue::Undefined)
+            }
+        }),
+    );
+
+    // unshift(...items)
+    proto.insert(
+        "unshift".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let new_len = items.len() + args.len() - 1;
+                Ok(JsValue::Smi(new_len as i32))
+            } else {
+                Ok(JsValue::Undefined)
+            }
+        }),
+    );
+
+    // indexOf(searchElement, fromIndex?)
+    proto.insert(
+        "indexOf".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let search = args.get(1).unwrap_or(&JsValue::Undefined);
+                let from = args
+                    .get(2)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let len = items.len() as i64;
+                let start = if from < 0 { (len + from).max(0) } else { from } as usize;
+                for (i, v) in items.iter().enumerate().skip(start) {
+                    if v == search {
+                        return Ok(JsValue::Smi(i as i32));
+                    }
+                }
+                Ok(JsValue::Smi(-1))
+            } else {
+                Ok(JsValue::Smi(-1))
+            }
+        }),
+    );
+
+    // lastIndexOf(searchElement, fromIndex?)
+    proto.insert(
+        "lastIndexOf".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let search = args.get(1).unwrap_or(&JsValue::Undefined);
+                let len = items.len() as i64;
+                let from = args
+                    .get(2)
+                    .map(|v| v.to_number().unwrap_or((len - 1) as f64) as i64)
+                    .unwrap_or(len - 1);
+                let start = if from < 0 {
+                    (len + from).max(0) as usize
+                } else {
+                    from.min(len - 1) as usize
+                };
+                for i in (0..=start).rev() {
+                    if items.get(i) == Some(search) {
+                        return Ok(JsValue::Smi(i as i32));
+                    }
+                }
+                Ok(JsValue::Smi(-1))
+            } else {
+                Ok(JsValue::Smi(-1))
+            }
+        }),
+    );
+
+    // includes(searchElement, fromIndex?)
+    proto.insert(
+        "includes".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let search = args.get(1).unwrap_or(&JsValue::Undefined);
+                let from = args
+                    .get(2)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let len = items.len() as i64;
+                let start = if from < 0 { (len + from).max(0) } else { from } as usize;
+                for v in items.iter().skip(start) {
+                    if v == search {
+                        return Ok(JsValue::Boolean(true));
+                    }
+                }
+                Ok(JsValue::Boolean(false))
+            } else {
+                Ok(JsValue::Boolean(false))
+            }
+        }),
+    );
+
+    // join(separator?)
+    proto.insert(
+        "join".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let sep = match args.get(1) {
+                    Some(JsValue::Undefined) | None => ",".to_string(),
+                    Some(v) => v.to_js_string()?,
+                };
+                let parts: Vec<String> = items
+                    .iter()
+                    .map(|v| match v {
+                        JsValue::Undefined | JsValue::Null => Ok(String::new()),
+                        other => other.to_js_string(),
+                    })
+                    .collect::<StatorResult<_>>()?;
+                Ok(JsValue::String(parts.join(&sep)))
+            } else {
+                Ok(JsValue::String(String::new()))
+            }
+        }),
+    );
+
+    // concat(...arrays)
+    proto.insert(
+        "concat".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            let mut result: Vec<JsValue> = if let JsValue::Array(items) = arr {
+                (**items).clone()
+            } else {
+                Vec::new()
+            };
+            for other in args.iter().skip(1) {
+                if let JsValue::Array(items) = other {
+                    result.extend(items.iter().cloned());
+                } else {
+                    result.push(other.clone());
+                }
+            }
+            Ok(JsValue::Array(Rc::new(result)))
+        }),
+    );
+
+    // slice(start?, end?)
+    proto.insert(
+        "slice".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let len = items.len() as i64;
+                let start = args
+                    .get(1)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let end = args
+                    .get(2)
+                    .map(|v| v.to_number().unwrap_or(len as f64) as i64)
+                    .unwrap_or(len);
+                let s = if start < 0 {
+                    (len + start).max(0)
+                } else {
+                    start.min(len)
+                } as usize;
+                let e = if end < 0 {
+                    (len + end).max(0)
+                } else {
+                    end.min(len)
+                } as usize;
+                Ok(JsValue::Array(Rc::new(items[s..e].to_vec())))
+            } else {
+                Ok(JsValue::Array(Rc::new(Vec::new())))
+            }
+        }),
+    );
+
+    // reverse()
+    proto.insert(
+        "reverse".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let mut v = (**items).clone();
+                v.reverse();
+                Ok(JsValue::Array(Rc::new(v)))
+            } else {
+                Ok(JsValue::Undefined)
+            }
+        }),
+    );
+
+    // sort(compareFn?)
+    proto.insert(
+        "sort".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let mut v = (**items).clone();
+                let cmp_fn = args.get(1).cloned();
+                if let Some(JsValue::NativeFunction(cmp)) = cmp_fn {
+                    v.sort_by(|a, b| {
+                        let result = cmp(vec![a.clone(), b.clone()]).unwrap_or(JsValue::Smi(0));
+                        let n = match result {
+                            JsValue::Smi(n) => n as f64,
+                            JsValue::HeapNumber(n) => n,
+                            _ => 0.0,
+                        };
+                        n.partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                } else {
+                    v.sort_by(|a, b| {
+                        let sa = a.to_js_string().unwrap_or_default();
+                        let sb = b.to_js_string().unwrap_or_default();
+                        sa.cmp(&sb)
+                    });
+                }
+                Ok(JsValue::Array(Rc::new(v)))
+            } else {
+                Ok(JsValue::Undefined)
+            }
+        }),
+    );
+
+    // fill(value, start?, end?)
+    proto.insert(
+        "fill".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let value = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let len = items.len() as i64;
+                let start = args
+                    .get(2)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let end = args
+                    .get(3)
+                    .map(|v| v.to_number().unwrap_or(len as f64) as i64)
+                    .unwrap_or(len);
+                let s = if start < 0 {
+                    (len + start).max(0)
+                } else {
+                    start.min(len)
+                } as usize;
+                let e = if end < 0 {
+                    (len + end).max(0)
+                } else {
+                    end.min(len)
+                } as usize;
+                let mut v = (**items).clone();
+                for item in v.iter_mut().take(e).skip(s) {
+                    *item = value.clone();
+                }
+                Ok(JsValue::Array(Rc::new(v)))
+            } else {
+                Ok(JsValue::Undefined)
+            }
+        }),
+    );
+
+    // at(index)
+    proto.insert(
+        "at".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let index = args
+                    .get(1)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let len = items.len() as i64;
+                let actual = if index < 0 { len + index } else { index };
+                if actual < 0 || actual >= len {
+                    Ok(JsValue::Undefined)
+                } else {
+                    Ok(items[actual as usize].clone())
+                }
+            } else {
+                Ok(JsValue::Undefined)
+            }
+        }),
+    );
+
+    // flat(depth?)
+    proto.insert(
+        "flat".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let depth = args
+                    .get(1)
+                    .unwrap_or(&JsValue::Smi(1))
+                    .to_number()
+                    .unwrap_or(1.0) as u32;
+                fn flatten(items: &[JsValue], depth: u32) -> Vec<JsValue> {
+                    let mut result = Vec::new();
+                    for item in items {
+                        if depth > 0
+                            && let JsValue::Array(inner) = item
+                        {
+                            result.extend(flatten(inner, depth - 1));
+                            continue;
+                        }
+                        result.push(item.clone());
+                    }
+                    result
+                }
+                Ok(JsValue::Array(Rc::new(flatten(items, depth))))
+            } else {
+                Ok(JsValue::Array(Rc::new(Vec::new())))
+            }
+        }),
+    );
+
+    // flatMap(callback)
+    proto.insert(
+        "flatMap".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let mut result = Vec::new();
+                for (i, item) in items.iter().enumerate() {
+                    let mapped = if let JsValue::NativeFunction(f) = &cb {
+                        f(vec![item.clone(), JsValue::Smi(i as i32)])?
+                    } else {
+                        item.clone()
+                    };
+                    if let JsValue::Array(inner) = mapped {
+                        result.extend(inner.iter().cloned());
+                    } else {
+                        result.push(mapped);
+                    }
+                }
+                Ok(JsValue::Array(Rc::new(result)))
+            } else {
+                Ok(JsValue::Array(Rc::new(Vec::new())))
+            }
+        }),
+    );
+
+    // copyWithin(target, start, end?)
+    proto.insert(
+        "copyWithin".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let len = items.len() as i64;
+                let target = args
+                    .get(1)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let start = args
+                    .get(2)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let end = args
+                    .get(3)
+                    .map(|v| v.to_number().unwrap_or(len as f64) as i64)
+                    .unwrap_or(len);
+                let to = if target < 0 {
+                    (len + target).max(0)
+                } else {
+                    target.min(len)
+                } as usize;
+                let from = if start < 0 {
+                    (len + start).max(0)
+                } else {
+                    start.min(len)
+                } as usize;
+                let fin = if end < 0 {
+                    (len + end).max(0)
+                } else {
+                    end.min(len)
+                } as usize;
+                let count = (fin.saturating_sub(from)).min(items.len().saturating_sub(to));
+                let buf: Vec<JsValue> = items[from..from + count].to_vec();
+                let mut v = (**items).clone();
+                for (i, val) in buf.into_iter().enumerate() {
+                    v[to + i] = val;
+                }
+                Ok(JsValue::Array(Rc::new(v)))
+            } else {
+                Ok(JsValue::Undefined)
+            }
+        }),
+    );
+
+    // splice(start, deleteCount?, ...items)
+    proto.insert(
+        "splice".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let len = items.len() as i64;
+                let start = args
+                    .get(1)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let s = if start < 0 {
+                    (len + start).max(0)
+                } else {
+                    start.min(len)
+                } as usize;
+                let max_del = (len - s as i64).max(0) as usize;
+                let del = args
+                    .get(2)
+                    .map(|v| (v.to_number().unwrap_or(max_del as f64) as usize).min(max_del))
+                    .unwrap_or(max_del);
+                let new_items = if args.len() > 3 { &args[3..] } else { &[] };
+                let deleted: Vec<JsValue> = items[s..s + del].to_vec();
+                let mut v: Vec<JsValue> = items[..s].to_vec();
+                v.extend_from_slice(new_items);
+                v.extend_from_slice(&items[s + del..]);
+                // Return the deleted elements as an array.
+                Ok(JsValue::Array(Rc::new(deleted)))
+            } else {
+                Ok(JsValue::Array(Rc::new(Vec::new())))
+            }
+        }),
+    );
+
+    // map(callback)
+    proto.insert(
+        "map".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let mut result = Vec::with_capacity(items.len());
+                for (i, item) in items.iter().enumerate() {
+                    let mapped = if let JsValue::NativeFunction(f) = &cb {
+                        f(vec![item.clone(), JsValue::Smi(i as i32)])?
+                    } else {
+                        item.clone()
+                    };
+                    result.push(mapped);
+                }
+                Ok(JsValue::Array(Rc::new(result)))
+            } else {
+                Ok(JsValue::Array(Rc::new(Vec::new())))
+            }
+        }),
+    );
+
+    // filter(callback)
+    proto.insert(
+        "filter".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let mut result = Vec::new();
+                for (i, item) in items.iter().enumerate() {
+                    let keep = if let JsValue::NativeFunction(f) = &cb {
+                        let v = f(vec![item.clone(), JsValue::Smi(i as i32)])?;
+                        v.to_boolean()
+                    } else {
+                        false
+                    };
+                    if keep {
+                        result.push(item.clone());
+                    }
+                }
+                Ok(JsValue::Array(Rc::new(result)))
+            } else {
+                Ok(JsValue::Array(Rc::new(Vec::new())))
+            }
+        }),
+    );
+
+    // reduce(callback, initialValue?)
+    proto.insert(
+        "reduce".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let (mut acc, start) = if let Some(init) = args.get(2) {
+                    (init.clone(), 0usize)
+                } else {
+                    if items.is_empty() {
+                        return Err(StatorError::TypeError(
+                            "Reduce of empty array with no initial value".into(),
+                        ));
+                    }
+                    (items[0].clone(), 1)
+                };
+                for (i, item) in items.iter().enumerate().skip(start) {
+                    if let JsValue::NativeFunction(f) = &cb {
+                        acc = f(vec![acc, item.clone(), JsValue::Smi(i as i32)])?;
+                    }
+                }
+                Ok(acc)
+            } else {
+                Err(StatorError::TypeError(
+                    "Reduce of empty array with no initial value".into(),
+                ))
+            }
+        }),
+    );
+
+    // reduceRight(callback, initialValue?)
+    proto.insert(
+        "reduceRight".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let (mut acc, end_exclusive) = if let Some(init) = args.get(2) {
+                    (init.clone(), items.len())
+                } else {
+                    if items.is_empty() {
+                        return Err(StatorError::TypeError(
+                            "Reduce of empty array with no initial value".into(),
+                        ));
+                    }
+                    (items[items.len() - 1].clone(), items.len() - 1)
+                };
+                for i in (0..end_exclusive).rev() {
+                    if let JsValue::NativeFunction(f) = &cb {
+                        acc = f(vec![acc, items[i].clone(), JsValue::Smi(i as i32)])?;
+                    }
+                }
+                Ok(acc)
+            } else {
+                Err(StatorError::TypeError(
+                    "Reduce of empty array with no initial value".into(),
+                ))
+            }
+        }),
+    );
+
+    // forEach(callback)
+    proto.insert(
+        "forEach".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                for (i, item) in items.iter().enumerate() {
+                    if let JsValue::NativeFunction(f) = &cb {
+                        f(vec![item.clone(), JsValue::Smi(i as i32)])?;
+                    }
+                }
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+
+    // find(callback)
+    proto.insert(
+        "find".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                for (i, item) in items.iter().enumerate() {
+                    if let JsValue::NativeFunction(f) = &cb {
+                        let v = f(vec![item.clone(), JsValue::Smi(i as i32)])?;
+                        if v.to_boolean() {
+                            return Ok(item.clone());
+                        }
+                    }
+                }
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+
+    // findIndex(callback)
+    proto.insert(
+        "findIndex".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                for (i, item) in items.iter().enumerate() {
+                    if let JsValue::NativeFunction(f) = &cb {
+                        let v = f(vec![item.clone(), JsValue::Smi(i as i32)])?;
+                        if v.to_boolean() {
+                            return Ok(JsValue::Smi(i as i32));
+                        }
+                    }
+                }
+            }
+            Ok(JsValue::Smi(-1))
+        }),
+    );
+
+    // findLast(callback)
+    proto.insert(
+        "findLast".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                for i in (0..items.len()).rev() {
+                    if let JsValue::NativeFunction(f) = &cb {
+                        let v = f(vec![items[i].clone(), JsValue::Smi(i as i32)])?;
+                        if v.to_boolean() {
+                            return Ok(items[i].clone());
+                        }
+                    }
+                }
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+
+    // findLastIndex(callback)
+    proto.insert(
+        "findLastIndex".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                for i in (0..items.len()).rev() {
+                    if let JsValue::NativeFunction(f) = &cb {
+                        let v = f(vec![items[i].clone(), JsValue::Smi(i as i32)])?;
+                        if v.to_boolean() {
+                            return Ok(JsValue::Smi(i as i32));
+                        }
+                    }
+                }
+            }
+            Ok(JsValue::Smi(-1))
+        }),
+    );
+
+    // some(callback)
+    proto.insert(
+        "some".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                for (i, item) in items.iter().enumerate() {
+                    if let JsValue::NativeFunction(f) = &cb {
+                        let v = f(vec![item.clone(), JsValue::Smi(i as i32)])?;
+                        if v.to_boolean() {
+                            return Ok(JsValue::Boolean(true));
+                        }
+                    }
+                }
+            }
+            Ok(JsValue::Boolean(false))
+        }),
+    );
+
+    // every(callback)
+    proto.insert(
+        "every".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                for (i, item) in items.iter().enumerate() {
+                    if let JsValue::NativeFunction(f) = &cb {
+                        let v = f(vec![item.clone(), JsValue::Smi(i as i32)])?;
+                        if !v.to_boolean() {
+                            return Ok(JsValue::Boolean(false));
+                        }
+                    }
+                }
+            }
+            Ok(JsValue::Boolean(true))
+        }),
+    );
+
+    // keys()
+    proto.insert(
+        "keys".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let keys: Vec<JsValue> = (0..items.len()).map(|i| JsValue::Smi(i as i32)).collect();
+                Ok(JsValue::Array(Rc::new(keys)))
+            } else {
+                Ok(JsValue::Array(Rc::new(Vec::new())))
+            }
+        }),
+    );
+
+    // values()
+    proto.insert(
+        "values".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                Ok(JsValue::Array(Rc::new((**items).clone())))
+            } else {
+                Ok(JsValue::Array(Rc::new(Vec::new())))
+            }
+        }),
+    );
+
+    // entries()
+    proto.insert(
+        "entries".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let entries: Vec<JsValue> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| JsValue::Array(Rc::new(vec![JsValue::Smi(i as i32), v.clone()])))
+                    .collect();
+                Ok(JsValue::Array(Rc::new(entries)))
+            } else {
+                Ok(JsValue::Array(Rc::new(Vec::new())))
+            }
+        }),
+    );
+
+    // toReversed()
+    proto.insert(
+        "toReversed".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let mut v = (**items).clone();
+                v.reverse();
+                Ok(JsValue::Array(Rc::new(v)))
+            } else {
+                Ok(JsValue::Array(Rc::new(Vec::new())))
+            }
+        }),
+    );
+
+    // toSorted(compareFn?)
+    proto.insert(
+        "toSorted".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let mut v = (**items).clone();
+                let cmp_fn = args.get(1).cloned();
+                if let Some(JsValue::NativeFunction(cmp)) = cmp_fn {
+                    v.sort_by(|a, b| {
+                        let result = cmp(vec![a.clone(), b.clone()]).unwrap_or(JsValue::Smi(0));
+                        let n = match result {
+                            JsValue::Smi(n) => n as f64,
+                            JsValue::HeapNumber(n) => n,
+                            _ => 0.0,
+                        };
+                        n.partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                } else {
+                    v.sort_by(|a, b| {
+                        let sa = a.to_js_string().unwrap_or_default();
+                        let sb = b.to_js_string().unwrap_or_default();
+                        sa.cmp(&sb)
+                    });
+                }
+                Ok(JsValue::Array(Rc::new(v)))
+            } else {
+                Ok(JsValue::Array(Rc::new(Vec::new())))
+            }
+        }),
+    );
+
+    // toSpliced(start, deleteCount, ...items)
+    proto.insert(
+        "toSpliced".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let len = items.len() as i64;
+                let start = args
+                    .get(1)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let s = if start < 0 {
+                    (len + start).max(0)
+                } else {
+                    start.min(len)
+                } as usize;
+                let max_del = (len - s as i64).max(0) as usize;
+                let del = args
+                    .get(2)
+                    .map(|v| (v.to_number().unwrap_or(max_del as f64) as usize).min(max_del))
+                    .unwrap_or(max_del);
+                let new_items = if args.len() > 3 { &args[3..] } else { &[] };
+                let mut v: Vec<JsValue> = items[..s].to_vec();
+                v.extend_from_slice(new_items);
+                v.extend_from_slice(&items[s + del..]);
+                Ok(JsValue::Array(Rc::new(v)))
+            } else {
+                Ok(JsValue::Array(Rc::new(Vec::new())))
+            }
+        }),
+    );
+
+    // with(index, value)
+    proto.insert(
+        "with".into(),
+        native(|args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Array(items) = arr {
+                let index = args
+                    .get(1)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let value = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+                let len = items.len() as i64;
+                let actual = if index < 0 { len + index } else { index };
+                if actual < 0 || actual >= len {
+                    return Err(StatorError::RangeError(format!("Invalid index : {index}")));
+                }
+                let mut v = (**items).clone();
+                v[actual as usize] = value;
+                Ok(JsValue::Array(Rc::new(v)))
+            } else {
+                Err(StatorError::TypeError(
+                    "Array.prototype.with called on non-array".into(),
+                ))
+            }
+        }),
+    );
+
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
     );
 
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
