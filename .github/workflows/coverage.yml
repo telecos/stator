@@ -6,6 +6,12 @@ on:
       - main
   pull_request:
 
+# Cancel any in-progress run for the same branch/PR so that only the latest
+# commit is measured, saving runner minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   coverage:
     name: Code Coverage
