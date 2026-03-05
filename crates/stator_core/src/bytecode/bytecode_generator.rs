@@ -424,7 +424,8 @@ impl FunctionCompiler {
             Stmt::Empty(_) => Ok(()),
             Stmt::Switch(s) => self.compile_switch(s),
             Stmt::ForIn(s) => self.compile_for_in(s),
-            Stmt::With(_) | Stmt::ClassDecl(_) => Err(StatorError::Internal(format!(
+            Stmt::With(s) => self.compile_with(s),
+            Stmt::ClassDecl(_) => Err(StatorError::Internal(format!(
                 "{} is not yet supported",
                 stmt_kind(stmt)
             ))),
@@ -439,6 +440,49 @@ impl FunctionCompiler {
             self.compile_stmt(stmt)?;
         }
         self.pop_scope();
+        Ok(())
+    }
+
+    /// Compile a `with (expr) stmt` statement.
+    ///
+    /// Emits `ToObject` + `PushContext` before the body and `PopContext` after
+    /// so the interpreter's context chain includes the with-object.
+    fn compile_with(&mut self, s: &crate::parser::ast::WithStmt) -> StatorResult<()> {
+        // Evaluate the object expression into the accumulator.
+        self.compile_expr(&s.object)?;
+
+        // Convert the value to an object (spec: ToObject).
+        let obj_reg = self.allocator.allocate_temporary();
+        self.emit(Instruction::new_unchecked(
+            Opcode::ToObject,
+            vec![to_reg_op(obj_reg)],
+        ));
+        self.emit_ldar(obj_reg);
+
+        // Push a new with-context; save the old context in ctx_reg.
+        let ctx_reg = self.allocator.allocate_temporary();
+        self.emit(Instruction::new_unchecked(
+            Opcode::PushContext,
+            vec![to_reg_op(ctx_reg)],
+        ));
+
+        // Compile the body inside a fresh scope.
+        self.push_scope();
+        self.compile_stmt(&s.body)?;
+        self.pop_scope();
+
+        // Restore the previous context.
+        self.emit(Instruction::new_unchecked(
+            Opcode::PopContext,
+            vec![to_reg_op(ctx_reg)],
+        ));
+
+        self.allocator
+            .release_temporary(ctx_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        self.allocator
+            .release_temporary(obj_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -4453,6 +4497,34 @@ mod tests {
         assert!(
             kinds.contains(&FeedbackSlotKind::DefineAccessor),
             "expected DefineAccessor slot, got {kinds:?}"
+        );
+    }
+
+    // ── with statement ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_with_emits_push_pop_context() {
+        use crate::parser::ast::{EmptyStmt, WithStmt};
+
+        let prog = make_program(vec![Stmt::With(WithStmt {
+            loc: span(),
+            object: Box::new(ident_expr("obj")),
+            body: Box::new(Stmt::Empty(EmptyStmt { loc: span() })),
+        })]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        let opcodes: Vec<Opcode> = instrs.iter().map(|i| i.opcode).collect();
+        assert!(
+            opcodes.contains(&Opcode::ToObject),
+            "expected ToObject, got {opcodes:?}"
+        );
+        assert!(
+            opcodes.contains(&Opcode::PushContext),
+            "expected PushContext, got {opcodes:?}"
+        );
+        assert!(
+            opcodes.contains(&Opcode::PopContext),
+            "expected PopContext, got {opcodes:?}"
         );
     }
 }

@@ -36,7 +36,7 @@ use crate::parser::ast::{
     Param, Pat, Program, ProgramItem, Prop, PropKey, PropValue, RegExpLit, RestElement, ReturnStmt,
     SequenceExpr, SourceLocation, SourceType, SpreadElement, Stmt, StringLit, SwitchCase,
     SwitchStmt, TemplateElement, TemplateLit, ThrowStmt, TryStmt, UnaryExpr, UnaryOp, UpdateExpr,
-    UpdateOp, VarDecl, VarDeclarator, VarKind, WhileStmt,
+    UpdateOp, VarDecl, VarDeclarator, VarKind, WhileStmt, WithStmt,
 };
 use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue};
 
@@ -275,6 +275,7 @@ impl<'src> Parser<'src> {
             TokenKind::Throw => self.parse_throw(),
             TokenKind::Try => self.parse_try(),
             TokenKind::Switch => self.parse_switch(),
+            TokenKind::With => self.parse_with(),
             TokenKind::Debugger => {
                 let span = self.current_span();
                 self.bump()?;
@@ -711,6 +712,21 @@ impl<'src> Parser<'src> {
             block,
             handler,
             finalizer,
+        }))
+    }
+
+    /// Parse a `with (expr) stmt` statement (sloppy mode only).
+    fn parse_with(&mut self) -> StatorResult<Stmt> {
+        let start = self.current_span();
+        self.bump()?; // 'with'
+        self.expect(TokenKind::LeftParen)?;
+        let object = self.parse_expr()?;
+        self.expect(TokenKind::RightParen)?;
+        let body = self.parse_stmt()?;
+        Ok(Stmt::With(WithStmt {
+            loc: Self::merge_spans(start, self.current_span()),
+            object: Box::new(object),
+            body: Box::new(body),
         }))
     }
 
@@ -5692,6 +5708,40 @@ mod tests {
             }
         } else {
             panic!("expected ClassDecl");
+        }
+    }
+
+    // ── with statement tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_with_basic() {
+        let prog = parse("with (obj) x;").unwrap();
+        assert_eq!(prog.body.len(), 1);
+        if let ProgramItem::Stmt(Stmt::With(w)) = &prog.body[0] {
+            assert!(matches!(*w.object, Expr::Ident(_)));
+            assert!(matches!(*w.body, Stmt::Expr(_)));
+        } else {
+            panic!("expected WithStmt, got {:?}", prog.body[0]);
+        }
+    }
+
+    #[test]
+    fn test_with_block_body() {
+        let prog = parse("with (obj) { var x = 1; }").unwrap();
+        if let ProgramItem::Stmt(Stmt::With(w)) = &prog.body[0] {
+            assert!(matches!(*w.body, Stmt::Block(_)));
+        } else {
+            panic!("expected WithStmt");
+        }
+    }
+
+    #[test]
+    fn test_with_nested() {
+        let prog = parse("with (a) with (b) x;").unwrap();
+        if let ProgramItem::Stmt(Stmt::With(outer)) = &prog.body[0] {
+            assert!(matches!(*outer.body, Stmt::With(_)));
+        } else {
+            panic!("expected nested with");
         }
     }
 }
