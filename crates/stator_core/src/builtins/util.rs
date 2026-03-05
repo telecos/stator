@@ -11,6 +11,8 @@ use crate::objects::value::JsValue;
 /// * `NaN` is considered equal to `NaN`.
 /// * `-0` is considered equal to `+0`.
 ///
+/// Delegates to [`JsValue::same_value_zero`].
+///
 /// # Examples
 ///
 /// ```
@@ -24,16 +26,7 @@ use crate::objects::value::JsValue;
 /// assert!(a != b); // PartialEq for f64 NaN
 /// ```
 pub(crate) fn same_value_zero(a: &JsValue, b: &JsValue) -> bool {
-    match (a, b) {
-        (JsValue::HeapNumber(x), JsValue::HeapNumber(y)) => {
-            if x.is_nan() && y.is_nan() {
-                true
-            } else {
-                x == y
-            }
-        }
-        _ => a == b,
-    }
+    a.same_value_zero(b)
 }
 
 #[cfg(test)]
