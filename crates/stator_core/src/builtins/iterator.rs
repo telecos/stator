@@ -221,6 +221,330 @@ pub fn iterator_to_vec(iter: &JsValue) -> StatorResult<Vec<JsValue>> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Private: call a JsValue callback
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Invoke `func` with the given arguments.
+///
+/// Returns [`StatorError::TypeError`] if `func` is not a callable
+/// [`JsValue::NativeFunction`].
+fn call_fn(func: &JsValue, args: Vec<JsValue>) -> StatorResult<JsValue> {
+    match func {
+        JsValue::NativeFunction(f) => f(args),
+        _ => Err(StatorError::TypeError(
+            "iterator helper: callback is not a function".into(),
+        )),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Iterator Helpers — ES2025 (§27.1.4)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// ES2025 `Iterator.prototype.map(mapper)`.
+///
+/// Returns a new iterator that yields the result of applying `mapper` to each
+/// element of `iter`.
+///
+/// # Errors
+///
+/// Propagates any error from the source iterator or the mapper callback.
+pub fn iterator_map(iter: &JsValue, mapper: &JsValue) -> StatorResult<JsValue> {
+    let mut out = Vec::new();
+    let mut index = 0i64;
+    loop {
+        let rec = iterator_next(iter)?;
+        if rec.done {
+            break;
+        }
+        let mapped = call_fn(mapper, vec![rec.value, JsValue::HeapNumber(index as f64)])?;
+        out.push(mapped);
+        index += 1;
+    }
+    Ok(make_array_iterator(out))
+}
+
+/// ES2025 `Iterator.prototype.filter(predicate)`.
+///
+/// Returns a new iterator that yields only the elements of `iter` for which
+/// `predicate` returns a truthy value.
+///
+/// # Errors
+///
+/// Propagates any error from the source iterator or the predicate callback.
+pub fn iterator_filter(iter: &JsValue, predicate: &JsValue) -> StatorResult<JsValue> {
+    let mut out = Vec::new();
+    let mut index = 0i64;
+    loop {
+        let rec = iterator_next(iter)?;
+        if rec.done {
+            break;
+        }
+        let result = call_fn(
+            predicate,
+            vec![rec.value.clone(), JsValue::HeapNumber(index as f64)],
+        )?;
+        if result.to_boolean() {
+            out.push(rec.value);
+        }
+        index += 1;
+    }
+    Ok(make_array_iterator(out))
+}
+
+/// ES2025 `Iterator.prototype.take(limit)`.
+///
+/// Returns a new iterator that yields at most `limit` elements from `iter`.
+///
+/// # Errors
+///
+/// Propagates any error from the source iterator.
+pub fn iterator_take(iter: &JsValue, limit: usize) -> StatorResult<JsValue> {
+    let mut out = Vec::new();
+    for _ in 0..limit {
+        let rec = iterator_next(iter)?;
+        if rec.done {
+            break;
+        }
+        out.push(rec.value);
+    }
+    Ok(make_array_iterator(out))
+}
+
+/// ES2025 `Iterator.prototype.drop(count)`.
+///
+/// Returns a new iterator that skips the first `count` elements of `iter`,
+/// then yields the rest.
+///
+/// # Errors
+///
+/// Propagates any error from the source iterator.
+pub fn iterator_drop(iter: &JsValue, count: usize) -> StatorResult<JsValue> {
+    // Skip the first `count` items.
+    for _ in 0..count {
+        let rec = iterator_next(iter)?;
+        if rec.done {
+            return Ok(make_array_iterator(vec![]));
+        }
+    }
+    // Collect the rest.
+    let mut out = Vec::new();
+    loop {
+        let rec = iterator_next(iter)?;
+        if rec.done {
+            break;
+        }
+        out.push(rec.value);
+    }
+    Ok(make_array_iterator(out))
+}
+
+/// ES2025 `Iterator.prototype.flatMap(mapper)`.
+///
+/// Returns a new iterator that yields the concatenation of iterators (or
+/// single values) produced by applying `mapper` to each element of `iter`.
+/// If the mapper returns an iterator or array, its elements are flattened
+/// one level deep.
+///
+/// # Errors
+///
+/// Propagates any error from the source iterator or the mapper callback.
+pub fn iterator_flat_map(iter: &JsValue, mapper: &JsValue) -> StatorResult<JsValue> {
+    let mut out = Vec::new();
+    let mut index = 0i64;
+    loop {
+        let rec = iterator_next(iter)?;
+        if rec.done {
+            break;
+        }
+        let mapped = call_fn(mapper, vec![rec.value, JsValue::HeapNumber(index as f64)])?;
+        match &mapped {
+            JsValue::Iterator(_) | JsValue::Generator(_) => {
+                let inner = iterator_to_vec(&mapped)?;
+                out.extend(inner);
+            }
+            JsValue::Array(arr) => {
+                out.extend(arr.iter().cloned());
+            }
+            _ => {
+                out.push(mapped);
+            }
+        }
+        index += 1;
+    }
+    Ok(make_array_iterator(out))
+}
+
+/// ES2025 `Iterator.prototype.reduce(reducer, initialValue)`.
+///
+/// Reduces the elements of `iter` to a single value by repeatedly calling
+/// `reducer(accumulator, currentValue)`. If `initial` is `None`, the first
+/// element is used as the initial accumulator.
+///
+/// # Errors
+///
+/// - [`StatorError::TypeError`] if `iter` is empty and no `initial` value is
+///   provided.
+/// - Propagates any error from the source iterator or the reducer callback.
+pub fn iterator_reduce(
+    iter: &JsValue,
+    reducer: &JsValue,
+    initial: Option<JsValue>,
+) -> StatorResult<JsValue> {
+    let mut acc = match initial {
+        Some(v) => v,
+        None => {
+            let rec = iterator_next(iter)?;
+            if rec.done {
+                return Err(StatorError::TypeError(
+                    "Reduce of empty iterator with no initial value".into(),
+                ));
+            }
+            rec.value
+        }
+    };
+    loop {
+        let rec = iterator_next(iter)?;
+        if rec.done {
+            break;
+        }
+        acc = call_fn(reducer, vec![acc, rec.value])?;
+    }
+    Ok(acc)
+}
+
+/// ES2025 `Iterator.prototype.toArray()`.
+///
+/// Eagerly collects all remaining elements of `iter` into a
+/// [`JsValue::Array`].
+///
+/// # Errors
+///
+/// Propagates any error from the source iterator.
+pub fn iterator_to_array(iter: &JsValue) -> StatorResult<JsValue> {
+    let items = iterator_to_vec(iter)?;
+    Ok(JsValue::Array(Rc::new(items)))
+}
+
+/// ES2025 `Iterator.prototype.forEach(callback)`.
+///
+/// Calls `callback` for each element of `iter` and returns `undefined`.
+///
+/// # Errors
+///
+/// Propagates any error from the source iterator or the callback.
+pub fn iterator_for_each(iter: &JsValue, callback: &JsValue) -> StatorResult<JsValue> {
+    let mut index = 0i64;
+    loop {
+        let rec = iterator_next(iter)?;
+        if rec.done {
+            break;
+        }
+        call_fn(callback, vec![rec.value, JsValue::HeapNumber(index as f64)])?;
+        index += 1;
+    }
+    Ok(JsValue::Undefined)
+}
+
+/// ES2025 `Iterator.prototype.some(predicate)`.
+///
+/// Returns `true` if `predicate` returns a truthy value for any element of
+/// `iter`, otherwise `false`.
+///
+/// # Errors
+///
+/// Propagates any error from the source iterator or the predicate callback.
+pub fn iterator_some(iter: &JsValue, predicate: &JsValue) -> StatorResult<JsValue> {
+    let mut index = 0i64;
+    loop {
+        let rec = iterator_next(iter)?;
+        if rec.done {
+            return Ok(JsValue::Boolean(false));
+        }
+        let result = call_fn(
+            predicate,
+            vec![rec.value, JsValue::HeapNumber(index as f64)],
+        )?;
+        if result.to_boolean() {
+            return Ok(JsValue::Boolean(true));
+        }
+        index += 1;
+    }
+}
+
+/// ES2025 `Iterator.prototype.every(predicate)`.
+///
+/// Returns `true` if `predicate` returns a truthy value for every element of
+/// `iter`, otherwise `false`.
+///
+/// # Errors
+///
+/// Propagates any error from the source iterator or the predicate callback.
+pub fn iterator_every(iter: &JsValue, predicate: &JsValue) -> StatorResult<JsValue> {
+    let mut index = 0i64;
+    loop {
+        let rec = iterator_next(iter)?;
+        if rec.done {
+            return Ok(JsValue::Boolean(true));
+        }
+        let result = call_fn(
+            predicate,
+            vec![rec.value, JsValue::HeapNumber(index as f64)],
+        )?;
+        if !result.to_boolean() {
+            return Ok(JsValue::Boolean(false));
+        }
+        index += 1;
+    }
+}
+
+/// ES2025 `Iterator.prototype.find(predicate)`.
+///
+/// Returns the first element of `iter` for which `predicate` returns a truthy
+/// value, or `undefined` if none match.
+///
+/// # Errors
+///
+/// Propagates any error from the source iterator or the predicate callback.
+pub fn iterator_find(iter: &JsValue, predicate: &JsValue) -> StatorResult<JsValue> {
+    let mut index = 0i64;
+    loop {
+        let rec = iterator_next(iter)?;
+        if rec.done {
+            return Ok(JsValue::Undefined);
+        }
+        let result = call_fn(
+            predicate,
+            vec![rec.value.clone(), JsValue::HeapNumber(index as f64)],
+        )?;
+        if result.to_boolean() {
+            return Ok(rec.value);
+        }
+        index += 1;
+    }
+}
+
+/// ES2025 `Iterator.from(iterable)`.
+///
+/// If `iterable` is already an iterator, returns it unchanged. If it is an
+/// array, wraps it in an array iterator. Otherwise returns a
+/// [`StatorError::TypeError`].
+///
+/// # Errors
+///
+/// Returns [`StatorError::TypeError`] if `iterable` is not an iterator or array.
+pub fn iterator_from(iterable: &JsValue) -> StatorResult<JsValue> {
+    match iterable {
+        JsValue::Iterator(_) | JsValue::Generator(_) => Ok(iterable.clone()),
+        JsValue::Array(arr) => Ok(make_array_iterator(arr.as_ref().clone())),
+        JsValue::String(s) => Ok(make_string_iterator(s)),
+        _ => Err(StatorError::TypeError(format!(
+            "Iterator.from: value is not iterable (got {iterable:?})"
+        ))),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -466,5 +790,357 @@ mod tests {
             collected,
             vec![JsValue::Smi(100), JsValue::Smi(200), JsValue::Smi(300)]
         );
+    }
+
+    // ── Helper: make a native function for testing ────────────────────────────
+
+    fn make_native_fn(f: impl Fn(Vec<JsValue>) -> StatorResult<JsValue> + 'static) -> JsValue {
+        JsValue::NativeFunction(Rc::new(f))
+    }
+
+    // ── iterator_map ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_iterator_map_doubles_values() {
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let mapper = make_native_fn(|args| {
+            let n = args[0].to_number()?;
+            Ok(JsValue::Smi((n * 2.0) as i32))
+        });
+        let result = iterator_map(&iter, &mapper).unwrap();
+        let items = iterator_to_vec(&result).unwrap();
+        assert_eq!(
+            items,
+            vec![JsValue::Smi(2), JsValue::Smi(4), JsValue::Smi(6)]
+        );
+    }
+
+    #[test]
+    fn test_iterator_map_empty() {
+        let iter = make_array_iterator(vec![]);
+        let mapper = make_native_fn(|args| Ok(args[0].clone()));
+        let result = iterator_map(&iter, &mapper).unwrap();
+        assert!(iterator_to_vec(&result).unwrap().is_empty());
+    }
+
+    // ── iterator_filter ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_iterator_filter_even() {
+        let iter = make_array_iterator(vec![
+            JsValue::Smi(1),
+            JsValue::Smi(2),
+            JsValue::Smi(3),
+            JsValue::Smi(4),
+        ]);
+        let pred = make_native_fn(|args| {
+            let n = args[0].to_number()?;
+            Ok(JsValue::Boolean(n as i64 % 2 == 0))
+        });
+        let result = iterator_filter(&iter, &pred).unwrap();
+        let items = iterator_to_vec(&result).unwrap();
+        assert_eq!(items, vec![JsValue::Smi(2), JsValue::Smi(4)]);
+    }
+
+    #[test]
+    fn test_iterator_filter_none_match() {
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(3)]);
+        let pred = make_native_fn(|_| Ok(JsValue::Boolean(false)));
+        let result = iterator_filter(&iter, &pred).unwrap();
+        assert!(iterator_to_vec(&result).unwrap().is_empty());
+    }
+
+    // ── iterator_take ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_iterator_take() {
+        let iter = make_array_iterator(vec![
+            JsValue::Smi(1),
+            JsValue::Smi(2),
+            JsValue::Smi(3),
+            JsValue::Smi(4),
+        ]);
+        let result = iterator_take(&iter, 2).unwrap();
+        let items = iterator_to_vec(&result).unwrap();
+        assert_eq!(items, vec![JsValue::Smi(1), JsValue::Smi(2)]);
+    }
+
+    #[test]
+    fn test_iterator_take_more_than_available() {
+        let iter = make_array_iterator(vec![JsValue::Smi(1)]);
+        let result = iterator_take(&iter, 10).unwrap();
+        let items = iterator_to_vec(&result).unwrap();
+        assert_eq!(items, vec![JsValue::Smi(1)]);
+    }
+
+    #[test]
+    fn test_iterator_take_zero() {
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        let result = iterator_take(&iter, 0).unwrap();
+        assert!(iterator_to_vec(&result).unwrap().is_empty());
+    }
+
+    // ── iterator_drop ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_iterator_drop() {
+        let iter = make_array_iterator(vec![
+            JsValue::Smi(1),
+            JsValue::Smi(2),
+            JsValue::Smi(3),
+            JsValue::Smi(4),
+        ]);
+        let result = iterator_drop(&iter, 2).unwrap();
+        let items = iterator_to_vec(&result).unwrap();
+        assert_eq!(items, vec![JsValue::Smi(3), JsValue::Smi(4)]);
+    }
+
+    #[test]
+    fn test_iterator_drop_all() {
+        let iter = make_array_iterator(vec![JsValue::Smi(1)]);
+        let result = iterator_drop(&iter, 5).unwrap();
+        assert!(iterator_to_vec(&result).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_iterator_drop_zero() {
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        let result = iterator_drop(&iter, 0).unwrap();
+        let items = iterator_to_vec(&result).unwrap();
+        assert_eq!(items, vec![JsValue::Smi(1), JsValue::Smi(2)]);
+    }
+
+    // ── iterator_flat_map ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_iterator_flat_map_with_arrays() {
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        let mapper = make_native_fn(|args| {
+            let n = args[0].to_number()? as i32;
+            Ok(JsValue::Array(Rc::new(vec![
+                JsValue::Smi(n),
+                JsValue::Smi(n * 10),
+            ])))
+        });
+        let result = iterator_flat_map(&iter, &mapper).unwrap();
+        let items = iterator_to_vec(&result).unwrap();
+        assert_eq!(
+            items,
+            vec![
+                JsValue::Smi(1),
+                JsValue::Smi(10),
+                JsValue::Smi(2),
+                JsValue::Smi(20)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_iterator_flat_map_with_scalars() {
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        let mapper = make_native_fn(|args| Ok(args[0].clone()));
+        let result = iterator_flat_map(&iter, &mapper).unwrap();
+        let items = iterator_to_vec(&result).unwrap();
+        assert_eq!(items, vec![JsValue::Smi(1), JsValue::Smi(2)]);
+    }
+
+    // ── iterator_reduce ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_iterator_reduce_sum() {
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let reducer = make_native_fn(|args| {
+            let a = args[0].to_number()?;
+            let b = args[1].to_number()?;
+            Ok(JsValue::Smi((a + b) as i32))
+        });
+        let result = iterator_reduce(&iter, &reducer, Some(JsValue::Smi(0))).unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn test_iterator_reduce_no_initial() {
+        let iter = make_array_iterator(vec![JsValue::Smi(10), JsValue::Smi(20)]);
+        let reducer = make_native_fn(|args| {
+            let a = args[0].to_number()?;
+            let b = args[1].to_number()?;
+            Ok(JsValue::Smi((a + b) as i32))
+        });
+        let result = iterator_reduce(&iter, &reducer, None).unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    #[test]
+    fn test_iterator_reduce_empty_no_initial_errors() {
+        let iter = make_array_iterator(vec![]);
+        let reducer = make_native_fn(|_| Ok(JsValue::Undefined));
+        let err = iterator_reduce(&iter, &reducer, None).unwrap_err();
+        assert!(matches!(err, StatorError::TypeError(_)));
+    }
+
+    // ── iterator_to_array ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_iterator_to_array_returns_js_array() {
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        let result = iterator_to_array(&iter).unwrap();
+        assert_eq!(
+            result,
+            JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::Smi(2)]))
+        );
+    }
+
+    #[test]
+    fn test_iterator_to_array_empty() {
+        let iter = make_array_iterator(vec![]);
+        let result = iterator_to_array(&iter).unwrap();
+        assert_eq!(result, JsValue::Array(Rc::new(vec![])));
+    }
+
+    // ── iterator_for_each ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_iterator_for_each_calls_callback() {
+        use std::cell::Cell;
+        let count = Rc::new(Cell::new(0i32));
+        let count_clone = count.clone();
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let callback = make_native_fn(move |_| {
+            count_clone.set(count_clone.get() + 1);
+            Ok(JsValue::Undefined)
+        });
+        let result = iterator_for_each(&iter, &callback).unwrap();
+        assert_eq!(result, JsValue::Undefined);
+        assert_eq!(count.get(), 3);
+    }
+
+    // ── iterator_some ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_iterator_some_found() {
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let pred = make_native_fn(|args| {
+            let n = args[0].to_number()?;
+            Ok(JsValue::Boolean(n == 2.0))
+        });
+        assert_eq!(iterator_some(&iter, &pred).unwrap(), JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_iterator_some_not_found() {
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(3)]);
+        let pred = make_native_fn(|args| {
+            let n = args[0].to_number()?;
+            Ok(JsValue::Boolean(n == 2.0))
+        });
+        assert_eq!(
+            iterator_some(&iter, &pred).unwrap(),
+            JsValue::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn test_iterator_some_empty() {
+        let iter = make_array_iterator(vec![]);
+        let pred = make_native_fn(|_| Ok(JsValue::Boolean(true)));
+        assert_eq!(
+            iterator_some(&iter, &pred).unwrap(),
+            JsValue::Boolean(false)
+        );
+    }
+
+    // ── iterator_every ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_iterator_every_all_pass() {
+        let iter = make_array_iterator(vec![JsValue::Smi(2), JsValue::Smi(4), JsValue::Smi(6)]);
+        let pred = make_native_fn(|args| {
+            let n = args[0].to_number()?;
+            Ok(JsValue::Boolean(n as i64 % 2 == 0))
+        });
+        assert_eq!(
+            iterator_every(&iter, &pred).unwrap(),
+            JsValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn test_iterator_every_one_fails() {
+        let iter = make_array_iterator(vec![JsValue::Smi(2), JsValue::Smi(3), JsValue::Smi(4)]);
+        let pred = make_native_fn(|args| {
+            let n = args[0].to_number()?;
+            Ok(JsValue::Boolean(n as i64 % 2 == 0))
+        });
+        assert_eq!(
+            iterator_every(&iter, &pred).unwrap(),
+            JsValue::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn test_iterator_every_empty() {
+        let iter = make_array_iterator(vec![]);
+        let pred = make_native_fn(|_| Ok(JsValue::Boolean(false)));
+        assert_eq!(
+            iterator_every(&iter, &pred).unwrap(),
+            JsValue::Boolean(true)
+        );
+    }
+
+    // ── iterator_find ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_iterator_find_found() {
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let pred = make_native_fn(|args| {
+            let n = args[0].to_number()?;
+            Ok(JsValue::Boolean(n == 2.0))
+        });
+        assert_eq!(iterator_find(&iter, &pred).unwrap(), JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_iterator_find_not_found() {
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(3)]);
+        let pred = make_native_fn(|args| {
+            let n = args[0].to_number()?;
+            Ok(JsValue::Boolean(n == 99.0))
+        });
+        assert_eq!(iterator_find(&iter, &pred).unwrap(), JsValue::Undefined);
+    }
+
+    // ── iterator_from ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_iterator_from_array() {
+        let arr = JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::Smi(2)]));
+        let iter = iterator_from(&arr).unwrap();
+        let items = iterator_to_vec(&iter).unwrap();
+        assert_eq!(items, vec![JsValue::Smi(1), JsValue::Smi(2)]);
+    }
+
+    #[test]
+    fn test_iterator_from_string() {
+        let s = JsValue::String("ab".into());
+        let iter = iterator_from(&s).unwrap();
+        let items = iterator_to_vec(&iter).unwrap();
+        assert_eq!(
+            items,
+            vec![JsValue::String("a".into()), JsValue::String("b".into())]
+        );
+    }
+
+    #[test]
+    fn test_iterator_from_iterator_passthrough() {
+        let orig = make_array_iterator(vec![JsValue::Smi(5)]);
+        let result = iterator_from(&orig).unwrap();
+        let items = iterator_to_vec(&result).unwrap();
+        assert_eq!(items, vec![JsValue::Smi(5)]);
+    }
+
+    #[test]
+    fn test_iterator_from_non_iterable_errors() {
+        let err = iterator_from(&JsValue::Smi(42)).unwrap_err();
+        assert!(matches!(err, StatorError::TypeError(_)));
     }
 }

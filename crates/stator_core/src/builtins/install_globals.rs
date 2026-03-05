@@ -27,6 +27,11 @@ use crate::builtins::global::{
     global_encode_uri_component, global_is_finite, global_is_nan, global_parse_float,
     global_parse_int,
 };
+use crate::builtins::iterator::{
+    iterator_drop, iterator_every, iterator_filter, iterator_find, iterator_flat_map,
+    iterator_for_each, iterator_from, iterator_map, iterator_reduce, iterator_some, iterator_take,
+    iterator_to_array,
+};
 use crate::builtins::math::{
     MATH_E, MATH_LN2, MATH_LN10, MATH_LOG2E, MATH_LOG10E, MATH_PI, MATH_SQRT1_2, MATH_SQRT2,
     math_abs, math_acos, math_asin, math_atan, math_atan2, math_cbrt, math_ceil, math_clz32,
@@ -862,6 +867,135 @@ fn make_symbol() -> JsValue {
 
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
+
+// ── Iterator (ES2025 §27.1.4) ────────────────────────────────────────────────
+
+/// Build the `Iterator` constructor/namespace object with prototype helpers.
+fn make_iterator() -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    // ── Static method: Iterator.from ──────────────────────────────────────
+    props.insert(
+        "from".into(),
+        native(|args| {
+            let iterable = args.first().unwrap_or(&JsValue::Undefined);
+            iterator_from(iterable)
+        }),
+    );
+
+    // ── Prototype (instance) methods ─────────────────────────────────────
+    //
+    // In a full engine these would live on Iterator.prototype.  Here we
+    // attach them as own properties so that `Iterator.prototype.map(…)` is
+    // accessible as `Iterator.map(iter, mapper)` for direct testing and for
+    // the bytecode to call via property lookup.
+    let mut proto: HashMap<String, JsValue> = HashMap::new();
+
+    proto.insert(
+        "map".into(),
+        native(|args| {
+            let iter = args.first().unwrap_or(&JsValue::Undefined);
+            let mapper = args.get(1).unwrap_or(&JsValue::Undefined);
+            iterator_map(iter, mapper)
+        }),
+    );
+    proto.insert(
+        "filter".into(),
+        native(|args| {
+            let iter = args.first().unwrap_or(&JsValue::Undefined);
+            let predicate = args.get(1).unwrap_or(&JsValue::Undefined);
+            iterator_filter(iter, predicate)
+        }),
+    );
+    proto.insert(
+        "take".into(),
+        native(|args| {
+            let iter = args.first().unwrap_or(&JsValue::Undefined);
+            let limit = args
+                .get(1)
+                .unwrap_or(&JsValue::Undefined)
+                .to_number()
+                .unwrap_or(0.0);
+            iterator_take(iter, limit.max(0.0) as usize)
+        }),
+    );
+    proto.insert(
+        "drop".into(),
+        native(|args| {
+            let iter = args.first().unwrap_or(&JsValue::Undefined);
+            let count = args
+                .get(1)
+                .unwrap_or(&JsValue::Undefined)
+                .to_number()
+                .unwrap_or(0.0);
+            iterator_drop(iter, count.max(0.0) as usize)
+        }),
+    );
+    proto.insert(
+        "flatMap".into(),
+        native(|args| {
+            let iter = args.first().unwrap_or(&JsValue::Undefined);
+            let mapper = args.get(1).unwrap_or(&JsValue::Undefined);
+            iterator_flat_map(iter, mapper)
+        }),
+    );
+    proto.insert(
+        "reduce".into(),
+        native(|args| {
+            let iter = args.first().unwrap_or(&JsValue::Undefined);
+            let reducer = args.get(1).unwrap_or(&JsValue::Undefined);
+            let initial = args.get(2).cloned();
+            iterator_reduce(iter, reducer, initial)
+        }),
+    );
+    proto.insert(
+        "toArray".into(),
+        native(|args| {
+            let iter = args.first().unwrap_or(&JsValue::Undefined);
+            iterator_to_array(iter)
+        }),
+    );
+    proto.insert(
+        "forEach".into(),
+        native(|args| {
+            let iter = args.first().unwrap_or(&JsValue::Undefined);
+            let callback = args.get(1).unwrap_or(&JsValue::Undefined);
+            iterator_for_each(iter, callback)
+        }),
+    );
+    proto.insert(
+        "some".into(),
+        native(|args| {
+            let iter = args.first().unwrap_or(&JsValue::Undefined);
+            let predicate = args.get(1).unwrap_or(&JsValue::Undefined);
+            iterator_some(iter, predicate)
+        }),
+    );
+    proto.insert(
+        "every".into(),
+        native(|args| {
+            let iter = args.first().unwrap_or(&JsValue::Undefined);
+            let predicate = args.get(1).unwrap_or(&JsValue::Undefined);
+            iterator_every(iter, predicate)
+        }),
+    );
+    proto.insert(
+        "find".into(),
+        native(|args| {
+            let iter = args.first().unwrap_or(&JsValue::Undefined);
+            let predicate = args.get(1).unwrap_or(&JsValue::Undefined);
+            iterator_find(iter, predicate)
+        }),
+    );
+
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 // ── install_globals ──────────────────────────────────────────────────────────
 
 /// Pre-populate `globals` with all ECMAScript built-in names.
@@ -881,6 +1015,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     globals.insert("Object".into(), make_object());
     globals.insert("Array".into(), make_array());
     globals.insert("Symbol".into(), make_symbol());
+    globals.insert("Iterator".into(), make_iterator());
 
     // ── Error constructors ────────────────────────────────────────────────
     install_error_constructors(globals);
@@ -976,6 +1111,12 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             Ok(JsValue::String(global_decode_uri_component(&s)?))
         }),
     );
+
+    // ── globalThis (ECMAScript §19.1) ───────────────────────────────────
+    // `globalThis` is a self-referential property of the global object.
+    // We represent the global object as a PlainObject snapshot.
+    let global_this = JsValue::PlainObject(Rc::new(RefCell::new(globals.clone())));
+    globals.insert("globalThis".into(), global_this);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1003,6 +1144,8 @@ mod tests {
         assert!(globals.contains_key("NaN"));
         assert!(globals.contains_key("Infinity"));
         assert!(globals.contains_key("Symbol"));
+        assert!(globals.contains_key("Iterator"));
+        assert!(globals.contains_key("globalThis"));
     }
 
     /// Verify that the `Math` object has the expected properties.
@@ -1711,6 +1854,109 @@ mod tests {
             assert!(map.contains_key("entries"));
         } else {
             panic!("Object should be a PlainObject");
+        }
+    }
+
+    // ── Iterator tests ──────────────────────────────────────────────────────
+
+    /// `Iterator` is available as a global PlainObject.
+    #[test]
+    fn test_iterator_global_exists() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        assert!(matches!(
+            globals.get("Iterator"),
+            Some(JsValue::PlainObject(_))
+        ));
+    }
+
+    /// `Iterator` has a `from` static method and a `prototype` with helpers.
+    #[test]
+    fn test_iterator_object_properties() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let iter_obj = globals.get("Iterator").unwrap();
+        if let JsValue::PlainObject(map) = iter_obj {
+            let map = map.borrow();
+            assert!(matches!(map.get("from"), Some(JsValue::NativeFunction(_))));
+            assert!(matches!(
+                map.get("prototype"),
+                Some(JsValue::PlainObject(_))
+            ));
+            if let Some(JsValue::PlainObject(proto)) = map.get("prototype") {
+                let proto = proto.borrow();
+                assert!(matches!(proto.get("map"), Some(JsValue::NativeFunction(_))));
+                assert!(matches!(
+                    proto.get("filter"),
+                    Some(JsValue::NativeFunction(_))
+                ));
+                assert!(matches!(
+                    proto.get("take"),
+                    Some(JsValue::NativeFunction(_))
+                ));
+                assert!(matches!(
+                    proto.get("drop"),
+                    Some(JsValue::NativeFunction(_))
+                ));
+                assert!(matches!(
+                    proto.get("flatMap"),
+                    Some(JsValue::NativeFunction(_))
+                ));
+                assert!(matches!(
+                    proto.get("reduce"),
+                    Some(JsValue::NativeFunction(_))
+                ));
+                assert!(matches!(
+                    proto.get("toArray"),
+                    Some(JsValue::NativeFunction(_))
+                ));
+                assert!(matches!(
+                    proto.get("forEach"),
+                    Some(JsValue::NativeFunction(_))
+                ));
+                assert!(matches!(
+                    proto.get("some"),
+                    Some(JsValue::NativeFunction(_))
+                ));
+                assert!(matches!(
+                    proto.get("every"),
+                    Some(JsValue::NativeFunction(_))
+                ));
+                assert!(matches!(
+                    proto.get("find"),
+                    Some(JsValue::NativeFunction(_))
+                ));
+            }
+        } else {
+            panic!("Iterator should be a PlainObject");
+        }
+    }
+
+    // ── globalThis tests ────────────────────────────────────────────────────
+
+    /// `globalThis` is a PlainObject containing the global scope keys.
+    #[test]
+    fn test_global_this_exists() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        assert!(matches!(
+            globals.get("globalThis"),
+            Some(JsValue::PlainObject(_))
+        ));
+    }
+
+    /// `globalThis` contains the same keys as the global scope.
+    #[test]
+    fn test_global_this_has_keys() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        if let Some(JsValue::PlainObject(gt)) = globals.get("globalThis") {
+            let gt = gt.borrow();
+            assert!(gt.contains_key("Math"));
+            assert!(gt.contains_key("parseInt"));
+            assert!(gt.contains_key("Iterator"));
+        } else {
+            panic!("globalThis should be a PlainObject");
         }
     }
 }
