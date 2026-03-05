@@ -62,6 +62,30 @@ pub fn set_new() -> JsSet {
     JsSet::default()
 }
 
+/// ECMAScript §24.2.1.1 `new Set(iterable)`.
+///
+/// Creates a [`JsSet`] from an iterable of values.  Duplicates (per
+/// `SameValueZero`) are silently ignored.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_from_iterable, set_has, set_size};
+/// use stator_core::objects::value::JsValue;
+///
+/// let items = vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(1)];
+/// let s = set_from_iterable(items);
+/// assert_eq!(set_size(&s), 2);
+/// assert!(set_has(&s, &JsValue::Smi(1)));
+/// ```
+pub fn set_from_iterable(items: Vec<JsValue>) -> JsSet {
+    let mut s = set_new();
+    for v in items {
+        set_add(&mut s, v);
+    }
+    s
+}
+
 // ── set_add ───────────────────────────────────────────────────────────────────
 
 /// ECMAScript §24.2.3.1 `Set.prototype.add(value)`.
@@ -222,11 +246,128 @@ pub fn set_values(set: &JsSet) -> Vec<JsValue> {
     set.values.clone()
 }
 
+/// ECMAScript §24.2.3.8 `Set.prototype.keys()`.
+///
+/// Returns all values in insertion order.  Per the ECMAScript specification,
+/// `Set.prototype.keys` is the **same function** as `Set.prototype.values`.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_keys};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut s = set_new();
+/// set_add(&mut s, JsValue::Smi(7));
+/// assert_eq!(set_keys(&s), vec![JsValue::Smi(7)]);
+/// ```
+pub fn set_keys(set: &JsSet) -> Vec<JsValue> {
+    set_values(set)
+}
+
+// ── set_entries ───────────────────────────────────────────────────────────────
+
+/// ECMAScript §24.2.3.5 `Set.prototype.entries()`.
+///
+/// Returns `(value, value)` pairs in insertion order.  The key and value of
+/// each entry are identical, matching the spec's requirement that `Set`
+/// entries mirror the `Map` entry format.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_entries};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut s = set_new();
+/// set_add(&mut s, JsValue::Smi(1));
+/// assert_eq!(set_entries(&s), vec![(JsValue::Smi(1), JsValue::Smi(1))]);
+/// ```
+pub fn set_entries(set: &JsSet) -> Vec<(JsValue, JsValue)> {
+    set.values.iter().map(|v| (v.clone(), v.clone())).collect()
+}
+
+// ── set_iter ──────────────────────────────────────────────────────────────────
+
+/// ECMAScript §24.2.3 `Set.prototype[@@iterator]()`.
+///
+/// Returns all values in insertion order.  This is the same as
+/// [`set_values`] and fulfils the `Symbol.iterator` protocol for `Set`.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_iter};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut s = set_new();
+/// set_add(&mut s, JsValue::Smi(5));
+/// let vals = set_iter(&s);
+/// assert_eq!(vals.len(), 1);
+/// ```
+pub fn set_iter(set: &JsSet) -> Vec<JsValue> {
+    set_values(set)
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── set_from_iterable ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_from_iterable() {
+        let items = vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)];
+        let s = set_from_iterable(items);
+        assert_eq!(set_size(&s), 3);
+        assert!(set_has(&s, &JsValue::Smi(1)));
+        assert!(set_has(&s, &JsValue::Smi(3)));
+    }
+
+    #[test]
+    fn test_set_from_iterable_deduplicates() {
+        let items = vec![JsValue::Smi(1), JsValue::Smi(1), JsValue::Smi(2)];
+        let s = set_from_iterable(items);
+        assert_eq!(set_size(&s), 2);
+    }
+
+    // ── set_keys ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_keys_equals_values() {
+        let mut s = set_new();
+        set_add(&mut s, JsValue::Smi(10));
+        set_add(&mut s, JsValue::Smi(20));
+        assert_eq!(set_keys(&s), set_values(&s));
+    }
+
+    // ── set_entries ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_entries_returns_value_value_pairs() {
+        let mut s = set_new();
+        set_add(&mut s, JsValue::Smi(1));
+        set_add(&mut s, JsValue::Smi(2));
+        assert_eq!(
+            set_entries(&s),
+            vec![
+                (JsValue::Smi(1), JsValue::Smi(1)),
+                (JsValue::Smi(2), JsValue::Smi(2)),
+            ]
+        );
+    }
+
+    // ── set_iter ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_iter_returns_values() {
+        let mut s = set_new();
+        set_add(&mut s, JsValue::Smi(7));
+        set_add(&mut s, JsValue::Smi(3));
+        assert_eq!(set_iter(&s), set_values(&s));
+    }
 
     // ── set_add / set_has / set_size ──────────────────────────────────────────
 

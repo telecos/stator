@@ -32,6 +32,10 @@ use crate::builtins::iterator::{
     iterator_for_each, iterator_from, iterator_map, iterator_reduce, iterator_some, iterator_take,
     iterator_to_array,
 };
+use crate::builtins::map::{
+    map_clear, map_delete, map_entries, map_from_iterable, map_get, map_has, map_keys, map_new,
+    map_set, map_size, map_values,
+};
 use crate::builtins::math::{
     MATH_E, MATH_LN2, MATH_LN10, MATH_LOG2E, MATH_LOG10E, MATH_PI, MATH_SQRT1_2, MATH_SQRT2,
     math_abs, math_acos, math_acosh, math_asin, math_asinh, math_atan, math_atan2, math_atanh,
@@ -40,13 +44,21 @@ use crate::builtins::math::{
     math_min, math_pow, math_random, math_round, math_sign, math_sin, math_sinh, math_sqrt,
     math_tan, math_tanh, math_trunc,
 };
+use crate::builtins::set::{
+    set_add, set_clear, set_delete, set_entries, set_from_iterable, set_has, set_keys, set_new,
+    set_size, set_values,
+};
 use crate::builtins::symbol::{
     SYMBOL_ASYNC_ITERATOR, SYMBOL_HAS_INSTANCE, SYMBOL_IS_CONCAT_SPREADABLE, SYMBOL_ITERATOR,
     SYMBOL_MATCH, SYMBOL_REPLACE, SYMBOL_SEARCH, SYMBOL_SPECIES, SYMBOL_SPLIT, SYMBOL_TO_PRIMITIVE,
     SYMBOL_TO_STRING_TAG, SYMBOL_UNSCOPABLES, symbol_create, symbol_for, symbol_key_for,
 };
-use crate::error::StatorResult;
-use crate::objects::value::JsValue;
+use crate::builtins::weak_map::{
+    weak_map_delete, weak_map_get, weak_map_has, weak_map_new, weak_map_set,
+};
+use crate::builtins::weak_set::{weak_set_add, weak_set_delete, weak_set_has, weak_set_new};
+use crate::error::{StatorError, StatorResult};
+use crate::objects::value::{JsValue, NativeIterator};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1048,6 +1060,466 @@ fn make_iterator() -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
+// ── Map constructor (ES2025 §24.1) ───────────────────────────────────────────
+
+/// Build the `Map` constructor/namespace object.
+///
+/// The returned `PlainObject` provides a `__call__` constructor that
+/// optionally accepts an iterable of `[key, value]` pairs, plus prototype
+/// methods (`get`, `set`, `has`, `delete`, `clear`, `forEach`, `keys`,
+/// `values`, `entries`, `size`).
+fn make_map_builtin() -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    // ── Constructor: new Map() / new Map(iterable) ───────────────────────
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let m = if let Some(JsValue::Array(arr)) = args.first() {
+                let mut pairs = Vec::new();
+                for item in arr.iter() {
+                    if let JsValue::Array(pair) = item {
+                        let k = pair.first().cloned().unwrap_or(JsValue::Undefined);
+                        let v = pair.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        pairs.push((k, v));
+                    }
+                }
+                map_from_iterable(pairs)
+            } else {
+                map_new()
+            };
+            // Store the JsMap in a RefCell so prototype methods can mutate it.
+            let inner = Rc::new(RefCell::new(m));
+            let mut obj: HashMap<String, JsValue> = HashMap::new();
+            // size getter
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "size".into(),
+                    JsValue::Smi(map_size(&inner.borrow()) as i32),
+                );
+            }
+            // get(key)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "get".into(),
+                    native(move |a| {
+                        let key = a.first().unwrap_or(&JsValue::Undefined);
+                        Ok(map_get(&inner.borrow(), key))
+                    }),
+                );
+            }
+            // set(key, value)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "set".into(),
+                    native(move |a| {
+                        let key = a.first().cloned().unwrap_or(JsValue::Undefined);
+                        let val = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        map_set(&mut inner.borrow_mut(), key, val);
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+            }
+            // has(key)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "has".into(),
+                    native(move |a| {
+                        let key = a.first().unwrap_or(&JsValue::Undefined);
+                        Ok(JsValue::Boolean(map_has(&inner.borrow(), key)))
+                    }),
+                );
+            }
+            // delete(key)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "delete".into(),
+                    native(move |a| {
+                        let key = a.first().unwrap_or(&JsValue::Undefined);
+                        Ok(JsValue::Boolean(map_delete(&mut inner.borrow_mut(), key)))
+                    }),
+                );
+            }
+            // clear()
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "clear".into(),
+                    native(move |_| {
+                        map_clear(&mut inner.borrow_mut());
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+            }
+            // forEach(callback)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "forEach".into(),
+                    native(move |a| {
+                        let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                        let snapshot = map_entries(&inner.borrow());
+                        for (k, v) in snapshot {
+                            if let JsValue::NativeFunction(f) = &cb {
+                                f(vec![v, k])?;
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+            }
+            // keys()
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "keys".into(),
+                    native(move |_| {
+                        let keys = map_keys(&inner.borrow());
+                        Ok(JsValue::Iterator(NativeIterator::from_items(keys)))
+                    }),
+                );
+            }
+            // values()
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "values".into(),
+                    native(move |_| {
+                        let vals = map_values(&inner.borrow());
+                        Ok(JsValue::Iterator(NativeIterator::from_items(vals)))
+                    }),
+                );
+            }
+            // entries()
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "entries".into(),
+                    native(move |_| {
+                        let entries = map_entries(&inner.borrow());
+                        let items: Vec<JsValue> = entries
+                            .into_iter()
+                            .map(|(k, v)| JsValue::Array(Rc::new(vec![k, v])))
+                            .collect();
+                        Ok(JsValue::Iterator(NativeIterator::from_items(items)))
+                    }),
+                );
+            }
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+        }),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+// ── Set constructor (ES2025 §24.2) ───────────────────────────────────────────
+
+/// Build the `Set` constructor/namespace object.
+///
+/// The returned `PlainObject` provides a `__call__` constructor that
+/// optionally accepts an iterable of values, plus prototype methods
+/// (`add`, `has`, `delete`, `clear`, `forEach`, `keys`, `values`,
+/// `entries`, `size`).
+fn make_set_builtin() -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    // ── Constructor: new Set() / new Set(iterable) ───────────────────────
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let s = if let Some(JsValue::Array(arr)) = args.first() {
+                set_from_iterable(arr.as_ref().clone())
+            } else {
+                set_new()
+            };
+            let inner = Rc::new(RefCell::new(s));
+            let mut obj: HashMap<String, JsValue> = HashMap::new();
+            // size getter
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "size".into(),
+                    JsValue::Smi(set_size(&inner.borrow()) as i32),
+                );
+            }
+            // add(value)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "add".into(),
+                    native(move |a| {
+                        let val = a.first().cloned().unwrap_or(JsValue::Undefined);
+                        set_add(&mut inner.borrow_mut(), val);
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+            }
+            // has(value)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "has".into(),
+                    native(move |a| {
+                        let val = a.first().unwrap_or(&JsValue::Undefined);
+                        Ok(JsValue::Boolean(set_has(&inner.borrow(), val)))
+                    }),
+                );
+            }
+            // delete(value)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "delete".into(),
+                    native(move |a| {
+                        let val = a.first().unwrap_or(&JsValue::Undefined);
+                        Ok(JsValue::Boolean(set_delete(&mut inner.borrow_mut(), val)))
+                    }),
+                );
+            }
+            // clear()
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "clear".into(),
+                    native(move |_| {
+                        set_clear(&mut inner.borrow_mut());
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+            }
+            // forEach(callback)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "forEach".into(),
+                    native(move |a| {
+                        let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                        let snapshot = set_values(&inner.borrow());
+                        for v in snapshot {
+                            if let JsValue::NativeFunction(f) = &cb {
+                                f(vec![v.clone(), v])?;
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+            }
+            // keys() — alias for values()
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "keys".into(),
+                    native(move |_| {
+                        let vals = set_keys(&inner.borrow());
+                        Ok(JsValue::Iterator(NativeIterator::from_items(vals)))
+                    }),
+                );
+            }
+            // values()
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "values".into(),
+                    native(move |_| {
+                        let vals = set_values(&inner.borrow());
+                        Ok(JsValue::Iterator(NativeIterator::from_items(vals)))
+                    }),
+                );
+            }
+            // entries()
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "entries".into(),
+                    native(move |_| {
+                        let entries = set_entries(&inner.borrow());
+                        let items: Vec<JsValue> = entries
+                            .into_iter()
+                            .map(|(k, v)| JsValue::Array(Rc::new(vec![k, v])))
+                            .collect();
+                        Ok(JsValue::Iterator(NativeIterator::from_items(items)))
+                    }),
+                );
+            }
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+        }),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+// ── WeakMap constructor (ES2025 §24.3) ───────────────────────────────────────
+
+/// Build the `WeakMap` constructor/namespace object.
+///
+/// The returned `PlainObject` provides a `__call__` constructor that creates
+/// a new `WeakMap` instance with prototype methods (`get`, `set`, `has`,
+/// `delete`).  Keys must be `Object` pointers; non-object keys cause a
+/// `TypeError`.
+fn make_weak_map_builtin() -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|_args| {
+            let inner = Rc::new(RefCell::new(weak_map_new()));
+            let mut obj: HashMap<String, JsValue> = HashMap::new();
+
+            // get(key)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "get".into(),
+                    native(move |a| {
+                        let key = a.first().unwrap_or(&JsValue::Undefined);
+                        if let JsValue::Object(ptr) = key {
+                            Ok(weak_map_get(&inner.borrow(), *ptr))
+                        } else {
+                            Ok(JsValue::Undefined)
+                        }
+                    }),
+                );
+            }
+            // set(key, value)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "set".into(),
+                    native(move |a| {
+                        let key = a.first().unwrap_or(&JsValue::Undefined);
+                        let val = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        if let JsValue::Object(ptr) = key {
+                            weak_map_set(&mut inner.borrow_mut(), *ptr, val)?;
+                            Ok(JsValue::Undefined)
+                        } else {
+                            Err(StatorError::TypeError(
+                                "Invalid value used as weak map key".into(),
+                            ))
+                        }
+                    }),
+                );
+            }
+            // has(key)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "has".into(),
+                    native(move |a| {
+                        let key = a.first().unwrap_or(&JsValue::Undefined);
+                        if let JsValue::Object(ptr) = key {
+                            Ok(JsValue::Boolean(weak_map_has(&inner.borrow(), *ptr)))
+                        } else {
+                            Ok(JsValue::Boolean(false))
+                        }
+                    }),
+                );
+            }
+            // delete(key)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "delete".into(),
+                    native(move |a| {
+                        let key = a.first().unwrap_or(&JsValue::Undefined);
+                        if let JsValue::Object(ptr) = key {
+                            Ok(JsValue::Boolean(weak_map_delete(
+                                &mut inner.borrow_mut(),
+                                *ptr,
+                            )))
+                        } else {
+                            Ok(JsValue::Boolean(false))
+                        }
+                    }),
+                );
+            }
+
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+        }),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+// ── WeakSet constructor (ES2025 §24.4) ───────────────────────────────────────
+
+/// Build the `WeakSet` constructor/namespace object.
+///
+/// The returned `PlainObject` provides a `__call__` constructor that creates
+/// a new `WeakSet` instance with prototype methods (`add`, `has`, `delete`).
+/// Values must be `Object` pointers; non-object values cause a `TypeError`.
+fn make_weak_set_builtin() -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|_args| {
+            let inner = Rc::new(RefCell::new(weak_set_new()));
+            let mut obj: HashMap<String, JsValue> = HashMap::new();
+
+            // add(value)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "add".into(),
+                    native(move |a| {
+                        let val = a.first().unwrap_or(&JsValue::Undefined);
+                        if let JsValue::Object(ptr) = val {
+                            weak_set_add(&mut inner.borrow_mut(), *ptr)?;
+                            Ok(JsValue::Undefined)
+                        } else {
+                            Err(StatorError::TypeError(
+                                "Invalid value used in weak set".into(),
+                            ))
+                        }
+                    }),
+                );
+            }
+            // has(value)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "has".into(),
+                    native(move |a| {
+                        let val = a.first().unwrap_or(&JsValue::Undefined);
+                        if let JsValue::Object(ptr) = val {
+                            Ok(JsValue::Boolean(weak_set_has(&inner.borrow(), *ptr)))
+                        } else {
+                            Ok(JsValue::Boolean(false))
+                        }
+                    }),
+                );
+            }
+            // delete(value)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "delete".into(),
+                    native(move |a| {
+                        let val = a.first().unwrap_or(&JsValue::Undefined);
+                        if let JsValue::Object(ptr) = val {
+                            Ok(JsValue::Boolean(weak_set_delete(
+                                &mut inner.borrow_mut(),
+                                *ptr,
+                            )))
+                        } else {
+                            Ok(JsValue::Boolean(false))
+                        }
+                    }),
+                );
+            }
+
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+        }),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 // ── install_globals ──────────────────────────────────────────────────────────
 
 /// Pre-populate `globals` with all ECMAScript built-in names.
@@ -1068,6 +1540,10 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     globals.insert("Array".into(), make_array());
     globals.insert("Symbol".into(), make_symbol());
     globals.insert("Iterator".into(), make_iterator());
+    globals.insert("Map".into(), make_map_builtin());
+    globals.insert("Set".into(), make_set_builtin());
+    globals.insert("WeakMap".into(), make_weak_map_builtin());
+    globals.insert("WeakSet".into(), make_weak_set_builtin());
 
     // ── Error constructors ────────────────────────────────────────────────
     install_error_constructors(globals);
@@ -1197,6 +1673,10 @@ mod tests {
         assert!(globals.contains_key("Infinity"));
         assert!(globals.contains_key("Symbol"));
         assert!(globals.contains_key("Iterator"));
+        assert!(globals.contains_key("Map"));
+        assert!(globals.contains_key("Set"));
+        assert!(globals.contains_key("WeakMap"));
+        assert!(globals.contains_key("WeakSet"));
         assert!(globals.contains_key("globalThis"));
     }
 
@@ -2009,6 +2489,204 @@ mod tests {
             assert!(gt.contains_key("Iterator"));
         } else {
             panic!("globalThis should be a PlainObject");
+        }
+    }
+
+    // ── Map constructor tests ────────────────────────────────────────────────
+
+    /// `Map` global is a PlainObject with a `__call__` constructor.
+    #[test]
+    fn test_map_global_exists() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        assert!(matches!(globals.get("Map"), Some(JsValue::PlainObject(_))));
+    }
+
+    /// Constructing a Map via `__call__` returns an object with prototype methods.
+    #[test]
+    fn test_map_constructor_creates_instance() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        if let JsValue::PlainObject(map_ctor) = globals.get("Map").unwrap() {
+            let call = map_ctor.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                let result = f(vec![]).unwrap();
+                if let JsValue::PlainObject(instance) = result {
+                    let inst = instance.borrow();
+                    assert!(inst.contains_key("get"));
+                    assert!(inst.contains_key("set"));
+                    assert!(inst.contains_key("has"));
+                    assert!(inst.contains_key("delete"));
+                    assert!(inst.contains_key("clear"));
+                    assert!(inst.contains_key("forEach"));
+                    assert!(inst.contains_key("keys"));
+                    assert!(inst.contains_key("values"));
+                    assert!(inst.contains_key("entries"));
+                    assert!(inst.contains_key("size"));
+                } else {
+                    panic!("Map() should return a PlainObject");
+                }
+            } else {
+                panic!("Map.__call__ should be NativeFunction");
+            }
+        } else {
+            panic!("Map should be a PlainObject");
+        }
+    }
+
+    /// Map constructed with iterable argument.
+    #[test]
+    fn test_map_constructor_with_iterable() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        if let JsValue::PlainObject(map_ctor) = globals.get("Map").unwrap() {
+            let call = map_ctor.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                let iterable = JsValue::Array(Rc::new(vec![
+                    JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::String("a".into())])),
+                    JsValue::Array(Rc::new(vec![JsValue::Smi(2), JsValue::String("b".into())])),
+                ]));
+                let result = f(vec![iterable]).unwrap();
+                if let JsValue::PlainObject(instance) = result {
+                    let inst = instance.borrow();
+                    assert_eq!(inst.get("size"), Some(&JsValue::Smi(2)));
+                    // Test get
+                    if let Some(JsValue::NativeFunction(get_fn)) = inst.get("get") {
+                        let val = get_fn(vec![JsValue::Smi(1)]).unwrap();
+                        assert_eq!(val, JsValue::String("a".into()));
+                    }
+                } else {
+                    panic!("Map() should return a PlainObject");
+                }
+            }
+        }
+    }
+
+    // ── Set constructor tests ────────────────────────────────────────────────
+
+    /// `Set` global is a PlainObject with a `__call__` constructor.
+    #[test]
+    fn test_set_global_exists() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        assert!(matches!(globals.get("Set"), Some(JsValue::PlainObject(_))));
+    }
+
+    /// Constructing a Set via `__call__` returns an object with prototype methods.
+    #[test]
+    fn test_set_constructor_creates_instance() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        if let JsValue::PlainObject(set_ctor) = globals.get("Set").unwrap() {
+            let call = set_ctor.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                let result = f(vec![]).unwrap();
+                if let JsValue::PlainObject(instance) = result {
+                    let inst = instance.borrow();
+                    assert!(inst.contains_key("add"));
+                    assert!(inst.contains_key("has"));
+                    assert!(inst.contains_key("delete"));
+                    assert!(inst.contains_key("clear"));
+                    assert!(inst.contains_key("forEach"));
+                    assert!(inst.contains_key("keys"));
+                    assert!(inst.contains_key("values"));
+                    assert!(inst.contains_key("entries"));
+                    assert!(inst.contains_key("size"));
+                } else {
+                    panic!("Set() should return a PlainObject");
+                }
+            }
+        }
+    }
+
+    /// Set constructed with iterable argument deduplicates.
+    #[test]
+    fn test_set_constructor_with_iterable() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        if let JsValue::PlainObject(set_ctor) = globals.get("Set").unwrap() {
+            let call = set_ctor.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                let iterable = JsValue::Array(Rc::new(vec![
+                    JsValue::Smi(1),
+                    JsValue::Smi(2),
+                    JsValue::Smi(1),
+                ]));
+                let result = f(vec![iterable]).unwrap();
+                if let JsValue::PlainObject(instance) = result {
+                    let inst = instance.borrow();
+                    assert_eq!(inst.get("size"), Some(&JsValue::Smi(2)));
+                }
+            }
+        }
+    }
+
+    // ── WeakMap constructor tests ────────────────────────────────────────────
+
+    /// `WeakMap` global is a PlainObject with a `__call__` constructor.
+    #[test]
+    fn test_weak_map_global_exists() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        assert!(matches!(
+            globals.get("WeakMap"),
+            Some(JsValue::PlainObject(_))
+        ));
+    }
+
+    /// Constructing a WeakMap via `__call__` returns an object with prototype methods.
+    #[test]
+    fn test_weak_map_constructor_creates_instance() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        if let JsValue::PlainObject(wm_ctor) = globals.get("WeakMap").unwrap() {
+            let call = wm_ctor.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                let result = f(vec![]).unwrap();
+                if let JsValue::PlainObject(instance) = result {
+                    let inst = instance.borrow();
+                    assert!(inst.contains_key("get"));
+                    assert!(inst.contains_key("set"));
+                    assert!(inst.contains_key("has"));
+                    assert!(inst.contains_key("delete"));
+                } else {
+                    panic!("WeakMap() should return a PlainObject");
+                }
+            }
+        }
+    }
+
+    // ── WeakSet constructor tests ────────────────────────────────────────────
+
+    /// `WeakSet` global is a PlainObject with a `__call__` constructor.
+    #[test]
+    fn test_weak_set_global_exists() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        assert!(matches!(
+            globals.get("WeakSet"),
+            Some(JsValue::PlainObject(_))
+        ));
+    }
+
+    /// Constructing a WeakSet via `__call__` returns an object with prototype methods.
+    #[test]
+    fn test_weak_set_constructor_creates_instance() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        if let JsValue::PlainObject(ws_ctor) = globals.get("WeakSet").unwrap() {
+            let call = ws_ctor.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                let result = f(vec![]).unwrap();
+                if let JsValue::PlainObject(instance) = result {
+                    let inst = instance.borrow();
+                    assert!(inst.contains_key("add"));
+                    assert!(inst.contains_key("has"));
+                    assert!(inst.contains_key("delete"));
+                } else {
+                    panic!("WeakSet() should return a PlainObject");
+                }
+            }
         }
     }
 }
