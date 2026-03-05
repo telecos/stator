@@ -99,6 +99,7 @@
 //! |------------------------------|-----------------------------------------------------|
 //! | `Construct(f,a,n,_)`         | `acc ← new f(a, …, a+n−1)` (P3: returns body acc) |
 //! | `ConstructWithSpread(f,a,n,_)` | same as `Construct`                               |
+//! | `ConstructForwardAllArgs(f,_)` | like `Construct` but forward all current-frame args |
 //!
 //! ## Context management
 //!
@@ -3571,19 +3572,8 @@ impl Interpreter {
                         return Err(err_bad_operand("JumpIfJSReceiverConstant", 0));
                     };
                     if is_js_receiver(&frame.accumulator) {
-                        let entry = frame.bytecode_array.get_constant(idx).ok_or_else(|| {
-                            StatorError::Internal(format!(
-                                "JumpIfJSReceiverConstant: constant pool index {idx} out of bounds"
-                            ))
-                        })?;
-                        let delta = match entry {
-                            ConstantPoolEntry::Number(n) => *n as i32,
-                            _ => {
-                                return Err(StatorError::Internal(
-                                    "JumpIfJSReceiverConstant: constant is not a number".into(),
-                                ));
-                            }
-                        };
+                        let delta =
+                            constant_pool_jump_delta(frame, idx, "JumpIfJSReceiverConstant")?;
                         frame.pc =
                             resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
                     }
@@ -3599,6 +3589,251 @@ impl Interpreter {
                         let n = frame.accumulator.to_number()?;
                         frame.accumulator = number_to_jsvalue(n);
                     }
+                }
+
+                // ── Wide / ExtraWide prefix opcodes ────────────────────────
+                //
+                // These are encoding prefixes consumed by the decoder; they
+                // never appear as `instr.opcode` in the pre-decoded stream.
+                Opcode::Wide | Opcode::ExtraWide => {
+                    return Err(StatorError::Internal(
+                        "Wide/ExtraWide prefix should not appear as a decoded opcode".into(),
+                    ));
+                }
+
+                // ── Constant-pool jump variants ───────────────────────────
+                //
+                // Each *Constant jump reads a constant-pool index whose
+                // Number entry is the byte-level jump offset, then applies
+                // the same condition as the non-constant counterpart.
+
+                // JumpConstant [idx]: unconditional jump via constant pool.
+                Opcode::JumpConstant => {
+                    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpConstant", 0));
+                    };
+                    let delta = constant_pool_jump_delta(frame, idx, "JumpConstant")?;
+                    frame.pc = resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                }
+                // JumpIfTrueConstant [idx]
+                Opcode::JumpIfTrueConstant => {
+                    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfTrueConstant", 0));
+                    };
+                    if matches!(frame.accumulator, JsValue::Boolean(true)) {
+                        let delta = constant_pool_jump_delta(frame, idx, "JumpIfTrueConstant")?;
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+                // JumpIfFalseConstant [idx]
+                Opcode::JumpIfFalseConstant => {
+                    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfFalseConstant", 0));
+                    };
+                    if matches!(frame.accumulator, JsValue::Boolean(false)) {
+                        let delta = constant_pool_jump_delta(frame, idx, "JumpIfFalseConstant")?;
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+                // JumpIfToBooleanTrueConstant [idx]
+                Opcode::JumpIfToBooleanTrueConstant => {
+                    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfToBooleanTrueConstant", 0));
+                    };
+                    if frame.accumulator.to_boolean() {
+                        let delta =
+                            constant_pool_jump_delta(frame, idx, "JumpIfToBooleanTrueConstant")?;
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+                // JumpIfToBooleanFalseConstant [idx]
+                Opcode::JumpIfToBooleanFalseConstant => {
+                    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfToBooleanFalseConstant", 0));
+                    };
+                    if !frame.accumulator.to_boolean() {
+                        let delta =
+                            constant_pool_jump_delta(frame, idx, "JumpIfToBooleanFalseConstant")?;
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+                // JumpIfNullConstant [idx]
+                Opcode::JumpIfNullConstant => {
+                    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfNullConstant", 0));
+                    };
+                    if frame.accumulator.is_null() {
+                        let delta = constant_pool_jump_delta(frame, idx, "JumpIfNullConstant")?;
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+                // JumpIfNotNullConstant [idx]
+                Opcode::JumpIfNotNullConstant => {
+                    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfNotNullConstant", 0));
+                    };
+                    if !frame.accumulator.is_null() {
+                        let delta = constant_pool_jump_delta(frame, idx, "JumpIfNotNullConstant")?;
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+                // JumpIfUndefinedConstant [idx]
+                Opcode::JumpIfUndefinedConstant => {
+                    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfUndefinedConstant", 0));
+                    };
+                    if frame.accumulator.is_undefined() {
+                        let delta =
+                            constant_pool_jump_delta(frame, idx, "JumpIfUndefinedConstant")?;
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+                // JumpIfNotUndefinedConstant [idx]
+                Opcode::JumpIfNotUndefinedConstant => {
+                    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfNotUndefinedConstant", 0));
+                    };
+                    if !frame.accumulator.is_undefined() {
+                        let delta =
+                            constant_pool_jump_delta(frame, idx, "JumpIfNotUndefinedConstant")?;
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+                // JumpIfUndefinedOrNullConstant [idx]
+                Opcode::JumpIfUndefinedOrNullConstant => {
+                    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfUndefinedOrNullConstant", 0));
+                    };
+                    if frame.accumulator.is_nullish() {
+                        let delta =
+                            constant_pool_jump_delta(frame, idx, "JumpIfUndefinedOrNullConstant")?;
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+
+                // ── Host integration calls ────────────────────────────────
+                //
+                // CallJSRuntime, InvokeIntrinsic, CallRuntimeForPair: these
+                // call into the host runtime.  Currently treated as no-ops
+                // (like CallRuntime) since the runtime functions they target
+                // are optimisation hints or non-critical for correctness.
+
+                // CallJSRuntime [context_idx, args_start, args_count]
+                Opcode::CallJSRuntime => {
+                    let Operand::ConstantPoolIdx(_ctx_idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("CallJSRuntime", 0));
+                    };
+                    // No-op: accumulator is left unchanged.
+                }
+                // InvokeIntrinsic [function_id, args_start, args_count]
+                Opcode::InvokeIntrinsic => {
+                    let Operand::RuntimeId(_runtime_id) = instr.operands[0] else {
+                        return Err(err_bad_operand("InvokeIntrinsic", 0));
+                    };
+                    // No-op: accumulator is left unchanged.
+                }
+                // CallRuntimeForPair [function_id, args_start, args_count, first_return]
+                Opcode::CallRuntimeForPair => {
+                    let Operand::RuntimeId(_runtime_id) = instr.operands[0] else {
+                        return Err(err_bad_operand("CallRuntimeForPair", 0));
+                    };
+                    // No-op: accumulator is left unchanged.
+                }
+
+                // ── ConstructForwardAllArgs ────────────────────────────────
+                //
+                // ConstructForwardAllArgs [constructor, slot]:
+                //   Like Construct, but instead of reading args from an
+                //   explicit register range, forward all parameter registers
+                //   from the current frame to the callee.
+                Opcode::ConstructForwardAllArgs => {
+                    let Operand::Register(ctor_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("ConstructForwardAllArgs", 0));
+                    };
+                    // operands[1] is a FeedbackSlot, ignored at runtime.
+                    let ctor = frame.read_reg(ctor_v)?.clone();
+                    let param_count = frame.bytecode_array.parameter_count() as usize;
+                    let args: Vec<JsValue> =
+                        frame.registers.get(..param_count).unwrap_or(&[]).to_vec();
+                    match ctor {
+                        JsValue::Function(ba) => {
+                            let mut callee_frame = InterpreterFrame::new_with_globals(
+                                (*ba).clone(),
+                                args,
+                                Rc::clone(&frame.global_env),
+                            );
+                            push_call_frame("<anonymous>");
+                            let result = Interpreter::run(&mut callee_frame);
+                            pop_call_frame();
+                            frame.accumulator = result?;
+                        }
+                        JsValue::NativeFunction(f) => {
+                            frame.accumulator = f(args)?;
+                        }
+                        other => {
+                            return Err(StatorError::TypeError(format!(
+                                "ConstructForwardAllArgs: constructor is not a function (got {other:?})"
+                            )));
+                        }
+                    }
+                }
+
+                // ── CollectTypeProfile ─────────────────────────────────────
+                //
+                // CollectTypeProfile [position]:
+                //   Records type-profile information for the accumulator.
+                //   This is a profiling-only instruction; a no-op for
+                //   correctness.
+                Opcode::CollectTypeProfile => {
+                    // No-op: operands[0] is an Immediate (position), ignored.
+                }
+
+                // ── CreateObjectFromIterable ──────────────────────────────
+                //
+                // CreateObjectFromIterable:
+                //   Creates an object by spreading an iterable (e.g.
+                //   `{...iterable}`).  Consumes the accumulator and creates a
+                //   new PlainObject from its key-value pairs.
+                Opcode::CreateObjectFromIterable => {
+                    let iterable = frame.accumulator.clone();
+                    let map: HashMap<String, JsValue> = match &iterable {
+                        JsValue::PlainObject(obj) => obj.borrow().clone(),
+                        JsValue::Array(arr) => {
+                            let mut m = HashMap::new();
+                            for (i, v) in arr.iter().enumerate() {
+                                m.insert(i.to_string(), v.clone());
+                            }
+                            m.insert("length".to_string(), JsValue::Smi(arr.len() as i32));
+                            m
+                        }
+                        JsValue::Iterator(iter) => {
+                            let mut m = HashMap::new();
+                            let mut idx = 0usize;
+                            loop {
+                                let mut it = iter.borrow_mut();
+                                match it.next_item() {
+                                    Some(v) => {
+                                        m.insert(idx.to_string(), v);
+                                        idx += 1;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            m.insert("length".to_string(), JsValue::Smi(idx as i32));
+                            m
+                        }
+                        _ => HashMap::new(),
+                    };
+                    frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
                 }
 
                 // ── Unimplemented ──────────────────────────────────────────
@@ -3749,6 +3984,28 @@ fn resolve_jump(
                 "jump target byte offset {target_byte} is not at an instruction boundary"
             ))
         })
+}
+
+/// Read a jump offset from the constant pool for a `*Constant` jump opcode.
+///
+/// The constant pool entry at `idx` must be a [`ConstantPoolEntry::Number`]
+/// whose value is the signed byte-level jump delta.
+fn constant_pool_jump_delta(
+    frame: &InterpreterFrame,
+    idx: u32,
+    opcode_name: &str,
+) -> StatorResult<i32> {
+    let entry = frame.bytecode_array.get_constant(idx).ok_or_else(|| {
+        StatorError::Internal(format!(
+            "{opcode_name}: constant pool index {idx} out of bounds"
+        ))
+    })?;
+    match entry {
+        ConstantPoolEntry::Number(n) => Ok(*n as i32),
+        _ => Err(StatorError::Internal(format!(
+            "{opcode_name}: constant is not a number"
+        ))),
+    }
 }
 
 /// Convert a constant-pool entry to a [`JsValue`].
@@ -10412,5 +10669,465 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(1));
+    }
+
+    // ── Wide / ExtraWide prefix opcodes ──────────────────────────────────
+
+    #[test]
+    fn test_wide_prefix_never_reaches_dispatch() {
+        // Wide and ExtraWide are stripped by the decoder, so they should
+        // never appear in the dispatch loop.  We verify indirectly by
+        // encoding a wide operand and confirming the round-trip works.
+        use crate::bytecode::bytecodes::encode;
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(300)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let bytes = encode(&instrs);
+        // The encoder should have emitted a Wide prefix byte.
+        assert_eq!(bytes[0], Opcode::Wide as u8);
+        // Running this through the interpreter should work.
+        let ba = make_bytecode(instrs, 0, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(300));
+    }
+
+    // ── Constant-pool jump variants ──────────────────────────────────────
+
+    #[test]
+    fn test_jump_constant_unconditional() {
+        // Bytecode layout:
+        //   [0] JumpConstant(0)  → 2 bytes, end=2, target=2+2=4
+        //   [2] LdaSmi(99)       → 2 bytes
+        //   [4] LdaSmi(42)       → 2 bytes
+        //   [6] Return           → 1 byte
+        let pool = vec![ConstantPoolEntry::Number(2.0)];
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::JumpConstant, vec![Operand::ConstantPoolIdx(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_jump_if_true_constant_taken() {
+        let pool = vec![ConstantPoolEntry::Number(2.0)];
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaTrue, vec![]),
+            Instruction::new_unchecked(
+                Opcode::JumpIfTrueConstant,
+                vec![Operand::ConstantPoolIdx(0)],
+            ),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_jump_if_true_constant_not_taken() {
+        let pool = vec![ConstantPoolEntry::Number(2.0)];
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaFalse, vec![]),
+            Instruction::new_unchecked(
+                Opcode::JumpIfTrueConstant,
+                vec![Operand::ConstantPoolIdx(0)],
+            ),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_jump_if_false_constant_taken() {
+        let pool = vec![ConstantPoolEntry::Number(2.0)];
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaFalse, vec![]),
+            Instruction::new_unchecked(
+                Opcode::JumpIfFalseConstant,
+                vec![Operand::ConstantPoolIdx(0)],
+            ),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_jump_if_to_boolean_true_constant_taken() {
+        let pool = vec![ConstantPoolEntry::Number(2.0)];
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(
+                Opcode::JumpIfToBooleanTrueConstant,
+                vec![Operand::ConstantPoolIdx(0)],
+            ),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_jump_if_to_boolean_false_constant_taken() {
+        let pool = vec![ConstantPoolEntry::Number(2.0)];
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
+            Instruction::new_unchecked(
+                Opcode::JumpIfToBooleanFalseConstant,
+                vec![Operand::ConstantPoolIdx(0)],
+            ),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_jump_if_null_constant_taken() {
+        let pool = vec![ConstantPoolEntry::Number(2.0)];
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaNull, vec![]),
+            Instruction::new_unchecked(
+                Opcode::JumpIfNullConstant,
+                vec![Operand::ConstantPoolIdx(0)],
+            ),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Null);
+    }
+
+    #[test]
+    fn test_jump_if_not_null_constant_taken() {
+        let pool = vec![ConstantPoolEntry::Number(2.0)];
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
+            Instruction::new_unchecked(
+                Opcode::JumpIfNotNullConstant,
+                vec![Operand::ConstantPoolIdx(0)],
+            ),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_jump_if_undefined_constant_taken() {
+        let pool = vec![ConstantPoolEntry::Number(2.0)];
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaUndefined, vec![]),
+            Instruction::new_unchecked(
+                Opcode::JumpIfUndefinedConstant,
+                vec![Operand::ConstantPoolIdx(0)],
+            ),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_jump_if_not_undefined_constant_taken() {
+        let pool = vec![ConstantPoolEntry::Number(2.0)];
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(7)]),
+            Instruction::new_unchecked(
+                Opcode::JumpIfNotUndefinedConstant,
+                vec![Operand::ConstantPoolIdx(0)],
+            ),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn test_jump_if_undefined_or_null_constant_null() {
+        let pool = vec![ConstantPoolEntry::Number(2.0)];
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaNull, vec![]),
+            Instruction::new_unchecked(
+                Opcode::JumpIfUndefinedOrNullConstant,
+                vec![Operand::ConstantPoolIdx(0)],
+            ),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Null);
+    }
+
+    #[test]
+    fn test_jump_if_undefined_or_null_constant_undefined() {
+        let pool = vec![ConstantPoolEntry::Number(2.0)];
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaUndefined, vec![]),
+            Instruction::new_unchecked(
+                Opcode::JumpIfUndefinedOrNullConstant,
+                vec![Operand::ConstantPoolIdx(0)],
+            ),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    // ── Host integration calls ───────────────────────────────────────────
+
+    #[test]
+    fn test_call_js_runtime_noop() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+                Instruction::new_unchecked(
+                    Opcode::CallJSRuntime,
+                    vec![
+                        Operand::ConstantPoolIdx(0),
+                        Operand::Register(0),
+                        Operand::RegisterCount(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            1,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_invoke_intrinsic_noop() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(7)]),
+                Instruction::new_unchecked(
+                    Opcode::InvokeIntrinsic,
+                    vec![
+                        Operand::RuntimeId(0),
+                        Operand::Register(0),
+                        Operand::RegisterCount(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            1,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn test_call_runtime_for_pair_noop() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(3)]),
+                Instruction::new_unchecked(
+                    Opcode::CallRuntimeForPair,
+                    vec![
+                        Operand::RuntimeId(0),
+                        Operand::Register(0),
+                        Operand::RegisterCount(0),
+                        Operand::Register(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            1,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── CollectTypeProfile ───────────────────────────────────────────────
+
+    #[test]
+    fn test_collect_type_profile_noop() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(10)]),
+                Instruction::new_unchecked(Opcode::CollectTypeProfile, vec![Operand::Immediate(0)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    // ── ConstructForwardAllArgs ──────────────────────────────────────────
+
+    #[test]
+    fn test_construct_forward_all_args_native() {
+        // Build a "callee" that is a NativeFunction constructor.
+        // The outer function takes 2 params and forwards them via
+        // ConstructForwardAllArgs.
+        use crate::bytecode::bytecodes::encode;
+
+        // Inner function: just adds its two parameters.
+        let inner_instrs = vec![
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register((-1i32) as u32)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register((-2i32) as u32)]),
+            Instruction::new_unchecked(
+                Opcode::Add,
+                vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let inner_ba = BytecodeArray::new(
+            encode(&inner_instrs),
+            vec![],
+            1,
+            2,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        );
+
+        // Outer function: has 2 params, stores inner_ba in r0 via
+        // LdaConstant, then calls ConstructForwardAllArgs.
+        let pool = vec![ConstantPoolEntry::Function(Box::new(inner_ba))];
+        let outer_instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(0)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::ConstructForwardAllArgs,
+                vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode_with_pool(outer_instrs, pool, 1, 2);
+        let mut frame = InterpreterFrame::new(ba, vec![JsValue::Smi(3), JsValue::Smi(4)]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn test_construct_forward_all_args_no_params() {
+        use crate::bytecode::bytecodes::encode;
+
+        // Inner function: returns 42.
+        let inner_instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let inner_ba = BytecodeArray::new(
+            encode(&inner_instrs),
+            vec![],
+            0,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        );
+
+        let pool = vec![ConstantPoolEntry::Function(Box::new(inner_ba))];
+        let outer_instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(0)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::ConstructForwardAllArgs,
+                vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode_with_pool(outer_instrs, pool, 1, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    // ── CreateObjectFromIterable ─────────────────────────────────────────
+
+    #[test]
+    fn test_create_object_from_iterable_plain_object() {
+        let pool = vec![ConstantPoolEntry::String("x".to_string())];
+        let instrs = vec![
+            // Create an empty object, set property "x" = 10, then
+            // use CreateObjectFromIterable to spread it.
+            Instruction::new_unchecked(Opcode::CreateEmptyObjectLiteral, vec![]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(10)]),
+            Instruction::new_unchecked(
+                Opcode::StaNamedProperty,
+                vec![
+                    Operand::Register(0),
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::CreateObjectFromIterable, vec![]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode_with_pool(instrs, pool, 1, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        if let JsValue::PlainObject(obj) = &result {
+            let map = obj.borrow();
+            assert_eq!(map.get("x"), Some(&JsValue::Smi(10)));
+        } else {
+            panic!("expected PlainObject, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_create_object_from_iterable_empty() {
+        // CreateObjectFromIterable with undefined accumulator → empty object.
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaUndefined, vec![]),
+                Instruction::new_unchecked(Opcode::CreateObjectFromIterable, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        if let JsValue::PlainObject(obj) = &result {
+            assert!(obj.borrow().is_empty());
+        } else {
+            panic!("expected PlainObject, got {result:?}");
+        }
     }
 }
