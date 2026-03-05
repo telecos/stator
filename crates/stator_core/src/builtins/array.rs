@@ -664,6 +664,192 @@ pub fn array_symbol_iterator(arr: &JsArray) -> Vec<JsValue> {
     array_values(arr)
 }
 
+// ── findLast ──────────────────────────────────────────────────────────────────
+
+/// ECMAScript §23.1.3.11 `Array.prototype.findLast(callbackFn)`.
+///
+/// Returns the last element for which `f(element, index)` is `true`, or
+/// [`JsValue::Undefined`] if none is found.
+pub fn array_find_last(arr: &JsArray, mut f: impl FnMut(&JsValue, u32) -> bool) -> JsValue {
+    let len = arr.length();
+    for i in (0..len).rev() {
+        let v = arr.get(i);
+        if f(&v, i) {
+            return v;
+        }
+    }
+    JsValue::Undefined
+}
+
+// ── findLastIndex ─────────────────────────────────────────────────────────────
+
+/// ECMAScript §23.1.3.12 `Array.prototype.findLastIndex(callbackFn)`.
+///
+/// Returns `Some(index)` of the last element for which `f(element, index)` is
+/// `true`, or `None` if none is found.
+pub fn array_find_last_index(
+    arr: &JsArray,
+    mut f: impl FnMut(&JsValue, u32) -> bool,
+) -> Option<u32> {
+    let len = arr.length();
+    for i in (0..len).rev() {
+        let v = arr.get(i);
+        if f(&v, i) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+// ── lastIndexOf ───────────────────────────────────────────────────────────────
+
+/// ECMAScript §23.1.3.17 `Array.prototype.lastIndexOf(searchElement, fromIndex?)`.
+///
+/// Returns `Some(index)` of the last element strictly equal to `value` at or
+/// before `from_index`, using strict equality (`===`; `NaN !== NaN`).
+///
+/// If `from_index` is `None`, the search starts at the last element.
+/// Negative `from_index` is interpreted as an offset from the end.
+pub fn array_last_index_of(arr: &JsArray, value: &JsValue, from_index: Option<i64>) -> Option<u32> {
+    let len = arr.length();
+    if len == 0 {
+        return None;
+    }
+    let start = match from_index {
+        Some(fi) if fi < 0 => {
+            let idx = len as i64 + fi;
+            if idx < 0 {
+                return None;
+            }
+            idx as u32
+        }
+        Some(fi) => (fi as u32).min(len - 1),
+        None => len - 1,
+    };
+    (0..=start)
+        .rev()
+        .find(|&i| strict_equal(&arr.get(i), value))
+}
+
+// ── reduceRight ───────────────────────────────────────────────────────────────
+
+/// ECMAScript §23.1.3.23 `Array.prototype.reduceRight(callbackFn, initialValue?)`.
+///
+/// Like [`array_reduce`] but iterates from the last element to the first.
+pub fn array_reduce_right(
+    arr: &JsArray,
+    mut f: impl FnMut(JsValue, &JsValue, u32) -> JsValue,
+    initial: Option<JsValue>,
+) -> StatorResult<JsValue> {
+    let len = arr.length();
+    let (mut acc, start_inclusive) = if let Some(init) = initial {
+        if len == 0 {
+            return Ok(init);
+        }
+        (init, len - 1)
+    } else {
+        if len == 0 {
+            return Err(StatorError::TypeError(
+                "Reduce of empty array with no initial value".to_string(),
+            ));
+        }
+        if len == 1 {
+            return Ok(arr.get(0));
+        }
+        (arr.get(len - 1), len - 2)
+    };
+    for i in (0..=start_inclusive).rev() {
+        let v = arr.get(i);
+        acc = f(acc, &v, i);
+    }
+    Ok(acc)
+}
+
+// ── copyWithin ────────────────────────────────────────────────────────────────
+
+/// ECMAScript §23.1.3.3 `Array.prototype.copyWithin(target, start, end?)`.
+///
+/// Copies the sequence of elements from `[start, end)` to position `target`,
+/// without changing the array's length.  Negative indices are relative to the
+/// end.
+pub fn array_copy_within(arr: &mut JsArray, target: i64, start: i64, end: Option<i64>) {
+    let len = arr.length();
+    let to = resolve_relative_index(target, len);
+    let from = resolve_relative_index(start, len);
+    let fin = end.map(|e| resolve_relative_index(e, len)).unwrap_or(len);
+    let count = ((fin as i64 - from as i64).max(0) as u32).min(len - to);
+    // Copy to a temp buffer to handle overlapping regions.
+    let buf: Vec<JsValue> = (0..count).map(|i| arr.get(from + i)).collect();
+    for (i, v) in buf.into_iter().enumerate() {
+        arr.set(to + i as u32, v);
+    }
+}
+
+// ── toReversed ────────────────────────────────────────────────────────────────
+
+/// ECMAScript §23.1.3.31 `Array.prototype.toReversed()`.
+///
+/// Returns a new [`JsArray`] with the elements in reverse order.
+/// The original array is unchanged.
+pub fn array_to_reversed(arr: &JsArray) -> JsArray {
+    let len = arr.length();
+    let mut result = JsArray::new();
+    for i in (0..len).rev() {
+        result.push(arr.get(i));
+    }
+    result
+}
+
+// ── toSorted ──────────────────────────────────────────────────────────────────
+
+/// ECMAScript §23.1.3.32 `Array.prototype.toSorted(compareFn?)`.
+///
+/// Returns a new sorted [`JsArray`] without mutating the original.
+pub fn array_to_sorted(
+    arr: &JsArray,
+    comparator: Option<impl FnMut(&JsValue, &JsValue) -> std::cmp::Ordering>,
+) -> StatorResult<JsArray> {
+    let mut copy = array_slice(arr, None, None);
+    array_sort(&mut copy, comparator)?;
+    Ok(copy)
+}
+
+// ── toSpliced ─────────────────────────────────────────────────────────────────
+
+/// ECMAScript §23.1.3.33 `Array.prototype.toSpliced(start, deleteCount, ...items)`.
+///
+/// Returns a new [`JsArray`] with the splice applied, leaving the original
+/// unchanged.
+pub fn array_to_spliced(
+    arr: &JsArray,
+    start: i64,
+    delete_count: Option<u32>,
+    items: &[JsValue],
+) -> JsArray {
+    let mut copy = array_slice(arr, None, None);
+    let _ = array_splice(&mut copy, start, delete_count, items);
+    copy
+}
+
+// ── with ──────────────────────────────────────────────────────────────────────
+
+/// ECMAScript §23.1.3.36 `Array.prototype.with(index, value)`.
+///
+/// Returns a new [`JsArray`] identical to `arr` except that the element at
+/// `index` is replaced with `value`.
+///
+/// Returns [`StatorError::RangeError`] if `index` is out of bounds.
+pub fn array_with(arr: &JsArray, index: i64, value: JsValue) -> StatorResult<JsArray> {
+    let len = arr.length() as i64;
+    let actual = if index < 0 { len + index } else { index };
+    if actual < 0 || actual >= len {
+        return Err(StatorError::RangeError(format!("Invalid index : {index}")));
+    }
+    let mut result = array_slice(arr, None, None);
+    result.set(actual as u32, value);
+    Ok(result)
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Converts a relative integer index to an absolute `u32` clamped to
@@ -1508,5 +1694,224 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0], (0, JsValue::Undefined));
         assert_eq!(entries[2], (2, JsValue::Smi(7)));
+    }
+
+    // ── array_find_last ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_array_find_last_returns_last_match() {
+        let arr = array_of(&[JsValue::Smi(1), JsValue::Smi(3), JsValue::Smi(5)]);
+        let found = array_find_last(&arr, |v, _| matches!(v, JsValue::Smi(n) if *n > 2));
+        assert_eq!(found, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_array_find_last_no_match_returns_undefined() {
+        let arr = array_of(&[JsValue::Smi(1), JsValue::Smi(2)]);
+        assert_eq!(array_find_last(&arr, |_, _| false), JsValue::Undefined);
+    }
+
+    // ── array_find_last_index ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_array_find_last_index_returns_last() {
+        let arr = array_of(&[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let idx = array_find_last_index(&arr, |v, _| matches!(v, JsValue::Smi(n) if *n >= 2));
+        assert_eq!(idx, Some(2));
+    }
+
+    #[test]
+    fn test_array_find_last_index_no_match_returns_none() {
+        let arr = array_of(&[JsValue::Smi(1)]);
+        assert_eq!(array_find_last_index(&arr, |_, _| false), None);
+    }
+
+    // ── array_last_index_of ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_array_last_index_of_finds_last() {
+        let arr = array_of(&[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(1)]);
+        assert_eq!(array_last_index_of(&arr, &JsValue::Smi(1), None), Some(2));
+    }
+
+    #[test]
+    fn test_array_last_index_of_with_from_index() {
+        let arr = array_of(&[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(1)]);
+        assert_eq!(
+            array_last_index_of(&arr, &JsValue::Smi(1), Some(1)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_array_last_index_of_not_found() {
+        let arr = array_of(&[JsValue::Smi(1)]);
+        assert_eq!(array_last_index_of(&arr, &JsValue::Smi(9), None), None);
+    }
+
+    #[test]
+    fn test_array_last_index_of_negative_from_index() {
+        let arr = array_of(&[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(1)]);
+        // from = -2 → index 1.
+        assert_eq!(
+            array_last_index_of(&arr, &JsValue::Smi(1), Some(-2)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_array_last_index_of_empty_array() {
+        let arr = JsArray::new();
+        assert_eq!(array_last_index_of(&arr, &JsValue::Smi(1), None), None);
+    }
+
+    // ── array_reduce_right ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_array_reduce_right_with_initial() {
+        let arr = array_of(&[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let result = array_reduce_right(
+            &arr,
+            |acc, v, _| {
+                if let (JsValue::Smi(a), JsValue::Smi(b)) = (acc, v) {
+                    JsValue::Smi(a + b)
+                } else {
+                    JsValue::Undefined
+                }
+            },
+            Some(JsValue::Smi(0)),
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn test_array_reduce_right_without_initial() {
+        // [1, 2, 3] reduceRight with subtraction: 3 - 2 - 1 = 0
+        let arr = array_of(&[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let result = array_reduce_right(
+            &arr,
+            |acc, v, _| {
+                if let (JsValue::Smi(a), JsValue::Smi(b)) = (acc, v) {
+                    JsValue::Smi(a - b)
+                } else {
+                    JsValue::Undefined
+                }
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_array_reduce_right_empty_without_initial_is_error() {
+        let arr = JsArray::new();
+        let err = array_reduce_right(&arr, |acc, _, _| acc, None);
+        assert!(matches!(err, Err(StatorError::TypeError(_))));
+    }
+
+    // ── array_copy_within ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_array_copy_within_basic() {
+        let mut arr = array_of(&[
+            JsValue::Smi(1),
+            JsValue::Smi(2),
+            JsValue::Smi(3),
+            JsValue::Smi(4),
+            JsValue::Smi(5),
+        ]);
+        array_copy_within(&mut arr, 0, 3, None);
+        assert_eq!(arr.get(0), JsValue::Smi(4));
+        assert_eq!(arr.get(1), JsValue::Smi(5));
+        assert_eq!(arr.get(2), JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_array_copy_within_negative_target() {
+        let mut arr = array_of(&[
+            JsValue::Smi(1),
+            JsValue::Smi(2),
+            JsValue::Smi(3),
+            JsValue::Smi(4),
+        ]);
+        // target=-2 → index 2, copy from 0..2 → [1,2] into positions 2,3
+        array_copy_within(&mut arr, -2, 0, Some(2));
+        assert_eq!(arr.get(2), JsValue::Smi(1));
+        assert_eq!(arr.get(3), JsValue::Smi(2));
+    }
+
+    // ── array_to_reversed ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_array_to_reversed_returns_new_array() {
+        let arr = array_of(&[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let reversed = array_to_reversed(&arr);
+        assert_eq!(reversed.get(0), JsValue::Smi(3));
+        assert_eq!(reversed.get(1), JsValue::Smi(2));
+        assert_eq!(reversed.get(2), JsValue::Smi(1));
+        // Original unchanged.
+        assert_eq!(arr.get(0), JsValue::Smi(1));
+    }
+
+    // ── array_to_sorted ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_array_to_sorted_returns_new_array() {
+        let arr = array_of(&[JsValue::Smi(3), JsValue::Smi(1), JsValue::Smi(2)]);
+        let sorted = array_to_sorted(
+            &arr,
+            Some(|a: &JsValue, b: &JsValue| {
+                let na = if let JsValue::Smi(n) = a { *n } else { 0 };
+                let nb = if let JsValue::Smi(n) = b { *n } else { 0 };
+                na.cmp(&nb)
+            }),
+        )
+        .unwrap();
+        assert_eq!(sorted.get(0), JsValue::Smi(1));
+        assert_eq!(sorted.get(1), JsValue::Smi(2));
+        assert_eq!(sorted.get(2), JsValue::Smi(3));
+        // Original unchanged.
+        assert_eq!(arr.get(0), JsValue::Smi(3));
+    }
+
+    // ── array_to_spliced ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_array_to_spliced_returns_new_array() {
+        let arr = array_of(&[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let spliced = array_to_spliced(&arr, 1, Some(1), &[JsValue::Smi(99)]);
+        assert_eq!(spliced.length(), 3);
+        assert_eq!(spliced.get(1), JsValue::Smi(99));
+        // Original unchanged.
+        assert_eq!(arr.get(1), JsValue::Smi(2));
+    }
+
+    // ── array_with ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_array_with_positive_index() {
+        let arr = array_of(&[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let result = array_with(&arr, 1, JsValue::Smi(99)).unwrap();
+        assert_eq!(result.get(1), JsValue::Smi(99));
+        // Original unchanged.
+        assert_eq!(arr.get(1), JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_array_with_negative_index() {
+        let arr = array_of(&[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let result = array_with(&arr, -1, JsValue::Smi(99)).unwrap();
+        assert_eq!(result.get(2), JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_array_with_out_of_bounds() {
+        let arr = array_of(&[JsValue::Smi(1)]);
+        assert!(matches!(
+            array_with(&arr, 5, JsValue::Smi(1)),
+            Err(StatorError::RangeError(_))
+        ));
     }
 }
