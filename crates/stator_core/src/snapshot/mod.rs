@@ -125,6 +125,7 @@ const CPE_BOOLEAN: u8 = 0x02;
 const CPE_NULL: u8 = 0x03;
 const CPE_UNDEFINED: u8 = 0x04;
 const CPE_FUNCTION: u8 = 0x05;
+const CPE_TEMPLATE_OBJECT: u8 = 0x06;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // StartupSnapshot
@@ -407,6 +408,22 @@ fn write_constant_pool_entry(buf: &mut Vec<u8>, entry: &ConstantPoolEntry) {
         ConstantPoolEntry::Function(ba) => {
             write_u8(buf, CPE_FUNCTION);
             write_bytecode_array(buf, ba);
+        }
+        ConstantPoolEntry::TemplateObject { cooked, raw } => {
+            write_u8(buf, CPE_TEMPLATE_OBJECT);
+            write_u32(buf, cooked.len() as u32);
+            for c in cooked {
+                match c {
+                    Some(s) => {
+                        write_u8(buf, 1);
+                        write_str32(buf, s);
+                    }
+                    None => write_u8(buf, 0),
+                }
+            }
+            for r in raw {
+                write_str32(buf, r);
+            }
         }
     }
 }
@@ -710,6 +727,23 @@ fn read_constant_pool_entry(bytes: &[u8], cursor: &mut usize) -> StatorResult<Co
         CPE_FUNCTION => {
             let ba = read_bytecode_array(bytes, cursor)?;
             Ok(ConstantPoolEntry::Function(Box::new(ba)))
+        }
+        CPE_TEMPLATE_OBJECT => {
+            let len = read_u32(bytes, cursor)? as usize;
+            let mut cooked = Vec::with_capacity(len);
+            for _ in 0..len {
+                let has = read_u8(bytes, cursor)?;
+                if has == 1 {
+                    cooked.push(Some(read_str32(bytes, cursor)?));
+                } else {
+                    cooked.push(None);
+                }
+            }
+            let mut raw = Vec::with_capacity(len);
+            for _ in 0..len {
+                raw.push(read_str32(bytes, cursor)?);
+            }
+            Ok(ConstantPoolEntry::TemplateObject { cooked, raw })
         }
         other => Err(StatorError::Internal(format!(
             "snapshot: unknown ConstantPoolEntry tag {other:#04x}"

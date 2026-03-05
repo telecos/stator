@@ -2243,6 +2243,20 @@ impl<'src> Parser<'src> {
                         arguments: args,
                     }));
                 }
+                TokenKind::NoSubstitutionTemplate | TokenKind::TemplateHead => {
+                    // Tagged template: expr`template`
+                    let tpl_expr = self.parse_primary()?;
+                    let quasi = match tpl_expr {
+                        Expr::Template(t) => *t,
+                        _ => unreachable!("template token must produce Expr::Template"),
+                    };
+                    let end = quasi.loc;
+                    expr = Expr::TaggedTemplate(Box::new(crate::parser::ast::TaggedTemplateExpr {
+                        loc: Self::merge_spans(start, end),
+                        tag: Box::new(expr),
+                        quasi,
+                    }));
+                }
                 _ => break,
             }
         }
@@ -5836,6 +5850,72 @@ mod tests {
             );
         } else {
             panic!("expected ForOf statement");
+        }
+    }
+
+    // ── Tagged template literal parsing ─────────────────────────────────
+
+    #[test]
+    fn test_tagged_template_no_substitution() {
+        let prog = parse("tag`hello`").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            assert!(
+                matches!(es.expr.as_ref(), Expr::TaggedTemplate(_)),
+                "expected TaggedTemplate, got {:?}",
+                es.expr
+            );
+            if let Expr::TaggedTemplate(t) = es.expr.as_ref() {
+                assert!(matches!(t.tag.as_ref(), Expr::Ident(_)));
+                assert_eq!(t.quasi.quasis.len(), 1);
+                assert_eq!(t.quasi.expressions.len(), 0);
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_tagged_template_with_interpolation() {
+        let prog = parse("tag`a${x}b`").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::TaggedTemplate(t) = es.expr.as_ref() {
+                assert_eq!(t.quasi.quasis.len(), 2);
+                assert_eq!(t.quasi.expressions.len(), 1);
+            } else {
+                panic!("expected TaggedTemplate");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_tagged_template_member_tag() {
+        let prog = parse("foo.bar`hello`").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::TaggedTemplate(t) = es.expr.as_ref() {
+                assert!(matches!(t.tag.as_ref(), Expr::Member(_)));
+                assert_eq!(t.quasi.quasis.len(), 1);
+            } else {
+                panic!("expected TaggedTemplate");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_tagged_template_chained() {
+        // tag`a``b` should parse as (tag`a`)`b`
+        let prog = parse("tag`a``b`").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::TaggedTemplate(outer) = es.expr.as_ref() {
+                assert!(matches!(outer.tag.as_ref(), Expr::TaggedTemplate(_)));
+            } else {
+                panic!("expected nested TaggedTemplate");
+            }
+        } else {
+            panic!("expected expression statement");
         }
     }
 }

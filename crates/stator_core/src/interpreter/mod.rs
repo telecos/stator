@@ -4024,7 +4024,39 @@ fn constant_to_value(entry: &ConstantPoolEntry) -> JsValue {
         ConstantPoolEntry::Null => JsValue::Null,
         ConstantPoolEntry::Undefined => JsValue::Undefined,
         ConstantPoolEntry::Function(ba) => JsValue::Function(Rc::new((**ba).clone())),
+        ConstantPoolEntry::TemplateObject { cooked, raw } => build_template_object(cooked, raw),
     }
+}
+
+/// Build the frozen template-strings object passed as the first argument to
+/// a tagged-template function.
+///
+/// The result is a `PlainObject` with indexed cooked strings, a `length`
+/// property, and a `raw` sub-object with the same layout holding the raw
+/// (un-escaped) strings.
+fn build_template_object(cooked: &[Option<String>], raw: &[String]) -> JsValue {
+    let mut map = HashMap::new();
+    for (i, c) in cooked.iter().enumerate() {
+        let val = match c {
+            Some(s) => JsValue::String(s.clone()),
+            None => JsValue::Undefined,
+        };
+        map.insert(i.to_string(), val);
+    }
+    map.insert("length".to_string(), JsValue::Smi(cooked.len() as i32));
+
+    let mut raw_map = HashMap::new();
+    for (i, r) in raw.iter().enumerate() {
+        raw_map.insert(i.to_string(), JsValue::String(r.clone()));
+    }
+    raw_map.insert("length".to_string(), JsValue::Smi(raw.len() as i32));
+
+    map.insert(
+        "raw".to_string(),
+        JsValue::PlainObject(Rc::new(RefCell::new(raw_map))),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(map)))
 }
 
 /// Decode a constant-pool string entry into its runtime string value.
@@ -11129,5 +11161,58 @@ mod tests {
         } else {
             panic!("expected PlainObject, got {result:?}");
         }
+    }
+
+    // ── Tagged template literal integration tests ───────────────────────
+
+    /// Compile a JavaScript source string and run it through the interpreter.
+    fn compile_source_and_run(src: &str) -> StatorResult<JsValue> {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        let program = crate::parser::recursive_descent::parse(src)?;
+        let ba = BytecodeGenerator::compile_program(&program)?;
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        Interpreter::run(&mut frame)
+    }
+
+    #[test]
+    fn test_tagged_template_basic_call() {
+        let result =
+            compile_source_and_run("function tag(strings) { return strings[0]; } tag`hello`")
+                .unwrap();
+        assert_eq!(result, JsValue::String("hello".to_string()));
+    }
+
+    #[test]
+    fn test_tagged_template_raw_property() {
+        let result =
+            compile_source_and_run("function tag(strings) { return strings.raw[0]; } tag`hello`")
+                .unwrap();
+        assert_eq!(result, JsValue::String("hello".to_string()));
+    }
+
+    #[test]
+    fn test_tagged_template_interpolation_args() {
+        let result = compile_source_and_run(
+            "function tag(strings, a, b) { return a + b; } tag`x${10}y${32}z`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_tagged_template_strings_length() {
+        let result = compile_source_and_run(
+            "function tag(strings) { return strings.length; } tag`a${1}b${2}c`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_tagged_template_no_substitution() {
+        let result =
+            compile_source_and_run("function tag(strings) { return strings.length; } tag`hello`")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
     }
 }

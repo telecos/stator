@@ -102,6 +102,16 @@ pub enum ConstantPoolEntry {
     Undefined,
     /// A compiled nested function or closure.
     Function(Box<BytecodeArray>),
+    /// A template-literal descriptor for [`Opcode::GetTemplateObject`](super::bytecodes::Opcode::GetTemplateObject).
+    ///
+    /// Holds the cooked strings (`None` when the segment has an invalid escape)
+    /// and the raw strings (backslash sequences preserved).
+    TemplateObject {
+        /// Cooked template strings.
+        cooked: Vec<Option<String>>,
+        /// Raw template strings.
+        raw: Vec<String>,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

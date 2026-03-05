@@ -1591,9 +1591,7 @@ impl FunctionCompiler {
                 self.compile_await(a)
             }
 
-            Expr::TaggedTemplate(_) => Err(StatorError::Internal(
-                "tagged template literals are not yet supported".into(),
-            )),
+            Expr::TaggedTemplate(t) => self.compile_tagged_template(t),
             Expr::Spread(_) => Err(StatorError::Internal(
                 "spread in expression position is not yet supported".into(),
             )),
@@ -2706,6 +2704,161 @@ impl FunctionCompiler {
             .release_temporary(acc_reg)
             .map_err(|e| StatorError::Internal(e.to_string()))?;
         Ok(())
+    }
+
+    // ── Tagged template literals ─────────────────────────────────────────────
+
+    /// Compile a tagged template expression `` tag`…` ``.
+    ///
+    /// Emits:
+    /// 1. The tag function expression.
+    /// 2. `GetTemplateObject` — loads or creates the frozen template-strings
+    ///    array (with `.raw`) from the constant pool.
+    /// 3. Each interpolated expression as additional arguments.
+    /// 4. A call instruction (`CallProperty` for method tags, otherwise
+    ///    `CallAnyReceiver`).
+    fn compile_tagged_template(
+        &mut self,
+        t: &crate::parser::ast::TaggedTemplateExpr,
+    ) -> StatorResult<()> {
+        // Method-call form: `obj.method`…`` — use correct `this`.
+        if let Expr::Member(m) = t.tag.as_ref() {
+            return self.compile_tagged_template_method(m, &t.quasi);
+        }
+
+        // General call form: `tag`…`` with undefined receiver.
+        self.compile_expr(&t.tag)?;
+        let callee_reg = self.allocator.allocate_temporary();
+        self.emit_star(callee_reg);
+
+        // First argument: the template object.
+        let tpl_idx = self.add_template_object(&t.quasi);
+        let tpl_slot = self.alloc_slot(FeedbackSlotKind::Literal);
+        self.emit(Instruction::new_unchecked(
+            Opcode::GetTemplateObject,
+            vec![Operand::ConstantPoolIdx(tpl_idx), tpl_slot],
+        ));
+        let tpl_reg = self.allocator.allocate_temporary();
+        self.emit_star(tpl_reg);
+
+        // Remaining arguments: interpolated expressions.
+        let mut arg_regs = vec![tpl_reg];
+        for expr in &t.quasi.expressions {
+            let r = self.allocator.allocate_temporary();
+            self.compile_expr(expr)?;
+            self.emit_star(r);
+            arg_regs.push(r);
+        }
+
+        self.emit_call_any_receiver(callee_reg, &arg_regs)?;
+
+        for r in arg_regs.into_iter().rev() {
+            self.allocator
+                .release_temporary(r)
+                .map_err(|e| StatorError::Internal(e.to_string()))?;
+        }
+        self.allocator
+            .release_temporary(callee_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Compile a tagged template where the tag is a member expression
+    /// (`obj.method`…``), preserving the correct `this` binding.
+    fn compile_tagged_template_method(
+        &mut self,
+        m: &crate::parser::ast::MemberExpr,
+        quasi: &crate::parser::ast::TemplateLit,
+    ) -> StatorResult<()> {
+        // Load the receiver (object).
+        self.compile_expr(&m.object)?;
+        let recv_reg = self.allocator.allocate_temporary();
+        self.emit_star(recv_reg);
+
+        // Load the method function from the object.
+        match &m.property {
+            crate::parser::ast::MemberProp::Ident(id) => {
+                let name_idx = self.add_string(&id.name);
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaNamedProperty,
+                    vec![
+                        to_reg_op(recv_reg),
+                        Operand::ConstantPoolIdx(name_idx),
+                        slot,
+                    ],
+                ));
+            }
+            crate::parser::ast::MemberProp::Computed(key) => {
+                self.compile_expr(key)?;
+                let slot = self.alloc_slot(FeedbackSlotKind::KeyedLoadProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaKeyedProperty,
+                    vec![to_reg_op(recv_reg), slot],
+                ));
+            }
+            crate::parser::ast::MemberProp::Private(_) => {
+                return Err(StatorError::Internal(
+                    "private tagged-template method calls are not yet supported".into(),
+                ));
+            }
+        }
+        let callee_reg = self.allocator.allocate_temporary();
+        self.emit_star(callee_reg);
+
+        // First argument: the template object.
+        let tpl_idx = self.add_template_object(quasi);
+        let tpl_slot = self.alloc_slot(FeedbackSlotKind::Literal);
+        self.emit(Instruction::new_unchecked(
+            Opcode::GetTemplateObject,
+            vec![Operand::ConstantPoolIdx(tpl_idx), tpl_slot],
+        ));
+
+        let mut arg_regs = Vec::with_capacity(1 + quasi.expressions.len());
+        let tpl_reg = self.allocator.allocate_temporary();
+        self.emit_star(tpl_reg);
+        arg_regs.push(tpl_reg);
+
+        for expr in &quasi.expressions {
+            let r = self.allocator.allocate_temporary();
+            self.compile_expr(expr)?;
+            self.emit_star(r);
+            arg_regs.push(r);
+        }
+
+        // CallProperty with the original receiver as `this`.
+        let arg_count = arg_regs.len() as u32;
+        let slot = self.alloc_slot(FeedbackSlotKind::Call);
+        self.emit(Instruction::new_unchecked(
+            Opcode::CallProperty,
+            vec![
+                to_reg_op(callee_reg),
+                to_reg_op(recv_reg),
+                Operand::RegisterCount(arg_count),
+                slot,
+            ],
+        ));
+
+        for r in arg_regs.into_iter().rev() {
+            self.allocator
+                .release_temporary(r)
+                .map_err(|e| StatorError::Internal(e.to_string()))?;
+        }
+        self.allocator
+            .release_temporary(callee_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        self.allocator
+            .release_temporary(recv_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Add a [`ConstantPoolEntry::TemplateObject`] for the given template
+    /// literal and return its constant-pool index.
+    fn add_template_object(&mut self, t: &crate::parser::ast::TemplateLit) -> u32 {
+        let cooked: Vec<Option<String>> = t.quasis.iter().map(|q| q.cooked.clone()).collect();
+        let raw: Vec<String> = t.quasis.iter().map(|q| q.raw.clone()).collect();
+        self.add_constant_raw(ConstantPoolEntry::TemplateObject { cooked, raw })
     }
 
     // ── Generator / yield ────────────────────────────────────────────────────
