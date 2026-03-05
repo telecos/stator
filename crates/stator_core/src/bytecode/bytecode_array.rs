@@ -221,6 +221,8 @@ pub struct BytecodeArray {
     /// [`crate::objects::value::JsValue::Generator`] without executing the
     /// body immediately.
     is_generator: bool,
+    /// `true` if this bytecode belongs to an async function or async generator.
+    is_async: bool,
     // ─── Tiering state (shared across clones via Rc / Arc) ───────────────────
     /// Number of times this function has been invoked.
     ///
@@ -270,6 +272,7 @@ impl PartialEq for BytecodeArray {
             && self.feedback_metadata == other.feedback_metadata
             && self.handler_table == other.handler_table
             && self.is_generator == other.is_generator
+            && self.is_async == other.is_async
     }
 }
 
@@ -305,6 +308,7 @@ impl BytecodeArray {
             feedback_metadata,
             handler_table,
             is_generator: false,
+            is_async: false,
             invocation_count: Rc::new(Cell::new(0)),
             jit_code: Rc::new(RefCell::new(None)),
             maglev_jit_code: Arc::new(Mutex::new(None)),
@@ -332,6 +336,21 @@ impl BytecodeArray {
     /// Returns `true` if this bytecode belongs to a `function*` generator.
     pub fn is_generator(&self) -> bool {
         self.is_generator
+    }
+
+    /// Mark this [`BytecodeArray`] as belonging to an async function.
+    ///
+    /// When combined with [`BytecodeArray::with_generator_flag`] this marks
+    /// the function as an async generator (`async function*`).
+    pub fn with_async_flag(mut self, flag: bool) -> Self {
+        self.is_async = flag;
+        self
+    }
+
+    /// Returns `true` if this bytecode belongs to an `async function` or
+    /// `async function*`.
+    pub fn is_async(&self) -> bool {
+        self.is_async
     }
 
     /// The raw encoded bytecode bytes.

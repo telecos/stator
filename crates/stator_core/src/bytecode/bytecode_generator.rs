@@ -183,6 +183,11 @@ struct FunctionCompiler {
     /// [`BytecodeArray::with_generator_flag`]) and enables `yield` /
     /// `yield*` compilation.
     is_generator: bool,
+    /// `true` when compiling an `async function` or `async function*` body.
+    ///
+    /// Affects `finalize` (marks the [`BytecodeArray`] with
+    /// [`BytecodeArray::with_async_flag`]) and enables `await` compilation.
+    is_async: bool,
     /// Counter used to generate unique `suspend_id` immediates for each
     /// [`Opcode::SuspendGenerator`] instruction in this function.
     yield_suspend_id: u32,
@@ -214,6 +219,7 @@ impl FunctionCompiler {
             slot_kinds: Vec::new(),
             handler_table: Vec::new(),
             is_generator: false,
+            is_async: false,
             yield_suspend_id: 0,
             is_program: false,
         };
@@ -523,7 +529,8 @@ impl FunctionCompiler {
                 "async functions are not yet supported".into(),
             ));
         }
-        let func_array = compile_function(&decl.params, &decl.body, decl.is_generator)?;
+        let func_array =
+            compile_function(&decl.params, &decl.body, decl.is_generator, decl.is_async)?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         // Emit CreateClosure: [func_idx, slot, flags]
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
@@ -1051,7 +1058,14 @@ impl FunctionCompiler {
                 }
                 self.compile_yield(y)
             }
-            Expr::Await(_) => Err(StatorError::Internal("await is not yet supported".into())),
+            Expr::Await(a) => {
+                if !self.is_async {
+                    return Err(StatorError::Internal(
+                        "await expression outside of an async function".into(),
+                    ));
+                }
+                self.compile_await(a)
+            }
 
             Expr::TaggedTemplate(_) => Err(StatorError::Internal(
                 "tagged template literals are not yet supported".into(),
@@ -1833,7 +1847,7 @@ impl FunctionCompiler {
                 "async function expressions are not yet supported".into(),
             ));
         }
-        let func_array = compile_function(&f.params, &f.body, f.is_generator)?;
+        let func_array = compile_function(&f.params, &f.body, f.is_generator, f.is_async)?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
@@ -1866,7 +1880,7 @@ impl FunctionCompiler {
                 }
             }
         };
-        let func_array = compile_function(&a.params, &body_block, false)?;
+        let func_array = compile_function(&a.params, &body_block, false, false)?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
@@ -2210,6 +2224,39 @@ impl FunctionCompiler {
 
         // ResumeGenerator [gen, regs_start, regs_count]
         // After this, acc = value sent by caller's .next(sent).
+        self.emit(Instruction::new_unchecked(
+            Opcode::ResumeGenerator,
+            vec![dummy, dummy, Operand::RegisterCount(0)],
+        ));
+
+        Ok(())
+    }
+
+    /// Compile an `await expr` expression inside an async (generator) function.
+    ///
+    /// Uses the same suspend/resume mechanism as `yield` so the runtime can
+    /// resolve the awaited value and resume execution with the result.
+    fn compile_await(&mut self, expr: &crate::parser::ast::AwaitExpr) -> StatorResult<()> {
+        // Evaluate the awaited expression → acc.
+        self.compile_expr(&expr.argument)?;
+
+        let dummy = Operand::Register(0);
+
+        // SuspendGenerator [gen, regs_start, regs_count, suspend_id]
+        let suspend_id = self.yield_suspend_id;
+        self.yield_suspend_id += 1;
+        self.emit(Instruction::new_unchecked(
+            Opcode::SuspendGenerator,
+            vec![
+                dummy,
+                dummy,
+                Operand::RegisterCount(0),
+                Operand::Immediate(suspend_id as i32),
+            ],
+        ));
+
+        // ResumeGenerator [gen, regs_start, regs_count]
+        // After this, acc = resolved value of the awaited expression.
         self.emit(Instruction::new_unchecked(
             Opcode::ResumeGenerator,
             vec![dummy, dummy, Operand::RegisterCount(0)],
@@ -2705,7 +2752,9 @@ impl FunctionCompiler {
             feedback_metadata,
             self.handler_table,
         );
-        Ok(ba.with_generator_flag(self.is_generator))
+        Ok(ba
+            .with_generator_flag(self.is_generator)
+            .with_async_flag(self.is_async))
     }
 }
 
@@ -2768,15 +2817,24 @@ fn resolve_jumps(instructions: &mut [Instruction], labels: &[Label]) -> StatorRe
 ///   [`BytecodeArray::with_generator_flag(true)`][BytecodeArray::with_generator_flag].
 /// - A [`Opcode::SwitchOnGeneratorState`] prologue is emitted before the body
 ///   so that resumed executions jump directly to the saved resume point.
+///
+/// When `is_async` is `true`:
+/// - The produced [`BytecodeArray`] is marked with
+///   [`BytecodeArray::with_async_flag(true)`][BytecodeArray::with_async_flag].
+/// - `await` expressions are compiled using the same suspend/resume mechanism
+///   as `yield`.
 fn compile_function(
     params: &[crate::parser::ast::Param],
     body: &BlockStmt,
     is_generator: bool,
+    is_async: bool,
 ) -> StatorResult<BytecodeArray> {
     let mut compiler = FunctionCompiler::new(params)?;
     compiler.is_generator = is_generator;
+    compiler.is_async = is_async;
 
-    // Generator prologue: jump to the saved resume point on re-entry.
+    // Generator / async-generator prologue: jump to the saved resume point on
+    // re-entry.
     if is_generator {
         compiler.emit(Instruction::new_unchecked(
             Opcode::SwitchOnGeneratorState,
@@ -3355,6 +3413,7 @@ mod tests {
                 },
             ],
             &body,
+            false,
             false,
         )
         .unwrap();
@@ -4525,6 +4584,176 @@ mod tests {
         assert!(
             opcodes.contains(&Opcode::PopContext),
             "expected PopContext, got {opcodes:?}"
+        );
+    }
+
+    // ── Async generator functions ─────────────────────────────────────────────
+
+    /// Helper: build a `FnDecl` for an async generator function.
+    fn make_async_generator_fn_decl(name: &str, body: Vec<Stmt>) -> FnDecl {
+        FnDecl {
+            loc: span(),
+            id: Some(ident(name)),
+            params: vec![],
+            body: BlockStmt { loc: span(), body },
+            is_generator: true,
+            is_async: true,
+        }
+    }
+
+    /// Helper: build an `await expr` expression statement.
+    fn await_stmt(arg: Expr) -> Stmt {
+        use crate::parser::ast::{AwaitExpr, ExprStmt};
+        Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(Expr::Await(Box::new(AwaitExpr {
+                loc: span(),
+                argument: Box::new(arg),
+            }))),
+        })
+    }
+
+    #[test]
+    fn test_async_generator_function_compiles() {
+        // `async function* gen() { yield 1; yield 2; }`
+        let decl = make_async_generator_fn_decl(
+            "gen",
+            vec![
+                yield_stmt(Some(num_expr(1.0)), false),
+                yield_stmt(Some(num_expr(2.0)), false),
+            ],
+        );
+        let prog = make_program(vec![Stmt::FnDecl(Box::new(decl))]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let pool = arr.constant_pool();
+        assert!(!pool.is_empty());
+        if let crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) = &pool[0] {
+            assert!(ba.is_generator(), "must be marked as generator");
+            assert!(ba.is_async(), "must be marked as async");
+            let inner_instrs = ba.instructions().unwrap();
+            assert_eq!(
+                inner_instrs[0].opcode,
+                Opcode::SwitchOnGeneratorState,
+                "async generator body must begin with SwitchOnGeneratorState"
+            );
+            assert!(
+                inner_instrs
+                    .iter()
+                    .any(|i| i.opcode == Opcode::SuspendGenerator),
+                "async generator body must contain SuspendGenerator"
+            );
+        } else {
+            panic!("constant pool[0] should be a Function");
+        }
+    }
+
+    #[test]
+    fn test_async_generator_with_await_compiles() {
+        // `async function* gen() { await x; yield 1; }`
+        let decl = make_async_generator_fn_decl(
+            "gen",
+            vec![
+                await_stmt(ident_expr("x")),
+                yield_stmt(Some(num_expr(1.0)), false),
+            ],
+        );
+        let prog = make_program(vec![Stmt::FnDecl(Box::new(decl))]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let pool = arr.constant_pool();
+        if let crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) = &pool[0] {
+            assert!(ba.is_async(), "must be marked as async");
+            let inner_instrs = ba.instructions().unwrap();
+            // The body should have two SuspendGenerator instructions: one for
+            // await (suspend/resume) and one for yield.
+            let suspend_count = inner_instrs
+                .iter()
+                .filter(|i| i.opcode == Opcode::SuspendGenerator)
+                .count();
+            assert!(
+                suspend_count >= 2,
+                "expected >= 2 SuspendGenerator (1 await + 1 yield), got {suspend_count}"
+            );
+        } else {
+            panic!("constant pool[0] should be a Function");
+        }
+    }
+
+    #[test]
+    fn test_async_generator_expr_compiles() {
+        // `var f = async function*() { yield 1; };`
+        use crate::parser::ast::FnExpr;
+        let fn_expr = Expr::Fn(Box::new(FnExpr {
+            loc: span(),
+            id: None,
+            params: vec![],
+            body: BlockStmt {
+                loc: span(),
+                body: vec![yield_stmt(Some(num_expr(1.0)), false)],
+            },
+            is_generator: true,
+            is_async: true,
+        }));
+        let prog = make_program(vec![var_decl_stmt(VarKind::Var, "f", Some(fn_expr))]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let pool = arr.constant_pool();
+        if let crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) = &pool[0] {
+            assert!(ba.is_generator(), "must be marked as generator");
+            assert!(ba.is_async(), "must be marked as async");
+        } else {
+            panic!("constant pool[0] should be a Function");
+        }
+    }
+
+    #[test]
+    fn test_for_await_of_compiles_with_get_async_iterator() {
+        // `for await (const x of someArr) { }` — verify GetAsyncIterator.
+        use crate::parser::ast::{ForInOfLeft, ForOfStmt, VarDecl, VarDeclarator, VarKind};
+        let prog = make_program(vec![Stmt::ForOf(ForOfStmt {
+            loc: span(),
+            is_await: true,
+            left: ForInOfLeft::VarDecl(VarDecl {
+                loc: span(),
+                kind: VarKind::Const,
+                declarators: vec![VarDeclarator {
+                    loc: span(),
+                    id: Pat::Ident(ident("x")),
+                    init: None,
+                }],
+            }),
+            right: Box::new(ident_expr("someArr")),
+            body: Box::new(Stmt::Empty(crate::parser::ast::EmptyStmt { loc: span() })),
+        })]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::GetAsyncIterator),
+            "for-await-of must emit GetAsyncIterator, got {instrs:?}"
+        );
+    }
+
+    #[test]
+    fn test_async_generator_call_returns_generator_value() {
+        // `async function* gen() { yield 1; } return gen();`
+        use crate::objects::value::JsValue;
+        let decl =
+            make_async_generator_fn_decl("gen", vec![yield_stmt(Some(num_expr(1.0)), false)]);
+        let prog = make_program(vec![
+            Stmt::FnDecl(Box::new(decl)),
+            Stmt::Return(ReturnStmt {
+                loc: span(),
+                argument: Some(Box::new(Expr::Call(Box::new(
+                    crate::parser::ast::CallExpr {
+                        loc: span(),
+                        callee: Box::new(ident_expr("gen")),
+                        arguments: vec![],
+                    },
+                )))),
+            }),
+        ]);
+        let result = run(&prog);
+        assert!(
+            matches!(result, JsValue::Generator(_)),
+            "calling an async generator must return JsValue::Generator, got {result:?}"
         );
     }
 }
