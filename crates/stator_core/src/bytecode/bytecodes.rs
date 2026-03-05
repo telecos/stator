@@ -605,6 +605,16 @@ pub enum Opcode {
     /// the generator has not yet been suspended. `[generator]`
     SwitchOnGeneratorState,
 
+    // ── Class ─────────────────────────────────────────────────────────────
+    /// Create a class constructor with prototype chain setup.
+    /// `[constructor_func_idx, super_reg, slot]`
+    CreateClass,
+    /// Check whether the accumulator has the private brand in `brand_reg`.
+    /// `[obj, brand_reg]`
+    TestPrivateBrand,
+    /// Define a private brand on `obj`. `[obj]`
+    DefinePrivateBrand,
+
     // ── Encoding prefixes ─────────────────────────────────────────────────
     /// Prefix: all operands in the following instruction use 2-byte (wide) encoding.
     Wide,
@@ -846,6 +856,11 @@ impl Opcode {
             Opcode::SuspendGenerator => &[Register, Register, RegisterCount, Immediate],
             Opcode::SetGeneratorState => &[Register],
             Opcode::SwitchOnGeneratorState => &[Register],
+
+            // Class
+            Opcode::CreateClass => &[ConstantPoolIdx, Register, FeedbackSlot],
+            Opcode::TestPrivateBrand => &[Register, Register],
+            Opcode::DefinePrivateBrand => &[Register],
 
             // Prefixes / trap — no operands of their own
             Opcode::Wide | Opcode::ExtraWide | Opcode::Illegal => &[],

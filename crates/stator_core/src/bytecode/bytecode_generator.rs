@@ -18,7 +18,8 @@
 //! 3. **Functions + closures** — function declarations and expressions,
 //!    arrow functions, function calls, property access, `new`, `throw`,
 //!    `try`/`catch`/`finally`.
-//! 4. Classes and generators are not yet implemented; they return an error.
+//! 4. **Classes** — class declarations and expressions, methods, accessors,
+//!    static fields and blocks, instance-field initializers.
 //!
 //! # Jump patching
 //!
@@ -431,10 +432,7 @@ impl FunctionCompiler {
             Stmt::Switch(s) => self.compile_switch(s),
             Stmt::ForIn(s) => self.compile_for_in(s),
             Stmt::With(s) => self.compile_with(s),
-            Stmt::ClassDecl(_) => Err(StatorError::Internal(format!(
-                "{} is not yet supported",
-                stmt_kind(stmt)
-            ))),
+            Stmt::ClassDecl(c) => self.compile_class_decl(c),
             Stmt::ForOf(s) => self.compile_for_of(s),
         }
     }
@@ -556,6 +554,534 @@ impl FunctionCompiler {
                 ));
             }
         }
+        Ok(())
+    }
+
+    // ── Class compilation ────────────────────────────────────────────────
+
+    /// Compile a class declaration statement.
+    fn compile_class_decl(&mut self, decl: &crate::parser::ast::ClassDecl) -> StatorResult<()> {
+        self.compile_class(decl.id.as_ref(), decl.super_class.as_deref(), &decl.body)?;
+        // Bind the class name in the current scope.
+        if let Some(id) = &decl.id {
+            let reg = self.define_local(&id.name);
+            self.emit_star(reg);
+            // Top-level class declarations are also stored as globals.
+            if self.is_program {
+                let name_idx = self.add_string(&id.name);
+                let sta_slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
+                self.emit_ldar(reg);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::StaGlobal,
+                    vec![Operand::ConstantPoolIdx(name_idx), sta_slot],
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a class expression (leaves the class constructor in the
+    /// accumulator).
+    fn compile_class_expr(&mut self, expr: &crate::parser::ast::ClassExpr) -> StatorResult<()> {
+        self.compile_class(expr.id.as_ref(), expr.super_class.as_deref(), &expr.body)
+    }
+
+    /// Compile the shared core of a class declaration or expression.
+    ///
+    /// Emits [`Opcode::CreateClass`] and then defines methods, accessors,
+    /// static fields, static blocks, and instance-field initializers.
+    /// On return the accumulator holds the class constructor.
+    fn compile_class(
+        &mut self,
+        _id: Option<&crate::parser::ast::Ident>,
+        super_class: Option<&Expr>,
+        body: &crate::parser::ast::ClassBody,
+    ) -> StatorResult<()> {
+        use crate::parser::ast::{ClassMember, MethodKind};
+
+        // 1. Evaluate superclass (or load undefined) into a register.
+        let super_reg = self.allocator.allocate_temporary();
+        if let Some(sc) = super_class {
+            self.compile_expr(sc)?;
+        } else {
+            self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+        }
+        self.emit_star(super_reg);
+
+        // 2. Find and compile the explicit constructor, or use a default.
+        let ctor_method = body.body.iter().find_map(|m| match m {
+            ClassMember::Method(md) if md.kind == MethodKind::Constructor => Some(md),
+            _ => None,
+        });
+        let ctor_array = if let Some(ctor) = ctor_method {
+            compile_function(&ctor.value.params, &ctor.value.body, false, false)?
+        } else {
+            let empty_body = BlockStmt {
+                loc: body.loc,
+                body: vec![],
+            };
+            compile_function(&[], &empty_body, false, false)?
+        };
+        let ctor_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(ctor_array)));
+        let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
+
+        // 3. Emit CreateClass.
+        self.emit(Instruction::new_unchecked(
+            Opcode::CreateClass,
+            vec![
+                Operand::ConstantPoolIdx(ctor_idx),
+                to_reg_op(super_reg),
+                slot,
+            ],
+        ));
+        let class_reg = self.allocator.allocate_temporary();
+        self.emit_star(class_reg);
+
+        // 4. Load the prototype object.
+        let proto_reg = self.allocator.allocate_temporary();
+        let proto_name = self.add_string("prototype");
+        let proto_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+        self.emit(Instruction::new_unchecked(
+            Opcode::LdaNamedProperty,
+            vec![
+                to_reg_op(class_reg),
+                Operand::ConstantPoolIdx(proto_name),
+                proto_slot,
+            ],
+        ));
+        self.emit_star(proto_reg);
+
+        // 5. Compile each class member.
+        for member in &body.body {
+            match member {
+                ClassMember::Method(m) if m.kind != MethodKind::Constructor => {
+                    let target = if m.is_static { class_reg } else { proto_reg };
+                    self.compile_class_method(target, m)?;
+                }
+                ClassMember::Property(p) if p.is_static => {
+                    self.compile_class_static_property(class_reg, p)?;
+                }
+                ClassMember::StaticBlock(sb) => {
+                    for stmt in &sb.body {
+                        self.compile_stmt(stmt)?;
+                    }
+                }
+                _ => {} // instance fields + constructor handled separately
+            }
+        }
+
+        // 6. Compile instance-field initializer (if any instance fields exist).
+        let instance_fields: Vec<&crate::parser::ast::PropertyDef> = body
+            .body
+            .iter()
+            .filter_map(|m| match m {
+                ClassMember::Property(p) if !p.is_static => Some(p),
+                _ => None,
+            })
+            .collect();
+        if !instance_fields.is_empty() {
+            self.compile_instance_field_initializer(class_reg, &instance_fields)?;
+        }
+
+        // Leave the class constructor in the accumulator.
+        self.emit_ldar(class_reg);
+
+        // Release temporaries in LIFO order.
+        self.allocator
+            .release_temporary(proto_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        self.allocator
+            .release_temporary(class_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        self.allocator
+            .release_temporary(super_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Compile a non-constructor class method or accessor onto `target_reg`.
+    fn compile_class_method(
+        &mut self,
+        target_reg: Register,
+        method: &crate::parser::ast::MethodDef,
+    ) -> StatorResult<()> {
+        use crate::parser::ast::{MethodKind, PropKey};
+
+        self.compile_fn_expr(&method.value)?;
+
+        let key_name: Option<String> = match &method.key {
+            PropKey::Ident(id) => Some(id.name.clone()),
+            PropKey::Str(s) => Some(s.value.clone()),
+            PropKey::Num(n) => {
+                if n.value.fract() == 0.0 && n.value.is_finite() && n.value >= 0.0 {
+                    Some(format!("{}", n.value as u64))
+                } else {
+                    Some(n.raw.clone())
+                }
+            }
+            PropKey::Private(id) => Some(format!("#{}", id.name)),
+            PropKey::Computed(_) => None,
+        };
+
+        match method.kind {
+            MethodKind::Method => {
+                if let Some(name) = key_name {
+                    let name_idx = self.add_string(&name);
+                    let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::DefineNamedOwnProperty,
+                        vec![
+                            to_reg_op(target_reg),
+                            Operand::ConstantPoolIdx(name_idx),
+                            slot,
+                        ],
+                    ));
+                } else if let PropKey::Computed(key_expr) = &method.key {
+                    let val_reg = self.allocator.allocate_temporary();
+                    self.emit_star(val_reg);
+                    self.compile_expr(key_expr)?;
+                    let key_reg = self.allocator.allocate_temporary();
+                    self.emit_star(key_reg);
+                    self.emit_ldar(val_reg);
+                    let slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::DefineKeyedOwnProperty,
+                        vec![
+                            to_reg_op(target_reg),
+                            to_reg_op(key_reg),
+                            Operand::Flag(0),
+                            slot,
+                        ],
+                    ));
+                    self.allocator
+                        .release_temporary(key_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
+                    self.allocator
+                        .release_temporary(val_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
+                }
+            }
+            MethodKind::Get => {
+                if let Some(name) = key_name {
+                    let name_idx = self.add_string(&name);
+                    let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::DefineGetterProperty,
+                        vec![
+                            to_reg_op(target_reg),
+                            Operand::ConstantPoolIdx(name_idx),
+                            slot,
+                        ],
+                    ));
+                } else if let PropKey::Computed(key_expr) = &method.key {
+                    let val_reg = self.allocator.allocate_temporary();
+                    self.emit_star(val_reg);
+                    self.compile_expr(key_expr)?;
+                    let key_reg = self.allocator.allocate_temporary();
+                    self.emit_star(key_reg);
+                    self.emit_ldar(val_reg);
+                    let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::DefineKeyedGetterProperty,
+                        vec![to_reg_op(target_reg), to_reg_op(key_reg), slot],
+                    ));
+                    self.allocator
+                        .release_temporary(key_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
+                    self.allocator
+                        .release_temporary(val_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
+                }
+            }
+            MethodKind::Set => {
+                if let Some(name) = key_name {
+                    let name_idx = self.add_string(&name);
+                    let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::DefineSetterProperty,
+                        vec![
+                            to_reg_op(target_reg),
+                            Operand::ConstantPoolIdx(name_idx),
+                            slot,
+                        ],
+                    ));
+                } else if let PropKey::Computed(key_expr) = &method.key {
+                    let val_reg = self.allocator.allocate_temporary();
+                    self.emit_star(val_reg);
+                    self.compile_expr(key_expr)?;
+                    let key_reg = self.allocator.allocate_temporary();
+                    self.emit_star(key_reg);
+                    self.emit_ldar(val_reg);
+                    let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::DefineKeyedSetterProperty,
+                        vec![to_reg_op(target_reg), to_reg_op(key_reg), slot],
+                    ));
+                    self.allocator
+                        .release_temporary(key_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
+                    self.allocator
+                        .release_temporary(val_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
+                }
+            }
+            MethodKind::Constructor => {} // handled in compile_class
+        }
+
+        Ok(())
+    }
+
+    /// Compile a static class field: evaluate the value and define it on the
+    /// class constructor object.
+    fn compile_class_static_property(
+        &mut self,
+        class_reg: Register,
+        prop: &crate::parser::ast::PropertyDef,
+    ) -> StatorResult<()> {
+        use crate::parser::ast::PropKey;
+
+        if let Some(value) = &prop.value {
+            self.compile_expr(value)?;
+        } else {
+            self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+        }
+
+        match &prop.key {
+            PropKey::Ident(id) => {
+                let name_idx = self.add_string(&id.name);
+                let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::DefineNamedOwnProperty,
+                    vec![
+                        to_reg_op(class_reg),
+                        Operand::ConstantPoolIdx(name_idx),
+                        slot,
+                    ],
+                ));
+            }
+            PropKey::Str(s) => {
+                let name_idx = self.add_string(&s.value);
+                let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::DefineNamedOwnProperty,
+                    vec![
+                        to_reg_op(class_reg),
+                        Operand::ConstantPoolIdx(name_idx),
+                        slot,
+                    ],
+                ));
+            }
+            PropKey::Num(n) => {
+                let name = if n.value.fract() == 0.0 && n.value.is_finite() && n.value >= 0.0 {
+                    format!("{}", n.value as u64)
+                } else {
+                    n.raw.clone()
+                };
+                let name_idx = self.add_string(&name);
+                let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::DefineNamedOwnProperty,
+                    vec![
+                        to_reg_op(class_reg),
+                        Operand::ConstantPoolIdx(name_idx),
+                        slot,
+                    ],
+                ));
+            }
+            PropKey::Computed(key_expr) => {
+                let val_reg = self.allocator.allocate_temporary();
+                self.emit_star(val_reg);
+                self.compile_expr(key_expr)?;
+                let key_reg = self.allocator.allocate_temporary();
+                self.emit_star(key_reg);
+                self.emit_ldar(val_reg);
+                let slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::DefineKeyedOwnProperty,
+                    vec![
+                        to_reg_op(class_reg),
+                        to_reg_op(key_reg),
+                        Operand::Flag(0),
+                        slot,
+                    ],
+                ));
+                self.allocator
+                    .release_temporary(key_reg)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+                self.allocator
+                    .release_temporary(val_reg)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+            }
+            PropKey::Private(id) => {
+                let name_idx = self.add_string(&format!("#{}", id.name));
+                let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::DefineNamedOwnProperty,
+                    vec![
+                        to_reg_op(class_reg),
+                        Operand::ConstantPoolIdx(name_idx),
+                        slot,
+                    ],
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Compile instance-field initializers into a separate closure and attach
+    /// it to the class constructor as a hidden `.class_field_initializer`
+    /// property.  The runtime calls this function on each `new` invocation
+    /// with the freshly created instance as the first argument.
+    fn compile_instance_field_initializer(
+        &mut self,
+        class_reg: Register,
+        fields: &[&crate::parser::ast::PropertyDef],
+    ) -> StatorResult<()> {
+        use crate::parser::ast::PropKey;
+
+        // Build a sub-compiler for the initializer.  It receives a single
+        // implicit parameter (the `this` value) in register p0.
+        let mut ic = FunctionCompiler {
+            instructions: Vec::new(),
+            constant_pool: Vec::new(),
+            allocator: RegisterAllocator::new(1),
+            scopes: vec![{
+                let mut s = HashMap::new();
+                s.insert(".this".to_owned(), Register::parameter(0));
+                s
+            }],
+            source_positions: Vec::new(),
+            pending_positions: Vec::new(),
+            labels: Vec::new(),
+            loop_stack: Vec::new(),
+            label_map: HashMap::new(),
+            pending_label_name: None,
+            param_count: 1,
+            slot_kinds: Vec::new(),
+            handler_table: Vec::new(),
+            is_generator: false,
+            yield_suspend_id: 0,
+            is_program: false,
+            is_async: false,
+        };
+
+        let this_reg = Register::parameter(0);
+
+        for field in fields {
+            // Compile the field value (or undefined).
+            if let Some(value) = &field.value {
+                ic.compile_expr(value)?;
+            } else {
+                ic.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+            }
+
+            // Define the property on `this`.
+            match &field.key {
+                PropKey::Ident(id) => {
+                    let name_idx = ic.add_string(&id.name);
+                    let slot = ic.alloc_slot(FeedbackSlotKind::StoreProperty);
+                    ic.emit(Instruction::new_unchecked(
+                        Opcode::DefineNamedOwnProperty,
+                        vec![
+                            to_reg_op(this_reg),
+                            Operand::ConstantPoolIdx(name_idx),
+                            slot,
+                        ],
+                    ));
+                }
+                PropKey::Str(s) => {
+                    let name_idx = ic.add_string(&s.value);
+                    let slot = ic.alloc_slot(FeedbackSlotKind::StoreProperty);
+                    ic.emit(Instruction::new_unchecked(
+                        Opcode::DefineNamedOwnProperty,
+                        vec![
+                            to_reg_op(this_reg),
+                            Operand::ConstantPoolIdx(name_idx),
+                            slot,
+                        ],
+                    ));
+                }
+                PropKey::Num(n) => {
+                    let name = if n.value.fract() == 0.0 && n.value.is_finite() && n.value >= 0.0 {
+                        format!("{}", n.value as u64)
+                    } else {
+                        n.raw.clone()
+                    };
+                    let name_idx = ic.add_string(&name);
+                    let slot = ic.alloc_slot(FeedbackSlotKind::StoreProperty);
+                    ic.emit(Instruction::new_unchecked(
+                        Opcode::DefineNamedOwnProperty,
+                        vec![
+                            to_reg_op(this_reg),
+                            Operand::ConstantPoolIdx(name_idx),
+                            slot,
+                        ],
+                    ));
+                }
+                PropKey::Computed(key_expr) => {
+                    let val_reg = ic.allocator.allocate_temporary();
+                    ic.emit_star(val_reg);
+                    ic.compile_expr(key_expr)?;
+                    let key_reg = ic.allocator.allocate_temporary();
+                    ic.emit_star(key_reg);
+                    ic.emit_ldar(val_reg);
+                    let slot = ic.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
+                    ic.emit(Instruction::new_unchecked(
+                        Opcode::DefineKeyedOwnProperty,
+                        vec![
+                            to_reg_op(this_reg),
+                            to_reg_op(key_reg),
+                            Operand::Flag(0),
+                            slot,
+                        ],
+                    ));
+                    ic.allocator
+                        .release_temporary(key_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
+                    ic.allocator
+                        .release_temporary(val_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
+                }
+                PropKey::Private(id) => {
+                    let name_idx = ic.add_string(&format!("#{}", id.name));
+                    let slot = ic.alloc_slot(FeedbackSlotKind::StoreProperty);
+                    ic.emit(Instruction::new_unchecked(
+                        Opcode::DefineNamedOwnProperty,
+                        vec![
+                            to_reg_op(this_reg),
+                            Operand::ConstantPoolIdx(name_idx),
+                            slot,
+                        ],
+                    ));
+                }
+            }
+        }
+
+        let init_array = ic.finalize()?;
+        let init_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(init_array)));
+        let closure_slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
+        self.emit(Instruction::new_unchecked(
+            Opcode::CreateClosure,
+            vec![
+                Operand::ConstantPoolIdx(init_idx),
+                closure_slot,
+                Operand::Flag(0),
+            ],
+        ));
+        // Store the initializer as a hidden property on the class constructor.
+        let init_name = self.add_string(".class_field_initializer");
+        let store_slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+        self.emit(Instruction::new_unchecked(
+            Opcode::DefineNamedOwnProperty,
+            vec![
+                to_reg_op(class_reg),
+                Operand::ConstantPoolIdx(init_name),
+                store_slot,
+            ],
+        ));
+
         Ok(())
     }
 
@@ -1024,9 +1550,7 @@ impl FunctionCompiler {
             // ── Function-like ─────────────────────────────────────────────
             Expr::Fn(f) => self.compile_fn_expr(f),
             Expr::Arrow(a) => self.compile_arrow_expr(a),
-            Expr::Class(_) => Err(StatorError::Internal(
-                "class expressions are not yet supported".into(),
-            )),
+            Expr::Class(c) => self.compile_class_expr(c),
 
             // ── Operators ─────────────────────────────────────────────────
             Expr::Unary(u) => self.compile_unary(u),
@@ -2857,16 +3381,6 @@ fn compile_function(
     compiler.finalize()
 }
 
-/// Return a short description string for unsupported statement types.
-fn stmt_kind(stmt: &Stmt) -> &'static str {
-    match stmt {
-        Stmt::ForIn(_) => "for-in",
-        Stmt::With(_) => "with",
-        Stmt::ClassDecl(_) => "class declaration",
-        _ => "statement",
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2934,10 +3448,11 @@ mod tests {
     use super::*;
     use crate::bytecode::bytecodes::{Opcode, decode};
     use crate::parser::ast::{
-        BinaryExpr, BinaryOp, BlockStmt, BoolLit, BreakStmt, CatchClause, ContinueStmt,
-        DoWhileStmt, Expr, ExprStmt, FnDecl, FnExpr, ForStmt, Ident, IfStmt, LabeledStmt, NullLit,
-        NumLit, ObjectExpr, ObjectProp, Param, Pat, Program, ProgramItem, Prop, PropKey, PropValue,
-        ReturnStmt, SourceType, Stmt, StringLit, ThrowStmt, TryStmt, VarDecl, VarDeclarator,
+        BinaryExpr, BinaryOp, BlockStmt, BoolLit, BreakStmt, CatchClause, ClassBody, ClassDecl,
+        ClassExpr, ClassMember, ContinueStmt, DoWhileStmt, Expr, ExprStmt, FnDecl, FnExpr, ForStmt,
+        Ident, IfStmt, LabeledStmt, MethodDef, MethodKind, NullLit, NumLit, ObjectExpr, ObjectProp,
+        Param, Pat, Program, ProgramItem, Prop, PropKey, PropValue, PropertyDef, ReturnStmt,
+        SourceType, StaticBlock, Stmt, StringLit, ThrowStmt, TryStmt, VarDecl, VarDeclarator,
         VarKind, WhileStmt,
     };
     use crate::parser::scanner::{Position, Span};
@@ -4731,6 +5246,63 @@ mod tests {
         );
     }
 
+    // ── Class compilation tests ───────────────────────────────────────────
+
+    /// Helper: build a class declaration statement.
+    fn class_decl_stmt(name: &str, super_class: Option<Expr>, body: Vec<ClassMember>) -> Stmt {
+        Stmt::ClassDecl(Box::new(ClassDecl {
+            loc: span(),
+            id: Some(ident(name)),
+            super_class: super_class.map(Box::new),
+            body: ClassBody { loc: span(), body },
+        }))
+    }
+
+    /// Helper: build a class method/getter/setter member.
+    fn method_member(
+        name: &str,
+        params: &[&str],
+        is_static: bool,
+        kind: MethodKind,
+    ) -> ClassMember {
+        ClassMember::Method(MethodDef {
+            loc: span(),
+            is_static,
+            kind,
+            key: PropKey::Ident(ident(name)),
+            is_computed: false,
+            value: empty_fn_expr(params),
+        })
+    }
+
+    /// Helper: build a class field member.
+    fn field_member(name: &str, value: Option<Expr>, is_static: bool) -> ClassMember {
+        ClassMember::Property(PropertyDef {
+            loc: span(),
+            is_static,
+            key: PropKey::Ident(ident(name)),
+            is_computed: false,
+            value: value.map(Box::new),
+        })
+    }
+
+    /// Helper: build a static block member.
+    fn static_block_member(body: Vec<Stmt>) -> ClassMember {
+        ClassMember::StaticBlock(StaticBlock { loc: span(), body })
+    }
+
+    #[test]
+    fn test_class_decl_emits_create_class() {
+        // `class Foo {}`
+        let prog = make_program(vec![class_decl_stmt("Foo", None, vec![])]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::CreateClass),
+            "expected CreateClass opcode, got {instrs:?}"
+        );
+    }
+
     #[test]
     fn test_async_generator_call_returns_generator_value() {
         // `async function* gen() { yield 1; } return gen();`
@@ -4754,6 +5326,219 @@ mod tests {
         assert!(
             matches!(result, JsValue::Generator(_)),
             "calling an async generator must return JsValue::Generator, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_class_with_constructor() {
+        // `class Foo { constructor() {} }`
+        let prog = make_program(vec![class_decl_stmt(
+            "Foo",
+            None,
+            vec![method_member(
+                "constructor",
+                &[],
+                false,
+                MethodKind::Constructor,
+            )],
+        )]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(instrs.iter().any(|i| i.opcode == Opcode::CreateClass));
+    }
+
+    #[test]
+    fn test_class_method_emits_define_named_own() {
+        // `class Foo { bar() {} }`
+        let prog = make_program(vec![class_decl_stmt(
+            "Foo",
+            None,
+            vec![method_member("bar", &[], false, MethodKind::Method)],
+        )]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::DefineNamedOwnProperty),
+            "expected DefineNamedOwnProperty for method"
+        );
+    }
+
+    #[test]
+    fn test_class_static_method() {
+        // `class Foo { static bar() {} }`
+        let prog = make_program(vec![class_decl_stmt(
+            "Foo",
+            None,
+            vec![method_member("bar", &[], true, MethodKind::Method)],
+        )]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::DefineNamedOwnProperty)
+        );
+    }
+
+    #[test]
+    fn test_class_getter_setter() {
+        // `class Foo { get x() {} set x(v) {} }`
+        let prog = make_program(vec![class_decl_stmt(
+            "Foo",
+            None,
+            vec![
+                method_member("x", &[], false, MethodKind::Get),
+                method_member("x", &["v"], false, MethodKind::Set),
+            ],
+        )]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::DefineGetterProperty)
+        );
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::DefineSetterProperty)
+        );
+    }
+
+    #[test]
+    fn test_class_extends() {
+        // `class Foo {} class Bar extends Foo {}`
+        let prog = make_program(vec![
+            class_decl_stmt("Foo", None, vec![]),
+            class_decl_stmt("Bar", Some(ident_expr("Foo")), vec![]),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        let count = instrs
+            .iter()
+            .filter(|i| i.opcode == Opcode::CreateClass)
+            .count();
+        assert_eq!(count, 2, "expected two CreateClass opcodes");
+    }
+
+    #[test]
+    fn test_class_static_field() {
+        // `class Foo { static count = 0 }`
+        let prog = make_program(vec![class_decl_stmt(
+            "Foo",
+            None,
+            vec![field_member("count", Some(num_expr(0.0)), true)],
+        )]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::DefineNamedOwnProperty)
+        );
+    }
+
+    #[test]
+    fn test_class_instance_field_emits_initializer() {
+        // `class Foo { x = 1 }`
+        let prog = make_program(vec![class_decl_stmt(
+            "Foo",
+            None,
+            vec![field_member("x", Some(num_expr(1.0)), false)],
+        )]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        // Instance field initializer produces a CreateClosure.
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::CreateClosure),
+            "expected CreateClosure for field initializer"
+        );
+    }
+
+    #[test]
+    fn test_class_expression() {
+        // `var C = class {};`
+        let prog = make_program(vec![var_decl_stmt(
+            VarKind::Var,
+            "C",
+            Some(Expr::Class(Box::new(ClassExpr {
+                loc: span(),
+                id: None,
+                super_class: None,
+                body: ClassBody {
+                    loc: span(),
+                    body: vec![],
+                },
+            }))),
+        )]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::CreateClass),
+            "expected CreateClass for class expression"
+        );
+    }
+
+    #[test]
+    fn test_class_static_block() {
+        // `class Foo { static { } }`
+        let prog = make_program(vec![class_decl_stmt(
+            "Foo",
+            None,
+            vec![static_block_member(vec![])],
+        )]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(instrs.iter().any(|i| i.opcode == Opcode::CreateClass));
+    }
+
+    #[test]
+    fn test_class_computed_method() {
+        // `class Foo { [k]() {} }` (k declared beforehand)
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "k", Some(str_expr("bar"))),
+            class_decl_stmt(
+                "Foo",
+                None,
+                vec![ClassMember::Method(MethodDef {
+                    loc: span(),
+                    is_static: false,
+                    kind: MethodKind::Method,
+                    key: PropKey::Computed(Box::new(ident_expr("k"))),
+                    is_computed: true,
+                    value: empty_fn_expr(&[]),
+                })],
+            ),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::DefineKeyedOwnProperty),
+            "expected DefineKeyedOwnProperty for computed method"
+        );
+    }
+
+    #[test]
+    fn test_feedback_slots_class_method() {
+        use crate::bytecode::feedback::FeedbackSlotKind;
+        // `class Foo { bar() {} }`
+        let prog = make_program(vec![class_decl_stmt(
+            "Foo",
+            None,
+            vec![method_member("bar", &[], false, MethodKind::Method)],
+        )]);
+        let kinds = slot_kinds_for(&prog);
+        assert!(
+            kinds.contains(&FeedbackSlotKind::CreateClosure),
+            "expected CreateClosure slot for class, got {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&FeedbackSlotKind::StoreProperty),
+            "expected StoreProperty slot for method, got {kinds:?}"
         );
     }
 }
