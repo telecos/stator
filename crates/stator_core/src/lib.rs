@@ -34,12 +34,12 @@
 pub mod builtins;
 /// Bytecode instruction set and encode/decode utilities.
 pub mod bytecode;
-/// V8-compatible FFI wrapper types (`V8Object`, `V8Array`, `V8Number`, etc.).
-pub mod ffi;
 /// JIT compiler infrastructure: baseline code generator and macro-assembler.
 pub mod compiler;
 /// Engine error types and [`StatorResult`] alias.
 pub mod error;
+/// V8-compatible FFI wrapper types (`V8Object`, `V8Array`, `V8Number`, etc.).
+pub mod ffi;
 /// Garbage collector infrastructure: heap, tracing, and handle scopes.
 pub mod gc;
 /// Inline-cache runtime: property load/store fast paths and call-site tracking.

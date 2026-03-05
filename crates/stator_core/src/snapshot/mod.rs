@@ -335,8 +335,7 @@ fn write_jsvalue(buf: &mut Vec<u8>, value: &JsValue) {
             write_str32(buf, "<native>");
         }
         // Object (raw pointer), Generator, Iterator, and Context cannot be serialized.
-        JsValue::Object(_) | JsValue::Generator(_) | JsValue::Iterator(_)
-        | JsValue::Context(_) => {
+        JsValue::Object(_) | JsValue::Generator(_) | JsValue::Iterator(_) | JsValue::Context(_) => {
             write_u8(buf, TAG_UNDEFINED);
         }
     }

@@ -404,9 +404,10 @@ impl FunctionCompiler {
             Stmt::Empty(_) => Ok(()),
             Stmt::Switch(s) => self.compile_switch(s),
             Stmt::ForIn(s) => self.compile_for_in(s),
-            Stmt::With(_) | Stmt::ClassDecl(_) => Err(StatorError::Internal(
-                format!("{} is not yet supported", stmt_kind(stmt)),
-            )),
+            Stmt::With(_) | Stmt::ClassDecl(_) => Err(StatorError::Internal(format!(
+                "{} is not yet supported",
+                stmt_kind(stmt)
+            ))),
             Stmt::ForOf(s) => self.compile_for_of(s),
         }
     }
@@ -2219,10 +2220,7 @@ impl FunctionCompiler {
         self.emit_star(r_length);
 
         // index = 0.
-        self.emit(Instruction::new_unchecked(
-            Opcode::LdaZero,
-            vec![],
-        ));
+        self.emit(Instruction::new_unchecked(Opcode::LdaZero, vec![]));
         let r_index = self.allocator.allocate_temporary();
         self.emit_star(r_index);
 
@@ -2270,10 +2268,7 @@ impl FunctionCompiler {
             ForInOfLeft::Pat(pat) => match pat {
                 crate::parser::ast::Pat::Ident(id) => {
                     let reg = self.lookup_var(&id.name).ok_or_else(|| {
-                        StatorError::Internal(format!(
-                            "for-in: undefined variable '{}'",
-                            id.name
-                        ))
+                        StatorError::Internal(format!("for-in: undefined variable '{}'", id.name))
                     })?;
                     self.emit_star(reg);
                 }

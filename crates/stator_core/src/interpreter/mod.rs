@@ -1469,7 +1469,8 @@ impl Interpreter {
                                 frame.accumulator = f(args)?;
                             } else {
                                 return Err(StatorError::TypeError(
-                                    "CallAnyReceiver: callee is not a function (got PlainObject)".to_string()
+                                    "CallAnyReceiver: callee is not a function (got PlainObject)"
+                                        .to_string(),
                                 ));
                             }
                         }
@@ -1760,7 +1761,8 @@ impl Interpreter {
                                 frame.accumulator = f(args)?;
                             } else {
                                 return Err(StatorError::TypeError(
-                                    "CallProperty: callee is not a function (got PlainObject)".to_string()
+                                    "CallProperty: callee is not a function (got PlainObject)"
+                                        .to_string(),
                                 ));
                             }
                         }
@@ -1831,7 +1833,8 @@ impl Interpreter {
                                 frame.accumulator = f(args)?;
                             } else {
                                 return Err(StatorError::TypeError(
-                                    "CallWithSpread: callee is not a function (got PlainObject)".to_string()
+                                    "CallWithSpread: callee is not a function (got PlainObject)"
+                                        .to_string(),
                                 ));
                             }
                         }
@@ -1960,9 +1963,7 @@ impl Interpreter {
                         .context
                         .as_ref()
                         .ok_or_else(|| {
-                            StatorError::Internal(
-                                "LdaCurrentContextSlot: no active context".into(),
-                            )
+                            StatorError::Internal("LdaCurrentContextSlot: no active context".into())
                         })?
                         .clone();
                     let ctx = extract_context(&ctx_val, "LdaCurrentContextSlot")?;
@@ -2009,9 +2010,7 @@ impl Interpreter {
                         .context
                         .as_ref()
                         .ok_or_else(|| {
-                            StatorError::Internal(
-                                "StaCurrentContextSlot: no active context".into(),
-                            )
+                            StatorError::Internal("StaCurrentContextSlot: no active context".into())
                         })?
                         .clone();
                     let ctx = extract_context(&ctx_val, "StaCurrentContextSlot")?;
@@ -2547,10 +2546,7 @@ impl Interpreter {
                         return Err(err_bad_operand("TestTypeOf", 0));
                     };
                     let matches_type = match flag {
-                        0 => matches!(
-                            frame.accumulator,
-                            JsValue::Smi(_) | JsValue::HeapNumber(_)
-                        ),
+                        0 => matches!(frame.accumulator, JsValue::Smi(_) | JsValue::HeapNumber(_)),
                         1 => matches!(frame.accumulator, JsValue::String(_)),
                         2 => matches!(frame.accumulator, JsValue::Symbol(_)),
                         3 => matches!(frame.accumulator, JsValue::Boolean(_)),
@@ -2637,8 +2633,7 @@ impl Interpreter {
                 // CreateEmptyObjectLiteral:
                 //   Create a new empty PlainObject and store it in the accumulator.
                 Opcode::CreateEmptyObjectLiteral => {
-                    frame.accumulator =
-                        JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())));
+                    frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())));
                 }
 
                 // CreateEmptyArrayLiteral [feedback_slot]:
@@ -2649,8 +2644,7 @@ impl Interpreter {
                     // operands[0] is a FeedbackSlot, ignored at runtime.
                     let mut map = HashMap::new();
                     map.insert("length".to_string(), JsValue::Smi(0));
-                    frame.accumulator =
-                        JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                    frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
                 }
 
                 // CreateArrayLiteral [elements_const_pool_idx, feedback_slot, flags]:
@@ -2662,8 +2656,7 @@ impl Interpreter {
                     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
                     let mut map = HashMap::new();
                     map.insert("length".to_string(), JsValue::Smi(0));
-                    frame.accumulator =
-                        JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                    frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
                 }
 
                 // CreateArrayFromIterable:
@@ -2692,8 +2685,7 @@ impl Interpreter {
                         map.insert(i.to_string(), v.clone());
                     }
                     map.insert("length".to_string(), JsValue::Smi(items.len() as i32));
-                    frame.accumulator =
-                        JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                    frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
                 }
 
                 // CreateObjectLiteral [boilerplate_const_pool_idx, feedback_slot, flags]:
@@ -2703,8 +2695,7 @@ impl Interpreter {
                 //   DefineNamedOwnProperty instead).
                 Opcode::CreateObjectLiteral => {
                     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
-                    frame.accumulator =
-                        JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())));
+                    frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())));
                 }
 
                 // CreateRegExpLiteral [pattern_const_pool_idx, feedback_slot, flags]:
@@ -2725,12 +2716,24 @@ impl Interpreter {
                     };
                     // Decode flag bits back to a flag string.
                     let mut flags_str = String::new();
-                    if flags_val & 0x01 != 0 { flags_str.push('g'); }
-                    if flags_val & 0x02 != 0 { flags_str.push('i'); }
-                    if flags_val & 0x04 != 0 { flags_str.push('m'); }
-                    if flags_val & 0x08 != 0 { flags_str.push('s'); }
-                    if flags_val & 0x10 != 0 { flags_str.push('u'); }
-                    if flags_val & 0x20 != 0 { flags_str.push('y'); }
+                    if flags_val & 0x01 != 0 {
+                        flags_str.push('g');
+                    }
+                    if flags_val & 0x02 != 0 {
+                        flags_str.push('i');
+                    }
+                    if flags_val & 0x04 != 0 {
+                        flags_str.push('m');
+                    }
+                    if flags_val & 0x08 != 0 {
+                        flags_str.push('s');
+                    }
+                    if flags_val & 0x10 != 0 {
+                        flags_str.push('u');
+                    }
+                    if flags_val & 0x20 != 0 {
+                        flags_str.push('y');
+                    }
                     let mut map = HashMap::new();
                     map.insert("source".to_string(), JsValue::String(pattern.clone()));
                     map.insert("flags".to_string(), JsValue::String(flags_str.clone()));
@@ -2739,8 +2742,7 @@ impl Interpreter {
                         "toString".to_string(),
                         JsValue::String(format!("/{pattern}/{flags_str}")),
                     );
-                    frame.accumulator =
-                        JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                    frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
                 }
 
                 // StaInArrayLiteral [array_reg, index_reg, feedback_slot]:
@@ -2864,9 +2866,7 @@ impl Interpreter {
 
                     // Obtain the constructor's "prototype" property.
                     let ctor_proto = match &constructor {
-                        JsValue::PlainObject(map) => {
-                            map.borrow().get("prototype").cloned()
-                        }
+                        JsValue::PlainObject(map) => map.borrow().get("prototype").cloned(),
                         _ => None,
                     };
 
@@ -3390,11 +3390,15 @@ fn walk_context_chain(
     for _ in 0..depth {
         let parent = {
             let borrowed = current.borrow();
-            borrowed.parent.as_ref().ok_or_else(|| {
-                StatorError::Internal(format!(
-                    "{opcode_name}: context chain exhausted before reaching depth {depth}"
-                ))
-            })?.clone()
+            borrowed
+                .parent
+                .as_ref()
+                .ok_or_else(|| {
+                    StatorError::Internal(format!(
+                        "{opcode_name}: context chain exhausted before reaching depth {depth}"
+                    ))
+                })?
+                .clone()
         };
         current = parent;
     }
@@ -3548,9 +3552,7 @@ fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> StatorResult<()>
 
 /// Extract array elements from a PlainObject that represents an array-like
 /// value (has a `"length"` property and numeric-string keys).
-fn plain_object_to_array_items(
-    map: &Rc<RefCell<HashMap<String, JsValue>>>,
-) -> Vec<JsValue> {
+fn plain_object_to_array_items(map: &Rc<RefCell<HashMap<String, JsValue>>>) -> Vec<JsValue> {
     let borrow = map.borrow();
     let len = match borrow.get("length") {
         Some(JsValue::Smi(n)) => *n as usize,
@@ -6112,15 +6114,7 @@ mod tests {
         ];
         let pool = vec![ConstantPoolEntry::String("hello".to_owned())];
         let bytes = encode(&instrs);
-        let ba = BytecodeArray::new(
-            bytes,
-            pool,
-            0,
-            0,
-            vec![],
-            FeedbackMetadata::empty(),
-            vec![],
-        );
+        let ba = BytecodeArray::new(bytes, pool, 0, 0, vec![], FeedbackMetadata::empty(), vec![]);
         let mut frame = InterpreterFrame::new(ba, vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::String("string".to_owned()));
@@ -6528,27 +6522,45 @@ mod tests {
     #[test]
     fn test_bitwise_or() {
         // 0b1010 | 0b1100 = 0b1110 = 14
-        assert_eq!(arith_op(0b1010, 0b1100, Opcode::BitwiseOr).unwrap(), JsValue::Smi(14));
+        assert_eq!(
+            arith_op(0b1010, 0b1100, Opcode::BitwiseOr).unwrap(),
+            JsValue::Smi(14)
+        );
         // 0 | 0 = 0
         assert_eq!(arith_op(0, 0, Opcode::BitwiseOr).unwrap(), JsValue::Smi(0));
         // -1 | 0 = -1
-        assert_eq!(arith_op(-1, 0, Opcode::BitwiseOr).unwrap(), JsValue::Smi(-1));
+        assert_eq!(
+            arith_op(-1, 0, Opcode::BitwiseOr).unwrap(),
+            JsValue::Smi(-1)
+        );
     }
 
     #[test]
     fn test_bitwise_and() {
         // 0b1010 & 0b1100 = 0b1000 = 8
-        assert_eq!(arith_op(0b1010, 0b1100, Opcode::BitwiseAnd).unwrap(), JsValue::Smi(8));
+        assert_eq!(
+            arith_op(0b1010, 0b1100, Opcode::BitwiseAnd).unwrap(),
+            JsValue::Smi(8)
+        );
         // 0xFF & 0x0F = 0x0F = 15
-        assert_eq!(arith_op(0xFF, 0x0F, Opcode::BitwiseAnd).unwrap(), JsValue::Smi(15));
+        assert_eq!(
+            arith_op(0xFF, 0x0F, Opcode::BitwiseAnd).unwrap(),
+            JsValue::Smi(15)
+        );
         // -1 & 0x7FFFFFFF = 0x7FFFFFFF
-        assert_eq!(arith_op(-1, 0x7FFFFFFF, Opcode::BitwiseAnd).unwrap(), JsValue::Smi(0x7FFFFFFF));
+        assert_eq!(
+            arith_op(-1, 0x7FFFFFFF, Opcode::BitwiseAnd).unwrap(),
+            JsValue::Smi(0x7FFFFFFF)
+        );
     }
 
     #[test]
     fn test_bitwise_xor() {
         // 0b1010 ^ 0b1100 = 0b0110 = 6
-        assert_eq!(arith_op(0b1010, 0b1100, Opcode::BitwiseXor).unwrap(), JsValue::Smi(6));
+        assert_eq!(
+            arith_op(0b1010, 0b1100, Opcode::BitwiseXor).unwrap(),
+            JsValue::Smi(6)
+        );
         // 5 ^ 5 = 0
         assert_eq!(arith_op(5, 5, Opcode::BitwiseXor).unwrap(), JsValue::Smi(0));
     }
@@ -6568,15 +6580,24 @@ mod tests {
     #[test]
     fn test_shift_right() {
         // 16 >> 2 = 4
-        assert_eq!(arith_op(16, 2, Opcode::ShiftRight).unwrap(), JsValue::Smi(4));
+        assert_eq!(
+            arith_op(16, 2, Opcode::ShiftRight).unwrap(),
+            JsValue::Smi(4)
+        );
         // -1 >> 1 = -1 (sign-extending)
-        assert_eq!(arith_op(-1, 1, Opcode::ShiftRight).unwrap(), JsValue::Smi(-1));
+        assert_eq!(
+            arith_op(-1, 1, Opcode::ShiftRight).unwrap(),
+            JsValue::Smi(-1)
+        );
     }
 
     #[test]
     fn test_shift_right_logical() {
         // 16 >>> 2 = 4
-        assert_eq!(arith_op(16, 2, Opcode::ShiftRightLogical).unwrap(), JsValue::Smi(4));
+        assert_eq!(
+            arith_op(16, 2, Opcode::ShiftRightLogical).unwrap(),
+            JsValue::Smi(4)
+        );
         // -1 >>> 0 = 4294967295 (0xFFFFFFFF as u32, doesn't fit Smi → HeapNumber)
         let result = arith_op(-1, 0, Opcode::ShiftRightLogical).unwrap();
         assert_eq!(result, JsValue::HeapNumber(4294967295.0));
@@ -6613,37 +6634,64 @@ mod tests {
 
     #[test]
     fn test_bitwise_or_smi() {
-        assert_eq!(smi_op(0b1010, 0b1100, Opcode::BitwiseOrSmi).unwrap(), JsValue::Smi(14));
+        assert_eq!(
+            smi_op(0b1010, 0b1100, Opcode::BitwiseOrSmi).unwrap(),
+            JsValue::Smi(14)
+        );
         assert_eq!(smi_op(0, 0, Opcode::BitwiseOrSmi).unwrap(), JsValue::Smi(0));
     }
 
     #[test]
     fn test_bitwise_and_smi() {
-        assert_eq!(smi_op(0b1010, 0b1100, Opcode::BitwiseAndSmi).unwrap(), JsValue::Smi(8));
-        assert_eq!(smi_op(0xFF, 0x0F, Opcode::BitwiseAndSmi).unwrap(), JsValue::Smi(15));
+        assert_eq!(
+            smi_op(0b1010, 0b1100, Opcode::BitwiseAndSmi).unwrap(),
+            JsValue::Smi(8)
+        );
+        assert_eq!(
+            smi_op(0xFF, 0x0F, Opcode::BitwiseAndSmi).unwrap(),
+            JsValue::Smi(15)
+        );
     }
 
     #[test]
     fn test_bitwise_xor_smi() {
-        assert_eq!(smi_op(0b1010, 0b1100, Opcode::BitwiseXorSmi).unwrap(), JsValue::Smi(6));
+        assert_eq!(
+            smi_op(0b1010, 0b1100, Opcode::BitwiseXorSmi).unwrap(),
+            JsValue::Smi(6)
+        );
     }
 
     #[test]
     fn test_shift_left_smi() {
-        assert_eq!(smi_op(1, 4, Opcode::ShiftLeftSmi).unwrap(), JsValue::Smi(16));
+        assert_eq!(
+            smi_op(1, 4, Opcode::ShiftLeftSmi).unwrap(),
+            JsValue::Smi(16)
+        );
         // shift amount masked: 1 << 32 = 1 << 0 = 1
-        assert_eq!(smi_op(1, 32, Opcode::ShiftLeftSmi).unwrap(), JsValue::Smi(1));
+        assert_eq!(
+            smi_op(1, 32, Opcode::ShiftLeftSmi).unwrap(),
+            JsValue::Smi(1)
+        );
     }
 
     #[test]
     fn test_shift_right_smi() {
-        assert_eq!(smi_op(16, 2, Opcode::ShiftRightSmi).unwrap(), JsValue::Smi(4));
-        assert_eq!(smi_op(-1, 1, Opcode::ShiftRightSmi).unwrap(), JsValue::Smi(-1));
+        assert_eq!(
+            smi_op(16, 2, Opcode::ShiftRightSmi).unwrap(),
+            JsValue::Smi(4)
+        );
+        assert_eq!(
+            smi_op(-1, 1, Opcode::ShiftRightSmi).unwrap(),
+            JsValue::Smi(-1)
+        );
     }
 
     #[test]
     fn test_shift_right_logical_smi() {
-        assert_eq!(smi_op(16, 2, Opcode::ShiftRightLogicalSmi).unwrap(), JsValue::Smi(4));
+        assert_eq!(
+            smi_op(16, 2, Opcode::ShiftRightLogicalSmi).unwrap(),
+            JsValue::Smi(4)
+        );
         // -1 >>> 0 = 0xFFFFFFFF
         let result = smi_op(-1, 0, Opcode::ShiftRightLogicalSmi).unwrap();
         assert_eq!(result, JsValue::HeapNumber(4294967295.0));
@@ -6673,7 +6721,10 @@ mod tests {
     #[test]
     fn test_div_smi() {
         assert_eq!(smi_op(10, 2, Opcode::DivSmi).unwrap(), JsValue::Smi(5));
-        assert_eq!(smi_op(7, 2, Opcode::DivSmi).unwrap(), JsValue::HeapNumber(3.5));
+        assert_eq!(
+            smi_op(7, 2, Opcode::DivSmi).unwrap(),
+            JsValue::HeapNumber(3.5)
+        );
     }
 
     #[test]
@@ -6685,10 +6736,8 @@ mod tests {
 
     /// Helper: create a PlainObject from key-value pairs.
     fn make_plain_object(pairs: Vec<(&str, JsValue)>) -> JsValue {
-        let map: HashMap<String, JsValue> = pairs
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect();
+        let map: HashMap<String, JsValue> =
+            pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         JsValue::PlainObject(Rc::new(RefCell::new(map)))
     }
 
@@ -6765,10 +6814,7 @@ mod tests {
     #[test]
     fn test_proto_lookup_shadowing() {
         let parent = make_plain_object(vec![("x", JsValue::Smi(100))]);
-        let child = make_plain_object(vec![
-            ("x", JsValue::Smi(1)),
-            ("__proto__", parent),
-        ]);
+        let child = make_plain_object(vec![("x", JsValue::Smi(1)), ("__proto__", parent)]);
         // Own property shadows inherited
         assert_eq!(proto_lookup(&child, "x"), JsValue::Smi(1));
     }
@@ -6893,10 +6939,7 @@ mod tests {
                         Operand::FeedbackSlot(0),
                     ],
                 ),
-                Instruction::new_unchecked(
-                    Opcode::LdaConstant,
-                    vec![Operand::ConstantPoolIdx(0)],
-                ),
+                Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(0)]),
                 Instruction::new_unchecked(
                     Opcode::LdaKeyedProperty,
                     vec![Operand::Register(0), Operand::FeedbackSlot(0)],
@@ -6928,10 +6971,7 @@ mod tests {
             vec![
                 Instruction::new_unchecked(Opcode::CreateEmptyObjectLiteral, vec![]),
                 Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
-                Instruction::new_unchecked(
-                    Opcode::LdaConstant,
-                    vec![Operand::ConstantPoolIdx(0)],
-                ),
+                Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(0)]),
                 Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
                 Instruction::new_unchecked(
@@ -6942,10 +6982,7 @@ mod tests {
                         Operand::FeedbackSlot(0),
                     ],
                 ),
-                Instruction::new_unchecked(
-                    Opcode::LdaConstant,
-                    vec![Operand::ConstantPoolIdx(0)],
-                ),
+                Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(0)]),
                 Instruction::new_unchecked(
                     Opcode::LdaKeyedProperty,
                     vec![Operand::Register(0), Operand::FeedbackSlot(0)],
@@ -6991,10 +7028,7 @@ mod tests {
         assert_eq!(to_array_index(&JsValue::Smi(-1)), None);
         assert_eq!(to_array_index(&JsValue::HeapNumber(3.0)), Some(3));
         assert_eq!(to_array_index(&JsValue::HeapNumber(3.5)), None);
-        assert_eq!(
-            to_array_index(&JsValue::String("7".to_string())),
-            Some(7)
-        );
+        assert_eq!(to_array_index(&JsValue::String("7".to_string())), Some(7));
         assert_eq!(to_array_index(&JsValue::String("abc".to_string())), None);
         assert_eq!(to_array_index(&JsValue::Undefined), None);
     }
@@ -7044,7 +7078,9 @@ mod tests {
         //        instance.__proto__   = proto_obj
         // TestInstanceOf should find the match.
         let proto = Rc::new(RefCell::new(HashMap::new()));
-        proto.borrow_mut().insert("kind".to_string(), JsValue::String("proto".to_string()));
+        proto
+            .borrow_mut()
+            .insert("kind".to_string(), JsValue::String("proto".to_string()));
 
         let mut ctor_map = HashMap::new();
         ctor_map.insert("prototype".to_string(), JsValue::PlainObject(proto.clone()));
@@ -7479,10 +7515,7 @@ mod tests {
                 Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
                 Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
-                Instruction::new_unchecked(
-                    Opcode::LdaConstant,
-                    vec![Operand::ConstantPoolIdx(0)],
-                ),
+                Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(0)]),
                 Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
                 Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(2)]),
                 Instruction::new_unchecked(
@@ -7536,7 +7569,10 @@ mod tests {
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::PlainObject(map) = &result {
             let borrow = map.borrow();
-            assert_eq!(borrow.get("source"), Some(&JsValue::String("ab+d".to_string())));
+            assert_eq!(
+                borrow.get("source"),
+                Some(&JsValue::String("ab+d".to_string()))
+            );
             assert_eq!(borrow.get("flags"), Some(&JsValue::String("i".to_string())));
             assert_eq!(
                 borrow.get("toString"),
@@ -7570,8 +7606,14 @@ mod tests {
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::PlainObject(map) = &result {
             let borrow = map.borrow();
-            assert_eq!(borrow.get("source"), Some(&JsValue::String("test".to_string())));
-            assert_eq!(borrow.get("flags"), Some(&JsValue::String("gim".to_string())));
+            assert_eq!(
+                borrow.get("source"),
+                Some(&JsValue::String("test".to_string()))
+            );
+            assert_eq!(
+                borrow.get("flags"),
+                Some(&JsValue::String("gim".to_string()))
+            );
         } else {
             panic!("expected PlainObject, got {result:?}");
         }
@@ -7600,7 +7642,10 @@ mod tests {
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::PlainObject(map) = &result {
             let borrow = map.borrow();
-            assert_eq!(borrow.get("source"), Some(&JsValue::String("abc".to_string())));
+            assert_eq!(
+                borrow.get("source"),
+                Some(&JsValue::String("abc".to_string()))
+            );
             assert_eq!(borrow.get("flags"), Some(&JsValue::String(String::new())));
             assert_eq!(
                 borrow.get("toString"),
@@ -7776,10 +7821,7 @@ mod tests {
                     ],
                 ),
                 // Read "length"
-                Instruction::new_unchecked(
-                    Opcode::LdaConstant,
-                    vec![Operand::ConstantPoolIdx(0)],
-                ),
+                Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(0)]),
                 Instruction::new_unchecked(
                     Opcode::LdaKeyedProperty,
                     vec![Operand::Register(0), Operand::FeedbackSlot(0)],
@@ -7860,10 +7902,7 @@ mod tests {
                 ],
             ),
             //  6: ForInEnumerate r0 → acc = keys array
-            Instruction::new_unchecked(
-                Opcode::ForInEnumerate,
-                vec![Operand::Register(0)],
-            ),
+            Instruction::new_unchecked(Opcode::ForInEnumerate, vec![Operand::Register(0)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
             //  8: ForInPrepare r1, slot → acc = length
             Instruction::new_unchecked(
@@ -7902,10 +7941,7 @@ mod tests {
             ),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(5)]),
             // 19: ForInStep r3 → acc = index + 1
-            Instruction::new_unchecked(
-                Opcode::ForInStep,
-                vec![Operand::Register(3)],
-            ),
+            Instruction::new_unchecked(Opcode::ForInStep, vec![Operand::Register(3)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(3)]),
             // 21: Check if index < length manually (since we can't use
             //     JumpIfForInDone with raw offsets easily).
@@ -7976,10 +8012,7 @@ mod tests {
                 ],
             ),
             // ForInEnumerate r0
-            Instruction::new_unchecked(
-                Opcode::ForInEnumerate,
-                vec![Operand::Register(0)],
-            ),
+            Instruction::new_unchecked(Opcode::ForInEnumerate, vec![Operand::Register(0)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
             // ForInPrepare r1, slot → acc = length
             Instruction::new_unchecked(
@@ -8010,10 +8043,7 @@ mod tests {
         let instrs = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
-            Instruction::new_unchecked(
-                Opcode::ForInStep,
-                vec![Operand::Register(0)],
-            ),
+            Instruction::new_unchecked(Opcode::ForInStep, vec![Operand::Register(0)]),
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let result = run_bytecode(instrs, 1).unwrap();
@@ -8035,9 +8065,9 @@ mod tests {
     #[test]
     fn test_e2e_for_in_count_keys() {
         use crate::parser::ast::{
-            AssignExpr, AssignOp, AssignTarget, BinaryOp, BlockStmt,
-            ExprStmt, ForInOfLeft, ForInStmt, Ident, ObjectExpr, ObjectProp,
-            Pat, Prop, PropKey, PropValue, Stmt, VarDecl, VarDeclarator, VarKind,
+            AssignExpr, AssignOp, AssignTarget, BinaryOp, BlockStmt, ExprStmt, ForInOfLeft,
+            ForInStmt, Ident, ObjectExpr, ObjectProp, Pat, Prop, PropKey, PropValue, Stmt, VarDecl,
+            VarDeclarator, VarKind,
         };
 
         // let obj = { a: 1, b: 2 };
@@ -8050,29 +8080,31 @@ mod tests {
                     loc: span(),
                     name: "obj".to_owned(),
                 }),
-                init: Some(Box::new(crate::parser::ast::Expr::Object(Box::new(ObjectExpr {
-                    loc: span(),
-                    properties: vec![
-                        ObjectProp::Prop(Box::new(Prop {
-                            loc: span(),
-                            key: PropKey::Ident(Ident {
+                init: Some(Box::new(crate::parser::ast::Expr::Object(Box::new(
+                    ObjectExpr {
+                        loc: span(),
+                        properties: vec![
+                            ObjectProp::Prop(Box::new(Prop {
                                 loc: span(),
-                                name: "a".to_owned(),
-                            }),
-                            is_computed: false,
-                            value: PropValue::Value(Box::new(num_expr(1.0))),
-                        })),
-                        ObjectProp::Prop(Box::new(Prop {
-                            loc: span(),
-                            key: PropKey::Ident(Ident {
+                                key: PropKey::Ident(Ident {
+                                    loc: span(),
+                                    name: "a".to_owned(),
+                                }),
+                                is_computed: false,
+                                value: PropValue::Value(Box::new(num_expr(1.0))),
+                            })),
+                            ObjectProp::Prop(Box::new(Prop {
                                 loc: span(),
-                                name: "b".to_owned(),
-                            }),
-                            is_computed: false,
-                            value: PropValue::Value(Box::new(num_expr(2.0))),
-                        })),
-                    ],
-                })))),
+                                key: PropKey::Ident(Ident {
+                                    loc: span(),
+                                    name: "b".to_owned(),
+                                }),
+                                is_computed: false,
+                                value: PropValue::Value(Box::new(num_expr(2.0))),
+                            })),
+                        ],
+                    },
+                )))),
             }],
         });
 
@@ -8099,23 +8131,22 @@ mod tests {
                 loc: span(),
                 body: vec![Stmt::Expr(ExprStmt {
                     loc: span(),
-                    expr: Box::new(crate::parser::ast::Expr::Assign(Box::new(
-                        AssignExpr {
-                            loc: span(),
-                            op: AssignOp::Assign,
-                            left: AssignTarget::Expr(Box::new(ident_expr("count"))),
-                            right: Box::new(binary(
-                                BinaryOp::Add,
-                                ident_expr("count"),
-                                num_expr(1.0),
-                            )),
-                        },
-                    ))),
+                    expr: Box::new(crate::parser::ast::Expr::Assign(Box::new(AssignExpr {
+                        loc: span(),
+                        op: AssignOp::Assign,
+                        left: AssignTarget::Expr(Box::new(ident_expr("count"))),
+                        right: Box::new(binary(BinaryOp::Add, ident_expr("count"), num_expr(1.0))),
+                    }))),
                 })],
             })),
         });
 
-        let stmts = vec![obj_decl, count_decl, for_in, return_stmt(Some(ident_expr("count")))];
+        let stmts = vec![
+            obj_decl,
+            count_decl,
+            for_in,
+            return_stmt(Some(ident_expr("count"))),
+        ];
         let result = compile_and_run(stmts).unwrap();
         assert_eq!(result, JsValue::Smi(2));
     }
@@ -8132,9 +8163,8 @@ mod tests {
     #[test]
     fn test_e2e_for_in_existing_var_sum_values() {
         use crate::parser::ast::{
-            AssignExpr, AssignOp, AssignTarget, BinaryOp, BlockStmt,
-            ExprStmt, ForInOfLeft, ForInStmt, Ident, MemberExpr,
-            MemberProp, ObjectExpr, ObjectProp, Pat, Prop, PropKey,
+            AssignExpr, AssignOp, AssignTarget, BinaryOp, BlockStmt, ExprStmt, ForInOfLeft,
+            ForInStmt, Ident, MemberExpr, MemberProp, ObjectExpr, ObjectProp, Pat, Prop, PropKey,
             PropValue, Stmt, VarDecl, VarDeclarator, VarKind,
         };
 
@@ -8148,29 +8178,31 @@ mod tests {
                     loc: span(),
                     name: "obj".to_owned(),
                 }),
-                init: Some(Box::new(crate::parser::ast::Expr::Object(Box::new(ObjectExpr {
-                    loc: span(),
-                    properties: vec![
-                        ObjectProp::Prop(Box::new(Prop {
-                            loc: span(),
-                            key: PropKey::Ident(Ident {
+                init: Some(Box::new(crate::parser::ast::Expr::Object(Box::new(
+                    ObjectExpr {
+                        loc: span(),
+                        properties: vec![
+                            ObjectProp::Prop(Box::new(Prop {
                                 loc: span(),
-                                name: "x".to_owned(),
-                            }),
-                            is_computed: false,
-                            value: PropValue::Value(Box::new(num_expr(10.0))),
-                        })),
-                        ObjectProp::Prop(Box::new(Prop {
-                            loc: span(),
-                            key: PropKey::Ident(Ident {
+                                key: PropKey::Ident(Ident {
+                                    loc: span(),
+                                    name: "x".to_owned(),
+                                }),
+                                is_computed: false,
+                                value: PropValue::Value(Box::new(num_expr(10.0))),
+                            })),
+                            ObjectProp::Prop(Box::new(Prop {
                                 loc: span(),
-                                name: "y".to_owned(),
-                            }),
-                            is_computed: false,
-                            value: PropValue::Value(Box::new(num_expr(20.0))),
-                        })),
-                    ],
-                })))),
+                                key: PropKey::Ident(Ident {
+                                    loc: span(),
+                                    name: "y".to_owned(),
+                                }),
+                                is_computed: false,
+                                value: PropValue::Value(Box::new(num_expr(20.0))),
+                            })),
+                        ],
+                    },
+                )))),
             }],
         });
 
@@ -8203,29 +8235,30 @@ mod tests {
                 loc: span(),
                 body: vec![Stmt::Expr(ExprStmt {
                     loc: span(),
-                    expr: Box::new(crate::parser::ast::Expr::Assign(Box::new(
-                        AssignExpr {
-                            loc: span(),
-                            op: AssignOp::Assign,
-                            left: AssignTarget::Expr(Box::new(ident_expr("sum"))),
-                            right: Box::new(binary(
-                                BinaryOp::Add,
-                                ident_expr("sum"),
-                                crate::parser::ast::Expr::Member(Box::new(MemberExpr {
-                                    loc: span(),
-                                    object: Box::new(ident_expr("obj")),
-                                    property: MemberProp::Computed(Box::new(ident_expr("k"))),
-                                    is_computed: true,
-                                })),
-                            )),
-                        },
-                    ))),
+                    expr: Box::new(crate::parser::ast::Expr::Assign(Box::new(AssignExpr {
+                        loc: span(),
+                        op: AssignOp::Assign,
+                        left: AssignTarget::Expr(Box::new(ident_expr("sum"))),
+                        right: Box::new(binary(
+                            BinaryOp::Add,
+                            ident_expr("sum"),
+                            crate::parser::ast::Expr::Member(Box::new(MemberExpr {
+                                loc: span(),
+                                object: Box::new(ident_expr("obj")),
+                                property: MemberProp::Computed(Box::new(ident_expr("k"))),
+                                is_computed: true,
+                            })),
+                        )),
+                    }))),
                 })],
             })),
         });
 
         let stmts = vec![
-            obj_decl, k_decl, sum_decl, for_in,
+            obj_decl,
+            k_decl,
+            sum_decl,
+            for_in,
             return_stmt(Some(ident_expr("sum"))),
         ];
         let result = compile_and_run(stmts).unwrap();
@@ -8236,9 +8269,8 @@ mod tests {
     #[test]
     fn test_e2e_for_in_null_noop() {
         use crate::parser::ast::{
-            ForInOfLeft, ForInStmt, Ident, Pat, Stmt, VarDecl,
-            VarDeclarator, VarKind, BlockStmt, ExprStmt, AssignExpr,
-            AssignOp, AssignTarget, BinaryOp,
+            AssignExpr, AssignOp, AssignTarget, BinaryOp, BlockStmt, ExprStmt, ForInOfLeft,
+            ForInStmt, Ident, Pat, Stmt, VarDecl, VarDeclarator, VarKind,
         };
 
         // let count = 0; for (let k in null) { count = count + 1; } return count;
@@ -8250,29 +8282,26 @@ mod tests {
                 kind: VarKind::Let,
                 declarators: vec![VarDeclarator {
                     loc: span(),
-                    id: Pat::Ident(Ident { loc: span(), name: "k".to_owned() }),
+                    id: Pat::Ident(Ident {
+                        loc: span(),
+                        name: "k".to_owned(),
+                    }),
                     init: None,
                 }],
             }),
-            right: Box::new(crate::parser::ast::Expr::Null(crate::parser::ast::NullLit {
-                loc: span(),
-            })),
+            right: Box::new(crate::parser::ast::Expr::Null(
+                crate::parser::ast::NullLit { loc: span() },
+            )),
             body: Box::new(Stmt::Block(BlockStmt {
                 loc: span(),
                 body: vec![Stmt::Expr(ExprStmt {
                     loc: span(),
-                    expr: Box::new(crate::parser::ast::Expr::Assign(Box::new(
-                        AssignExpr {
-                            loc: span(),
-                            op: AssignOp::Assign,
-                            left: AssignTarget::Expr(Box::new(ident_expr("count"))),
-                            right: Box::new(binary(
-                                BinaryOp::Add,
-                                ident_expr("count"),
-                                num_expr(1.0),
-                            )),
-                        },
-                    ))),
+                    expr: Box::new(crate::parser::ast::Expr::Assign(Box::new(AssignExpr {
+                        loc: span(),
+                        op: AssignOp::Assign,
+                        left: AssignTarget::Expr(Box::new(ident_expr("count"))),
+                        right: Box::new(binary(BinaryOp::Add, ident_expr("count"), num_expr(1.0))),
+                    }))),
                 })],
             })),
         });
@@ -8286,9 +8315,8 @@ mod tests {
     #[test]
     fn test_e2e_for_in_empty_object() {
         use crate::parser::ast::{
-            ForInOfLeft, ForInStmt, Ident, ObjectExpr, Pat, Stmt,
-            VarDecl, VarDeclarator, VarKind, BlockStmt, ExprStmt,
-            AssignExpr, AssignOp, AssignTarget, BinaryOp,
+            AssignExpr, AssignOp, AssignTarget, BinaryOp, BlockStmt, ExprStmt, ForInOfLeft,
+            ForInStmt, Ident, ObjectExpr, Pat, Stmt, VarDecl, VarDeclarator, VarKind,
         };
 
         // let count = 0; for (let k in {}) { count = count + 1; } return count;
@@ -8300,7 +8328,10 @@ mod tests {
                 kind: VarKind::Let,
                 declarators: vec![VarDeclarator {
                     loc: span(),
-                    id: Pat::Ident(Ident { loc: span(), name: "k".to_owned() }),
+                    id: Pat::Ident(Ident {
+                        loc: span(),
+                        name: "k".to_owned(),
+                    }),
                     init: None,
                 }],
             }),
@@ -8312,18 +8343,12 @@ mod tests {
                 loc: span(),
                 body: vec![Stmt::Expr(ExprStmt {
                     loc: span(),
-                    expr: Box::new(crate::parser::ast::Expr::Assign(Box::new(
-                        AssignExpr {
-                            loc: span(),
-                            op: AssignOp::Assign,
-                            left: AssignTarget::Expr(Box::new(ident_expr("count"))),
-                            right: Box::new(binary(
-                                BinaryOp::Add,
-                                ident_expr("count"),
-                                num_expr(1.0),
-                            )),
-                        },
-                    ))),
+                    expr: Box::new(crate::parser::ast::Expr::Assign(Box::new(AssignExpr {
+                        loc: span(),
+                        op: AssignOp::Assign,
+                        left: AssignTarget::Expr(Box::new(ident_expr("count"))),
+                        right: Box::new(binary(BinaryOp::Add, ident_expr("count"), num_expr(1.0))),
+                    }))),
                 })],
             })),
         });
@@ -8447,10 +8472,7 @@ mod tests {
                 vec![Operand::ConstantPoolIdx(0)],
             ),
             // Save inner context into r2 for later use as ctx_reg
-            Instruction::new_unchecked(
-                Opcode::Star,
-                vec![Operand::Register(2)],
-            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
             // Load the frame.context (inner) into r2
             // Actually, we can just load the current context from the frame.
             // Let's use a different approach: we know frame.context is the inner ctx.
@@ -8768,8 +8790,7 @@ mod tests {
 
     #[test]
     fn test_new_type_error_message() {
-        let result =
-            error_construct_and_read_property("TypeError", "bad type", "message").unwrap();
+        let result = error_construct_and_read_property("TypeError", "bad type", "message").unwrap();
         assert_eq!(result, JsValue::String("bad type".to_string()));
     }
 
@@ -8802,8 +8823,7 @@ mod tests {
 
     #[test]
     fn test_new_eval_error() {
-        let result =
-            error_construct_and_read_property("EvalError", "bad eval", "name").unwrap();
+        let result = error_construct_and_read_property("EvalError", "bad eval", "name").unwrap();
         assert_eq!(result, JsValue::String("EvalError".to_string()));
     }
 
