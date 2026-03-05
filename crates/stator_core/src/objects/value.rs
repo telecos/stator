@@ -181,6 +181,7 @@ pub type NativeFn = Rc<dyn Fn(Vec<JsValue>) -> StatorResult<JsValue>>;
 /// `Iterator` wraps a [`NativeIterator`] over a pre-collected sequence.
 /// `NativeFunction` wraps an embedder-provided Rust closure.
 /// `PlainObject` wraps a simple property map for lightweight object creation.
+/// `Context` wraps a scope context for closure variable capture.
 ///
 /// # Safety – `Object` variant
 ///
@@ -248,6 +249,35 @@ pub enum JsValue {
     /// Used to construct host objects (e.g. `console`) that carry
     /// [`NativeFunction`][Self::NativeFunction] properties.
     PlainObject(Rc<RefCell<HashMap<String, JsValue>>>),
+    /// A scope context for closure variable capture.
+    ///
+    /// A context holds numbered slots for captured variables and an optional
+    /// parent pointer forming the scope chain.  Used by context-slot opcodes
+    /// (`LdaContextSlot`, `StaContextSlot`, etc.) in the interpreter.
+    Context(Rc<RefCell<JsContext>>),
+}
+
+/// A scope context representing the environment for captured variables.
+///
+/// Each context contains a vector of numbered slots and an optional parent
+/// pointer so that inner scopes can walk the chain to reach outer scopes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsContext {
+    /// The captured variable slots.
+    pub slots: Vec<JsValue>,
+    /// The enclosing (parent) context, or `None` for the outermost scope.
+    pub parent: Option<Rc<RefCell<JsContext>>>,
+}
+
+impl JsContext {
+    /// Create a new context with `slot_count` slots initialised to `undefined`,
+    /// chained to an optional parent context.
+    pub fn new(slot_count: usize, parent: Option<Rc<RefCell<JsContext>>>) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self {
+            slots: vec![JsValue::Undefined; slot_count],
+            parent,
+        }))
+    }
 }
 
 // Manual Debug impl: NativeFunction can't derive Debug (dyn Fn).
@@ -270,6 +300,7 @@ impl std::fmt::Debug for JsValue {
             Self::Error(e) => write!(f, "Error({e:?})"),
             Self::NativeFunction(_) => write!(f, "NativeFunction"),
             Self::PlainObject(map) => write!(f, "PlainObject({map:?})"),
+            Self::Context(ctx) => write!(f, "Context({ctx:?})"),
         }
     }
 }
@@ -298,6 +329,7 @@ impl PartialEq for JsValue {
             // NativeFunction has no comparable content; use pointer identity.
             (Self::NativeFunction(a), Self::NativeFunction(b)) => Rc::ptr_eq(a, b),
             (Self::PlainObject(a), Self::PlainObject(b)) => Rc::ptr_eq(a, b),
+            (Self::Context(a), Self::Context(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -438,7 +470,8 @@ impl JsValue {
             | Self::Generator(_)
             | Self::Iterator(_)
             | Self::NativeFunction(_)
-            | Self::PlainObject(_) => true,
+            | Self::PlainObject(_)
+            | Self::Context(_) => true,
             Self::BigInt(n) => *n != 0,
         }
     }
@@ -507,6 +540,9 @@ impl JsValue {
             Self::PlainObject(_) => Err(StatorError::TypeError(
                 "Cannot convert an Object to a number without ToPrimitive".to_string(),
             )),
+            Self::Context(_) => Err(StatorError::TypeError(
+                "Cannot convert a Context to a number".to_string(),
+            )),
         }
     }
 
@@ -560,6 +596,7 @@ impl JsValue {
             Self::Error(e) => Ok(e.to_error_string()),
             Self::NativeFunction(_) => Ok("function () { [native code] }".to_string()),
             Self::PlainObject(_) => Ok("[object Object]".to_string()),
+            Self::Context(_) => Ok("[object Context]".to_string()),
         }
     }
 }
@@ -598,6 +635,15 @@ impl Trace for JsValue {
             Self::Iterator(iter) => {
                 for item in &iter.borrow().items {
                     item.trace(tracer);
+                }
+            }
+            Self::Context(ctx) => {
+                for slot in &ctx.borrow().slots {
+                    slot.trace(tracer);
+                }
+                // Parent contexts are traced transitively through the slots/parent chain.
+                if let Some(parent) = &ctx.borrow().parent {
+                    JsValue::Context(Rc::clone(parent)).trace(tracer);
                 }
             }
             // JsError (including AggregateError inner errors) contains no raw

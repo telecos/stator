@@ -10,6 +10,10 @@
 pub mod array;
 /// ECMAScript §20.5 `Error` built-in and error hierarchy (`TypeError`, `RangeError`, etc.).
 pub mod error;
+/// Pre-populates the global environment with all built-in constructors, namespace
+/// objects, and global functions so that JavaScript code can access `Math`,
+/// `console`, `JSON`, `parseInt`, etc.
+pub mod install_globals;
 /// ECMAScript §19 global object properties and global functions (`isNaN`, `isFinite`,
 /// `parseInt`, `parseFloat`, `encodeURI`, `decodeURI`, `encodeURIComponent`,
 /// `decodeURIComponent`, `eval`, and the `NaN`/`Infinity`/`undefined` constants).
@@ -37,6 +41,9 @@ pub mod reflect;
 pub mod set;
 /// ECMAScript §22.1 `String` built-in static methods and prototype equivalents.
 pub mod string;
+/// ECMAScript §20.4 `Symbol` built-in — unique property keys, well-known symbols,
+/// and the global symbol registry (`Symbol.for()` / `Symbol.keyFor()`).
+pub mod symbol;
 /// Shared utility functions (e.g. `SameValueZero`) used across built-in sub-modules.
 pub(crate) mod util;
 /// WebAssembly JavaScript API built-ins:

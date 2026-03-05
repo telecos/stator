@@ -235,7 +235,30 @@ pub fn object_is_frozen(obj: &JsObject) -> bool {
     }
     true
 }
+/// ECMAScript §20.1.2.16 `Object.isSealed(obj)`.
+///
+/// Returns `true` if and only if the object is non-extensible and every own
+/// property is non-configurable.
+pub fn object_is_sealed(obj: &JsObject) -> bool {
+    if obj.is_extensible() {
+        return false;
+    }
+    for key in obj.own_property_keys() {
+        if let Some((_, attrs)) = obj.get_own_property_descriptor(&key)
+            && attrs.contains(PropertyAttributes::CONFIGURABLE)
+        {
+            return false;
+        }
+    }
+    true
+}
 
+/// ECMAScript §20.1.2.9 `Object.getOwnPropertyNames(obj)`.
+///
+/// Returns an array of all own property names (including non-enumerable ones).
+pub fn object_get_own_property_names(obj: &JsObject) -> Vec<String> {
+    obj.own_property_keys()
+}
 // ── Object.is ────────────────────────────────────────────────────────────────
 
 /// ECMAScript §20.1.2.15 `Object.is(x, y)` — **SameValue** (§7.2.11).
@@ -735,5 +758,49 @@ mod tests {
         ];
         let obj = object_from_entries(entries).unwrap();
         assert_eq!(obj.get_own_property("k"), Some(JsValue::Smi(2)));
+    }
+
+    // ── object_is_sealed ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_object_is_sealed_extensible_returns_false() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        assert!(!object_is_sealed(&obj));
+    }
+
+    #[test]
+    fn test_object_is_sealed_after_seal() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        object_seal(&mut obj).unwrap();
+        assert!(object_is_sealed(&obj));
+    }
+
+    #[test]
+    fn test_object_is_sealed_empty_non_extensible() {
+        let mut obj = JsObject::new();
+        obj.prevent_extensions();
+        assert!(object_is_sealed(&obj));
+    }
+
+    // ── object_get_own_property_names ────────────────────────────────────
+
+    #[test]
+    fn test_get_own_property_names_includes_non_enumerable() {
+        let mut obj = JsObject::new();
+        obj.set_property("visible", JsValue::Smi(1)).unwrap();
+        obj.define_own_property("hidden", JsValue::Smi(2), PropertyAttributes::WRITABLE)
+            .unwrap();
+
+        let names = object_get_own_property_names(&obj);
+        assert!(names.contains(&"visible".to_string()));
+        assert!(names.contains(&"hidden".to_string()));
+    }
+
+    #[test]
+    fn test_get_own_property_names_empty() {
+        let obj = JsObject::new();
+        assert!(object_get_own_property_names(&obj).is_empty());
     }
 }

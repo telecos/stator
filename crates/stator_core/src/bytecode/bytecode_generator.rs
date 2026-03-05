@@ -403,7 +403,8 @@ impl FunctionCompiler {
             }
             Stmt::Empty(_) => Ok(()),
             Stmt::Switch(s) => self.compile_switch(s),
-            Stmt::ForIn(_) | Stmt::With(_) | Stmt::ClassDecl(_) => Err(StatorError::Internal(
+            Stmt::ForIn(s) => self.compile_for_in(s),
+            Stmt::With(_) | Stmt::ClassDecl(_) => Err(StatorError::Internal(
                 format!("{} is not yet supported", stmt_kind(stmt)),
             )),
             Stmt::ForOf(s) => self.compile_for_of(s),
@@ -2137,6 +2138,192 @@ impl FunctionCompiler {
 
     /// Compile a `for (left of right) body` statement.
     ///
+    /// Compile a `for (x in obj) { … }` statement.
+    ///
+    /// Emits:
+    /// ```text
+    /// <compile right>                          ; acc = object
+    /// Star r_obj
+    /// ForInEnumerate r_obj                     ; acc = keys array
+    /// Star r_keys
+    /// ForInPrepare r_keys, slot                ; acc = length
+    /// Star r_length
+    /// LdaZero
+    /// Star r_index
+    /// loop_start:
+    ///   JumpIfForInDone end, r_index, r_length ; jump when done
+    ///   ForInNext r_obj, r_index, r_keys, slot ; acc = keys[index]
+    ///   Star r_key                             ; bind loop variable
+    ///   <body>
+    ///   ForInStep r_index                      ; acc = index + 1
+    ///   Star r_index
+    ///   JumpLoop loop_start
+    /// end:
+    /// ```
+    fn compile_for_in(&mut self, stmt: &crate::parser::ast::ForInStmt) -> StatorResult<()> {
+        use crate::parser::ast::ForInOfLeft;
+
+        // Open the loop's own scope so the loop variable lives inside.
+        self.push_scope();
+
+        // Pre-allocate the loop variable register if it's a new declaration.
+        let loop_var_reg: Option<Register> = match &stmt.left {
+            ForInOfLeft::VarDecl(decl) => {
+                if decl.declarators.len() == 1 {
+                    match &decl.declarators[0].id {
+                        crate::parser::ast::Pat::Ident(id) => Some(self.define_local(&id.name)),
+                        _ => {
+                            return Err(StatorError::Internal(
+                                "destructuring in for-in is not yet supported".into(),
+                            ));
+                        }
+                    }
+                } else if decl.declarators.is_empty() {
+                    None
+                } else {
+                    return Err(StatorError::Internal(
+                        "multiple declarators in for-in are not supported".into(),
+                    ));
+                }
+            }
+            ForInOfLeft::Pat(_) => None,
+        };
+
+        // Evaluate the right-hand (object) expression → acc.
+        self.compile_expr(&stmt.right)?;
+
+        // Store the object in a temporary.
+        let r_obj = self.allocator.allocate_temporary();
+        self.emit_star(r_obj);
+
+        // ForInEnumerate r_obj → acc = array of enumerable keys.
+        let enum_slot = self.alloc_slot(FeedbackSlotKind::ForIn);
+        self.emit(Instruction::new_unchecked(
+            Opcode::ForInEnumerate,
+            vec![to_reg_op(r_obj)],
+        ));
+
+        // Save keys array.
+        let r_keys = self.allocator.allocate_temporary();
+        self.emit_star(r_keys);
+
+        // ForInPrepare r_keys, slot → acc = length.
+        let prepare_slot = self.alloc_slot(FeedbackSlotKind::ForIn);
+        self.emit(Instruction::new_unchecked(
+            Opcode::ForInPrepare,
+            vec![to_reg_op(r_keys), prepare_slot],
+        ));
+
+        // Save length.
+        let r_length = self.allocator.allocate_temporary();
+        self.emit_star(r_length);
+
+        // index = 0.
+        self.emit(Instruction::new_unchecked(
+            Opcode::LdaZero,
+            vec![],
+        ));
+        let r_index = self.allocator.allocate_temporary();
+        self.emit_star(r_index);
+
+        // Loop labels.
+        let loop_lbl = self.new_label();
+        let break_lbl = self.new_label();
+        self.loop_stack.push((loop_lbl, break_lbl));
+
+        // Bind loop start.
+        self.bind_label(loop_lbl);
+
+        // JumpIfForInDone [offset, r_index, r_length] — jump to break if done.
+        {
+            let jump_idx = self.instructions.len();
+            self.labels[break_lbl].refs.push(jump_idx);
+            self.emit(Instruction::new_unchecked(
+                Opcode::JumpIfForInDone,
+                vec![
+                    Operand::JumpOffset(0),
+                    to_reg_op(r_index),
+                    to_reg_op(r_length),
+                ],
+            ));
+        }
+
+        // ForInNext r_obj, r_index, r_keys, slot → acc = keys[index].
+        let next_slot = self.alloc_slot(FeedbackSlotKind::ForIn);
+        self.emit(Instruction::new_unchecked(
+            Opcode::ForInNext,
+            vec![
+                to_reg_op(r_obj),
+                to_reg_op(r_index),
+                to_reg_op(r_keys),
+                next_slot,
+            ],
+        ));
+
+        // Bind the loop variable.
+        match &stmt.left {
+            ForInOfLeft::VarDecl(_) => {
+                if let Some(reg) = loop_var_reg {
+                    self.emit_star(reg);
+                }
+            }
+            ForInOfLeft::Pat(pat) => match pat {
+                crate::parser::ast::Pat::Ident(id) => {
+                    let reg = self.lookup_var(&id.name).ok_or_else(|| {
+                        StatorError::Internal(format!(
+                            "for-in: undefined variable '{}'",
+                            id.name
+                        ))
+                    })?;
+                    self.emit_star(reg);
+                }
+                _ => {
+                    return Err(StatorError::Internal(
+                        "destructuring in for-in is not yet supported".into(),
+                    ));
+                }
+            },
+        }
+
+        // Compile the loop body.
+        self.compile_stmt(&stmt.body)?;
+
+        // ForInStep r_index → acc = index + 1.
+        self.emit(Instruction::new_unchecked(
+            Opcode::ForInStep,
+            vec![to_reg_op(r_index)],
+        ));
+        self.emit_star(r_index);
+
+        // Back-edge jump.
+        self.emit_jump_loop_to(loop_lbl);
+
+        // Bind break target.
+        self.bind_label(break_lbl);
+
+        self.loop_stack.pop();
+        self.pop_scope();
+
+        // Release temporaries in reverse allocation order.
+        self.allocator
+            .release_temporary(r_index)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        self.allocator
+            .release_temporary(r_length)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        self.allocator
+            .release_temporary(r_keys)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        self.allocator
+            .release_temporary(r_obj)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+
+        // Suppress the unused-variable warning for the ForIn feedback slots.
+        let _ = (enum_slot, prepare_slot, next_slot);
+
+        Ok(())
+    }
+
     /// Emits `GetIterator` + `IteratorNext` loop:
     /// ```text
     /// <compile right>

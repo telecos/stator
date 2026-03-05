@@ -1000,7 +1000,8 @@ fn js_value_to_json_inner(
         | JsValue::Function(_)
         | JsValue::Generator(_)
         | JsValue::Iterator(_)
-        | JsValue::Error(_) => Ok(None),
+        | JsValue::Error(_)
+        | JsValue::Context(_) => Ok(None),
         JsValue::Null => Ok(Some(JsonValue::Null)),
         JsValue::Boolean(b) => Ok(Some(JsonValue::Bool(*b))),
         JsValue::Smi(n) => Ok(Some(JsonValue::Number(f64::from(*n)))),
@@ -1030,7 +1031,23 @@ fn js_value_to_json_inner(
         JsValue::Object(_) => Ok(Some(JsonValue::Object(Rc::new(RefCell::new(Vec::new()))))),
         // NativeFunction and PlainObject are not JSON-serializable.
         JsValue::NativeFunction(_) => Ok(None),
-        JsValue::PlainObject(_) => Ok(Some(JsonValue::Object(Rc::new(RefCell::new(Vec::new()))))),
+        JsValue::PlainObject(map) => {
+            let ptr = Rc::as_ptr(map) as usize;
+            if seen.contains(&ptr) {
+                return Err(StatorError::TypeError(
+                    "Converting circular structure to JSON".to_string(),
+                ));
+            }
+            seen.insert(ptr);
+            let mut entries: Vec<(String, JsonValue)> = Vec::new();
+            for (k, v) in map.borrow().iter() {
+                if let Some(jv) = js_value_to_json_inner(v, seen)? {
+                    entries.push((k.clone(), jv));
+                }
+            }
+            seen.remove(&ptr);
+            Ok(Some(JsonValue::Object(Rc::new(RefCell::new(entries)))))
+        }
     }
 }
 

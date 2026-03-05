@@ -478,6 +478,7 @@ fn slash_is_regexp(last: Option<&TokenKind>) -> bool {
 ///     println!("{:?}", tok.kind);
 /// }
 /// ```
+#[derive(Clone)]
 pub struct Scanner<'src> {
     /// The complete source string.
     source: &'src str,

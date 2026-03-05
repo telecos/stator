@@ -292,6 +292,7 @@ impl HeapSnapshotBuilder {
             JsValue::Object(_) | JsValue::PlainObject(_) => NODE_TYPE_OBJECT,
             JsValue::NativeFunction(_) => NODE_TYPE_NATIVE,
             JsValue::Generator(_) | JsValue::Iterator(_) | JsValue::Error(_) => NODE_TYPE_OBJECT,
+            JsValue::Context(_) => NODE_TYPE_OBJECT,
         }
     }
 
@@ -338,6 +339,7 @@ impl HeapSnapshotBuilder {
                 let _ = write!(s, "{}: {}", e.name(), e.message());
                 s
             }
+            JsValue::Context(_) => "Context".to_string(),
         }
     }
 
