@@ -62,6 +62,33 @@ pub fn map_new() -> JsMap {
     JsMap::default()
 }
 
+/// ECMAScript §24.1.1.1 `new Map(iterable)`.
+///
+/// Creates a [`JsMap`] from an iterable of `[key, value]` pairs.  Each pair
+/// is a two-element slice.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::map::{map_from_iterable, map_get, map_size};
+/// use stator_core::objects::value::JsValue;
+///
+/// let pairs = vec![
+///     (JsValue::Smi(1), JsValue::String("one".into())),
+///     (JsValue::Smi(2), JsValue::String("two".into())),
+/// ];
+/// let m = map_from_iterable(pairs);
+/// assert_eq!(map_size(&m), 2);
+/// assert_eq!(map_get(&m, &JsValue::Smi(1)), JsValue::String("one".into()));
+/// ```
+pub fn map_from_iterable(pairs: Vec<(JsValue, JsValue)>) -> JsMap {
+    let mut m = map_new();
+    for (k, v) in pairs {
+        map_set(&mut m, k, v);
+    }
+    m
+}
+
 // ── map_set ───────────────────────────────────────────────────────────────────
 
 /// ECMAScript §24.1.3.9 `Map.prototype.set(key, value)`.
@@ -309,11 +336,76 @@ pub fn map_entries(map: &JsMap) -> Vec<(JsValue, JsValue)> {
     map.entries.clone()
 }
 
+/// ECMAScript §24.1.3 `Map.prototype[@@iterator]()`.
+///
+/// Returns all `(key, value)` pairs in insertion order.  This is the same as
+/// [`map_entries`] and fulfils the `Symbol.iterator` protocol for `Map`.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::map::{map_new, map_set, map_iter};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut m = map_new();
+/// map_set(&mut m, JsValue::Smi(1), JsValue::Boolean(true));
+/// let pairs = map_iter(&m);
+/// assert_eq!(pairs.len(), 1);
+/// ```
+pub fn map_iter(map: &JsMap) -> Vec<(JsValue, JsValue)> {
+    map_entries(map)
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── map_from_iterable ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_map_from_iterable() {
+        let pairs = vec![
+            (JsValue::Smi(1), JsValue::String("a".into())),
+            (JsValue::Smi(2), JsValue::String("b".into())),
+        ];
+        let m = map_from_iterable(pairs);
+        assert_eq!(map_size(&m), 2);
+        assert_eq!(map_get(&m, &JsValue::Smi(1)), JsValue::String("a".into()));
+        assert_eq!(map_get(&m, &JsValue::Smi(2)), JsValue::String("b".into()));
+    }
+
+    #[test]
+    fn test_map_from_iterable_deduplicates() {
+        let pairs = vec![
+            (JsValue::Smi(1), JsValue::String("first".into())),
+            (JsValue::Smi(1), JsValue::String("second".into())),
+        ];
+        let m = map_from_iterable(pairs);
+        assert_eq!(map_size(&m), 1);
+        assert_eq!(
+            map_get(&m, &JsValue::Smi(1)),
+            JsValue::String("second".into())
+        );
+    }
+
+    // ── map_iter ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_map_iter_returns_entries() {
+        let mut m = map_new();
+        map_set(&mut m, JsValue::Smi(1), JsValue::Smi(10));
+        map_set(&mut m, JsValue::Smi(2), JsValue::Smi(20));
+        let entries = map_iter(&m);
+        assert_eq!(
+            entries,
+            vec![
+                (JsValue::Smi(1), JsValue::Smi(10)),
+                (JsValue::Smi(2), JsValue::Smi(20)),
+            ]
+        );
+    }
 
     // ── map_set / map_get / map_size ──────────────────────────────────────────
 
