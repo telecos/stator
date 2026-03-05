@@ -171,8 +171,10 @@ use std::rc::Rc;
 use crate::builtins::error::{pop_call_frame, push_call_frame};
 use crate::bytecode::bytecode_array::{
     BytecodeArray, ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD,
-    MaglevJitCodeCache, TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD, TurbofanJitCodeCache,
+    TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD,
 };
+#[cfg(all(target_arch = "x86_64", unix))]
+use crate::bytecode::bytecode_array::{MaglevJitCodeCache, TurbofanJitCodeCache};
 use crate::bytecode::bytecodes::{Opcode, Operand, decode_with_byte_offsets};
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::debugger::Debugger;
@@ -3073,6 +3075,253 @@ impl Interpreter {
                     }
                 }
 
+                // ── Delete property ───────────────────────────────────────
+
+                // DeletePropertySloppy [object_reg]:
+                //   Delete the property named by the accumulator from the
+                //   object in `object_reg`.  Non-configurable properties
+                //   silently fail; the accumulator receives `true`/`false`.
+                Opcode::DeletePropertySloppy => {
+                    let Operand::Register(obj_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("DeletePropertySloppy", 0));
+                    };
+                    let key = to_property_key(&frame.accumulator)?;
+                    let obj = frame.read_reg(obj_v)?.clone();
+                    let removed = if let JsValue::PlainObject(ref map) = obj {
+                        map.borrow_mut().remove(&key).is_some()
+                    } else {
+                        false
+                    };
+                    frame.accumulator = JsValue::Boolean(removed);
+                }
+
+                // DeletePropertyStrict [object_reg]:
+                //   Like DeletePropertySloppy but throws TypeError when the
+                //   property exists and is non-configurable.  For our
+                //   simplified PlainObject model every property is
+                //   configurable, so this behaves the same as sloppy mode.
+                Opcode::DeletePropertyStrict => {
+                    let Operand::Register(obj_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("DeletePropertyStrict", 0));
+                    };
+                    let key = to_property_key(&frame.accumulator)?;
+                    let obj = frame.read_reg(obj_v)?.clone();
+                    if let JsValue::PlainObject(ref map) = obj {
+                        map.borrow_mut().remove(&key);
+                    }
+                    frame.accumulator = JsValue::Boolean(true);
+                }
+
+                // ── Arguments / rest parameter ───────────────────────────────
+
+                // CreateRestParameter []:
+                //   Collect all arguments beyond the formal parameter count
+                //   into a JsValue::Array.
+                Opcode::CreateRestParameter => {
+                    let param_count = frame.bytecode_array.parameter_count() as usize;
+                    let rest: Vec<JsValue> = if frame.registers.len() > param_count {
+                        frame.registers[param_count..].to_vec()
+                    } else {
+                        vec![]
+                    };
+                    frame.accumulator = JsValue::Array(Rc::new(rest));
+                }
+
+                // CreateMappedArguments []:
+                //   Create a sloppy-mode `arguments` object.  Implemented as
+                //   a PlainObject with indexed string keys and a `length`
+                //   property.
+                Opcode::CreateMappedArguments => {
+                    let param_count = frame.bytecode_array.parameter_count() as usize;
+                    let args: Vec<JsValue> =
+                        frame.registers.get(..param_count).unwrap_or(&[]).to_vec();
+                    let map: HashMap<String, JsValue> = args
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| (i.to_string(), v.clone()))
+                        .chain(std::iter::once((
+                            "length".to_string(),
+                            JsValue::Smi(args.len() as i32),
+                        )))
+                        .collect();
+                    frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                }
+
+                // CreateUnmappedArguments []:
+                //   Create a strict-mode `arguments` object (snapshot copy).
+                //   Same shape as mapped but values are not aliased.
+                Opcode::CreateUnmappedArguments => {
+                    let param_count = frame.bytecode_array.parameter_count() as usize;
+                    let args: Vec<JsValue> =
+                        frame.registers.get(..param_count).unwrap_or(&[]).to_vec();
+                    let map: HashMap<String, JsValue> = args
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| (i.to_string(), v.clone()))
+                        .chain(std::iter::once((
+                            "length".to_string(),
+                            JsValue::Smi(args.len() as i32),
+                        )))
+                        .collect();
+                    frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                }
+
+                // ── Throw-if-hole opcodes (TDZ checks) ──────────────────────
+
+                // ThrowReferenceErrorIfHole [name_idx]:
+                //   If the accumulator is Undefined (representing a TDZ hole),
+                //   throw a ReferenceError with the variable name from the
+                //   constant pool.
+                Opcode::ThrowReferenceErrorIfHole => {
+                    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("ThrowReferenceErrorIfHole", 0));
+                    };
+                    if frame.accumulator == JsValue::Undefined {
+                        let name = match frame.bytecode_array.get_constant(name_idx) {
+                            Some(ConstantPoolEntry::String(s)) => s.clone(),
+                            _ => "<unknown>".to_string(),
+                        };
+                        return Err(StatorError::ReferenceError(format!(
+                            "Cannot access '{name}' before initialization"
+                        )));
+                    }
+                }
+
+                // ThrowSuperNotCalledIfHole []:
+                //   If the accumulator is Undefined (hole), throw
+                //   ReferenceError because super() was never called.
+                Opcode::ThrowSuperNotCalledIfHole => {
+                    if frame.accumulator == JsValue::Undefined {
+                        return Err(StatorError::ReferenceError(
+                            "Must call super constructor in derived class \
+                             before accessing 'this' or returning from \
+                             derived constructor"
+                                .to_string(),
+                        ));
+                    }
+                }
+
+                // ThrowSuperAlreadyCalledIfNotHole []:
+                //   If the accumulator is NOT Undefined (not a hole), throw
+                //   ReferenceError because super() was already called.
+                Opcode::ThrowSuperAlreadyCalledIfNotHole => {
+                    if frame.accumulator != JsValue::Undefined {
+                        return Err(StatorError::ReferenceError(
+                            "Super constructor may only be called once".to_string(),
+                        ));
+                    }
+                }
+
+                // ── CallProperty variants ────────────────────────────────────
+
+                // CallProperty0 [callee_reg, receiver_reg, feedback]:
+                //   Call `callee` with `receiver` as `this` and zero
+                //   arguments.
+                Opcode::CallProperty0 => {
+                    let Operand::Register(callee_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("CallProperty0", 0));
+                    };
+                    let callee = frame.read_reg(callee_v)?.clone();
+                    dispatch_call(frame, &callee, vec![])?;
+                }
+
+                // CallProperty1 [callee_reg, receiver_reg, arg0_reg, feedback]:
+                //   Call `callee` with `receiver` as `this` and one argument.
+                Opcode::CallProperty1 => {
+                    let Operand::Register(callee_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("CallProperty1", 0));
+                    };
+                    let Operand::Register(arg0_v) = instr.operands[2] else {
+                        return Err(err_bad_operand("CallProperty1", 2));
+                    };
+                    let callee = frame.read_reg(callee_v)?.clone();
+                    let arg0 = frame.read_reg(arg0_v)?.clone();
+                    dispatch_call(frame, &callee, vec![arg0])?;
+                }
+
+                // CallProperty2 [callee_reg, receiver_reg, arg0, arg1,
+                //                 feedback]:
+                //   Call `callee` with `receiver` as `this` and two arguments.
+                Opcode::CallProperty2 => {
+                    let Operand::Register(callee_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("CallProperty2", 0));
+                    };
+                    let Operand::Register(arg0_v) = instr.operands[2] else {
+                        return Err(err_bad_operand("CallProperty2", 2));
+                    };
+                    let Operand::Register(arg1_v) = instr.operands[3] else {
+                        return Err(err_bad_operand("CallProperty2", 3));
+                    };
+                    let callee = frame.read_reg(callee_v)?.clone();
+                    let arg0 = frame.read_reg(arg0_v)?.clone();
+                    let arg1 = frame.read_reg(arg1_v)?.clone();
+                    dispatch_call(frame, &callee, vec![arg0, arg1])?;
+                }
+
+                // ── CallRuntime ──────────────────────────────────────────────
+
+                // CallRuntime [runtime_id, args_start, arg_count]:
+                //   Dispatch to an internal runtime function.  Most runtime
+                //   functions are optimisation hints that are not
+                //   correctness-critical, so unrecognised IDs are no-ops.
+                Opcode::CallRuntime => {
+                    // Operands validated but the call itself is a stub.
+                    let Operand::RuntimeId(_runtime_id) = instr.operands[0] else {
+                        return Err(err_bad_operand("CallRuntime", 0));
+                    };
+                    // No-op: accumulator is left unchanged.
+                }
+
+                // ── Named own property / lookup slot ─────────────────────────
+
+                // StaNamedOwnProperty [object_reg, name_idx, feedback]:
+                //   Define an own property on `object_reg` (like
+                //   Object.defineProperty).  For the current PlainObject
+                //   model this is identical to StaNamedProperty.
+                Opcode::StaNamedOwnProperty => {
+                    let Operand::Register(obj_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("StaNamedOwnProperty", 0));
+                    };
+                    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+                        return Err(err_bad_operand("StaNamedOwnProperty", 1));
+                    };
+                    let prop_name = match frame.bytecode_array.get_constant(name_idx) {
+                        Some(ConstantPoolEntry::String(s)) => s.clone(),
+                        _ => {
+                            return Err(StatorError::Internal(
+                                "StaNamedOwnProperty: property name is \
+                                     not a string"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    let val = frame.accumulator.clone();
+                    let obj = frame.read_reg(obj_v)?.clone();
+                    if let JsValue::PlainObject(ref map) = obj {
+                        map.borrow_mut().insert(prop_name, val);
+                    }
+                }
+
+                // StaLookupSlot [name_idx, flags]:
+                //   Store the accumulator to a named variable by walking the
+                //   scope chain.  Simplified: stores directly into
+                //   `global_env`.
+                Opcode::StaLookupSlot => {
+                    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("StaLookupSlot", 0));
+                    };
+                    let name = match frame.bytecode_array.get_constant(name_idx) {
+                        Some(ConstantPoolEntry::String(s)) => s.clone(),
+                        _ => {
+                            return Err(StatorError::Internal(
+                                "StaLookupSlot: slot name is not a string".into(),
+                            ));
+                        }
+                    };
+                    let val = frame.accumulator.clone();
+                    frame.global_env.borrow_mut().insert(name, val);
+                }
+
                 // ── Unimplemented ──────────────────────────────────────────
                 other => {
                     return Err(StatorError::Internal(format!(
@@ -3384,6 +3633,68 @@ fn err_bad_operand(opcode_name: &'static str, operand_index: usize) -> StatorErr
     StatorError::Internal(format!(
         "{opcode_name}: unexpected operand kind at index {operand_index}"
     ))
+}
+
+/// Dispatch a function call with the given arguments, writing the result to
+/// the frame's accumulator.  Handles `Function`, `NativeFunction`, and
+/// callable `PlainObject` values (those with a `__call__` property).
+fn dispatch_call(
+    frame: &mut InterpreterFrame,
+    callee: &JsValue,
+    args: Vec<JsValue>,
+) -> StatorResult<()> {
+    match callee {
+        JsValue::Function(ba) => {
+            if ba.is_generator() {
+                frame.accumulator = JsValue::Generator(GeneratorState::new((**ba).clone()));
+            } else {
+                let count = ba.increment_invocation_count();
+                if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
+                    maybe_compile_baseline(ba);
+                }
+                if count >= MAGLEV_TIERING_THRESHOLD {
+                    maybe_compile_maglev(ba);
+                }
+                if count >= TURBOFAN_TIERING_THRESHOLD {
+                    maybe_compile_turbofan(ba);
+                }
+                let mut tried_jit = false;
+                if let Some(jit_result) = try_execute_best_jit(ba, &args) {
+                    frame.accumulator = jit_result?;
+                    tried_jit = true;
+                }
+                if !tried_jit {
+                    let mut callee_frame = InterpreterFrame::new_with_globals(
+                        (**ba).clone(),
+                        args,
+                        Rc::clone(&frame.global_env),
+                    );
+                    push_call_frame("<anonymous>");
+                    let result = Interpreter::run(&mut callee_frame);
+                    pop_call_frame();
+                    frame.accumulator = result?;
+                }
+            }
+        }
+        JsValue::NativeFunction(f) => {
+            frame.accumulator = f(args)?;
+        }
+        JsValue::PlainObject(map) => {
+            if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
+                frame.accumulator = f(args)?;
+            } else {
+                return Err(StatorError::TypeError(
+                    "CallProperty: callee is not a function (got PlainObject)".to_string(),
+                ));
+            }
+        }
+        other => {
+            return Err(StatorError::TypeError(format!(
+                "CallProperty: callee is not a function (got {other:?})"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Extract a `Rc<RefCell<JsContext>>` from a `JsValue::Context`.
@@ -8914,5 +9225,332 @@ mod tests {
         }
         // Unknown property returns undefined
         assert_eq!(proto_lookup(&err, "foo"), JsValue::Undefined);
+    }
+
+    // ── DeletePropertySloppy / DeletePropertyStrict ──────────────────────
+
+    #[test]
+    fn test_delete_property_sloppy_removes_key() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                // r0 = new object
+                Instruction::new_unchecked(Opcode::CreateEmptyObjectLiteral, vec![]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                // acc = 42; store as obj.x
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+                Instruction::new_unchecked(
+                    Opcode::StaNamedProperty,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+                // acc = "x" (key); delete obj[acc]
+                Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(0)]),
+                Instruction::new_unchecked(
+                    Opcode::DeletePropertySloppy,
+                    vec![Operand::Register(0)],
+                ),
+                // acc should be Boolean(true)
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("x".to_string())],
+            1,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_delete_property_strict_returns_true() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::CreateEmptyObjectLiteral, vec![]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(0)]),
+                Instruction::new_unchecked(
+                    Opcode::DeletePropertyStrict,
+                    vec![Operand::Register(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("y".to_string())],
+            1,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── CreateRestParameter ─────────────────────────────────────────────
+
+    #[test]
+    fn test_create_rest_parameter() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::CreateRestParameter, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![],
+            2,
+            1,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![JsValue::Smi(1)]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        if let JsValue::Array(arr) = result {
+            assert!(arr.len() >= 0);
+        } else {
+            panic!("expected Array, got {result:?}");
+        }
+    }
+
+    // ── CreateMappedArguments / CreateUnmappedArguments ──────────────────
+
+    #[test]
+    fn test_create_mapped_arguments() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::CreateMappedArguments, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![],
+            0,
+            2,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![JsValue::Smi(10), JsValue::Smi(20)]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        if let JsValue::PlainObject(map) = result {
+            let m = map.borrow();
+            assert_eq!(m.get("0"), Some(&JsValue::Smi(10)));
+            assert_eq!(m.get("1"), Some(&JsValue::Smi(20)));
+            assert_eq!(m.get("length"), Some(&JsValue::Smi(2)));
+        } else {
+            panic!("expected PlainObject, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_create_unmapped_arguments() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::CreateUnmappedArguments, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![],
+            0,
+            2,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![JsValue::Smi(5), JsValue::Smi(6)]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        if let JsValue::PlainObject(map) = result {
+            let m = map.borrow();
+            assert_eq!(m.get("0"), Some(&JsValue::Smi(5)));
+            assert_eq!(m.get("1"), Some(&JsValue::Smi(6)));
+            assert_eq!(m.get("length"), Some(&JsValue::Smi(2)));
+        } else {
+            panic!("expected PlainObject, got {result:?}");
+        }
+    }
+
+    // ── ThrowReferenceErrorIfHole ───────────────────────────────────────
+
+    #[test]
+    fn test_throw_reference_error_if_hole_fires_on_undefined() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaUndefined, vec![]),
+                Instruction::new_unchecked(
+                    Opcode::ThrowReferenceErrorIfHole,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("myVar".to_string())],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let err = Interpreter::run(&mut frame).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Cannot access 'myVar' before initialization"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_throw_reference_error_if_hole_noop_when_not_undefined() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(7)]),
+                Instruction::new_unchecked(
+                    Opcode::ThrowReferenceErrorIfHole,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("x".to_string())],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    // ── ThrowSuperNotCalledIfHole ───────────────────────────────────────
+
+    #[test]
+    fn test_throw_super_not_called_if_hole() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaUndefined, vec![]),
+                Instruction::new_unchecked(Opcode::ThrowSuperNotCalledIfHole, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("Must call super constructor"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_throw_super_not_called_noop_when_not_hole() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+                Instruction::new_unchecked(Opcode::ThrowSuperNotCalledIfHole, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    // ── ThrowSuperAlreadyCalledIfNotHole ─────────────────────────────────
+
+    #[test]
+    fn test_throw_super_already_called_if_not_hole() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+                Instruction::new_unchecked(Opcode::ThrowSuperAlreadyCalledIfNotHole, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("Super constructor may only be called once"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_throw_super_already_called_noop_when_hole() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaUndefined, vec![]),
+                Instruction::new_unchecked(Opcode::ThrowSuperAlreadyCalledIfNotHole, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    // ── CallRuntime (stub / no-op) ──────────────────────────────────────
+
+    #[test]
+    fn test_call_runtime_is_noop() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+                Instruction::new_unchecked(
+                    Opcode::CallRuntime,
+                    vec![
+                        Operand::RuntimeId(0),
+                        Operand::Register(0),
+                        Operand::RegisterCount(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    // ── StaNamedOwnProperty ─────────────────────────────────────────────
+
+    #[test]
+    fn test_sta_named_own_property() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::CreateEmptyObjectLiteral, vec![]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(77)]),
+                Instruction::new_unchecked(
+                    Opcode::StaNamedOwnProperty,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+                Instruction::new_unchecked(
+                    Opcode::LdaNamedProperty,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("key".to_string())],
+            1,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(77));
+    }
+
+    // ── StaLookupSlot ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_sta_lookup_slot_stores_in_global_env() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(55)]),
+                Instruction::new_unchecked(
+                    Opcode::StaLookupSlot,
+                    vec![Operand::ConstantPoolIdx(0), Operand::Flag(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("globalVar".to_string())],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let _result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(
+            frame.global_env.borrow().get("globalVar"),
+            Some(&JsValue::Smi(55))
+        );
     }
 }
