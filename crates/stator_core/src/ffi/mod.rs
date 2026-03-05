@@ -208,11 +208,9 @@ impl V8Object {
     /// Get the value of a named property, or `JsValue::Undefined` if absent.
     pub fn get(&self, key: &str) -> JsValue {
         match &self.inner {
-            JsValue::PlainObject(map) => map
-                .borrow()
-                .get(key)
-                .cloned()
-                .unwrap_or(JsValue::Undefined),
+            JsValue::PlainObject(map) => {
+                map.borrow().get(key).cloned().unwrap_or(JsValue::Undefined)
+            }
             _ => JsValue::Undefined,
         }
     }
@@ -1224,8 +1222,7 @@ mod tests {
     #[test]
     fn test_v8object_from_jsvalue() {
         let map = Rc::new(RefCell::new(HashMap::new()));
-        map.borrow_mut()
-            .insert("key".to_string(), JsValue::Smi(10));
+        map.borrow_mut().insert("key".to_string(), JsValue::Smi(10));
         let val = JsValue::PlainObject(map);
         let obj = V8Object::from(val);
         assert_eq!(obj.get("key"), JsValue::Smi(10));
@@ -1576,17 +1573,14 @@ mod tests {
 
     #[test]
     fn test_v8function_call_error() {
-        let f = V8Function::from_native(|_args| {
-            Err(StatorError::TypeError("boom".to_string()))
-        });
+        let f = V8Function::from_native(|_args| Err(StatorError::TypeError("boom".to_string())));
         let result = f.call(JsValue::Undefined, &[]);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_v8function_from_jsvalue() {
-        let native: JsValue =
-            JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined)));
+        let native: JsValue = JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined)));
         let f = V8Function::from(native);
         assert!(f.is_native());
     }
@@ -2083,9 +2077,7 @@ mod tests {
     #[test]
     fn test_trycatch_with_function_error() {
         let mut tc = V8TryCatch::new();
-        let f = V8Function::from_native(|_| {
-            Err(StatorError::TypeError("kaboom".to_string()))
-        });
+        let f = V8Function::from_native(|_| Err(StatorError::TypeError("kaboom".to_string())));
 
         match f.call(JsValue::Undefined, &[]) {
             Err(StatorError::TypeError(msg)) => {

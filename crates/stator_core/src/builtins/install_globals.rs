@@ -23,22 +23,21 @@ use std::rc::Rc;
 
 use crate::builtins::error::{ErrorKind, JsError};
 use crate::builtins::global::{
-    global_decode_uri, global_decode_uri_component, global_encode_uri,
+    GLOBAL_INFINITY, GLOBAL_NAN, global_decode_uri, global_decode_uri_component, global_encode_uri,
     global_encode_uri_component, global_is_finite, global_is_nan, global_parse_float,
-    global_parse_int, GLOBAL_INFINITY, GLOBAL_NAN,
-};
-use crate::builtins::symbol::{
-    symbol_create, symbol_for, symbol_key_for, SYMBOL_ASYNC_ITERATOR,
-    SYMBOL_HAS_INSTANCE, SYMBOL_IS_CONCAT_SPREADABLE, SYMBOL_ITERATOR, SYMBOL_MATCH,
-    SYMBOL_REPLACE, SYMBOL_SEARCH, SYMBOL_SPECIES, SYMBOL_SPLIT, SYMBOL_TO_PRIMITIVE,
-    SYMBOL_TO_STRING_TAG, SYMBOL_UNSCOPABLES,
+    global_parse_int,
 };
 use crate::builtins::math::{
+    MATH_E, MATH_LN2, MATH_LN10, MATH_LOG2E, MATH_LOG10E, MATH_PI, MATH_SQRT1_2, MATH_SQRT2,
     math_abs, math_acos, math_asin, math_atan, math_atan2, math_cbrt, math_ceil, math_clz32,
-    math_cos, math_floor, math_fround, math_hypot, math_imul, math_log, math_log10, math_log2,
+    math_cos, math_floor, math_fround, math_hypot, math_imul, math_log, math_log2, math_log10,
     math_max, math_min, math_pow, math_random, math_round, math_sign, math_sin, math_sqrt,
-    math_tan, math_trunc, MATH_E, MATH_LN10, MATH_LN2, MATH_LOG10E, MATH_LOG2E, MATH_PI,
-    MATH_SQRT1_2, MATH_SQRT2,
+    math_tan, math_trunc,
+};
+use crate::builtins::symbol::{
+    SYMBOL_ASYNC_ITERATOR, SYMBOL_HAS_INSTANCE, SYMBOL_IS_CONCAT_SPREADABLE, SYMBOL_ITERATOR,
+    SYMBOL_MATCH, SYMBOL_REPLACE, SYMBOL_SEARCH, SYMBOL_SPECIES, SYMBOL_SPLIT, SYMBOL_TO_PRIMITIVE,
+    SYMBOL_TO_STRING_TAG, SYMBOL_UNSCOPABLES, symbol_create, symbol_for, symbol_key_for,
 };
 use crate::error::StatorResult;
 use crate::objects::value::JsValue;
@@ -64,12 +63,30 @@ fn make_error_constructor(kind: ErrorKind) -> JsValue {
 /// Register all ECMAScript error constructors in the global environment.
 fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
     globals.insert("Error".into(), make_error_constructor(ErrorKind::Error));
-    globals.insert("TypeError".into(), make_error_constructor(ErrorKind::TypeError));
-    globals.insert("RangeError".into(), make_error_constructor(ErrorKind::RangeError));
-    globals.insert("ReferenceError".into(), make_error_constructor(ErrorKind::ReferenceError));
-    globals.insert("SyntaxError".into(), make_error_constructor(ErrorKind::SyntaxError));
-    globals.insert("URIError".into(), make_error_constructor(ErrorKind::URIError));
-    globals.insert("EvalError".into(), make_error_constructor(ErrorKind::EvalError));
+    globals.insert(
+        "TypeError".into(),
+        make_error_constructor(ErrorKind::TypeError),
+    );
+    globals.insert(
+        "RangeError".into(),
+        make_error_constructor(ErrorKind::RangeError),
+    );
+    globals.insert(
+        "ReferenceError".into(),
+        make_error_constructor(ErrorKind::ReferenceError),
+    );
+    globals.insert(
+        "SyntaxError".into(),
+        make_error_constructor(ErrorKind::SyntaxError),
+    );
+    globals.insert(
+        "URIError".into(),
+        make_error_constructor(ErrorKind::URIError),
+    );
+    globals.insert(
+        "EvalError".into(),
+        make_error_constructor(ErrorKind::EvalError),
+    );
 }
 
 /// Convert an `f64` to the most compact `JsValue` representation.
@@ -258,8 +275,7 @@ fn make_console() -> JsValue {
     props.insert(
         "log".into(),
         native(|args: Vec<JsValue>| {
-            let parts: StatorResult<Vec<String>> =
-                args.iter().map(|a| a.to_js_string()).collect();
+            let parts: StatorResult<Vec<String>> = args.iter().map(|a| a.to_js_string()).collect();
             println!("{}", parts?.join(" "));
             Ok(JsValue::Undefined)
         }),
@@ -267,8 +283,7 @@ fn make_console() -> JsValue {
     props.insert(
         "warn".into(),
         native(|args: Vec<JsValue>| {
-            let parts: StatorResult<Vec<String>> =
-                args.iter().map(|a| a.to_js_string()).collect();
+            let parts: StatorResult<Vec<String>> = args.iter().map(|a| a.to_js_string()).collect();
             eprintln!("{}", parts?.join(" "));
             Ok(JsValue::Undefined)
         }),
@@ -276,8 +291,7 @@ fn make_console() -> JsValue {
     props.insert(
         "error".into(),
         native(|args: Vec<JsValue>| {
-            let parts: StatorResult<Vec<String>> =
-                args.iter().map(|a| a.to_js_string()).collect();
+            let parts: StatorResult<Vec<String>> = args.iter().map(|a| a.to_js_string()).collect();
             eprintln!("{}", parts?.join(" "));
             Ok(JsValue::Undefined)
         }),
@@ -285,8 +299,7 @@ fn make_console() -> JsValue {
     props.insert(
         "info".into(),
         native(|args: Vec<JsValue>| {
-            let parts: StatorResult<Vec<String>> =
-                args.iter().map(|a| a.to_js_string()).collect();
+            let parts: StatorResult<Vec<String>> = args.iter().map(|a| a.to_js_string()).collect();
             println!("{}", parts?.join(" "));
             Ok(JsValue::Undefined)
         }),
@@ -328,10 +341,7 @@ fn make_json() -> JsValue {
     props.insert(
         "parse".into(),
         native(|args| {
-            let text = args
-                .first()
-                .unwrap_or(&JsValue::Undefined)
-                .to_js_string()?;
+            let text = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             let json_val = json_parse(&text, None)?;
             Ok(json_value_to_js_value(&json_val))
         }),
@@ -398,10 +408,7 @@ fn make_number() -> JsValue {
     props.insert(
         "parseInt".into(),
         native(|args| {
-            let s = args
-                .first()
-                .unwrap_or(&JsValue::Undefined)
-                .to_js_string()?;
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             let radix = if args.len() > 1 {
                 args[1].to_number()?.floor() as u32
             } else {
@@ -414,10 +421,7 @@ fn make_number() -> JsValue {
     props.insert(
         "parseFloat".into(),
         native(|args| {
-            let s = args
-                .first()
-                .unwrap_or(&JsValue::Undefined)
-                .to_js_string()?;
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(num(global_parse_float(&s)))
         }),
     );
@@ -569,8 +573,7 @@ fn make_object() -> JsValue {
                     for (key, desc_val) in descs.iter() {
                         if let JsValue::PlainObject(single_desc) = desc_val {
                             let sd = single_desc.borrow();
-                            let value =
-                                sd.get("value").cloned().unwrap_or(JsValue::Undefined);
+                            let value = sd.get("value").cloned().unwrap_or(JsValue::Undefined);
                             map.borrow_mut().insert(key.clone(), value);
                         }
                     }
@@ -680,9 +683,7 @@ fn make_object() -> JsValue {
         native(|args| {
             let proto = args.first().unwrap_or(&JsValue::Undefined);
             match proto {
-                JsValue::Null => {
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new()))))
-                }
+                JsValue::Null => Ok(JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())))),
                 JsValue::PlainObject(map) => {
                     // Start with a copy of the prototype's properties
                     let new_map = map.borrow().clone();
@@ -799,10 +800,7 @@ fn make_symbol() -> JsValue {
     props.insert(
         "for".into(),
         native(|args| {
-            let key = args
-                .first()
-                .unwrap_or(&JsValue::Undefined)
-                .to_js_string()?;
+            let key = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(JsValue::Symbol(symbol_for(&key)))
         }),
     );
@@ -830,10 +828,7 @@ fn make_symbol() -> JsValue {
     props.insert("iterator".into(), JsValue::Symbol(SYMBOL_ITERATOR));
     props.insert("toPrimitive".into(), JsValue::Symbol(SYMBOL_TO_PRIMITIVE));
     props.insert("hasInstance".into(), JsValue::Symbol(SYMBOL_HAS_INSTANCE));
-    props.insert(
-        "toStringTag".into(),
-        JsValue::Symbol(SYMBOL_TO_STRING_TAG),
-    );
+    props.insert("toStringTag".into(), JsValue::Symbol(SYMBOL_TO_STRING_TAG));
     props.insert(
         "isConcatSpreadable".into(),
         JsValue::Symbol(SYMBOL_IS_CONCAT_SPREADABLE),
@@ -918,10 +913,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     globals.insert(
         "parseInt".into(),
         native(|args| {
-            let s = args
-                .first()
-                .unwrap_or(&JsValue::Undefined)
-                .to_js_string()?;
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             let radix = if args.len() > 1 {
                 let r = args[1].to_number()?;
                 if r.is_nan() || r == 0.0 {
@@ -938,70 +930,49 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     globals.insert(
         "parseFloat".into(),
         native(|args| {
-            let s = args
-                .first()
-                .unwrap_or(&JsValue::Undefined)
-                .to_js_string()?;
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(num(global_parse_float(&s)))
         }),
     );
     globals.insert(
         "isNaN".into(),
         native(|args| {
-            let n = args
-                .first()
-                .unwrap_or(&JsValue::Undefined)
-                .to_number()?;
+            let n = args.first().unwrap_or(&JsValue::Undefined).to_number()?;
             Ok(JsValue::Boolean(global_is_nan(n)))
         }),
     );
     globals.insert(
         "isFinite".into(),
         native(|args| {
-            let n = args
-                .first()
-                .unwrap_or(&JsValue::Undefined)
-                .to_number()?;
+            let n = args.first().unwrap_or(&JsValue::Undefined).to_number()?;
             Ok(JsValue::Boolean(global_is_finite(n)))
         }),
     );
     globals.insert(
         "encodeURI".into(),
         native(|args| {
-            let s = args
-                .first()
-                .unwrap_or(&JsValue::Undefined)
-                .to_js_string()?;
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(JsValue::String(global_encode_uri(&s)))
         }),
     );
     globals.insert(
         "decodeURI".into(),
         native(|args| {
-            let s = args
-                .first()
-                .unwrap_or(&JsValue::Undefined)
-                .to_js_string()?;
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(JsValue::String(global_decode_uri(&s)?))
         }),
     );
     globals.insert(
         "encodeURIComponent".into(),
         native(|args| {
-            let s = args
-                .first()
-                .unwrap_or(&JsValue::Undefined)
-                .to_js_string()?;
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(JsValue::String(global_encode_uri_component(&s)))
         }),
     );
     globals.insert(
         "decodeURIComponent".into(),
         native(|args| {
-            let s = args
-                .first()
-                .unwrap_or(&JsValue::Undefined)
-                .to_js_string()?;
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(JsValue::String(global_decode_uri_component(&s)?))
         }),
     );
@@ -1332,7 +1303,10 @@ mod tests {
     fn test_symbol_global_exists() {
         let mut globals = HashMap::new();
         install_globals(&mut globals);
-        assert!(matches!(globals.get("Symbol"), Some(JsValue::PlainObject(_))));
+        assert!(matches!(
+            globals.get("Symbol"),
+            Some(JsValue::PlainObject(_))
+        ));
     }
 
     /// The `Symbol` object has well-known symbol properties.
@@ -1363,8 +1337,14 @@ mod tests {
         if let JsValue::PlainObject(map) = sym {
             let map = map.borrow();
             assert!(matches!(map.get("for"), Some(JsValue::NativeFunction(_))));
-            assert!(matches!(map.get("keyFor"), Some(JsValue::NativeFunction(_))));
-            assert!(matches!(map.get("__call__"), Some(JsValue::NativeFunction(_))));
+            assert!(matches!(
+                map.get("keyFor"),
+                Some(JsValue::NativeFunction(_))
+            ));
+            assert!(matches!(
+                map.get("__call__"),
+                Some(JsValue::NativeFunction(_))
+            ));
         } else {
             panic!("Symbol should be a PlainObject");
         }

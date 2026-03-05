@@ -27,16 +27,16 @@ use crate::error::{StatorError, StatorResult};
 use crate::parser::ast::{
     ArrayExpr, ArrayPat, ArrowBody, ArrowExpr, AssignExpr, AssignOp, AssignPat, AssignPatProp,
     AssignTarget, AwaitExpr, BinaryExpr, BinaryOp, BlockStmt, BoolLit, BreakStmt, ClassBody,
-    ClassDecl, ClassExpr, ClassMember, ContinueStmt, DebuggerStmt, DoWhileStmt, EmptyStmt, Expr,
-    ExportAllDecl, ExportDefaultDecl, ExportDefaultExpr, ExportNamedDecl, ExportSpecifier,
-    ExprStmt, FnDecl, FnExpr, ForInOfLeft, ForInStmt, ForInit, ForOfStmt, ForStmt, Ident,
-    IfStmt, ImportDecl, ImportDefaultSpecifier, ImportNamedSpecifier, ImportNamespaceSpecifier,
-    ImportSpecifier, KeyValuePatProp, LogicalExpr, LogicalOp, MethodDef, MethodKind,
-    ModuleDecl, ModuleExportName, NewExpr, NullLit, NumLit, ObjectExpr, ObjectPat, ObjectPatProp,
-    ObjectProp, Param, Pat, Program, ProgramItem, Prop, PropKey, PropValue, RegExpLit,
-    RestElement, ReturnStmt, SequenceExpr, SourceLocation, SourceType, SpreadElement, Stmt,
-    StringLit, SwitchCase, SwitchStmt, TemplateElement, TemplateLit, ThrowStmt, TryStmt,
-    UnaryExpr, UnaryOp, UpdateExpr, UpdateOp, VarDecl, VarDeclarator, VarKind, WhileStmt,
+    ClassDecl, ClassExpr, ClassMember, ContinueStmt, DebuggerStmt, DoWhileStmt, EmptyStmt,
+    ExportAllDecl, ExportDefaultDecl, ExportDefaultExpr, ExportNamedDecl, ExportSpecifier, Expr,
+    ExprStmt, FnDecl, FnExpr, ForInOfLeft, ForInStmt, ForInit, ForOfStmt, ForStmt, Ident, IfStmt,
+    ImportDecl, ImportDefaultSpecifier, ImportNamedSpecifier, ImportNamespaceSpecifier,
+    ImportSpecifier, KeyValuePatProp, LogicalExpr, LogicalOp, MethodDef, MethodKind, ModuleDecl,
+    ModuleExportName, NewExpr, NullLit, NumLit, ObjectExpr, ObjectPat, ObjectPatProp, ObjectProp,
+    Param, Pat, Program, ProgramItem, Prop, PropKey, PropValue, RegExpLit, RestElement, ReturnStmt,
+    SequenceExpr, SourceLocation, SourceType, SpreadElement, Stmt, StringLit, SwitchCase,
+    SwitchStmt, TemplateElement, TemplateLit, ThrowStmt, TryStmt, UnaryExpr, UnaryOp, UpdateExpr,
+    UpdateOp, VarDecl, VarDeclarator, VarKind, WhileStmt,
 };
 use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue};
 
@@ -47,6 +47,13 @@ use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue};
 /// Recursive-descent JavaScript parser.
 ///
 /// Wraps a [`Scanner`] and maintains one token of lookahead in `current`.
+/// Maximum recursion depth for the recursive-descent parser.
+///
+/// Pathological inputs (e.g. `((((((…` nested thousands of levels) would
+/// otherwise blow the thread stack.  256 nesting levels is far beyond any
+/// reasonable real-world program.
+const MAX_RECURSION_DEPTH: usize = 256;
+
 pub struct Parser<'src> {
     scanner: Scanner<'src>,
     /// The lookahead token (already produced by the scanner).
@@ -56,6 +63,9 @@ pub struct Parser<'src> {
     /// so that `for (x in obj)` is parsed as a for-in loop instead of a
     /// relational `in` expression.
     no_in: bool,
+    /// Current recursion depth – incremented on entry to key recursive
+    /// functions and decremented on exit.
+    depth: usize,
 }
 
 impl<'src> Parser<'src> {
@@ -65,7 +75,12 @@ impl<'src> Parser<'src> {
     fn new(source: &'src str) -> StatorResult<Self> {
         let mut scanner = Scanner::new(source);
         let current = Self::next_significant(&mut scanner)?;
-        Ok(Self { scanner, current, no_in: false })
+        Ok(Self {
+            scanner,
+            current,
+            no_in: false,
+            depth: 0,
+        })
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
@@ -139,6 +154,25 @@ impl<'src> Parser<'src> {
         ))
     }
 
+    /// Increment the recursion depth counter, returning an error if the
+    /// maximum depth is exceeded.  Call [`Self::leave`] when returning from
+    /// the recursive function.
+    #[inline]
+    fn enter(&mut self) -> StatorResult<()> {
+        self.depth += 1;
+        if self.depth > MAX_RECURSION_DEPTH {
+            Err(self.error("maximum nesting depth exceeded"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Decrement the recursion depth counter.
+    #[inline]
+    fn leave(&mut self) {
+        self.depth -= 1;
+    }
+
     /// Consume an optional semicolon, inserting one automatically if needed
     /// (ASI rules: end of line, right brace, or end of input).
     fn consume_semicolon(&mut self) -> StatorResult<()> {
@@ -202,6 +236,13 @@ impl<'src> Parser<'src> {
     // ── Statements ───────────────────────────────────────────────────────────
 
     fn parse_stmt(&mut self) -> StatorResult<Stmt> {
+        self.enter()?;
+        let result = self.parse_stmt_inner();
+        self.leave();
+        result
+    }
+
+    fn parse_stmt_inner(&mut self) -> StatorResult<Stmt> {
         match self.peek_kind() {
             TokenKind::Semicolon => {
                 let span = self.current_span();
@@ -252,7 +293,8 @@ impl<'src> Parser<'src> {
                     && !self.current.had_line_terminator_before
                 {
                     let fn_tok = self.bump()?; // consume `function`
-                    return self.parse_fn_decl(Self::merge_spans(async_tok.span, fn_tok.span), true);
+                    return self
+                        .parse_fn_decl(Self::merge_spans(async_tok.span, fn_tok.span), true);
                 }
                 // Not `async function` — restore and parse as expression statement.
                 self.scanner = saved_scanner;
@@ -308,10 +350,7 @@ impl<'src> Parser<'src> {
         } else {
             None
         };
-        let end = init
-            .as_ref()
-            .map(|e| e.loc())
-            .unwrap_or(id_end);
+        let end = init.as_ref().map(|e| e.loc()).unwrap_or(id_end);
         Ok(VarDeclarator {
             loc: Self::merge_spans(start, end),
             id,
@@ -446,10 +485,7 @@ impl<'src> Parser<'src> {
             while self.eat(TokenKind::Comma)? {
                 declarators.push(self.parse_var_declarator()?);
             }
-            let decl_end = declarators
-                .last()
-                .map(|d| d.id.loc())
-                .unwrap_or(kw_span);
+            let decl_end = declarators.last().map(|d| d.id.loc()).unwrap_or(kw_span);
             let init = Some(ForInit::VarDecl(VarDecl {
                 loc: Self::merge_spans(kw_span, decl_end),
                 kind,
@@ -506,11 +542,7 @@ impl<'src> Parser<'src> {
     /// Finish parsing a C-style `for (init; test; update) body` after the
     /// init clause has already been consumed.  The parser is expected to be
     /// sitting on the first `;`.
-    fn parse_c_style_for_rest(
-        &mut self,
-        start: Span,
-        init: Option<ForInit>,
-    ) -> StatorResult<Stmt> {
+    fn parse_c_style_for_rest(&mut self, start: Span, init: Option<ForInit>) -> StatorResult<Stmt> {
         self.expect(TokenKind::Semicolon)?;
 
         // Test.
@@ -948,7 +980,13 @@ impl<'src> Parser<'src> {
                     TokenValue::Str(s) => s,
                     _ => return Err(Self::error_at(tok.span, "invalid string token")),
                 };
-                Ok((PropKey::Str(StringLit { loc: tok.span, value }), false))
+                Ok((
+                    PropKey::Str(StringLit {
+                        loc: tok.span,
+                        value,
+                    }),
+                    false,
+                ))
             }
             TokenKind::NumericLiteral => {
                 let tok = self.bump()?;
@@ -973,7 +1011,13 @@ impl<'src> Parser<'src> {
                     TokenValue::None => format!("{:?}", tok.kind).to_lowercase(),
                     _ => return Err(Self::error_at(tok.span, "expected method name")),
                 };
-                Ok((PropKey::Ident(Ident { loc: tok.span, name }), false))
+                Ok((
+                    PropKey::Ident(Ident {
+                        loc: tok.span,
+                        name,
+                    }),
+                    false,
+                ))
             }
         }
     }
@@ -1029,18 +1073,14 @@ impl<'src> Parser<'src> {
                     self.expect(TokenKind::As)?;
                     let ns_tok = self.expect(TokenKind::Identifier)?;
                     let ns_local = self.ident_from_token(&ns_tok)?;
-                    specifiers.push(ImportSpecifier::Namespace(
-                        ImportNamespaceSpecifier {
-                            loc: Self::merge_spans(start, ns_local.loc),
-                            local: ns_local,
-                        },
-                    ));
+                    specifiers.push(ImportSpecifier::Namespace(ImportNamespaceSpecifier {
+                        loc: Self::merge_spans(start, ns_local.loc),
+                        local: ns_local,
+                    }));
                 } else if self.peek_kind() == TokenKind::LeftBrace {
                     self.parse_import_named_specifiers(&mut specifiers)?;
                 } else {
-                    return Err(self.error(
-                        "expected '{' or '*' after ',' in import",
-                    ));
+                    return Err(self.error("expected '{' or '*' after ',' in import"));
                 }
             }
         } else {
@@ -1107,9 +1147,7 @@ impl<'src> Parser<'src> {
             TokenKind::Default => {
                 self.bump()?; // consume 'default'
                 match self.peek_kind() {
-                    TokenKind::Async
-                        if !self.current.had_line_terminator_before =>
-                    {
+                    TokenKind::Async if !self.current.had_line_terminator_before => {
                         // Speculatively check for `async function`.
                         let saved_scanner = self.scanner.clone();
                         let saved_current = self.current.clone();
@@ -1186,10 +1224,8 @@ impl<'src> Parser<'src> {
                     && !self.current.had_line_terminator_before
                 {
                     let fn_tok = self.bump()?;
-                    let decl = self.parse_fn_decl(
-                        Self::merge_spans(async_tok.span, fn_tok.span),
-                        true,
-                    )?;
+                    let decl =
+                        self.parse_fn_decl(Self::merge_spans(async_tok.span, fn_tok.span), true)?;
                     let end = decl.loc();
                     Ok(ModuleDecl::ExportNamed(ExportNamedDecl {
                         loc: Self::merge_spans(start, end),
@@ -1257,13 +1293,10 @@ impl<'src> Parser<'src> {
                 while self.peek_kind() != TokenKind::RightBrace {
                     let spec_start = self.current_span();
                     let local_tok = self.bump()?;
-                    let local =
-                        self.module_export_name_from_token(&local_tok)?;
-                    let (exported, spec_end) = if self.eat(TokenKind::As)?
-                    {
+                    let local = self.module_export_name_from_token(&local_tok)?;
+                    let (exported, spec_end) = if self.eat(TokenKind::As)? {
                         let exp_tok = self.bump()?;
-                        let exp =
-                            self.module_export_name_from_token(&exp_tok)?;
+                        let exp = self.module_export_name_from_token(&exp_tok)?;
                         (exp, exp_tok.span)
                     } else {
                         (local.clone(), local_tok.span)
@@ -1287,10 +1320,7 @@ impl<'src> Parser<'src> {
                     None
                 };
 
-                let end = source
-                    .as_ref()
-                    .map(|s| s.loc)
-                    .unwrap_or(rbrace.span);
+                let end = source.as_ref().map(|s| s.loc).unwrap_or(rbrace.span);
                 self.consume_semicolon()?;
 
                 Ok(ModuleDecl::ExportNamed(ExportNamedDecl {
@@ -1333,12 +1363,7 @@ impl<'src> Parser<'src> {
         let tok = self.expect(TokenKind::StringLiteral)?;
         let value = match &tok.value {
             TokenValue::Str(s) => s.clone(),
-            _ => {
-                return Err(Self::error_at(
-                    tok.span,
-                    "expected string literal",
-                ))
-            }
+            _ => return Err(Self::error_at(tok.span, "expected string literal")),
         };
         Ok(StringLit {
             loc: tok.span,
@@ -1350,10 +1375,7 @@ impl<'src> Parser<'src> {
     ///
     /// Accepts identifiers, string literals, and keywords (which are valid as
     /// import/export specifier names, e.g. `default`).
-    fn module_export_name_from_token(
-        &self,
-        tok: &Token,
-    ) -> StatorResult<ModuleExportName> {
+    fn module_export_name_from_token(&self, tok: &Token) -> StatorResult<ModuleExportName> {
         match tok.kind {
             TokenKind::Identifier => {
                 let ident = self.ident_from_token(tok)?;
@@ -1362,12 +1384,7 @@ impl<'src> Parser<'src> {
             TokenKind::StringLiteral => {
                 let value = match &tok.value {
                     TokenValue::Str(s) => s.clone(),
-                    _ => {
-                        return Err(Self::error_at(
-                            tok.span,
-                            "expected string literal",
-                        ))
-                    }
+                    _ => return Err(Self::error_at(tok.span, "expected string literal")),
                 };
                 Ok(ModuleExportName::Str(StringLit {
                     loc: tok.span,
@@ -1575,7 +1592,7 @@ impl<'src> Parser<'src> {
                         return Err(Self::error_at(
                             prop_start,
                             "expected ':' after property name in destructuring pattern",
-                        ))
+                        ));
                     }
                 };
                 let default = if self.eat(TokenKind::Equal)? {
@@ -1583,10 +1600,7 @@ impl<'src> Parser<'src> {
                 } else {
                     None
                 };
-                let prop_end = default
-                    .as_ref()
-                    .map(|e| e.loc())
-                    .unwrap_or(ident.loc);
+                let prop_end = default.as_ref().map(|e| e.loc()).unwrap_or(ident.loc);
                 properties.push(ObjectPatProp::Assign(AssignPatProp {
                     loc: Self::merge_spans(prop_start, prop_end),
                     key: ident,
@@ -1621,7 +1635,13 @@ impl<'src> Parser<'src> {
                     TokenValue::Str(s) => s,
                     _ => return Err(Self::error_at(tok.span, "invalid string token")),
                 };
-                Ok((PropKey::Str(StringLit { loc: tok.span, value }), false))
+                Ok((
+                    PropKey::Str(StringLit {
+                        loc: tok.span,
+                        value,
+                    }),
+                    false,
+                ))
             }
             TokenKind::NumericLiteral => {
                 let tok = self.bump()?;
@@ -1645,7 +1665,13 @@ impl<'src> Parser<'src> {
                     TokenValue::None => format!("{:?}", tok.kind).to_lowercase(),
                     _ => return Err(Self::error_at(tok.span, "expected property name")),
                 };
-                Ok((PropKey::Ident(Ident { loc: tok.span, name }), false))
+                Ok((
+                    PropKey::Ident(Ident {
+                        loc: tok.span,
+                        name,
+                    }),
+                    false,
+                ))
             }
         }
     }
@@ -1675,6 +1701,13 @@ impl<'src> Parser<'src> {
     /// Also handles arrow function expressions, which have assignment-level
     /// precedence: `x => x + 1`, `(x, y) => x + y`, `() => 42`.
     fn parse_assignment_expr(&mut self) -> StatorResult<Expr> {
+        self.enter()?;
+        let result = self.parse_assignment_expr_inner();
+        self.leave();
+        result
+    }
+
+    fn parse_assignment_expr_inner(&mut self) -> StatorResult<Expr> {
         let start = self.current_span();
 
         // ── Async arrow function detection ───────────────────────────────
@@ -2195,6 +2228,13 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_primary(&mut self) -> StatorResult<Expr> {
+        self.enter()?;
+        let result = self.parse_primary_inner();
+        self.leave();
+        result
+    }
+
+    fn parse_primary_inner(&mut self) -> StatorResult<Expr> {
         let span = self.current_span();
         match self.peek_kind() {
             TokenKind::NumericLiteral => {
@@ -2228,9 +2268,9 @@ impl<'src> Parser<'src> {
                 };
                 // raw is e.g. "/abc/gi" – strip leading '/' then split at last '/'
                 let body = &raw[1..];
-                let closing = body.rfind('/').ok_or_else(|| {
-                    Self::error_at(tok.span, "malformed regexp literal")
-                })?;
+                let closing = body
+                    .rfind('/')
+                    .ok_or_else(|| Self::error_at(tok.span, "malformed regexp literal"))?;
                 let pattern = body[..closing].to_string();
                 let flags = body[closing + 1..].to_string();
                 Ok(Expr::Regexp(RegExpLit {
@@ -2414,7 +2454,7 @@ impl<'src> Parser<'src> {
                                         return Err(Self::error_at(
                                             tok.span,
                                             "invalid string token",
-                                        ))
+                                        ));
                                     }
                                 };
                                 (
@@ -2434,7 +2474,7 @@ impl<'src> Parser<'src> {
                                         return Err(Self::error_at(
                                             tok.span,
                                             "invalid numeric token",
-                                        ))
+                                        ));
                                     }
                                 };
                                 (
@@ -2460,7 +2500,7 @@ impl<'src> Parser<'src> {
                                         return Err(Self::error_at(
                                             tok.span,
                                             "expected property name",
-                                        ))
+                                        ));
                                     }
                                 };
                                 (
@@ -2519,7 +2559,7 @@ impl<'src> Parser<'src> {
                                     return Err(Self::error_at(
                                         prop_start,
                                         "expected ':' after property name",
-                                    ))
+                                    ));
                                 }
                             }
                         };
@@ -2575,30 +2615,24 @@ impl<'src> Parser<'src> {
                                 name,
                             };
                             let end = prop_tok.span;
-                            callee =
-                                Expr::Member(Box::new(crate::parser::ast::MemberExpr {
-                                    loc: Self::merge_spans(new_start, end),
-                                    object: Box::new(callee),
-                                    property: crate::parser::ast::MemberProp::Ident(
-                                        prop_ident,
-                                    ),
-                                    is_computed: false,
-                                }));
+                            callee = Expr::Member(Box::new(crate::parser::ast::MemberExpr {
+                                loc: Self::merge_spans(new_start, end),
+                                object: Box::new(callee),
+                                property: crate::parser::ast::MemberProp::Ident(prop_ident),
+                                is_computed: false,
+                            }));
                         }
                         TokenKind::LeftBracket => {
                             self.bump()?;
                             let prop = self.parse_expr()?;
                             let end = self.current_span();
                             self.expect(TokenKind::RightBracket)?;
-                            callee =
-                                Expr::Member(Box::new(crate::parser::ast::MemberExpr {
-                                    loc: Self::merge_spans(new_start, end),
-                                    object: Box::new(callee),
-                                    property: crate::parser::ast::MemberProp::Computed(
-                                        Box::new(prop),
-                                    ),
-                                    is_computed: true,
-                                }));
+                            callee = Expr::Member(Box::new(crate::parser::ast::MemberExpr {
+                                loc: Self::merge_spans(new_start, end),
+                                object: Box::new(callee),
+                                property: crate::parser::ast::MemberProp::Computed(Box::new(prop)),
+                                is_computed: true,
+                            }));
                         }
                         _ => break,
                     }
@@ -2634,10 +2668,7 @@ impl<'src> Parser<'src> {
                     && !self.current.had_line_terminator_before
                 {
                     let fn_tok = self.bump()?; // consume `function`
-                    self.parse_fn_expr(
-                        Self::merge_spans(async_tok.span, fn_tok.span),
-                        true,
-                    )
+                    self.parse_fn_expr(Self::merge_spans(async_tok.span, fn_tok.span), true)
                 } else {
                     // Not `async function` — restore and emit as identifier
                     // so the caller (parse_assignment_expr) can detect the
@@ -3521,10 +3552,7 @@ mod tests {
 
     #[test]
     fn test_parse_switch_basic() {
-        let prog = parse(
-            "switch (x) { case 1: break; case 2: break; default: break; }",
-        )
-        .unwrap();
+        let prog = parse("switch (x) { case 1: break; case 2: break; default: break; }").unwrap();
         assert_eq!(prog.body.len(), 1);
         if let ProgramItem::Stmt(Stmt::Switch(sw)) = &prog.body[0] {
             assert_eq!(sw.cases.len(), 3);
@@ -3738,7 +3766,10 @@ mod tests {
         let prog = parse("for (var x in obj) {}").unwrap();
         assert_eq!(prog.body.len(), 1);
         if let ProgramItem::Stmt(Stmt::ForIn(fi)) = &prog.body[0] {
-            assert!(matches!(&fi.left, crate::parser::ast::ForInOfLeft::VarDecl(_)));
+            assert!(matches!(
+                &fi.left,
+                crate::parser::ast::ForInOfLeft::VarDecl(_)
+            ));
         } else {
             panic!("expected ForIn, got {:?}", prog.body[0]);
         }
@@ -3750,7 +3781,10 @@ mod tests {
         assert_eq!(prog.body.len(), 1);
         if let ProgramItem::Stmt(Stmt::ForOf(fo)) = &prog.body[0] {
             assert!(!fo.is_await);
-            assert!(matches!(&fo.left, crate::parser::ast::ForInOfLeft::VarDecl(_)));
+            assert!(matches!(
+                &fo.left,
+                crate::parser::ast::ForInOfLeft::VarDecl(_)
+            ));
         } else {
             panic!("expected ForOf, got {:?}", prog.body[0]);
         }
@@ -3881,7 +3915,10 @@ mod tests {
         if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
             assert_eq!(c.body.body.len(), 1);
             if let crate::parser::ast::ClassMember::Method(m) = &c.body.body[0] {
-                assert!(matches!(m.kind, crate::parser::ast::MethodKind::Constructor));
+                assert!(matches!(
+                    m.kind,
+                    crate::parser::ast::MethodKind::Constructor
+                ));
                 assert!(!m.is_static);
             } else {
                 panic!("expected Method");
@@ -3945,10 +3982,8 @@ mod tests {
 
     #[test]
     fn test_class_decl_getter_setter() {
-        let prog = parse(
-            "class Foo { get value() { return 1; } set value(v) { this.v = v; } }",
-        )
-        .unwrap();
+        let prog =
+            parse("class Foo { get value() { return 1; } set value(v) { this.v = v; } }").unwrap();
         assert_eq!(prog.body.len(), 1);
         if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
             assert_eq!(c.body.body.len(), 2);
@@ -5191,15 +5226,18 @@ mod tests {
 
     #[test]
     fn test_mixed_imports_and_statements() {
-        let prog = parse(
-            "import x from \"mod\";\nvar a = 1;\nexport const b = 2;",
-        )
-        .unwrap();
+        let prog = parse("import x from \"mod\";\nvar a = 1;\nexport const b = 2;").unwrap();
         assert_eq!(prog.source_type, SourceType::Module);
         assert_eq!(prog.body.len(), 3);
-        assert!(matches!(&prog.body[0], ProgramItem::ModuleDecl(ModuleDecl::Import(_))));
+        assert!(matches!(
+            &prog.body[0],
+            ProgramItem::ModuleDecl(ModuleDecl::Import(_))
+        ));
         assert!(matches!(&prog.body[1], ProgramItem::Stmt(Stmt::VarDecl(_))));
-        assert!(matches!(&prog.body[2], ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(_))));
+        assert!(matches!(
+            &prog.body[2],
+            ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(_))
+        ));
     }
 
     #[test]
@@ -5325,15 +5363,12 @@ mod tests {
 
     #[test]
     fn test_await_expression() {
-        let prog =
-            parse("async function f() { var x = await promise; }").unwrap();
+        let prog = parse("async function f() { var x = await promise; }").unwrap();
         if let ProgramItem::Stmt(Stmt::FnDecl(fd)) = &prog.body[0] {
             assert!(fd.is_async);
             // The body should contain a var declaration whose init is an Await expr.
             if let Stmt::VarDecl(vd) = &fd.body.body[0] {
-                if let Some(Expr::Await(await_expr)) =
-                    vd.declarators[0].init.as_deref()
-                {
+                if let Some(Expr::Await(await_expr)) = vd.declarators[0].init.as_deref() {
                     if let Expr::Ident(ref id) = *await_expr.argument {
                         assert_eq!(id.name, "promise");
                     } else {
@@ -5352,8 +5387,7 @@ mod tests {
 
     #[test]
     fn test_await_call_expression() {
-        let prog =
-            parse("async function f() { await fetch(); }").unwrap();
+        let prog = parse("async function f() { await fetch(); }").unwrap();
         if let ProgramItem::Stmt(Stmt::FnDecl(fd)) = &prog.body[0] {
             assert!(fd.is_async);
             if let Stmt::Expr(es) = &fd.body.body[0] {
@@ -5450,8 +5484,7 @@ mod tests {
     #[test]
     fn test_export_async_function() {
         let prog = parse("export async function fetchData() { }").unwrap();
-        if let ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(decl)) = &prog.body[0]
-        {
+        if let ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(decl)) = &prog.body[0] {
             if let Some(decl_stmt) = &decl.declaration {
                 if let Stmt::FnDecl(fd) = decl_stmt.as_ref() {
                     assert!(fd.is_async);
@@ -5469,10 +5502,8 @@ mod tests {
 
     #[test]
     fn test_export_default_async_function() {
-        let prog =
-            parse("export default async function fetchData() { }").unwrap();
-        if let ProgramItem::ModuleDecl(ModuleDecl::ExportDefault(decl)) = &prog.body[0]
-        {
+        let prog = parse("export default async function fetchData() { }").unwrap();
+        if let ProgramItem::ModuleDecl(ModuleDecl::ExportDefault(decl)) = &prog.body[0] {
             if let ExportDefaultExpr::Fn(fd) = &decl.declaration {
                 assert!(fd.is_async);
             } else {
