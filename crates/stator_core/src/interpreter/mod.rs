@@ -2555,6 +2555,7 @@ impl Interpreter {
                         | JsValue::Error(_) => "object",
                         JsValue::Generator(_) => "object",
                         JsValue::Iterator(_) => "object",
+                        JsValue::Promise(_) => "object",
                         JsValue::Context(_) => "object",
                     };
                     frame.accumulator = JsValue::String(type_str.to_owned());
@@ -2592,6 +2593,7 @@ impl Interpreter {
                                 | JsValue::Error(_)
                                 | JsValue::Generator(_)
                                 | JsValue::Iterator(_)
+                                | JsValue::Promise(_)
                         ),
                         _ => false,
                     };

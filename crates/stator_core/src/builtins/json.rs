@@ -1001,6 +1001,7 @@ fn js_value_to_json_inner(
         | JsValue::Generator(_)
         | JsValue::Iterator(_)
         | JsValue::Error(_)
+        | JsValue::Promise(_)
         | JsValue::Context(_) => Ok(None),
         JsValue::Null => Ok(Some(JsonValue::Null)),
         JsValue::Boolean(b) => Ok(Some(JsonValue::Bool(*b))),

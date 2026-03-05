@@ -2035,6 +2035,299 @@ fn make_string() -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
+// ── Promise ─────────────────────────────────────────────────────────────────
+
+/// Build the `Promise` constructor/namespace object.
+///
+/// Creates an internal [`MicrotaskQueue`] shared by all promise operations
+/// created through this global.  The constructor (`__call__`) corresponds to
+/// `new Promise(executor)`, and static methods (`resolve`, `reject`, `all`,
+/// `allSettled`, `any`, `race`, `withResolvers`) are available as properties.
+fn make_promise() -> JsValue {
+    use crate::builtins::promise::{
+        MicrotaskQueue, promise_all, promise_all_settled, promise_any, promise_catch,
+        promise_finally, promise_new, promise_race, promise_reject, promise_resolve, promise_then,
+        promise_with_resolvers,
+    };
+
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let queue = MicrotaskQueue::new();
+
+    // ── Constructor: new Promise(executor) ─────────────────────────────────
+    //
+    // The executor argument is expected to be a NativeFunction that receives
+    // two arguments: [resolve_fn, reject_fn].  Since we cannot call a JS
+    // bytecode function from here, the constructor is usable only when the
+    // executor is a NativeFunction.
+    {
+        let q = queue.clone();
+        props.insert(
+            "__call__".into(),
+            native(move |args| {
+                let executor = args.first().cloned().unwrap_or(JsValue::Undefined);
+                let p = promise_new(
+                    |resolve_box, reject_box| {
+                        // Wrap the resolve/reject callbacks as NativeFunctions and
+                        // pass them to the executor.
+                        let resolve_box = Rc::new(RefCell::new(Some(resolve_box)));
+                        let reject_box = Rc::new(RefCell::new(Some(reject_box)));
+                        let resolve_fn = JsValue::NativeFunction(Rc::new({
+                            let rb = Rc::clone(&resolve_box);
+                            move |a: Vec<JsValue>| {
+                                if let Some(f) = rb.borrow_mut().take() {
+                                    f(a.first().cloned().unwrap_or(JsValue::Undefined));
+                                }
+                                Ok(JsValue::Undefined)
+                            }
+                        }));
+                        let reject_fn = JsValue::NativeFunction(Rc::new({
+                            let rb = Rc::clone(&reject_box);
+                            move |a: Vec<JsValue>| {
+                                if let Some(f) = rb.borrow_mut().take() {
+                                    f(a.first().cloned().unwrap_or(JsValue::Undefined));
+                                }
+                                Ok(JsValue::Undefined)
+                            }
+                        }));
+                        if let JsValue::NativeFunction(f) = &executor {
+                            let _ = f(vec![resolve_fn, reject_fn]);
+                        }
+                    },
+                    &q,
+                );
+                Ok(JsValue::Promise(p))
+            }),
+        );
+    }
+
+    // ── Promise.resolve(value) ────────────────────────────────────────────
+    {
+        let q = queue.clone();
+        props.insert(
+            "resolve".into(),
+            native(move |args| {
+                let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                Ok(JsValue::Promise(promise_resolve(val, &q)))
+            }),
+        );
+    }
+
+    // ── Promise.reject(reason) ────────────────────────────────────────────
+    {
+        let q = queue.clone();
+        props.insert(
+            "reject".into(),
+            native(move |args| {
+                let reason = args.first().cloned().unwrap_or(JsValue::Undefined);
+                Ok(JsValue::Promise(promise_reject(reason, &q)))
+            }),
+        );
+    }
+
+    // ── Promise.all(promises) ─────────────────────────────────────────────
+    {
+        let q = queue.clone();
+        props.insert(
+            "all".into(),
+            native(move |args| {
+                let promises = extract_promise_array(args.first());
+                Ok(JsValue::Promise(promise_all(promises, &q)))
+            }),
+        );
+    }
+
+    // ── Promise.allSettled(promises) ──────────────────────────────────────
+    {
+        let q = queue.clone();
+        props.insert(
+            "allSettled".into(),
+            native(move |args| {
+                let promises = extract_promise_array(args.first());
+                Ok(JsValue::Promise(promise_all_settled(promises, &q)))
+            }),
+        );
+    }
+
+    // ── Promise.any(promises) ─────────────────────────────────────────────
+    {
+        let q = queue.clone();
+        props.insert(
+            "any".into(),
+            native(move |args| {
+                let promises = extract_promise_array(args.first());
+                Ok(JsValue::Promise(promise_any(promises, &q)))
+            }),
+        );
+    }
+
+    // ── Promise.race(promises) ────────────────────────────────────────────
+    {
+        let q = queue.clone();
+        props.insert(
+            "race".into(),
+            native(move |args| {
+                let promises = extract_promise_array(args.first());
+                Ok(JsValue::Promise(promise_race(promises, &q)))
+            }),
+        );
+    }
+
+    // ── Promise.withResolvers() ──────────────────────────────────────────
+    {
+        let q = queue.clone();
+        props.insert(
+            "withResolvers".into(),
+            native(move |_args| {
+                let wr = promise_with_resolvers(&q);
+                let resolve_box = Rc::new(RefCell::new(Some(wr.resolve)));
+                let reject_box = Rc::new(RefCell::new(Some(wr.reject)));
+                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                obj.insert("promise".into(), JsValue::Promise(wr.promise));
+                obj.insert(
+                    "resolve".into(),
+                    JsValue::NativeFunction(Rc::new({
+                        let rb = Rc::clone(&resolve_box);
+                        move |a: Vec<JsValue>| {
+                            if let Some(f) = rb.borrow_mut().take() {
+                                f(a.first().cloned().unwrap_or(JsValue::Undefined));
+                            }
+                            Ok(JsValue::Undefined)
+                        }
+                    })),
+                );
+                obj.insert(
+                    "reject".into(),
+                    JsValue::NativeFunction(Rc::new({
+                        let rb = Rc::clone(&reject_box);
+                        move |a: Vec<JsValue>| {
+                            if let Some(f) = rb.borrow_mut().take() {
+                                f(a.first().cloned().unwrap_or(JsValue::Undefined));
+                            }
+                            Ok(JsValue::Undefined)
+                        }
+                    })),
+                );
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            }),
+        );
+    }
+
+    // ── Promise.prototype.then / catch / finally ─────────────────────────
+    // These are stored on the namespace so the interpreter can look them up
+    // when called as `promise.then(...)`.
+
+    // prototype.then(onFulfilled, onRejected)
+    {
+        let q = queue.clone();
+        props.insert(
+            "prototype_then".into(),
+            JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+                let promise = match args.first() {
+                    Some(JsValue::Promise(p)) => p.clone(),
+                    _ => {
+                        return Err(StatorError::TypeError(
+                            "Promise.prototype.then called on non-Promise".into(),
+                        ));
+                    }
+                };
+                let on_fulfilled = args.get(1).and_then(|v| extract_handler(v));
+                let on_rejected = args.get(2).and_then(|v| extract_handler(v));
+                Ok(JsValue::Promise(promise_then(
+                    &promise,
+                    on_fulfilled,
+                    on_rejected,
+                    &q,
+                )))
+            })),
+        );
+    }
+
+    // prototype.catch(onRejected)
+    {
+        let q = queue.clone();
+        props.insert(
+            "prototype_catch".into(),
+            JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+                let promise = match args.first() {
+                    Some(JsValue::Promise(p)) => p.clone(),
+                    _ => {
+                        return Err(StatorError::TypeError(
+                            "Promise.prototype.catch called on non-Promise".into(),
+                        ));
+                    }
+                };
+                let handler = args
+                    .get(1)
+                    .and_then(|v| extract_handler(v))
+                    .unwrap_or_else(|| Box::new(Err));
+                Ok(JsValue::Promise(promise_catch(&promise, handler, &q)))
+            })),
+        );
+    }
+
+    // prototype.finally(onFinally)
+    {
+        let q = queue.clone();
+        props.insert(
+            "prototype_finally".into(),
+            JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+                let promise = match args.first() {
+                    Some(JsValue::Promise(p)) => p.clone(),
+                    _ => {
+                        return Err(StatorError::TypeError(
+                            "Promise.prototype.finally called on non-Promise".into(),
+                        ));
+                    }
+                };
+                let callback = match args.get(1) {
+                    Some(JsValue::NativeFunction(f)) => {
+                        let f = Rc::clone(f);
+                        Box::new(move || match f(vec![]) {
+                            Ok(_) => Ok(()),
+                            Err(e) => Err(JsValue::String(e.to_string())),
+                        }) as Box<dyn Fn() -> Result<(), JsValue>>
+                    }
+                    _ => Box::new(|| Ok(())) as Box<dyn Fn() -> Result<(), JsValue>>,
+                };
+                Ok(JsValue::Promise(promise_finally(&promise, callback, &q)))
+            })),
+        );
+    }
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+/// Extract a `Vec<JsPromise>` from an argument that should be a `JsValue::Array`
+/// of `JsValue::Promise` elements.
+fn extract_promise_array(arg: Option<&JsValue>) -> Vec<crate::builtins::promise::JsPromise> {
+    match arg {
+        Some(JsValue::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| {
+                if let JsValue::Promise(p) = v {
+                    Some(p.clone())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Convert a `JsValue::NativeFunction` into a `PromiseHandler`.
+fn extract_handler(val: &JsValue) -> Option<crate::builtins::promise::PromiseHandler> {
+    if let JsValue::NativeFunction(f) = val {
+        let f = Rc::clone(f);
+        Some(Box::new(move |v: JsValue| match f(vec![v.clone()]) {
+            Ok(result) => Ok(result),
+            Err(e) => Err(JsValue::String(e.to_string())),
+        }))
+    } else {
+        None
+    }
+}
+
 // ── install_globals ──────────────────────────────────────────────────────────
 
 /// Pre-populate `globals` with all ECMAScript built-in names.
@@ -2059,6 +2352,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     globals.insert("Set".into(), make_set_builtin());
     globals.insert("WeakMap".into(), make_weak_map_builtin());
     globals.insert("WeakSet".into(), make_weak_set_builtin());
+    globals.insert("Promise".into(), make_promise());
 
     // ── Error constructors ────────────────────────────────────────────────
     install_error_constructors(globals);
@@ -2186,6 +2480,7 @@ mod tests {
         assert!(globals.contains_key("Set"));
         assert!(globals.contains_key("WeakMap"));
         assert!(globals.contains_key("WeakSet"));
+        assert!(globals.contains_key("Promise"));
         assert!(globals.contains_key("globalThis"));
     }
 
@@ -3195,6 +3490,106 @@ mod tests {
                 } else {
                     panic!("WeakSet() should return a PlainObject");
                 }
+            }
+        }
+    }
+
+    // ── Promise ─────────────────────────────────────────────────────────────
+
+    /// Verify that the `Promise` object has the expected static methods.
+    #[test]
+    fn test_promise_object_properties() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let promise = globals.get("Promise").unwrap();
+        if let JsValue::PlainObject(map) = promise {
+            let map = map.borrow();
+            assert!(map.contains_key("__call__"));
+            assert!(map.contains_key("resolve"));
+            assert!(map.contains_key("reject"));
+            assert!(map.contains_key("all"));
+            assert!(map.contains_key("allSettled"));
+            assert!(map.contains_key("any"));
+            assert!(map.contains_key("race"));
+            assert!(map.contains_key("withResolvers"));
+            assert!(map.contains_key("prototype_then"));
+            assert!(map.contains_key("prototype_catch"));
+            assert!(map.contains_key("prototype_finally"));
+        } else {
+            panic!("Promise should be a PlainObject");
+        }
+    }
+
+    /// Verify that `Promise.resolve` returns a fulfilled Promise value.
+    #[test]
+    fn test_promise_resolve_global() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let promise = globals.get("Promise").unwrap();
+        if let JsValue::PlainObject(map) = promise {
+            let resolve = map.borrow().get("resolve").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = resolve {
+                let result = f(vec![JsValue::Smi(42)]).unwrap();
+                if let JsValue::Promise(p) = result {
+                    assert!(p.is_fulfilled());
+                    assert_eq!(p.value(), Some(JsValue::Smi(42)));
+                } else {
+                    panic!("Expected Promise value");
+                }
+            } else {
+                panic!("resolve should be a NativeFunction");
+            }
+        }
+    }
+
+    /// Verify that `Promise.reject` returns a rejected Promise value.
+    #[test]
+    fn test_promise_reject_global() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let promise = globals.get("Promise").unwrap();
+        if let JsValue::PlainObject(map) = promise {
+            let reject = map.borrow().get("reject").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = reject {
+                let result = f(vec![JsValue::String("err".into())]).unwrap();
+                if let JsValue::Promise(p) = result {
+                    assert!(p.is_rejected());
+                    assert_eq!(p.reason(), Some(JsValue::String("err".into())));
+                } else {
+                    panic!("Expected Promise value");
+                }
+            } else {
+                panic!("reject should be a NativeFunction");
+            }
+        }
+    }
+
+    /// Verify that `Promise.withResolvers` returns an object with promise, resolve, reject.
+    #[test]
+    fn test_promise_with_resolvers_global() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let promise = globals.get("Promise").unwrap();
+        if let JsValue::PlainObject(map) = promise {
+            let wr_fn = map.borrow().get("withResolvers").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = wr_fn {
+                let result = f(vec![]).unwrap();
+                if let JsValue::PlainObject(obj) = result {
+                    let obj = obj.borrow();
+                    assert!(matches!(obj.get("promise"), Some(JsValue::Promise(_))));
+                    assert!(matches!(
+                        obj.get("resolve"),
+                        Some(JsValue::NativeFunction(_))
+                    ));
+                    assert!(matches!(
+                        obj.get("reject"),
+                        Some(JsValue::NativeFunction(_))
+                    ));
+                } else {
+                    panic!("Expected PlainObject");
+                }
+            } else {
+                panic!("withResolvers should be a NativeFunction");
             }
         }
     }

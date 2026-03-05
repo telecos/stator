@@ -249,6 +249,12 @@ pub enum JsValue {
     /// Used to construct host objects (e.g. `console`) that carry
     /// [`NativeFunction`][Self::NativeFunction] properties.
     PlainObject(Rc<RefCell<HashMap<String, JsValue>>>),
+    /// A JavaScript `Promise` object backed by the [`JsPromise`] state machine.
+    ///
+    /// Wraps the shared-state [`JsPromise`] handle from the promise module so
+    /// that promises can be stored and passed through the value pipeline just
+    /// like any other JavaScript value.
+    Promise(crate::builtins::promise::JsPromise),
     /// A scope context for closure variable capture.
     ///
     /// A context holds numbered slots for captured variables and an optional
@@ -300,6 +306,7 @@ impl std::fmt::Debug for JsValue {
             Self::Error(e) => write!(f, "Error({e:?})"),
             Self::NativeFunction(_) => write!(f, "NativeFunction"),
             Self::PlainObject(map) => write!(f, "PlainObject({map:?})"),
+            Self::Promise(p) => write!(f, "Promise({:?})", p.state()),
             Self::Context(ctx) => write!(f, "Context({ctx:?})"),
         }
     }
@@ -329,6 +336,7 @@ impl PartialEq for JsValue {
             // NativeFunction has no comparable content; use pointer identity.
             (Self::NativeFunction(a), Self::NativeFunction(b)) => Rc::ptr_eq(a, b),
             (Self::PlainObject(a), Self::PlainObject(b)) => Rc::ptr_eq(a, b),
+            (Self::Promise(a), Self::Promise(b)) => a == b,
             (Self::Context(a), Self::Context(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
@@ -435,6 +443,12 @@ impl JsValue {
     pub fn is_error(&self) -> bool {
         matches!(self, Self::Error(_))
     }
+
+    /// Returns `true` if this value is a JavaScript `Promise` ([`Promise`][JsValue::Promise]).
+    #[inline]
+    pub fn is_promise(&self) -> bool {
+        matches!(self, Self::Promise(_))
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -471,6 +485,7 @@ impl JsValue {
             | Self::Iterator(_)
             | Self::NativeFunction(_)
             | Self::PlainObject(_)
+            | Self::Promise(_)
             | Self::Context(_) => true,
             Self::BigInt(n) => *n != 0,
         }
@@ -540,6 +555,9 @@ impl JsValue {
             Self::PlainObject(_) => Err(StatorError::TypeError(
                 "Cannot convert an Object to a number without ToPrimitive".to_string(),
             )),
+            Self::Promise(_) => Err(StatorError::TypeError(
+                "Cannot convert a Promise to a number".to_string(),
+            )),
             Self::Context(_) => Err(StatorError::TypeError(
                 "Cannot convert a Context to a number".to_string(),
             )),
@@ -596,6 +614,7 @@ impl JsValue {
             Self::Error(e) => Ok(e.to_error_string()),
             Self::NativeFunction(_) => Ok("function () { [native code] }".to_string()),
             Self::PlainObject(_) => Ok("[object Object]".to_string()),
+            Self::Promise(_) => Ok("[object Promise]".to_string()),
             Self::Context(_) => Ok("[object Context]".to_string()),
         }
     }
@@ -650,6 +669,8 @@ impl Trace for JsValue {
             // GC heap pointers — only Strings, Rc-reference-counted JsErrors,
             // and an ErrorKind enum.  Nothing to report to the tracer.
             Self::Error(_) => {}
+            // JsPromise uses Rc<RefCell<_>> internally with no raw GC pointers.
+            Self::Promise(_) => {}
             _ => {}
         }
     }

@@ -133,6 +133,9 @@ enum PromiseStateInner {
 
 struct PromiseInner {
     state: PromiseStateInner,
+    /// Whether at least one rejection handler has been attached.
+    /// Used by [`UnhandledRejectionTracker`] to detect unhandled rejections.
+    is_handled: bool,
 }
 
 // ── JsPromise ──────────────────────────────────────────────────────────────────
@@ -178,6 +181,18 @@ pub enum PromiseState {
 #[derive(Clone)]
 pub struct JsPromise(Rc<RefCell<PromiseInner>>);
 
+impl std::fmt::Debug for JsPromise {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "JsPromise({:?})", self.state())
+    }
+}
+
+impl PartialEq for JsPromise {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 impl JsPromise {
     fn new_pending() -> Self {
         Self(Rc::new(RefCell::new(PromiseInner {
@@ -185,6 +200,7 @@ impl JsPromise {
                 fulfill_reactions: Vec::new(),
                 reject_reactions: Vec::new(),
             },
+            is_handled: false,
         })))
     }
 
@@ -210,6 +226,11 @@ impl JsPromise {
     /// Returns `true` if the promise has been rejected.
     pub fn is_rejected(&self) -> bool {
         matches!(self.0.borrow().state, PromiseStateInner::Rejected(_))
+    }
+
+    /// Returns `true` if at least one rejection handler has been attached.
+    pub fn is_handled(&self) -> bool {
+        self.0.borrow().is_handled
     }
 
     /// Returns the fulfillment value, or `None` if not yet fulfilled.
@@ -301,6 +322,7 @@ impl JsPromise {
         }
         let settled = {
             let mut inner = self.0.borrow_mut();
+            inner.is_handled = true;
             match &mut inner.state {
                 PromiseStateInner::Pending {
                     fulfill_reactions,
@@ -813,6 +835,77 @@ pub fn promise_with_resolvers(queue: &MicrotaskQueue) -> PromiseWithResolvers {
         promise: p,
         resolve,
         reject,
+    }
+}
+
+// ── Unhandled Rejection Tracking ──────────────────────────────────────────────
+
+/// Tracks promises that were rejected without a handler attached.
+///
+/// Register promises via [`track`](Self::track) and then call
+/// [`collect_unhandled`](Self::collect_unhandled) after draining the microtask
+/// queue to discover rejections that were never caught.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::promise::{
+///     MicrotaskQueue, UnhandledRejectionTracker, promise_reject, promise_catch,
+/// };
+/// use stator_core::objects::value::JsValue;
+///
+/// let queue = MicrotaskQueue::new();
+/// let mut tracker = UnhandledRejectionTracker::new();
+///
+/// let p1 = promise_reject(JsValue::String("oops".into()), &queue);
+/// tracker.track(p1);
+///
+/// let p2 = promise_reject(JsValue::String("handled".into()), &queue);
+/// promise_catch(&p2, Box::new(|_| Ok(JsValue::Undefined)), &queue);
+/// tracker.track(p2);
+///
+/// queue.drain();
+/// let unhandled = tracker.collect_unhandled();
+/// assert_eq!(unhandled.len(), 1);
+/// assert_eq!(
+///     unhandled[0].reason(),
+///     Some(JsValue::String("oops".into())),
+/// );
+/// ```
+pub struct UnhandledRejectionTracker {
+    promises: Vec<JsPromise>,
+}
+
+impl Default for UnhandledRejectionTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UnhandledRejectionTracker {
+    /// Create an empty tracker.
+    pub fn new() -> Self {
+        Self {
+            promises: Vec::new(),
+        }
+    }
+
+    /// Register a promise for tracking.
+    pub fn track(&mut self, promise: JsPromise) {
+        self.promises.push(promise);
+    }
+
+    /// Return all tracked promises that are rejected and have no handler attached.
+    ///
+    /// This should be called **after** draining the microtask queue so that
+    /// late-attached handlers have had a chance to run.
+    pub fn collect_unhandled(&mut self) -> Vec<JsPromise> {
+        let unhandled: Vec<JsPromise> = self
+            .promises
+            .drain(..)
+            .filter(|p| p.is_rejected() && !p.is_handled())
+            .collect();
+        unhandled
     }
 }
 
@@ -1367,5 +1460,60 @@ mod tests {
         );
         let p3 = promise_new(|_, _| {}, &queue);
         assert_eq!(p3.state(), PromiseState::Pending);
+    }
+
+    // ── Unhandled rejection tracking ──────────────────────────────────────────
+
+    #[test]
+    fn test_unhandled_rejection_detected() {
+        let queue = MicrotaskQueue::new();
+        let mut tracker = UnhandledRejectionTracker::new();
+        let p = promise_reject(JsValue::String("oops".into()), &queue);
+        tracker.track(p);
+        queue.drain();
+        let unhandled = tracker.collect_unhandled();
+        assert_eq!(unhandled.len(), 1);
+        assert_eq!(unhandled[0].reason(), Some(JsValue::String("oops".into())));
+    }
+
+    #[test]
+    fn test_handled_rejection_not_reported() {
+        let queue = MicrotaskQueue::new();
+        let mut tracker = UnhandledRejectionTracker::new();
+        let p = promise_reject(JsValue::String("caught".into()), &queue);
+        promise_catch(&p, Box::new(|_| Ok(JsValue::Undefined)), &queue);
+        tracker.track(p);
+        queue.drain();
+        let unhandled = tracker.collect_unhandled();
+        assert!(unhandled.is_empty());
+    }
+
+    #[test]
+    fn test_tracker_ignores_fulfilled_promises() {
+        let queue = MicrotaskQueue::new();
+        let mut tracker = UnhandledRejectionTracker::new();
+        let p = promise_resolve(JsValue::Smi(1), &queue);
+        tracker.track(p);
+        queue.drain();
+        let unhandled = tracker.collect_unhandled();
+        assert!(unhandled.is_empty());
+    }
+
+    #[test]
+    fn test_tracker_default() {
+        let tracker = UnhandledRejectionTracker::default();
+        assert_eq!(tracker.promises.len(), 0);
+    }
+
+    // ── JsPromise identity equality ──────────────────────────────────────────
+
+    #[test]
+    fn test_promise_identity_equality() {
+        let queue = MicrotaskQueue::new();
+        let p1 = promise_resolve(JsValue::Smi(1), &queue);
+        let p1_clone = p1.clone();
+        let p2 = promise_resolve(JsValue::Smi(1), &queue);
+        assert_eq!(p1, p1_clone);
+        assert_ne!(p1, p2);
     }
 }
