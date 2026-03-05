@@ -340,6 +340,8 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "regexp-v-flag",
     // Internationalisation
     "Intl",
+    // Tail-call optimisation
+    "tail-call-optimization",
     // Miscellaneous
     "globalThis",
 ];
@@ -414,13 +416,25 @@ fn execute_source(source: &str, harness_prefix: &str) -> Result<JsValue, StatorE
         .and_then(|p| BytecodeGenerator::compile_program(&p))
         .and_then(|bc| {
             let mut frame = InterpreterFrame::new_with_globals(bc, vec![], globals);
+            // Limit each test to 10 million instructions to prevent infinite
+            // loops from hanging the runner.
+            frame.instruction_limit = 10_000_000;
             Interpreter::run(&mut frame)
         })
 }
 
 /// Runs a single Test262 test and returns its outcome.
 fn run_test(source: &str, harness_prefix: &str, meta: &TestMeta) -> TestOutcome {
-    let result = execute_source(source, harness_prefix);
+    // Wrap execution in catch_unwind to gracefully handle stack overflows
+    // or other panics from pathological test inputs.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        execute_source(source, harness_prefix)
+    }));
+
+    let result = match result {
+        Ok(r) => r,
+        Err(_) => return TestOutcome::Fail("panicked (likely stack overflow)".into()),
+    };
 
     if let Some(neg) = &meta.negative {
         match neg.phase.as_str() {
@@ -564,6 +578,19 @@ fn parse_args() -> CliArgs {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
+    // Spawn the real main on a thread with a large stack to prevent
+    // pathological test inputs from overflowing the default 8 MB stack.
+    let builder = std::thread::Builder::new()
+        .name("test262-main".into())
+        .stack_size(64 * 1024 * 1024); // 64 MB
+    let handler = builder.spawn(main_inner).expect("failed to spawn main thread");
+    if let Err(e) = handler.join() {
+        eprintln!("stator_test262: main thread panicked: {e:?}");
+        std::process::exit(2);
+    }
+}
+
+fn main_inner() {
     let cli = parse_args();
 
     let base_dir = match cli.test262_dir {

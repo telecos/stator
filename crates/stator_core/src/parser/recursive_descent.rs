@@ -47,6 +47,13 @@ use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue};
 /// Recursive-descent JavaScript parser.
 ///
 /// Wraps a [`Scanner`] and maintains one token of lookahead in `current`.
+/// Maximum recursion depth for the recursive-descent parser.
+///
+/// Pathological inputs (e.g. `((((((…` nested thousands of levels) would
+/// otherwise blow the thread stack.  256 nesting levels is far beyond any
+/// reasonable real-world program.
+const MAX_RECURSION_DEPTH: usize = 256;
+
 pub struct Parser<'src> {
     scanner: Scanner<'src>,
     /// The lookahead token (already produced by the scanner).
@@ -56,6 +63,9 @@ pub struct Parser<'src> {
     /// so that `for (x in obj)` is parsed as a for-in loop instead of a
     /// relational `in` expression.
     no_in: bool,
+    /// Current recursion depth – incremented on entry to key recursive
+    /// functions and decremented on exit.
+    depth: usize,
 }
 
 impl<'src> Parser<'src> {
@@ -69,6 +79,7 @@ impl<'src> Parser<'src> {
             scanner,
             current,
             no_in: false,
+            depth: 0,
         })
     }
 
@@ -143,6 +154,25 @@ impl<'src> Parser<'src> {
         ))
     }
 
+    /// Increment the recursion depth counter, returning an error if the
+    /// maximum depth is exceeded.  Call [`Self::leave`] when returning from
+    /// the recursive function.
+    #[inline]
+    fn enter(&mut self) -> StatorResult<()> {
+        self.depth += 1;
+        if self.depth > MAX_RECURSION_DEPTH {
+            Err(self.error("maximum nesting depth exceeded"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Decrement the recursion depth counter.
+    #[inline]
+    fn leave(&mut self) {
+        self.depth -= 1;
+    }
+
     /// Consume an optional semicolon, inserting one automatically if needed
     /// (ASI rules: end of line, right brace, or end of input).
     fn consume_semicolon(&mut self) -> StatorResult<()> {
@@ -206,6 +236,13 @@ impl<'src> Parser<'src> {
     // ── Statements ───────────────────────────────────────────────────────────
 
     fn parse_stmt(&mut self) -> StatorResult<Stmt> {
+        self.enter()?;
+        let result = self.parse_stmt_inner();
+        self.leave();
+        result
+    }
+
+    fn parse_stmt_inner(&mut self) -> StatorResult<Stmt> {
         match self.peek_kind() {
             TokenKind::Semicolon => {
                 let span = self.current_span();
@@ -1664,6 +1701,13 @@ impl<'src> Parser<'src> {
     /// Also handles arrow function expressions, which have assignment-level
     /// precedence: `x => x + 1`, `(x, y) => x + y`, `() => 42`.
     fn parse_assignment_expr(&mut self) -> StatorResult<Expr> {
+        self.enter()?;
+        let result = self.parse_assignment_expr_inner();
+        self.leave();
+        result
+    }
+
+    fn parse_assignment_expr_inner(&mut self) -> StatorResult<Expr> {
         let start = self.current_span();
 
         // ── Async arrow function detection ───────────────────────────────
@@ -2184,6 +2228,13 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_primary(&mut self) -> StatorResult<Expr> {
+        self.enter()?;
+        let result = self.parse_primary_inner();
+        self.leave();
+        result
+    }
+
+    fn parse_primary_inner(&mut self) -> StatorResult<Expr> {
         let span = self.current_span();
         match self.peek_kind() {
             TokenKind::NumericLiteral => {

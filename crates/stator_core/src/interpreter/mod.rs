@@ -756,6 +756,12 @@ pub struct InterpreterFrame {
     /// [`OSR_LOOP_THRESHOLD`] and the function has not yet been JIT-compiled,
     /// baseline compilation is triggered so the next *call* uses native code.
     osr_loop_count: u32,
+    /// Maximum number of instructions to execute before aborting.  `0` means
+    /// unlimited.  Used by the Test262 runner to prevent infinite-loop tests
+    /// from hanging the suite.
+    pub instruction_limit: u64,
+    /// Number of instructions executed so far in this frame.
+    pub instructions_executed: u64,
 }
 
 impl InterpreterFrame {
@@ -785,6 +791,8 @@ impl InterpreterFrame {
             generator_state: None,
             global_env: Rc::new(RefCell::new(global_map)),
             osr_loop_count: 0,
+            instruction_limit: 0,
+            instructions_executed: 0,
         }
     }
 
@@ -900,6 +908,16 @@ impl Interpreter {
             // ── Fetch ──────────────────────────────────────────────────────
             let instr = &instructions[frame.pc];
             frame.pc += 1;
+
+            // ── Instruction limit check ────────────────────────────────────
+            if frame.instruction_limit > 0 {
+                frame.instructions_executed += 1;
+                if frame.instructions_executed > frame.instruction_limit {
+                    return Err(StatorError::Internal(
+                        "instruction limit exceeded".into(),
+                    ));
+                }
+            }
 
             // ── Decode + Dispatch ──────────────────────────────────────────
             match instr.opcode {
@@ -3121,6 +3139,8 @@ impl Interpreter {
             generator_state: Some(Rc::clone(state)),
             global_env: Rc::new(RefCell::new(std::collections::HashMap::new())),
             osr_loop_count: 0,
+            instruction_limit: 0,
+            instructions_executed: 0,
         };
 
         state.borrow_mut().status = GeneratorStatus::Executing;
