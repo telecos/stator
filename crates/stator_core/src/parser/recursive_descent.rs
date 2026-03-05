@@ -1964,27 +1964,34 @@ impl<'src> Parser<'src> {
         Ok(test)
     }
 
-    // Nullish coalescing has slightly different grouping rules with && and ||.
-    // For simplicity we treat it as same level as logical OR/AND here.
+    /// `??` has lower precedence than `||`, so it wraps `parse_logical_or`.
     fn parse_nullish_coalesce(&mut self) -> StatorResult<Expr> {
-        self.parse_logical_or()
+        let start = self.current_span();
+        let mut left = self.parse_logical_or()?;
+        while self.peek_kind() == TokenKind::QuestionQuestion {
+            self.bump()?;
+            let right = self.parse_logical_or()?;
+            let end = right.loc();
+            left = Expr::Logical(Box::new(LogicalExpr {
+                loc: Self::merge_spans(start, end),
+                op: LogicalOp::NullishCoalesce,
+                left: Box::new(left),
+                right: Box::new(right),
+            }));
+        }
+        Ok(left)
     }
 
     fn parse_logical_or(&mut self) -> StatorResult<Expr> {
         let start = self.current_span();
         let mut left = self.parse_logical_and()?;
-        loop {
-            let op = match self.peek_kind() {
-                TokenKind::PipePipe => LogicalOp::Or,
-                TokenKind::QuestionQuestion => LogicalOp::NullishCoalesce,
-                _ => break,
-            };
+        while self.peek_kind() == TokenKind::PipePipe {
             self.bump()?;
             let right = self.parse_logical_and()?;
             let end = right.loc();
             left = Expr::Logical(Box::new(LogicalExpr {
                 loc: Self::merge_spans(start, end),
-                op,
+                op: LogicalOp::Or,
                 left: Box::new(left),
                 right: Box::new(right),
             }));
@@ -5913,6 +5920,116 @@ mod tests {
                 assert!(matches!(outer.tag.as_ref(), Expr::TaggedTemplate(_)));
             } else {
                 panic!("expected nested TaggedTemplate");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    // ── Optional catch binding ────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_optional_catch_binding() {
+        let prog = parse("try {} catch {}").unwrap();
+        if let ProgramItem::Stmt(Stmt::Try(t)) = &prog.body[0] {
+            let handler = t.handler.as_ref().unwrap();
+            assert!(handler.param.is_none(), "catch param should be None");
+        } else {
+            panic!("expected try statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_catch_with_binding() {
+        let prog = parse("try {} catch (e) {}").unwrap();
+        if let ProgramItem::Stmt(Stmt::Try(t)) = &prog.body[0] {
+            let handler = t.handler.as_ref().unwrap();
+            assert!(handler.param.is_some(), "catch param should be Some");
+        } else {
+            panic!("expected try statement");
+        }
+    }
+
+    // ── Nullish coalescing ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_nullish_coalesce() {
+        use crate::parser::ast::{Expr, LogicalOp};
+        let prog = parse("a ?? b").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
+            if let Expr::Logical(l) = expr.as_ref() {
+                assert_eq!(l.op, LogicalOp::NullishCoalesce);
+            } else {
+                panic!("expected logical expression");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_nullish_coalesce_lower_than_or() {
+        // a || b ?? c  should parse as (a || b) ?? c
+        use crate::parser::ast::{Expr, LogicalOp};
+        let prog = parse("a || b ?? c").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
+            if let Expr::Logical(outer) = expr.as_ref() {
+                assert_eq!(outer.op, LogicalOp::NullishCoalesce);
+                // Left side should be `a || b`
+                if let Expr::Logical(inner) = outer.left.as_ref() {
+                    assert_eq!(inner.op, LogicalOp::Or);
+                } else {
+                    panic!("expected inner || expression");
+                }
+            } else {
+                panic!("expected logical expression");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    // ── Logical assignment operators ──────────────────────────────────────────
+
+    #[test]
+    fn test_parse_logical_and_assign() {
+        use crate::parser::ast::{AssignOp, Expr};
+        let prog = parse("a &&= b").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
+            if let Expr::Assign(a) = expr.as_ref() {
+                assert_eq!(a.op, AssignOp::LogicalAndAssign);
+            } else {
+                panic!("expected assignment");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_logical_or_assign() {
+        use crate::parser::ast::{AssignOp, Expr};
+        let prog = parse("a ||= b").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
+            if let Expr::Assign(a) = expr.as_ref() {
+                assert_eq!(a.op, AssignOp::LogicalOrAssign);
+            } else {
+                panic!("expected assignment");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_nullish_assign() {
+        use crate::parser::ast::{AssignOp, Expr};
+        let prog = parse("a ??= b").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
+            if let Expr::Assign(a) = expr.as_ref() {
+                assert_eq!(a.op, AssignOp::NullishAssign);
+            } else {
+                panic!("expected assignment");
             }
         } else {
             panic!("expected expression statement");

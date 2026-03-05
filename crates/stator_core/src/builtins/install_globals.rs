@@ -22,10 +22,14 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::builtins::error::{ErrorKind, JsError};
+use crate::builtins::finalization_registry::{
+    finalization_registry_drain, finalization_registry_new, finalization_registry_notify,
+    finalization_registry_register, finalization_registry_unregister,
+};
 use crate::builtins::global::{
     GLOBAL_INFINITY, GLOBAL_NAN, global_decode_uri, global_decode_uri_component, global_encode_uri,
-    global_encode_uri_component, global_eval, global_is_finite, global_is_nan, global_parse_float,
-    global_parse_int,
+    global_encode_uri_component, global_escape, global_eval, global_is_finite, global_is_nan,
+    global_parse_float, global_parse_int, global_unescape,
 };
 use crate::builtins::iterator::{
     iterator_drop, iterator_every, iterator_filter, iterator_find, iterator_flat_map,
@@ -50,13 +54,16 @@ use crate::builtins::set::{
     set_size, set_values,
 };
 use crate::builtins::string::{
-    string_at, string_char_at, string_char_code_at, string_code_point_at, string_concat,
-    string_ends_with, string_from_char_code, string_from_code_point, string_includes,
-    string_index_of, string_is_well_formed, string_iter, string_last_index_of, string_match,
-    string_match_all, string_normalize, string_pad_end, string_pad_start, string_raw,
-    string_repeat, string_replace, string_replace_all, string_search, string_slice, string_split,
-    string_starts_with, string_substring, string_to_lower_case, string_to_upper_case,
-    string_to_well_formed, string_trim, string_trim_end, string_trim_start,
+    string_anchor, string_at, string_big, string_blink, string_bold, string_char_at,
+    string_char_code_at, string_code_point_at, string_concat, string_ends_with, string_fixed,
+    string_fontcolor, string_fontsize, string_from_char_code, string_from_code_point,
+    string_includes, string_index_of, string_is_well_formed, string_italics, string_iter,
+    string_last_index_of, string_link, string_match, string_match_all, string_normalize,
+    string_pad_end, string_pad_start, string_raw, string_repeat, string_replace,
+    string_replace_all, string_search, string_slice, string_small, string_split,
+    string_starts_with, string_strike, string_sub, string_substr, string_substring, string_sup,
+    string_to_lower_case, string_to_upper_case, string_to_well_formed, string_trim,
+    string_trim_end, string_trim_start,
 };
 use crate::builtins::symbol::{
     SYMBOL_ASYNC_ITERATOR, SYMBOL_HAS_INSTANCE, SYMBOL_IS_CONCAT_SPREADABLE, SYMBOL_ITERATOR,
@@ -67,6 +74,7 @@ use crate::builtins::symbol::{
 use crate::builtins::weak_map::{
     weak_map_delete, weak_map_get, weak_map_has, weak_map_new, weak_map_set,
 };
+use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new};
 use crate::builtins::weak_set::{weak_set_add, weak_set_delete, weak_set_has, weak_set_new};
 use crate::error::{StatorError, StatorResult};
 use crate::objects::value::{JsValue, NativeIterator};
@@ -933,6 +941,28 @@ fn make_object() -> JsValue {
             // PlainObject has no symbol-keyed properties.
             Ok(JsValue::Array(Rc::new(vec![])))
         }),
+    );
+
+    // ── Object.prototype ─────────────────────────────────────────────────
+    let mut obj_proto: HashMap<String, JsValue> = HashMap::new();
+
+    // Annex B §B.2.2.1 — Object.prototype.__proto__ (getter/setter)
+    // __proto__ getter: returns null (no prototype chain in our model).
+    obj_proto.insert("__proto__get__".into(), native(|_args| Ok(JsValue::Null)));
+    // __proto__ setter: no-op (we don't support mutable prototype chains).
+    obj_proto.insert(
+        "__proto__set__".into(),
+        native(|args| {
+            let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
+            Ok(obj)
+        }),
+    );
+    // Expose __proto__ as null for property access.
+    obj_proto.insert("__proto__".into(), JsValue::Null);
+
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(obj_proto))),
     );
 
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
@@ -2538,6 +2568,167 @@ fn make_weak_set_builtin() -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
+// ── WeakRef constructor (ES2025 §26.1) ───────────────────────────────────────
+
+/// Build the `WeakRef` constructor/namespace object.
+///
+/// The returned `PlainObject` provides a `__call__` constructor that creates
+/// a new `WeakRef` instance with a `deref` prototype method.  The target
+/// must be an `Object` pointer; non-object targets cause a `TypeError`.
+fn make_weak_ref_builtin() -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let target = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::Object(ptr) = target {
+                let inner = Rc::new(RefCell::new(weak_ref_new(*ptr)?));
+                let mut obj: HashMap<String, JsValue> = HashMap::new();
+
+                // deref()
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "deref".into(),
+                        native(move |_a| Ok(weak_ref_deref(&inner.borrow()))),
+                    );
+                }
+
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            } else {
+                Err(StatorError::TypeError(
+                    "WeakRef target must be an object".into(),
+                ))
+            }
+        }),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+// ── FinalizationRegistry constructor (ES2025 §26.2) ─────────────────────────
+
+/// Build the `FinalizationRegistry` constructor/namespace object.
+///
+/// The returned `PlainObject` provides a `__call__` constructor that creates
+/// a new `FinalizationRegistry` instance with `register` and `unregister`
+/// prototype methods.  The cleanup callback is stored as a JS-level value;
+/// actual invocation happens when the GC integration is complete.
+fn make_finalization_registry_builtin() -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if !matches!(callback, JsValue::NativeFunction(_)) {
+                return Err(StatorError::TypeError(
+                    "FinalizationRegistry requires a callable cleanup callback".into(),
+                ));
+            }
+
+            let inner = Rc::new(RefCell::new(finalization_registry_new()));
+            let callback = Rc::new(callback);
+            let mut obj: HashMap<String, JsValue> = HashMap::new();
+
+            // register(target, heldValue [, unregisterToken])
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "register".into(),
+                    native(move |a| {
+                        let target = a.first().unwrap_or(&JsValue::Undefined);
+                        let held_value = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        let token = a.get(2).unwrap_or(&JsValue::Undefined);
+
+                        if let JsValue::Object(ptr) = target {
+                            let unregister_token = match token {
+                                JsValue::Object(tok_ptr) => Some(*tok_ptr),
+                                JsValue::Undefined => None,
+                                _ => {
+                                    return Err(StatorError::TypeError(
+                                        "unregister token must be an object or undefined".into(),
+                                    ));
+                                }
+                            };
+                            finalization_registry_register(
+                                &mut inner.borrow_mut(),
+                                *ptr,
+                                held_value,
+                                unregister_token,
+                            )?;
+                            Ok(JsValue::Undefined)
+                        } else {
+                            Err(StatorError::TypeError(
+                                "FinalizationRegistry target must be an object".into(),
+                            ))
+                        }
+                    }),
+                );
+            }
+
+            // unregister(unregisterToken)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "unregister".into(),
+                    native(move |a| {
+                        let token = a.first().unwrap_or(&JsValue::Undefined);
+                        if let JsValue::Object(ptr) = token {
+                            Ok(JsValue::Boolean(finalization_registry_unregister(
+                                &mut inner.borrow_mut(),
+                                *ptr,
+                            )?))
+                        } else {
+                            Err(StatorError::TypeError(
+                                "unregister token must be an object".into(),
+                            ))
+                        }
+                    }),
+                );
+            }
+
+            // cleanupSome() — drain the queue and invoke callback
+            {
+                let inner = Rc::clone(&inner);
+                let cb = Rc::clone(&callback);
+                obj.insert(
+                    "cleanupSome".into(),
+                    native(move |_a| {
+                        let held_values = finalization_registry_drain(&mut inner.borrow_mut());
+                        if let JsValue::NativeFunction(ref f) = *cb {
+                            for held in held_values {
+                                f(vec![held])?;
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+            }
+
+            // __notify__ — internal GC hook exposed for testing
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "__notify__".into(),
+                    native(move |a| {
+                        let target = a.first().unwrap_or(&JsValue::Undefined);
+                        if let JsValue::Object(ptr) = target {
+                            finalization_registry_notify(&mut inner.borrow_mut(), *ptr);
+                        }
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+            }
+
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+        }),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 // ── String constructor ───────────────────────────────────────────────────────
 
 /// Build the `String` constructor/namespace object with static and prototype
@@ -3036,6 +3227,147 @@ fn make_string() -> JsValue {
         }),
     );
 
+    // ── Annex B prototype methods ───────────────────────────────────────
+
+    // substr(start, length?)
+    proto.insert(
+        "substr".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let start = args
+                .get(1)
+                .unwrap_or(&JsValue::Undefined)
+                .to_number()
+                .unwrap_or(0.0) as i64;
+            let length = match args.get(2) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+            };
+            Ok(JsValue::String(string_substr(&s, start, length)))
+        }),
+    );
+
+    // anchor(name)
+    proto.insert(
+        "anchor".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let name = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_anchor(&s, &name)))
+        }),
+    );
+
+    // big()
+    proto.insert(
+        "big".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_big(&s)))
+        }),
+    );
+
+    // blink()
+    proto.insert(
+        "blink".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_blink(&s)))
+        }),
+    );
+
+    // bold()
+    proto.insert(
+        "bold".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_bold(&s)))
+        }),
+    );
+
+    // fixed()
+    proto.insert(
+        "fixed".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_fixed(&s)))
+        }),
+    );
+
+    // fontcolor(color)
+    proto.insert(
+        "fontcolor".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let color = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_fontcolor(&s, &color)))
+        }),
+    );
+
+    // fontsize(size)
+    proto.insert(
+        "fontsize".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let size = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_fontsize(&s, &size)))
+        }),
+    );
+
+    // italics()
+    proto.insert(
+        "italics".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_italics(&s)))
+        }),
+    );
+
+    // link(url)
+    proto.insert(
+        "link".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let url = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_link(&s, &url)))
+        }),
+    );
+
+    // small()
+    proto.insert(
+        "small".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_small(&s)))
+        }),
+    );
+
+    // strike()
+    proto.insert(
+        "strike".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_strike(&s)))
+        }),
+    );
+
+    // sub()
+    proto.insert(
+        "sub".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_sub(&s)))
+        }),
+    );
+
+    // sup()
+    proto.insert(
+        "sup".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_sup(&s)))
+        }),
+    );
+
     props.insert(
         "prototype".into(),
         JsValue::PlainObject(Rc::new(RefCell::new(proto))),
@@ -3315,6 +3647,16 @@ fn make_regexp() -> JsValue {
     // Callable: new RegExp(pattern, flags)
     props.insert("__call__".into(), native(|args| regexp_construct(&args)));
 
+    // Annex B legacy static properties (stubs)
+    for i in 1..=9 {
+        props.insert(format!("${i}"), JsValue::String(String::new()));
+    }
+    props.insert("input".into(), JsValue::String(String::new()));
+    props.insert("lastMatch".into(), JsValue::String(String::new()));
+    props.insert("lastParen".into(), JsValue::String(String::new()));
+    props.insert("leftContext".into(), JsValue::String(String::new()));
+    props.insert("rightContext".into(), JsValue::String(String::new()));
+
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -3373,6 +3715,11 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     globals.insert("Set".into(), make_set_builtin());
     globals.insert("WeakMap".into(), make_weak_map_builtin());
     globals.insert("WeakSet".into(), make_weak_set_builtin());
+    globals.insert("WeakRef".into(), make_weak_ref_builtin());
+    globals.insert(
+        "FinalizationRegistry".into(),
+        make_finalization_registry_builtin(),
+    );
     globals.insert("Promise".into(), make_promise());
     globals.insert("RegExp".into(), make_regexp());
 
@@ -3477,6 +3824,22 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         }),
     );
 
+    // ── Annex B global functions ─────────────────────────────────────────
+    globals.insert(
+        "escape".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(global_escape(&s)))
+        }),
+    );
+    globals.insert(
+        "unescape".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(global_unescape(&s)))
+        }),
+    );
+
     // ── globalThis (ECMAScript §19.1) ───────────────────────────────────
     // `globalThis` is a self-referential property of the global object.
     // We represent the global object as a PlainObject snapshot.
@@ -3514,6 +3877,8 @@ mod tests {
         assert!(globals.contains_key("Set"));
         assert!(globals.contains_key("WeakMap"));
         assert!(globals.contains_key("WeakSet"));
+        assert!(globals.contains_key("WeakRef"));
+        assert!(globals.contains_key("FinalizationRegistry"));
         assert!(globals.contains_key("Promise"));
         assert!(globals.contains_key("RegExp"));
         assert!(globals.contains_key("globalThis"));
@@ -4629,6 +4994,146 @@ mod tests {
                     assert!(inst.contains_key("delete"));
                 } else {
                     panic!("WeakSet() should return a PlainObject");
+                }
+            }
+        }
+    }
+
+    // ── WeakRef constructor tests ────────────────────────────────────────────
+
+    /// `WeakRef` global is a PlainObject with a `__call__` constructor.
+    #[test]
+    fn test_weak_ref_global_exists() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        assert!(matches!(
+            globals.get("WeakRef"),
+            Some(JsValue::PlainObject(_))
+        ));
+    }
+
+    /// Constructing a WeakRef via `__call__` returns an object with `deref`.
+    #[test]
+    fn test_weak_ref_constructor_creates_instance() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        if let JsValue::PlainObject(wr_ctor) = globals.get("WeakRef").unwrap() {
+            let call = wr_ctor.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                let mut obj = crate::objects::heap_object::HeapObject::new_null();
+                let ptr = &raw mut obj;
+                let result = f(vec![JsValue::Object(ptr)]).unwrap();
+                if let JsValue::PlainObject(instance) = result {
+                    let inst = instance.borrow();
+                    assert!(inst.contains_key("deref"));
+                } else {
+                    panic!("WeakRef() should return a PlainObject");
+                }
+            }
+        }
+    }
+
+    /// `WeakRef` constructor with non-object argument returns TypeError.
+    #[test]
+    fn test_weak_ref_constructor_non_object_error() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        if let JsValue::PlainObject(wr_ctor) = globals.get("WeakRef").unwrap() {
+            let call = wr_ctor.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                let result = f(vec![JsValue::Smi(42)]);
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    /// `WeakRef.prototype.deref()` returns the target object.
+    #[test]
+    fn test_weak_ref_deref_returns_target() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        if let JsValue::PlainObject(wr_ctor) = globals.get("WeakRef").unwrap() {
+            let call = wr_ctor.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                let mut obj = crate::objects::heap_object::HeapObject::new_null();
+                let ptr = &raw mut obj;
+                let instance = f(vec![JsValue::Object(ptr)]).unwrap();
+                if let JsValue::PlainObject(inst) = instance {
+                    let deref_fn = inst.borrow().get("deref").cloned().unwrap();
+                    if let JsValue::NativeFunction(deref) = deref_fn {
+                        let result = deref(vec![]).unwrap();
+                        assert!(matches!(result, JsValue::Object(p) if p == ptr));
+                    }
+                }
+            }
+        }
+    }
+
+    // ── FinalizationRegistry constructor tests ───────────────────────────────
+
+    /// `FinalizationRegistry` global is a PlainObject with a `__call__` constructor.
+    #[test]
+    fn test_finalization_registry_global_exists() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        assert!(matches!(
+            globals.get("FinalizationRegistry"),
+            Some(JsValue::PlainObject(_))
+        ));
+    }
+
+    /// Constructing a FinalizationRegistry via `__call__` returns an object.
+    #[test]
+    fn test_finalization_registry_constructor_creates_instance() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        if let JsValue::PlainObject(fr_ctor) = globals.get("FinalizationRegistry").unwrap() {
+            let call = fr_ctor.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                let cb = native(|_| Ok(JsValue::Undefined));
+                let result = f(vec![cb]).unwrap();
+                if let JsValue::PlainObject(instance) = result {
+                    let inst = instance.borrow();
+                    assert!(inst.contains_key("register"));
+                    assert!(inst.contains_key("unregister"));
+                    assert!(inst.contains_key("cleanupSome"));
+                } else {
+                    panic!("FinalizationRegistry() should return a PlainObject");
+                }
+            }
+        }
+    }
+
+    /// `FinalizationRegistry` constructor without callback returns TypeError.
+    #[test]
+    fn test_finalization_registry_constructor_no_callback_error() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        if let JsValue::PlainObject(fr_ctor) = globals.get("FinalizationRegistry").unwrap() {
+            let call = fr_ctor.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                let result = f(vec![]);
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    /// `FinalizationRegistry.prototype.register` with non-object target returns TypeError.
+    #[test]
+    fn test_finalization_registry_register_non_object_error() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        if let JsValue::PlainObject(fr_ctor) = globals.get("FinalizationRegistry").unwrap() {
+            let call = fr_ctor.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                let cb = native(|_| Ok(JsValue::Undefined));
+                let instance = f(vec![cb]).unwrap();
+                if let JsValue::PlainObject(inst) = instance {
+                    let register_fn = inst.borrow().get("register").cloned().unwrap();
+                    if let JsValue::NativeFunction(register) = register_fn {
+                        let result = register(vec![JsValue::Smi(42), JsValue::Smi(1)]);
+                        assert!(result.is_err());
+                    }
                 }
             }
         }

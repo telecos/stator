@@ -250,6 +250,99 @@ pub fn global_decode_uri_component(encoded_component: &str) -> StatorResult<Stri
     percent_decode(encoded_component, |_| false)
 }
 
+// ── Annex B: escape / unescape ───────────────────────────────────────────────
+
+/// ECMAScript Annex B §B.2.1.1 `escape(string)`.
+///
+/// Encodes a string by replacing characters outside the safe set with
+/// `%XX` (for code units ≤ 0xFF) or `%uXXXX` (for code units > 0xFF).
+///
+/// The safe set is: `A-Z a-z 0-9 @ * _ + - . /`
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::global::global_escape;
+///
+/// assert_eq!(global_escape("abc"), "abc");
+/// assert_eq!(global_escape("hello world"), "hello%20world");
+/// assert_eq!(global_escape("©"), "%A9");
+/// ```
+pub fn global_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for c in s.encode_utf16() {
+        let ch = char::from_u32(c as u32);
+        let is_safe = ch.is_some_and(|ch| {
+            matches!(ch,
+                'A'..='Z' | 'a'..='z' | '0'..='9'
+                | '@' | '*' | '_' | '+' | '-' | '.' | '/'
+            )
+        });
+        if is_safe {
+            out.push(ch.unwrap());
+        } else if c <= 0xFF {
+            out.push('%');
+            out.push(hex_digit((c as u8) >> 4));
+            out.push(hex_digit((c as u8) & 0xF));
+        } else {
+            out.push_str(&format!("%u{c:04X}"));
+        }
+    }
+    out
+}
+
+/// ECMAScript Annex B §B.2.1.2 `unescape(string)`.
+///
+/// Decodes a string produced by [`global_escape`], recognising both
+/// `%XX` and `%uXXXX` sequences.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::global::global_unescape;
+///
+/// assert_eq!(global_unescape("hello%20world"), "hello world");
+/// assert_eq!(global_unescape("%A9"), "©");
+/// assert_eq!(global_unescape("abc"), "abc");
+/// ```
+pub fn global_unescape(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            // Try %uXXXX
+            if i + 5 < bytes.len()
+                && bytes[i + 1] == b'u'
+                && bytes[i + 2..i + 6].iter().all(|b| b.is_ascii_hexdigit())
+            {
+                let hex_str = std::str::from_utf8(&bytes[i + 2..i + 6]).unwrap_or("0000");
+                if let Ok(code) = u16::from_str_radix(hex_str, 16) {
+                    let decoded = String::from_utf16_lossy(&[code]);
+                    out.push_str(&decoded);
+                    i += 6;
+                    continue;
+                }
+            }
+            // Try %XX
+            if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit()
+            {
+                let hex_str = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("00");
+                if let Ok(code) = u8::from_str_radix(hex_str, 16) {
+                    out.push(code as char);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 // ── eval ──────────────────────────────────────────────────────────────────────
 
 /// Distinguishes direct from indirect `eval` calls per ECMAScript §19.2.1.1.
@@ -953,5 +1046,53 @@ mod tests {
         // Ensure EvalMode derives Debug and Eq correctly.
         assert_eq!(EvalMode::Direct, EvalMode::Direct);
         assert_ne!(EvalMode::Direct, EvalMode::Indirect);
+    }
+
+    // ── global_escape (Annex B) ─────────────────────────────────────────────
+
+    #[test]
+    fn test_escape_ascii_safe() {
+        assert_eq!(global_escape("abc"), "abc");
+        assert_eq!(global_escape("ABC"), "ABC");
+        assert_eq!(global_escape("019"), "019");
+        assert_eq!(global_escape("@*_+-./"), "@*_+-./");
+    }
+
+    #[test]
+    fn test_escape_space() {
+        assert_eq!(global_escape("hello world"), "hello%20world");
+    }
+
+    #[test]
+    fn test_escape_latin1() {
+        assert_eq!(global_escape("\u{00A9}"), "%A9");
+    }
+
+    #[test]
+    fn test_escape_empty() {
+        assert_eq!(global_escape(""), "");
+    }
+
+    // ── global_unescape (Annex B) ───────────────────────────────────────────
+
+    #[test]
+    fn test_unescape_percent_xx() {
+        assert_eq!(global_unescape("hello%20world"), "hello world");
+    }
+
+    #[test]
+    fn test_unescape_percent_u() {
+        assert_eq!(global_unescape("%u00A9"), "\u{00A9}");
+    }
+
+    #[test]
+    fn test_unescape_passthrough() {
+        assert_eq!(global_unescape("abc"), "abc");
+    }
+
+    #[test]
+    fn test_escape_unescape_roundtrip() {
+        let original = "hello world ©";
+        assert_eq!(global_unescape(&global_escape(original)), original);
     }
 }

@@ -1453,6 +1453,10 @@ impl Interpreter {
                             if ba.is_generator() {
                                 frame.accumulator =
                                     JsValue::Generator(GeneratorState::new((*ba).clone()));
+                            } else if ba.is_async() {
+                                let args = collect_args(frame, args_start_v, arg_count)?;
+                                frame.accumulator =
+                                    Interpreter::run_async_function((*ba).clone(), args)?;
                             } else {
                                 let args = collect_args(frame, args_start_v, arg_count)?;
                                 // ── Tiering ──────────────────────────────────
@@ -1521,9 +1525,11 @@ impl Interpreter {
                             if ba.is_generator() {
                                 frame.accumulator =
                                     JsValue::Generator(GeneratorState::new((*ba).clone()));
+                            } else if ba.is_async() {
+                                frame.accumulator =
+                                    Interpreter::run_async_function((*ba).clone(), vec![])?;
                             } else {
                                 let args: Vec<JsValue> = vec![];
-                                // ── Tiering ──────────────────────────────────
                                 let count = ba.increment_invocation_count();
                                 if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
                                     maybe_compile_baseline(&ba);
@@ -1589,10 +1595,13 @@ impl Interpreter {
                             if ba.is_generator() {
                                 frame.accumulator =
                                     JsValue::Generator(GeneratorState::new((*ba).clone()));
+                            } else if ba.is_async() {
+                                let arg1 = frame.read_reg(arg1_v)?.clone();
+                                frame.accumulator =
+                                    Interpreter::run_async_function((*ba).clone(), vec![arg1])?;
                             } else {
                                 let arg1 = frame.read_reg(arg1_v)?.clone();
                                 let args = vec![arg1];
-                                // ── Tiering ──────────────────────────────────
                                 let count = ba.increment_invocation_count();
                                 if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
                                     maybe_compile_baseline(&ba);
@@ -1663,6 +1672,13 @@ impl Interpreter {
                             if ba.is_generator() {
                                 frame.accumulator =
                                     JsValue::Generator(GeneratorState::new((*ba).clone()));
+                            } else if ba.is_async() {
+                                let arg1 = frame.read_reg(arg1_v)?.clone();
+                                let arg2 = frame.read_reg(arg2_v)?.clone();
+                                frame.accumulator = Interpreter::run_async_function(
+                                    (*ba).clone(),
+                                    vec![arg1, arg2],
+                                )?;
                             } else {
                                 let arg1 = frame.read_reg(arg1_v)?.clone();
                                 let arg2 = frame.read_reg(arg2_v)?.clone();
@@ -4014,11 +4030,109 @@ impl Interpreter {
             Ok(GeneratorStep::Return(return_val))
         }
     }
+
+    /// Execute a pure async function (not an async generator) to completion.
+    ///
+    /// Drives the internal generator until it returns.  Each `await` is
+    /// compiled as `SuspendGenerator`; the awaited value is resolved
+    /// synchronously (matching V8's microtask-draining behaviour for already-
+    /// resolved promises) and fed back via `run_generator_step`.
+    ///
+    /// Returns a `JsValue::Promise` that is already fulfilled with the return
+    /// value, or already rejected if the async body threw.
+    pub fn run_async_function(
+        bytecode_array: BytecodeArray,
+        _args: Vec<JsValue>,
+    ) -> StatorResult<JsValue> {
+        use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
+
+        let queue = MicrotaskQueue::new();
+        let state = GeneratorState::new(bytecode_array);
+        let mut input = JsValue::Undefined;
+
+        loop {
+            match Interpreter::run_generator_step(&state, input)? {
+                GeneratorStep::Yield(awaited) => {
+                    // The awaited value is the result of evaluating the
+                    // expression after `await`.  If it is already a resolved
+                    // promise we extract its value; otherwise we treat it as
+                    // a plain value (auto-wrap semantics).
+                    input = match awaited {
+                        JsValue::Promise(ref p) => p.value().unwrap_or(awaited),
+                        other => other,
+                    };
+                }
+                GeneratorStep::Return(v) => {
+                    let p = promise_resolve(v, &queue);
+                    queue.drain();
+                    return Ok(JsValue::Promise(p));
+                }
+            }
+        }
+    }
+
+    /// Execute a `.return(value)` call on a generator.
+    ///
+    /// If the generator is suspended, marks it as completed and returns
+    /// `{ value, done: true }`.  If already completed, returns
+    /// `{ value: undefined, done: true }`.
+    pub fn generator_return(
+        state: &Rc<RefCell<GeneratorState>>,
+        value: JsValue,
+    ) -> StatorResult<JsValue> {
+        let status = state.borrow().status;
+        match status {
+            GeneratorStatus::SuspendedAtStart | GeneratorStatus::SuspendedAtYield => {
+                state.borrow_mut().status = GeneratorStatus::Completed;
+                Ok(make_iterator_result(value, true))
+            }
+            GeneratorStatus::Completed => Ok(make_iterator_result(JsValue::Undefined, true)),
+            GeneratorStatus::Executing => Err(StatorError::TypeError(
+                "Generator is already running".into(),
+            )),
+        }
+    }
+
+    /// Execute a `.throw(value)` call on a generator.
+    ///
+    /// If the generator is suspended, marks it as completed and returns an
+    /// error.  If already completed, re-throws.
+    pub fn generator_throw(
+        state: &Rc<RefCell<GeneratorState>>,
+        value: JsValue,
+    ) -> StatorResult<JsValue> {
+        let status = state.borrow().status;
+        match status {
+            GeneratorStatus::SuspendedAtStart | GeneratorStatus::SuspendedAtYield => {
+                state.borrow_mut().status = GeneratorStatus::Completed;
+                Err(StatorError::TypeError(format!(
+                    "Generator throw: {value:?}"
+                )))
+            }
+            GeneratorStatus::Completed => Err(StatorError::TypeError(format!(
+                "Generator throw: {value:?}"
+            ))),
+            GeneratorStatus::Executing => Err(StatorError::TypeError(
+                "Generator is already running".into(),
+            )),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Create a `{ value, done }` iterator result object.
+fn make_iterator_result(value: JsValue, done: bool) -> JsValue {
+    let map: HashMap<String, JsValue> = [
+        ("value".to_string(), value),
+        ("done".to_string(), JsValue::Boolean(done)),
+    ]
+    .into_iter()
+    .collect();
+    JsValue::PlainObject(Rc::new(RefCell::new(map)))
+}
 
 /// Look up the innermost exception handler for the instruction at `instr_idx`.
 ///
@@ -4330,6 +4444,10 @@ fn dispatch_call(
         JsValue::Function(ba) => {
             if ba.is_generator() {
                 frame.accumulator = JsValue::Generator(GeneratorState::new((**ba).clone()));
+            } else if ba.is_async() {
+                // Async (non-generator) function: drive the internal generator
+                // to completion and return a Promise.
+                frame.accumulator = Interpreter::run_async_function((**ba).clone(), args)?;
             } else {
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
@@ -4475,6 +4593,48 @@ fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "name" => JsValue::String(e.name().to_string()),
             "message" => JsValue::String(e.message().to_string()),
             "stack" => JsValue::String(e.stack().to_string()),
+            _ => JsValue::Undefined,
+        };
+    }
+    // Handle JsValue::Generator — expose next/return/throw methods.
+    if let JsValue::Generator(gs) = obj {
+        let gs = Rc::clone(gs);
+        return match key {
+            "next" => {
+                let gs = gs.clone();
+                JsValue::NativeFunction(Rc::new(move |args| {
+                    let input = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                    match Interpreter::run_generator_step(&gs, input)? {
+                        GeneratorStep::Yield(v) => Ok(make_iterator_result(v, false)),
+                        GeneratorStep::Return(v) => Ok(make_iterator_result(v, true)),
+                    }
+                }))
+            }
+            "return" => {
+                let gs = gs.clone();
+                JsValue::NativeFunction(Rc::new(move |args| {
+                    let value = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                    Interpreter::generator_return(&gs, value)
+                }))
+            }
+            "throw" => {
+                let gs = gs.clone();
+                JsValue::NativeFunction(Rc::new(move |args| {
+                    let value = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                    Interpreter::generator_throw(&gs, value)
+                }))
+            }
+            _ => JsValue::Undefined,
+        };
+    }
+    // Handle JsValue::Promise — expose then/catch/finally.
+    if let JsValue::Promise(_p) = obj {
+        return match key {
+            "then" | "catch" | "finally" => {
+                // Return a no-op native function for now; full chaining is
+                // handled at a higher level by the promise builtins.
+                JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Undefined)))
+            }
             _ => JsValue::Undefined,
         };
     }
@@ -11312,5 +11472,195 @@ mod tests {
             compile_source_and_run("function tag(strings) { return strings.length; } tag`hello`")
                 .unwrap();
         assert_eq!(result, JsValue::Smi(1));
+    }
+
+    // ── Async function execution ──────────────────────────────────────────────
+
+    #[test]
+    fn test_async_function_returns_promise() {
+        // `async function f() { return 42; } f()`
+        // The call should return a Promise wrapping 42.
+        let result = compile_source_and_run("async function f() { return 42; } f()").unwrap();
+        assert!(
+            matches!(result, JsValue::Promise(_)),
+            "expected Promise, got {result:?}"
+        );
+        if let JsValue::Promise(p) = &result {
+            assert_eq!(
+                p.value(),
+                Some(JsValue::Smi(42)),
+                "promise should be fulfilled with 42"
+            );
+        }
+    }
+
+    #[test]
+    fn test_async_function_await_resolves() {
+        // `async function f() { let x = await 10; return x + 1; } f()`
+        let result =
+            compile_source_and_run("async function f() { let x = await 10; return x + 1; } f()")
+                .unwrap();
+        if let JsValue::Promise(p) = &result {
+            assert_eq!(
+                p.value(),
+                Some(JsValue::Smi(11)),
+                "promise should be fulfilled with 11"
+            );
+        } else {
+            panic!("expected Promise, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_async_arrow_returns_promise() {
+        // `var f = async () => 99; f()`
+        let result = compile_source_and_run("var f = async () => 99; f()").unwrap();
+        assert!(
+            matches!(result, JsValue::Promise(_)),
+            "expected Promise, got {result:?}"
+        );
+        if let JsValue::Promise(p) = &result {
+            assert_eq!(p.value(), Some(JsValue::Smi(99)));
+        }
+    }
+
+    // ── Generator .next()/.return()/.throw() ──────────────────────────────────
+
+    #[test]
+    fn test_generator_next_method() {
+        // `function* g() { yield 1; yield 2; } var it = g(); it.next()`
+        // it.next() should return { value: 1, done: false }
+        let result =
+            compile_source_and_run("function* g() { yield 1; yield 2; } var it = g(); it.next()")
+                .unwrap();
+        if let JsValue::PlainObject(map) = &result {
+            let borrow = map.borrow();
+            assert_eq!(borrow.get("value"), Some(&JsValue::Smi(1)));
+            assert_eq!(borrow.get("done"), Some(&JsValue::Boolean(false)));
+        } else {
+            panic!("expected PlainObject iterator result, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_generator_return_method() {
+        // Generator .return(val) should complete the generator.
+        let ba = gen_bytecode_yield_1_yield_2();
+        let gs = GeneratorState::new(ba);
+
+        // Advance once.
+        Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
+
+        // .return(99)
+        let result = Interpreter::generator_return(&gs, JsValue::Smi(99)).unwrap();
+        if let JsValue::PlainObject(map) = &result {
+            let borrow = map.borrow();
+            assert_eq!(borrow.get("value"), Some(&JsValue::Smi(99)));
+            assert_eq!(borrow.get("done"), Some(&JsValue::Boolean(true)));
+        } else {
+            panic!("expected PlainObject iterator result, got {result:?}");
+        }
+        assert_eq!(gs.borrow().status, GeneratorStatus::Completed);
+    }
+
+    #[test]
+    fn test_generator_throw_method() {
+        // Generator .throw(val) should mark the generator as completed and error.
+        let ba = gen_bytecode_yield_1_yield_2();
+        let gs = GeneratorState::new(ba);
+
+        // Advance once.
+        Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
+
+        // .throw(error)
+        let result = Interpreter::generator_throw(&gs, JsValue::String("boom".into()));
+        assert!(result.is_err(), "generator_throw should return an error");
+        assert_eq!(gs.borrow().status, GeneratorStatus::Completed);
+    }
+
+    #[test]
+    fn test_generator_return_on_completed() {
+        // .return() on a completed generator returns { value: undefined, done: true }.
+        let ba = gen_bytecode_yield_1_yield_2();
+        let gs = GeneratorState::new(ba);
+
+        // Drive to completion.
+        Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
+        Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
+        Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
+        assert_eq!(gs.borrow().status, GeneratorStatus::Completed);
+
+        let result = Interpreter::generator_return(&gs, JsValue::Smi(5)).unwrap();
+        if let JsValue::PlainObject(map) = &result {
+            let borrow = map.borrow();
+            assert_eq!(borrow.get("value"), Some(&JsValue::Undefined));
+            assert_eq!(borrow.get("done"), Some(&JsValue::Boolean(true)));
+        } else {
+            panic!("expected PlainObject, got {result:?}");
+        }
+    }
+
+    // ── Async function (run_async_function) ───────────────────────────────────
+
+    #[test]
+    fn test_run_async_function_simple_return() {
+        // Simulate `async function f() { return 42; }` — no await points.
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::SwitchOnGeneratorState, vec![GEN_REG]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode(instrs, 1, 0).with_async_flag(true);
+        let result = Interpreter::run_async_function(ba, vec![]).unwrap();
+        if let JsValue::Promise(p) = &result {
+            assert_eq!(p.value(), Some(JsValue::Smi(42)));
+        } else {
+            panic!("expected Promise, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_run_async_function_with_await() {
+        // Simulate `async function f() { let x = await 10; return x + 1; }`
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::SwitchOnGeneratorState, vec![GEN_REG]),
+            // await 10
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(10)]),
+            Instruction::new_unchecked(
+                Opcode::SuspendGenerator,
+                vec![
+                    GEN_REG,
+                    GEN_REG,
+                    Operand::RegisterCount(0),
+                    Operand::Immediate(0),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::ResumeGenerator,
+                vec![GEN_REG, GEN_REG, Operand::RegisterCount(0)],
+            ),
+            // x = resolved_value (acc)
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            // return x + 1
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(
+                Opcode::Add,
+                vec![Operand::Register(2), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = make_bytecode(instrs, 3, 0).with_async_flag(true);
+        let result = Interpreter::run_async_function(ba, vec![]).unwrap();
+        if let JsValue::Promise(p) = &result {
+            assert_eq!(
+                p.value(),
+                Some(JsValue::Smi(11)),
+                "async function should return 10 + 1 = 11"
+            );
+        } else {
+            panic!("expected Promise, got {result:?}");
+        }
     }
 }

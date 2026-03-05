@@ -1065,6 +1065,129 @@ pub fn string_search(s: &str, pattern: &str) -> i64 {
     }
 }
 
+// ── Annex B: String.prototype.substr ──────────────────────────────────────────
+
+/// ECMAScript Annex B §B.2.3.1 `String.prototype.substr(start, length)`.
+///
+/// Returns a substring beginning at UTF-16 code-unit index `start` and
+/// spanning up to `length` code units.  Negative `start` counts from the
+/// end of the string.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::string::string_substr;
+///
+/// assert_eq!(string_substr("hello", 1, Some(3)), "ell");
+/// assert_eq!(string_substr("hello", -3, Some(2)), "ll");
+/// assert_eq!(string_substr("hello", 0, None), "hello");
+/// ```
+pub fn string_substr(s: &str, start: i64, length: Option<i64>) -> String {
+    let units = encode_utf16(s);
+    let len = units.len() as i64;
+
+    let mut int_start = if start < 0 {
+        (len + start).max(0)
+    } else {
+        start
+    };
+    if int_start > len {
+        int_start = len;
+    }
+    let int_start = int_start as usize;
+
+    let actual_len = match length {
+        None => units.len().saturating_sub(int_start),
+        Some(l) => {
+            if l <= 0 {
+                return String::new();
+            }
+            (l as usize).min(units.len().saturating_sub(int_start))
+        }
+    };
+
+    let end = int_start + actual_len;
+    decode_utf16(&units[int_start..end])
+}
+
+// ── Annex B: String HTML wrapper methods ─────────────────────────────────────
+
+/// Wraps `s` in an HTML tag: `<tag>s</tag>`.
+fn html_wrap(s: &str, tag: &str) -> String {
+    format!("<{tag}>{s}</{tag}>")
+}
+
+/// Wraps `s` in an HTML tag with one attribute: `<tag attr="value">s</tag>`.
+fn html_wrap_attr(s: &str, tag: &str, attr: &str, value: &str) -> String {
+    // Per spec, attribute values are NOT escaped.
+    format!("<{tag} {attr}=\"{value}\">{s}</{tag}>")
+}
+
+/// Annex B §B.2.3.2 `String.prototype.anchor(name)`.
+pub fn string_anchor(s: &str, name: &str) -> String {
+    html_wrap_attr(s, "a", "name", name)
+}
+
+/// Annex B §B.2.3.3 `String.prototype.big()`.
+pub fn string_big(s: &str) -> String {
+    html_wrap(s, "big")
+}
+
+/// Annex B §B.2.3.4 `String.prototype.blink()`.
+pub fn string_blink(s: &str) -> String {
+    html_wrap(s, "blink")
+}
+
+/// Annex B §B.2.3.5 `String.prototype.bold()`.
+pub fn string_bold(s: &str) -> String {
+    html_wrap(s, "b")
+}
+
+/// Annex B §B.2.3.6 `String.prototype.fixed()`.
+pub fn string_fixed(s: &str) -> String {
+    html_wrap(s, "tt")
+}
+
+/// Annex B §B.2.3.7 `String.prototype.fontcolor(color)`.
+pub fn string_fontcolor(s: &str, color: &str) -> String {
+    html_wrap_attr(s, "font", "color", color)
+}
+
+/// Annex B §B.2.3.8 `String.prototype.fontsize(size)`.
+pub fn string_fontsize(s: &str, size: &str) -> String {
+    html_wrap_attr(s, "font", "size", size)
+}
+
+/// Annex B §B.2.3.9 `String.prototype.italics()`.
+pub fn string_italics(s: &str) -> String {
+    html_wrap(s, "i")
+}
+
+/// Annex B §B.2.3.10 `String.prototype.link(url)`.
+pub fn string_link(s: &str, url: &str) -> String {
+    html_wrap_attr(s, "a", "href", url)
+}
+
+/// Annex B §B.2.3.11 `String.prototype.small()`.
+pub fn string_small(s: &str) -> String {
+    html_wrap(s, "small")
+}
+
+/// Annex B §B.2.3.12 `String.prototype.strike()`.
+pub fn string_strike(s: &str) -> String {
+    html_wrap(s, "strike")
+}
+
+/// Annex B §B.2.3.13 `String.prototype.sub()`.
+pub fn string_sub(s: &str) -> String {
+    html_wrap(s, "sub")
+}
+
+/// Annex B §B.2.3.14 `String.prototype.sup()`.
+pub fn string_sup(s: &str) -> String {
+    html_wrap(s, "sup")
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1869,5 +1992,105 @@ mod tests {
     #[test]
     fn test_ends_with_empty_both() {
         assert!(string_ends_with("", "", None));
+    }
+
+    // ── string_substr (Annex B) ─────────────────────────────────────────────
+
+    #[test]
+    fn test_substr_basic() {
+        assert_eq!(string_substr("hello", 1, Some(3)), "ell");
+    }
+
+    #[test]
+    fn test_substr_negative_start() {
+        assert_eq!(string_substr("hello", -3, Some(2)), "ll");
+    }
+
+    #[test]
+    fn test_substr_no_length() {
+        assert_eq!(string_substr("hello", 1, None), "ello");
+    }
+
+    #[test]
+    fn test_substr_zero_length() {
+        assert_eq!(string_substr("hello", 0, Some(0)), "");
+    }
+
+    #[test]
+    fn test_substr_from_start() {
+        assert_eq!(string_substr("hello", 0, None), "hello");
+    }
+
+    // ── HTML wrapper methods (Annex B) ──────────────────────────────────────
+
+    #[test]
+    fn test_html_anchor() {
+        assert_eq!(string_anchor("text", "n"), "<a name=\"n\">text</a>");
+    }
+
+    #[test]
+    fn test_html_big() {
+        assert_eq!(string_big("text"), "<big>text</big>");
+    }
+
+    #[test]
+    fn test_html_blink() {
+        assert_eq!(string_blink("text"), "<blink>text</blink>");
+    }
+
+    #[test]
+    fn test_html_bold() {
+        assert_eq!(string_bold("text"), "<b>text</b>");
+    }
+
+    #[test]
+    fn test_html_fixed() {
+        assert_eq!(string_fixed("text"), "<tt>text</tt>");
+    }
+
+    #[test]
+    fn test_html_fontcolor() {
+        assert_eq!(
+            string_fontcolor("text", "red"),
+            "<font color=\"red\">text</font>"
+        );
+    }
+
+    #[test]
+    fn test_html_fontsize() {
+        assert_eq!(string_fontsize("text", "7"), "<font size=\"7\">text</font>");
+    }
+
+    #[test]
+    fn test_html_italics() {
+        assert_eq!(string_italics("text"), "<i>text</i>");
+    }
+
+    #[test]
+    fn test_html_link() {
+        assert_eq!(
+            string_link("text", "http://x"),
+            "<a href=\"http://x\">text</a>"
+        );
+    }
+
+    #[test]
+    fn test_html_small() {
+        assert_eq!(string_small("text"), "<small>text</small>");
+    }
+
+    #[test]
+    fn test_html_strike() {
+        assert_eq!(string_strike("text"), "<strike>text</strike>");
+    }
+
+    #[test]
+    fn test_html_sub() {
+        assert_eq!(string_sub("text"), "<sub>text</sub>");
+    }
+
+    #[test]
+    fn test_html_sup() {
+        assert_eq!(string_sup("text"), "<sup>text</sup>");
     }
 }

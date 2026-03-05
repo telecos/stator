@@ -10,6 +10,8 @@
 pub mod array;
 /// ECMAScript §20.5 `Error` built-in and error hierarchy (`TypeError`, `RangeError`, etc.).
 pub mod error;
+/// ECMAScript §26.2 `FinalizationRegistry` built-in — cleanup callbacks after GC collection.
+pub mod finalization_registry;
 /// ECMAScript §19 global object properties and global functions (`isNaN`, `isFinite`,
 /// `parseInt`, `parseFloat`, `encodeURI`, `decodeURI`, `encodeURIComponent`,
 /// `decodeURIComponent`, `eval`, and the `NaN`/`Infinity`/`undefined` constants).
@@ -55,5 +57,7 @@ pub(crate) mod util;
 pub mod wasm;
 /// ECMAScript §24.3 `WeakMap` built-in — object-keyed weak map with ephemeron GC semantics.
 pub mod weak_map;
+/// ECMAScript §26.1 `WeakRef` built-in — weak reference that does not prevent GC collection.
+pub mod weak_ref;
 /// ECMAScript §24.4 `WeakSet` built-in — object-keyed weak set with ephemeron GC semantics.
 pub mod weak_set;
