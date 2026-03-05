@@ -522,11 +522,6 @@ impl FunctionCompiler {
     /// resulting [`BytecodeArray`] to the constant pool, emit `CreateClosure`,
     /// and bind the name to the resulting register.
     fn compile_fn_decl(&mut self, decl: &FnDecl) -> StatorResult<()> {
-        if decl.is_async && !decl.is_generator {
-            return Err(StatorError::Internal(
-                "async functions are not yet supported".into(),
-            ));
-        }
         let func_array =
             compile_function(&decl.params, &decl.body, decl.is_generator, decl.is_async)?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
@@ -2364,11 +2359,6 @@ impl FunctionCompiler {
 
     /// Compile a function expression.
     fn compile_fn_expr(&mut self, f: &FnExpr) -> StatorResult<()> {
-        if f.is_async && !f.is_generator {
-            return Err(StatorError::Internal(
-                "async function expressions are not yet supported".into(),
-            ));
-        }
         let func_array = compile_function(&f.params, &f.body, f.is_generator, f.is_async)?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
@@ -2381,11 +2371,6 @@ impl FunctionCompiler {
 
     /// Compile an arrow function expression.
     fn compile_arrow_expr(&mut self, a: &ArrowExpr) -> StatorResult<()> {
-        if a.is_async {
-            return Err(StatorError::Internal(
-                "async arrow functions are not yet supported".into(),
-            ));
-        }
         // Build a synthetic block body if the arrow uses a concise expression.
         let body_block = match &a.body {
             ArrowBody::Block(b) => b.clone(),
@@ -2402,7 +2387,7 @@ impl FunctionCompiler {
                 }
             }
         };
-        let func_array = compile_function(&a.params, &body_block, false, false)?;
+        let func_array = compile_function(&a.params, &body_block, false, a.is_async)?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
@@ -3510,9 +3495,10 @@ fn compile_function(
     compiler.is_generator = is_generator;
     compiler.is_async = is_async;
 
-    // Generator / async-generator prologue: jump to the saved resume point on
-    // re-entry.
-    if is_generator {
+    // Generator / async / async-generator prologue: jump to the saved resume
+    // point on re-entry.  Async functions are desugared to generators internally,
+    // so they need the same prologue.
+    if is_generator || is_async {
         compiler.emit(Instruction::new_unchecked(
             Opcode::SwitchOnGeneratorState,
             vec![Operand::Register(0)],
@@ -5693,6 +5679,101 @@ mod tests {
             kinds.contains(&FeedbackSlotKind::StoreProperty),
             "expected StoreProperty slot for method, got {kinds:?}"
         );
+    }
+
+    // ── Async function compilation ────────────────────────────────────────────
+
+    #[test]
+    fn test_async_function_decl_compiles() {
+        // `async function f() { await 1; return 2; }`
+        let decl = FnDecl {
+            loc: span(),
+            id: Some(ident("f")),
+            params: vec![],
+            body: BlockStmt {
+                loc: span(),
+                body: vec![
+                    await_stmt(num_expr(1.0)),
+                    Stmt::Return(ReturnStmt {
+                        loc: span(),
+                        argument: Some(Box::new(num_expr(2.0))),
+                    }),
+                ],
+            },
+            is_generator: false,
+            is_async: true,
+        };
+        let prog = make_program(vec![Stmt::FnDecl(Box::new(decl))]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let pool = arr.constant_pool();
+        assert!(!pool.is_empty());
+        if let crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) = &pool[0] {
+            assert!(ba.is_async(), "must be marked as async");
+            assert!(!ba.is_generator(), "must NOT be marked as generator");
+            let inner_instrs = ba.instructions().unwrap();
+            assert_eq!(
+                inner_instrs[0].opcode,
+                Opcode::SwitchOnGeneratorState,
+                "async function body must begin with SwitchOnGeneratorState"
+            );
+            assert!(
+                inner_instrs
+                    .iter()
+                    .any(|i| i.opcode == Opcode::SuspendGenerator),
+                "async function body must contain SuspendGenerator for await"
+            );
+        } else {
+            panic!("constant pool[0] should be a Function");
+        }
+    }
+
+    #[test]
+    fn test_async_function_expr_compiles() {
+        // `var f = async function() { await 1; };`
+        use crate::parser::ast::FnExpr;
+        let fn_expr = Expr::Fn(Box::new(FnExpr {
+            loc: span(),
+            id: None,
+            params: vec![],
+            body: BlockStmt {
+                loc: span(),
+                body: vec![await_stmt(num_expr(1.0))],
+            },
+            is_generator: false,
+            is_async: true,
+        }));
+        let prog = make_program(vec![var_decl_stmt(VarKind::Var, "f", Some(fn_expr))]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let pool = arr.constant_pool();
+        if let crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) = &pool[0] {
+            assert!(ba.is_async(), "must be marked as async");
+            assert!(!ba.is_generator(), "must NOT be marked as generator");
+        } else {
+            panic!("constant pool[0] should be a Function");
+        }
+    }
+
+    #[test]
+    fn test_async_arrow_compiles() {
+        // `var f = async () => { await 1; };`
+        use crate::parser::ast::ArrowExpr;
+        let arrow = Expr::Arrow(Box::new(ArrowExpr {
+            loc: span(),
+            params: vec![],
+            body: ArrowBody::Block(BlockStmt {
+                loc: span(),
+                body: vec![await_stmt(num_expr(1.0))],
+            }),
+            is_async: true,
+        }));
+        let prog = make_program(vec![var_decl_stmt(VarKind::Var, "f", Some(arrow))]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let pool = arr.constant_pool();
+        if let crate::bytecode::bytecode_array::ConstantPoolEntry::Function(ba) = &pool[0] {
+            assert!(ba.is_async(), "must be marked as async");
+        } else {
+            panic!("constant pool[0] should be a Function");
+        }
     }
 
     // ── Optional catch binding ────────────────────────────────────────────────
