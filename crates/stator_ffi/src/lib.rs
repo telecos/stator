@@ -2842,6 +2842,7 @@ fn jsvalue_to_stator_value_inner(v: &JsValue) -> StatorValueInner {
         | JsValue::Generator(_)
         | JsValue::Iterator(_)
         | JsValue::Error(_)
+        | JsValue::Promise(_)
         | JsValue::PlainObject(_) => StatorValueInner::Object,
         JsValue::Symbol(_) | JsValue::BigInt(_) | JsValue::Context(_) => {
             // Symbols, BigInts, and Contexts are not yet representable in StatorValueInner;

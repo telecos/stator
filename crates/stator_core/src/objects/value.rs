@@ -271,6 +271,12 @@ pub enum JsValue {
     /// Used to construct host objects (e.g. `console`) that carry
     /// [`NativeFunction`][Self::NativeFunction] properties.
     PlainObject(Rc<RefCell<HashMap<String, JsValue>>>),
+    /// A JavaScript `Promise` object backed by the [`JsPromise`] state machine.
+    ///
+    /// Wraps the shared-state [`JsPromise`] handle from the promise module so
+    /// that promises can be stored and passed through the value pipeline just
+    /// like any other JavaScript value.
+    Promise(crate::builtins::promise::JsPromise),
     /// A scope context for closure variable capture.
     ///
     /// A context holds numbered slots for captured variables and an optional
@@ -322,6 +328,7 @@ impl std::fmt::Debug for JsValue {
             Self::Error(e) => write!(f, "Error({e:?})"),
             Self::NativeFunction(_) => write!(f, "NativeFunction"),
             Self::PlainObject(map) => write!(f, "PlainObject({map:?})"),
+            Self::Promise(p) => write!(f, "Promise({:?})", p.state()),
             Self::Context(ctx) => write!(f, "Context({ctx:?})"),
         }
     }
@@ -351,6 +358,7 @@ impl PartialEq for JsValue {
             // NativeFunction has no comparable content; use pointer identity.
             (Self::NativeFunction(a), Self::NativeFunction(b)) => Rc::ptr_eq(a, b),
             (Self::PlainObject(a), Self::PlainObject(b)) => Rc::ptr_eq(a, b),
+            (Self::Promise(a), Self::Promise(b)) => a == b,
             (Self::Context(a), Self::Context(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
@@ -458,6 +466,12 @@ impl JsValue {
         matches!(self, Self::Error(_))
     }
 
+    /// Returns `true` if this value is a JavaScript `Promise` ([`Promise`][JsValue::Promise]).
+    #[inline]
+    pub fn is_promise(&self) -> bool {
+        matches!(self, Self::Promise(_))
+    }
+
     /// Returns `true` if this value is an ECMAScript primitive
     /// (Undefined, Null, Boolean, Number, String, Symbol, or BigInt).
     #[inline]
@@ -516,6 +530,7 @@ impl JsValue {
             | Self::Iterator(_)
             | Self::NativeFunction(_)
             | Self::PlainObject(_)
+            | Self::Promise(_)
             | Self::Context(_) => true,
             Self::BigInt(n) => *n != 0,
         }
@@ -704,6 +719,7 @@ impl JsValue {
             Self::Error(e) => e.to_error_string(),
             Self::NativeFunction(_) => "function () { [native code] }".to_string(),
             Self::PlainObject(_) => "[object Object]".to_string(),
+            Self::Promise(_) => "[object Promise]".to_string(),
             Self::Context(_) => "[object Context]".to_string(),
             Self::Object(_) => "[object Object]".to_string(),
             // Primitives should not reach here.
@@ -803,6 +819,7 @@ impl JsValue {
             (Self::Error(a), Self::Error(b)) => Rc::ptr_eq(a, b),
             (Self::NativeFunction(a), Self::NativeFunction(b)) => Rc::ptr_eq(a, b),
             (Self::PlainObject(a), Self::PlainObject(b)) => Rc::ptr_eq(a, b),
+            (Self::Promise(a), Self::Promise(b)) => a == b,
             (Self::Context(a), Self::Context(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
@@ -858,6 +875,8 @@ impl Trace for JsValue {
             // GC heap pointers — only Strings, Rc-reference-counted JsErrors,
             // and an ErrorKind enum.  Nothing to report to the tracer.
             Self::Error(_) => {}
+            // JsPromise uses Rc<RefCell<_>> internally with no raw GC pointers.
+            Self::Promise(_) => {}
             _ => {}
         }
     }
