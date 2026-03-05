@@ -6,9 +6,18 @@ on:
       - main
   pull_request:
 
+# Cancel any in-progress run for the same branch/PR so that only the latest
+# commit is tested, saving runner minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
-  test:
-    name: Test Suite
+  test-debug:
+    name: Test Suite (debug)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -20,10 +29,25 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "ci"
+          shared-key: "ci-debug"
 
       - name: Run tests (debug)
         run: cargo test --workspace
+
+  test-release:
+    name: Test Suite (release)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-release"
 
       - name: Run tests (release)
         run: cargo test --workspace --release
@@ -43,7 +67,7 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "ci"
+          shared-key: "ci-debug"
 
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings

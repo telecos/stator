@@ -4,7 +4,23 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'crates/**'
+      - 'fuzz/**'
+      - 'Cargo.lock'
+      - '.github/workflows/fuzz.yml'
   pull_request:
+    paths:
+      - 'crates/**'
+      - 'fuzz/**'
+      - 'Cargo.lock'
+      - '.github/workflows/fuzz.yml'
+
+# Cancel any in-progress run for the same branch/PR so that only the latest
+# commit is tested, saving runner minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -37,10 +53,20 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "fuzz-${{ matrix.target }}"
+          shared-key: "fuzz"
           workspaces: "fuzz -> target"
 
+      - name: Cache cargo-fuzz binary
+        id: cache-cargo-fuzz
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fuzz-
+
       - name: Install cargo-fuzz
+        if: steps.cache-cargo-fuzz.outputs.cache-hit != 'true'
         run: cargo install cargo-fuzz
 
       - name: Build fuzz target
