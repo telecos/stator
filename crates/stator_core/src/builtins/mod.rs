@@ -37,6 +37,8 @@ pub mod promise;
 pub mod proxy;
 /// ECMAScript §28.1 `Reflect` built-in static methods.
 pub mod reflect;
+/// ECMAScript §22.2 `RegExp` built-in constructor and prototype methods.
+pub mod regexp;
 /// ECMAScript §24.2 `Set` built-in — insertion-ordered unique-value collection.
 pub mod set;
 /// ECMAScript §22.1 `String` built-in static methods and prototype equivalents.
