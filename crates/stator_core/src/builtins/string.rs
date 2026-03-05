@@ -412,9 +412,10 @@ pub fn string_includes(s: &str, search: &str, from_index: Option<i64>) -> bool {
 pub fn string_starts_with(s: &str, search: &str, position: Option<i64>) -> bool {
     let units = encode_utf16(s);
     let search_units = encode_utf16(search);
-    let pos = position.unwrap_or(0).max(0) as usize;
-    if pos + search_units.len() > units.len() {
-        return search_units.is_empty();
+    let len = units.len();
+    let pos = position.unwrap_or(0).max(0).min(len as i64) as usize;
+    if pos + search_units.len() > len {
+        return false;
     }
     units[pos..pos + search_units.len()] == search_units[..]
 }
@@ -443,7 +444,7 @@ pub fn string_ends_with(s: &str, search: &str, end_position: Option<i64>) -> boo
         None => units.len(),
     };
     if search_units.len() > end {
-        return search_units.is_empty();
+        return false;
     }
     let start = end - search_units.len();
     units[start..end] == search_units[..]
@@ -718,7 +719,17 @@ pub fn string_repeat(s: &str, count: i64) -> StatorResult<String> {
             "Invalid count value: must be non-negative".to_string(),
         ));
     }
-    Ok(s.repeat(count as usize))
+    let n = count as usize;
+    // Guard against allocation failure: cap result size at ~256 MiB
+    // (similar to V8's string length limit).
+    const MAX_STRING_LEN: usize = 1 << 28;
+    let total = n.saturating_mul(s.len());
+    if total > MAX_STRING_LEN {
+        return Err(StatorError::RangeError(
+            "Invalid count value: result string exceeds maximum length".to_string(),
+        ));
+    }
+    Ok(s.repeat(n))
 }
 
 // ── padStart / padEnd ─────────────────────────────────────────────────────────
@@ -891,6 +902,167 @@ pub fn string_normalize(s: &str, form: Option<&str>) -> StatorResult<String> {
 /// ```
 pub fn string_iter(s: &str) -> Vec<String> {
     s.chars().map(|c| c.to_string()).collect()
+}
+
+// ── String.raw ────────────────────────────────────────────────────────────────
+
+/// ECMAScript §22.1.2.4 `String.raw(strings, ...substitutions)`.
+///
+/// Produces a string by interleaving the *raw* template segments with the
+/// provided substitutions.  This is the tagged-template equivalent: the
+/// `raw_strings` slice corresponds to the `raw` property of the template
+/// object (the literal portions of the template), and `substitutions` are the
+/// values that fill `${…}` placeholders.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::string::string_raw;
+///
+/// assert_eq!(string_raw(&["hello\\n", "world"], &["!"]), "hello\\n!world");
+/// assert_eq!(string_raw(&["a", "b", "c"], &["1", "2"]), "a1b2c");
+/// assert_eq!(string_raw(&[], &[]), "");
+/// ```
+pub fn string_raw(raw_strings: &[&str], substitutions: &[&str]) -> String {
+    let mut result = String::new();
+    for (i, raw) in raw_strings.iter().enumerate() {
+        result.push_str(raw);
+        if i < substitutions.len() {
+            result.push_str(substitutions[i]);
+        }
+    }
+    result
+}
+
+// ── isWellFormed ──────────────────────────────────────────────────────────────
+
+/// ECMAScript §22.1.3.9 `String.prototype.isWellFormed()`.
+///
+/// Returns `true` if the string contains no lone (unpaired) UTF-16 surrogates.
+///
+/// # Implementation note
+///
+/// Because this engine stores strings as Rust `String` values (guaranteed valid
+/// UTF-8), lone surrogates can never appear.  Therefore this function always
+/// returns `true`.  It is provided for spec-completeness so that user code
+/// calling `"…".isWellFormed()` receives the expected result.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::string::string_is_well_formed;
+///
+/// assert!(string_is_well_formed("Hello 😀"));
+/// assert!(string_is_well_formed(""));
+/// ```
+pub fn string_is_well_formed(s: &str) -> bool {
+    // Rust strings are always valid UTF-8, which implies well-formed
+    // UTF-16 (no lone surrogates).  Verify by checking the encode/decode
+    // round-trip produces no replacement characters.
+    let units = encode_utf16(s);
+    let len = units.len();
+    let mut i = 0;
+    while i < len {
+        let cu = units[i];
+        if (UTF16_HIGH_SURROGATE_START..=UTF16_HIGH_SURROGATE_END).contains(&cu) {
+            // High surrogate must be followed by a low surrogate.
+            if i + 1 >= len
+                || !(UTF16_LOW_SURROGATE_START..=UTF16_LOW_SURROGATE_END).contains(&units[i + 1])
+            {
+                return false;
+            }
+            i += 2;
+        } else if (UTF16_LOW_SURROGATE_START..=UTF16_LOW_SURROGATE_END).contains(&cu) {
+            // Lone low surrogate.
+            return false;
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
+
+// ── toWellFormed ──────────────────────────────────────────────────────────────
+
+/// ECMAScript §22.1.3.38 `String.prototype.toWellFormed()`.
+///
+/// Returns a new string where every lone UTF-16 surrogate is replaced by
+/// `U+FFFD` (the Unicode replacement character).
+///
+/// # Implementation note
+///
+/// Rust `String` values cannot contain lone surrogates, so in practice this
+/// returns a copy of the input unchanged.  Provided for spec-completeness.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::string::string_to_well_formed;
+///
+/// assert_eq!(string_to_well_formed("Hello"), "Hello");
+/// assert_eq!(string_to_well_formed(""), "");
+/// ```
+pub fn string_to_well_formed(s: &str) -> String {
+    // Replace any lone surrogates in the UTF-16 encoding with U+FFFD.
+    let units = encode_utf16(s);
+    let len = units.len();
+    let mut result: Vec<u16> = Vec::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        let cu = units[i];
+        if (UTF16_HIGH_SURROGATE_START..=UTF16_HIGH_SURROGATE_END).contains(&cu) {
+            if i + 1 < len
+                && (UTF16_LOW_SURROGATE_START..=UTF16_LOW_SURROGATE_END).contains(&units[i + 1])
+            {
+                // Valid pair — keep both.
+                result.push(cu);
+                result.push(units[i + 1]);
+                i += 2;
+            } else {
+                result.push(0xFFFD);
+                i += 1;
+            }
+        } else if (UTF16_LOW_SURROGATE_START..=UTF16_LOW_SURROGATE_END).contains(&cu) {
+            result.push(0xFFFD);
+            i += 1;
+        } else {
+            result.push(cu);
+            i += 1;
+        }
+    }
+    decode_utf16(&result)
+}
+
+// ── search ────────────────────────────────────────────────────────────────────
+
+/// ECMAScript §22.1.3.19 `String.prototype.search(regexp)`.
+///
+/// Searches for the first match of the regular expression `pattern` in `s` and
+/// returns the index of the match as a UTF-16 code unit offset, or `-1` if no
+/// match is found.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::string::string_search;
+///
+/// assert_eq!(string_search("hello world", r"\d+"), -1);
+/// assert_eq!(string_search("abc123", r"\d+"), 3);
+/// ```
+pub fn string_search(s: &str, pattern: &str) -> i64 {
+    let re = match regress::Regex::new(pattern) {
+        Ok(r) => r,
+        Err(_) => return -1,
+    };
+    match re.find(s) {
+        Some(m) => {
+            // Convert byte offset to UTF-16 code unit index.
+            let byte_start = m.range().start;
+            let prefix = &s[..byte_start];
+            encode_utf16(prefix).len() as i64
+        }
+        None => -1,
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1571,5 +1743,131 @@ mod tests {
     #[test]
     fn test_repeat_empty_string() {
         assert_eq!(string_repeat("", 100).unwrap(), "");
+    }
+
+    // ── string_raw ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_raw_basic() {
+        assert_eq!(string_raw(&["a", "b", "c"], &["1", "2"]), "a1b2c");
+    }
+
+    #[test]
+    fn test_raw_preserves_escape_sequences() {
+        assert_eq!(string_raw(&["hello\\n", "world"], &["!"]), "hello\\n!world");
+    }
+
+    #[test]
+    fn test_raw_empty_strings() {
+        assert_eq!(string_raw(&[], &[]), "");
+    }
+
+    #[test]
+    fn test_raw_more_strings_than_substitutions() {
+        assert_eq!(string_raw(&["a", "b", "c"], &["1"]), "a1bc");
+    }
+
+    #[test]
+    fn test_raw_single_segment_no_substitution() {
+        assert_eq!(string_raw(&["hello"], &[]), "hello");
+    }
+
+    // ── string_is_well_formed ────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_well_formed_ascii() {
+        assert!(string_is_well_formed("hello"));
+    }
+
+    #[test]
+    fn test_is_well_formed_emoji() {
+        assert!(string_is_well_formed("Hello 😀"));
+    }
+
+    #[test]
+    fn test_is_well_formed_empty() {
+        assert!(string_is_well_formed(""));
+    }
+
+    #[test]
+    fn test_is_well_formed_unicode_chars() {
+        assert!(string_is_well_formed("café résumé"));
+    }
+
+    // ── string_to_well_formed ────────────────────────────────────────────────
+
+    #[test]
+    fn test_to_well_formed_normal_string() {
+        assert_eq!(string_to_well_formed("Hello"), "Hello");
+    }
+
+    #[test]
+    fn test_to_well_formed_empty() {
+        assert_eq!(string_to_well_formed(""), "");
+    }
+
+    #[test]
+    fn test_to_well_formed_emoji() {
+        assert_eq!(string_to_well_formed("a😀b"), "a😀b");
+    }
+
+    // ── string_search ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_search_found() {
+        assert_eq!(string_search("abc123def", r"\d+"), 3);
+    }
+
+    #[test]
+    fn test_search_not_found() {
+        assert_eq!(string_search("hello world", r"\d+"), -1);
+    }
+
+    #[test]
+    fn test_search_at_start() {
+        assert_eq!(string_search("123abc", r"\d+"), 0);
+    }
+
+    #[test]
+    fn test_search_invalid_regex() {
+        assert_eq!(string_search("hello", r"[invalid"), -1);
+    }
+
+    // ── string_repeat overflow ────────────────────────────────────────────────
+
+    #[test]
+    fn test_repeat_overflow_is_range_error() {
+        assert!(matches!(
+            string_repeat("ab", i64::MAX),
+            Err(StatorError::RangeError(_))
+        ));
+    }
+
+    // ── string_starts_with edge cases ────────────────────────────────────────
+
+    #[test]
+    fn test_starts_with_position_beyond_length() {
+        // Per spec, position is clamped to [0, len]. Empty search at clamped
+        // position should still succeed.
+        assert!(string_starts_with("Hello", "", Some(100)));
+    }
+
+    #[test]
+    fn test_starts_with_empty_both() {
+        assert!(string_starts_with("", "", None));
+    }
+
+    // ── string_ends_with edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn test_ends_with_end_position_zero() {
+        // endPosition 0 → only empty search matches.
+        assert!(string_ends_with("Hello", "", Some(0)));
+        assert!(!string_ends_with("Hello", "H", Some(0)));
+    }
+
+    #[test]
+    fn test_ends_with_empty_both() {
+        assert!(string_ends_with("", "", None));
     }
 }

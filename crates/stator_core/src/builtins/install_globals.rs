@@ -48,6 +48,15 @@ use crate::builtins::set::{
     set_add, set_clear, set_delete, set_entries, set_from_iterable, set_has, set_keys, set_new,
     set_size, set_values,
 };
+use crate::builtins::string::{
+    string_at, string_char_at, string_char_code_at, string_code_point_at, string_concat,
+    string_ends_with, string_from_char_code, string_from_code_point, string_includes,
+    string_index_of, string_is_well_formed, string_iter, string_last_index_of, string_match,
+    string_match_all, string_normalize, string_pad_end, string_pad_start, string_raw,
+    string_repeat, string_replace, string_replace_all, string_search, string_slice, string_split,
+    string_starts_with, string_substring, string_to_lower_case, string_to_upper_case,
+    string_to_well_formed, string_trim, string_trim_end, string_trim_start,
+};
 use crate::builtins::symbol::{
     SYMBOL_ASYNC_ITERATOR, SYMBOL_HAS_INSTANCE, SYMBOL_IS_CONCAT_SPREADABLE, SYMBOL_ITERATOR,
     SYMBOL_MATCH, SYMBOL_REPLACE, SYMBOL_SEARCH, SYMBOL_SPECIES, SYMBOL_SPLIT, SYMBOL_TO_PRIMITIVE,
@@ -1520,6 +1529,512 @@ fn make_weak_set_builtin() -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
+// ── String constructor ───────────────────────────────────────────────────────
+
+/// Build the `String` constructor/namespace object with static and prototype
+/// methods.
+///
+/// The returned `PlainObject` carries:
+/// - `__call__` — the callable `String(value)` conversion.
+/// - Static methods: `fromCharCode`, `fromCodePoint`, `raw`.
+/// - `prototype` — an object with all `String.prototype.*` methods.
+fn make_string() -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    // ── Callable: String(value) ─────────────────────────────────────────
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let val = args.first().unwrap_or(&JsValue::Undefined);
+            Ok(JsValue::String(val.to_js_string()?))
+        }),
+    );
+
+    // ── Static methods ──────────────────────────────────────────────────
+
+    // String.fromCharCode(...codes)
+    props.insert(
+        "fromCharCode".into(),
+        native(|args| {
+            let codes: Vec<u32> = args
+                .iter()
+                .map(|a| a.to_number().unwrap_or(0.0) as u32)
+                .collect();
+            Ok(JsValue::String(string_from_char_code(&codes)))
+        }),
+    );
+
+    // String.fromCodePoint(...codePoints)
+    props.insert(
+        "fromCodePoint".into(),
+        native(|args| {
+            let codes: Vec<u32> = args
+                .iter()
+                .map(|a| a.to_number().unwrap_or(0.0) as u32)
+                .collect();
+            Ok(JsValue::String(string_from_code_point(&codes)?))
+        }),
+    );
+
+    // String.raw(strings, ...substitutions)
+    props.insert(
+        "raw".into(),
+        native(|args| {
+            // First arg is the template object with a `raw` property.
+            let template = args.first().unwrap_or(&JsValue::Undefined);
+            let raw_array = match template {
+                JsValue::PlainObject(map) => {
+                    let borrowed = map.borrow();
+                    borrowed.get("raw").cloned()
+                }
+                _ => None,
+            };
+            let raw_strings: Vec<String> = match &raw_array {
+                Some(JsValue::Array(arr)) => arr
+                    .iter()
+                    .map(|v| v.to_js_string().unwrap_or_default())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let subs: Vec<String> = args
+                .iter()
+                .skip(1)
+                .map(|v| v.to_js_string().unwrap_or_default())
+                .collect();
+            let raw_refs: Vec<&str> = raw_strings.iter().map(String::as_str).collect();
+            let sub_refs: Vec<&str> = subs.iter().map(String::as_str).collect();
+            Ok(JsValue::String(string_raw(&raw_refs, &sub_refs)))
+        }),
+    );
+
+    // ── Prototype methods ───────────────────────────────────────────────
+    let mut proto: HashMap<String, JsValue> = HashMap::new();
+
+    // charAt(pos)
+    proto.insert(
+        "charAt".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let pos = args
+                .get(1)
+                .unwrap_or(&JsValue::Undefined)
+                .to_number()
+                .unwrap_or(0.0) as i64;
+            Ok(JsValue::String(string_char_at(&s, pos)))
+        }),
+    );
+
+    // charCodeAt(pos)
+    proto.insert(
+        "charCodeAt".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let pos = args
+                .get(1)
+                .unwrap_or(&JsValue::Undefined)
+                .to_number()
+                .unwrap_or(0.0) as i64;
+            Ok(num(string_char_code_at(&s, pos)))
+        }),
+    );
+
+    // codePointAt(pos)
+    proto.insert(
+        "codePointAt".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let pos = args
+                .get(1)
+                .unwrap_or(&JsValue::Undefined)
+                .to_number()
+                .unwrap_or(0.0) as i64;
+            match string_code_point_at(&s, pos) {
+                Some(cp) => Ok(num(cp as f64)),
+                None => Ok(JsValue::Undefined),
+            }
+        }),
+    );
+
+    // concat(...strings)
+    proto.insert(
+        "concat".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let parts: StatorResult<Vec<String>> =
+                args.iter().skip(1).map(|a| a.to_js_string()).collect();
+            let parts = parts?;
+            let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+            Ok(JsValue::String(string_concat(&s, &refs)))
+        }),
+    );
+
+    // slice(start, end?)
+    proto.insert(
+        "slice".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let start = args
+                .get(1)
+                .unwrap_or(&JsValue::Undefined)
+                .to_number()
+                .unwrap_or(0.0) as i64;
+            let end = match args.get(2) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+            };
+            Ok(JsValue::String(string_slice(&s, start, end)))
+        }),
+    );
+
+    // substring(start, end?)
+    proto.insert(
+        "substring".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let start = args
+                .get(1)
+                .unwrap_or(&JsValue::Undefined)
+                .to_number()
+                .unwrap_or(0.0) as i64;
+            let end = match args.get(2) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+            };
+            Ok(JsValue::String(string_substring(&s, start, end)))
+        }),
+    );
+
+    // indexOf(searchString, position?)
+    proto.insert(
+        "indexOf".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let pos = match args.get(2) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+            };
+            Ok(num(string_index_of(&s, &search, pos) as f64))
+        }),
+    );
+
+    // lastIndexOf(searchString, position?)
+    proto.insert(
+        "lastIndexOf".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let pos = match args.get(2) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+            };
+            Ok(num(string_last_index_of(&s, &search, pos) as f64))
+        }),
+    );
+
+    // includes(searchString, position?)
+    proto.insert(
+        "includes".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let pos = match args.get(2) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+            };
+            Ok(JsValue::Boolean(string_includes(&s, &search, pos)))
+        }),
+    );
+
+    // startsWith(searchString, position?)
+    proto.insert(
+        "startsWith".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let pos = match args.get(2) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+            };
+            Ok(JsValue::Boolean(string_starts_with(&s, &search, pos)))
+        }),
+    );
+
+    // endsWith(searchString, endPosition?)
+    proto.insert(
+        "endsWith".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let end = match args.get(2) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+            };
+            Ok(JsValue::Boolean(string_ends_with(&s, &search, end)))
+        }),
+    );
+
+    // toUpperCase()
+    proto.insert(
+        "toUpperCase".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_to_upper_case(&s)))
+        }),
+    );
+
+    // toLowerCase()
+    proto.insert(
+        "toLowerCase".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_to_lower_case(&s)))
+        }),
+    );
+
+    // trim()
+    proto.insert(
+        "trim".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_trim(&s)))
+        }),
+    );
+
+    // trimStart()
+    proto.insert(
+        "trimStart".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_trim_start(&s)))
+        }),
+    );
+
+    // trimEnd()
+    proto.insert(
+        "trimEnd".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_trim_end(&s)))
+        }),
+    );
+
+    // split(separator?, limit?)
+    proto.insert(
+        "split".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let sep = match args.get(1) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.to_js_string()?),
+            };
+            let limit = match args.get(2) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.to_number().unwrap_or(0.0) as u32),
+            };
+            let parts = string_split(&s, sep.as_deref(), limit);
+            let arr: Vec<JsValue> = parts.into_iter().map(JsValue::String).collect();
+            Ok(JsValue::Array(Rc::new(arr)))
+        }),
+    );
+
+    // replace(searchValue, replaceValue)
+    proto.insert(
+        "replace".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let replacement = args.get(2).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_replace(&s, &search, &replacement)))
+        }),
+    );
+
+    // replaceAll(searchValue, replaceValue)
+    proto.insert(
+        "replaceAll".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let replacement = args.get(2).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_replace_all(
+                &s,
+                &search,
+                &replacement,
+            )))
+        }),
+    );
+
+    // match(regexp)
+    proto.insert(
+        "match".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let pattern = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            match string_match(&s, &pattern) {
+                Some(groups) => {
+                    let arr: Vec<JsValue> = groups.into_iter().map(JsValue::String).collect();
+                    Ok(JsValue::Array(Rc::new(arr)))
+                }
+                None => Ok(JsValue::Null),
+            }
+        }),
+    );
+
+    // matchAll(regexp)
+    proto.insert(
+        "matchAll".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let pattern = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            match string_match_all(&s, &pattern) {
+                Some(matches) => {
+                    let arr: Vec<JsValue> = matches.into_iter().map(JsValue::String).collect();
+                    Ok(JsValue::Array(Rc::new(arr)))
+                }
+                None => Ok(JsValue::Array(Rc::new(Vec::new()))),
+            }
+        }),
+    );
+
+    // repeat(count)
+    proto.insert(
+        "repeat".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let n = args
+                .get(1)
+                .unwrap_or(&JsValue::Undefined)
+                .to_number()
+                .unwrap_or(0.0);
+            if n.is_infinite() || n < 0.0 {
+                return Err(crate::error::StatorError::RangeError(
+                    "Invalid count value".to_string(),
+                ));
+            }
+            Ok(JsValue::String(string_repeat(&s, n as i64)?))
+        }),
+    );
+
+    // padStart(targetLength, padString?)
+    proto.insert(
+        "padStart".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let target_len = args
+                .get(1)
+                .unwrap_or(&JsValue::Undefined)
+                .to_number()
+                .unwrap_or(0.0) as usize;
+            let pad = match args.get(2) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.to_js_string()?),
+            };
+            Ok(JsValue::String(string_pad_start(
+                &s,
+                target_len,
+                pad.as_deref(),
+            )))
+        }),
+    );
+
+    // padEnd(targetLength, padString?)
+    proto.insert(
+        "padEnd".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let target_len = args
+                .get(1)
+                .unwrap_or(&JsValue::Undefined)
+                .to_number()
+                .unwrap_or(0.0) as usize;
+            let pad = match args.get(2) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.to_js_string()?),
+            };
+            Ok(JsValue::String(string_pad_end(
+                &s,
+                target_len,
+                pad.as_deref(),
+            )))
+        }),
+    );
+
+    // at(index)
+    proto.insert(
+        "at".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let idx = args
+                .get(1)
+                .unwrap_or(&JsValue::Undefined)
+                .to_number()
+                .unwrap_or(0.0) as i64;
+            match string_at(&s, idx) {
+                Some(ch) => Ok(JsValue::String(ch)),
+                None => Ok(JsValue::Undefined),
+            }
+        }),
+    );
+
+    // normalize(form?)
+    proto.insert(
+        "normalize".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let form = match args.get(1) {
+                Some(JsValue::Undefined) | None => None,
+                Some(v) => Some(v.to_js_string()?),
+            };
+            Ok(JsValue::String(string_normalize(&s, form.as_deref())?))
+        }),
+    );
+
+    // search(regexp)
+    proto.insert(
+        "search".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let pattern = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(num(string_search(&s, &pattern) as f64))
+        }),
+    );
+
+    // isWellFormed()
+    proto.insert(
+        "isWellFormed".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::Boolean(string_is_well_formed(&s)))
+        }),
+    );
+
+    // toWellFormed()
+    proto.insert(
+        "toWellFormed".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_to_well_formed(&s)))
+        }),
+    );
+
+    // [Symbol.iterator]() — returns the code-point iteration as an array.
+    proto.insert(
+        "@@iterator".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let chars: Vec<JsValue> = string_iter(&s).into_iter().map(JsValue::String).collect();
+            Ok(JsValue::Array(Rc::new(chars)))
+        }),
+    );
+
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 // ── install_globals ──────────────────────────────────────────────────────────
 
 /// Pre-populate `globals` with all ECMAScript built-in names.
@@ -1556,13 +2071,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             Ok(JsValue::Boolean(val.to_boolean()))
         }),
     );
-    globals.insert(
-        "String".into(),
-        native(|args| {
-            let val = args.first().unwrap_or(&JsValue::Undefined);
-            Ok(JsValue::String(val.to_js_string()?))
-        }),
-    );
+    globals.insert("String".into(), make_string());
 
     // ── Global constants ────────────────────────────────────────────────
     globals.insert("undefined".into(), JsValue::Undefined);
