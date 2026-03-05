@@ -54,6 +54,9 @@ use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue};
 /// reasonable real-world program.
 const MAX_RECURSION_DEPTH: usize = 256;
 
+/// Recursive-descent JavaScript parser.
+///
+/// Converts a UTF-8 source string into a [`Program`] AST.
 pub struct Parser<'src> {
     scanner: Scanner<'src>,
     /// The lookahead token (already produced by the scanner).

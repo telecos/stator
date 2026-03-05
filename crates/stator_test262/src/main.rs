@@ -583,7 +583,9 @@ fn main() {
     let builder = std::thread::Builder::new()
         .name("test262-main".into())
         .stack_size(64 * 1024 * 1024); // 64 MB
-    let handler = builder.spawn(main_inner).expect("failed to spawn main thread");
+    let handler = builder
+        .spawn(main_inner)
+        .expect("failed to spawn main thread");
     if let Err(e) = handler.join() {
         eprintln!("stator_test262: main thread panicked: {e:?}");
         std::process::exit(2);

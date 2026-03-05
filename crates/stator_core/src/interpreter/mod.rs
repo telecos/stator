@@ -913,9 +913,7 @@ impl Interpreter {
             if frame.instruction_limit > 0 {
                 frame.instructions_executed += 1;
                 if frame.instructions_executed > frame.instruction_limit {
-                    return Err(StatorError::Internal(
-                        "instruction limit exceeded".into(),
-                    ));
+                    return Err(StatorError::Internal("instruction limit exceeded".into()));
                 }
             }
 
