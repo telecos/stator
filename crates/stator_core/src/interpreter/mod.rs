@@ -3838,6 +3838,101 @@ impl Interpreter {
                     frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
                 }
 
+                // ── CallDirectEval ────────────────────────────────────────
+                // Emitted when the callee is the bare identifier `eval`.
+                // At runtime: if the callee is still the built-in eval
+                // function, execute the source sharing the caller's
+                // `global_env` (direct eval); otherwise fall through to a
+                // normal function call.
+                Opcode::CallDirectEval => {
+                    let Operand::Register(callee_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("CallDirectEval", 0));
+                    };
+                    let Operand::Register(args_start_v) = instr.operands[1] else {
+                        return Err(err_bad_operand("CallDirectEval", 1));
+                    };
+                    let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+                        return Err(err_bad_operand("CallDirectEval", 2));
+                    };
+                    let callee = frame.read_reg(callee_v)?.clone();
+                    let args = collect_args(frame, args_start_v, arg_count)?;
+
+                    // Check whether the callee is the original built-in eval
+                    // by comparing the Rc pointer with the one stored in the
+                    // global environment under "eval".
+                    let is_builtin = if let JsValue::NativeFunction(ref callee_fn) = callee {
+                        if let Some(JsValue::NativeFunction(ref global_fn)) =
+                            frame.global_env.borrow().get("eval").cloned()
+                        {
+                            Rc::ptr_eq(callee_fn, global_fn)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if is_builtin {
+                        // Direct eval semantics (ECMAScript §19.2.1.1).
+                        // Non-string arg → return as-is; no arg → undefined.
+                        let source = match args.first() {
+                            Some(JsValue::String(s)) => s.clone(),
+                            Some(other) => {
+                                frame.accumulator = other.clone();
+                                continue;
+                            }
+                            None => {
+                                frame.accumulator = JsValue::Undefined;
+                                continue;
+                            }
+                        };
+                        frame.accumulator = crate::builtins::global::global_eval_direct(
+                            &source,
+                            Rc::clone(&frame.global_env),
+                        )?;
+                    } else {
+                        // Callee was reassigned — fall through to normal call.
+                        match callee {
+                            JsValue::Function(ba) => {
+                                if ba.is_generator() {
+                                    frame.accumulator =
+                                        JsValue::Generator(GeneratorState::new((*ba).clone()));
+                                } else {
+                                    let mut callee_frame = InterpreterFrame::new_with_globals(
+                                        (*ba).clone(),
+                                        args,
+                                        Rc::clone(&frame.global_env),
+                                    );
+                                    push_call_frame("<eval-fallback>");
+                                    let result = Interpreter::run(&mut callee_frame);
+                                    pop_call_frame();
+                                    frame.accumulator = result?;
+                                }
+                            }
+                            JsValue::NativeFunction(f) => {
+                                frame.accumulator = f(args)?;
+                            }
+                            JsValue::PlainObject(ref map) => {
+                                if let Some(JsValue::NativeFunction(f)) =
+                                    map.borrow().get("__call__").cloned()
+                                {
+                                    frame.accumulator = f(args)?;
+                                } else {
+                                    return Err(StatorError::TypeError(
+                                        "CallDirectEval: callee is not a function (got PlainObject)"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                            other => {
+                                return Err(StatorError::TypeError(format!(
+                                    "CallDirectEval: callee is not a function (got {other:?})"
+                                )));
+                            }
+                        }
+                    }
+                }
+
                 // ── Unimplemented ──────────────────────────────────────────
                 other => {
                     return Err(StatorError::Internal(format!(

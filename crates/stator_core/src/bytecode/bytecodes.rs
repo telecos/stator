@@ -442,6 +442,11 @@ pub enum Opcode {
     CallJSRuntime,
     /// Invoke a JS intrinsic. `[function_id, args_start, args_count]`
     InvokeIntrinsic,
+    /// Direct eval call (callee is the bare `eval` identifier).
+    /// At runtime, if the callee is still the built-in eval function the
+    /// code is executed sharing the caller's variable environment; otherwise
+    /// a normal call is performed.  `[callable, args_start, args_count, slot]`
+    CallDirectEval,
 
     // ── Construct ─────────────────────────────────────────────────────────
     /// `new constructor(args…)`. `[constructor, args_start, args_count, slot]`
@@ -769,6 +774,7 @@ impl Opcode {
             Opcode::CallRuntimeForPair => &[RuntimeId, Register, RegisterCount, Register],
             Opcode::CallJSRuntime => &[ConstantPoolIdx, Register, RegisterCount],
             Opcode::InvokeIntrinsic => &[RuntimeId, Register, RegisterCount],
+            Opcode::CallDirectEval => &[Register, Register, RegisterCount, FeedbackSlot],
 
             // Construct
             Opcode::Construct => &[Register, Register, RegisterCount, FeedbackSlot],
