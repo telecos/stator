@@ -171,8 +171,10 @@ use std::rc::Rc;
 use crate::builtins::error::{pop_call_frame, push_call_frame};
 use crate::bytecode::bytecode_array::{
     BytecodeArray, ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD,
-    MaglevJitCodeCache, TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD, TurbofanJitCodeCache,
+    TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD,
 };
+#[cfg(all(target_arch = "x86_64", unix))]
+use crate::bytecode::bytecode_array::{MaglevJitCodeCache, TurbofanJitCodeCache};
 use crate::bytecode::bytecodes::{Opcode, Operand, decode_with_byte_offsets};
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::debugger::Debugger;
