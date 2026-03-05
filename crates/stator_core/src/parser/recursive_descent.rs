@@ -36,7 +36,7 @@ use crate::parser::ast::{
     Param, Pat, Program, ProgramItem, Prop, PropKey, PropValue, RegExpLit, RestElement, ReturnStmt,
     SequenceExpr, SourceLocation, SourceType, SpreadElement, Stmt, StringLit, SwitchCase,
     SwitchStmt, TemplateElement, TemplateLit, ThrowStmt, TryStmt, UnaryExpr, UnaryOp, UpdateExpr,
-    UpdateOp, VarDecl, VarDeclarator, VarKind, WhileStmt, WithStmt,
+    UpdateOp, VarDecl, VarDeclarator, VarKind, WhileStmt, WithStmt, YieldExpr,
 };
 use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue};
 
@@ -432,6 +432,10 @@ impl<'src> Parser<'src> {
     fn parse_for(&mut self) -> StatorResult<Stmt> {
         let start = self.current_span();
         self.bump()?; // 'for'
+
+        // `for await (…)` — async iteration.
+        let is_await = self.eat(TokenKind::Await)?;
+
         self.expect(TokenKind::LeftParen)?;
 
         // ── var / let / const  ───────────────────────────────────────────
@@ -468,7 +472,7 @@ impl<'src> Parser<'src> {
                 return if is_of {
                     Ok(Stmt::ForOf(ForOfStmt {
                         loc: Self::merge_spans(start, end),
-                        is_await: false,
+                        is_await,
                         left,
                         right: Box::new(right),
                         body: Box::new(body),
@@ -523,7 +527,7 @@ impl<'src> Parser<'src> {
             return if is_of {
                 Ok(Stmt::ForOf(ForOfStmt {
                     loc: Self::merge_spans(start, end),
-                    is_await: false,
+                    is_await,
                     left,
                     right: Box::new(right),
                     body: Box::new(body),
@@ -1799,6 +1803,34 @@ impl<'src> Parser<'src> {
             // parser can handle `async` as an identifier or `async function`.
             self.scanner = saved_scanner;
             self.current = saved_current;
+        }
+
+        // ── yield expression ─────────────────────────────────────────────
+        // `yield`, `yield expr`, `yield* expr`
+        if self.peek_kind() == TokenKind::Yield {
+            let yield_tok = self.bump()?; // consume `yield`
+            let delegate = self.eat(TokenKind::Star)?;
+
+            // Yield with no argument when followed by a statement terminator.
+            let argument = if !delegate
+                && (self.peek_kind() == TokenKind::Semicolon
+                    || self.peek_kind() == TokenKind::RightBrace
+                    || self.peek_kind() == TokenKind::RightParen
+                    || self.peek_kind() == TokenKind::RightBracket
+                    || self.peek_kind() == TokenKind::Eof
+                    || self.current.had_line_terminator_before)
+            {
+                None
+            } else {
+                Some(Box::new(self.parse_assignment_expr()?))
+            };
+
+            let end = argument.as_ref().map(|a| a.loc()).unwrap_or(yield_tok.span);
+            return Ok(Expr::Yield(Box::new(YieldExpr {
+                loc: Self::merge_spans(start, end),
+                delegate,
+                argument,
+            })));
         }
 
         // ── Arrow function detection ─────────────────────────────────────
@@ -5742,6 +5774,68 @@ mod tests {
             assert!(matches!(*outer.body, Stmt::With(_)));
         } else {
             panic!("expected nested with");
+        }
+    }
+
+    // ── Async generator parsing ───────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_async_generator_declaration() {
+        let prog = parse("async function* gen() { yield 1; }").unwrap();
+        if let ProgramItem::Stmt(Stmt::FnDecl(f)) = &prog.body[0] {
+            assert!(f.is_async, "should be async");
+            assert!(f.is_generator, "should be generator");
+            assert_eq!(f.id.as_ref().unwrap().name, "gen");
+        } else {
+            panic!("expected async generator FnDecl");
+        }
+    }
+
+    #[test]
+    fn test_parse_async_generator_expression() {
+        let prog = parse("var f = async function*() { yield 1; };").unwrap();
+        if let ProgramItem::Stmt(Stmt::VarDecl(v)) = &prog.body[0] {
+            if let Some(init) = &v.declarators[0].init {
+                if let Expr::Fn(f) = init.as_ref() {
+                    assert!(f.is_async, "should be async");
+                    assert!(f.is_generator, "should be generator");
+                } else {
+                    panic!("expected FnExpr");
+                }
+            } else {
+                panic!("expected init");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_parse_for_await_of() {
+        let prog = parse("async function* f() { for await (const x of arr) { } }").unwrap();
+        if let ProgramItem::Stmt(Stmt::FnDecl(f)) = &prog.body[0] {
+            assert!(f.is_async);
+            assert!(f.is_generator);
+            if let Stmt::ForOf(for_of) = &f.body.body[0] {
+                assert!(for_of.is_await, "for-of should have is_await = true");
+            } else {
+                panic!("expected ForOf statement, got {:?}", f.body.body[0]);
+            }
+        } else {
+            panic!("expected FnDecl");
+        }
+    }
+
+    #[test]
+    fn test_parse_for_of_without_await() {
+        let prog = parse("for (const x of arr) { }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ForOf(for_of)) = &prog.body[0] {
+            assert!(
+                !for_of.is_await,
+                "regular for-of should have is_await = false"
+            );
+        } else {
+            panic!("expected ForOf statement");
         }
     }
 }
