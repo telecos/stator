@@ -1145,7 +1145,12 @@ impl<'a> BaselineCompiler<'a> {
             }
 
             // These prefix/trap opcodes should never appear here.
-            Opcode::Wide | Opcode::ExtraWide | Opcode::Illegal => {
+            Opcode::CreateClass
+            | Opcode::TestPrivateBrand
+            | Opcode::DefinePrivateBrand
+            | Opcode::Wide
+            | Opcode::ExtraWide
+            | Opcode::Illegal => {
                 return Err(StatorError::Internal(format!(
                     "unexpected opcode in compilation: {:?}",
                     instr.opcode
