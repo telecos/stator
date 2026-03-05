@@ -288,6 +288,18 @@ pub enum Opcode {
     StaInArrayLiteral,
     /// Define a keyed own property in a literal. `[obj, key_reg, flags, slot]`
     DefineKeyedOwnPropertyInLiteral,
+    /// Define a getter on an object (accumulator holds the getter function).
+    /// `[obj, name_idx, slot]`
+    DefineGetterProperty,
+    /// Define a setter on an object (accumulator holds the setter function).
+    /// `[obj, name_idx, slot]`
+    DefineSetterProperty,
+    /// Define a getter with a computed key (accumulator holds the getter function).
+    /// `[obj, key_reg, slot]`
+    DefineKeyedGetterProperty,
+    /// Define a setter with a computed key (accumulator holds the setter function).
+    /// `[obj, key_reg, slot]`
+    DefineKeyedSetterProperty,
     /// Collect type-profile information for the accumulator. `[position]`
     CollectTypeProfile,
 
@@ -668,6 +680,10 @@ impl Opcode {
             Opcode::DefineKeyedOwnProperty => &[Register, Register, Flag, FeedbackSlot],
             Opcode::StaInArrayLiteral => &[Register, Register, FeedbackSlot],
             Opcode::DefineKeyedOwnPropertyInLiteral => &[Register, Register, Flag, FeedbackSlot],
+            Opcode::DefineGetterProperty => &[Register, ConstantPoolIdx, FeedbackSlot],
+            Opcode::DefineSetterProperty => &[Register, ConstantPoolIdx, FeedbackSlot],
+            Opcode::DefineKeyedGetterProperty => &[Register, Register, FeedbackSlot],
+            Opcode::DefineKeyedSetterProperty => &[Register, Register, FeedbackSlot],
             Opcode::CollectTypeProfile => &[Immediate],
 
             // Arithmetic
