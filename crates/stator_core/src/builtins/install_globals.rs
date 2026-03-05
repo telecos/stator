@@ -44,6 +44,7 @@ use crate::builtins::math::{
     math_min, math_pow, math_random, math_round, math_sign, math_sin, math_sinh, math_sqrt,
     math_tan, math_tanh, math_trunc,
 };
+use crate::builtins::regexp::regexp_construct;
 use crate::builtins::set::{
     set_add, set_clear, set_delete, set_entries, set_from_iterable, set_has, set_keys, set_new,
     set_size, set_values,
@@ -59,8 +60,9 @@ use crate::builtins::string::{
 };
 use crate::builtins::symbol::{
     SYMBOL_ASYNC_ITERATOR, SYMBOL_HAS_INSTANCE, SYMBOL_IS_CONCAT_SPREADABLE, SYMBOL_ITERATOR,
-    SYMBOL_MATCH, SYMBOL_REPLACE, SYMBOL_SEARCH, SYMBOL_SPECIES, SYMBOL_SPLIT, SYMBOL_TO_PRIMITIVE,
-    SYMBOL_TO_STRING_TAG, SYMBOL_UNSCOPABLES, symbol_create, symbol_for, symbol_key_for,
+    SYMBOL_MATCH, SYMBOL_MATCH_ALL, SYMBOL_REPLACE, SYMBOL_SEARCH, SYMBOL_SPECIES, SYMBOL_SPLIT,
+    SYMBOL_TO_PRIMITIVE, SYMBOL_TO_STRING_TAG, SYMBOL_UNSCOPABLES, symbol_create, symbol_for,
+    symbol_key_for,
 };
 use crate::builtins::weak_map::{
     weak_map_delete, weak_map_get, weak_map_has, weak_map_new, weak_map_set,
@@ -1018,6 +1020,7 @@ fn make_symbol() -> JsValue {
         "asyncIterator".into(),
         JsValue::Symbol(SYMBOL_ASYNC_ITERATOR),
     );
+    props.insert("matchAll".into(), JsValue::Symbol(SYMBOL_MATCH_ALL));
 
     // ── The callable Symbol(desc?) ────────────────────────────────────────
     //
@@ -2132,6 +2135,18 @@ fn make_string() -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
+// ── RegExp ────────────────────────────────────────────────────────────────────
+
+/// Build the `RegExp` constructor.
+fn make_regexp() -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    // Callable: new RegExp(pattern, flags)
+    props.insert("__call__".into(), native(|args| regexp_construct(&args)));
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 // ── install_globals ──────────────────────────────────────────────────────────
 
 /// Pre-populate `globals` with all ECMAScript built-in names.
@@ -2156,6 +2171,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     globals.insert("Set".into(), make_set_builtin());
     globals.insert("WeakMap".into(), make_weak_map_builtin());
     globals.insert("WeakSet".into(), make_weak_set_builtin());
+    globals.insert("RegExp".into(), make_regexp());
 
     // ── Error constructors ────────────────────────────────────────────────
     install_error_constructors(globals);
@@ -2283,6 +2299,7 @@ mod tests {
         assert!(globals.contains_key("Set"));
         assert!(globals.contains_key("WeakMap"));
         assert!(globals.contains_key("WeakSet"));
+        assert!(globals.contains_key("RegExp"));
         assert!(globals.contains_key("globalThis"));
     }
 

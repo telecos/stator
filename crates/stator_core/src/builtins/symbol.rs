@@ -48,6 +48,8 @@ pub const SYMBOL_SPLIT: u64 = 10;
 pub const SYMBOL_UNSCOPABLES: u64 = 11;
 /// `Symbol.asyncIterator` — used by `for await..of`.
 pub const SYMBOL_ASYNC_ITERATOR: u64 = 12;
+/// `Symbol.matchAll` — customises `String.prototype.matchAll`.
+pub const SYMBOL_MATCH_ALL: u64 = 13;
 
 /// First ID available for user-created symbols (everything below is reserved).
 const FIRST_USER_SYMBOL_ID: u64 = 100;
@@ -107,6 +109,8 @@ impl SymbolRegistry {
             .insert(SYMBOL_UNSCOPABLES, Some("Symbol.unscopables".into()));
         reg.descriptions
             .insert(SYMBOL_ASYNC_ITERATOR, Some("Symbol.asyncIterator".into()));
+        reg.descriptions
+            .insert(SYMBOL_MATCH_ALL, Some("Symbol.matchAll".into()));
         reg
     }
 }
