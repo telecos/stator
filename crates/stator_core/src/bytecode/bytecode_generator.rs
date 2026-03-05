@@ -1843,8 +1843,7 @@ impl FunctionCompiler {
             LogicalOp::NullishCoalesce => {
                 // a ?? b: if a is null or undefined, use b; otherwise keep a.
                 let eval_right_label = self.new_label();
-                self.compile_expr(&l.left)?;
-                // Jump to right side if left is null or undefined.
+                // Left already compiled above; acc holds its value.
                 self.emit_jump(Opcode::JumpIfUndefinedOrNull, eval_right_label);
                 // Left is neither null nor undefined: already in acc, jump to end.
                 self.emit_jump(Opcode::Jump, end_label);
@@ -1941,6 +1940,7 @@ impl FunctionCompiler {
                 return Ok(());
             }
             AssignOp::NullishAssign => {
+                // a ??= b  →  if a is null/undefined, a = b
                 self.allocator
                     .release_temporary(rhs_reg)
                     .map_err(|e| StatorError::Internal(e.to_string()))?;
@@ -1948,14 +1948,14 @@ impl FunctionCompiler {
                     .release_temporary(lhs_reg)
                     .map_err(|e| StatorError::Internal(e.to_string()))?;
                 self.compile_assign_target_load(&a.left)?;
+                let do_assign = self.new_label();
                 let skip = self.new_label();
-                self.emit_jump(Opcode::JumpIfNotUndefined, skip);
-                let skip2 = self.new_label();
-                self.emit_jump(Opcode::JumpIfNotNull, skip2);
+                self.emit_jump(Opcode::JumpIfUndefinedOrNull, do_assign);
+                self.emit_jump(Opcode::Jump, skip);
+                self.bind_label(do_assign);
                 self.compile_expr(&a.right)?;
                 self.compile_assign_target_store(&a.left)?;
                 self.bind_label(skip);
-                self.bind_label(skip2);
                 return Ok(());
             }
             AssignOp::Assign => unreachable!("handled above"),
@@ -3587,12 +3587,12 @@ mod tests {
     use super::*;
     use crate::bytecode::bytecodes::{Opcode, decode};
     use crate::parser::ast::{
-        BinaryExpr, BinaryOp, BlockStmt, BoolLit, BreakStmt, CatchClause, ClassBody, ClassDecl,
-        ClassExpr, ClassMember, ContinueStmt, DoWhileStmt, Expr, ExprStmt, FnDecl, FnExpr, ForStmt,
-        Ident, IfStmt, LabeledStmt, MethodDef, MethodKind, NullLit, NumLit, ObjectExpr, ObjectProp,
-        Param, Pat, Program, ProgramItem, Prop, PropKey, PropValue, PropertyDef, ReturnStmt,
-        SourceType, StaticBlock, Stmt, StringLit, ThrowStmt, TryStmt, VarDecl, VarDeclarator,
-        VarKind, WhileStmt,
+        AssignExpr, AssignOp, AssignTarget, BinaryExpr, BinaryOp, BlockStmt, BoolLit, BreakStmt,
+        CatchClause, ClassBody, ClassDecl, ClassExpr, ClassMember, ContinueStmt, DoWhileStmt, Expr,
+        ExprStmt, FnDecl, FnExpr, ForStmt, Ident, IfStmt, LabeledStmt, LogicalExpr, LogicalOp,
+        MethodDef, MethodKind, NullLit, NumLit, ObjectExpr, ObjectProp, Param, Pat, Program,
+        ProgramItem, Prop, PropKey, PropValue, PropertyDef, ReturnStmt, SourceType, StaticBlock,
+        Stmt, StringLit, ThrowStmt, TryStmt, VarDecl, VarDeclarator, VarKind, WhileStmt,
     };
     use crate::parser::scanner::{Position, Span};
 
@@ -5774,5 +5774,131 @@ mod tests {
         } else {
             panic!("constant pool[0] should be a Function");
         }
+    }
+
+    // ── Optional catch binding ────────────────────────────────────────────────
+
+    #[test]
+    fn test_optional_catch_binding() {
+        // try { let x = 1; } catch { }
+        let prog = make_program(vec![Stmt::Try(TryStmt {
+            loc: span(),
+            block: BlockStmt {
+                loc: span(),
+                body: vec![var_decl_stmt(VarKind::Let, "x", Some(num_expr(1.0)))],
+            },
+            handler: Some(CatchClause {
+                loc: span(),
+                param: None,
+                body: BlockStmt {
+                    loc: span(),
+                    body: vec![],
+                },
+            }),
+            finalizer: None,
+        })]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(!instrs.is_empty());
+        let bytes = arr.bytecodes();
+        decode(bytes).expect("optional catch binding bytecode must decode");
+    }
+
+    // ── Nullish coalescing ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_nullish_coalesce_bytecode() {
+        // a ?? b
+        let prog = make_program(vec![Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(Expr::Logical(Box::new(LogicalExpr {
+                loc: span(),
+                op: LogicalOp::NullishCoalesce,
+                left: Box::new(ident_expr("a")),
+                right: Box::new(ident_expr("b")),
+            }))),
+        })]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(!instrs.is_empty());
+        let opcodes: Vec<_> = instrs.iter().map(|i| i.opcode).collect();
+        assert!(
+            opcodes.contains(&Opcode::JumpIfUndefinedOrNull),
+            "expected JumpIfUndefinedOrNull, got {opcodes:?}"
+        );
+    }
+
+    // ── Logical assignment operators ──────────────────────────────────────────
+
+    #[test]
+    fn test_logical_and_assign_bytecode() {
+        // x &&= 1
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "x", Some(bool_expr(true))),
+            Stmt::Expr(ExprStmt {
+                loc: span(),
+                expr: Box::new(Expr::Assign(Box::new(AssignExpr {
+                    loc: span(),
+                    op: AssignOp::LogicalAndAssign,
+                    left: AssignTarget::Expr(Box::new(ident_expr("x"))),
+                    right: Box::new(num_expr(1.0)),
+                }))),
+            }),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        let opcodes: Vec<_> = instrs.iter().map(|i| i.opcode).collect();
+        assert!(
+            opcodes.contains(&Opcode::JumpIfToBooleanFalse),
+            "expected JumpIfToBooleanFalse for &&=, got {opcodes:?}"
+        );
+    }
+
+    #[test]
+    fn test_logical_or_assign_bytecode() {
+        // x ||= 1
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "x", Some(bool_expr(false))),
+            Stmt::Expr(ExprStmt {
+                loc: span(),
+                expr: Box::new(Expr::Assign(Box::new(AssignExpr {
+                    loc: span(),
+                    op: AssignOp::LogicalOrAssign,
+                    left: AssignTarget::Expr(Box::new(ident_expr("x"))),
+                    right: Box::new(num_expr(1.0)),
+                }))),
+            }),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        let opcodes: Vec<_> = instrs.iter().map(|i| i.opcode).collect();
+        assert!(
+            opcodes.contains(&Opcode::JumpIfToBooleanTrue),
+            "expected JumpIfToBooleanTrue for ||=, got {opcodes:?}"
+        );
+    }
+
+    #[test]
+    fn test_nullish_assign_bytecode() {
+        // x ??= 1
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "x", Some(null_expr())),
+            Stmt::Expr(ExprStmt {
+                loc: span(),
+                expr: Box::new(Expr::Assign(Box::new(AssignExpr {
+                    loc: span(),
+                    op: AssignOp::NullishAssign,
+                    left: AssignTarget::Expr(Box::new(ident_expr("x"))),
+                    right: Box::new(num_expr(1.0)),
+                }))),
+            }),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        let opcodes: Vec<_> = instrs.iter().map(|i| i.opcode).collect();
+        assert!(
+            opcodes.contains(&Opcode::JumpIfUndefinedOrNull),
+            "expected JumpIfUndefinedOrNull for ??=, got {opcodes:?}"
+        );
     }
 }
