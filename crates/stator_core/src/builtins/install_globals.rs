@@ -836,6 +836,103 @@ fn make_object() -> JsValue {
         }),
     );
 
+    // ── Object.hasOwn(obj, key) ──────────────────────────────────────────
+    props.insert(
+        "hasOwn".into(),
+        native(|args| {
+            let obj = args.first().unwrap_or(&JsValue::Undefined);
+            let prop = args.get(1).unwrap_or(&JsValue::Undefined);
+            let key = prop.to_js_string()?;
+
+            match obj {
+                JsValue::PlainObject(map) => Ok(JsValue::Boolean(map.borrow().contains_key(&key))),
+                _ => Ok(JsValue::Boolean(false)),
+            }
+        }),
+    );
+
+    // ── Object.getPrototypeOf(obj) ───────────────────────────────────────
+    props.insert(
+        "getPrototypeOf".into(),
+        native(|args| {
+            let obj = args.first().unwrap_or(&JsValue::Undefined);
+            match obj {
+                // PlainObject has no prototype chain — return null.
+                JsValue::PlainObject(_) => Ok(JsValue::Null),
+                // Non-objects: per spec, coerce to object first, but for
+                // primitives the prototype is not observable here.
+                _ => Ok(JsValue::Null),
+            }
+        }),
+    );
+
+    // ── Object.setPrototypeOf(obj, proto) ────────────────────────────────
+    props.insert(
+        "setPrototypeOf".into(),
+        native(|args| {
+            let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
+            // Per spec, return the object itself.
+            Ok(obj)
+        }),
+    );
+
+    // ── Object.preventExtensions(obj) ────────────────────────────────────
+    props.insert(
+        "preventExtensions".into(),
+        native(|args| {
+            let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
+            // Per spec, return the object itself.
+            Ok(obj)
+        }),
+    );
+
+    // ── Object.isExtensible(obj) ─────────────────────────────────────────
+    props.insert(
+        "isExtensible".into(),
+        native(|args| {
+            let obj = args.first().unwrap_or(&JsValue::Undefined);
+            match obj {
+                // Non-objects are not extensible per spec.
+                JsValue::PlainObject(_) => Ok(JsValue::Boolean(true)),
+                _ => Ok(JsValue::Boolean(false)),
+            }
+        }),
+    );
+
+    // ── Object.getOwnPropertyDescriptors(obj) ────────────────────────────
+    props.insert(
+        "getOwnPropertyDescriptors".into(),
+        native(|args| {
+            let obj = args.first().unwrap_or(&JsValue::Undefined);
+            if let JsValue::PlainObject(map) = obj {
+                let mut result: HashMap<String, JsValue> = HashMap::new();
+                for (key, value) in map.borrow().iter() {
+                    let mut desc: HashMap<String, JsValue> = HashMap::new();
+                    desc.insert("value".into(), value.clone());
+                    desc.insert("writable".into(), JsValue::Boolean(true));
+                    desc.insert("enumerable".into(), JsValue::Boolean(true));
+                    desc.insert("configurable".into(), JsValue::Boolean(true));
+                    result.insert(
+                        key.clone(),
+                        JsValue::PlainObject(Rc::new(RefCell::new(desc))),
+                    );
+                }
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
+            } else {
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new()))))
+            }
+        }),
+    );
+
+    // ── Object.getOwnPropertySymbols(obj) ────────────────────────────────
+    props.insert(
+        "getOwnPropertySymbols".into(),
+        native(|_args| {
+            // PlainObject has no symbol-keyed properties.
+            Ok(JsValue::Array(Rc::new(vec![])))
+        }),
+    );
+
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -2893,9 +2990,114 @@ mod tests {
             assert!(map.contains_key("keys"));
             assert!(map.contains_key("values"));
             assert!(map.contains_key("entries"));
+            assert!(map.contains_key("hasOwn"));
+            assert!(map.contains_key("getPrototypeOf"));
+            assert!(map.contains_key("setPrototypeOf"));
+            assert!(map.contains_key("preventExtensions"));
+            assert!(map.contains_key("isExtensible"));
+            assert!(map.contains_key("getOwnPropertyDescriptors"));
+            assert!(map.contains_key("getOwnPropertySymbols"));
         } else {
             panic!("Object should be a PlainObject");
         }
+    }
+
+    // ── Object.hasOwn e2e tests ─────────────────────────────────────────
+
+    /// `Object.hasOwn` returns true for own properties.
+    #[test]
+    fn e2e_object_has_own_true() {
+        let result = global_eval(
+            r#"
+            var obj = { x: 1 };
+            Object.hasOwn(obj, "x")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.hasOwn` returns false for missing properties.
+    #[test]
+    fn e2e_object_has_own_false() {
+        let result = global_eval(
+            r#"
+            var obj = { x: 1 };
+            Object.hasOwn(obj, "y")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Object.getPrototypeOf` returns null for plain objects.
+    #[test]
+    fn e2e_object_get_prototype_of_null() {
+        let result = global_eval("Object.getPrototypeOf({}) === null").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.setPrototypeOf` returns the object.
+    #[test]
+    fn e2e_object_set_prototype_of_returns_obj() {
+        let result = global_eval(
+            r#"
+            var obj = { a: 5 };
+            var ret = Object.setPrototypeOf(obj, null);
+            ret.a
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// `Object.preventExtensions` returns the object.
+    #[test]
+    fn e2e_object_prevent_extensions_returns_obj() {
+        let result = global_eval(
+            r#"
+            var obj = { x: 42 };
+            var ret = Object.preventExtensions(obj);
+            ret.x
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `Object.isExtensible` returns true for plain objects.
+    #[test]
+    fn e2e_object_is_extensible_plain() {
+        let result = global_eval("Object.isExtensible({})").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.isExtensible` returns false for primitives.
+    #[test]
+    fn e2e_object_is_extensible_primitive() {
+        let result = global_eval("Object.isExtensible(42)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Object.getOwnPropertyDescriptors` returns descriptors for all props.
+    #[test]
+    fn e2e_object_get_own_property_descriptors() {
+        let result = global_eval(
+            r#"
+            var obj = { a: 1 };
+            var descs = Object.getOwnPropertyDescriptors(obj);
+            descs.a.value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `Object.getOwnPropertySymbols` returns an array.
+    #[test]
+    fn e2e_object_get_own_property_symbols() {
+        let result = global_eval("Array.isArray(Object.getOwnPropertySymbols({}))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 
     // ── Iterator tests ──────────────────────────────────────────────────────

@@ -335,6 +335,62 @@ pub fn object_from_entries(
     Ok(obj)
 }
 
+// ── Object.hasOwn ────────────────────────────────────────────────────────────
+
+/// ECMAScript §20.1.2.13 `Object.hasOwn(obj, key)`.
+///
+/// Returns `true` if `obj` has an own property named `key`, regardless of
+/// its enumerability or other attributes.  This is the static-method
+/// replacement for `Object.prototype.hasOwnProperty`.
+pub fn object_has_own(obj: &JsObject, key: &str) -> bool {
+    obj.has_own_property(key)
+}
+
+// ── Object.preventExtensions ─────────────────────────────────────────────────
+
+/// ECMAScript §20.1.2.18 `Object.preventExtensions(obj)`.
+///
+/// Marks `obj` as non-extensible so that no new own properties may be added.
+/// Existing properties are unaffected.
+pub fn object_prevent_extensions(obj: &mut JsObject) {
+    obj.prevent_extensions();
+}
+
+// ── Object.isExtensible ──────────────────────────────────────────────────────
+
+/// ECMAScript §20.1.2.14 `Object.isExtensible(obj)`.
+///
+/// Returns `true` if new properties may be added to `obj`.
+pub fn object_is_extensible(obj: &JsObject) -> bool {
+    obj.is_extensible()
+}
+
+// ── Object.getOwnPropertyDescriptors ─────────────────────────────────────────
+
+/// ECMAScript §20.1.2.10 `Object.getOwnPropertyDescriptors(obj)`.
+///
+/// Returns a `Vec` of `(key, value, attributes)` tuples for every own
+/// property of `obj`, regardless of enumerability.
+pub fn object_get_own_property_descriptors(
+    obj: &JsObject,
+) -> Vec<(String, JsValue, PropertyAttributes)> {
+    obj.own_property_keys()
+        .into_iter()
+        .filter_map(|k| obj.get_own_property_descriptor(&k).map(|(v, a)| (k, v, a)))
+        .collect()
+}
+
+// ── Object.getOwnPropertySymbols ─────────────────────────────────────────────
+
+/// ECMAScript §20.1.2.11 `Object.getOwnPropertySymbols(obj)`.
+///
+/// Returns an array of all own symbol-keyed properties of `obj`.
+/// Currently returns an empty `Vec` since `JsObject` does not track
+/// symbol-keyed properties.
+pub fn object_get_own_property_symbols(_obj: &JsObject) -> Vec<JsValue> {
+    Vec::new()
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -802,5 +858,73 @@ mod tests {
     fn test_get_own_property_names_empty() {
         let obj = JsObject::new();
         assert!(object_get_own_property_names(&obj).is_empty());
+    }
+
+    // ── object_has_own ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_has_own_existing_property() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        assert!(object_has_own(&obj, "x"));
+    }
+
+    #[test]
+    fn test_has_own_missing_property() {
+        let obj = JsObject::new();
+        assert!(!object_has_own(&obj, "x"));
+    }
+
+    #[test]
+    fn test_has_own_does_not_check_prototype() {
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        proto
+            .borrow_mut()
+            .set_property("inherited", JsValue::Smi(1))
+            .unwrap();
+        let child = object_create(Some(proto));
+        assert!(!object_has_own(&child, "inherited"));
+    }
+
+    // ── object_prevent_extensions / is_extensible ───────────────────────
+
+    #[test]
+    fn test_is_extensible_default_true() {
+        let obj = JsObject::new();
+        assert!(object_is_extensible(&obj));
+    }
+
+    #[test]
+    fn test_prevent_extensions_makes_non_extensible() {
+        let mut obj = JsObject::new();
+        object_prevent_extensions(&mut obj);
+        assert!(!object_is_extensible(&obj));
+    }
+
+    // ── object_get_own_property_descriptors ──────────────────────────────
+
+    #[test]
+    fn test_get_own_property_descriptors_basic() {
+        let mut obj = JsObject::new();
+        obj.set_property("a", JsValue::Smi(1)).unwrap();
+        obj.set_property("b", JsValue::Smi(2)).unwrap();
+
+        let descs = object_get_own_property_descriptors(&obj);
+        assert_eq!(descs.len(), 2);
+    }
+
+    #[test]
+    fn test_get_own_property_descriptors_empty() {
+        let obj = JsObject::new();
+        assert!(object_get_own_property_descriptors(&obj).is_empty());
+    }
+
+    // ── object_get_own_property_symbols ──────────────────────────────────
+
+    #[test]
+    fn test_get_own_property_symbols_returns_empty() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        assert!(object_get_own_property_symbols(&obj).is_empty());
     }
 }
