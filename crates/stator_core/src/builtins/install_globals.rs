@@ -28,7 +28,7 @@ use crate::builtins::finalization_registry::{
 };
 use crate::builtins::global::{
     GLOBAL_INFINITY, GLOBAL_NAN, global_decode_uri, global_decode_uri_component, global_encode_uri,
-    global_encode_uri_component, global_escape, global_is_finite, global_is_nan,
+    global_encode_uri_component, global_escape, global_eval, global_is_finite, global_is_nan,
     global_parse_float, global_parse_int, global_unescape,
 };
 use crate::builtins::iterator::{
@@ -3811,6 +3811,18 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             Ok(JsValue::String(global_decode_uri_component(&s)?))
         }),
     );
+    globals.insert(
+        "eval".into(),
+        native(|args| {
+            // Indirect eval: non-string arguments are returned as-is (§19.2.1 step 2).
+            let source = match args.first() {
+                Some(JsValue::String(s)) => s.clone(),
+                Some(other) => return Ok(other.clone()),
+                None => return Ok(JsValue::Undefined),
+            };
+            global_eval(&source)
+        }),
+    );
 
     // ── Annex B global functions ─────────────────────────────────────────
     globals.insert(
@@ -5225,5 +5237,67 @@ mod tests {
                 panic!("withResolvers should be a NativeFunction");
             }
         }
+    }
+
+    // ── eval: direct vs indirect (end-to-end) ───────────────────────────────
+
+    /// Direct eval `eval("1+2")` is recognised by the bytecode generator
+    /// and executed sharing the caller's global environment.
+    #[test]
+    fn e2e_eval_direct_expression() {
+        let result = global_eval("eval(42)").unwrap();
+        // Non-string argument returns the value directly.
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_eval_direct_string() {
+        let result = global_eval("eval('1 + 2')").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_eval_direct_var_hoisting() {
+        // Direct eval: `var x` should be visible after eval.
+        let result = global_eval("eval('var x = 10'); x").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_eval_indirect_expression() {
+        // Indirect eval via comma operator: `(0, eval)("1+2")`.
+        let result = global_eval("(0, eval)('1 + 2')").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_eval_indirect_no_caller_scope() {
+        // Indirect eval runs in global scope: variables defined in the
+        // outer scope should NOT be accessible.  Unknown names resolve to
+        // `undefined` (not an error) because LdaGlobal returns undefined
+        // for unbound names.
+        let result = global_eval("var a = 5; (0, eval)('a')").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_eval_with_closures() {
+        // Direct eval at the top level can declare variables via var
+        // hoisting that persist in the same top-level scope.
+        let result = global_eval("eval('var x = 10'); eval('x + 5')").unwrap();
+        assert_eq!(result, JsValue::Smi(15));
+    }
+
+    #[test]
+    fn e2e_eval_no_args_returns_undefined() {
+        let result = global_eval("eval()").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// `eval` is accessible as a global identifier.
+    #[test]
+    fn e2e_eval_is_global() {
+        let result = global_eval("typeof eval").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
     }
 }

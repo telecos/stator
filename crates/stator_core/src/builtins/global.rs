@@ -33,6 +33,10 @@
 //! * ECMAScript 2025 Language Specification §19 — *The Global Object*
 //! * ECMAScript 2025 Language Specification §19.2 — *Function Properties of the Global Object*
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use crate::builtins::number::{number_parse_float, number_parse_int};
 use crate::error::{StatorError, StatorResult};
 use crate::objects::value::JsValue;
@@ -341,6 +345,21 @@ pub fn global_unescape(s: &str) -> String {
 
 // ── eval ──────────────────────────────────────────────────────────────────────
 
+/// Distinguishes direct from indirect `eval` calls per ECMAScript §19.2.1.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalMode {
+    /// Direct eval — `eval("code")`.
+    ///
+    /// The evaluated code shares the caller's variable environment so that
+    /// `var` declarations inside `eval` are visible in the enclosing scope.
+    Direct,
+    /// Indirect eval — `(0, eval)("code")` or `var e = eval; e("code")`.
+    ///
+    /// The evaluated code runs in a fresh global environment, completely
+    /// isolated from the call-site scope.
+    Indirect,
+}
+
 /// ECMAScript §19.2.1 global `eval(x)`.
 ///
 /// Parses `source` as a JavaScript program, compiles it to bytecode, and
@@ -366,15 +385,124 @@ pub fn global_unescape(s: &str) -> String {
 /// assert_eq!(result, JsValue::Boolean(true));
 /// ```
 pub fn global_eval(source: &str) -> StatorResult<JsValue> {
+    global_eval_indirect(source)
+}
+
+/// Direct eval — ECMAScript §19.2.1.1 *PerformEval* with `direct = true`.
+///
+/// The evaluated code shares the caller's `global_env` so that `var`
+/// declarations in the eval'd source are hoisted into the enclosing scope.
+///
+/// # Examples
+///
+/// ```
+/// use std::cell::RefCell;
+/// use std::collections::HashMap;
+/// use std::rc::Rc;
+/// use stator_core::builtins::global::global_eval_direct;
+/// use stator_core::objects::value::JsValue;
+///
+/// let env = Rc::new(RefCell::new(HashMap::new()));
+/// let result = global_eval_direct("1 + 2", Rc::clone(&env)).unwrap();
+/// assert_eq!(result, JsValue::Smi(3));
+/// ```
+pub fn global_eval_direct(
+    source: &str,
+    caller_env: Rc<RefCell<HashMap<String, JsValue>>>,
+) -> StatorResult<JsValue> {
+    eval_core(source, EvalMode::Direct, Some(caller_env))
+}
+
+/// Indirect eval — ECMAScript §19.2.1.1 *PerformEval* with `direct = false`.
+///
+/// The evaluated code runs in a fresh global environment, isolated from the
+/// call-site scope.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::global::global_eval_indirect;
+/// use stator_core::objects::value::JsValue;
+///
+/// let result = global_eval_indirect("1 + 2").unwrap();
+/// assert_eq!(result, JsValue::Smi(3));
+/// ```
+pub fn global_eval_indirect(source: &str) -> StatorResult<JsValue> {
+    eval_core(source, EvalMode::Indirect, None)
+}
+
+/// Strict-mode eval — the evaluated code receives its own variable
+/// environment; `var` declarations do not leak into the enclosing scope.
+///
+/// # Examples
+///
+/// ```
+/// use std::cell::RefCell;
+/// use std::collections::HashMap;
+/// use std::rc::Rc;
+/// use stator_core::builtins::global::global_eval_strict;
+/// use stator_core::objects::value::JsValue;
+///
+/// let env = Rc::new(RefCell::new(HashMap::new()));
+/// let result = global_eval_strict("var x = 42; x", Rc::clone(&env)).unwrap();
+/// assert_eq!(result, JsValue::Smi(42));
+/// // x is NOT visible in the caller's environment.
+/// assert!(!env.borrow().contains_key("x"));
+/// ```
+pub fn global_eval_strict(
+    source: &str,
+    caller_env: Rc<RefCell<HashMap<String, JsValue>>>,
+) -> StatorResult<JsValue> {
     use crate::bytecode::bytecode_generator::BytecodeGenerator;
     use crate::interpreter::{Interpreter, InterpreterFrame};
-    use crate::parser::ast::{ProgramItem, ReturnStmt, Stmt};
     use crate::parser::parse;
 
     let mut program = parse(source)?;
+    rewrite_last_expr_to_return(&mut program);
 
-    // ECMAScript completion value: if the last item is an expression statement,
-    // convert it to a `return` so the interpreter propagates the value.
+    let bytecode = BytecodeGenerator::compile_program(&program)?;
+
+    // Strict eval: create a child environment that reads from the caller's
+    // scope but writes new bindings to its own map, preventing leakage.
+    let child_env = caller_env.borrow().clone();
+    let child_rc = Rc::new(RefCell::new(child_env));
+    let mut frame = InterpreterFrame::new_with_globals(bytecode, vec![], child_rc);
+    Interpreter::run(&mut frame)
+}
+
+/// Shared implementation of *PerformEval* (ECMAScript §19.2.1.1).
+fn eval_core(
+    source: &str,
+    mode: EvalMode,
+    caller_env: Option<Rc<RefCell<HashMap<String, JsValue>>>>,
+) -> StatorResult<JsValue> {
+    use crate::bytecode::bytecode_generator::BytecodeGenerator;
+    use crate::interpreter::{Interpreter, InterpreterFrame};
+    use crate::parser::parse;
+
+    let mut program = parse(source)?;
+    rewrite_last_expr_to_return(&mut program);
+
+    let mut frame = match mode {
+        EvalMode::Direct => {
+            // Direct eval: var declarations emit StaGlobal so they are
+            // hoisted into the caller's variable environment.
+            let bytecode = BytecodeGenerator::compile_eval_program(&program)?;
+            let env = caller_env.expect("direct eval requires a caller environment");
+            InterpreterFrame::new_with_globals(bytecode, vec![], env)
+        }
+        EvalMode::Indirect => {
+            let bytecode = BytecodeGenerator::compile_program(&program)?;
+            InterpreterFrame::new(bytecode, vec![])
+        }
+    };
+    Interpreter::run(&mut frame)
+}
+
+/// If the last program item is an expression statement, rewrite it to a
+/// `return` so the interpreter propagates the completion value.
+fn rewrite_last_expr_to_return(program: &mut crate::parser::ast::Program) {
+    use crate::parser::ast::{ProgramItem, ReturnStmt, Stmt};
     if let Some(ProgramItem::Stmt(Stmt::Expr(expr_stmt))) = program.body.last_mut() {
         let return_stmt = ReturnStmt {
             loc: expr_stmt.loc,
@@ -382,10 +510,6 @@ pub fn global_eval(source: &str) -> StatorResult<JsValue> {
         };
         *program.body.last_mut().unwrap() = ProgramItem::Stmt(Stmt::Return(return_stmt));
     }
-
-    let bytecode = BytecodeGenerator::compile_program(&program)?;
-    let mut frame = InterpreterFrame::new(bytecode, vec![]);
-    Interpreter::run(&mut frame)
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -859,6 +983,69 @@ mod tests {
         // An empty program should return undefined.
         let result = global_eval("").unwrap();
         assert_eq!(result, JsValue::Undefined);
+    }
+
+    // ── direct eval ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_eval_direct_shares_caller_env() {
+        // Direct eval shares the caller's global_env: a `var` declaration
+        // inside eval should be visible in the caller's environment.
+        let env = Rc::new(RefCell::new(HashMap::new()));
+        crate::builtins::install_globals::install_globals(&mut env.borrow_mut());
+        let result = global_eval_direct("var x = 99; x", Rc::clone(&env)).unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+        // `x` should now exist in the caller's environment.
+        assert!(env.borrow().contains_key("x"));
+    }
+
+    #[test]
+    fn test_eval_direct_reads_caller_vars() {
+        // Direct eval can read variables from the caller's environment.
+        let env = Rc::new(RefCell::new(HashMap::new()));
+        crate::builtins::install_globals::install_globals(&mut env.borrow_mut());
+        env.borrow_mut().insert("y".into(), JsValue::Smi(7));
+        let result = global_eval_direct("y + 3", Rc::clone(&env)).unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    // ── indirect eval ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_eval_indirect_fresh_scope() {
+        // Indirect eval creates a fresh environment: `var` declarations
+        // should NOT be visible in the outer scope.
+        let result = global_eval_indirect("var z = 42; z").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_eval_indirect_arithmetic() {
+        let result = global_eval_indirect("2 + 3").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    // ── strict eval ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_eval_strict_isolates_vars() {
+        // Strict eval creates a child environment: `var` declarations inside
+        // eval should NOT leak into the caller's scope.
+        let env = Rc::new(RefCell::new(HashMap::new()));
+        crate::builtins::install_globals::install_globals(&mut env.borrow_mut());
+        let result = global_eval_strict("var secret = 100; secret", Rc::clone(&env)).unwrap();
+        assert_eq!(result, JsValue::Smi(100));
+        // `secret` must not exist in the caller's environment.
+        assert!(!env.borrow().contains_key("secret"));
+    }
+
+    // ── EvalMode enum ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_eval_mode_debug_repr() {
+        // Ensure EvalMode derives Debug and Eq correctly.
+        assert_eq!(EvalMode::Direct, EvalMode::Direct);
+        assert_ne!(EvalMode::Direct, EvalMode::Indirect);
     }
 
     // ── global_escape (Annex B) ─────────────────────────────────────────────

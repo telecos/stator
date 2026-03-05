@@ -1050,6 +1050,7 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::CallRuntimeForPair
             | Opcode::CallJSRuntime
             | Opcode::InvokeIntrinsic
+            | Opcode::CallDirectEval
             | Opcode::Construct
             | Opcode::ConstructWithSpread
             | Opcode::ConstructForwardAllArgs

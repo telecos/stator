@@ -196,6 +196,10 @@ struct FunctionCompiler {
     /// nested function).  Top-level function declarations are also stored
     /// as globals via `StaGlobal` so that recursive calls can find them.
     is_program: bool,
+    /// `true` when compiling code for a direct `eval()` call.  In this mode
+    /// `var` declarations emit [`Opcode::StaGlobal`] so that new bindings
+    /// are hoisted into the caller's variable environment.
+    is_eval_scope: bool,
 }
 
 impl FunctionCompiler {
@@ -223,6 +227,7 @@ impl FunctionCompiler {
             is_async: false,
             yield_suspend_id: 0,
             is_program: false,
+            is_eval_scope: false,
         };
         for (i, param) in params.iter().enumerate() {
             match &param.pat {
@@ -501,15 +506,26 @@ impl FunctionCompiler {
     fn compile_var_declarator(&mut self, declarator: &VarDeclarator) -> StatorResult<()> {
         match &declarator.id {
             Pat::Ident(ident) => {
-                // Allocate the local register first.
-                let reg = self.define_local(&ident.name);
-                // Compile the initializer if present; otherwise load undefined.
-                if let Some(init) = &declarator.init {
-                    self.compile_expr(init)?;
+                if self.is_eval_scope {
+                    // Eval scope: var declarations are hoisted into the
+                    // caller's global environment via StaGlobal so they
+                    // survive after the eval frame completes.
+                    if let Some(init) = &declarator.init {
+                        self.compile_expr(init)?;
+                    } else {
+                        self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                    }
+                    self.compile_ident_store(&ident.name);
                 } else {
-                    self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                    // Normal scope: allocate the local register.
+                    let reg = self.define_local(&ident.name);
+                    if let Some(init) = &declarator.init {
+                        self.compile_expr(init)?;
+                    } else {
+                        self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                    }
+                    self.emit_star(reg);
                 }
-                self.emit_star(reg);
                 Ok(())
             }
             _ => Err(StatorError::Internal(
@@ -960,6 +976,7 @@ impl FunctionCompiler {
             yield_suspend_id: 0,
             is_program: false,
             is_async: false,
+            is_eval_scope: false,
         };
 
         let this_reg = Register::parameter(0);
@@ -2161,6 +2178,10 @@ impl FunctionCompiler {
             return self.compile_method_call(m, &c.arguments);
         }
 
+        // Detect direct eval: `eval(args)` where the callee is the bare
+        // identifier `eval` (ECMAScript §19.2.1.1 step 1).
+        let is_direct_eval = matches!(c.callee.as_ref(), Expr::Ident(id) if id.name == "eval");
+
         // General call with undefined receiver.
         self.compile_expr(&c.callee)?;
         let callee_reg = self.allocator.allocate_temporary();
@@ -2168,7 +2189,11 @@ impl FunctionCompiler {
 
         let arg_regs = self.compile_arguments(&c.arguments)?;
 
-        self.emit_call_any_receiver(callee_reg, &arg_regs)?;
+        if is_direct_eval {
+            self.emit_call_direct_eval(callee_reg, &arg_regs)?;
+        } else {
+            self.emit_call_any_receiver(callee_reg, &arg_regs)?;
+        }
 
         // Release args in reverse order.
         for r in arg_regs.into_iter().rev() {
@@ -2315,6 +2340,28 @@ impl FunctionCompiler {
         let slot = self.alloc_slot(FeedbackSlotKind::Call);
         self.emit(Instruction::new_unchecked(
             Opcode::CallAnyReceiver,
+            vec![
+                to_reg_op(callee_reg),
+                to_reg_op(args_start),
+                Operand::RegisterCount(arg_count),
+                slot,
+            ],
+        ));
+        Ok(())
+    }
+
+    /// Emit a `CallDirectEval` instruction (same operand layout as
+    /// [`Self::emit_call_any_receiver`] but signals direct-eval semantics).
+    fn emit_call_direct_eval(
+        &mut self,
+        callee_reg: Register,
+        arg_regs: &[Register],
+    ) -> StatorResult<()> {
+        let arg_count = arg_regs.len() as u32;
+        let args_start = arg_regs.first().copied().unwrap_or(callee_reg);
+        let slot = self.alloc_slot(FeedbackSlotKind::Call);
+        self.emit(Instruction::new_unchecked(
+            Opcode::CallDirectEval,
             vec![
                 to_reg_op(callee_reg),
                 to_reg_op(args_start),
@@ -3566,6 +3613,36 @@ impl BytecodeGenerator {
         for item in &program.body {
             match item {
                 ProgramItem::Stmt(Stmt::FnDecl(_)) => {} // already hoisted
+                ProgramItem::Stmt(stmt) => compiler.compile_stmt(stmt)?,
+                ProgramItem::ModuleDecl(_) => {
+                    return Err(StatorError::Internal(
+                        "module declarations are not yet supported".into(),
+                    ));
+                }
+            }
+        }
+        compiler.finalize()
+    }
+
+    /// Compile a program for direct `eval()` execution.
+    ///
+    /// Like [`Self::compile_program`] but `var` declarations emit
+    /// [`Opcode::StaGlobal`] so they are hoisted into the caller's
+    /// variable environment.
+    pub fn compile_eval_program(program: &Program) -> StatorResult<BytecodeArray> {
+        let mut compiler = FunctionCompiler::new(&[])?;
+        compiler.is_program = true;
+        compiler.is_eval_scope = true;
+
+        for item in &program.body {
+            if let ProgramItem::Stmt(Stmt::FnDecl(decl)) = item {
+                compiler.compile_fn_decl(decl)?;
+            }
+        }
+
+        for item in &program.body {
+            match item {
+                ProgramItem::Stmt(Stmt::FnDecl(_)) => {}
                 ProgramItem::Stmt(stmt) => compiler.compile_stmt(stmt)?,
                 ProgramItem::ModuleDecl(_) => {
                     return Err(StatorError::Internal(
