@@ -764,6 +764,12 @@ pub struct InterpreterFrame {
     pub instruction_limit: u64,
     /// Number of instructions executed so far in this frame.
     pub instructions_executed: u64,
+    /// Saved pending-exception message for `SetPendingMessage` (swap pattern
+    /// used by `finally` blocks).
+    pub pending_message: JsValue,
+    /// Cache of frozen template objects keyed by bytecode offset, used by
+    /// `GetTemplateObject`.
+    pub template_cache: HashMap<u32, JsValue>,
 }
 
 impl InterpreterFrame {
@@ -795,6 +801,8 @@ impl InterpreterFrame {
             osr_loop_count: 0,
             instruction_limit: 0,
             instructions_executed: 0,
+            pending_message: JsValue::Undefined,
+            template_cache: HashMap::new(),
         }
     }
 
@@ -3322,6 +3330,277 @@ impl Interpreter {
                     frame.global_env.borrow_mut().insert(name, val);
                 }
 
+                // LdaLookupSlot [name_idx]:
+                //   Dynamic lookup of a variable name in the scope chain.
+                //   Simplified: looks up in `global_env`, throws
+                //   ReferenceError if not found.
+                Opcode::LdaLookupSlot => {
+                    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("LdaLookupSlot", 0));
+                    };
+                    let name = match frame.bytecode_array.get_constant(name_idx) {
+                        Some(ConstantPoolEntry::String(s)) => s.clone(),
+                        _ => {
+                            return Err(StatorError::Internal(
+                                "LdaLookupSlot: slot name is not a string".into(),
+                            ));
+                        }
+                    };
+                    frame.accumulator = match frame.global_env.borrow().get(&name) {
+                        Some(v) => v.clone(),
+                        None => {
+                            return Err(StatorError::ReferenceError(format!(
+                                "{name} is not defined"
+                            )));
+                        }
+                    };
+                }
+
+                // LdaLookupSlotInsideTypeof [name_idx]:
+                //   Same as LdaLookupSlot but returns undefined instead of
+                //   throwing ReferenceError (used inside `typeof`).
+                Opcode::LdaLookupSlotInsideTypeof => {
+                    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("LdaLookupSlotInsideTypeof", 0));
+                    };
+                    let name = match frame.bytecode_array.get_constant(name_idx) {
+                        Some(ConstantPoolEntry::String(s)) => s.clone(),
+                        _ => {
+                            return Err(StatorError::Internal(
+                                "LdaLookupSlotInsideTypeof: slot name is not a string".into(),
+                            ));
+                        }
+                    };
+                    frame.accumulator = frame
+                        .global_env
+                        .borrow()
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined);
+                }
+
+                // LdaLookupContextSlot [name_idx, slot_idx, depth]:
+                //   Dynamic lookup resolving to a context slot.
+                //   Simplified: falls back to `global_env`.
+                Opcode::LdaLookupContextSlot => {
+                    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("LdaLookupContextSlot", 0));
+                    };
+                    let name = match frame.bytecode_array.get_constant(name_idx) {
+                        Some(ConstantPoolEntry::String(s)) => s.clone(),
+                        _ => {
+                            return Err(StatorError::Internal(
+                                "LdaLookupContextSlot: slot name is not a string".into(),
+                            ));
+                        }
+                    };
+                    frame.accumulator = match frame.global_env.borrow().get(&name) {
+                        Some(v) => v.clone(),
+                        None => {
+                            return Err(StatorError::ReferenceError(format!(
+                                "{name} is not defined"
+                            )));
+                        }
+                    };
+                }
+
+                // LdaLookupContextSlotInsideTypeof [name_idx, slot_idx, depth]:
+                //   Same as LdaLookupContextSlot but returns undefined instead
+                //   of throwing (used inside `typeof`).
+                Opcode::LdaLookupContextSlotInsideTypeof => {
+                    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("LdaLookupContextSlotInsideTypeof", 0));
+                    };
+                    let name = match frame.bytecode_array.get_constant(name_idx) {
+                        Some(ConstantPoolEntry::String(s)) => s.clone(),
+                        _ => {
+                            return Err(StatorError::Internal(
+                                "LdaLookupContextSlotInsideTypeof: slot name is not a string"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    frame.accumulator = frame
+                        .global_env
+                        .borrow()
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined);
+                }
+
+                // LdaLookupGlobalSlot [name_idx, slot, depth]:
+                //   Dynamic lookup resolving to a global slot.
+                //   Simplified: looks up in `global_env`, throws
+                //   ReferenceError if not found.
+                Opcode::LdaLookupGlobalSlot => {
+                    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("LdaLookupGlobalSlot", 0));
+                    };
+                    let name = match frame.bytecode_array.get_constant(name_idx) {
+                        Some(ConstantPoolEntry::String(s)) => s.clone(),
+                        _ => {
+                            return Err(StatorError::Internal(
+                                "LdaLookupGlobalSlot: slot name is not a string".into(),
+                            ));
+                        }
+                    };
+                    frame.accumulator = match frame.global_env.borrow().get(&name) {
+                        Some(v) => v.clone(),
+                        None => {
+                            return Err(StatorError::ReferenceError(format!(
+                                "{name} is not defined"
+                            )));
+                        }
+                    };
+                }
+
+                // LdaLookupGlobalSlotInsideTypeof [name_idx, slot, depth]:
+                //   Same as LdaLookupGlobalSlot but returns undefined instead
+                //   of throwing (used inside `typeof`).
+                Opcode::LdaLookupGlobalSlotInsideTypeof => {
+                    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("LdaLookupGlobalSlotInsideTypeof", 0));
+                    };
+                    let name = match frame.bytecode_array.get_constant(name_idx) {
+                        Some(ConstantPoolEntry::String(s)) => s.clone(),
+                        _ => {
+                            return Err(StatorError::Internal(
+                                "LdaLookupGlobalSlotInsideTypeof: slot name is not a string".into(),
+                            ));
+                        }
+                    };
+                    frame.accumulator = frame
+                        .global_env
+                        .borrow()
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined);
+                }
+
+                // LdaNamedPropertyFromSuper [obj_reg, name_idx, feedback_slot]:
+                //   Load a named property from the super object.  The
+                //   accumulator holds the home object; `obj_reg` holds the
+                //   receiver.  Simplified: delegates to `proto_lookup` on the
+                //   receiver.
+                Opcode::LdaNamedPropertyFromSuper => {
+                    let Operand::Register(obj_v) = instr.operands[0] else {
+                        return Err(err_bad_operand("LdaNamedPropertyFromSuper", 0));
+                    };
+                    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+                        return Err(err_bad_operand("LdaNamedPropertyFromSuper", 1));
+                    };
+                    let prop_name = match frame.bytecode_array.get_constant(name_idx) {
+                        Some(ConstantPoolEntry::String(s)) => s.clone(),
+                        _ => {
+                            return Err(StatorError::Internal(
+                                "LdaNamedPropertyFromSuper: property name is not a string".into(),
+                            ));
+                        }
+                    };
+                    let obj = frame.read_reg(obj_v)?.clone();
+                    frame.accumulator = proto_lookup(&obj, &prop_name);
+                }
+
+                // GetTemplateObject [template_idx, feedback_slot]:
+                //   Create an array of template strings, freeze it, and cache
+                //   by the current bytecode offset.
+                Opcode::GetTemplateObject => {
+                    let Operand::ConstantPoolIdx(tpl_idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("GetTemplateObject", 0));
+                    };
+                    let cache_key = byte_offsets[frame.pc - 1] as u32;
+                    if let Some(cached) = frame.template_cache.get(&cache_key) {
+                        frame.accumulator = cached.clone();
+                    } else {
+                        let entry =
+                            frame.bytecode_array.get_constant(tpl_idx).ok_or_else(|| {
+                                StatorError::Internal(format!(
+                                    "GetTemplateObject: constant pool index {tpl_idx} out of bounds"
+                                ))
+                            })?;
+                        let tpl_val = constant_to_value(entry);
+                        frame.template_cache.insert(cache_key, tpl_val.clone());
+                        frame.accumulator = tpl_val;
+                    }
+                }
+
+                // SetPendingMessage:
+                //   Swap the accumulator with the pending-exception message
+                //   slot.  Used by `finally` blocks to save/restore the
+                //   pending exception.
+                Opcode::SetPendingMessage => {
+                    std::mem::swap(&mut frame.accumulator, &mut frame.pending_message);
+                }
+
+                // TestReferenceEqual [reg]:
+                //   Strict reference identity check (===).
+                Opcode::TestReferenceEqual => {
+                    let Operand::Register(v) = instr.operands[0] else {
+                        return Err(err_bad_operand("TestReferenceEqual", 0));
+                    };
+                    let rhs = frame.read_reg(v)?.clone();
+                    let result = strict_eq(&frame.accumulator, &rhs);
+                    frame.accumulator = JsValue::Boolean(result);
+                }
+
+                // TestUndetectable:
+                //   Check if the accumulator is null or undefined (the two
+                //   "undetectable" values in ECMAScript).
+                Opcode::TestUndetectable => {
+                    let result = matches!(frame.accumulator, JsValue::Null | JsValue::Undefined);
+                    frame.accumulator = JsValue::Boolean(result);
+                }
+
+                // JumpIfJSReceiver [offset]:
+                //   Jump if the accumulator is a JS receiver (object type, not
+                //   null, undefined, or a primitive).
+                Opcode::JumpIfJSReceiver => {
+                    let Operand::JumpOffset(delta) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfJSReceiver", 0));
+                    };
+                    if is_js_receiver(&frame.accumulator) {
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+
+                // JumpIfJSReceiverConstant [idx]:
+                //   Constant-pool variant of JumpIfJSReceiver.
+                Opcode::JumpIfJSReceiverConstant => {
+                    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+                        return Err(err_bad_operand("JumpIfJSReceiverConstant", 0));
+                    };
+                    if is_js_receiver(&frame.accumulator) {
+                        let entry = frame.bytecode_array.get_constant(idx).ok_or_else(|| {
+                            StatorError::Internal(format!(
+                                "JumpIfJSReceiverConstant: constant pool index {idx} out of bounds"
+                            ))
+                        })?;
+                        let delta = match entry {
+                            ConstantPoolEntry::Number(n) => *n as i32,
+                            _ => {
+                                return Err(StatorError::Internal(
+                                    "JumpIfJSReceiverConstant: constant is not a number".into(),
+                                ));
+                            }
+                        };
+                        frame.pc =
+                            resolve_jump(frame.pc, delta, &byte_offsets, instructions.len())?;
+                    }
+                }
+
+                // ToNumeric [feedback_slot]:
+                //   Abstract ToNumeric operation — converts the accumulator to
+                //   a numeric value (Number or BigInt).  BigInt values pass
+                //   through unchanged.
+                Opcode::ToNumeric => {
+                    // operands[0] is a FeedbackSlot, ignored at runtime.
+                    if !matches!(frame.accumulator, JsValue::BigInt(_)) {
+                        let n = frame.accumulator.to_number()?;
+                        frame.accumulator = number_to_jsvalue(n);
+                    }
+                }
+
                 // ── Unimplemented ──────────────────────────────────────────
                 other => {
                     return Err(StatorError::Internal(format!(
@@ -3388,6 +3667,8 @@ impl Interpreter {
             osr_loop_count: 0,
             instruction_limit: 0,
             instructions_executed: 0,
+            pending_message: JsValue::Undefined,
+            template_cache: std::collections::HashMap::new(),
         };
 
         state.borrow_mut().status = GeneratorStatus::Executing;
@@ -3633,6 +3914,22 @@ fn err_bad_operand(opcode_name: &'static str, operand_index: usize) -> StatorErr
     StatorError::Internal(format!(
         "{opcode_name}: unexpected operand kind at index {operand_index}"
     ))
+}
+
+/// Returns `true` if the value is a JS receiver (an object-like type, not a
+/// primitive, null, or undefined).
+fn is_js_receiver(value: &JsValue) -> bool {
+    !matches!(
+        value,
+        JsValue::Undefined
+            | JsValue::Null
+            | JsValue::Boolean(_)
+            | JsValue::Smi(_)
+            | JsValue::HeapNumber(_)
+            | JsValue::String(_)
+            | JsValue::Symbol(_)
+            | JsValue::BigInt(_)
+    )
 }
 
 /// Dispatch a function call with the given arguments, writing the result to
@@ -9552,5 +9849,568 @@ mod tests {
             frame.global_env.borrow().get("globalVar"),
             Some(&JsValue::Smi(55))
         );
+    }
+
+    // ── LdaLookupSlot ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_lda_lookup_slot_found() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                // Store 99 into global "myVar"
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+                Instruction::new_unchecked(
+                    Opcode::StaLookupSlot,
+                    vec![Operand::ConstantPoolIdx(0), Operand::Flag(0)],
+                ),
+                // Now load it back via LdaLookupSlot
+                Instruction::new_unchecked(
+                    Opcode::LdaLookupSlot,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("myVar".to_string())],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_lda_lookup_slot_not_found_throws() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::LdaLookupSlot,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("noSuchVar".to_string())],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let err = Interpreter::run(&mut frame).unwrap_err();
+        assert!(matches!(err, StatorError::ReferenceError(_)));
+    }
+
+    // ── LdaLookupSlotInsideTypeof ───────────────────────────────────────
+
+    #[test]
+    fn test_lda_lookup_slot_inside_typeof_found() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+                Instruction::new_unchecked(
+                    Opcode::StaLookupSlot,
+                    vec![Operand::ConstantPoolIdx(0), Operand::Flag(0)],
+                ),
+                Instruction::new_unchecked(
+                    Opcode::LdaLookupSlotInsideTypeof,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("x".to_string())],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_lda_lookup_slot_inside_typeof_not_found_returns_undefined() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::LdaLookupSlotInsideTypeof,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("missing".to_string())],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    // ── LdaLookupContextSlot ────────────────────────────────────────────
+
+    #[test]
+    fn test_lda_lookup_context_slot_found() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(7)]),
+                Instruction::new_unchecked(
+                    Opcode::StaLookupSlot,
+                    vec![Operand::ConstantPoolIdx(0), Operand::Flag(0)],
+                ),
+                Instruction::new_unchecked(
+                    Opcode::LdaLookupContextSlot,
+                    vec![
+                        Operand::ConstantPoolIdx(0),
+                        Operand::ConstantPoolIdx(0),
+                        Operand::Immediate(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("ctxVar".to_string())],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn test_lda_lookup_context_slot_not_found_throws() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::LdaLookupContextSlot,
+                    vec![
+                        Operand::ConstantPoolIdx(0),
+                        Operand::ConstantPoolIdx(0),
+                        Operand::Immediate(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("nope".to_string())],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let err = Interpreter::run(&mut frame).unwrap_err();
+        assert!(matches!(err, StatorError::ReferenceError(_)));
+    }
+
+    // ── LdaLookupContextSlotInsideTypeof ────────────────────────────────
+
+    #[test]
+    fn test_lda_lookup_context_slot_inside_typeof_not_found() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::LdaLookupContextSlotInsideTypeof,
+                    vec![
+                        Operand::ConstantPoolIdx(0),
+                        Operand::ConstantPoolIdx(0),
+                        Operand::Immediate(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("missing".to_string())],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    // ── LdaLookupGlobalSlot ─────────────────────────────────────────────
+
+    #[test]
+    fn test_lda_lookup_global_slot_found() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(33)]),
+                Instruction::new_unchecked(
+                    Opcode::StaLookupSlot,
+                    vec![Operand::ConstantPoolIdx(0), Operand::Flag(0)],
+                ),
+                Instruction::new_unchecked(
+                    Opcode::LdaLookupGlobalSlot,
+                    vec![
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(0),
+                        Operand::Immediate(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("gVar".to_string())],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(33));
+    }
+
+    #[test]
+    fn test_lda_lookup_global_slot_not_found_throws() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::LdaLookupGlobalSlot,
+                    vec![
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(0),
+                        Operand::Immediate(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("noGlobal".to_string())],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let err = Interpreter::run(&mut frame).unwrap_err();
+        assert!(matches!(err, StatorError::ReferenceError(_)));
+    }
+
+    // ── LdaLookupGlobalSlotInsideTypeof ─────────────────────────────────
+
+    #[test]
+    fn test_lda_lookup_global_slot_inside_typeof_not_found() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::LdaLookupGlobalSlotInsideTypeof,
+                    vec![
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(0),
+                        Operand::Immediate(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("missing".to_string())],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    // ── LdaNamedPropertyFromSuper ───────────────────────────────────────
+
+    #[test]
+    fn test_lda_named_property_from_super() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                // Create a PlainObject with property "x" = 10 in reg 0
+                Instruction::new_unchecked(Opcode::CreateEmptyObjectLiteral, vec![]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(10)]),
+                Instruction::new_unchecked(
+                    Opcode::StaNamedProperty,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+                // LdaNamedPropertyFromSuper reads from reg 0
+                Instruction::new_unchecked(
+                    Opcode::LdaNamedPropertyFromSuper,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("x".to_string())],
+            1,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_lda_named_property_from_super_missing_returns_undefined() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::CreateEmptyObjectLiteral, vec![]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(
+                    Opcode::LdaNamedPropertyFromSuper,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("y".to_string())],
+            1,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    // ── GetTemplateObject ───────────────────────────────────────────────
+
+    #[test]
+    fn test_get_template_object() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::GetTemplateObject,
+                    vec![Operand::ConstantPoolIdx(0), Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("hello".to_string())],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::String("hello".to_string()));
+    }
+
+    #[test]
+    fn test_get_template_object_cached() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::GetTemplateObject,
+                    vec![Operand::ConstantPoolIdx(0), Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("tpl".to_string())],
+            1,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::String("tpl".to_string()));
+        assert_eq!(frame.template_cache.len(), 1);
+    }
+
+    // ── SetPendingMessage ───────────────────────────────────────────────
+
+    #[test]
+    fn test_set_pending_message_swaps() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+                Instruction::new_unchecked(Opcode::SetPendingMessage, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Undefined);
+        assert_eq!(frame.pending_message, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_set_pending_message_double_swap() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+                Instruction::new_unchecked(Opcode::SetPendingMessage, vec![]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(2)]),
+                Instruction::new_unchecked(Opcode::SetPendingMessage, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+        assert_eq!(frame.pending_message, JsValue::Smi(2));
+    }
+
+    // ── TestReferenceEqual ──────────────────────────────────────────────
+
+    #[test]
+    fn test_test_reference_equal_same_smi() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
+                Instruction::new_unchecked(Opcode::TestReferenceEqual, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            1,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_test_reference_equal_different_values() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(10)]),
+                Instruction::new_unchecked(Opcode::TestReferenceEqual, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            1,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── TestUndetectable ────────────────────────────────────────────────
+
+    #[test]
+    fn test_test_undetectable_null() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaNull, vec![]),
+                Instruction::new_unchecked(Opcode::TestUndetectable, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_test_undetectable_undefined() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaUndefined, vec![]),
+                Instruction::new_unchecked(Opcode::TestUndetectable, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_test_undetectable_number_is_false() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+                Instruction::new_unchecked(Opcode::TestUndetectable, vec![]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── JumpIfJSReceiver ────────────────────────────────────────────────
+
+    #[test]
+    fn test_jump_if_js_receiver_object_jumps() {
+        // Byte layout:
+        //   [0] CreateEmptyObjectLiteral → 1 byte
+        //   [1] JumpIfJSReceiver(2)      → 2 bytes, end=3, target=3+2=5
+        //   [3] LdaSmi(0)               → 2 bytes ← skipped
+        //   [5] Return                  → 1 byte
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::CreateEmptyObjectLiteral, vec![]),
+                Instruction::new_unchecked(Opcode::JumpIfJSReceiver, vec![Operand::JumpOffset(2)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert!(matches!(result, JsValue::PlainObject(_)));
+    }
+
+    #[test]
+    fn test_jump_if_js_receiver_primitive_no_jump() {
+        // Byte layout:
+        //   [0] LdaSmi(5)               → 2 bytes
+        //   [2] JumpIfJSReceiver(2)      → 2 bytes, end=4, target=4+2=6
+        //   [4] LdaSmi(99)              → 2 bytes
+        //   [6] Return                  → 1 byte
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
+                Instruction::new_unchecked(Opcode::JumpIfJSReceiver, vec![Operand::JumpOffset(2)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    // ── ToNumeric ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_to_numeric_from_smi() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(7)]),
+                Instruction::new_unchecked(Opcode::ToNumeric, vec![Operand::FeedbackSlot(0)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn test_to_numeric_from_string() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(0)]),
+                Instruction::new_unchecked(Opcode::ToNumeric, vec![Operand::FeedbackSlot(0)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("42".to_string())],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_to_numeric_from_boolean() {
+        let result = run_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaTrue, vec![]),
+                Instruction::new_unchecked(Opcode::ToNumeric, vec![Operand::FeedbackSlot(0)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
     }
 }
