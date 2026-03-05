@@ -164,6 +164,13 @@ struct FunctionCompiler {
     labels: Vec<Label>,
     /// Stack of `(continue_label, break_label)` pairs for loop statements.
     loop_stack: Vec<(usize, usize)>,
+    /// Maps label names to `(continue_label, break_label)` pairs for
+    /// labeled statements.  `continue_label` is `Some` only when the
+    /// labeled body is a loop.
+    label_map: HashMap<String, (Option<usize>, usize)>,
+    /// When set, the next loop compiler that runs will patch the
+    /// `label_map` entry for this label name with its continue-label.
+    pending_label_name: Option<String>,
     /// Number of formal parameters.
     param_count: u32,
     /// Ordered list of feedback slot kinds allocated during compilation.
@@ -201,6 +208,8 @@ impl FunctionCompiler {
             pending_positions: Vec::new(),
             labels: Vec::new(),
             loop_stack: Vec::new(),
+            label_map: HashMap::new(),
+            pending_label_name: None,
             param_count,
             slot_kinds: Vec::new(),
             handler_table: Vec::new(),
@@ -286,6 +295,17 @@ impl FunctionCompiler {
     /// Bind `label_id` to the *next* instruction to be emitted.
     fn bind_label(&mut self, label_id: usize) {
         self.labels[label_id].bound_at = Some(self.instructions.len());
+    }
+
+    /// If a labeled statement is pending, patch its `label_map` entry with
+    /// the loop's `continue_label`.  Called by each loop compiler right
+    /// after it determines its continue target.
+    fn patch_pending_label(&mut self, continue_label: usize) {
+        if let Some(name) = self.pending_label_name.take()
+            && let Some(entry) = self.label_map.get_mut(&name)
+        {
+            entry.0 = Some(continue_label);
+        }
     }
 
     // ── Instruction emission ─────────────────────────────────────────────────
@@ -396,7 +416,7 @@ impl FunctionCompiler {
             Stmt::Try(s) => self.compile_try(s),
             Stmt::Break(s) => self.compile_break(s),
             Stmt::Continue(s) => self.compile_continue(s),
-            Stmt::Labeled(s) => self.compile_stmt(&s.body),
+            Stmt::Labeled(s) => self.compile_labeled(s),
             Stmt::Debugger(_) => {
                 self.emit(Instruction::new_unchecked(Opcode::Debugger, vec![]));
                 Ok(())
@@ -513,6 +533,7 @@ impl FunctionCompiler {
         let loop_start = self.new_label();
         let loop_end = self.new_label();
 
+        self.patch_pending_label(loop_start);
         self.loop_stack.push((loop_start, loop_end));
 
         self.bind_label(loop_start);
@@ -533,6 +554,7 @@ impl FunctionCompiler {
         // continue target is the condition check, placed after body
         let cond_label = self.new_label();
 
+        self.patch_pending_label(cond_label);
         self.loop_stack.push((cond_label, loop_end));
 
         self.bind_label(loop_start);
@@ -565,6 +587,7 @@ impl FunctionCompiler {
             }
         }
 
+        self.patch_pending_label(continue_label);
         self.loop_stack.push((continue_label, loop_end));
 
         self.bind_label(loop_start);
@@ -604,12 +627,15 @@ impl FunctionCompiler {
 
     /// Compile a `break [label]` statement.
     ///
-    /// Only unlabeled breaks are supported; labeled breaks return an error.
+    /// Labeled breaks look up the target in `label_map`; unlabeled breaks
+    /// use the innermost `loop_stack` entry.
     fn compile_break(&mut self, s: &crate::parser::ast::BreakStmt) -> StatorResult<()> {
-        if s.label.is_some() {
-            return Err(StatorError::Internal(
-                "labeled break is not yet supported".into(),
-            ));
+        if let Some(label) = &s.label {
+            let (_, break_label) = *self.label_map.get(&label.name).ok_or_else(|| {
+                StatorError::Internal(format!("undefined label '{}'", label.name))
+            })?;
+            self.emit_jump(Opcode::Jump, break_label);
+            return Ok(());
         }
         let (_, break_label) = *self
             .loop_stack
@@ -620,17 +646,68 @@ impl FunctionCompiler {
     }
 
     /// Compile a `continue [label]` statement.
+    ///
+    /// Labeled continues look up the target in `label_map` and require the
+    /// labeled body to be a loop; unlabeled continues use the innermost
+    /// `loop_stack` entry.
     fn compile_continue(&mut self, s: &crate::parser::ast::ContinueStmt) -> StatorResult<()> {
-        if s.label.is_some() {
-            return Err(StatorError::Internal(
-                "labeled continue is not yet supported".into(),
-            ));
+        if let Some(label) = &s.label {
+            let (continue_label, _) = *self.label_map.get(&label.name).ok_or_else(|| {
+                StatorError::Internal(format!("undefined label '{}'", label.name))
+            })?;
+            let continue_label = continue_label.ok_or_else(|| {
+                StatorError::Internal(format!(
+                    "label '{}' is not a loop — continue is invalid",
+                    label.name
+                ))
+            })?;
+            self.emit_jump(Opcode::Jump, continue_label);
+            return Ok(());
         }
         let (continue_label, _) = *self
             .loop_stack
             .last()
             .ok_or_else(|| StatorError::Internal("continue outside loop".into()))?;
         self.emit_jump(Opcode::Jump, continue_label);
+        Ok(())
+    }
+
+    /// Compile a labeled statement (`label: body`).
+    ///
+    /// A break-label is always created so that `break label` can exit the
+    /// labeled statement.  If the body is a loop (`While`, `DoWhile`,
+    /// `For`, `ForIn`, or `ForOf`), the loop compiler patches the
+    /// `label_map` entry with the real continue-label via
+    /// `pending_label_name`.
+    fn compile_labeled(&mut self, s: &crate::parser::ast::LabeledStmt) -> StatorResult<()> {
+        let name = s.label.name.clone();
+        if self.label_map.contains_key(&name) {
+            return Err(StatorError::Internal(format!("duplicate label '{name}'")));
+        }
+
+        let break_label = self.new_label();
+        let is_loop = matches!(
+            *s.body,
+            Stmt::While(_) | Stmt::DoWhile(_) | Stmt::For(_) | Stmt::ForIn(_) | Stmt::ForOf(_)
+        );
+
+        // Pre-populate label_map so that `break label` works during body
+        // compilation.  continue_label starts as None and is patched by
+        // the loop compiler when `pending_label_name` is set.
+        self.label_map.insert(name.clone(), (None, break_label));
+
+        if is_loop {
+            self.pending_label_name = Some(name.clone());
+        }
+
+        self.compile_stmt(&s.body)?;
+
+        // Clear pending_label_name in case the body was not a recognized
+        // loop (shouldn't happen if is_loop matched, but be safe).
+        self.pending_label_name = None;
+
+        self.label_map.remove(&name);
+        self.bind_label(break_label);
         Ok(())
     }
 
@@ -2227,6 +2304,7 @@ impl FunctionCompiler {
         // Loop labels.
         let loop_lbl = self.new_label();
         let break_lbl = self.new_label();
+        self.patch_pending_label(loop_lbl);
         self.loop_stack.push((loop_lbl, break_lbl));
 
         // Bind loop start.
@@ -2398,6 +2476,7 @@ impl FunctionCompiler {
         // Loop labels.
         let loop_lbl = self.new_label();
         let break_lbl = self.new_label();
+        self.patch_pending_label(loop_lbl);
         self.loop_stack.push((loop_lbl, break_lbl));
 
         // Bind loop start.
@@ -2707,9 +2786,9 @@ mod tests {
     use crate::bytecode::bytecodes::{Opcode, decode};
     use crate::parser::ast::{
         BinaryExpr, BinaryOp, BlockStmt, BoolLit, BreakStmt, CatchClause, ContinueStmt,
-        DoWhileStmt, Expr, ExprStmt, FnDecl, ForStmt, Ident, IfStmt, NullLit, NumLit, Param, Pat,
-        Program, ProgramItem, ReturnStmt, SourceType, Stmt, StringLit, ThrowStmt, TryStmt, VarDecl,
-        VarDeclarator, VarKind, WhileStmt,
+        DoWhileStmt, Expr, ExprStmt, FnDecl, ForStmt, Ident, IfStmt, LabeledStmt, NullLit, NumLit,
+        Param, Pat, Program, ProgramItem, ReturnStmt, SourceType, Stmt, StringLit, ThrowStmt,
+        TryStmt, VarDecl, VarDeclarator, VarKind, WhileStmt,
     };
     use crate::parser::scanner::{Position, Span};
 
@@ -4036,5 +4115,141 @@ mod tests {
         } else {
             panic!("constant pool[0] should be a Function");
         }
+    }
+
+    // ── Labeled break / continue ─────────────────────────────────────────
+
+    #[test]
+    fn test_labeled_break_non_loop() {
+        // outer: { break outer; }
+        let prog = make_program(vec![Stmt::Labeled(LabeledStmt {
+            loc: span(),
+            label: ident("outer"),
+            body: Box::new(Stmt::Block(BlockStmt {
+                loc: span(),
+                body: vec![Stmt::Break(BreakStmt {
+                    loc: span(),
+                    label: Some(ident("outer")),
+                })],
+            })),
+        })]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let bytes = arr.bytecodes();
+        let decoded = decode(bytes).expect("bytecode must decode");
+        assert!(!decoded.is_empty());
+        // Must contain a forward Jump.
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::Jump),
+            "labeled break must emit a Jump"
+        );
+    }
+
+    #[test]
+    fn test_labeled_break_while_loop() {
+        // outer: while (true) { break outer; }
+        let prog = make_program(vec![Stmt::Labeled(LabeledStmt {
+            loc: span(),
+            label: ident("outer"),
+            body: Box::new(Stmt::While(WhileStmt {
+                loc: span(),
+                test: Box::new(bool_expr(true)),
+                body: Box::new(Stmt::Break(BreakStmt {
+                    loc: span(),
+                    label: Some(ident("outer")),
+                })),
+            })),
+        })]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let bytes = arr.bytecodes();
+        let decoded = decode(bytes).expect("bytecode must decode");
+        assert!(!decoded.is_empty());
+    }
+
+    #[test]
+    fn test_labeled_continue_while_loop() {
+        // outer: while (true) { continue outer; }
+        let prog = make_program(vec![Stmt::Labeled(LabeledStmt {
+            loc: span(),
+            label: ident("outer"),
+            body: Box::new(Stmt::While(WhileStmt {
+                loc: span(),
+                test: Box::new(bool_expr(true)),
+                body: Box::new(Stmt::Continue(ContinueStmt {
+                    loc: span(),
+                    label: Some(ident("outer")),
+                })),
+            })),
+        })]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let bytes = arr.bytecodes();
+        let decoded = decode(bytes).expect("bytecode must decode");
+        assert!(!decoded.is_empty());
+    }
+
+    #[test]
+    fn test_nested_labeled_loops() {
+        // outer: while (true) { inner: while (true) { break outer; } }
+        let prog = make_program(vec![Stmt::Labeled(LabeledStmt {
+            loc: span(),
+            label: ident("outer"),
+            body: Box::new(Stmt::While(WhileStmt {
+                loc: span(),
+                test: Box::new(bool_expr(true)),
+                body: Box::new(Stmt::Labeled(LabeledStmt {
+                    loc: span(),
+                    label: ident("inner"),
+                    body: Box::new(Stmt::While(WhileStmt {
+                        loc: span(),
+                        test: Box::new(bool_expr(true)),
+                        body: Box::new(Stmt::Break(BreakStmt {
+                            loc: span(),
+                            label: Some(ident("outer")),
+                        })),
+                    })),
+                })),
+            })),
+        })]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let bytes = arr.bytecodes();
+        let decoded = decode(bytes).expect("bytecode must decode");
+        assert!(!decoded.is_empty());
+    }
+
+    #[test]
+    fn test_labeled_continue_non_loop_errors() {
+        // outer: { continue outer; }  — should error
+        let prog = make_program(vec![Stmt::Labeled(LabeledStmt {
+            loc: span(),
+            label: ident("outer"),
+            body: Box::new(Stmt::Block(BlockStmt {
+                loc: span(),
+                body: vec![Stmt::Continue(ContinueStmt {
+                    loc: span(),
+                    label: Some(ident("outer")),
+                })],
+            })),
+        })]);
+        let result = BytecodeGenerator::compile_program(&prog);
+        assert!(result.is_err(), "continue on non-loop label must error");
+    }
+
+    #[test]
+    fn test_duplicate_label_errors() {
+        // outer: outer: {} — should error
+        let prog = make_program(vec![Stmt::Labeled(LabeledStmt {
+            loc: span(),
+            label: ident("outer"),
+            body: Box::new(Stmt::Labeled(LabeledStmt {
+                loc: span(),
+                label: ident("outer"),
+                body: Box::new(Stmt::Block(BlockStmt {
+                    loc: span(),
+                    body: vec![],
+                })),
+            })),
+        })]);
+        let result = BytecodeGenerator::compile_program(&prog);
+        assert!(result.is_err(), "duplicate labels must error");
     }
 }
