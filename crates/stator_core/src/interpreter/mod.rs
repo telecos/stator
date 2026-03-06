@@ -4862,12 +4862,29 @@ fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             _ => JsValue::Undefined,
         };
     }
-    // Handle JsValue::Error — expose name, message, stack properties.
+    // Handle JsValue::Error — expose name, message, stack, cause, errors properties.
     if let JsValue::Error(e) = obj {
+        let err = Rc::clone(e);
         return match key {
             "name" => JsValue::String(e.name().to_string()),
             "message" => JsValue::String(e.message().to_string()),
             "stack" => JsValue::String(e.stack().to_string()),
+            "cause" => e.cause().cloned().unwrap_or(JsValue::Undefined),
+            "errors" => {
+                if e.kind == crate::builtins::error::ErrorKind::AggregateError {
+                    JsValue::Array(Rc::new(
+                        e.errors
+                            .iter()
+                            .map(|ie| JsValue::Error(Rc::clone(ie)))
+                            .collect(),
+                    ))
+                } else {
+                    JsValue::Undefined
+                }
+            }
+            "toString" => JsValue::NativeFunction(Rc::new(move |_args| {
+                Ok(JsValue::String(err.to_error_string()))
+            })),
             _ => JsValue::Undefined,
         };
     }
@@ -10361,6 +10378,75 @@ mod tests {
         }
         // Unknown property returns undefined
         assert_eq!(proto_lookup(&err, "foo"), JsValue::Undefined);
+    }
+
+    /// Test that `proto_lookup` exposes `cause` property (ES2022).
+    #[test]
+    fn test_proto_lookup_error_cause_property() {
+        use crate::builtins::error::{ErrorKind, JsError};
+
+        // Error without cause returns undefined.
+        let err = JsValue::Error(Rc::new(JsError::new(
+            ErrorKind::Error,
+            "no cause".to_string(),
+        )));
+        assert_eq!(proto_lookup(&err, "cause"), JsValue::Undefined);
+
+        // Error with cause returns the cause value.
+        let cause = JsValue::String("original problem".to_string());
+        let err_with_cause = JsValue::Error(Rc::new(
+            JsError::new(ErrorKind::Error, "wrapper".to_string()).with_cause(cause.clone()),
+        ));
+        assert_eq!(proto_lookup(&err_with_cause, "cause"), cause);
+    }
+
+    /// Test that `proto_lookup` exposes `errors` property for `AggregateError`.
+    #[test]
+    fn test_proto_lookup_aggregate_error_errors_property() {
+        use crate::builtins::error::{ErrorKind, JsError};
+
+        let inner1 = Rc::new(JsError::new(ErrorKind::TypeError, "bad type".to_string()));
+        let inner2 = Rc::new(JsError::new(
+            ErrorKind::RangeError,
+            "out of range".to_string(),
+        ));
+        let agg = JsValue::Error(Rc::new(JsError::new_aggregate(
+            vec![inner1.clone(), inner2.clone()],
+            "multiple failures".to_string(),
+        )));
+
+        // errors property should be an Array of Error values.
+        if let JsValue::Array(arr) = proto_lookup(&agg, "errors") {
+            assert_eq!(arr.len(), 2);
+            assert!(matches!(&arr[0], JsValue::Error(e) if e.kind == ErrorKind::TypeError));
+            assert!(matches!(&arr[1], JsValue::Error(e) if e.kind == ErrorKind::RangeError));
+        } else {
+            panic!("expected Array for AggregateError.errors");
+        }
+
+        // Non-AggregateError should return undefined for errors.
+        let regular = JsValue::Error(Rc::new(JsError::new(
+            ErrorKind::Error,
+            "regular".to_string(),
+        )));
+        assert_eq!(proto_lookup(&regular, "errors"), JsValue::Undefined);
+    }
+
+    /// Test that `proto_lookup` exposes `toString` method on errors.
+    #[test]
+    fn test_proto_lookup_error_to_string_method() {
+        use crate::builtins::error::{ErrorKind, JsError};
+
+        let err = JsValue::Error(Rc::new(JsError::new(
+            ErrorKind::TypeError,
+            "bad value".to_string(),
+        )));
+        if let JsValue::NativeFunction(f) = proto_lookup(&err, "toString") {
+            let result = f(vec![]).unwrap();
+            assert_eq!(result, JsValue::String("TypeError: bad value".to_string()));
+        } else {
+            panic!("expected NativeFunction for toString");
+        }
     }
 
     // ── DeletePropertySloppy / DeletePropertyStrict ──────────────────────

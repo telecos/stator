@@ -91,13 +91,62 @@ fn native(f: impl Fn(Vec<JsValue>) -> StatorResult<JsValue> + 'static) -> JsValu
 }
 
 /// Build a NativeFunction that constructs a `JsValue::Error` of the given `ErrorKind`.
+///
+/// Supports the ES2022 options parameter: `new Error(message, { cause })`.
 fn make_error_constructor(kind: ErrorKind) -> JsValue {
     native(move |args| {
         let message = match args.first() {
             Some(JsValue::Undefined) | None => String::new(),
             Some(v) => v.to_js_string()?,
         };
-        Ok(JsValue::Error(Rc::new(JsError::new(kind, message))))
+        let mut err = JsError::new(kind, message);
+        // ES2022: extract `cause` from the optional second options argument.
+        err.cause = extract_cause(args.get(1));
+        Ok(JsValue::Error(Rc::new(err)))
+    })
+}
+
+/// Extract the `cause` value from an options argument, if present.
+fn extract_cause(options: Option<&JsValue>) -> Option<JsValue> {
+    if let Some(JsValue::PlainObject(map)) = options {
+        map.borrow().get("cause").cloned()
+    } else {
+        None
+    }
+}
+
+/// Build the `AggregateError` constructor.
+///
+/// Signature: `AggregateError(errors, message [, options])`.
+///
+/// The `errors` argument is consumed as an `Array`; the optional `options`
+/// object may contain a `cause` property (ES2022).
+fn make_aggregate_error_constructor() -> JsValue {
+    native(|args| {
+        // First arg: errors (iterable — we accept Array).
+        let errors_val = args.first().unwrap_or(&JsValue::Undefined);
+        let inner_errors: Vec<Rc<JsError>> = match errors_val {
+            JsValue::Array(arr) => arr
+                .iter()
+                .map(|v| match v {
+                    JsValue::Error(e) => Rc::clone(e),
+                    other => Rc::new(JsError::new(
+                        ErrorKind::Error,
+                        other.to_js_string().unwrap_or_default(),
+                    )),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        // Second arg: message.
+        let message = match args.get(1) {
+            Some(JsValue::Undefined) | None => String::new(),
+            Some(v) => v.to_js_string()?,
+        };
+        let mut err = JsError::new_aggregate(inner_errors, message);
+        // Third arg: optional options object with `cause`.
+        err.cause = extract_cause(args.get(2));
+        Ok(JsValue::Error(Rc::new(err)))
     })
 }
 
@@ -128,6 +177,7 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
         "EvalError".into(),
         make_error_constructor(ErrorKind::EvalError),
     );
+    globals.insert("AggregateError".into(), make_aggregate_error_constructor());
 }
 
 /// Convert an `f64` to the most compact `JsValue` representation.
@@ -4258,6 +4308,15 @@ mod tests {
         assert!(globals.contains_key("BigInt"));
         assert!(globals.contains_key("Function"));
         assert!(globals.contains_key("globalThis"));
+        // Error constructors
+        assert!(globals.contains_key("Error"));
+        assert!(globals.contains_key("TypeError"));
+        assert!(globals.contains_key("RangeError"));
+        assert!(globals.contains_key("ReferenceError"));
+        assert!(globals.contains_key("SyntaxError"));
+        assert!(globals.contains_key("URIError"));
+        assert!(globals.contains_key("EvalError"));
+        assert!(globals.contains_key("AggregateError"));
     }
 
     /// Verify that the `Math` object has the expected properties.
@@ -7563,5 +7622,112 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(777));
+    }
+
+    // ── Error spec-compliance e2e tests (issue #295) ─────────────────────
+
+    /// `new Error("msg").name` → "Error"
+    #[test]
+    fn e2e_error_name_property() {
+        let result = global_eval(r#"var e = new Error("msg"); e.name"#).unwrap();
+        assert_eq!(result, JsValue::String("Error".to_string()));
+    }
+
+    /// `new TypeError("msg").name` → "TypeError"
+    #[test]
+    fn e2e_type_error_name() {
+        let result = global_eval(r#"var e = new TypeError("msg"); e.name"#).unwrap();
+        assert_eq!(result, JsValue::String("TypeError".to_string()));
+    }
+
+    /// `new RangeError("msg").name` → "RangeError"
+    #[test]
+    fn e2e_range_error_name() {
+        let result = global_eval(r#"var e = new RangeError("msg"); e.name"#).unwrap();
+        assert_eq!(result, JsValue::String("RangeError".to_string()));
+    }
+
+    /// `new ReferenceError("msg").name` → "ReferenceError"
+    #[test]
+    fn e2e_reference_error_name() {
+        let result = global_eval(r#"var e = new ReferenceError("msg"); e.name"#).unwrap();
+        assert_eq!(result, JsValue::String("ReferenceError".to_string()));
+    }
+
+    /// `new SyntaxError("msg").name` → "SyntaxError"
+    #[test]
+    fn e2e_syntax_error_name() {
+        let result = global_eval(r#"var e = new SyntaxError("msg"); e.name"#).unwrap();
+        assert_eq!(result, JsValue::String("SyntaxError".to_string()));
+    }
+
+    /// `new URIError("msg").name` → "URIError"
+    #[test]
+    fn e2e_uri_error_name() {
+        let result = global_eval(r#"var e = new URIError("msg"); e.name"#).unwrap();
+        assert_eq!(result, JsValue::String("URIError".to_string()));
+    }
+
+    /// `new EvalError("msg").name` → "EvalError"
+    #[test]
+    fn e2e_eval_error_name() {
+        let result = global_eval(r#"var e = new EvalError("msg"); e.name"#).unwrap();
+        assert_eq!(result, JsValue::String("EvalError".to_string()));
+    }
+
+    /// `new Error("msg").message` → "msg"
+    #[test]
+    fn e2e_error_message_property() {
+        let result = global_eval(r#"var e = new Error("hello"); e.message"#).unwrap();
+        assert_eq!(result, JsValue::String("hello".to_string()));
+    }
+
+    /// `new Error("msg").stack` starts with "Error: msg"
+    #[test]
+    fn e2e_error_stack_property() {
+        let result = global_eval(r#"var e = new Error("msg"); e.stack"#).unwrap();
+        if let JsValue::String(s) = result {
+            assert!(
+                s.starts_with("Error: msg"),
+                "stack should start with error string: {s}"
+            );
+        } else {
+            panic!("expected String for .stack");
+        }
+    }
+
+    /// Error without cause: `.cause` → undefined
+    #[test]
+    fn e2e_error_cause_undefined_when_absent() {
+        let result = global_eval(r#"var e = new Error("msg"); e.cause"#).unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// AggregateError constructor: `.name` → "AggregateError"
+    #[test]
+    fn e2e_aggregate_error_name() {
+        let result = global_eval(r#"var e = new AggregateError([], "msg"); e.name"#).unwrap();
+        assert_eq!(result, JsValue::String("AggregateError".to_string()));
+    }
+
+    /// AggregateError constructor: `.message` → "msg"
+    #[test]
+    fn e2e_aggregate_error_message() {
+        let result = global_eval(r#"var e = new AggregateError([], "msg"); e.message"#).unwrap();
+        assert_eq!(result, JsValue::String("msg".to_string()));
+    }
+
+    /// `new Error("msg").toString()` → "Error: msg"
+    #[test]
+    fn e2e_error_to_string() {
+        let result = global_eval(r#"var e = new Error("msg"); e.toString()"#).unwrap();
+        assert_eq!(result, JsValue::String("Error: msg".to_string()));
+    }
+
+    /// `new TypeError("").toString()` → "TypeError"
+    #[test]
+    fn e2e_type_error_to_string_empty_message() {
+        let result = global_eval(r#"var e = new TypeError(); e.toString()"#).unwrap();
+        assert_eq!(result, JsValue::String("TypeError".to_string()));
     }
 }
