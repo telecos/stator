@@ -305,6 +305,8 @@ pub enum TokenValue {
     Str(String),
     /// Parsed numeric value for [`TokenKind::NumericLiteral`].
     Number(f64),
+    /// Raw BigInt string (no trailing `n`) for [`TokenKind::NumericLiteral`].
+    BigInt(String),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -903,11 +905,18 @@ impl<'src> Scanner<'src> {
         }
 
         let raw = &self.source[num_start..self.pos];
-        let value = parse_numeric_raw(raw);
+        let is_bigint = raw.ends_with('n');
+        let token_value = if is_bigint {
+            // Strip trailing `n` and numeric separators for the BigInt string.
+            let numeric = raw[..raw.len() - 1].replace('_', "");
+            TokenValue::BigInt(numeric)
+        } else {
+            TokenValue::Number(parse_numeric_raw(raw))
+        };
         let end = self.current_pos();
         Ok(Token {
             kind: TokenKind::NumericLiteral,
-            value: TokenValue::Number(value),
+            value: token_value,
             span: Span { start, end },
             had_line_terminator_before: false, // caller patches this
         })

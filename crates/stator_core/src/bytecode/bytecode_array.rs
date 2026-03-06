@@ -100,6 +100,8 @@ pub enum ConstantPoolEntry {
     Null,
     /// The JavaScript `undefined` literal.
     Undefined,
+    /// A BigInt literal (128-bit signed integer).
+    BigInt(i128),
     /// A compiled nested function or closure.
     Function(Box<BytecodeArray>),
     /// A template-literal descriptor for [`Opcode::GetTemplateObject`](super::bytecodes::Opcode::GetTemplateObject).

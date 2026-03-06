@@ -126,6 +126,8 @@ const CPE_NULL: u8 = 0x03;
 const CPE_UNDEFINED: u8 = 0x04;
 const CPE_FUNCTION: u8 = 0x05;
 const CPE_TEMPLATE_OBJECT: u8 = 0x06;
+/// BigInt constant pool entry tag.
+const CPE_BIGINT: u8 = 0x07;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // StartupSnapshot
@@ -409,6 +411,10 @@ fn write_constant_pool_entry(buf: &mut Vec<u8>, entry: &ConstantPoolEntry) {
         }
         ConstantPoolEntry::Null => write_u8(buf, CPE_NULL),
         ConstantPoolEntry::Undefined => write_u8(buf, CPE_UNDEFINED),
+        ConstantPoolEntry::BigInt(n) => {
+            write_u8(buf, CPE_BIGINT);
+            buf.extend_from_slice(&n.to_le_bytes());
+        }
         ConstantPoolEntry::Function(ba) => {
             write_u8(buf, CPE_FUNCTION);
             write_bytecode_array(buf, ba);
@@ -728,6 +734,17 @@ fn read_constant_pool_entry(bytes: &[u8], cursor: &mut usize) -> StatorResult<Co
         }
         CPE_NULL => Ok(ConstantPoolEntry::Null),
         CPE_UNDEFINED => Ok(ConstantPoolEntry::Undefined),
+        CPE_BIGINT => {
+            if *cursor + 16 > bytes.len() {
+                return Err(StatorError::Internal(
+                    "snapshot: truncated BigInt CPE".into(),
+                ));
+            }
+            let mut buf = [0u8; 16];
+            buf.copy_from_slice(&bytes[*cursor..*cursor + 16]);
+            *cursor += 16;
+            Ok(ConstantPoolEntry::BigInt(i128::from_le_bytes(buf)))
+        }
         CPE_FUNCTION => {
             let ba = read_bytecode_array(bytes, cursor)?;
             Ok(ConstantPoolEntry::Function(Box::new(ba)))

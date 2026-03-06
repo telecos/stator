@@ -3660,6 +3660,121 @@ fn make_regexp() -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
+/// Build the `BigInt` global constructor with `asIntN` and `asUintN` static methods.
+fn make_bigint() -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    // BigInt(value) — callable constructor (must not be called with `new`)
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let val = args.first().unwrap_or(&JsValue::Undefined);
+            match val {
+                JsValue::BigInt(n) => Ok(JsValue::BigInt(*n)),
+                JsValue::Smi(n) => Ok(JsValue::BigInt(i128::from(*n))),
+                JsValue::HeapNumber(n) => {
+                    if n.is_nan() || n.is_infinite() || n.fract() != 0.0 {
+                        Err(StatorError::RangeError(format!(
+                            "The number {n} cannot be converted to a BigInt because it is not an integer"
+                        )))
+                    } else {
+                        Ok(JsValue::BigInt(*n as i128))
+                    }
+                }
+                JsValue::Boolean(b) => Ok(JsValue::BigInt(if *b { 1 } else { 0 })),
+                JsValue::String(s) => {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        return Err(StatorError::SyntaxError(
+                            "Cannot convert  to a BigInt".to_string(),
+                        ));
+                    }
+                    let parsed = if let Some(hex) =
+                        trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X"))
+                    {
+                        i128::from_str_radix(hex, 16)
+                    } else if let Some(oct) =
+                        trimmed.strip_prefix("0o").or_else(|| trimmed.strip_prefix("0O"))
+                    {
+                        i128::from_str_radix(oct, 8)
+                    } else if let Some(bin) =
+                        trimmed.strip_prefix("0b").or_else(|| trimmed.strip_prefix("0B"))
+                    {
+                        i128::from_str_radix(bin, 2)
+                    } else {
+                        trimmed.parse::<i128>()
+                    };
+                    parsed.map(JsValue::BigInt).map_err(|_| {
+                        StatorError::SyntaxError(format!(
+                            "Cannot convert {s} to a BigInt"
+                        ))
+                    })
+                }
+                _ => Err(StatorError::TypeError(format!(
+                    "Cannot convert {} to a BigInt",
+                    val.to_js_string().unwrap_or_default()
+                ))),
+            }
+        }),
+    );
+
+    // BigInt.asIntN(bits, bigint)
+    props.insert(
+        "asIntN".into(),
+        native(|args| {
+            let bits = args.first().unwrap_or(&JsValue::Undefined).to_number()? as u32;
+            let bigint = match args.get(1) {
+                Some(JsValue::BigInt(n)) => *n,
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "Cannot convert a non-BigInt value to a BigInt".to_string(),
+                    ));
+                }
+            };
+            if bits == 0 {
+                return Ok(JsValue::BigInt(0));
+            }
+            if bits >= 128 {
+                return Ok(JsValue::BigInt(bigint));
+            }
+            let mask = (1i128 << bits) - 1;
+            let truncated = bigint & mask;
+            // Sign extension
+            if truncated & (1i128 << (bits - 1)) != 0 {
+                Ok(JsValue::BigInt(truncated | !mask))
+            } else {
+                Ok(JsValue::BigInt(truncated))
+            }
+        }),
+    );
+
+    // BigInt.asUintN(bits, bigint)
+    props.insert(
+        "asUintN".into(),
+        native(|args| {
+            let bits = args.first().unwrap_or(&JsValue::Undefined).to_number()? as u32;
+            let bigint = match args.get(1) {
+                Some(JsValue::BigInt(n)) => *n,
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "Cannot convert a non-BigInt value to a BigInt".to_string(),
+                    ));
+                }
+            };
+            if bits == 0 {
+                return Ok(JsValue::BigInt(0));
+            }
+            if bits >= 128 {
+                return Ok(JsValue::BigInt(bigint));
+            }
+            let mask = (1i128 << bits) - 1;
+            Ok(JsValue::BigInt(bigint & mask))
+        }),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 /// Extract a `Vec<JsPromise>` from an argument that should be a `JsValue::Array`
 /// of `JsValue::Promise` elements.
 fn extract_promise_array(arg: Option<&JsValue>) -> Vec<crate::builtins::promise::JsPromise> {
@@ -3722,6 +3837,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     );
     globals.insert("Promise".into(), make_promise());
     globals.insert("RegExp".into(), make_regexp());
+    globals.insert("BigInt".into(), make_bigint());
 
     // ── Error constructors ────────────────────────────────────────────────
     install_error_constructors(globals);
@@ -3881,6 +3997,7 @@ mod tests {
         assert!(globals.contains_key("FinalizationRegistry"));
         assert!(globals.contains_key("Promise"));
         assert!(globals.contains_key("RegExp"));
+        assert!(globals.contains_key("BigInt"));
         assert!(globals.contains_key("globalThis"));
     }
 
@@ -5299,5 +5416,1295 @@ mod tests {
     fn e2e_eval_is_global() {
         let result = global_eval("typeof eval").unwrap();
         assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    // ── BigInt tests ────────────────────────────────────────────────────────
+
+    // -- Literal parsing --
+
+    #[test]
+    fn e2e_bigint_literal_zero() {
+        let result = global_eval("0n").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_literal_positive() {
+        let result = global_eval("42n").unwrap();
+        assert_eq!(result, JsValue::BigInt(42));
+    }
+
+    #[test]
+    fn e2e_bigint_literal_negative() {
+        let result = global_eval("-1n").unwrap();
+        assert_eq!(result, JsValue::BigInt(-1));
+    }
+
+    #[test]
+    fn e2e_bigint_literal_large() {
+        let result = global_eval("9007199254740993n").unwrap();
+        assert_eq!(result, JsValue::BigInt(9_007_199_254_740_993));
+    }
+
+    #[test]
+    fn e2e_bigint_literal_hex() {
+        let result = global_eval("0xFFn").unwrap();
+        assert_eq!(result, JsValue::BigInt(255));
+    }
+
+    #[test]
+    fn e2e_bigint_literal_octal() {
+        let result = global_eval("0o77n").unwrap();
+        assert_eq!(result, JsValue::BigInt(63));
+    }
+
+    #[test]
+    fn e2e_bigint_literal_binary() {
+        let result = global_eval("0b1010n").unwrap();
+        assert_eq!(result, JsValue::BigInt(10));
+    }
+
+    #[test]
+    fn e2e_bigint_literal_large_hex() {
+        let result = global_eval("0x1Fn").unwrap();
+        assert_eq!(result, JsValue::BigInt(31));
+    }
+
+    // -- typeof --
+
+    #[test]
+    fn e2e_bigint_typeof() {
+        let result = global_eval("typeof 42n").unwrap();
+        assert_eq!(result, JsValue::String("bigint".into()));
+    }
+
+    #[test]
+    fn e2e_bigint_typeof_zero() {
+        let result = global_eval("typeof 0n").unwrap();
+        assert_eq!(result, JsValue::String("bigint".into()));
+    }
+
+    #[test]
+    fn e2e_bigint_typeof_negative() {
+        let result = global_eval("typeof -1n").unwrap();
+        assert_eq!(result, JsValue::String("bigint".into()));
+    }
+
+    // -- Arithmetic: addition --
+
+    #[test]
+    fn e2e_bigint_add() {
+        let result = global_eval("1n + 2n").unwrap();
+        assert_eq!(result, JsValue::BigInt(3));
+    }
+
+    #[test]
+    fn e2e_bigint_add_zero() {
+        let result = global_eval("0n + 0n").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_add_negative() {
+        let result = global_eval("-1n + -2n").unwrap();
+        assert_eq!(result, JsValue::BigInt(-3));
+    }
+
+    #[test]
+    fn e2e_bigint_add_large() {
+        let result = global_eval("9007199254740993n + 1n").unwrap();
+        assert_eq!(result, JsValue::BigInt(9_007_199_254_740_994));
+    }
+
+    #[test]
+    fn e2e_bigint_add_mixed_type_error() {
+        let result = global_eval("1n + 1");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn e2e_bigint_add_mixed_type_error_reverse() {
+        let result = global_eval("1 + 1n");
+        assert!(result.is_err());
+    }
+
+    // -- Arithmetic: subtraction --
+
+    #[test]
+    fn e2e_bigint_sub() {
+        let result = global_eval("5n - 3n").unwrap();
+        assert_eq!(result, JsValue::BigInt(2));
+    }
+
+    #[test]
+    fn e2e_bigint_sub_negative_result() {
+        let result = global_eval("3n - 5n").unwrap();
+        assert_eq!(result, JsValue::BigInt(-2));
+    }
+
+    #[test]
+    fn e2e_bigint_sub_zero() {
+        let result = global_eval("0n - 0n").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_sub_mixed_error() {
+        assert!(global_eval("1n - 1").is_err());
+    }
+
+    // -- Arithmetic: multiplication --
+
+    #[test]
+    fn e2e_bigint_mul() {
+        let result = global_eval("3n * 4n").unwrap();
+        assert_eq!(result, JsValue::BigInt(12));
+    }
+
+    #[test]
+    fn e2e_bigint_mul_zero() {
+        let result = global_eval("100n * 0n").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_mul_negative() {
+        let result = global_eval("-3n * 4n").unwrap();
+        assert_eq!(result, JsValue::BigInt(-12));
+    }
+
+    #[test]
+    fn e2e_bigint_mul_both_negative() {
+        let result = global_eval("-3n * -4n").unwrap();
+        assert_eq!(result, JsValue::BigInt(12));
+    }
+
+    #[test]
+    fn e2e_bigint_mul_mixed_error() {
+        assert!(global_eval("2n * 3").is_err());
+    }
+
+    // -- Arithmetic: division --
+
+    #[test]
+    fn e2e_bigint_div() {
+        let result = global_eval("10n / 3n").unwrap();
+        assert_eq!(result, JsValue::BigInt(3)); // truncates
+    }
+
+    #[test]
+    fn e2e_bigint_div_exact() {
+        let result = global_eval("10n / 2n").unwrap();
+        assert_eq!(result, JsValue::BigInt(5));
+    }
+
+    #[test]
+    fn e2e_bigint_div_negative() {
+        let result = global_eval("-10n / 3n").unwrap();
+        assert_eq!(result, JsValue::BigInt(-3));
+    }
+
+    #[test]
+    fn e2e_bigint_div_by_zero_error() {
+        assert!(global_eval("10n / 0n").is_err());
+    }
+
+    #[test]
+    fn e2e_bigint_div_mixed_error() {
+        assert!(global_eval("10n / 2").is_err());
+    }
+
+    // -- Arithmetic: modulo --
+
+    #[test]
+    fn e2e_bigint_mod() {
+        let result = global_eval("10n % 3n").unwrap();
+        assert_eq!(result, JsValue::BigInt(1));
+    }
+
+    #[test]
+    fn e2e_bigint_mod_zero_result() {
+        let result = global_eval("10n % 5n").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_mod_negative() {
+        let result = global_eval("-10n % 3n").unwrap();
+        assert_eq!(result, JsValue::BigInt(-1));
+    }
+
+    #[test]
+    fn e2e_bigint_mod_by_zero_error() {
+        assert!(global_eval("10n % 0n").is_err());
+    }
+
+    #[test]
+    fn e2e_bigint_mod_mixed_error() {
+        assert!(global_eval("10n % 3").is_err());
+    }
+
+    // -- Arithmetic: exponentiation --
+
+    #[test]
+    fn e2e_bigint_exp() {
+        let result = global_eval("2n ** 10n").unwrap();
+        assert_eq!(result, JsValue::BigInt(1024));
+    }
+
+    #[test]
+    fn e2e_bigint_exp_zero() {
+        let result = global_eval("2n ** 0n").unwrap();
+        assert_eq!(result, JsValue::BigInt(1));
+    }
+
+    #[test]
+    fn e2e_bigint_exp_one() {
+        let result = global_eval("5n ** 1n").unwrap();
+        assert_eq!(result, JsValue::BigInt(5));
+    }
+
+    #[test]
+    fn e2e_bigint_exp_negative_exponent_error() {
+        assert!(global_eval("2n ** -1n").is_err());
+    }
+
+    #[test]
+    fn e2e_bigint_exp_mixed_error() {
+        assert!(global_eval("2n ** 3").is_err());
+    }
+
+    // -- Unary: negate --
+
+    #[test]
+    fn e2e_bigint_negate() {
+        let result = global_eval("-42n").unwrap();
+        assert_eq!(result, JsValue::BigInt(-42));
+    }
+
+    #[test]
+    fn e2e_bigint_negate_zero() {
+        let result = global_eval("-0n").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_negate_negative() {
+        // Double negate: -(-5n) = 5n; but this is parsed as `-(-(5n))`
+        let result = global_eval("let x = -5n; -x").unwrap();
+        assert_eq!(result, JsValue::BigInt(5));
+    }
+
+    // -- Unary: bitwise not --
+
+    #[test]
+    fn e2e_bigint_bitwise_not() {
+        let result = global_eval("~0n").unwrap();
+        assert_eq!(result, JsValue::BigInt(-1));
+    }
+
+    #[test]
+    fn e2e_bigint_bitwise_not_positive() {
+        let result = global_eval("~5n").unwrap();
+        assert_eq!(result, JsValue::BigInt(-6));
+    }
+
+    #[test]
+    fn e2e_bigint_bitwise_not_negative() {
+        let result = global_eval("~-1n").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    // -- Bitwise: OR --
+
+    #[test]
+    fn e2e_bigint_bitwise_or() {
+        let result = global_eval("5n | 3n").unwrap();
+        assert_eq!(result, JsValue::BigInt(7));
+    }
+
+    #[test]
+    fn e2e_bigint_bitwise_or_zero() {
+        let result = global_eval("0n | 0n").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_bitwise_or_mixed_error() {
+        assert!(global_eval("5n | 3").is_err());
+    }
+
+    // -- Bitwise: AND --
+
+    #[test]
+    fn e2e_bigint_bitwise_and() {
+        let result = global_eval("5n & 3n").unwrap();
+        assert_eq!(result, JsValue::BigInt(1));
+    }
+
+    #[test]
+    fn e2e_bigint_bitwise_and_zero() {
+        let result = global_eval("5n & 0n").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_bitwise_and_mixed_error() {
+        assert!(global_eval("5n & 3").is_err());
+    }
+
+    // -- Bitwise: XOR --
+
+    #[test]
+    fn e2e_bigint_bitwise_xor() {
+        let result = global_eval("5n ^ 3n").unwrap();
+        assert_eq!(result, JsValue::BigInt(6));
+    }
+
+    #[test]
+    fn e2e_bigint_bitwise_xor_same() {
+        let result = global_eval("7n ^ 7n").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_bitwise_xor_mixed_error() {
+        assert!(global_eval("5n ^ 3").is_err());
+    }
+
+    // -- Bitwise: shifts --
+
+    #[test]
+    fn e2e_bigint_shift_left() {
+        let result = global_eval("1n << 10n").unwrap();
+        assert_eq!(result, JsValue::BigInt(1024));
+    }
+
+    #[test]
+    fn e2e_bigint_shift_left_zero() {
+        let result = global_eval("5n << 0n").unwrap();
+        assert_eq!(result, JsValue::BigInt(5));
+    }
+
+    #[test]
+    fn e2e_bigint_shift_left_mixed_error() {
+        assert!(global_eval("1n << 2").is_err());
+    }
+
+    #[test]
+    fn e2e_bigint_shift_right() {
+        let result = global_eval("1024n >> 5n").unwrap();
+        assert_eq!(result, JsValue::BigInt(32));
+    }
+
+    #[test]
+    fn e2e_bigint_shift_right_zero() {
+        let result = global_eval("5n >> 0n").unwrap();
+        assert_eq!(result, JsValue::BigInt(5));
+    }
+
+    #[test]
+    fn e2e_bigint_shift_right_mixed_error() {
+        assert!(global_eval("1024n >> 5").is_err());
+    }
+
+    // -- Comparison: strict equality --
+
+    #[test]
+    fn e2e_bigint_strict_eq_same() {
+        let result = global_eval("42n === 42n").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_strict_eq_different() {
+        let result = global_eval("42n === 43n").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_bigint_strict_eq_number_false() {
+        let result = global_eval("42n === 42").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_bigint_strict_neq() {
+        let result = global_eval("42n !== 42").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_strict_eq_zero() {
+        let result = global_eval("0n === 0n").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // -- Comparison: abstract equality --
+
+    #[test]
+    fn e2e_bigint_abstract_eq_number() {
+        let result = global_eval("42n == 42").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_abstract_eq_number_reverse() {
+        let result = global_eval("42 == 42n").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_abstract_eq_different() {
+        let result = global_eval("42n == 43").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_bigint_abstract_eq_string() {
+        let result = global_eval("42n == '42'").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_abstract_eq_string_reverse() {
+        let result = global_eval("'42' == 42n").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_abstract_eq_string_mismatch() {
+        let result = global_eval("42n == 'hello'").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_bigint_abstract_neq() {
+        let result = global_eval("42n != 43").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_abstract_eq_zero() {
+        let result = global_eval("0n == 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_abstract_eq_false() {
+        let result = global_eval("0n == false").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_abstract_eq_true() {
+        let result = global_eval("1n == true").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // -- Comparison: relational --
+
+    #[test]
+    fn e2e_bigint_less_than() {
+        let result = global_eval("1n < 2n").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_less_than_false() {
+        let result = global_eval("2n < 1n").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_bigint_less_than_equal() {
+        let result = global_eval("2n < 2n").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_bigint_greater_than() {
+        let result = global_eval("2n > 1n").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_greater_than_false() {
+        let result = global_eval("1n > 2n").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_bigint_lte() {
+        let result = global_eval("2n <= 2n").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_gte() {
+        let result = global_eval("2n >= 2n").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_mixed_lt_number() {
+        let result = global_eval("1n < 2").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_mixed_gt_number() {
+        let result = global_eval("2n > 1").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_mixed_lt_reverse() {
+        let result = global_eval("1 < 2n").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_mixed_gt_reverse() {
+        let result = global_eval("2 > 1n").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // -- No implicit coercion --
+
+    #[test]
+    fn e2e_bigint_to_number_error() {
+        assert!(global_eval("Number(1n)").is_err());
+    }
+
+    // -- String coercion --
+
+    #[test]
+    fn e2e_bigint_string_concat() {
+        let result = global_eval("'' + 42n").unwrap();
+        assert_eq!(result, JsValue::String("42".into()));
+    }
+
+    #[test]
+    fn e2e_bigint_string_concat_reverse() {
+        let result = global_eval("42n + ''").unwrap();
+        assert_eq!(result, JsValue::String("42".into()));
+    }
+
+    #[test]
+    fn e2e_bigint_string_concat_negative() {
+        let result = global_eval("'' + -42n").unwrap();
+        assert_eq!(result, JsValue::String("-42".into()));
+    }
+
+    // -- BigInt() constructor --
+
+    #[test]
+    fn e2e_bigint_constructor_number() {
+        let result = global_eval("BigInt(42)").unwrap();
+        assert_eq!(result, JsValue::BigInt(42));
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_zero() {
+        let result = global_eval("BigInt(0)").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_negative() {
+        let result = global_eval("BigInt(-5)").unwrap();
+        assert_eq!(result, JsValue::BigInt(-5));
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_string() {
+        let result = global_eval("BigInt('123')").unwrap();
+        assert_eq!(result, JsValue::BigInt(123));
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_string_hex() {
+        let result = global_eval("BigInt('0xff')").unwrap();
+        assert_eq!(result, JsValue::BigInt(255));
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_string_octal() {
+        let result = global_eval("BigInt('0o77')").unwrap();
+        assert_eq!(result, JsValue::BigInt(63));
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_string_binary() {
+        let result = global_eval("BigInt('0b1010')").unwrap();
+        assert_eq!(result, JsValue::BigInt(10));
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_bool_true() {
+        let result = global_eval("BigInt(true)").unwrap();
+        assert_eq!(result, JsValue::BigInt(1));
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_bool_false() {
+        let result = global_eval("BigInt(false)").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_bigint() {
+        let result = global_eval("BigInt(42n)").unwrap();
+        assert_eq!(result, JsValue::BigInt(42));
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_float_error() {
+        assert!(global_eval("BigInt(1.5)").is_err());
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_nan_error() {
+        assert!(global_eval("BigInt(NaN)").is_err());
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_infinity_error() {
+        assert!(global_eval("BigInt(Infinity)").is_err());
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_invalid_string_error() {
+        assert!(global_eval("BigInt('hello')").is_err());
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_undefined_error() {
+        assert!(global_eval("BigInt(undefined)").is_err());
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_null_error() {
+        assert!(global_eval("BigInt(null)").is_err());
+    }
+
+    // -- BigInt.asIntN --
+
+    #[test]
+    fn e2e_bigint_as_int_n_positive() {
+        let result = global_eval("BigInt.asIntN(8, 127n)").unwrap();
+        assert_eq!(result, JsValue::BigInt(127));
+    }
+
+    #[test]
+    fn e2e_bigint_as_int_n_overflow() {
+        let result = global_eval("BigInt.asIntN(8, 128n)").unwrap();
+        assert_eq!(result, JsValue::BigInt(-128));
+    }
+
+    #[test]
+    fn e2e_bigint_as_int_n_negative() {
+        let result = global_eval("BigInt.asIntN(8, -129n)").unwrap();
+        assert_eq!(result, JsValue::BigInt(127));
+    }
+
+    #[test]
+    fn e2e_bigint_as_int_n_zero_bits() {
+        let result = global_eval("BigInt.asIntN(0, 42n)").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_as_int_n_16() {
+        let result = global_eval("BigInt.asIntN(16, 32768n)").unwrap();
+        assert_eq!(result, JsValue::BigInt(-32768));
+    }
+
+    #[test]
+    fn e2e_bigint_as_int_n_32() {
+        let result = global_eval("BigInt.asIntN(32, 2147483648n)").unwrap();
+        assert_eq!(result, JsValue::BigInt(-2147483648));
+    }
+
+    // -- BigInt.asUintN --
+
+    #[test]
+    fn e2e_bigint_as_uint_n_positive() {
+        let result = global_eval("BigInt.asUintN(8, 255n)").unwrap();
+        assert_eq!(result, JsValue::BigInt(255));
+    }
+
+    #[test]
+    fn e2e_bigint_as_uint_n_overflow() {
+        let result = global_eval("BigInt.asUintN(8, 256n)").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_as_uint_n_large() {
+        let result = global_eval("BigInt.asUintN(8, 257n)").unwrap();
+        assert_eq!(result, JsValue::BigInt(1));
+    }
+
+    #[test]
+    fn e2e_bigint_as_uint_n_zero_bits() {
+        let result = global_eval("BigInt.asUintN(0, 42n)").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_as_uint_n_16() {
+        let result = global_eval("BigInt.asUintN(16, 65536n)").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_as_uint_n_negative() {
+        let result = global_eval("BigInt.asUintN(8, -1n)").unwrap();
+        assert_eq!(result, JsValue::BigInt(255));
+    }
+
+    // -- ToBoolean --
+
+    #[test]
+    fn e2e_bigint_to_boolean_truthy() {
+        let result = global_eval("!!42n").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_to_boolean_falsy() {
+        let result = global_eval("!!0n").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_bigint_to_boolean_negative_truthy() {
+        let result = global_eval("!!-1n").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // -- Increment / Decrement --
+
+    #[test]
+    fn e2e_bigint_increment() {
+        let result = global_eval("let x = 5n; ++x").unwrap();
+        assert_eq!(result, JsValue::BigInt(6));
+    }
+
+    #[test]
+    fn e2e_bigint_decrement() {
+        let result = global_eval("let x = 5n; --x").unwrap();
+        assert_eq!(result, JsValue::BigInt(4));
+    }
+
+    #[test]
+    fn e2e_bigint_increment_zero() {
+        let result = global_eval("let x = 0n; ++x").unwrap();
+        assert_eq!(result, JsValue::BigInt(1));
+    }
+
+    #[test]
+    fn e2e_bigint_decrement_zero() {
+        let result = global_eval("let x = 0n; --x").unwrap();
+        assert_eq!(result, JsValue::BigInt(-1));
+    }
+
+    #[test]
+    fn e2e_bigint_postfix_increment() {
+        let result = global_eval("let x = 5n; x++; x").unwrap();
+        assert_eq!(result, JsValue::BigInt(6));
+    }
+
+    #[test]
+    fn e2e_bigint_postfix_decrement() {
+        let result = global_eval("let x = 5n; x--; x").unwrap();
+        assert_eq!(result, JsValue::BigInt(4));
+    }
+
+    // -- Variables and assignment --
+
+    #[test]
+    fn e2e_bigint_let_variable() {
+        let result = global_eval("let x = 42n; x").unwrap();
+        assert_eq!(result, JsValue::BigInt(42));
+    }
+
+    #[test]
+    fn e2e_bigint_reassign() {
+        let result = global_eval("let x = 1n; x = 2n; x").unwrap();
+        assert_eq!(result, JsValue::BigInt(2));
+    }
+
+    #[test]
+    fn e2e_bigint_add_assign() {
+        let result = global_eval("let x = 10n; x += 5n; x").unwrap();
+        assert_eq!(result, JsValue::BigInt(15));
+    }
+
+    #[test]
+    fn e2e_bigint_sub_assign() {
+        let result = global_eval("let x = 10n; x -= 3n; x").unwrap();
+        assert_eq!(result, JsValue::BigInt(7));
+    }
+
+    #[test]
+    fn e2e_bigint_mul_assign() {
+        let result = global_eval("let x = 3n; x *= 4n; x").unwrap();
+        assert_eq!(result, JsValue::BigInt(12));
+    }
+
+    #[test]
+    fn e2e_bigint_div_assign() {
+        let result = global_eval("let x = 10n; x /= 3n; x").unwrap();
+        assert_eq!(result, JsValue::BigInt(3));
+    }
+
+    #[test]
+    fn e2e_bigint_mod_assign() {
+        let result = global_eval("let x = 10n; x %= 3n; x").unwrap();
+        assert_eq!(result, JsValue::BigInt(1));
+    }
+
+    #[test]
+    fn e2e_bigint_exp_assign() {
+        let result = global_eval("let x = 2n; x **= 10n; x").unwrap();
+        assert_eq!(result, JsValue::BigInt(1024));
+    }
+
+    #[test]
+    fn e2e_bigint_bitwise_or_assign() {
+        let result = global_eval("let x = 5n; x |= 3n; x").unwrap();
+        assert_eq!(result, JsValue::BigInt(7));
+    }
+
+    #[test]
+    fn e2e_bigint_bitwise_and_assign() {
+        let result = global_eval("let x = 5n; x &= 3n; x").unwrap();
+        assert_eq!(result, JsValue::BigInt(1));
+    }
+
+    #[test]
+    fn e2e_bigint_bitwise_xor_assign() {
+        let result = global_eval("let x = 5n; x ^= 3n; x").unwrap();
+        assert_eq!(result, JsValue::BigInt(6));
+    }
+
+    #[test]
+    fn e2e_bigint_shift_left_assign() {
+        let result = global_eval("let x = 1n; x <<= 10n; x").unwrap();
+        assert_eq!(result, JsValue::BigInt(1024));
+    }
+
+    #[test]
+    fn e2e_bigint_shift_right_assign() {
+        let result = global_eval("let x = 1024n; x >>= 5n; x").unwrap();
+        assert_eq!(result, JsValue::BigInt(32));
+    }
+
+    // -- Control flow with BigInt --
+
+    #[test]
+    fn e2e_bigint_if_truthy() {
+        let result = global_eval("if (1n) { 42n } else { 0n }").unwrap();
+        assert_eq!(result, JsValue::BigInt(42));
+    }
+
+    #[test]
+    fn e2e_bigint_if_falsy() {
+        let result = global_eval("if (0n) { 42n } else { 0n }").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_ternary() {
+        let result = global_eval("1n ? 'yes' : 'no'").unwrap();
+        assert_eq!(result, JsValue::String("yes".into()));
+    }
+
+    #[test]
+    fn e2e_bigint_ternary_falsy() {
+        let result = global_eval("0n ? 'yes' : 'no'").unwrap();
+        assert_eq!(result, JsValue::String("no".into()));
+    }
+
+    // -- Loop with BigInt --
+
+    #[test]
+    fn e2e_bigint_while_loop() {
+        let result =
+            global_eval("let x = 0n; let i = 0n; while (i < 5n) { x += i; i += 1n; } x").unwrap();
+        assert_eq!(result, JsValue::BigInt(10)); // 0+1+2+3+4
+    }
+
+    #[test]
+    fn e2e_bigint_for_loop() {
+        let result =
+            global_eval("let sum = 0n; for (let i = 1n; i <= 5n; i += 1n) { sum += i; } sum")
+                .unwrap();
+        assert_eq!(result, JsValue::BigInt(15)); // 1+2+3+4+5
+    }
+
+    // -- Function with BigInt --
+
+    #[test]
+    fn e2e_bigint_function_return() {
+        let result = global_eval("function f() { return 42n; } f()").unwrap();
+        assert_eq!(result, JsValue::BigInt(42));
+    }
+
+    #[test]
+    fn e2e_bigint_function_parameter() {
+        let result = global_eval("function f(x) { return x + 1n; } f(41n)").unwrap();
+        assert_eq!(result, JsValue::BigInt(42));
+    }
+
+    #[test]
+    fn e2e_bigint_function_multiple_params() {
+        let result = global_eval("function add(a, b) { return a + b; } add(20n, 22n)").unwrap();
+        assert_eq!(result, JsValue::BigInt(42));
+    }
+
+    // -- Complex expressions --
+
+    #[test]
+    fn e2e_bigint_chained_arithmetic() {
+        let result = global_eval("1n + 2n + 3n + 4n + 5n").unwrap();
+        assert_eq!(result, JsValue::BigInt(15));
+    }
+
+    #[test]
+    fn e2e_bigint_parenthesized() {
+        let result = global_eval("(2n + 3n) * 4n").unwrap();
+        assert_eq!(result, JsValue::BigInt(20));
+    }
+
+    #[test]
+    fn e2e_bigint_nested_operations() {
+        let result = global_eval("2n ** 3n + 4n * 2n - 1n").unwrap();
+        assert_eq!(result, JsValue::BigInt(15)); // 8 + 8 - 1
+    }
+
+    #[test]
+    fn e2e_bigint_factorial_iterative() {
+        let result = global_eval(
+            "function factorial(n) { let r = 1n; for (let i = 2n; i <= n; i += 1n) { r *= i; } return r; } factorial(10n)"
+        ).unwrap();
+        assert_eq!(result, JsValue::BigInt(3_628_800));
+    }
+
+    #[test]
+    fn e2e_bigint_fibonacci() {
+        let result = global_eval(
+            "function fib(n) { let a = 0n; let b = 1n; for (let i = 0n; i < n; i += 1n) { let t = b; b = a + b; a = t; } return a; } fib(20n)"
+        ).unwrap();
+        assert_eq!(result, JsValue::BigInt(6765));
+    }
+
+    // -- Edge cases --
+
+    #[test]
+    fn e2e_bigint_max_safe_integer_plus_one() {
+        let result = global_eval("9007199254740991n + 1n").unwrap();
+        assert_eq!(result, JsValue::BigInt(9_007_199_254_740_992));
+    }
+
+    #[test]
+    fn e2e_bigint_very_large_mul() {
+        let result = global_eval("1000000000n * 1000000000n").unwrap();
+        assert_eq!(result, JsValue::BigInt(1_000_000_000_000_000_000));
+    }
+
+    #[test]
+    fn e2e_bigint_negative_large() {
+        let result = global_eval("-9007199254740993n").unwrap();
+        assert_eq!(result, JsValue::BigInt(-9_007_199_254_740_993));
+    }
+
+    // -- install_globals includes BigInt --
+
+    #[test]
+    fn test_install_globals_has_bigint() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        assert!(globals.contains_key("BigInt"));
+    }
+
+    #[test]
+    fn test_bigint_object_has_as_int_n() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let bigint = globals.get("BigInt").unwrap();
+        if let JsValue::PlainObject(map) = bigint {
+            let map = map.borrow();
+            assert!(map.contains_key("asIntN"));
+            assert!(map.contains_key("asUintN"));
+            assert!(map.contains_key("__call__"));
+        } else {
+            panic!("BigInt should be a PlainObject");
+        }
+    }
+
+    // -- BigInt constructor direct call tests --
+
+    #[test]
+    fn test_bigint_constructor_from_smi() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let bigint = globals.get("BigInt").unwrap();
+        if let JsValue::PlainObject(map) = bigint {
+            let call = map.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                let result = f(vec![JsValue::Smi(42)]).unwrap();
+                assert_eq!(result, JsValue::BigInt(42));
+            }
+        }
+    }
+
+    #[test]
+    fn test_bigint_constructor_from_heap_number() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let bigint = globals.get("BigInt").unwrap();
+        if let JsValue::PlainObject(map) = bigint {
+            let call = map.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                let result = f(vec![JsValue::HeapNumber(100.0)]).unwrap();
+                assert_eq!(result, JsValue::BigInt(100));
+            }
+        }
+    }
+
+    #[test]
+    fn test_bigint_constructor_from_float_fails() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let bigint = globals.get("BigInt").unwrap();
+        if let JsValue::PlainObject(map) = bigint {
+            let call = map.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                assert!(f(vec![JsValue::HeapNumber(1.5)]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn test_bigint_constructor_from_nan_fails() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let bigint = globals.get("BigInt").unwrap();
+        if let JsValue::PlainObject(map) = bigint {
+            let call = map.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                assert!(f(vec![JsValue::HeapNumber(f64::NAN)]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn test_bigint_constructor_from_string_negative() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let bigint = globals.get("BigInt").unwrap();
+        if let JsValue::PlainObject(map) = bigint {
+            let call = map.borrow().get("__call__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = call {
+                let result = f(vec![JsValue::String("-123".into())]).unwrap();
+                assert_eq!(result, JsValue::BigInt(-123));
+            }
+        }
+    }
+
+    #[test]
+    fn test_bigint_as_int_n_direct() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let bigint = globals.get("BigInt").unwrap();
+        if let JsValue::PlainObject(map) = bigint {
+            let as_int_n = map.borrow().get("asIntN").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = as_int_n {
+                // asIntN(8, 255n) = -1n
+                let result = f(vec![JsValue::Smi(8), JsValue::BigInt(255)]).unwrap();
+                assert_eq!(result, JsValue::BigInt(-1));
+            }
+        }
+    }
+
+    #[test]
+    fn test_bigint_as_uint_n_direct() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let bigint = globals.get("BigInt").unwrap();
+        if let JsValue::PlainObject(map) = bigint {
+            let as_uint_n = map.borrow().get("asUintN").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = as_uint_n {
+                // asUintN(8, 256n) = 0n
+                let result = f(vec![JsValue::Smi(8), JsValue::BigInt(256)]).unwrap();
+                assert_eq!(result, JsValue::BigInt(0));
+            }
+        }
+    }
+
+    // -- Additional edge cases and combinations --
+
+    #[test]
+    fn e2e_bigint_logical_and_truthy() {
+        let result = global_eval("1n && 2n").unwrap();
+        assert_eq!(result, JsValue::BigInt(2));
+    }
+
+    #[test]
+    fn e2e_bigint_logical_and_falsy() {
+        let result = global_eval("0n && 2n").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_logical_or_truthy() {
+        let result = global_eval("1n || 2n").unwrap();
+        assert_eq!(result, JsValue::BigInt(1));
+    }
+
+    #[test]
+    fn e2e_bigint_logical_or_falsy() {
+        let result = global_eval("0n || 2n").unwrap();
+        assert_eq!(result, JsValue::BigInt(2));
+    }
+
+    #[test]
+    fn e2e_bigint_nullish_coalescing() {
+        let result = global_eval("0n ?? 42n").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_power_of_two() {
+        let result = global_eval("2n ** 32n").unwrap();
+        assert_eq!(result, JsValue::BigInt(4_294_967_296));
+    }
+
+    #[test]
+    fn e2e_bigint_large_shift() {
+        let result = global_eval("1n << 32n").unwrap();
+        assert_eq!(result, JsValue::BigInt(4_294_967_296));
+    }
+
+    #[test]
+    fn e2e_bigint_xor_identity() {
+        let result = global_eval("42n ^ 42n").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_bigint_and_all_ones() {
+        let result = global_eval("255n & 15n").unwrap();
+        assert_eq!(result, JsValue::BigInt(15));
+    }
+
+    #[test]
+    fn e2e_bigint_or_complement() {
+        let result = global_eval("240n | 15n").unwrap();
+        assert_eq!(result, JsValue::BigInt(255));
+    }
+
+    #[test]
+    fn e2e_bigint_complex_expression() {
+        let result = global_eval("(10n + 20n) * 2n - 5n / 1n").unwrap();
+        assert_eq!(result, JsValue::BigInt(55));
+    }
+
+    #[test]
+    fn e2e_bigint_switch_case() {
+        let result = global_eval(
+            "let x = 2n; let r; switch (true) { case x === 1n: r = 'one'; break; case x === 2n: r = 'two'; break; default: r = 'other'; } r"
+        ).unwrap();
+        assert_eq!(result, JsValue::String("two".into()));
+    }
+
+    #[test]
+    fn e2e_bigint_conditional_chain() {
+        let result =
+            global_eval("let x = 5n; x > 3n ? x > 4n ? 'big' : 'medium' : 'small'").unwrap();
+        assert_eq!(result, JsValue::String("big".into()));
+    }
+
+    #[test]
+    fn e2e_bigint_recursive_sum() {
+        let result = global_eval(
+            "function sum(n) { if (n <= 0n) return 0n; return n + sum(n - 1n); } sum(10n)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::BigInt(55));
+    }
+
+    #[test]
+    fn e2e_bigint_power_iterative() {
+        let result = global_eval(
+            "function pow(b, e) { let r = 1n; for (let i = 0n; i < e; i += 1n) { r *= b; } return r; } pow(3n, 5n)"
+        ).unwrap();
+        assert_eq!(result, JsValue::BigInt(243));
+    }
+
+    #[test]
+    fn e2e_bigint_gcd() {
+        let result = global_eval(
+            "function gcd(a, b) { while (b !== 0n) { let t = b; b = a % b; a = t; } return a; } gcd(48n, 18n)"
+        ).unwrap();
+        assert_eq!(result, JsValue::BigInt(6));
+    }
+
+    #[test]
+    fn e2e_bigint_abs() {
+        let result = global_eval("let x = -42n; x < 0n ? -x : x").unwrap();
+        assert_eq!(result, JsValue::BigInt(42));
+    }
+
+    #[test]
+    fn e2e_bigint_min_of_two() {
+        let result = global_eval("let a = 10n; let b = 20n; a < b ? a : b").unwrap();
+        assert_eq!(result, JsValue::BigInt(10));
+    }
+
+    #[test]
+    fn e2e_bigint_max_of_two() {
+        let result = global_eval("let a = 10n; let b = 20n; a > b ? a : b").unwrap();
+        assert_eq!(result, JsValue::BigInt(20));
+    }
+
+    #[test]
+    fn e2e_bigint_div_truncates_toward_zero() {
+        // JS BigInt division truncates toward zero
+        let result = global_eval("7n / 2n").unwrap();
+        assert_eq!(result, JsValue::BigInt(3));
+    }
+
+    #[test]
+    fn e2e_bigint_div_negative_truncates_toward_zero() {
+        let result = global_eval("-7n / 2n").unwrap();
+        assert_eq!(result, JsValue::BigInt(-3));
+    }
+
+    #[test]
+    fn e2e_bigint_mod_sign_follows_dividend() {
+        let result = global_eval("-7n % 2n").unwrap();
+        assert_eq!(result, JsValue::BigInt(-1));
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_empty_string_error() {
+        assert!(global_eval("BigInt('')").is_err());
+    }
+
+    #[test]
+    fn e2e_bigint_string_with_suffix_n() {
+        // BigInt('42n') should fail — n suffix not valid in constructor
+        assert!(global_eval("BigInt('42n')").is_err());
+    }
+
+    #[test]
+    fn e2e_bigint_constructor_large_positive() {
+        let result = global_eval("BigInt('170141183460469231731687303715884105727')").unwrap();
+        assert_eq!(result, JsValue::BigInt(i128::MAX));
     }
 }

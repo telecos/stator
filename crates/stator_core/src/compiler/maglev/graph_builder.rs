@@ -1623,6 +1623,11 @@ impl<'a> GraphBuilder<'a> {
                 // opaque constant-pool reference.
                 ValueNode::ConstantPoolEntry { index: idx }
             }
+            ConstantPoolEntry::BigInt(_) => {
+                // BigInt constants are handled at runtime; emit an opaque
+                // constant-pool reference.
+                ValueNode::ConstantPoolEntry { index: idx }
+            }
             ConstantPoolEntry::TemplateObject { .. } => {
                 // Template objects are handled by GetTemplateObject at runtime;
                 // emit an opaque constant-pool reference.

@@ -1005,90 +1005,161 @@ impl Interpreter {
                         return Err(err_bad_operand("Sub", 0));
                     };
                     let rhs = frame.read_reg(v)?.clone();
-                    let lhs_n = frame.accumulator.to_number()?;
-                    let rhs_n = rhs.to_number()?;
-                    frame.accumulator = number_to_jsvalue(lhs_n - rhs_n);
+                    if frame.accumulator.is_bigint() || rhs.is_bigint() {
+                        let l = to_bigint(&frame.accumulator)?;
+                        let r = to_bigint(&rhs)?;
+                        frame.accumulator = JsValue::BigInt(l.wrapping_sub(r));
+                    } else {
+                        let lhs_n = frame.accumulator.to_number()?;
+                        let rhs_n = rhs.to_number()?;
+                        frame.accumulator = number_to_jsvalue(lhs_n - rhs_n);
+                    }
                 }
                 Opcode::Mul => {
                     let Operand::Register(v) = instr.operands[0] else {
                         return Err(err_bad_operand("Mul", 0));
                     };
                     let rhs = frame.read_reg(v)?.clone();
-                    let lhs_n = frame.accumulator.to_number()?;
-                    let rhs_n = rhs.to_number()?;
-                    frame.accumulator = number_to_jsvalue(lhs_n * rhs_n);
+                    if frame.accumulator.is_bigint() || rhs.is_bigint() {
+                        let l = to_bigint(&frame.accumulator)?;
+                        let r = to_bigint(&rhs)?;
+                        frame.accumulator = JsValue::BigInt(l.wrapping_mul(r));
+                    } else {
+                        let lhs_n = frame.accumulator.to_number()?;
+                        let rhs_n = rhs.to_number()?;
+                        frame.accumulator = number_to_jsvalue(lhs_n * rhs_n);
+                    }
                 }
                 Opcode::Div => {
                     let Operand::Register(v) = instr.operands[0] else {
                         return Err(err_bad_operand("Div", 0));
                     };
                     let rhs = frame.read_reg(v)?.clone();
-                    let lhs_n = frame.accumulator.to_number()?;
-                    let rhs_n = rhs.to_number()?;
-                    frame.accumulator = number_to_jsvalue(lhs_n / rhs_n);
+                    if frame.accumulator.is_bigint() || rhs.is_bigint() {
+                        let l = to_bigint(&frame.accumulator)?;
+                        let r = to_bigint(&rhs)?;
+                        if r == 0 {
+                            return Err(StatorError::RangeError("Division by zero".to_string()));
+                        }
+                        frame.accumulator = JsValue::BigInt(l / r);
+                    } else {
+                        let lhs_n = frame.accumulator.to_number()?;
+                        let rhs_n = rhs.to_number()?;
+                        frame.accumulator = number_to_jsvalue(lhs_n / rhs_n);
+                    }
                 }
                 Opcode::Mod => {
                     let Operand::Register(v) = instr.operands[0] else {
                         return Err(err_bad_operand("Mod", 0));
                     };
                     let rhs = frame.read_reg(v)?.clone();
-                    let lhs_n = frame.accumulator.to_number()?;
-                    let rhs_n = rhs.to_number()?;
-                    frame.accumulator = number_to_jsvalue(lhs_n % rhs_n);
+                    if frame.accumulator.is_bigint() || rhs.is_bigint() {
+                        let l = to_bigint(&frame.accumulator)?;
+                        let r = to_bigint(&rhs)?;
+                        if r == 0 {
+                            return Err(StatorError::RangeError("Division by zero".to_string()));
+                        }
+                        frame.accumulator = JsValue::BigInt(l % r);
+                    } else {
+                        let lhs_n = frame.accumulator.to_number()?;
+                        let rhs_n = rhs.to_number()?;
+                        frame.accumulator = number_to_jsvalue(lhs_n % rhs_n);
+                    }
                 }
                 Opcode::Exp => {
                     let Operand::Register(v) = instr.operands[0] else {
                         return Err(err_bad_operand("Exp", 0));
                     };
                     let rhs = frame.read_reg(v)?.clone();
-                    let lhs_n = frame.accumulator.to_number()?;
-                    let rhs_n = rhs.to_number()?;
-                    frame.accumulator = number_to_jsvalue(lhs_n.powf(rhs_n));
+                    if frame.accumulator.is_bigint() || rhs.is_bigint() {
+                        let l = to_bigint(&frame.accumulator)?;
+                        let r = to_bigint(&rhs)?;
+                        if r < 0 {
+                            return Err(StatorError::RangeError(
+                                "Exponent must be positive".to_string(),
+                            ));
+                        }
+                        frame.accumulator = JsValue::BigInt(bigint_pow(l, r as u32));
+                    } else {
+                        let lhs_n = frame.accumulator.to_number()?;
+                        let rhs_n = rhs.to_number()?;
+                        frame.accumulator = number_to_jsvalue(lhs_n.powf(rhs_n));
+                    }
                 }
                 Opcode::BitwiseOr => {
                     let Operand::Register(v) = instr.operands[0] else {
                         return Err(err_bad_operand("BitwiseOr", 0));
                     };
                     let rhs = frame.read_reg(v)?.clone();
-                    let lhs = frame.accumulator.to_number()? as i32;
-                    let rhs_i = rhs.to_number()? as i32;
-                    frame.accumulator = JsValue::Smi(lhs | rhs_i);
+                    if frame.accumulator.is_bigint() || rhs.is_bigint() {
+                        let l = to_bigint(&frame.accumulator)?;
+                        let r = to_bigint(&rhs)?;
+                        frame.accumulator = JsValue::BigInt(l | r);
+                    } else {
+                        let lhs = frame.accumulator.to_number()? as i32;
+                        let rhs_i = rhs.to_number()? as i32;
+                        frame.accumulator = JsValue::Smi(lhs | rhs_i);
+                    }
                 }
                 Opcode::BitwiseXor => {
                     let Operand::Register(v) = instr.operands[0] else {
                         return Err(err_bad_operand("BitwiseXor", 0));
                     };
                     let rhs = frame.read_reg(v)?.clone();
-                    let lhs = frame.accumulator.to_number()? as i32;
-                    let rhs_i = rhs.to_number()? as i32;
-                    frame.accumulator = JsValue::Smi(lhs ^ rhs_i);
+                    if frame.accumulator.is_bigint() || rhs.is_bigint() {
+                        let l = to_bigint(&frame.accumulator)?;
+                        let r = to_bigint(&rhs)?;
+                        frame.accumulator = JsValue::BigInt(l ^ r);
+                    } else {
+                        let lhs = frame.accumulator.to_number()? as i32;
+                        let rhs_i = rhs.to_number()? as i32;
+                        frame.accumulator = JsValue::Smi(lhs ^ rhs_i);
+                    }
                 }
                 Opcode::BitwiseAnd => {
                     let Operand::Register(v) = instr.operands[0] else {
                         return Err(err_bad_operand("BitwiseAnd", 0));
                     };
                     let rhs = frame.read_reg(v)?.clone();
-                    let lhs = frame.accumulator.to_number()? as i32;
-                    let rhs_i = rhs.to_number()? as i32;
-                    frame.accumulator = JsValue::Smi(lhs & rhs_i);
+                    if frame.accumulator.is_bigint() || rhs.is_bigint() {
+                        let l = to_bigint(&frame.accumulator)?;
+                        let r = to_bigint(&rhs)?;
+                        frame.accumulator = JsValue::BigInt(l & r);
+                    } else {
+                        let lhs = frame.accumulator.to_number()? as i32;
+                        let rhs_i = rhs.to_number()? as i32;
+                        frame.accumulator = JsValue::Smi(lhs & rhs_i);
+                    }
                 }
                 Opcode::ShiftLeft => {
                     let Operand::Register(v) = instr.operands[0] else {
                         return Err(err_bad_operand("ShiftLeft", 0));
                     };
                     let rhs = frame.read_reg(v)?.clone();
-                    let lhs = frame.accumulator.to_number()? as i32;
-                    let shift = (rhs.to_number()? as u32) & 0x1f;
-                    frame.accumulator = JsValue::Smi(lhs << shift);
+                    if frame.accumulator.is_bigint() || rhs.is_bigint() {
+                        let l = to_bigint(&frame.accumulator)?;
+                        let r = to_bigint(&rhs)?;
+                        frame.accumulator = JsValue::BigInt(l.wrapping_shl(r as u32));
+                    } else {
+                        let lhs = frame.accumulator.to_number()? as i32;
+                        let shift = (rhs.to_number()? as u32) & 0x1f;
+                        frame.accumulator = JsValue::Smi(lhs << shift);
+                    }
                 }
                 Opcode::ShiftRight => {
                     let Operand::Register(v) = instr.operands[0] else {
                         return Err(err_bad_operand("ShiftRight", 0));
                     };
                     let rhs = frame.read_reg(v)?.clone();
-                    let lhs = frame.accumulator.to_number()? as i32;
-                    let shift = (rhs.to_number()? as u32) & 0x1f;
-                    frame.accumulator = JsValue::Smi(lhs >> shift);
+                    if frame.accumulator.is_bigint() || rhs.is_bigint() {
+                        let l = to_bigint(&frame.accumulator)?;
+                        let r = to_bigint(&rhs)?;
+                        frame.accumulator = JsValue::BigInt(l.wrapping_shr(r as u32));
+                    } else {
+                        let lhs = frame.accumulator.to_number()? as i32;
+                        let shift = (rhs.to_number()? as u32) & 0x1f;
+                        frame.accumulator = JsValue::Smi(lhs >> shift);
+                    }
                 }
                 Opcode::ShiftRightLogical => {
                     let Operand::Register(v) = instr.operands[0] else {
@@ -1106,80 +1177,135 @@ impl Interpreter {
                     let Operand::Immediate(imm) = instr.operands[0] else {
                         return Err(err_bad_operand("AddSmi", 0));
                     };
-                    let lhs_n = frame.accumulator.to_number()?;
-                    frame.accumulator = number_to_jsvalue(lhs_n + imm as f64);
+                    if let JsValue::BigInt(n) = &frame.accumulator {
+                        frame.accumulator = JsValue::BigInt(n.wrapping_add(i128::from(imm)));
+                    } else {
+                        let lhs_n = frame.accumulator.to_number()?;
+                        frame.accumulator = number_to_jsvalue(lhs_n + imm as f64);
+                    }
                 }
                 Opcode::SubSmi => {
                     let Operand::Immediate(imm) = instr.operands[0] else {
                         return Err(err_bad_operand("SubSmi", 0));
                     };
-                    let lhs_n = frame.accumulator.to_number()?;
-                    frame.accumulator = number_to_jsvalue(lhs_n - imm as f64);
+                    if let JsValue::BigInt(n) = &frame.accumulator {
+                        frame.accumulator = JsValue::BigInt(n.wrapping_sub(i128::from(imm)));
+                    } else {
+                        let lhs_n = frame.accumulator.to_number()?;
+                        frame.accumulator = number_to_jsvalue(lhs_n - imm as f64);
+                    }
                 }
                 Opcode::MulSmi => {
                     let Operand::Immediate(imm) = instr.operands[0] else {
                         return Err(err_bad_operand("MulSmi", 0));
                     };
-                    let lhs_n = frame.accumulator.to_number()?;
-                    frame.accumulator = number_to_jsvalue(lhs_n * imm as f64);
+                    if let JsValue::BigInt(n) = &frame.accumulator {
+                        frame.accumulator = JsValue::BigInt(n.wrapping_mul(i128::from(imm)));
+                    } else {
+                        let lhs_n = frame.accumulator.to_number()?;
+                        frame.accumulator = number_to_jsvalue(lhs_n * imm as f64);
+                    }
                 }
                 Opcode::DivSmi => {
                     let Operand::Immediate(imm) = instr.operands[0] else {
                         return Err(err_bad_operand("DivSmi", 0));
                     };
-                    let lhs_n = frame.accumulator.to_number()?;
-                    frame.accumulator = number_to_jsvalue(lhs_n / imm as f64);
+                    if let JsValue::BigInt(n) = &frame.accumulator {
+                        if imm == 0 {
+                            return Err(StatorError::RangeError("Division by zero".to_string()));
+                        }
+                        frame.accumulator = JsValue::BigInt(n / i128::from(imm));
+                    } else {
+                        let lhs_n = frame.accumulator.to_number()?;
+                        frame.accumulator = number_to_jsvalue(lhs_n / imm as f64);
+                    }
                 }
                 Opcode::ModSmi => {
                     let Operand::Immediate(imm) = instr.operands[0] else {
                         return Err(err_bad_operand("ModSmi", 0));
                     };
-                    let lhs_n = frame.accumulator.to_number()?;
-                    frame.accumulator = number_to_jsvalue(lhs_n % imm as f64);
+                    if let JsValue::BigInt(n) = &frame.accumulator {
+                        if imm == 0 {
+                            return Err(StatorError::RangeError("Division by zero".to_string()));
+                        }
+                        frame.accumulator = JsValue::BigInt(n % i128::from(imm));
+                    } else {
+                        let lhs_n = frame.accumulator.to_number()?;
+                        frame.accumulator = number_to_jsvalue(lhs_n % imm as f64);
+                    }
                 }
                 Opcode::ExpSmi => {
                     let Operand::Immediate(imm) = instr.operands[0] else {
                         return Err(err_bad_operand("ExpSmi", 0));
                     };
-                    let lhs_n = frame.accumulator.to_number()?;
-                    frame.accumulator = number_to_jsvalue(lhs_n.powf(imm as f64));
+                    if let JsValue::BigInt(n) = &frame.accumulator {
+                        if imm < 0 {
+                            return Err(StatorError::RangeError(
+                                "Exponent must be positive".to_string(),
+                            ));
+                        }
+                        frame.accumulator = JsValue::BigInt(bigint_pow(*n, imm as u32));
+                    } else {
+                        let lhs_n = frame.accumulator.to_number()?;
+                        frame.accumulator = number_to_jsvalue(lhs_n.powf(imm as f64));
+                    }
                 }
                 Opcode::BitwiseOrSmi => {
                     let Operand::Immediate(imm) = instr.operands[0] else {
                         return Err(err_bad_operand("BitwiseOrSmi", 0));
                     };
-                    let lhs = frame.accumulator.to_number()? as i32;
-                    frame.accumulator = JsValue::Smi(lhs | imm);
+                    if let JsValue::BigInt(n) = &frame.accumulator {
+                        frame.accumulator = JsValue::BigInt(n | i128::from(imm));
+                    } else {
+                        let lhs = frame.accumulator.to_number()? as i32;
+                        frame.accumulator = JsValue::Smi(lhs | imm);
+                    }
                 }
                 Opcode::BitwiseXorSmi => {
                     let Operand::Immediate(imm) = instr.operands[0] else {
                         return Err(err_bad_operand("BitwiseXorSmi", 0));
                     };
-                    let lhs = frame.accumulator.to_number()? as i32;
-                    frame.accumulator = JsValue::Smi(lhs ^ imm);
+                    if let JsValue::BigInt(n) = &frame.accumulator {
+                        frame.accumulator = JsValue::BigInt(n ^ i128::from(imm));
+                    } else {
+                        let lhs = frame.accumulator.to_number()? as i32;
+                        frame.accumulator = JsValue::Smi(lhs ^ imm);
+                    }
                 }
                 Opcode::BitwiseAndSmi => {
                     let Operand::Immediate(imm) = instr.operands[0] else {
                         return Err(err_bad_operand("BitwiseAndSmi", 0));
                     };
-                    let lhs = frame.accumulator.to_number()? as i32;
-                    frame.accumulator = JsValue::Smi(lhs & imm);
+                    if let JsValue::BigInt(n) = &frame.accumulator {
+                        frame.accumulator = JsValue::BigInt(n & i128::from(imm));
+                    } else {
+                        let lhs = frame.accumulator.to_number()? as i32;
+                        frame.accumulator = JsValue::Smi(lhs & imm);
+                    }
                 }
                 Opcode::ShiftLeftSmi => {
                     let Operand::Immediate(imm) = instr.operands[0] else {
                         return Err(err_bad_operand("ShiftLeftSmi", 0));
                     };
-                    let lhs = frame.accumulator.to_number()? as i32;
-                    let shift = (imm as u32) & 0x1f;
-                    frame.accumulator = JsValue::Smi(lhs << shift);
+                    if let JsValue::BigInt(n) = &frame.accumulator {
+                        frame.accumulator = JsValue::BigInt(n.wrapping_shl(imm as u32));
+                    } else {
+                        let lhs = frame.accumulator.to_number()? as i32;
+                        let shift = (imm as u32) & 0x1f;
+                        frame.accumulator = JsValue::Smi(lhs << shift);
+                    }
                 }
                 Opcode::ShiftRightSmi => {
                     let Operand::Immediate(imm) = instr.operands[0] else {
                         return Err(err_bad_operand("ShiftRightSmi", 0));
                     };
-                    let lhs = frame.accumulator.to_number()? as i32;
-                    let shift = (imm as u32) & 0x1f;
-                    frame.accumulator = JsValue::Smi(lhs >> shift);
+                    if let JsValue::BigInt(n) = &frame.accumulator {
+                        frame.accumulator = JsValue::BigInt(n.wrapping_shr(imm as u32));
+                    } else {
+                        let lhs = frame.accumulator.to_number()? as i32;
+                        let shift = (imm as u32) & 0x1f;
+                        frame.accumulator = JsValue::Smi(lhs >> shift);
+                    }
                 }
                 Opcode::ShiftRightLogicalSmi => {
                     let Operand::Immediate(imm) = instr.operands[0] else {
@@ -1193,13 +1319,21 @@ impl Interpreter {
 
                 Opcode::Inc => {
                     // operands[0] is a FeedbackSlot, ignored at runtime.
-                    let n = frame.accumulator.to_number()?;
-                    frame.accumulator = number_to_jsvalue(n + 1.0);
+                    if let JsValue::BigInt(n) = &frame.accumulator {
+                        frame.accumulator = JsValue::BigInt(n.wrapping_add(1));
+                    } else {
+                        let n = frame.accumulator.to_number()?;
+                        frame.accumulator = number_to_jsvalue(n + 1.0);
+                    }
                 }
                 Opcode::Dec => {
                     // operands[0] is a FeedbackSlot, ignored at runtime.
-                    let n = frame.accumulator.to_number()?;
-                    frame.accumulator = number_to_jsvalue(n - 1.0);
+                    if let JsValue::BigInt(n) = &frame.accumulator {
+                        frame.accumulator = JsValue::BigInt(n.wrapping_sub(1));
+                    } else {
+                        let n = frame.accumulator.to_number()?;
+                        frame.accumulator = number_to_jsvalue(n - 1.0);
+                    }
                 }
 
                 // ── Comparisons ────────────────────────────────────────────
@@ -2666,13 +2800,21 @@ impl Interpreter {
                 // ── Unary arithmetic ──────────────────────────────────────────
                 Opcode::Negate => {
                     // operands[0] is a FeedbackSlot, ignored at runtime.
-                    let n = frame.accumulator.to_number()?;
-                    frame.accumulator = number_to_jsvalue(-n);
+                    if let JsValue::BigInt(n) = &frame.accumulator {
+                        frame.accumulator = JsValue::BigInt(n.wrapping_neg());
+                    } else {
+                        let n = frame.accumulator.to_number()?;
+                        frame.accumulator = number_to_jsvalue(-n);
+                    }
                 }
                 Opcode::BitwiseNot => {
                     // operands[0] is a FeedbackSlot, ignored at runtime.
-                    let n = frame.accumulator.to_number()? as i32;
-                    frame.accumulator = JsValue::Smi(!n);
+                    if let JsValue::BigInt(n) = &frame.accumulator {
+                        frame.accumulator = JsValue::BigInt(!n);
+                    } else {
+                        let n = frame.accumulator.to_number()? as i32;
+                        frame.accumulator = JsValue::Smi(!n);
+                    }
                 }
 
                 // CreateEmptyObjectLiteral:
@@ -4234,6 +4376,7 @@ fn constant_to_value(entry: &ConstantPoolEntry) -> JsValue {
         ConstantPoolEntry::Boolean(b) => JsValue::Boolean(*b),
         ConstantPoolEntry::Null => JsValue::Null,
         ConstantPoolEntry::Undefined => JsValue::Undefined,
+        ConstantPoolEntry::BigInt(n) => JsValue::BigInt(*n),
         ConstantPoolEntry::Function(ba) => JsValue::Function(Rc::new((**ba).clone())),
         ConstantPoolEntry::TemplateObject { cooked, raw } => build_template_object(cooked, raw),
     }
@@ -4323,15 +4466,44 @@ fn number_to_jsvalue(n: f64) -> JsValue {
     }
 }
 
+/// Return a `TypeError` for mixed BigInt/Number operations.
+fn mixed_bigint_number_error() -> StatorError {
+    StatorError::TypeError(
+        "Cannot mix BigInt and other types, use explicit conversions".to_string(),
+    )
+}
+
+/// Extract the `i128` value from a BigInt, or return a TypeError for mixed operations.
+fn to_bigint(val: &JsValue) -> StatorResult<i128> {
+    match val {
+        JsValue::BigInt(n) => Ok(*n),
+        _ => Err(mixed_bigint_number_error()),
+    }
+}
+
+/// BigInt exponentiation with wrapping semantics.
+fn bigint_pow(base: i128, exp: u32) -> i128 {
+    let mut result: i128 = 1;
+    for _ in 0..exp {
+        result = result.wrapping_mul(base);
+    }
+    result
+}
+
 /// ECMAScript `+` operator: string concatenation or numeric addition.
 ///
 /// If either operand is already a string, both are converted to strings and
 /// concatenated.  Otherwise both are converted to numbers and added.
+/// BigInt operands are added together; mixing BigInt and Number is a TypeError.
 fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
     if lhs.is_string() || rhs.is_string() {
         let l = lhs.to_js_string()?;
         let r = rhs.to_js_string()?;
         Ok(JsValue::String(l + &r))
+    } else if lhs.is_bigint() || rhs.is_bigint() {
+        let l = to_bigint(lhs)?;
+        let r = to_bigint(rhs)?;
+        Ok(JsValue::BigInt(l.wrapping_add(r)))
     } else {
         let l = lhs.to_number()?;
         let r = rhs.to_number()?;
@@ -4347,6 +4519,25 @@ fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
 fn js_less_than(lhs: &JsValue, rhs: &JsValue) -> StatorResult<bool> {
     if let (JsValue::String(a), JsValue::String(b)) = (lhs, rhs) {
         return Ok(a < b);
+    }
+    // BigInt × BigInt
+    if let (JsValue::BigInt(a), JsValue::BigInt(b)) = (lhs, rhs) {
+        return Ok(a < b);
+    }
+    // BigInt × Number and Number × BigInt (mixed comparison is allowed)
+    if let (JsValue::BigInt(a), rhs_val) = (lhs, rhs) {
+        let r = rhs_val.to_number()?;
+        if r.is_nan() {
+            return Ok(false);
+        }
+        return Ok((*a as f64) < r);
+    }
+    if let (lhs_val, JsValue::BigInt(b)) = (lhs, rhs) {
+        let l = lhs_val.to_number()?;
+        if l.is_nan() {
+            return Ok(false);
+        }
+        return Ok(l < (*b as f64));
     }
     let l = lhs.to_number()?;
     let r = rhs.to_number()?;
@@ -4364,6 +4555,8 @@ fn abstract_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
         (JsValue::Boolean(a), JsValue::Boolean(b)) => a == b,
         (JsValue::String(a), JsValue::String(b)) => a == b,
         (JsValue::Symbol(a), JsValue::Symbol(b)) => a == b,
+        // BigInt × BigInt
+        (JsValue::BigInt(a), JsValue::BigInt(b)) => a == b,
         // Numeric — covers Smi×Smi, Smi×HeapNumber, HeapNumber×HeapNumber.
         (lhs, rhs) if lhs.is_number() && rhs.is_number() => {
             matches!((lhs.to_number(), rhs.to_number()), (Ok(a), Ok(b)) if a == b)
@@ -4373,6 +4566,36 @@ fn abstract_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
         // Boolean → Number coercion (ECMAScript §7.2.13 steps 9/10).
         (JsValue::Boolean(b), _) => abstract_eq(&JsValue::Smi(i32::from(*b)), rhs),
         (_, JsValue::Boolean(b)) => abstract_eq(lhs, &JsValue::Smi(i32::from(*b))),
+        // BigInt × Number and Number × BigInt (mixed comparison is allowed for ==).
+        (JsValue::BigInt(a), rhs_val) if rhs_val.is_number() => {
+            if let Ok(r) = rhs_val.to_number() {
+                if r.is_nan() || r.is_infinite() {
+                    return false;
+                }
+                if r.fract() != 0.0 {
+                    return false;
+                }
+                *a == r as i128
+            } else {
+                false
+            }
+        }
+        (lhs_val, JsValue::BigInt(b)) if lhs_val.is_number() => {
+            if let Ok(l) = lhs_val.to_number() {
+                if l.is_nan() || l.is_infinite() {
+                    return false;
+                }
+                if l.fract() != 0.0 {
+                    return false;
+                }
+                l as i128 == *b
+            } else {
+                false
+            }
+        }
+        // BigInt × String: parse string as BigInt.
+        (JsValue::BigInt(a), JsValue::String(s)) => s.trim().parse::<i128>() == Ok(*a),
+        (JsValue::String(s), JsValue::BigInt(b)) => s.trim().parse::<i128>() == Ok(*b),
         // String → Number coercion (steps 5/6).
         (JsValue::String(s), _) if rhs.is_number() => {
             let n: f64 = s.trim().parse().unwrap_or(f64::NAN);
@@ -4396,6 +4619,7 @@ fn strict_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
         (JsValue::Boolean(a), JsValue::Boolean(b)) => a == b,
         (JsValue::String(a), JsValue::String(b)) => a == b,
         (JsValue::Symbol(a), JsValue::Symbol(b)) => a == b,
+        (JsValue::BigInt(a), JsValue::BigInt(b)) => a == b,
         // Numeric — IEEE 754: NaN !== NaN is handled correctly by f64's PartialEq.
         (JsValue::Smi(a), JsValue::Smi(b)) => a == b,
         (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => a == b,
