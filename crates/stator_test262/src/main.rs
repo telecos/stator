@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use stator_core::builtins::error::clear_call_stack;
+use stator_core::builtins::install_globals::install_globals;
 use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_core::error::StatorError;
 use stator_core::interpreter::{Interpreter, InterpreterFrame};
@@ -258,13 +259,16 @@ impl HarnessCache {
     fn build_prefix(&mut self, includes: &[String]) -> String {
         let mut parts: Vec<String> = Vec::new();
 
-        // sta.js is always first.
+        // sta.js and assert.js are always prepended per the Test262 spec.
         if let Ok(s) = self.get("sta.js") {
+            parts.push(s.to_string());
+        }
+        if let Ok(s) = self.get("assert.js") {
             parts.push(s.to_string());
         }
 
         for name in includes {
-            if name == "sta.js" {
+            if name == "sta.js" || name == "assert.js" {
                 continue; // Already added above.
             }
             if let Ok(s) = self.get(name) {
@@ -341,8 +345,25 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "regexp-v-flag",
     // Internationalisation
     "Intl",
+    // Temporal (draft proposal — requires `super`, `class`, advanced object model)
+    "Temporal",
+    // Destructuring (not yet compiled)
+    "destructuring-binding",
+    "destructuring-assignment",
     // Miscellaneous
     "globalThis",
+    // Tail calls
+    "tail-call-optimization",
+    // TypedArrays / ArrayBuffer
+    "TypedArray",
+    "ArrayBuffer",
+    "DataView",
+    "resizable-arraybuffer",
+    // For-of / spread / iterators (require Symbol.iterator)
+    "for-of",
+    // ShadowRealm / Disposable
+    "ShadowRealm",
+    "explicit-resource-management",
 ];
 
 /// Returns `true` when the feature list contains at least one unsupported tag.
@@ -359,10 +380,14 @@ fn has_unsupported_feature(features: &[String]) -> bool {
 /// Provides a silent `print` stub (some harness files call it) and a minimal
 /// `$262` object with `gc()` and `evalScript()` stubs.
 fn make_test_globals() -> Rc<RefCell<HashMap<String, JsValue>>> {
-    let globals: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+    let mut map = HashMap::new();
+
+    // Install all standard built-in constructors, namespace objects, and
+    // global functions (Object, Array, Number, Error, Math, JSON, …).
+    install_globals(&mut map);
 
     // Silent print — some harness files reference it.
-    globals.borrow_mut().insert(
+    map.insert(
         "print".to_string(),
         JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined))),
     );
@@ -377,15 +402,14 @@ fn make_test_globals() -> Rc<RefCell<HashMap<String, JsValue>>> {
         "evalScript".to_string(),
         JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined))),
     );
-    globals
-        .borrow_mut()
-        .insert("$262".to_string(), JsValue::PlainObject(obj_262));
+    map.insert("$262".to_string(), JsValue::PlainObject(obj_262));
 
-    globals
+    Rc::new(RefCell::new(map))
 }
 
 /// Returns `true` when `err` matches the Test262 `type` string from a
 /// `negative` frontmatter entry.
+#[cfg(test)]
 fn error_matches_type(err: &StatorError, expected: &str) -> bool {
     match (err, expected) {
         (StatorError::SyntaxError(_), "SyntaxError") => true,
@@ -423,56 +447,104 @@ fn execute_source(source: &str, harness_prefix: &str) -> Result<JsValue, StatorE
 }
 
 /// Runs a single Test262 test and returns its outcome.
+///
+/// Each test is spawned on a dedicated thread (with 32 MB of stack) so that a
+/// stack overflow in the parser or compiler only terminates that thread
+/// instead of aborting the entire process.
 fn run_test(source: &str, harness_prefix: &str, meta: &TestMeta) -> TestOutcome {
-    // Wrap execution in catch_unwind to gracefully handle stack overflows
-    // or other panics from pathological test inputs.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        execute_source(source, harness_prefix)
-    }));
+    let source = source.to_string();
+    let harness_prefix = harness_prefix.to_string();
+    let negative = meta
+        .negative
+        .as_ref()
+        .map(|n| (n.phase.clone(), n.type_.clone()));
 
-    // A panic inside the interpreter may leave frames on the thread-local
-    // call stack (because panics bypass the normal pop_call_frame() calls).
-    // Clear it unconditionally so the next test starts with a clean slate.
-    clear_call_stack();
+    let builder = std::thread::Builder::new()
+        .name("test262-worker".into())
+        .stack_size(128 * 1024 * 1024); // 128 MB per test
 
-    let result = match result {
-        Ok(r) => r,
-        Err(_) => return TestOutcome::Fail("panicked (likely stack overflow)".into()),
-    };
+    let handle = builder
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                execute_source(&source, &harness_prefix)
+            }));
 
-    if let Some(neg) = &meta.negative {
-        match neg.phase.as_str() {
-            // "parse" errors occur during parsing (invalid token sequences).
-            // "early" errors are static-semantics violations caught at
-            // compile time (e.g. `return` outside a function).  Both phases
-            // surface as `StatorError::SyntaxError` in our engine because we
-            // combine parsing and static-semantic checking into one pass.
-            "parse" | "early" => match result {
-                Err(StatorError::SyntaxError(_)) => TestOutcome::Pass,
-                Err(e) => {
-                    TestOutcome::Fail(format!("expected {} SyntaxError, got: {e}", neg.phase))
+            // A panic inside the interpreter may leave frames on the
+            // thread-local call stack (because panics bypass the normal
+            // pop_call_frame() calls).  Clear it so the next test on this
+            // thread (if any) starts with a clean slate.
+            clear_call_stack();
+
+            // Convert JsValue result to a simple Send-able representation
+            // before crossing the thread boundary.
+            let outcome: Result<(), (String, String)> = match result {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(ref e)) => {
+                    let kind = match e {
+                        StatorError::SyntaxError(_) => "SyntaxError",
+                        StatorError::TypeError(_) => "TypeError",
+                        StatorError::ReferenceError(_) => "ReferenceError",
+                        StatorError::RangeError(_) => "RangeError",
+                        StatorError::URIError(_) => "URIError",
+                        StatorError::JsException(repr) => {
+                            if repr.contains("TypeError") {
+                                "TypeError"
+                            } else if repr.contains("RangeError") {
+                                "RangeError"
+                            } else if repr.contains("ReferenceError") {
+                                "ReferenceError"
+                            } else if repr.contains("SyntaxError") {
+                                "SyntaxError"
+                            } else {
+                                "JsException"
+                            }
+                        }
+                        _ => "Error",
+                    };
+                    Err((kind.to_string(), e.to_string()))
                 }
-                Ok(_) => TestOutcome::Fail(format!(
-                    "expected {} SyntaxError but test succeeded",
-                    neg.phase
+                Err(_) => Err((
+                    "Panic".to_string(),
+                    "panicked (likely stack overflow)".to_string(),
                 )),
-            },
-            "runtime" => match result {
-                Err(ref e) if error_matches_type(e, &neg.type_) => TestOutcome::Pass,
-                Err(ref e) => {
-                    TestOutcome::Fail(format!("expected runtime {}, got: {e}", neg.type_))
+            };
+
+            // Evaluate outcome against negative expectations inside the
+            // thread so that non-Send JsValue never crosses boundaries.
+            if let Some((phase, type_)) = negative {
+                match phase.as_str() {
+                    "parse" | "early" => match outcome {
+                        Err((ref kind, _)) if kind == "SyntaxError" => TestOutcome::Pass,
+                        Err((_, msg)) => {
+                            TestOutcome::Fail(format!("expected {phase} SyntaxError, got: {msg}"))
+                        }
+                        Ok(()) => TestOutcome::Fail(format!(
+                            "expected {phase} SyntaxError but test succeeded"
+                        )),
+                    },
+                    "runtime" => match outcome {
+                        Err((ref kind, _)) if *kind == type_ => TestOutcome::Pass,
+                        Err((_, msg)) => {
+                            TestOutcome::Fail(format!("expected runtime {type_}, got: {msg}"))
+                        }
+                        Ok(()) => TestOutcome::Fail(format!(
+                            "expected runtime {type_} but test succeeded"
+                        )),
+                    },
+                    other => TestOutcome::Skip(format!("unsupported negative phase: {other}")),
                 }
-                Ok(_) => {
-                    TestOutcome::Fail(format!("expected runtime {} but test succeeded", neg.type_))
+            } else {
+                match outcome {
+                    Ok(()) => TestOutcome::Pass,
+                    Err((_, msg)) => TestOutcome::Fail(msg),
                 }
-            },
-            other => TestOutcome::Skip(format!("unsupported negative phase: {other}")),
-        }
-    } else {
-        match result {
-            Ok(_) => TestOutcome::Pass,
-            Err(e) => TestOutcome::Fail(e.to_string()),
-        }
+            }
+        })
+        .expect("failed to spawn test worker thread");
+
+    match handle.join() {
+        Ok(outcome) => outcome,
+        Err(_) => TestOutcome::Fail("thread panicked (likely stack overflow)".into()),
     }
 }
 
@@ -717,6 +789,10 @@ fn main_inner() {
                 }
             }
         }
+
+        // Reset the thread-local call stack so that a failed test with
+        // leftover frames does not pollute subsequent runs.
+        clear_call_stack();
 
         // Periodic progress line (every 500 tests, unless verbose).
         if !cli.verbose && (idx + 1) % 500 == 0 {
