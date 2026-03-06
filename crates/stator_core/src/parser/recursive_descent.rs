@@ -2626,6 +2626,13 @@ impl<'src> Parser<'src> {
                             None
                         };
 
+                        // Check for generator `*` modifier.
+                        let is_generator_method = if getter_setter_kind.is_none() {
+                            self.eat(TokenKind::Star)?
+                        } else {
+                            false
+                        };
+
                         // Parse the property key.
                         let (key, is_computed) = match self.peek_kind() {
                             // Computed property: `[expr]`
@@ -2724,8 +2731,12 @@ impl<'src> Parser<'src> {
                                 MethodKind::Set => PropValue::Set(fn_expr),
                                 _ => unreachable!(),
                             }
-                        } else if is_async_method || self.peek_kind() == TokenKind::LeftParen {
-                            // Method shorthand: `key(params) { … }` or `async key(params) { … }`
+                        } else if is_async_method
+                            || is_generator_method
+                            || self.peek_kind() == TokenKind::LeftParen
+                        {
+                            // Method shorthand: `key(params) { … }`, `async key(params) { … }`,
+                            // or `*key(params) { … }` (generator method).
                             let fn_start = self.current_span();
                             self.expect(TokenKind::LeftParen)?;
                             let params = self.parse_formal_params()?;
@@ -2735,7 +2746,7 @@ impl<'src> Parser<'src> {
                                 loc: Self::merge_spans(fn_start, fn_end),
                                 id: None,
                                 is_async: is_async_method,
-                                is_generator: false,
+                                is_generator: is_generator_method,
                                 params,
                                 body,
                             })
@@ -6201,6 +6212,102 @@ mod tests {
             }
         } else {
             panic!("expected VarDecl");
+        }
+    }
+
+    // ── Object-literal generator methods ─────────────────────────────────────
+
+    #[test]
+    fn test_object_generator_method() {
+        let prog = parse("var o = { *gen() { yield 1; } };").unwrap();
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(Expr::Object(obj)) = vd.declarators[0].init.as_deref() {
+                if let ObjectProp::Prop(p) = &obj.properties[0] {
+                    if let PropValue::Method(ref fe) = p.value {
+                        assert!(fe.is_generator, "should be generator");
+                        assert!(!fe.is_async, "should not be async");
+                    } else {
+                        panic!("expected Method PropValue");
+                    }
+                    if let PropKey::Ident(ref id) = p.key {
+                        assert_eq!(id.name, "gen");
+                    } else {
+                        panic!("expected Ident key");
+                    }
+                } else {
+                    panic!("expected Prop");
+                }
+            } else {
+                panic!("expected Object");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_object_async_generator_method() {
+        let prog = parse("var o = { async *gen() { yield 1; } };").unwrap();
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(Expr::Object(obj)) = vd.declarators[0].init.as_deref() {
+                if let ObjectProp::Prop(p) = &obj.properties[0] {
+                    if let PropValue::Method(ref fe) = p.value {
+                        assert!(fe.is_generator, "should be async generator");
+                        assert!(fe.is_async, "should be async");
+                    } else {
+                        panic!("expected Method PropValue");
+                    }
+                } else {
+                    panic!("expected Prop");
+                }
+            } else {
+                panic!("expected Object");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_object_computed_generator_method() {
+        let prog = parse("var o = { *[Symbol.iterator]() { yield 1; } };").unwrap();
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(Expr::Object(obj)) = vd.declarators[0].init.as_deref() {
+                if let ObjectProp::Prop(p) = &obj.properties[0] {
+                    assert!(p.is_computed, "key should be computed");
+                    if let PropValue::Method(ref fe) = p.value {
+                        assert!(fe.is_generator, "should be generator");
+                    } else {
+                        panic!("expected Method PropValue");
+                    }
+                } else {
+                    panic!("expected Prop");
+                }
+            } else {
+                panic!("expected Object");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_yield_star_delegation() {
+        let prog = parse("function* g() { yield* other(); }").unwrap();
+        if let ProgramItem::Stmt(Stmt::FnDecl(f)) = &prog.body[0] {
+            assert!(f.is_generator);
+            if let Stmt::Expr(ref es) = f.body.body[0] {
+                if let Expr::Yield(y) = es.expr.as_ref() {
+                    assert!(y.delegate, "should be yield* delegation");
+                    assert!(y.argument.is_some());
+                } else {
+                    panic!("expected YieldExpr");
+                }
+            } else {
+                panic!("expected ExprStmt");
+            }
+        } else {
+            panic!("expected FnDecl");
         }
     }
 
