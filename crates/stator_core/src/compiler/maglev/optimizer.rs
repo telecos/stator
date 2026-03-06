@@ -1,6 +1,6 @@
 //! Maglev IR optimisation passes.
 //!
-//! Three passes are implemented and composed by [`optimize`]:
+//! Six passes are implemented and composed by [`optimize`]:
 //!
 //! 1. **Constant folding** — replaces arithmetic/comparison nodes whose *all*
 //!    inputs resolve to compile-time constant nodes with a new constant node,
@@ -12,19 +12,32 @@
 //!    - `Int32` / `Float64` unary: `Negate`, `CheckedSmiIncrement`,
 //!      `CheckedSmiDecrement`, `Int32Increment`, `Int32Decrement`.
 //!
-//! 2. **Dead-code elimination (DCE)** — removes `ValueNode`s whose [`NodeId`]
+//! 2. **Range analysis** — tracks integer `[min, max]` intervals through
+//!    the graph and replaces `CheckedSmi*` nodes whose output provably fits
+//!    `i32` with unchecked `Int32*` equivalents (eliminating deopt overhead).
+//!    See [`crate::compiler::maglev::range_analysis`].
+//!
+//! 3. **Loop-invariant code motion (LICM)** — detects natural loops via
+//!    back-edges and hoists pure nodes whose inputs are all defined outside
+//!    the loop into the preheader block.
+//!    See [`crate::compiler::maglev::licm`].
+//!
+//! 4. **Dead-code elimination (DCE)** — removes `ValueNode`s whose [`NodeId`]
 //!    is never referenced by any other node (value or control) in the graph.
 //!    Pure side-effect-free nodes that produce a value which nobody consumes
 //!    are safe to drop.  Nodes with observable side-effects (stores, calls,
 //!    allocations, guards/checks) are always considered *live* and are kept
 //!    even when their result value is unused.
 //!
-//! 3. **Redundant `CheckMaps` removal** — within each basic block, a
+//! 5. **Redundant `CheckMaps` removal** — within each basic block, a
 //!    `CheckMaps { receiver, feedback_slot }` node is redundant if an
 //!    identical guard for the *same* (receiver, feedback_slot) pair has
 //!    already been emitted earlier in the same block.  The duplicate is
 //!    replaced by a [`ValueNode::UndefinedConstant`] placeholder and the
 //!    relevant ID is remapped so all consumers still compile correctly.
+//!
+//! 6. **Dead-code elimination (final)** — a second DCE sweep after the
+//!    CheckMaps pass cleans up any newly-dead placeholder nodes.
 //!
 //! # Usage
 //!
@@ -59,11 +72,14 @@ use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, 
 
 /// Run all optimisation passes on `graph` in place.
 ///
-/// Passes are applied in the order: constant folding → redundant-CheckMaps
-/// removal → dead-code elimination.  Multiple rounds are *not* performed; a
-/// single sweep of each pass is sufficient for the patterns targeted here.
+/// Passes are applied in the order: constant folding → range analysis →
+/// LICM → redundant-CheckMaps removal → dead-code elimination.
+/// Multiple rounds are *not* performed; a single sweep of each pass is
+/// sufficient for the patterns targeted here.
 pub fn optimize(graph: &mut MaglevGraph) {
     fold_constants(graph);
+    crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
+    crate::compiler::maglev::licm::hoist_loop_invariants(graph);
     remove_redundant_check_maps(graph);
     eliminate_dead_code(graph);
 }
