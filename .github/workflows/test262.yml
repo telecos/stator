@@ -47,9 +47,9 @@ jobs:
         run: cargo build --package stator_test262 --release
 
       - name: Run Test262 suite
-        # --threshold 0.0 acts as a reporting-only gate for now.
+        # --threshold 25.0 enforces the 25% pass-rate milestone.
         # Raise this value as engine conformance improves.
         run: |
           ./target/release/stator_test262 \
             --test262-dir test262 \
-            --threshold 0.0
+            --threshold 25.0

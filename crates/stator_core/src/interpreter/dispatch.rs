@@ -15,11 +15,11 @@ use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
     TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, constant_pool_jump_delta,
     constant_to_value, decode_string_constant, dispatch_call, err_bad_operand,
-    error_message_from_value, extract_context, find_handler, is_js_receiver, js_add, js_less_than,
-    keyed_load, keyed_store, maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan,
-    number_to_jsvalue, plain_object_to_array_items, proto_lookup, resolve_jump, strict_eq,
-    to_array_index, to_bigint, to_property_key, try_execute_best_jit, walk_context_chain,
-    wire_construct_prototype,
+    error_message_from_value, extract_context, find_handler, fn_props_set, is_js_receiver, js_add,
+    js_less_than, keyed_load, keyed_store, maybe_compile_baseline, maybe_compile_maglev,
+    maybe_compile_turbofan, number_to_jsvalue, plain_object_to_array_items, proto_lookup,
+    resolve_jump, strict_eq, to_array_index, to_bigint, to_property_key, try_execute_best_jit,
+    walk_context_chain, wire_construct_prototype,
 };
 use crate::builtins::error::{pop_call_frame, push_call_frame};
 use crate::bytecode::bytecode_array::{
@@ -1494,6 +1494,18 @@ fn handle_construct(
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
             ctx.frame.accumulator = f(args)?;
         }
+        JsValue::PlainObject(ref map) => {
+            if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
+                let args = collect_args(ctx.frame, args_start_v, arg_count)?;
+                let val = f(args)?;
+                ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
+            } else {
+                return Err(StatorError::TypeError(format!(
+                    "Construct: constructor is not a function (got {other:?})",
+                    other = JsValue::PlainObject(Rc::clone(map))
+                )));
+            }
+        }
         other => {
             return Err(StatorError::TypeError(format!(
                 "Construct: constructor is not a function (got {other:?})"
@@ -1846,8 +1858,14 @@ fn handle_sta_named_property(
     };
     let val = ctx.frame.accumulator.clone();
     let obj = ctx.frame.read_reg(obj_v)?.clone();
-    if let JsValue::PlainObject(ref map) = obj {
-        map.borrow_mut().insert(prop_name, val);
+    match obj {
+        JsValue::PlainObject(ref map) => {
+            map.borrow_mut().insert(prop_name, val);
+        }
+        JsValue::Function(ref ba) => {
+            fn_props_set(ba, prop_name, val);
+        }
+        _ => {}
     }
     // Accumulator stays unchanged: the assignment's completion
     // value is the stored value (already in the accumulator).

@@ -192,6 +192,9 @@ pub use crate::objects::value::{GeneratorState, GeneratorStatus, GeneratorStep, 
 // Debugger integration
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Property map for a single `Function` value in the side-table.
+type FnPropMap = Rc<RefCell<HashMap<String, JsValue>>>;
+
 thread_local! {
     /// The currently-attached debugger for this thread, if any.
     ///
@@ -200,6 +203,19 @@ thread_local! {
     /// on pauses.
     pub(super) static ACTIVE_DEBUGGER: RefCell<Option<Rc<RefCell<Debugger>>>> =
         const { RefCell::new(None) };
+
+    /// Side table mapping `Function` identity (pointer of the inner
+    /// `Rc<BytecodeArray>`) to a property map.
+    ///
+    /// JavaScript functions are objects and can carry ad-hoc properties
+    /// (e.g. `assert.sameValue = function(){}`).  Rather than modifying the
+    /// [`JsValue::Function`] variant to include a property map (which would
+    /// touch dozens of match arms), we store properties in this thread-local
+    /// table.  All `Rc` clones of the same `BytecodeArray` share the same
+    /// pointer, so property stores through one clone are visible through all
+    /// clones.
+    static FUNCTION_PROPS: RefCell<HashMap<usize, FnPropMap>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Attach a [`Debugger`] to the current thread's interpreter.
@@ -232,6 +248,42 @@ pub fn with_debugger<R, F: FnOnce(&mut Debugger) -> R>(f: F) -> Option<R> {
             let mut dbg = rc.borrow_mut();
             f(&mut dbg)
         })
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Function property side-table helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Return the identity key for a `Function`'s property table entry.
+///
+/// Uses the raw pointer of the inner `Rc<BytecodeArray>` allocation so that
+/// all clones of the same `Rc` share a single property bag.
+fn fn_props_key(ba: &Rc<BytecodeArray>) -> usize {
+    Rc::as_ptr(ba) as usize
+}
+
+/// Store a named property on a `Function` value's side-table entry.
+fn fn_props_set(ba: &Rc<BytecodeArray>, name: String, val: JsValue) {
+    FUNCTION_PROPS.with(|fp| {
+        let mut table = fp.borrow_mut();
+        let map = table
+            .entry(fn_props_key(ba))
+            .or_insert_with(|| Rc::new(RefCell::new(HashMap::new())));
+        map.borrow_mut().insert(name, val);
+    });
+}
+
+/// Load a named property from a `Function` value's side-table entry.
+///
+/// Returns `JsValue::Undefined` when the property has not been set.
+fn fn_props_get(ba: &Rc<BytecodeArray>, name: &str) -> JsValue {
+    FUNCTION_PROPS.with(|fp| {
+        let table = fp.borrow();
+        table
+            .get(&fn_props_key(ba))
+            .and_then(|map| map.borrow().get(name).cloned())
+            .unwrap_or(JsValue::Undefined)
     })
 }
 
@@ -1759,6 +1811,16 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             _ => JsValue::Undefined,
         };
     }
+    // Handle JsValue::Function — look up ad-hoc properties stored in the
+    // thread-local side table (e.g. `assert.sameValue`).
+    if let JsValue::Function(ba) = obj {
+        let val = fn_props_get(ba, key);
+        if !matches!(val, JsValue::Undefined) {
+            return val;
+        }
+        // Fall through to proto chain lookup for built-in Function.prototype
+        // methods like `call`, `apply`, `bind`.
+    }
     let mut current = obj.clone();
     for _ in 0..256 {
         if let JsValue::PlainObject(ref map) = current {
@@ -1841,21 +1903,28 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
 /// Supports `PlainObject` (string keys).  Stores to non-object types are
 /// silently discarded (matching the existing `StaNamedProperty` behaviour).
 pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> StatorResult<()> {
-    if let JsValue::PlainObject(map) = obj {
-        let prop_name = to_property_key(key)?;
-        map.borrow_mut().insert(prop_name, value);
-        // If this is an array-like PlainObject, update "length".
-        if let Some(idx) = to_array_index(key) {
-            let new_len = (idx + 1) as i32;
-            let cur_len = match map.borrow().get("length") {
-                Some(JsValue::Smi(n)) => *n,
-                _ => return Ok(()),
-            };
-            if new_len > cur_len {
-                map.borrow_mut()
-                    .insert("length".to_string(), JsValue::Smi(new_len));
+    match obj {
+        JsValue::PlainObject(map) => {
+            let prop_name = to_property_key(key)?;
+            map.borrow_mut().insert(prop_name, value);
+            // If this is an array-like PlainObject, update "length".
+            if let Some(idx) = to_array_index(key) {
+                let new_len = (idx + 1) as i32;
+                let cur_len = match map.borrow().get("length") {
+                    Some(JsValue::Smi(n)) => *n,
+                    _ => return Ok(()),
+                };
+                if new_len > cur_len {
+                    map.borrow_mut()
+                        .insert("length".to_string(), JsValue::Smi(new_len));
+                }
             }
         }
+        JsValue::Function(ba) => {
+            let prop_name = to_property_key(key)?;
+            fn_props_set(ba, prop_name, value);
+        }
+        _ => {}
     }
     Ok(())
 }
