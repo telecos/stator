@@ -4674,6 +4674,226 @@ pub unsafe extern "C" fn stator_dom_weak_ref_destroy(weak: *mut StatorDomWeakRef
     }
 }
 
+// ── Event loop FFI ─────────────────────────────────────────────────────────────
+
+use stator_core::builtins::promise::MicrotaskQueue;
+use stator_core::event_loop::{DefaultCallbacks, EmbedderCallbacks, EventLoop, TimerHandle};
+
+/// Opaque event loop handle.
+pub struct StatorEventLoop {
+    inner: EventLoop,
+}
+
+/// C function pointer types for embedder callbacks.
+type StatorPostTaskFn = unsafe extern "C" fn(task_data: *mut c_void);
+type StatorPostDelayedTaskFn = unsafe extern "C" fn(task_data: *mut c_void, delay_secs: f64);
+type StatorRequestIdleCallbackFn = unsafe extern "C" fn(cb_data: *mut c_void, idle_time: f64);
+type StatorMonotonicTimeFn = unsafe extern "C" fn() -> f64;
+
+/// C-compatible vtable for embedder callbacks.
+#[repr(C)]
+pub struct StatorEmbedderCallbacks {
+    /// Post a task to the embedder's main thread.
+    pub post_task: StatorPostTaskFn,
+    /// Post a delayed task.
+    pub post_delayed_task: StatorPostDelayedTaskFn,
+    /// Request an idle callback.
+    pub request_idle_callback: StatorRequestIdleCallbackFn,
+    /// Monotonic time source.
+    pub monotonic_time: StatorMonotonicTimeFn,
+}
+
+/// Adapter that wraps C function pointers into the [`EmbedderCallbacks`] trait.
+struct FfiCallbacks {
+    vtable: StatorEmbedderCallbacks,
+}
+
+impl EmbedderCallbacks for FfiCallbacks {
+    fn post_task(&self, _task: Box<dyn FnOnce()>) {
+        // SAFETY: embedder guarantees the function pointer is valid.
+        unsafe { (self.vtable.post_task)(std::ptr::null_mut()) };
+    }
+
+    fn post_delayed_task(&self, _task: Box<dyn FnOnce()>, delay_secs: f64) {
+        // SAFETY: embedder guarantees the function pointer is valid.
+        unsafe { (self.vtable.post_delayed_task)(std::ptr::null_mut(), delay_secs) };
+    }
+
+    fn request_idle_callback(&self, _cb: Box<dyn FnOnce(f64)>) {
+        // SAFETY: embedder guarantees the function pointer is valid.
+        unsafe { (self.vtable.request_idle_callback)(std::ptr::null_mut(), 0.0) };
+    }
+
+    fn monotonic_time(&self) -> f64 {
+        // SAFETY: embedder guarantees the function pointer is valid.
+        unsafe { (self.vtable.monotonic_time)() }
+    }
+}
+
+/// Create a new event loop with default (no-op) callbacks.
+///
+/// The returned pointer must be freed with [`stator_event_loop_destroy`].
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_event_loop_create() -> *mut StatorEventLoop {
+    Box::into_raw(Box::new(StatorEventLoop {
+        inner: EventLoop::new(MicrotaskQueue::new(), Box::new(DefaultCallbacks)),
+    }))
+}
+
+/// Create a new event loop with embedder-provided callbacks.
+///
+/// # Safety
+/// All function pointers in `cbs` must be valid for the lifetime of the
+/// returned event loop.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_event_loop_create_with_callbacks(
+    cbs: StatorEmbedderCallbacks,
+) -> *mut StatorEventLoop {
+    let callbacks = FfiCallbacks { vtable: cbs };
+    Box::into_raw(Box::new(StatorEventLoop {
+        inner: EventLoop::new(MicrotaskQueue::new(), Box::new(callbacks)),
+    }))
+}
+
+/// Destroy an event loop.
+///
+/// # Safety
+/// `el` must be a non-null pointer returned by `stator_event_loop_create*`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_event_loop_destroy(el: *mut StatorEventLoop) {
+    if !el.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw`.
+        drop(unsafe { Box::from_raw(el) });
+    }
+}
+
+/// Post a macrotask.  The provided C callback will be invoked with `data` on
+/// the next turn of the event loop.
+///
+/// # Safety
+/// `el` must be a valid event loop pointer.  `callback` must be a valid
+/// function pointer.  `data` is passed through opaquely.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_event_loop_post_task(
+    el: *mut StatorEventLoop,
+    callback: unsafe extern "C" fn(*mut c_void),
+    data: *mut c_void,
+) {
+    if el.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `el` is valid.
+    let el = unsafe { &*el };
+    // Wrap the C callback+data into a Rust closure.
+    // SAFETY: the caller guarantees `callback` and `data` remain valid until
+    // the task executes.
+    el.inner.post_task(Box::new(move || unsafe {
+        callback(data);
+    }));
+}
+
+/// Schedule a one-shot timer.  Returns the timer id (0 on null input).
+///
+/// # Safety
+/// `el` must be a valid event loop pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_event_loop_set_timer(
+    el: *mut StatorEventLoop,
+    delay_secs: f64,
+    callback: unsafe extern "C" fn(*mut c_void),
+    data: *mut c_void,
+) -> u64 {
+    if el.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `el` is valid.
+    let el = unsafe { &*el };
+    let handle = el
+        .inner
+        .set_timer(delay_secs, Box::new(move || unsafe { callback(data) }));
+    handle.id()
+}
+
+/// Cancel a previously scheduled timer.
+///
+/// # Safety
+/// `el` must be a valid event loop pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_event_loop_cancel_timer(el: *mut StatorEventLoop, timer_id: u64) {
+    if el.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `el` is valid.
+    unsafe { &*el }
+        .inner
+        .cancel_timer(TimerHandle::from_raw(timer_id));
+}
+
+/// Run one tick of the event loop.  Returns `true` if a macrotask ran.
+///
+/// # Safety
+/// `el` must be a valid event loop pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_event_loop_tick(el: *mut StatorEventLoop) -> bool {
+    if el.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `el` is valid.
+    unsafe { &*el }.inner.tick()
+}
+
+/// Spin the event loop until idle.
+///
+/// # Safety
+/// `el` must be a valid event loop pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_event_loop_run_until_idle(el: *mut StatorEventLoop) {
+    if el.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `el` is valid.
+    unsafe { &*el }.inner.run_until_idle();
+}
+
+/// Drain pending microtasks.
+///
+/// # Safety
+/// `el` must be a valid event loop pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_event_loop_drain_microtasks(el: *mut StatorEventLoop) {
+    if el.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `el` is valid.
+    unsafe { &*el }.inner.drain_microtasks();
+}
+
+/// Returns `true` when the event loop has no pending work.
+///
+/// # Safety
+/// `el` must be a valid event loop pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_event_loop_is_idle(el: *mut StatorEventLoop) -> bool {
+    if el.is_null() {
+        return true;
+    }
+    // SAFETY: caller guarantees `el` is valid.
+    unsafe { &*el }.inner.is_idle()
+}
+
+/// Returns the number of pending macrotasks.
+///
+/// # Safety
+/// `el` must be a valid event loop pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_event_loop_pending_task_count(el: *mut StatorEventLoop) -> usize {
+    if el.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `el` is valid.
+    unsafe { &*el }.inner.pending_task_count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
