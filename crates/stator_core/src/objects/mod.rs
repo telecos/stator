@@ -8,6 +8,10 @@ pub mod js_function;
 pub mod js_object;
 /// Hidden class ([`map::Map`]) and instance-type tag for heap objects.
 pub mod map;
+/// NaN-boxed (tagged-pointer) 64-bit value representation ([issue #265]).
+///
+/// [issue #265]: https://github.com/telecos/stator/issues/265
+pub mod nan_boxing;
 /// ECMAScript §6.2.6 Property Descriptor specification type with data,
 /// accessor, and generic variants plus validation logic.
 pub mod property_descriptor;
