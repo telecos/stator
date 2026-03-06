@@ -1188,6 +1188,69 @@ pub fn string_sup(s: &str) -> String {
     html_wrap(s, "sup")
 }
 
+// ── Locale-aware methods ──────────────────────────────────────────────────────
+
+/// ECMAScript §22.1.3.12 `String.prototype.localeCompare(that)`.
+///
+/// Returns a negative number, zero, or a positive number indicating whether
+/// the reference string comes before, is equal to, or comes after the given
+/// string in sort order.  This implementation delegates to a simple
+/// Unicode code-point comparison (locale-independent), which is conformant as
+/// the spec allows implementation-defined locale behaviour.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::string::string_locale_compare;
+///
+/// assert!(string_locale_compare("a", "b") < 0);
+/// assert_eq!(string_locale_compare("abc", "abc"), 0);
+/// assert!(string_locale_compare("b", "a") > 0);
+/// ```
+pub fn string_locale_compare(s: &str, that: &str) -> i32 {
+    match s.cmp(that) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// ECMAScript §22.1.3.26 `String.prototype.toLocaleLowerCase()`.
+///
+/// Converts the string to lowercase using locale-sensitive mappings.  This
+/// implementation delegates to the standard Unicode case folding (identical to
+/// `toLowerCase`), which is spec-conformant as the spec permits
+/// implementation-defined locale behaviour.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::string::string_to_locale_lower_case;
+///
+/// assert_eq!(string_to_locale_lower_case("HELLO"), "hello");
+/// ```
+pub fn string_to_locale_lower_case(s: &str) -> String {
+    string_to_lower_case(s)
+}
+
+/// ECMAScript §22.1.3.27 `String.prototype.toLocaleUpperCase()`.
+///
+/// Converts the string to uppercase using locale-sensitive mappings.  This
+/// implementation delegates to the standard Unicode case folding (identical to
+/// `toUpperCase`), which is spec-conformant as the spec permits
+/// implementation-defined locale behaviour.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::string::string_to_locale_upper_case;
+///
+/// assert_eq!(string_to_locale_upper_case("hello"), "HELLO");
+/// ```
+pub fn string_to_locale_upper_case(s: &str) -> String {
+    string_to_upper_case(s)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2092,5 +2155,55 @@ mod tests {
     #[test]
     fn test_html_sup() {
         assert_eq!(string_sup("text"), "<sup>text</sup>");
+    }
+
+    // ── string_locale_compare ────────────────────────────────────────────────
+
+    #[test]
+    fn test_locale_compare_less() {
+        assert_eq!(string_locale_compare("a", "b"), -1);
+    }
+
+    #[test]
+    fn test_locale_compare_equal() {
+        assert_eq!(string_locale_compare("abc", "abc"), 0);
+    }
+
+    #[test]
+    fn test_locale_compare_greater() {
+        assert_eq!(string_locale_compare("b", "a"), 1);
+    }
+
+    #[test]
+    fn test_locale_compare_empty_strings() {
+        assert_eq!(string_locale_compare("", ""), 0);
+    }
+
+    #[test]
+    fn test_locale_compare_empty_vs_non_empty() {
+        assert_eq!(string_locale_compare("", "a"), -1);
+        assert_eq!(string_locale_compare("a", ""), 1);
+    }
+
+    // ── string_to_locale_lower_case / locale_upper_case ──────────────────────
+
+    #[test]
+    fn test_to_locale_lower_case() {
+        assert_eq!(string_to_locale_lower_case("HELLO"), "hello");
+    }
+
+    #[test]
+    fn test_to_locale_lower_case_unicode() {
+        assert_eq!(string_to_locale_lower_case("CAFÉ"), "café");
+    }
+
+    #[test]
+    fn test_to_locale_upper_case() {
+        assert_eq!(string_to_locale_upper_case("hello"), "HELLO");
+    }
+
+    #[test]
+    fn test_to_locale_upper_case_unicode() {
+        assert_eq!(string_to_locale_upper_case("café"), "CAFÉ");
     }
 }
