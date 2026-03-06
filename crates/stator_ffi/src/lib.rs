@@ -25,6 +25,7 @@ use stator_core::dom::{
 use stator_core::gc::heap::Heap;
 use stator_core::interpreter::{Interpreter, InterpreterFrame};
 use stator_core::objects::js_object::JsObject;
+use stator_core::objects::plain_object_storage::PlainObjectStorage;
 use stator_core::objects::value::{JsValue, NativeFn};
 use stator_core::parser;
 use stator_core::wasm::{WasmEngine, WasmInstance, WasmModule};
@@ -2397,7 +2398,9 @@ pub unsafe extern "C" fn stator_register_native_function(
         // Insert the parent object if it doesn't exist yet.
         let obj = env
             .entry(obj_name.to_owned())
-            .or_insert_with(|| JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new()))))
+            .or_insert_with(|| {
+                JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::new())))
+            })
             .clone();
         drop(env); // release borrow before we potentially re-borrow
 
@@ -2704,7 +2707,9 @@ pub unsafe extern "C" fn stator_context_global_set(
         let mut env = globals.borrow_mut();
         let obj = env
             .entry(obj_name.to_owned())
-            .or_insert_with(|| JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new()))))
+            .or_insert_with(|| {
+                JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::new())))
+            })
             .clone();
         drop(env);
 
@@ -2847,7 +2852,9 @@ fn stator_value_inner_to_jsvalue(inner: &StatorValueInner) -> JsValue {
         | StatorValueInner::RegExp
         | StatorValueInner::Promise
         | StatorValueInner::Map
-        | StatorValueInner::Set => JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new()))),
+        | StatorValueInner::Set => {
+            JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::new())))
+        }
         StatorValueInner::Function => {
             // Return a no-op native function to preserve the callable nature.
             JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined)))

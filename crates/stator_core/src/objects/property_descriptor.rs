@@ -13,6 +13,7 @@
 //! with helpers to convert to/from a plain [`JsObject`] (as required by
 //! `Object.defineProperty` and `Object.getOwnPropertyDescriptor`).
 
+use crate::objects::plain_object_storage::PlainObjectStorage;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -256,7 +257,7 @@ impl FullPropertyDescriptor {
                 }
             }
         }
-        JsValue::PlainObject(Rc::new(RefCell::new(map)))
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))))
     }
 
     /// ECMAScript §10.1.6.3 *ValidateAndApplyPropertyDescriptor*.
@@ -509,7 +510,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("value".to_string(), JsValue::Smi(1));
         map.insert("get".to_string(), JsValue::Undefined);
-        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))));
         let result = FullPropertyDescriptor::from_object(&obj);
         assert!(result.is_err());
     }
@@ -517,7 +518,7 @@ mod tests {
     #[test]
     fn test_from_object_empty_yields_generic() {
         let map = HashMap::new();
-        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))));
         let desc = FullPropertyDescriptor::from_object(&obj).unwrap();
         assert!(desc.is_generic());
     }

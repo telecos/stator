@@ -17,6 +17,7 @@
 //! assert!(matches!(globals.get("Math"), Some(JsValue::PlainObject(_))));
 //! ```
 
+use crate::objects::plain_object_storage::PlainObjectStorage;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -433,7 +434,7 @@ fn make_math() -> JsValue {
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 // ── console ──────────────────────────────────────────────────────────────────
@@ -475,7 +476,7 @@ fn make_console() -> JsValue {
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 // ── JSON ─────────────────────────────────────────────────────────────────────
@@ -497,7 +498,7 @@ fn json_value_to_js_value(jv: &crate::builtins::json::JsonValue) -> JsValue {
             for (k, v) in entries.borrow().iter() {
                 map.insert(k.clone(), json_value_to_js_value(v));
             }
-            JsValue::PlainObject(Rc::new(RefCell::new(map)))
+            JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))))
         }
     }
 }
@@ -598,7 +599,7 @@ fn make_json() -> JsValue {
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 /// Walk a `JsValue` tree bottom-up, calling `reviver(key, value)` at each
@@ -748,7 +749,7 @@ fn make_date() -> JsValue {
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 /// Create a Date instance object with all prototype methods.
@@ -1247,7 +1248,7 @@ fn make_date_instance(t: f64) -> JsValue {
         );
     }
 
-    JsValue::PlainObject(Rc::new(RefCell::new(obj)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(obj))))
 }
 
 // ── Number constructor ───────────────────────────────────────────────────────
@@ -1353,7 +1354,7 @@ fn make_number() -> JsValue {
     );
     props.insert("NaN".into(), JsValue::HeapNumber(f64::NAN));
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 // ── Object constructor ───────────────────────────────────────────────────────
@@ -1455,7 +1456,9 @@ fn make_object() -> JsValue {
                     desc.insert("writable".into(), JsValue::Boolean(true));
                     desc.insert("enumerable".into(), JsValue::Boolean(true));
                     desc.insert("configurable".into(), JsValue::Boolean(true));
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(desc))))
+                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                        PlainObjectStorage::from(desc),
+                    ))))
                 } else {
                     Ok(JsValue::Undefined)
                 }
@@ -1594,7 +1597,9 @@ fn make_object() -> JsValue {
                     obj.insert("__proto__".to_string(), proto.clone());
                 }
             }
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                PlainObjectStorage::from(obj),
+            ))))
         }),
     );
 
@@ -1658,7 +1663,9 @@ fn make_object() -> JsValue {
                     }
                 }
             }
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                PlainObjectStorage::from(result),
+            ))))
         }),
     );
 
@@ -1773,12 +1780,16 @@ fn make_object() -> JsValue {
                     desc.insert("configurable".into(), JsValue::Boolean(true));
                     result.insert(
                         key.clone(),
-                        JsValue::PlainObject(Rc::new(RefCell::new(desc))),
+                        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(desc)))),
                     );
                 }
-                Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    PlainObjectStorage::from(result),
+                ))))
             } else {
-                Ok(JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new()))))
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    PlainObjectStorage::new(),
+                ))))
             }
         }),
     );
@@ -1844,10 +1855,10 @@ fn make_object() -> JsValue {
 
     props.insert(
         "prototype".into(),
-        JsValue::PlainObject(Rc::new(RefCell::new(obj_proto))),
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(obj_proto)))),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 // ── Array constructor ────────────────────────────────────────────────────────
@@ -2770,10 +2781,10 @@ fn make_array() -> JsValue {
 
     props.insert(
         "prototype".into(),
-        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(proto)))),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 // ── Symbol constructor ────────────────────────────────────────────────────────────
 
@@ -2906,7 +2917,7 @@ fn make_symbol() -> JsValue {
 
         props.insert(
             "prototype".into(),
-            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+            JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(proto)))),
         );
     }
 
@@ -2926,7 +2937,7 @@ fn make_symbol() -> JsValue {
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 // ── Iterator (ES2025 §27.1.4) ────────────────────────────────────────────────
@@ -3051,10 +3062,10 @@ fn make_iterator() -> JsValue {
 
     props.insert(
         "prototype".into(),
-        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(proto)))),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 // ── AsyncIterator (ES2025 §27.1.4.2) ─────────────────────────────────────────
@@ -3214,10 +3225,10 @@ fn make_async_iterator() -> JsValue {
 
     props.insert(
         "prototype".into(),
-        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(proto)))),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 // ── Map constructor (ES2025 §24.1) ───────────────────────────────────────────
@@ -3382,11 +3393,13 @@ fn make_map_builtin() -> JsValue {
                     }),
                 );
             }
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                PlainObjectStorage::from(obj),
+            ))))
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 // ── Set constructor (ES2025 §24.2) ───────────────────────────────────────────
@@ -3530,11 +3543,13 @@ fn make_set_builtin() -> JsValue {
                     }),
                 );
             }
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                PlainObjectStorage::from(obj),
+            ))))
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 // ── WeakMap constructor (ES2025 §24.3) ───────────────────────────────────────
@@ -3622,11 +3637,13 @@ fn make_weak_map_builtin() -> JsValue {
                 );
             }
 
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                PlainObjectStorage::from(obj),
+            ))))
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 // ── WeakSet constructor (ES2025 §24.4) ───────────────────────────────────────
@@ -3697,11 +3714,13 @@ fn make_weak_set_builtin() -> JsValue {
                 );
             }
 
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                PlainObjectStorage::from(obj),
+            ))))
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 // ── WeakRef constructor (ES2025 §26.1) ───────────────────────────────────────
@@ -3731,7 +3750,9 @@ fn make_weak_ref_builtin() -> JsValue {
                     );
                 }
 
-                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    PlainObjectStorage::from(obj),
+                ))))
             } else {
                 Err(StatorError::TypeError(
                     "WeakRef target must be an object".into(),
@@ -3740,7 +3761,7 @@ fn make_weak_ref_builtin() -> JsValue {
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 // ── FinalizationRegistry constructor (ES2025 §26.2) ─────────────────────────
@@ -3858,11 +3879,13 @@ fn make_finalization_registry_builtin() -> JsValue {
                 );
             }
 
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                PlainObjectStorage::from(obj),
+            ))))
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 // ── String constructor ───────────────────────────────────────────────────────
@@ -3982,10 +4005,10 @@ fn make_function() -> JsValue {
 
     props.insert(
         "prototype".into(),
-        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(proto)))),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 /// Build the `String` constructor/namespace object with static and prototype
@@ -4673,10 +4696,10 @@ fn make_string() -> JsValue {
 
     props.insert(
         "prototype".into(),
-        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(proto)))),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 // ── Promise ─────────────────────────────────────────────────────────────────
@@ -4851,7 +4874,9 @@ fn make_promise() -> JsValue {
                         }
                     })),
                 );
-                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    PlainObjectStorage::from(obj),
+                ))))
             }),
         );
     }
@@ -4938,7 +4963,7 @@ fn make_promise() -> JsValue {
         );
     }
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 // ── RegExp ────────────────────────────────────────────────────────────────────
@@ -4960,7 +4985,7 @@ fn make_regexp() -> JsValue {
     props.insert("leftContext".into(), JsValue::String(String::new()));
     props.insert("rightContext".into(), JsValue::String(String::new()));
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 /// Build the `BigInt` global constructor with `asIntN` and `asUintN` static methods.
@@ -5075,7 +5100,7 @@ fn make_bigint() -> JsValue {
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 /// Extract a `Vec<JsPromise>` from an argument that should be a `JsValue::Array`
@@ -5133,13 +5158,17 @@ fn make_intl() -> JsValue {
                         let mut opts: HashMap<String, JsValue> = HashMap::new();
                         opts.insert("locale".into(), JsValue::String("en-US".into()));
                         opts.insert("numberingSystem".into(), JsValue::String("latn".into()));
-                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                            PlainObjectStorage::from(opts),
+                        ))))
                     }),
                 );
-                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    PlainObjectStorage::from(obj),
+                ))))
             }),
         );
-        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(ctor))))
     });
 
     // ── Intl.DateTimeFormat ──────────────────────────────────────────────
@@ -5157,13 +5186,17 @@ fn make_intl() -> JsValue {
                         opts.insert("locale".into(), JsValue::String("en-US".into()));
                         opts.insert("calendar".into(), JsValue::String("gregory".into()));
                         opts.insert("timeZone".into(), JsValue::String("UTC".into()));
-                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                            PlainObjectStorage::from(opts),
+                        ))))
                     }),
                 );
-                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    PlainObjectStorage::from(obj),
+                ))))
             }),
         );
-        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(ctor))))
     });
 
     // ── Intl.Collator ───────────────────────────────────────────────────
@@ -5180,13 +5213,17 @@ fn make_intl() -> JsValue {
                         let mut opts: HashMap<String, JsValue> = HashMap::new();
                         opts.insert("locale".into(), JsValue::String("en-US".into()));
                         opts.insert("sensitivity".into(), JsValue::String("variant".into()));
-                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                            PlainObjectStorage::from(opts),
+                        ))))
                     }),
                 );
-                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    PlainObjectStorage::from(obj),
+                ))))
             }),
         );
-        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(ctor))))
     });
 
     // ── Intl.PluralRules ────────────────────────────────────────────────
@@ -5203,13 +5240,17 @@ fn make_intl() -> JsValue {
                         let mut opts: HashMap<String, JsValue> = HashMap::new();
                         opts.insert("locale".into(), JsValue::String("en-US".into()));
                         opts.insert("type".into(), JsValue::String("cardinal".into()));
-                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                            PlainObjectStorage::from(opts),
+                        ))))
                     }),
                 );
-                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    PlainObjectStorage::from(obj),
+                ))))
             }),
         );
-        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(ctor))))
     });
 
     // ── Intl.ListFormat ─────────────────────────────────────────────────
@@ -5237,10 +5278,12 @@ fn make_intl() -> JsValue {
                     "format".into(),
                     native(move |a| list_format_js(&a, &list_type)),
                 );
-                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    PlainObjectStorage::from(obj),
+                ))))
             }),
         );
-        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(ctor))))
     });
 
     // ── Intl.RelativeTimeFormat ─────────────────────────────────────────
@@ -5251,10 +5294,12 @@ fn make_intl() -> JsValue {
             native(|_args| {
                 let mut obj: HashMap<String, JsValue> = HashMap::new();
                 obj.insert("format".into(), native(|a| relative_time_format_js(&a)));
-                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    PlainObjectStorage::from(obj),
+                ))))
             }),
         );
-        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(ctor))))
     });
 
     // ── Intl.Segmenter ──────────────────────────────────────────────────
@@ -5275,10 +5320,12 @@ fn make_intl() -> JsValue {
                         Ok(JsValue::Array(Rc::new(segs)))
                     }),
                 );
-                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    PlainObjectStorage::from(obj),
+                ))))
             }),
         );
-        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(ctor))))
     });
 
     // ── Intl.DisplayNames ───────────────────────────────────────────────
@@ -5295,10 +5342,12 @@ fn make_intl() -> JsValue {
                         Ok(JsValue::String(display_names_of(&code)))
                     }),
                 );
-                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    PlainObjectStorage::from(obj),
+                ))))
             }),
         );
-        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(ctor))))
     });
 
     // ── Intl.Locale ─────────────────────────────────────────────────────
@@ -5315,10 +5364,12 @@ fn make_intl() -> JsValue {
                     "toString".into(),
                     native(move |_| Ok(JsValue::String(tag.clone()))),
                 );
-                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    PlainObjectStorage::from(obj),
+                ))))
             }),
         );
-        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(ctor))))
     });
 
     // ── Intl.getCanonicalLocales ────────────────────────────────────────
@@ -5358,7 +5409,7 @@ fn make_intl() -> JsValue {
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(ns)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(ns))))
 }
 
 // ── Proxy ────────────────────────────────────────────────────────────────────
@@ -5429,11 +5480,13 @@ fn make_proxy() -> JsValue {
             let mut result = HashMap::new();
             result.insert("proxy".to_string(), proxy_val);
             result.insert("revoke".to_string(), revoke_fn);
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                PlainObjectStorage::from(result),
+            ))))
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 /// Extract proxy handler traps from a JS handler object.
@@ -5567,7 +5620,9 @@ fn make_reflect() -> JsValue {
                         "configurable".to_string(),
                         JsValue::Boolean(attrs.contains(PropertyAttributes::CONFIGURABLE)),
                     );
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(desc))))
+                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                        PlainObjectStorage::from(desc),
+                    ))))
                 }
                 None => Ok(JsValue::Undefined),
             }
@@ -5579,7 +5634,9 @@ fn make_reflect() -> JsValue {
         native(|args| {
             let target = require_object_arg(&args, 0, "Reflect.getPrototypeOf")?;
             match reflect_get_prototype_of(&target) {
-                Some(_) => Ok(JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())))),
+                Some(_) => Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    PlainObjectStorage::new(),
+                )))),
                 None => Ok(JsValue::Null),
             }
         }),
@@ -5665,7 +5722,7 @@ fn make_reflect() -> JsValue {
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 /// Helper to extract a `JsObject` from the first argument, converting from
@@ -5713,7 +5770,7 @@ fn make_arraybuffer() -> JsValue {
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 /// Build the `DataView` constructor object.
@@ -5901,7 +5958,7 @@ fn make_dataview() -> JsValue {
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 /// Helper to convert a numeric value to `JsValue`.
@@ -5986,7 +6043,7 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
         }),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 /// Build the prototype methods for a `JsValue::TypedArray` instance.
@@ -6537,7 +6594,7 @@ fn make_typed_array_instance(
     // Store the TypedArray value for identity purposes.
     obj.insert("__typed_array__".into(), typed_array_val);
 
-    JsValue::PlainObject(Rc::new(RefCell::new(obj)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(obj))))
 }
 
 // ── install_globals ──────────────────────────────────────────────────────────
@@ -6748,7 +6805,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     // `globalThis` is a self-referential property of the global object.
     // The inner map is shared via `Rc` so that `globalThis.globalThis`
     // resolves back to the same object (configurable, writable, not enumerable).
-    let inner = Rc::new(RefCell::new(globals.clone()));
+    let inner = Rc::new(RefCell::new(PlainObjectStorage::from(globals.clone())));
     inner
         .borrow_mut()
         .insert("globalThis".into(), JsValue::PlainObject(Rc::clone(&inner)));
@@ -7180,7 +7237,7 @@ mod tests {
                 Ok(JsValue::String("custom-serialized".into()))
             })),
         );
-        let obj = JsValue::PlainObject(Rc::new(RefCell::new(inner)));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(inner))));
 
         let s = json_stringify_js_value(&obj, None, None).unwrap().unwrap();
         assert_eq!(s, r#""custom-serialized""#);
@@ -8062,10 +8119,13 @@ mod tests {
             let assign = map.borrow().get("assign").cloned().unwrap();
             if let JsValue::NativeFunction(f) = assign {
                 let target_map: HashMap<String, JsValue> = HashMap::new();
-                let target = JsValue::PlainObject(Rc::new(RefCell::new(target_map)));
+                let target = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(
+                    target_map,
+                ))));
                 let mut src_map: HashMap<String, JsValue> = HashMap::new();
                 src_map.insert("b".into(), JsValue::Smi(2));
-                let source = JsValue::PlainObject(Rc::new(RefCell::new(src_map)));
+                let source =
+                    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(src_map))));
                 let result = f(vec![target.clone(), source]).unwrap();
                 // Target should have the property from source
                 if let JsValue::PlainObject(r) = &result {
@@ -8090,13 +8150,16 @@ mod tests {
             if let JsValue::NativeFunction(f) = assign {
                 let mut t: HashMap<String, JsValue> = HashMap::new();
                 t.insert("a".into(), JsValue::Smi(1));
-                let target = JsValue::PlainObject(Rc::new(RefCell::new(t)));
+                let target =
+                    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(t))));
                 let mut s1: HashMap<String, JsValue> = HashMap::new();
                 s1.insert("b".into(), JsValue::Smi(2));
-                let src1 = JsValue::PlainObject(Rc::new(RefCell::new(s1)));
+                let src1 =
+                    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(s1))));
                 let mut s2: HashMap<String, JsValue> = HashMap::new();
                 s2.insert("c".into(), JsValue::Smi(3));
-                let src2 = JsValue::PlainObject(Rc::new(RefCell::new(s2)));
+                let src2 =
+                    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(s2))));
                 let result = f(vec![target, src1, src2]).unwrap();
                 if let JsValue::PlainObject(r) = &result {
                     let r = r.borrow();

@@ -30,6 +30,7 @@ use stator_core::builtins::wasm::make_webassembly_object;
 use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_core::inspector::cdp::CdpServer;
 use stator_core::interpreter::{Interpreter, InterpreterFrame};
+use stator_core::objects::plain_object_storage::PlainObjectStorage;
 use stator_core::objects::value::JsValue;
 use stator_core::parser;
 
@@ -197,7 +198,8 @@ fn build_globals() -> Rc<RefCell<HashMap<String, JsValue>>> {
     );
 
     // console.log(...args) — alias for print
-    let console_obj: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+    let console_obj: Rc<RefCell<PlainObjectStorage>> =
+        Rc::new(RefCell::new(PlainObjectStorage::new()));
     console_obj.borrow_mut().insert(
         "log".to_string(),
         JsValue::NativeFunction(Rc::new(print_args)),

@@ -14,6 +14,8 @@ pub mod map;
 ///
 /// [issue #265]: https://github.com/telecos/stator/issues/265
 pub mod nan_boxing;
+/// Shape-indexed flat property storage for lightweight plain objects.
+pub mod plain_object_storage;
 /// ECMAScript §6.2.6 Property Descriptor specification type with data,
 /// accessor, and generic variants plus validation logic.
 pub mod property_descriptor;

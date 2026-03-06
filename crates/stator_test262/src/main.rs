@@ -28,6 +28,7 @@ use stator_core::builtins::install_globals::install_globals;
 use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_core::error::StatorError;
 use stator_core::interpreter::{Interpreter, InterpreterFrame};
+use stator_core::objects::plain_object_storage::PlainObjectStorage;
 use stator_core::objects::value::JsValue;
 use stator_core::parser;
 
@@ -333,7 +334,7 @@ fn make_test_globals() -> HashMap<String, JsValue> {
     );
 
     // Minimal $262 host-defined object.
-    let obj_262: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+    let obj_262: Rc<RefCell<PlainObjectStorage>> = Rc::new(RefCell::new(PlainObjectStorage::new()));
     obj_262.borrow_mut().insert(
         "gc".to_string(),
         JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined))),
@@ -345,7 +346,8 @@ fn make_test_globals() -> HashMap<String, JsValue> {
     map.insert("$262".to_string(), JsValue::PlainObject(obj_262));
 
     // ── Native Test262Error constructor ──────────────────────────────────
-    let t262_proto: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+    let t262_proto: Rc<RefCell<PlainObjectStorage>> =
+        Rc::new(RefCell::new(PlainObjectStorage::new()));
     t262_proto.borrow_mut().insert(
         "toString".to_string(),
         JsValue::NativeFunction(Rc::new(|_args| {
@@ -354,7 +356,8 @@ fn make_test_globals() -> HashMap<String, JsValue> {
     );
     let t262_proto_val = JsValue::PlainObject(t262_proto.clone());
 
-    let t262_ctor: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+    let t262_ctor: Rc<RefCell<PlainObjectStorage>> =
+        Rc::new(RefCell::new(PlainObjectStorage::new()));
     let proto_for_ctor = t262_proto_val.clone();
     t262_ctor.borrow_mut().insert(
         "__call__".to_string(),
@@ -363,7 +366,8 @@ fn make_test_globals() -> HashMap<String, JsValue> {
                 .first()
                 .cloned()
                 .unwrap_or(JsValue::String(String::new()));
-            let obj: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+            let obj: Rc<RefCell<PlainObjectStorage>> =
+                Rc::new(RefCell::new(PlainObjectStorage::new()));
             obj.borrow_mut().insert("message".to_string(), msg);
             obj.borrow_mut()
                 .insert("__proto__".to_string(), proto_for_ctor.clone());
@@ -396,7 +400,8 @@ fn make_test_globals() -> HashMap<String, JsValue> {
     );
 
     // ── Native assert harness ────────────────────────────────────────────
-    let assert_obj: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+    let assert_obj: Rc<RefCell<PlainObjectStorage>> =
+        Rc::new(RefCell::new(PlainObjectStorage::new()));
 
     // assert(mustBeTrue, message) — base callable.
     assert_obj.borrow_mut().insert(

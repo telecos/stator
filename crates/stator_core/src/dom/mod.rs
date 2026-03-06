@@ -16,10 +16,10 @@
 //!   can release the backing DOM node when the JS wrapper is collected.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::rc::Rc;
 
+use crate::objects::plain_object_storage::PlainObjectStorage;
 use crate::objects::value::JsValue;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -387,7 +387,7 @@ pub const MAX_INTERNAL_FIELDS: usize = 16;
 pub struct DomObjectWrap {
     /// Own JS properties (for the rare case where the embedder stores values
     /// directly on the wrapper rather than going through interceptors).
-    properties: Rc<RefCell<HashMap<String, JsValue>>>,
+    properties: Rc<RefCell<PlainObjectStorage>>,
     /// Opaque embedder pointers (e.g. `blink::Element*`).
     internal_fields: Vec<*mut c_void>,
     /// Optional named-property interceptor configuration.
@@ -415,7 +415,7 @@ impl DomObjectWrap {
             "field_count ({field_count}) exceeds MAX_INTERNAL_FIELDS ({MAX_INTERNAL_FIELDS})"
         );
         Self {
-            properties: Rc::new(RefCell::new(HashMap::new())),
+            properties: Rc::new(RefCell::new(PlainObjectStorage::new())),
             internal_fields: vec![std::ptr::null_mut(); field_count],
             named_handler: None,
             indexed_handler: None,

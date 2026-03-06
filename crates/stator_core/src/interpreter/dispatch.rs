@@ -7,6 +7,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::objects::plain_object_storage::PlainObjectStorage;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -1483,8 +1484,8 @@ fn handle_construct(
             // [[Construct]]: create a fresh object for `this`,
             // wire its __proto__ to the constructor's prototype,
             // then run the constructor body with `this` bound.
-            let this_obj: Rc<RefCell<HashMap<String, JsValue>>> =
-                Rc::new(RefCell::new(HashMap::new()));
+            let this_obj: Rc<RefCell<PlainObjectStorage>> =
+                Rc::new(RefCell::new(PlainObjectStorage::new()));
             if !matches!(ctor_proto, JsValue::Undefined) {
                 this_obj
                     .borrow_mut()
@@ -2289,7 +2290,7 @@ fn handle_create_empty_object_literal(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())));
+    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::new())));
     Ok(DispatchAction::Continue)
 }
 
@@ -2300,7 +2301,8 @@ fn handle_create_empty_array_literal(
     // operands[0] is a FeedbackSlot, ignored at runtime.
     let mut map = HashMap::new();
     map.insert("length".to_string(), JsValue::Smi(0));
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+    ctx.frame.accumulator =
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))));
     Ok(DispatchAction::Continue)
 }
 
@@ -2311,7 +2313,8 @@ fn handle_create_array_literal(
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
     let mut map = HashMap::new();
     map.insert("length".to_string(), JsValue::Smi(0));
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+    ctx.frame.accumulator =
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))));
     Ok(DispatchAction::Continue)
 }
 
@@ -2340,7 +2343,8 @@ fn handle_create_array_from_iterable(
         map.insert(i.to_string(), v.clone());
     }
     map.insert("length".to_string(), JsValue::Smi(items.len() as i32));
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+    ctx.frame.accumulator =
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))));
     Ok(DispatchAction::Continue)
 }
 
@@ -2349,7 +2353,7 @@ fn handle_create_object_literal(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())));
+    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::new())));
     Ok(DispatchAction::Continue)
 }
 
@@ -2396,7 +2400,8 @@ fn handle_create_reg_exp_literal(
         "toString".to_string(),
         JsValue::String(format!("/{pattern}/{flags_str}")),
     );
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+    ctx.frame.accumulator =
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))));
     Ok(DispatchAction::Continue)
 }
 
@@ -2782,7 +2787,8 @@ fn handle_create_mapped_arguments(
             JsValue::Smi(args.len() as i32),
         )))
         .collect();
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+    ctx.frame.accumulator =
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))));
     Ok(DispatchAction::Continue)
 }
 
@@ -2806,7 +2812,8 @@ fn handle_create_unmapped_arguments(
             JsValue::Smi(args.len() as i32),
         )))
         .collect();
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+    ctx.frame.accumulator =
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))));
     Ok(DispatchAction::Continue)
 }
 
@@ -2928,7 +2935,7 @@ fn handle_call_runtime(
         // equal to the specifier string (stub for now — a
         // full implementation would resolve a module).
         let ns = HashMap::new();
-        let ns_val = JsValue::PlainObject(Rc::new(RefCell::new(ns)));
+        let ns_val = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(ns))));
 
         let queue = MicrotaskQueue::new();
         let p = promise_resolve(ns_val, &queue);
@@ -3553,10 +3560,10 @@ fn handle_create_object_from_iterable(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     let iterable = ctx.frame.accumulator.clone();
-    let map: HashMap<String, JsValue> = match &iterable {
+    let storage: PlainObjectStorage = match &iterable {
         JsValue::PlainObject(obj) => obj.borrow().clone(),
         JsValue::Array(arr) => {
-            let mut m = HashMap::new();
+            let mut m = PlainObjectStorage::new();
             for (i, v) in arr.iter().enumerate() {
                 m.insert(i.to_string(), v.clone());
             }
@@ -3564,7 +3571,7 @@ fn handle_create_object_from_iterable(
             m
         }
         JsValue::Iterator(iter) => {
-            let mut m = HashMap::new();
+            let mut m = PlainObjectStorage::new();
             let mut idx = 0usize;
             loop {
                 let mut it = iter.borrow_mut();
@@ -3579,9 +3586,9 @@ fn handle_create_object_from_iterable(
             m.insert("length".to_string(), JsValue::Smi(idx as i32));
             m
         }
-        _ => HashMap::new(),
+        _ => PlainObjectStorage::new(),
     };
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(storage)));
     Ok(DispatchAction::Continue)
 }
 

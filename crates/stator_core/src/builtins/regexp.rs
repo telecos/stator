@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::error::StatorResult;
+use crate::objects::plain_object_storage::PlainObjectStorage;
 use crate::objects::regexp::{JsRegExp, RegExpFlags, SymbolMatchResult};
 use crate::objects::value::{JsValue, NativeIterator};
 
@@ -194,7 +195,7 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
     // Sentinel so the interpreter can identify this PlainObject as a RegExp.
     props.insert("__is_regexp__".into(), JsValue::Boolean(true));
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 /// Convert a [`RegExpMatch`] into a `JsValue::PlainObject` matching the
@@ -236,7 +237,7 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
             .collect();
         props.insert(
             "groups".into(),
-            JsValue::PlainObject(Rc::new(RefCell::new(groups))),
+            JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(groups)))),
         );
     }
 
@@ -269,19 +270,19 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
                 .collect();
             idx_props.insert(
                 "groups".into(),
-                JsValue::PlainObject(Rc::new(RefCell::new(g))),
+                JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(g)))),
             );
         }
         props.insert(
             "indices".into(),
-            JsValue::PlainObject(Rc::new(RefCell::new(idx_props))),
+            JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(idx_props)))),
         );
     }
 
     // length = 1 + captures.len() (spec compatibility)
     props.insert("length".into(), JsValue::Smi((1 + m.captures.len()) as i32));
 
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props))))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
