@@ -448,6 +448,14 @@ pub enum Opcode {
     /// a normal call is performed.  `[callable, args_start, args_count, slot]`
     CallDirectEval,
 
+    /// Tail call in return position (ES2015 proper tail calls).
+    /// Same operand layout as `CallAnyReceiver`:
+    /// `[callable, args_start, args_count, slot]`.
+    ///
+    /// The interpreter reuses the current call frame instead of pushing a
+    /// new one, preventing stack growth for recursive tail-position calls.
+    TailCall,
+
     // ── Construct ─────────────────────────────────────────────────────────
     /// `new constructor(args…)`. `[constructor, args_start, args_count, slot]`
     Construct,
@@ -798,6 +806,7 @@ impl Opcode {
             Opcode::CallJSRuntime => &[ConstantPoolIdx, Register, RegisterCount],
             Opcode::InvokeIntrinsic => &[RuntimeId, Register, RegisterCount],
             Opcode::CallDirectEval => &[Register, Register, RegisterCount, FeedbackSlot],
+            Opcode::TailCall => &[Register, Register, RegisterCount, FeedbackSlot],
 
             // Construct
             Opcode::Construct => &[Register, Register, RegisterCount, FeedbackSlot],
