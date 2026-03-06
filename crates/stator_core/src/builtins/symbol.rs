@@ -252,4 +252,78 @@ mod tests {
         assert_eq!(symbol_key_for(SYMBOL_ITERATOR), None);
         assert_eq!(symbol_key_for(SYMBOL_TO_PRIMITIVE), None);
     }
+
+    #[test]
+    fn all_well_known_ids_are_distinct() {
+        let ids = [
+            SYMBOL_ITERATOR,
+            SYMBOL_TO_PRIMITIVE,
+            SYMBOL_HAS_INSTANCE,
+            SYMBOL_TO_STRING_TAG,
+            SYMBOL_IS_CONCAT_SPREADABLE,
+            SYMBOL_SPECIES,
+            SYMBOL_MATCH,
+            SYMBOL_REPLACE,
+            SYMBOL_SEARCH,
+            SYMBOL_SPLIT,
+            SYMBOL_UNSCOPABLES,
+            SYMBOL_ASYNC_ITERATOR,
+            SYMBOL_MATCH_ALL,
+        ];
+        let mut sorted = ids.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(ids.len(), sorted.len());
+    }
+
+    #[test]
+    fn all_well_known_descriptions() {
+        let cases: &[(u64, &str)] = &[
+            (SYMBOL_ITERATOR, "Symbol.iterator"),
+            (SYMBOL_TO_PRIMITIVE, "Symbol.toPrimitive"),
+            (SYMBOL_HAS_INSTANCE, "Symbol.hasInstance"),
+            (SYMBOL_TO_STRING_TAG, "Symbol.toStringTag"),
+            (SYMBOL_IS_CONCAT_SPREADABLE, "Symbol.isConcatSpreadable"),
+            (SYMBOL_SPECIES, "Symbol.species"),
+            (SYMBOL_MATCH, "Symbol.match"),
+            (SYMBOL_REPLACE, "Symbol.replace"),
+            (SYMBOL_SEARCH, "Symbol.search"),
+            (SYMBOL_SPLIT, "Symbol.split"),
+            (SYMBOL_UNSCOPABLES, "Symbol.unscopables"),
+            (SYMBOL_ASYNC_ITERATOR, "Symbol.asyncIterator"),
+            (SYMBOL_MATCH_ALL, "Symbol.matchAll"),
+        ];
+        for &(id, expected_desc) in cases {
+            assert_eq!(
+                symbol_description(id),
+                Some(expected_desc.to_string()),
+                "description mismatch for id={id}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_symbols_do_not_overlap_well_known() {
+        let user = symbol_create(Some("user".into()));
+        assert!(user >= FIRST_USER_SYMBOL_ID);
+    }
+
+    #[test]
+    fn symbol_for_description_is_key() {
+        let id = symbol_for("globalKey");
+        assert_eq!(symbol_description(id), Some("globalKey".into()));
+    }
+
+    #[test]
+    fn symbol_for_empty_key() {
+        let id = symbol_for("");
+        assert_eq!(symbol_key_for(id), Some("".into()));
+        assert_eq!(symbol_description(id), Some("".into()));
+    }
+
+    #[test]
+    fn symbol_create_empty_description() {
+        let id = symbol_create(Some("".into()));
+        assert_eq!(symbol_description(id), Some("".into()));
+    }
 }

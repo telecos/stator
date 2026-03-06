@@ -170,6 +170,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::builtins::error::{pop_call_frame, push_call_frame};
+use crate::builtins::symbol::symbol_description;
 use crate::bytecode::bytecode_array::{
     BytecodeArray, ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD,
     TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD,
@@ -4575,7 +4576,10 @@ fn to_array_index(key: &JsValue) -> Option<usize> {
 /// ECMAScript §7.1.19 ToPropertyKey — Symbols are not yet supported so all
 /// values are coerced to strings via [`JsValue::to_js_string`].
 fn to_property_key(key: &JsValue) -> StatorResult<String> {
-    key.to_js_string()
+    match key {
+        JsValue::Symbol(id) => Ok(format!("Symbol({id})")),
+        _ => key.to_js_string(),
+    }
 }
 
 /// Perform a keyed property load: `obj[key]`.
@@ -4587,6 +4591,24 @@ fn to_property_key(key: &JsValue) -> StatorResult<String> {
 /// Returns `JsValue::Undefined` if the property is not found after exhausting
 /// the chain or hitting a depth limit of 256 links.
 fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
+    // Handle JsValue::Symbol — expose description, toString, valueOf.
+    if let JsValue::Symbol(id) = obj {
+        let id = *id;
+        return match key {
+            "description" => match symbol_description(id) {
+                Some(desc) => JsValue::String(desc),
+                None => JsValue::Undefined,
+            },
+            "toString" => {
+                JsValue::NativeFunction(Rc::new(move |_args| match symbol_description(id) {
+                    Some(desc) => Ok(JsValue::String(format!("Symbol({desc})"))),
+                    None => Ok(JsValue::String("Symbol()".to_string())),
+                }))
+            }
+            "valueOf" => JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Symbol(id)))),
+            _ => JsValue::Undefined,
+        };
+    }
     // Handle JsValue::Error — expose name, message, stack properties.
     if let JsValue::Error(e) = obj {
         return match key {

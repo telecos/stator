@@ -68,8 +68,8 @@ use crate::builtins::string::{
 use crate::builtins::symbol::{
     SYMBOL_ASYNC_ITERATOR, SYMBOL_HAS_INSTANCE, SYMBOL_IS_CONCAT_SPREADABLE, SYMBOL_ITERATOR,
     SYMBOL_MATCH, SYMBOL_MATCH_ALL, SYMBOL_REPLACE, SYMBOL_SEARCH, SYMBOL_SPECIES, SYMBOL_SPLIT,
-    SYMBOL_TO_PRIMITIVE, SYMBOL_TO_STRING_TAG, SYMBOL_UNSCOPABLES, symbol_create, symbol_for,
-    symbol_key_for,
+    SYMBOL_TO_PRIMITIVE, SYMBOL_TO_STRING_TAG, SYMBOL_UNSCOPABLES, symbol_create,
+    symbol_description, symbol_for, symbol_key_for,
 };
 use crate::builtins::weak_map::{
     weak_map_delete, weak_map_get, weak_map_has, weak_map_new, weak_map_set,
@@ -1960,6 +1960,73 @@ fn make_symbol() -> JsValue {
         JsValue::Symbol(SYMBOL_ASYNC_ITERATOR),
     );
     props.insert("matchAll".into(), JsValue::Symbol(SYMBOL_MATCH_ALL));
+
+    // ── Symbol.prototype ─────────────────────────────────────────────────
+    {
+        let mut proto: HashMap<String, JsValue> = HashMap::new();
+
+        // Symbol.prototype.description — getter returning the description.
+        proto.insert(
+            "description".into(),
+            native(|args| {
+                let this = args.first().unwrap_or(&JsValue::Undefined);
+                if let JsValue::Symbol(id) = this {
+                    match symbol_description(*id) {
+                        Some(desc) => Ok(JsValue::String(desc)),
+                        None => Ok(JsValue::Undefined),
+                    }
+                } else {
+                    Err(crate::error::StatorError::TypeError(
+                        "Symbol.prototype.description requires a symbol".into(),
+                    ))
+                }
+            }),
+        );
+
+        // Symbol.prototype.toString()
+        proto.insert(
+            "toString".into(),
+            native(|args| {
+                let this = args.first().unwrap_or(&JsValue::Undefined);
+                if let JsValue::Symbol(id) = this {
+                    match symbol_description(*id) {
+                        Some(desc) => Ok(JsValue::String(format!("Symbol({desc})"))),
+                        None => Ok(JsValue::String("Symbol()".to_string())),
+                    }
+                } else {
+                    Err(crate::error::StatorError::TypeError(
+                        "Symbol.prototype.toString requires a symbol".into(),
+                    ))
+                }
+            }),
+        );
+
+        // Symbol.prototype.valueOf()
+        proto.insert(
+            "valueOf".into(),
+            native(|args| {
+                let this = args.first().unwrap_or(&JsValue::Undefined);
+                if let JsValue::Symbol(id) = this {
+                    Ok(JsValue::Symbol(*id))
+                } else {
+                    Err(crate::error::StatorError::TypeError(
+                        "Symbol.prototype.valueOf requires a symbol".into(),
+                    ))
+                }
+            }),
+        );
+
+        // Symbol.prototype[@@toStringTag] = "Symbol"
+        proto.insert(
+            format!("Symbol({})", SYMBOL_TO_STRING_TAG),
+            JsValue::String("Symbol".into()),
+        );
+
+        props.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        );
+    }
 
     // ── The callable Symbol(desc?) ────────────────────────────────────────
     //
@@ -4331,6 +4398,513 @@ mod tests {
     fn e2e_typeof_symbol_iterator() {
         let result = global_eval("typeof Symbol.iterator").unwrap();
         assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    // ── Symbol.prototype.description tests ──────────────────────────────
+
+    /// `Symbol("foo").description` → "foo"
+    #[test]
+    fn e2e_symbol_description_with_value() {
+        let result = global_eval(r#"Symbol("foo").description"#).unwrap();
+        assert_eq!(result, JsValue::String("foo".into()));
+    }
+
+    /// `Symbol().description` → undefined
+    #[test]
+    fn e2e_symbol_description_undefined() {
+        let result = global_eval("Symbol().description").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// `Symbol("").description` → ""
+    #[test]
+    fn e2e_symbol_description_empty_string() {
+        let result = global_eval(r#"Symbol("").description"#).unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    /// Well-known `Symbol.iterator.description` → "Symbol.iterator"
+    #[test]
+    fn e2e_symbol_iterator_description() {
+        let result = global_eval("Symbol.iterator.description").unwrap();
+        assert_eq!(result, JsValue::String("Symbol.iterator".into()));
+    }
+
+    /// `Symbol.toPrimitive.description` → "Symbol.toPrimitive"
+    #[test]
+    fn e2e_symbol_to_primitive_description() {
+        let result = global_eval("Symbol.toPrimitive.description").unwrap();
+        assert_eq!(result, JsValue::String("Symbol.toPrimitive".into()));
+    }
+
+    /// `Symbol.hasInstance.description` → "Symbol.hasInstance"
+    #[test]
+    fn e2e_symbol_has_instance_description() {
+        let result = global_eval("Symbol.hasInstance.description").unwrap();
+        assert_eq!(result, JsValue::String("Symbol.hasInstance".into()));
+    }
+
+    /// `Symbol.toStringTag.description` → "Symbol.toStringTag"
+    #[test]
+    fn e2e_symbol_to_string_tag_description() {
+        let result = global_eval("Symbol.toStringTag.description").unwrap();
+        assert_eq!(result, JsValue::String("Symbol.toStringTag".into()));
+    }
+
+    /// `Symbol.species.description` → "Symbol.species"
+    #[test]
+    fn e2e_symbol_species_description() {
+        let result = global_eval("Symbol.species.description").unwrap();
+        assert_eq!(result, JsValue::String("Symbol.species".into()));
+    }
+
+    /// `Symbol.isConcatSpreadable.description` → "Symbol.isConcatSpreadable"
+    #[test]
+    fn e2e_symbol_is_concat_spreadable_description() {
+        let result = global_eval("Symbol.isConcatSpreadable.description").unwrap();
+        assert_eq!(result, JsValue::String("Symbol.isConcatSpreadable".into()));
+    }
+
+    /// `Symbol.match.description` → "Symbol.match"
+    #[test]
+    fn e2e_symbol_match_description() {
+        let result = global_eval("Symbol.match.description").unwrap();
+        assert_eq!(result, JsValue::String("Symbol.match".into()));
+    }
+
+    /// `Symbol.replace.description` → "Symbol.replace"
+    #[test]
+    fn e2e_symbol_replace_description() {
+        let result = global_eval("Symbol.replace.description").unwrap();
+        assert_eq!(result, JsValue::String("Symbol.replace".into()));
+    }
+
+    /// `Symbol.search.description` → "Symbol.search"
+    #[test]
+    fn e2e_symbol_search_description() {
+        let result = global_eval("Symbol.search.description").unwrap();
+        assert_eq!(result, JsValue::String("Symbol.search".into()));
+    }
+
+    /// `Symbol.split.description` → "Symbol.split"
+    #[test]
+    fn e2e_symbol_split_description() {
+        let result = global_eval("Symbol.split.description").unwrap();
+        assert_eq!(result, JsValue::String("Symbol.split".into()));
+    }
+
+    /// `Symbol.unscopables.description` → "Symbol.unscopables"
+    #[test]
+    fn e2e_symbol_unscopables_description() {
+        let result = global_eval("Symbol.unscopables.description").unwrap();
+        assert_eq!(result, JsValue::String("Symbol.unscopables".into()));
+    }
+
+    /// `Symbol.asyncIterator.description` → "Symbol.asyncIterator"
+    #[test]
+    fn e2e_symbol_async_iterator_description() {
+        let result = global_eval("Symbol.asyncIterator.description").unwrap();
+        assert_eq!(result, JsValue::String("Symbol.asyncIterator".into()));
+    }
+
+    /// `Symbol.matchAll.description` → "Symbol.matchAll"
+    #[test]
+    fn e2e_symbol_match_all_description() {
+        let result = global_eval("Symbol.matchAll.description").unwrap();
+        assert_eq!(result, JsValue::String("Symbol.matchAll".into()));
+    }
+
+    // ── Symbol.prototype.toString tests ─────────────────────────────────
+
+    /// `Symbol("foo").toString()` → "Symbol(foo)"
+    #[test]
+    fn e2e_symbol_to_string_with_desc() {
+        let result = global_eval(r#"Symbol("foo").toString()"#).unwrap();
+        assert_eq!(result, JsValue::String("Symbol(foo)".into()));
+    }
+
+    /// `Symbol().toString()` → "Symbol()"
+    #[test]
+    fn e2e_symbol_to_string_no_desc() {
+        let result = global_eval("Symbol().toString()").unwrap();
+        assert_eq!(result, JsValue::String("Symbol()".into()));
+    }
+
+    /// `typeof Symbol("x").toString()` → "string"
+    #[test]
+    fn e2e_symbol_to_string_is_string() {
+        let result = global_eval(r#"typeof Symbol("x").toString()"#).unwrap();
+        assert_eq!(result, JsValue::String("string".into()));
+    }
+
+    // ── Symbol.prototype.valueOf tests ──────────────────────────────────
+
+    /// `typeof Symbol("x").valueOf()` → "symbol"
+    #[test]
+    fn e2e_symbol_value_of_is_symbol() {
+        let result = global_eval(r#"typeof Symbol("x").valueOf()"#).unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// `Symbol.iterator.valueOf() === Symbol.iterator`
+    #[test]
+    fn e2e_symbol_value_of_identity() {
+        let result = global_eval("Symbol.iterator.valueOf() === Symbol.iterator").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Symbol as property key tests ────────────────────────────────────
+
+    /// Symbols can be used as property keys on objects.
+    #[test]
+    fn e2e_symbol_as_property_key() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("myKey");
+            var obj = {};
+            obj[s] = 42;
+            obj[s]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Different symbols produce different property keys.
+    #[test]
+    fn e2e_symbol_different_keys() {
+        let result = global_eval(
+            r#"
+            var s1 = Symbol("a");
+            var s2 = Symbol("a");
+            var obj = {};
+            obj[s1] = 1;
+            obj[s2] = 2;
+            obj[s1]
+            "#,
+        )
+        .unwrap();
+        // s1 and s2 are different symbols despite same description,
+        // so they produce different property keys.
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `Symbol.for` symbol as property key is shared.
+    #[test]
+    fn e2e_symbol_for_as_property_key() {
+        let result = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.for("shared")] = 99;
+            obj[Symbol.for("shared")]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    /// Well-known symbol as property key.
+    #[test]
+    fn e2e_well_known_symbol_as_property_key() {
+        let result = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = "iter";
+            obj[Symbol.iterator]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("iter".into()));
+    }
+
+    // ── Symbol.for / Symbol.keyFor e2e tests ────────────────────────────
+
+    /// `Symbol.for("x") !== Symbol("x")` — registry symbols ≠ non-registry.
+    #[test]
+    fn e2e_symbol_for_not_same_as_symbol() {
+        let result = global_eval(r#"Symbol.for("x") === Symbol("x")"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Symbol.for` with different keys returns different symbols.
+    #[test]
+    fn e2e_symbol_for_different_keys() {
+        let result = global_eval(r#"Symbol.for("a") === Symbol.for("b")"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Symbol.keyFor(Symbol.for("test"))` → "test"
+    #[test]
+    fn e2e_symbol_key_for_returns_key() {
+        let result = global_eval(r#"Symbol.keyFor(Symbol.for("test"))"#).unwrap();
+        assert_eq!(result, JsValue::String("test".into()));
+    }
+
+    /// `Symbol.keyFor` returns undefined for non-registry symbols.
+    #[test]
+    fn e2e_symbol_key_for_undefined() {
+        let result = global_eval(r#"Symbol.keyFor(Symbol("desc")) === undefined"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Symbol.keyFor` returns undefined for well-known symbols.
+    #[test]
+    fn e2e_symbol_key_for_well_known_undefined() {
+        let result = global_eval("Symbol.keyFor(Symbol.iterator) === undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── typeof symbol tests ─────────────────────────────────────────────
+
+    /// `typeof Symbol.for("x")` → "symbol"
+    #[test]
+    fn e2e_typeof_symbol_for() {
+        let result = global_eval(r#"typeof Symbol.for("x")"#).unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// `typeof Symbol("desc")` → "symbol"
+    #[test]
+    fn e2e_typeof_symbol_with_desc() {
+        let result = global_eval(r#"typeof Symbol("desc")"#).unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// `typeof Symbol.toPrimitive` → "symbol"
+    #[test]
+    fn e2e_typeof_symbol_to_primitive() {
+        let result = global_eval("typeof Symbol.toPrimitive").unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// `typeof Symbol.hasInstance` → "symbol"
+    #[test]
+    fn e2e_typeof_symbol_has_instance() {
+        let result = global_eval("typeof Symbol.hasInstance").unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// `typeof Symbol.species` → "symbol"
+    #[test]
+    fn e2e_typeof_symbol_species() {
+        let result = global_eval("typeof Symbol.species").unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// `typeof Symbol.toStringTag` → "symbol"
+    #[test]
+    fn e2e_typeof_symbol_to_string_tag() {
+        let result = global_eval("typeof Symbol.toStringTag").unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// `typeof Symbol.match` → "symbol"
+    #[test]
+    fn e2e_typeof_symbol_match() {
+        let result = global_eval("typeof Symbol.match").unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// `typeof Symbol.replace` → "symbol"
+    #[test]
+    fn e2e_typeof_symbol_replace() {
+        let result = global_eval("typeof Symbol.replace").unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// `typeof Symbol.search` → "symbol"
+    #[test]
+    fn e2e_typeof_symbol_search() {
+        let result = global_eval("typeof Symbol.search").unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// `typeof Symbol.split` → "symbol"
+    #[test]
+    fn e2e_typeof_symbol_split() {
+        let result = global_eval("typeof Symbol.split").unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// `typeof Symbol.unscopables` → "symbol"
+    #[test]
+    fn e2e_typeof_symbol_unscopables() {
+        let result = global_eval("typeof Symbol.unscopables").unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// `typeof Symbol.asyncIterator` → "symbol"
+    #[test]
+    fn e2e_typeof_symbol_async_iterator() {
+        let result = global_eval("typeof Symbol.asyncIterator").unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// `typeof Symbol.isConcatSpreadable` → "symbol"
+    #[test]
+    fn e2e_typeof_symbol_is_concat_spreadable() {
+        let result = global_eval("typeof Symbol.isConcatSpreadable").unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// `typeof Symbol.matchAll` → "symbol"
+    #[test]
+    fn e2e_typeof_symbol_match_all() {
+        let result = global_eval("typeof Symbol.matchAll").unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    // ── Symbol identity / equality tests ────────────────────────────────
+
+    /// `Symbol("a") === Symbol("a")` → false (unique).
+    #[test]
+    fn e2e_symbol_same_desc_not_equal() {
+        let result = global_eval(r#"Symbol("a") === Symbol("a")"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// A symbol is strictly equal to itself.
+    #[test]
+    fn e2e_symbol_identity() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("id");
+            s === s
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Symbol.prototype exists ─────────────────────────────────────────
+
+    /// `Symbol` object has a `prototype` property.
+    #[test]
+    fn test_symbol_prototype_exists() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let sym = globals.get("Symbol").unwrap();
+        if let JsValue::PlainObject(map) = sym {
+            let map = map.borrow();
+            assert!(
+                matches!(map.get("prototype"), Some(JsValue::PlainObject(_))),
+                "Symbol.prototype should be a PlainObject"
+            );
+        } else {
+            panic!("Symbol should be a PlainObject");
+        }
+    }
+
+    /// `Symbol.prototype` has `toString`, `valueOf`, `description` methods.
+    #[test]
+    fn test_symbol_prototype_methods() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let sym = globals.get("Symbol").unwrap();
+        if let JsValue::PlainObject(map) = sym {
+            let map = map.borrow();
+            let proto = map.get("prototype").unwrap();
+            if let JsValue::PlainObject(proto_map) = proto {
+                let proto_map = proto_map.borrow();
+                assert!(matches!(
+                    proto_map.get("toString"),
+                    Some(JsValue::NativeFunction(_))
+                ));
+                assert!(matches!(
+                    proto_map.get("valueOf"),
+                    Some(JsValue::NativeFunction(_))
+                ));
+                assert!(matches!(
+                    proto_map.get("description"),
+                    Some(JsValue::NativeFunction(_))
+                ));
+            } else {
+                panic!("Symbol.prototype should be a PlainObject");
+            }
+        } else {
+            panic!("Symbol should be a PlainObject");
+        }
+    }
+
+    // ── Well-known symbol completeness test ─────────────────────────────
+
+    /// All 13 well-known symbols are present on the Symbol constructor.
+    #[test]
+    fn test_symbol_all_well_known_present() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let sym = globals.get("Symbol").unwrap();
+        if let JsValue::PlainObject(map) = sym {
+            let map = map.borrow();
+            let expected = [
+                "iterator",
+                "toPrimitive",
+                "hasInstance",
+                "toStringTag",
+                "isConcatSpreadable",
+                "species",
+                "match",
+                "replace",
+                "search",
+                "split",
+                "unscopables",
+                "asyncIterator",
+                "matchAll",
+            ];
+            for name in &expected {
+                assert!(
+                    matches!(map.get(*name), Some(JsValue::Symbol(_))),
+                    "Symbol.{name} should be present as a Symbol value"
+                );
+            }
+        } else {
+            panic!("Symbol should be a PlainObject");
+        }
+    }
+
+    /// Each well-known symbol is distinct from the others.
+    #[test]
+    fn test_symbol_well_known_all_distinct() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let sym = globals.get("Symbol").unwrap();
+        if let JsValue::PlainObject(map) = sym {
+            let map = map.borrow();
+            let names = [
+                "iterator",
+                "toPrimitive",
+                "hasInstance",
+                "toStringTag",
+                "isConcatSpreadable",
+                "species",
+                "match",
+                "replace",
+                "search",
+                "split",
+                "unscopables",
+                "asyncIterator",
+                "matchAll",
+            ];
+            let ids: Vec<u64> = names
+                .iter()
+                .map(|n| {
+                    if let Some(JsValue::Symbol(id)) = map.get(*n) {
+                        *id
+                    } else {
+                        panic!("Symbol.{n} missing");
+                    }
+                })
+                .collect();
+            // All IDs should be unique.
+            let mut deduped = ids.clone();
+            deduped.sort();
+            deduped.dedup();
+            assert_eq!(
+                ids.len(),
+                deduped.len(),
+                "All well-known symbols must have distinct IDs"
+            );
+        }
     }
 
     // ── Object.defineProperty / getOwnPropertyDescriptor tests ──────────
