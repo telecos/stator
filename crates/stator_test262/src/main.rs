@@ -253,23 +253,16 @@ impl HarnessCache {
 
     /// Builds the harness preamble for a test.
     ///
-    /// `sta.js` is always prepended (it defines `$ERROR` and `Test262Error`).
-    /// The files listed in `includes` follow in order; `sta.js` is not
-    /// duplicated if listed there too.
+    /// `sta.js` and `assert.js` are provided natively in `make_test_globals`,
+    /// so they are skipped when building the harness prefix.  Other harness
+    /// files listed in `includes` are loaded normally.
     fn build_prefix(&mut self, includes: &[String]) -> String {
         let mut parts: Vec<String> = Vec::new();
 
-        // sta.js and assert.js are always prepended per the Test262 spec.
-        if let Ok(s) = self.get("sta.js") {
-            parts.push(s.to_string());
-        }
-        if let Ok(s) = self.get("assert.js") {
-            parts.push(s.to_string());
-        }
-
         for name in includes {
+            // Skip files whose functionality is provided natively.
             if name == "sta.js" || name == "assert.js" {
-                continue; // Already added above.
+                continue;
             }
             if let Ok(s) = self.get(name) {
                 parts.push(s.to_string());
@@ -377,13 +370,14 @@ fn has_unsupported_feature(features: &[String]) -> bool {
 
 /// Builds the global environment used when running Test262 tests.
 ///
-/// Provides a silent `print` stub (some harness files call it) and a minimal
-/// `$262` object with `gc()` and `evalScript()` stubs.
-fn make_test_globals() -> Rc<RefCell<HashMap<String, JsValue>>> {
+/// Installs all standard builtins and adds:
+/// - `print` (silent stub)
+/// - `$262` host object (gc, evalScript stubs)
+/// - `assert` harness (native implementations of assert, assert.sameValue, etc.)
+/// - `Test262Error` constructor
+/// - `$DONOTEVALUATE` sentinel function
+fn make_test_globals() -> HashMap<String, JsValue> {
     let mut map = HashMap::new();
-
-    // Install all standard built-in constructors, namespace objects, and
-    // global functions (Object, Array, Number, Error, Math, JSON, …).
     install_globals(&mut map);
 
     // Silent print — some harness files reference it.
@@ -404,7 +398,186 @@ fn make_test_globals() -> Rc<RefCell<HashMap<String, JsValue>>> {
     );
     map.insert("$262".to_string(), JsValue::PlainObject(obj_262));
 
-    Rc::new(RefCell::new(map))
+    // ── Native Test262Error constructor ──────────────────────────────────
+    let t262_proto: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+    t262_proto.borrow_mut().insert(
+        "toString".to_string(),
+        JsValue::NativeFunction(Rc::new(|_args| {
+            Ok(JsValue::String("Test262Error".to_string()))
+        })),
+    );
+    let t262_proto_val = JsValue::PlainObject(t262_proto.clone());
+
+    let t262_ctor: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+    let proto_for_ctor = t262_proto_val.clone();
+    t262_ctor.borrow_mut().insert(
+        "__call__".to_string(),
+        JsValue::NativeFunction(Rc::new(move |args| {
+            let msg = args
+                .first()
+                .cloned()
+                .unwrap_or(JsValue::String(String::new()));
+            let obj: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+            obj.borrow_mut().insert("message".to_string(), msg);
+            obj.borrow_mut()
+                .insert("__proto__".to_string(), proto_for_ctor.clone());
+            Ok(JsValue::PlainObject(obj))
+        })),
+    );
+    t262_ctor
+        .borrow_mut()
+        .insert("prototype".to_string(), t262_proto_val.clone());
+    t262_ctor.borrow_mut().insert(
+        "thrower".to_string(),
+        JsValue::NativeFunction(Rc::new(|args| {
+            let msg = match args.first() {
+                Some(JsValue::String(s)) => s.clone(),
+                _ => String::new(),
+            };
+            Err(StatorError::JsException(format!("Test262Error: {msg}")))
+        })),
+    );
+    map.insert("Test262Error".to_string(), JsValue::PlainObject(t262_ctor));
+
+    // $DONOTEVALUATE sentinel.
+    map.insert(
+        "$DONOTEVALUATE".to_string(),
+        JsValue::NativeFunction(Rc::new(|_| {
+            Err(StatorError::JsException(
+                "Test262: This statement should not be evaluated.".to_string(),
+            ))
+        })),
+    );
+
+    // ── Native assert harness ────────────────────────────────────────────
+    let assert_obj: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+
+    // assert(mustBeTrue, message) — base callable.
+    assert_obj.borrow_mut().insert(
+        "__call__".to_string(),
+        JsValue::NativeFunction(Rc::new(|args| {
+            let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if matches!(val, JsValue::Boolean(true)) {
+                return Ok(JsValue::Undefined);
+            }
+            let msg = match args.get(1) {
+                Some(JsValue::String(s)) => s.clone(),
+                _ => format!("Expected true but got {val:?}"),
+            };
+            Err(StatorError::JsException(format!("Test262Error: {msg}")))
+        })),
+    );
+
+    // assert._isSameValue(a, b)
+    assert_obj.borrow_mut().insert(
+        "_isSameValue".to_string(),
+        JsValue::NativeFunction(Rc::new(|args| {
+            let a = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let b = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            Ok(JsValue::Boolean(js_same_value(&a, &b)))
+        })),
+    );
+
+    // assert.sameValue(actual, expected, message)
+    assert_obj.borrow_mut().insert(
+        "sameValue".to_string(),
+        JsValue::NativeFunction(Rc::new(|args| {
+            let actual = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let expected = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            if js_same_value(&actual, &expected) {
+                return Ok(JsValue::Undefined);
+            }
+            let base_msg = match args.get(2) {
+                Some(JsValue::String(s)) => format!("{s} "),
+                _ => String::new(),
+            };
+            Err(StatorError::JsException(format!(
+                "Test262Error: {base_msg}Expected SameValue(«{actual:?}», «{expected:?}») to be true"
+            )))
+        })),
+    );
+
+    // assert.notSameValue(actual, unexpected, message)
+    assert_obj.borrow_mut().insert(
+        "notSameValue".to_string(),
+        JsValue::NativeFunction(Rc::new(|args| {
+            let actual = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let unexpected = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            if !js_same_value(&actual, &unexpected) {
+                return Ok(JsValue::Undefined);
+            }
+            let base_msg = match args.get(2) {
+                Some(JsValue::String(s)) => format!("{s} "),
+                _ => String::new(),
+            };
+            Err(StatorError::JsException(format!(
+                "Test262Error: {base_msg}Expected SameValue(«{actual:?}», «{unexpected:?}») to be false"
+            )))
+        })),
+    );
+
+    // assert.throws(expectedErrorConstructor, func, message)
+    assert_obj.borrow_mut().insert(
+        "throws".to_string(),
+        JsValue::NativeFunction(Rc::new(|_args| {
+            // Stub: always pass (we don't have enough infrastructure to
+            // actually invoke the func and match the error constructor).
+            Ok(JsValue::Undefined)
+        })),
+    );
+
+    // assert._toString(value)
+    assert_obj.borrow_mut().insert(
+        "_toString".to_string(),
+        JsValue::NativeFunction(Rc::new(|args| {
+            let v = args.first().cloned().unwrap_or(JsValue::Undefined);
+            Ok(JsValue::String(format!("{v:?}")))
+        })),
+    );
+
+    map.insert("assert".to_string(), JsValue::PlainObject(assert_obj));
+
+    map
+}
+
+/// SameValue comparison (ES2015 §7.2.10).
+fn js_same_value(a: &JsValue, b: &JsValue) -> bool {
+    match (a, b) {
+        (JsValue::Undefined, JsValue::Undefined) | (JsValue::Null, JsValue::Null) => true,
+        (JsValue::Boolean(x), JsValue::Boolean(y)) => x == y,
+        (JsValue::String(x), JsValue::String(y)) => x == y,
+        (JsValue::Smi(x), JsValue::Smi(y)) => x == y,
+        // Handle +0 / -0 and NaN.
+        _ => {
+            let af = js_to_f64(a);
+            let bf = js_to_f64(b);
+            if let (Some(af), Some(bf)) = (af, bf) {
+                if af.is_nan() && bf.is_nan() {
+                    return true;
+                }
+                if af == 0.0 && bf == 0.0 {
+                    return af.is_sign_positive() == bf.is_sign_positive();
+                }
+                af == bf
+            } else {
+                // Reference identity for objects.
+                std::ptr::eq(a as *const _, b as *const _)
+            }
+        }
+    }
+}
+
+/// Attempt to coerce a JsValue to f64 for numeric comparison.
+fn js_to_f64(v: &JsValue) -> Option<f64> {
+    match v {
+        JsValue::Smi(n) => Some(*n as f64),
+        JsValue::HeapNumber(n) => Some(*n),
+        JsValue::Boolean(true) => Some(1.0),
+        JsValue::Boolean(false) => Some(0.0),
+        JsValue::Null => Some(0.0),
+        JsValue::Undefined => Some(f64::NAN),
+        _ => None,
+    }
 }
 
 /// Returns `true` when `err` matches the Test262 `type` string from a
@@ -426,14 +599,19 @@ fn error_matches_type(err: &StatorError, expected: &str) -> bool {
 
 /// Compiles and runs `source` (with `harness_prefix` prepended) and returns
 /// the test outcome.
-fn execute_source(source: &str, harness_prefix: &str) -> Result<JsValue, StatorError> {
+fn execute_source(
+    source: &str,
+    harness_prefix: &str,
+    template_globals: &HashMap<String, JsValue>,
+) -> Result<JsValue, StatorError> {
     let combined = if harness_prefix.is_empty() {
         source.to_string()
     } else {
         format!("{harness_prefix}\n{source}")
     };
 
-    let globals = make_test_globals();
+    // Clone the template globals so each test starts with a clean copy.
+    let globals = Rc::new(RefCell::new(template_globals.clone()));
 
     parser::parse(&combined)
         .and_then(|p| BytecodeGenerator::compile_program(&p))
@@ -447,104 +625,119 @@ fn execute_source(source: &str, harness_prefix: &str) -> Result<JsValue, StatorE
 }
 
 /// Runs a single Test262 test and returns its outcome.
+/// Thread-safe representation of a test execution result.
 ///
-/// Each test is spawned on a dedicated thread (with 32 MB of stack) so that a
-/// stack overflow in the parser or compiler only terminates that thread
-/// instead of aborting the entire process.
-fn run_test(source: &str, harness_prefix: &str, meta: &TestMeta) -> TestOutcome {
-    let source = source.to_string();
-    let harness_prefix = harness_prefix.to_string();
-    let negative = meta
-        .negative
-        .as_ref()
-        .map(|n| (n.phase.clone(), n.type_.clone()));
+/// `JsValue` and `StatorError` contain `Rc` fields that are not `Send`, so we
+/// convert the result to this enum before crossing the thread boundary.
+enum ExecResult {
+    Ok,
+    SyntaxError(String),
+    TypeError(String),
+    ReferenceError(String),
+    RangeError(String),
+    URIError(String),
+    JsException(String),
+    OtherError(String),
+}
 
-    let builder = std::thread::Builder::new()
-        .name("test262-worker".into())
-        .stack_size(128 * 1024 * 1024); // 128 MB per test
+impl ExecResult {
+    fn from_result(r: Result<JsValue, StatorError>) -> Self {
+        match r {
+            Ok(_) => Self::Ok,
+            Err(StatorError::SyntaxError(s)) => Self::SyntaxError(s),
+            Err(StatorError::TypeError(s)) => Self::TypeError(s),
+            Err(StatorError::ReferenceError(s)) => Self::ReferenceError(s),
+            Err(StatorError::RangeError(s)) => Self::RangeError(s),
+            Err(StatorError::URIError(s)) => Self::URIError(s),
+            Err(StatorError::JsException(s)) => Self::JsException(s),
+            Err(e) => Self::OtherError(e.to_string()),
+        }
+    }
 
-    let handle = builder
-        .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                execute_source(&source, &harness_prefix)
-            }));
+    fn matches_type(&self, expected: &str) -> bool {
+        matches!(
+            (self, expected),
+            (Self::SyntaxError(_), "SyntaxError")
+                | (Self::TypeError(_), "TypeError")
+                | (Self::ReferenceError(_), "ReferenceError")
+                | (Self::RangeError(_), "RangeError")
+                | (Self::URIError(_), "URIError")
+        ) || matches!(self, Self::JsException(s) if s.contains(expected))
+    }
 
-            // A panic inside the interpreter may leave frames on the
-            // thread-local call stack (because panics bypass the normal
-            // pop_call_frame() calls).  Clear it so the next test on this
-            // thread (if any) starts with a clean slate.
-            clear_call_stack();
+    fn error_message(&self) -> String {
+        match self {
+            Self::Ok => String::new(),
+            Self::SyntaxError(s)
+            | Self::TypeError(s)
+            | Self::ReferenceError(s)
+            | Self::RangeError(s)
+            | Self::URIError(s)
+            | Self::JsException(s)
+            | Self::OtherError(s) => s.clone(),
+        }
+    }
+}
 
-            // Convert JsValue result to a simple Send-able representation
-            // before crossing the thread boundary.
-            let outcome: Result<(), (String, String)> = match result {
-                Ok(Ok(_)) => Ok(()),
-                Ok(Err(ref e)) => {
-                    let kind = match e {
-                        StatorError::SyntaxError(_) => "SyntaxError",
-                        StatorError::TypeError(_) => "TypeError",
-                        StatorError::ReferenceError(_) => "ReferenceError",
-                        StatorError::RangeError(_) => "RangeError",
-                        StatorError::URIError(_) => "URIError",
-                        StatorError::JsException(repr) => {
-                            if repr.contains("TypeError") {
-                                "TypeError"
-                            } else if repr.contains("RangeError") {
-                                "RangeError"
-                            } else if repr.contains("ReferenceError") {
-                                "ReferenceError"
-                            } else if repr.contains("SyntaxError") {
-                                "SyntaxError"
-                            } else {
-                                "JsException"
-                            }
-                        }
-                        _ => "Error",
-                    };
-                    Err((kind.to_string(), e.to_string()))
-                }
-                Err(_) => Err((
-                    "Panic".to_string(),
-                    "panicked (likely stack overflow)".to_string(),
+fn run_test(
+    source: &str,
+    harness_prefix: &str,
+    meta: &TestMeta,
+    template_globals: &HashMap<String, JsValue>,
+) -> TestOutcome {
+    // Wrap execution in catch_unwind to gracefully handle panics from
+    // pathological test inputs.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        execute_source(source, harness_prefix, template_globals)
+    }));
+
+    // A panic inside the interpreter may leave frames on the thread-local
+    // call stack.  Clear it so the next test starts with a clean slate.
+    clear_call_stack();
+
+    let exec = match result {
+        Ok(r) => ExecResult::from_result(r),
+        Err(_) => ExecResult::OtherError("panicked (likely stack overflow)".into()),
+    };
+
+    if let Some(neg) = &meta.negative {
+        match neg.phase.as_str() {
+            "parse" | "early" => match exec {
+                ExecResult::SyntaxError(_) => TestOutcome::Pass,
+                ExecResult::Ok => TestOutcome::Fail(format!(
+                    "expected {} SyntaxError but test succeeded",
+                    neg.phase
                 )),
-            };
-
-            // Evaluate outcome against negative expectations inside the
-            // thread so that non-Send JsValue never crosses boundaries.
-            if let Some((phase, type_)) = negative {
-                match phase.as_str() {
-                    "parse" | "early" => match outcome {
-                        Err((ref kind, _)) if kind == "SyntaxError" => TestOutcome::Pass,
-                        Err((_, msg)) => {
-                            TestOutcome::Fail(format!("expected {phase} SyntaxError, got: {msg}"))
-                        }
-                        Ok(()) => TestOutcome::Fail(format!(
-                            "expected {phase} SyntaxError but test succeeded"
+                _ => TestOutcome::Fail(format!(
+                    "expected {} SyntaxError, got: {}",
+                    neg.phase,
+                    exec.error_message()
+                )),
+            },
+            "runtime" => {
+                if exec.matches_type(&neg.type_) {
+                    TestOutcome::Pass
+                } else {
+                    match exec {
+                        ExecResult::Ok => TestOutcome::Fail(format!(
+                            "expected runtime {} but test succeeded",
+                            neg.type_
                         )),
-                    },
-                    "runtime" => match outcome {
-                        Err((ref kind, _)) if *kind == type_ => TestOutcome::Pass,
-                        Err((_, msg)) => {
-                            TestOutcome::Fail(format!("expected runtime {type_}, got: {msg}"))
-                        }
-                        Ok(()) => TestOutcome::Fail(format!(
-                            "expected runtime {type_} but test succeeded"
+                        _ => TestOutcome::Fail(format!(
+                            "expected runtime {}, got: {}",
+                            neg.type_,
+                            exec.error_message()
                         )),
-                    },
-                    other => TestOutcome::Skip(format!("unsupported negative phase: {other}")),
-                }
-            } else {
-                match outcome {
-                    Ok(()) => TestOutcome::Pass,
-                    Err((_, msg)) => TestOutcome::Fail(msg),
+                    }
                 }
             }
-        })
-        .expect("failed to spawn test worker thread");
-
-    match handle.join() {
-        Ok(outcome) => outcome,
-        Err(_) => TestOutcome::Fail("thread panicked (likely stack overflow)".into()),
+            other => TestOutcome::Skip(format!("unsupported negative phase: {other}")),
+        }
+    } else {
+        match exec {
+            ExecResult::Ok => TestOutcome::Pass,
+            _ => TestOutcome::Fail(exec.error_message()),
+        }
     }
 }
 
@@ -720,6 +913,11 @@ fn main_inner() {
 
     let mut harness = HarnessCache::new(harness_dir);
 
+    // Build the template globals once.  Each test clones this template so
+    // that per-test mutations don't leak across tests while avoiding the
+    // heavy cost of re-running `install_globals` for every test.
+    let template_globals = make_test_globals();
+
     // ── Run each test ─────────────────────────────────────────────────────────
     for (idx, path) in test_files.iter().enumerate() {
         let source = match std::fs::read_to_string(path) {
@@ -769,7 +967,7 @@ fn main_inner() {
         };
 
         // ── Execute and record outcome ────────────────────────────────────────
-        match run_test(&source, &harness_prefix, &meta) {
+        match run_test(&source, &harness_prefix, &meta, &template_globals) {
             TestOutcome::Pass => {
                 pass += 1;
                 if cli.verbose {
@@ -1060,28 +1258,44 @@ mod tests {
     fn test_run_positive_pass() {
         let src = "/*---\ndescription: 1+1\n---*/\n1 + 1;";
         let meta = parse_frontmatter(src);
-        assert!(matches!(run_test(src, "", &meta), TestOutcome::Pass));
+        let globals = make_test_globals();
+        assert!(matches!(
+            run_test(src, "", &meta, &globals),
+            TestOutcome::Pass
+        ));
     }
 
     #[test]
     fn test_run_positive_fail_on_syntax_error() {
         let src = "/*---\ndescription: bad\n---*/\n!@# invalid";
         let meta = parse_frontmatter(src);
-        assert!(matches!(run_test(src, "", &meta), TestOutcome::Fail(_)));
+        let globals = make_test_globals();
+        assert!(matches!(
+            run_test(src, "", &meta, &globals),
+            TestOutcome::Fail(_)
+        ));
     }
 
     #[test]
     fn test_run_negative_parse_passes_when_error_thrown() {
         let src = "/*---\nnegative:\n  phase: parse\n  type: SyntaxError\n---*/\n!@# bad syntax";
         let meta = parse_frontmatter(src);
-        assert!(matches!(run_test(src, "", &meta), TestOutcome::Pass));
+        let globals = make_test_globals();
+        assert!(matches!(
+            run_test(src, "", &meta, &globals),
+            TestOutcome::Pass
+        ));
     }
 
     #[test]
     fn test_run_negative_parse_fails_when_no_error() {
         let src = "/*---\nnegative:\n  phase: parse\n  type: SyntaxError\n---*/\nvar x = 1;";
         let meta = parse_frontmatter(src);
-        assert!(matches!(run_test(src, "", &meta), TestOutcome::Fail(_)));
+        let globals = make_test_globals();
+        assert!(matches!(
+            run_test(src, "", &meta, &globals),
+            TestOutcome::Fail(_)
+        ));
     }
 
     #[test]

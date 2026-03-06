@@ -1479,16 +1479,33 @@ fn handle_construct(
     match ctor {
         JsValue::Function(ba) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
+            // [[Construct]]: create a fresh object for `this`,
+            // wire its __proto__ to the constructor's prototype,
+            // then run the constructor body with `this` bound.
+            let this_obj: Rc<RefCell<HashMap<String, JsValue>>> =
+                Rc::new(RefCell::new(HashMap::new()));
+            if !matches!(ctor_proto, JsValue::Undefined) {
+                this_obj
+                    .borrow_mut()
+                    .insert("__proto__".to_string(), ctor_proto.clone());
+            }
+            let this_val = JsValue::PlainObject(this_obj);
             let mut callee_frame = InterpreterFrame::new_with_globals(
                 (*ba).clone(),
                 args,
                 Rc::clone(&ctx.frame.global_env),
             );
+            callee_frame.context = Some(this_val.clone());
             push_call_frame("<anonymous>")?;
             let result = Interpreter::run(&mut callee_frame);
             pop_call_frame();
             let val = result?;
-            ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
+            // If the constructor explicitly returns an object,
+            // use it; otherwise return the `this` object.
+            ctx.frame.accumulator = match val {
+                JsValue::PlainObject(_) | JsValue::Object(_) => val,
+                _ => this_val,
+            };
         }
         JsValue::NativeFunction(f) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;

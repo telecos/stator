@@ -3118,8 +3118,9 @@ mod tests {
     ///
     /// `function Box(v) { return v + 1; }; return new Box(41);`
     ///
-    /// The P3 interpreter executes the constructor body and returns whatever
-    /// it produces (full prototype-chain wiring is deferred).
+    /// Per the [[Construct]] spec, when a constructor returns a primitive
+    /// (non-object), the `this` object created before calling the constructor
+    /// is returned instead.
     #[test]
     fn test_e2e_construct_returns_constructor_value() {
         use crate::parser::ast::{BinaryOp, BlockStmt, Expr, FnDecl, NewExpr, Param, Pat, Stmt};
@@ -3157,7 +3158,10 @@ mod tests {
         }))));
 
         let result = compile_and_run(vec![fn_decl, new_stmt]).unwrap();
-        assert_eq!(result, JsValue::Smi(42));
+        // Per spec, `new Box(41)` calls Box which returns 42 (a primitive).
+        // Since the return value is not an object, [[Construct]] returns the
+        // newly created `this` object instead.
+        assert!(matches!(result, JsValue::PlainObject(_)));
     }
 
     /// Low-level test: `PushContext` saves the old context into a register
