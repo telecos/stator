@@ -36,6 +36,9 @@ use crate::builtins::global::{
     global_parse_float, global_parse_int, global_unescape,
 };
 use crate::builtins::iterator::{
+    async_iterator_drop, async_iterator_every, async_iterator_filter, async_iterator_find,
+    async_iterator_flat_map, async_iterator_for_each, async_iterator_from, async_iterator_map,
+    async_iterator_reduce, async_iterator_some, async_iterator_take, async_iterator_to_array,
     iterator_drop, iterator_every, iterator_filter, iterator_find, iterator_flat_map,
     iterator_for_each, iterator_from, iterator_map, iterator_reduce, iterator_some, iterator_take,
     iterator_to_array,
@@ -2244,6 +2247,169 @@ fn make_iterator() -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
+// ── AsyncIterator (ES2025 §27.1.4.2) ─────────────────────────────────────────
+
+/// Build the `AsyncIterator` constructor/namespace object with prototype
+/// helpers mirroring [`make_iterator`].  Each method returns a `Promise`.
+fn make_async_iterator() -> JsValue {
+    use crate::builtins::promise::MicrotaskQueue;
+
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let queue = MicrotaskQueue::new();
+
+    // ── Static method: AsyncIterator.from ─────────────────────────────────
+    {
+        let q = queue.clone();
+        props.insert(
+            "from".into(),
+            native(move |args| {
+                let iterable = args.first().unwrap_or(&JsValue::Undefined);
+                Ok(async_iterator_from(iterable, &q))
+            }),
+        );
+    }
+
+    // ── Prototype (instance) methods ─────────────────────────────────────
+    let mut proto: HashMap<String, JsValue> = HashMap::new();
+
+    {
+        let q = queue.clone();
+        proto.insert(
+            "map".into(),
+            native(move |args| {
+                let iter = args.first().unwrap_or(&JsValue::Undefined);
+                let mapper = args.get(1).unwrap_or(&JsValue::Undefined);
+                Ok(async_iterator_map(iter, mapper, &q))
+            }),
+        );
+    }
+    {
+        let q = queue.clone();
+        proto.insert(
+            "filter".into(),
+            native(move |args| {
+                let iter = args.first().unwrap_or(&JsValue::Undefined);
+                let predicate = args.get(1).unwrap_or(&JsValue::Undefined);
+                Ok(async_iterator_filter(iter, predicate, &q))
+            }),
+        );
+    }
+    {
+        let q = queue.clone();
+        proto.insert(
+            "take".into(),
+            native(move |args| {
+                let iter = args.first().unwrap_or(&JsValue::Undefined);
+                let limit = args
+                    .get(1)
+                    .unwrap_or(&JsValue::Undefined)
+                    .to_number()
+                    .unwrap_or(0.0);
+                Ok(async_iterator_take(iter, limit.max(0.0) as usize, &q))
+            }),
+        );
+    }
+    {
+        let q = queue.clone();
+        proto.insert(
+            "drop".into(),
+            native(move |args| {
+                let iter = args.first().unwrap_or(&JsValue::Undefined);
+                let count = args
+                    .get(1)
+                    .unwrap_or(&JsValue::Undefined)
+                    .to_number()
+                    .unwrap_or(0.0);
+                Ok(async_iterator_drop(iter, count.max(0.0) as usize, &q))
+            }),
+        );
+    }
+    {
+        let q = queue.clone();
+        proto.insert(
+            "flatMap".into(),
+            native(move |args| {
+                let iter = args.first().unwrap_or(&JsValue::Undefined);
+                let mapper = args.get(1).unwrap_or(&JsValue::Undefined);
+                Ok(async_iterator_flat_map(iter, mapper, &q))
+            }),
+        );
+    }
+    {
+        let q = queue.clone();
+        proto.insert(
+            "reduce".into(),
+            native(move |args| {
+                let iter = args.first().unwrap_or(&JsValue::Undefined);
+                let reducer = args.get(1).unwrap_or(&JsValue::Undefined);
+                let initial = args.get(2).cloned();
+                Ok(async_iterator_reduce(iter, reducer, initial, &q))
+            }),
+        );
+    }
+    {
+        let q = queue.clone();
+        proto.insert(
+            "toArray".into(),
+            native(move |args| {
+                let iter = args.first().unwrap_or(&JsValue::Undefined);
+                Ok(async_iterator_to_array(iter, &q))
+            }),
+        );
+    }
+    {
+        let q = queue.clone();
+        proto.insert(
+            "forEach".into(),
+            native(move |args| {
+                let iter = args.first().unwrap_or(&JsValue::Undefined);
+                let callback = args.get(1).unwrap_or(&JsValue::Undefined);
+                Ok(async_iterator_for_each(iter, callback, &q))
+            }),
+        );
+    }
+    {
+        let q = queue.clone();
+        proto.insert(
+            "some".into(),
+            native(move |args| {
+                let iter = args.first().unwrap_or(&JsValue::Undefined);
+                let predicate = args.get(1).unwrap_or(&JsValue::Undefined);
+                Ok(async_iterator_some(iter, predicate, &q))
+            }),
+        );
+    }
+    {
+        let q = queue.clone();
+        proto.insert(
+            "every".into(),
+            native(move |args| {
+                let iter = args.first().unwrap_or(&JsValue::Undefined);
+                let predicate = args.get(1).unwrap_or(&JsValue::Undefined);
+                Ok(async_iterator_every(iter, predicate, &q))
+            }),
+        );
+    }
+    {
+        let q = queue.clone();
+        proto.insert(
+            "find".into(),
+            native(move |args| {
+                let iter = args.first().unwrap_or(&JsValue::Undefined);
+                let predicate = args.get(1).unwrap_or(&JsValue::Undefined);
+                Ok(async_iterator_find(iter, predicate, &q))
+            }),
+        );
+    }
+
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 // ── Map constructor (ES2025 §24.1) ───────────────────────────────────────────
 
 /// Build the `Map` constructor/namespace object.
@@ -4083,6 +4249,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     globals.insert("Array".into(), make_array());
     globals.insert("Symbol".into(), make_symbol());
     globals.insert("Iterator".into(), make_iterator());
+    globals.insert("AsyncIterator".into(), make_async_iterator());
     globals.insert("Map".into(), make_map_builtin());
     globals.insert("Set".into(), make_set_builtin());
     globals.insert("WeakMap".into(), make_weak_map_builtin());
