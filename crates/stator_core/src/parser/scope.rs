@@ -1244,6 +1244,7 @@ mod tests {
         Program {
             loc: loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![],
         }
     }
@@ -1292,6 +1293,7 @@ mod tests {
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Module,
+            strict: false,
             body: vec![],
         };
         let tree = analyze(&prog);
@@ -1305,6 +1307,7 @@ mod tests {
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![ProgramItem::Stmt(Stmt::VarDecl(var_decl(
                 VarKind::Var,
                 "x",
@@ -1326,6 +1329,7 @@ mod tests {
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![ProgramItem::Stmt(block)],
         };
         let tree = analyze(&prog);
@@ -1343,6 +1347,7 @@ mod tests {
             id: Some(ident("f")),
             is_async: false,
             is_generator: false,
+            strict: false,
             params: vec![],
             body: BlockStmt {
                 loc: loc(),
@@ -1352,6 +1357,7 @@ mod tests {
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![ProgramItem::Stmt(fn_decl)],
         };
         let tree = analyze(&prog);
@@ -1371,6 +1377,7 @@ mod tests {
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![ProgramItem::Stmt(block)],
         };
         let tree = analyze(&prog);
@@ -1392,6 +1399,7 @@ mod tests {
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![
                 ProgramItem::Stmt(Stmt::VarDecl(var_decl(VarKind::Var, "x"))),
                 ProgramItem::Stmt(Stmt::VarDecl(var_decl(VarKind::Var, "x"))),
@@ -1409,6 +1417,7 @@ mod tests {
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![
                 ProgramItem::Stmt(Stmt::VarDecl(var_decl(VarKind::Let, "x"))),
                 ProgramItem::Stmt(Stmt::VarDecl(var_decl(VarKind::Let, "x"))),
@@ -1428,6 +1437,7 @@ mod tests {
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![
                 ProgramItem::Stmt(Stmt::VarDecl(var_decl(VarKind::Const, "C"))),
                 ProgramItem::Stmt(Stmt::VarDecl(var_decl(VarKind::Const, "C"))),
@@ -1447,6 +1457,7 @@ mod tests {
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![ProgramItem::Stmt(Stmt::VarDecl(var_decl_init(
                 VarKind::Let,
                 "x",
@@ -1487,6 +1498,7 @@ mod tests {
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![ProgramItem::Stmt(x_decl), ProgramItem::Stmt(y_decl)],
         };
         let tree = analyze(&prog);
@@ -1502,6 +1514,7 @@ mod tests {
             id: Some(ident("f")),
             is_async: false,
             is_generator: false,
+            strict: false,
             params: vec![Param {
                 loc: loc(),
                 pat: Pat::Ident(ident("a")),
@@ -1515,6 +1528,7 @@ mod tests {
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![ProgramItem::Stmt(fn_stmt)],
         };
         let tree = analyze(&prog);
@@ -1540,6 +1554,7 @@ mod tests {
             id: Some(ident("inner")),
             is_async: false,
             is_generator: false,
+            strict: false,
             params: vec![],
             body: BlockStmt {
                 loc: loc(),
@@ -1554,6 +1569,7 @@ mod tests {
             id: Some(ident("outer")),
             is_async: false,
             is_generator: false,
+            strict: false,
             params: vec![],
             body: BlockStmt {
                 loc: loc(),
@@ -1563,6 +1579,7 @@ mod tests {
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![ProgramItem::Stmt(outer_fn)],
         };
         let tree = analyze(&prog);
@@ -1605,6 +1622,7 @@ mod tests {
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![ProgramItem::Stmt(try_stmt)],
         };
         let tree = analyze(&prog);
@@ -1631,6 +1649,7 @@ mod tests {
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![ProgramItem::Stmt(with_stmt)],
         };
         let tree = analyze(&prog);
@@ -1655,6 +1674,7 @@ mod tests {
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![ProgramItem::Stmt(Stmt::Expr(ExprStmt {
                 loc: loc(),
                 expr: Box::new(call),
@@ -1671,6 +1691,7 @@ mod tests {
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![ProgramItem::Stmt(Stmt::Expr(ExprStmt {
                 loc: loc(),
                 expr: Box::new(Expr::This(ThisExpr { loc: loc() })),

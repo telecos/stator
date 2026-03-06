@@ -1827,6 +1827,12 @@ fn handle_sta_global(
             ));
         }
     };
+    // In strict mode, assigning to an undeclared variable is a ReferenceError.
+    if ctx.frame.bytecode_array.is_strict() && !ctx.frame.global_env.borrow().contains_key(&name) {
+        return Err(StatorError::ReferenceError(format!(
+            "{name} is not defined"
+        )));
+    }
     let val = ctx.frame.accumulator.clone();
     ctx.frame.global_env.borrow_mut().insert(name, val);
     Ok(DispatchAction::Continue)

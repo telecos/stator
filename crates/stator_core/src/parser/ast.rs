@@ -44,6 +44,8 @@ pub struct Program {
     pub loc: SourceLocation,
     /// Whether the file is a script or a module.
     pub source_type: SourceType,
+    /// `true` when the program begins with a `"use strict"` directive prologue.
+    pub strict: bool,
     /// Top-level statements and module declarations.
     pub body: Vec<ProgramItem>,
 }
@@ -455,6 +457,8 @@ pub struct FnDecl {
     pub is_async: bool,
     /// `true` for generator functions (`function*`).
     pub is_generator: bool,
+    /// `true` when the function body starts with a `"use strict"` directive.
+    pub strict: bool,
     /// Parameter list.
     pub params: Vec<Param>,
     /// Function body.
@@ -472,6 +476,8 @@ pub struct FnExpr {
     pub is_async: bool,
     /// `true` for generator functions (`function*`).
     pub is_generator: bool,
+    /// `true` when the function body starts with a `"use strict"` directive.
+    pub strict: bool,
     /// Parameter list.
     pub params: Vec<Param>,
     /// Function body.
@@ -485,6 +491,8 @@ pub struct ArrowExpr {
     pub loc: SourceLocation,
     /// `true` for `async (…) => …`.
     pub is_async: bool,
+    /// `true` when the arrow body starts with a `"use strict"` directive.
+    pub strict: bool,
     /// Parameter list.
     pub params: Vec<Param>,
     /// Either a block body `{ … }` or a concise expression body.
@@ -1544,6 +1552,7 @@ mod tests {
         let prog = Program {
             loc: dummy_loc(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![],
         };
         assert!(prog.body.is_empty());
@@ -1556,6 +1565,7 @@ mod tests {
         let prog = Program {
             loc: dummy_loc(),
             source_type: SourceType::Module,
+            strict: false,
             body: vec![ProgramItem::Stmt(stmt)],
         };
         assert_eq!(prog.body.len(), 1);
@@ -1592,6 +1602,7 @@ mod tests {
                 id: Some(ident()),
                 is_async: false,
                 is_generator: false,
+                strict: false,
                 params: vec![],
                 body: BlockStmt { loc, body: vec![] },
             })),
@@ -1767,12 +1778,14 @@ mod tests {
                 id: None,
                 is_async: false,
                 is_generator: false,
+                strict: false,
                 params: vec![],
                 body: BlockStmt { loc, body: vec![] },
             })),
             Expr::Arrow(Box::new(ArrowExpr {
                 loc,
                 is_async: false,
+                strict: false,
                 params: vec![],
                 body: ArrowBody::Expr(null()),
             })),

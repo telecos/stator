@@ -200,6 +200,54 @@ impl<'src> Parser<'src> {
 
     // ── Top-level ────────────────────────────────────────────────────────────
 
+    /// Returns `true` if `raw` is a `"use strict"` or `'use strict'` token
+    /// value (the scanner stores the raw string including the quote characters).
+    fn is_use_strict_value(raw: &str) -> bool {
+        raw == "\"use strict\"" || raw == "'use strict'"
+    }
+
+    /// Returns `true` if `stmts` starts with a `"use strict"` directive
+    /// prologue (a bare string-literal expression statement).
+    fn has_use_strict_directive(stmts: &[Stmt]) -> bool {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Expr(es) => {
+                    if let Expr::Str(s) = es.expr.as_ref()
+                        && Self::is_use_strict_value(&s.value)
+                    {
+                        return true;
+                    }
+                    return false;
+                }
+                Stmt::Empty(_) => continue,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Like [`has_use_strict_directive`] but for [`ProgramItem`] slices.
+    fn program_has_use_strict(body: &[ProgramItem]) -> bool {
+        for item in body {
+            match item {
+                ProgramItem::Stmt(stmt) => match stmt {
+                    Stmt::Expr(es) => {
+                        if let Expr::Str(s) = es.expr.as_ref()
+                            && Self::is_use_strict_value(&s.value)
+                        {
+                            return true;
+                        }
+                        return false;
+                    }
+                    Stmt::Empty(_) => continue,
+                    _ => return false,
+                },
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// Parse a complete source file as a [`Program`].
     ///
     /// Top-level `import` and `export` declarations are emitted as
@@ -245,6 +293,7 @@ impl<'src> Parser<'src> {
         }
 
         let end = self.current_span();
+        let strict = Self::program_has_use_strict(&body);
         Ok(Program {
             loc: Self::merge_spans(start, end),
             source_type: if is_module {
@@ -252,6 +301,7 @@ impl<'src> Parser<'src> {
             } else {
                 SourceType::Script
             },
+            strict,
             body,
         })
     }
@@ -821,12 +871,14 @@ impl<'src> Parser<'src> {
         self.expect(TokenKind::LeftParen)?;
         let params = self.parse_formal_params()?;
         let body = self.parse_block()?;
+        let strict = Self::has_use_strict_directive(&body.body);
         let end = body.loc;
         Ok(Stmt::FnDecl(Box::new(FnDecl {
             loc: Self::merge_spans(fn_span, end),
             id,
             is_async,
             is_generator,
+            strict,
             params,
             body,
         })))
@@ -1006,6 +1058,7 @@ impl<'src> Parser<'src> {
                     id: None,
                     is_async,
                     is_generator,
+                    strict: false,
                     params,
                     body,
                 };
@@ -1835,6 +1888,7 @@ impl<'src> Parser<'src> {
                             return Ok(Expr::Arrow(Box::new(ArrowExpr {
                                 loc: Self::merge_spans(start, end),
                                 is_async: true,
+                                strict: false,
                                 params: vec![],
                                 body,
                             })));
@@ -1868,6 +1922,7 @@ impl<'src> Parser<'src> {
                         return Ok(Expr::Arrow(Box::new(ArrowExpr {
                             loc: Self::merge_spans(start, end),
                             is_async: true,
+                            strict: false,
                             params,
                             body,
                         })));
@@ -1930,6 +1985,7 @@ impl<'src> Parser<'src> {
                     return Ok(Expr::Arrow(Box::new(ArrowExpr {
                         loc: Self::merge_spans(start, end),
                         is_async: false,
+                        strict: false,
                         params: vec![],
                         body,
                     })));
@@ -1973,6 +2029,7 @@ impl<'src> Parser<'src> {
                 return Ok(Expr::Arrow(Box::new(ArrowExpr {
                     loc: Self::merge_spans(start, end),
                     is_async: true,
+                    strict: false,
                     params,
                     body,
                 })));
@@ -1984,6 +2041,7 @@ impl<'src> Parser<'src> {
             return Ok(Expr::Arrow(Box::new(ArrowExpr {
                 loc: Self::merge_spans(start, end),
                 is_async: false,
+                strict: false,
                 params,
                 body,
             })));
@@ -2737,6 +2795,7 @@ impl<'src> Parser<'src> {
                                 id: None,
                                 is_async: false,
                                 is_generator: false,
+                                strict: false,
                                 params,
                                 body,
                             };
@@ -2761,6 +2820,7 @@ impl<'src> Parser<'src> {
                                 id: None,
                                 is_async: is_async_method,
                                 is_generator: is_generator_method,
+                                strict: false,
                                 params,
                                 body,
                             })
@@ -3060,12 +3120,14 @@ impl<'src> Parser<'src> {
         self.expect(TokenKind::LeftParen)?;
         let params = self.parse_formal_params()?;
         let body = self.parse_block()?;
+        let strict = Self::has_use_strict_directive(&body.body);
         let end = body.loc;
         Ok(Expr::Fn(Box::new(crate::parser::ast::FnExpr {
             loc: Self::merge_spans(fn_span, end),
             id,
             is_async,
             is_generator,
+            strict,
             params,
             body,
         })))
@@ -6662,5 +6724,52 @@ mod tests {
             ProgramItem::ModuleDecl(ModuleDecl::Import(_))
         ));
         assert_eq!(prog.source_type, SourceType::Module);
+    }
+
+    // ── Strict-mode directive detection ──────────────────────────────────
+
+    #[test]
+    fn test_strict_mode_program_directive() {
+        let prog = parse(r#""use strict"; var x = 1;"#).unwrap();
+        assert!(prog.strict, "program should be strict");
+    }
+
+    #[test]
+    fn test_strict_mode_program_no_directive() {
+        let prog = parse("var x = 1;").unwrap();
+        assert!(
+            !prog.strict,
+            "program without directive should not be strict"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_function_directive() {
+        let prog = parse(r#"function f() { "use strict"; return 1; }"#).unwrap();
+        if let ProgramItem::Stmt(Stmt::FnDecl(decl)) = &prog.body[0] {
+            assert!(decl.strict, "function with directive should be strict");
+        } else {
+            panic!("expected FnDecl");
+        }
+    }
+
+    #[test]
+    fn test_strict_mode_function_no_directive() {
+        let prog = parse("function f() { return 1; }").unwrap();
+        if let ProgramItem::Stmt(Stmt::FnDecl(decl)) = &prog.body[0] {
+            assert!(
+                !decl.strict,
+                "function without directive should not be strict"
+            );
+        } else {
+            panic!("expected FnDecl");
+        }
+    }
+
+    #[test]
+    fn test_strict_mode_not_first_stmt() {
+        // "use strict" after a non-directive statement is ignored.
+        let prog = parse(r#"var x; "use strict";"#).unwrap();
+        assert!(!prog.strict, "use strict after var should not set strict");
     }
 }

@@ -2651,6 +2651,7 @@ mod tests {
         let program = Program {
             loc: span(),
             source_type: SourceType::Script,
+            strict: false,
             body: stmts.into_iter().map(ProgramItem::Stmt).collect(),
         };
         let ba = BytecodeGenerator::compile_program(&program)?;
@@ -3000,6 +3001,7 @@ mod tests {
             }),
             is_async: false,
             is_generator: false,
+            strict: false,
             params: vec![
                 Param {
                     loc: span(),
@@ -3054,6 +3056,7 @@ mod tests {
             }),
             is_async: false,
             is_generator: false,
+            strict: false,
             params: vec![],
             body: BlockStmt {
                 loc: span(),
@@ -3086,6 +3089,7 @@ mod tests {
             }),
             is_async: false,
             is_generator: false,
+            strict: false,
             params: vec![Param {
                 loc: span(),
                 pat: Pat::Ident(crate::parser::ast::Ident {
@@ -3133,6 +3137,7 @@ mod tests {
             }),
             is_async: false,
             is_generator: false,
+            strict: false,
             params: vec![Param {
                 loc: span(),
                 pat: Pat::Ident(crate::parser::ast::Ident {
@@ -9039,5 +9044,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::String("done".to_string()));
+    }
+
+    // ── Strict-mode enforcement ──────────────────────────────────────────
+
+    #[test]
+    fn test_strict_mode_undeclared_var_reference_error() {
+        // In strict mode, assigning to an undeclared variable should throw.
+        let result = crate::builtins::global::global_eval("\"use strict\"; x = 42;");
+        assert!(
+            result.is_err(),
+            "strict mode should throw on undeclared assignment"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("ReferenceError"),
+            "expected ReferenceError, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_non_strict_mode_undeclared_var_ok() {
+        // Without strict mode, assigning to an undeclared variable is OK.
+        let result = crate::builtins::global::global_eval("x = 42;");
+        assert!(
+            result.is_ok(),
+            "sloppy mode should allow undeclared assignment"
+        );
+    }
+
+    #[test]
+    fn test_strict_mode_declared_var_ok() {
+        // Strict mode allows assignment to declared variables.
+        let result = crate::builtins::global::global_eval("\"use strict\"; var x; x = 42; x");
+        assert!(
+            result.is_ok(),
+            "strict mode should allow declared assignment"
+        );
+        assert_eq!(result.unwrap(), JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_strict_mode_function_body() {
+        // A function with its own "use strict" directive should enforce
+        // strict mode even when the outer script is not strict.
+        let result =
+            crate::builtins::global::global_eval("function f() { \"use strict\"; y = 10; } f()");
+        assert!(
+            result.is_err(),
+            "function-level strict should throw on undeclared var"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("ReferenceError"),
+            "expected ReferenceError, got: {msg}"
+        );
     }
 }

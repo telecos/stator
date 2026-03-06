@@ -213,6 +213,11 @@ struct FunctionCompiler {
     /// and marks the resulting [`BytecodeArray`] with
     /// [`BytecodeArray::with_module_flag`].
     is_module: bool,
+    /// `true` when compiling a strict-mode function or script prologue.
+    ///
+    /// Marks the resulting [`BytecodeArray`] with
+    /// [`BytecodeArray::with_strict_flag`].
+    is_strict: bool,
     /// Maps imported binding names to `(module_request_idx, cell_idx)` pairs
     /// that parameterise [`Opcode::LdaModuleVariable`] and
     /// [`Opcode::StaModuleVariable`].
@@ -256,6 +261,7 @@ impl FunctionCompiler {
             is_program: false,
             is_eval_scope: false,
             is_module: false,
+            is_strict: false,
             module_variables: HashMap::new(),
             next_module_cell: 0,
             in_tail_position: false,
@@ -769,8 +775,13 @@ impl FunctionCompiler {
     /// resulting [`BytecodeArray`] to the constant pool, emit `CreateClosure`,
     /// and bind the name to the resulting register.
     fn compile_fn_decl(&mut self, decl: &FnDecl) -> StatorResult<()> {
-        let func_array =
-            compile_function(&decl.params, &decl.body, decl.is_generator, decl.is_async)?;
+        let func_array = compile_function(
+            &decl.params,
+            &decl.body,
+            decl.is_generator,
+            decl.is_async,
+            decl.strict,
+        )?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         // Emit CreateClosure: [func_idx, slot, flags]
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
@@ -856,13 +867,19 @@ impl FunctionCompiler {
             _ => None,
         });
         let ctor_array = if let Some(ctor) = ctor_method {
-            compile_function(&ctor.value.params, &ctor.value.body, false, false)?
+            compile_function(
+                &ctor.value.params,
+                &ctor.value.body,
+                false,
+                false,
+                ctor.value.strict,
+            )?
         } else {
             let empty_body = BlockStmt {
                 loc: body.loc,
                 body: vec![],
             };
-            compile_function(&[], &empty_body, false, false)?
+            compile_function(&[], &empty_body, false, false, false)?
         };
         let ctor_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(ctor_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
@@ -1209,6 +1226,7 @@ impl FunctionCompiler {
             is_async: false,
             is_eval_scope: false,
             is_module: false,
+            is_strict: false,
             module_variables: HashMap::new(),
             next_module_cell: 0,
             in_tail_position: false,
@@ -2800,7 +2818,8 @@ impl FunctionCompiler {
 
     /// Compile a function expression.
     fn compile_fn_expr(&mut self, f: &FnExpr) -> StatorResult<()> {
-        let func_array = compile_function(&f.params, &f.body, f.is_generator, f.is_async)?;
+        let func_array =
+            compile_function(&f.params, &f.body, f.is_generator, f.is_async, f.strict)?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
@@ -2828,7 +2847,7 @@ impl FunctionCompiler {
                 }
             }
         };
-        let func_array = compile_function(&a.params, &body_block, false, a.is_async)?;
+        let func_array = compile_function(&a.params, &body_block, false, a.is_async, a.strict)?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
@@ -4093,7 +4112,8 @@ impl FunctionCompiler {
         Ok(ba
             .with_generator_flag(self.is_generator)
             .with_async_flag(self.is_async)
-            .with_module_flag(self.is_module))
+            .with_module_flag(self.is_module)
+            .with_strict_flag(self.is_strict))
     }
 }
 
@@ -4167,10 +4187,12 @@ fn compile_function(
     body: &BlockStmt,
     is_generator: bool,
     is_async: bool,
+    is_strict: bool,
 ) -> StatorResult<BytecodeArray> {
     let mut compiler = FunctionCompiler::new(params)?;
     compiler.is_generator = is_generator;
     compiler.is_async = is_async;
+    compiler.is_strict = is_strict;
 
     // Generator / async / async-generator prologue: jump to the saved resume
     // point on re-entry.  Async functions are desugared to generators internally,
@@ -4219,6 +4241,7 @@ fn compile_function(
 /// let program = Program {
 ///     loc,
 ///     source_type: SourceType::Script,
+///     strict: false,
 ///     body: vec![],
 /// };
 /// let array = BytecodeGenerator::compile_program(&program)
@@ -4237,6 +4260,9 @@ impl BytecodeGenerator {
         compiler.is_program = true;
         let is_module = program.source_type == SourceType::Module;
         compiler.is_module = is_module;
+        // ES modules are always strict; scripts are strict when the prologue
+        // contains a "use strict" directive.
+        compiler.is_strict = program.strict || is_module;
 
         // Hoist function declarations to the top.
         for item in &program.body {
@@ -4381,6 +4407,7 @@ mod tests {
         Program {
             loc: span(),
             source_type: SourceType::Script,
+            strict: false,
             body: stmts.into_iter().map(ProgramItem::Stmt).collect(),
         }
     }
@@ -4732,6 +4759,7 @@ mod tests {
             id: Some(ident("add")),
             is_async: false,
             is_generator: false,
+            strict: false,
             params: vec![
                 Param {
                     loc: span(),
@@ -4783,6 +4811,7 @@ mod tests {
                 },
             ],
             &body,
+            false,
             false,
             false,
         )
@@ -5098,6 +5127,7 @@ mod tests {
             id: Some(ident("add")),
             is_async: false,
             is_generator: false,
+            strict: false,
             params: vec![
                 Param {
                     loc: span(),
@@ -5364,6 +5394,7 @@ mod tests {
             body: BlockStmt { loc: span(), body },
             is_generator: true,
             is_async: false,
+            strict: false,
         }
     }
 
@@ -5605,6 +5636,7 @@ mod tests {
             },
             is_generator: true,
             is_async: false,
+            strict: false,
         };
         let prog = make_program(vec![Stmt::FnDecl(Box::new(decl))]);
         // Must compile without error.
@@ -5801,6 +5833,7 @@ mod tests {
             id: None,
             is_async: false,
             is_generator: false,
+            strict: false,
             params: param_names
                 .iter()
                 .map(|n| Param {
@@ -5968,6 +6001,7 @@ mod tests {
             body: BlockStmt { loc: span(), body },
             is_generator: true,
             is_async: true,
+            strict: false,
         }
     }
 
@@ -6062,6 +6096,7 @@ mod tests {
             },
             is_generator: true,
             is_async: true,
+            strict: false,
         }));
         let prog = make_program(vec![var_decl_stmt(VarKind::Var, "f", Some(fn_expr))]);
         let arr = BytecodeGenerator::compile_program(&prog).unwrap();
@@ -6418,6 +6453,7 @@ mod tests {
             },
             is_generator: false,
             is_async: true,
+            strict: false,
         };
         let prog = make_program(vec![Stmt::FnDecl(Box::new(decl))]);
         let arr = BytecodeGenerator::compile_program(&prog).unwrap();
@@ -6457,6 +6493,7 @@ mod tests {
             },
             is_generator: false,
             is_async: true,
+            strict: false,
         }));
         let prog = make_program(vec![var_decl_stmt(VarKind::Var, "f", Some(fn_expr))]);
         let arr = BytecodeGenerator::compile_program(&prog).unwrap();
@@ -6481,6 +6518,7 @@ mod tests {
                 body: vec![await_stmt(num_expr(1.0))],
             }),
             is_async: true,
+            strict: false,
         }));
         let prog = make_program(vec![var_decl_stmt(VarKind::Var, "f", Some(arrow))]);
         let arr = BytecodeGenerator::compile_program(&prog).unwrap();
@@ -6636,6 +6674,7 @@ mod tests {
             &body,
             false,
             false,
+            false,
         )
         .unwrap();
         let instrs = inner.instructions().unwrap();
@@ -6676,6 +6715,7 @@ mod tests {
             &body,
             false,
             false,
+            false,
         )
         .unwrap();
         let instrs = inner.instructions().unwrap();
@@ -6706,6 +6746,7 @@ mod tests {
                 default: None,
             }],
             &body,
+            false,
             false,
             false,
         )
@@ -6749,6 +6790,7 @@ mod tests {
             &body,
             false,
             false,
+            false,
         )
         .unwrap();
         let instrs = inner.instructions().unwrap();
@@ -6784,6 +6826,7 @@ mod tests {
                 },
             ],
             &body,
+            false,
             false,
             false,
         )
@@ -6829,6 +6872,7 @@ mod tests {
             &body,
             false,
             false,
+            false,
         )
         .unwrap();
         let instrs = inner.instructions().unwrap();
@@ -6857,6 +6901,7 @@ mod tests {
                 default: None,
             }],
             &body,
+            false,
             false,
             false,
         )
@@ -6899,6 +6944,7 @@ mod tests {
         Program {
             loc: span(),
             source_type: SourceType::Module,
+            strict: false,
             body: items,
         }
     }
@@ -7150,6 +7196,7 @@ mod tests {
         let prog = Program {
             loc: span(),
             source_type: SourceType::Script,
+            strict: false,
             body: vec![ProgramItem::ModuleDecl(ModuleDecl::Import(ImportDecl {
                 loc: span(),
                 specifiers: vec![],
