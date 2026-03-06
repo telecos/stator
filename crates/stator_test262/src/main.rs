@@ -281,82 +281,28 @@ impl HarnessCache {
 /// skipped rather than run-and-failed, keeping the measured pass rate
 /// meaningful.
 const UNSUPPORTED_FEATURES: &[&str] = &[
-    // Async / generators
-    "async-functions",
-    "async-iteration",
-    "generators",
+    // Async: partially implemented but not yet robust enough for Test262
     "top-level-await",
-    // Classes
-    "class",
-    "class-fields-private",
-    "class-fields-public",
-    "class-methods-private",
-    "class-static-block",
-    "class-static-fields-private",
-    "class-static-fields-public",
-    "class-static-methods-private",
-    // Symbols
-    "Symbol",
-    "Symbol.asyncIterator",
-    "Symbol.hasInstance",
-    "Symbol.isConcatSpreadable",
-    "Symbol.iterator",
-    "Symbol.match",
-    "Symbol.matchAll",
-    "Symbol.replace",
-    "Symbol.search",
-    "Symbol.species",
-    "Symbol.split",
-    "Symbol.toPrimitive",
-    "Symbol.toStringTag",
-    "Symbol.unscopables",
-    // Proxy / Reflect
-    "Proxy",
-    "Reflect",
-    "Reflect.construct",
-    // BigInt
-    "BigInt",
-    // Modules
-    "arbitrary-module-namespace-names",
-    "dynamic-import",
-    "export-star-as-namespace-from-module",
-    "import-assertions",
-    "import-attributes",
-    "import.meta",
-    // SharedArrayBuffer / Atomics
+    // SharedArrayBuffer / Atomics — not implemented
     "Atomics",
     "SharedArrayBuffer",
-    // WeakRef / FinalizationRegistry
-    "FinalizationRegistry",
-    "WeakRef",
-    // Advanced RegExp
-    "regexp-dotall",
-    "regexp-lookbehind",
-    "regexp-match-indices",
-    "regexp-named-groups",
+    // Advanced RegExp features not yet fully supported
     "regexp-unicode-property-escapes",
     "regexp-v-flag",
-    // Internationalisation
-    "Intl",
-    // Temporal (draft proposal — requires `super`, `class`, advanced object model)
+    // Temporal (stage 3 proposal — very large surface area)
     "Temporal",
-    // Destructuring (not yet compiled)
-    "destructuring-binding",
-    "destructuring-assignment",
-    // Miscellaneous
-    "globalThis",
-    // Tail calls
-    "tail-call-optimization",
-    // TypedArrays / ArrayBuffer
+    // TypedArrays / ArrayBuffer — not implemented
     "TypedArray",
     "ArrayBuffer",
     "DataView",
     "resizable-arraybuffer",
-    // For-of / spread / iterators (require Symbol.iterator)
-    "for-of",
-    // ShadowRealm / Disposable
+    // ShadowRealm / Disposable — not implemented
     "ShadowRealm",
     "explicit-resource-management",
+    // Module features that need runtime module loader
+    "arbitrary-module-namespace-names",
+    "import-assertions",
+    "import-attributes",
 ];
 
 /// Returns `true` when the feature list contains at least one unsupported tag.
