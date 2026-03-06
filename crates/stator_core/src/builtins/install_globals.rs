@@ -26,6 +26,10 @@ use crate::builtins::finalization_registry::{
     finalization_registry_drain, finalization_registry_new, finalization_registry_notify,
     finalization_registry_register, finalization_registry_unregister,
 };
+use crate::builtins::function::{
+    function_apply, function_bind, function_call, function_constructor, function_has_instance,
+    function_to_string,
+};
 use crate::builtins::global::{
     GLOBAL_INFINITY, GLOBAL_NAN, global_decode_uri, global_decode_uri_component, global_encode_uri,
     global_encode_uri_component, global_escape, global_eval, global_is_finite, global_is_nan,
@@ -2731,6 +2735,127 @@ fn make_finalization_registry_builtin() -> JsValue {
 
 // ── String constructor ───────────────────────────────────────────────────────
 
+// ── Function constructor (ES2025 §20.2) ──────────────────────────────────────
+
+/// Build the `Function` constructor/namespace object.
+///
+/// The returned `PlainObject` carries:
+/// - `__call__` — the `Function(…args, body)` dynamic constructor.
+/// - `prototype` — an object with `bind`, `call`, `apply`, `toString`,
+///   `Symbol.hasInstance`, `name`, and `length`.
+fn make_function() -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    // ── Constructor: new Function(…args, body) ──────────────────────────
+    props.insert(
+        "__call__".into(),
+        native(|args| function_constructor(&args)),
+    );
+
+    // ── Function.prototype ──────────────────────────────────────────────
+    let mut proto: HashMap<String, JsValue> = HashMap::new();
+
+    // Function.prototype.call(thisArg, ...args)
+    proto.insert(
+        "call".into(),
+        native(|args| {
+            let func = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let call_args: Vec<JsValue> = args.get(2..).unwrap_or(&[]).to_vec();
+            match func {
+                JsValue::NativeFunction(f) => function_call(&f, &this_arg, &call_args),
+                _ => Err(StatorError::TypeError(
+                    "Function.prototype.call requires a callable".into(),
+                )),
+            }
+        }),
+    );
+
+    // Function.prototype.apply(thisArg, argsArray)
+    proto.insert(
+        "apply".into(),
+        native(|args| {
+            let func = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let args_array = match args.get(2) {
+                Some(JsValue::Array(arr)) => Some(arr.as_ref().clone()),
+                Some(JsValue::Null) | Some(JsValue::Undefined) | None => None,
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "CreateListFromArrayLike called on non-object".into(),
+                    ));
+                }
+            };
+            match func {
+                JsValue::NativeFunction(f) => function_apply(&f, &this_arg, &args_array),
+                _ => Err(StatorError::TypeError(
+                    "Function.prototype.apply requires a callable".into(),
+                )),
+            }
+        }),
+    );
+
+    // Function.prototype.bind(thisArg, ...args)
+    proto.insert(
+        "bind".into(),
+        native(|args| {
+            let func = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let bound_args: Vec<JsValue> = args.get(2..).unwrap_or(&[]).to_vec();
+            match func {
+                JsValue::NativeFunction(ref f) => {
+                    let bound = function_bind(f, &this_arg, &bound_args);
+                    Ok(JsValue::NativeFunction(bound))
+                }
+                _ => Err(StatorError::TypeError(
+                    "Function.prototype.bind requires a callable".into(),
+                )),
+            }
+        }),
+    );
+
+    // Function.prototype.toString()
+    proto.insert(
+        "toString".into(),
+        native(|args| {
+            let _func = args.first().cloned().unwrap_or(JsValue::Undefined);
+            Ok(JsValue::String(function_to_string("")))
+        }),
+    );
+
+    // Function.prototype[Symbol.hasInstance](V)
+    proto.insert(
+        format!("Symbol({})", SYMBOL_HAS_INSTANCE),
+        native(|args| {
+            let constructor_proto = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let value = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            Ok(JsValue::Boolean(function_has_instance(
+                &value,
+                &constructor_proto,
+            )))
+        }),
+    );
+
+    // Function.prototype.name (empty string for the prototype itself)
+    proto.insert("name".into(), JsValue::String(String::new()));
+
+    // Function.prototype.length (0 for the prototype itself)
+    proto.insert("length".into(), JsValue::Smi(0));
+
+    // Function.length = 1 (the constructor expects 1 argument)
+    props.insert("length".into(), JsValue::Smi(1));
+
+    // Function.name = "Function"
+    props.insert("name".into(), JsValue::String("Function".into()));
+
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 /// Build the `String` constructor/namespace object with static and prototype
 /// methods.
 ///
@@ -3722,6 +3847,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     );
     globals.insert("Promise".into(), make_promise());
     globals.insert("RegExp".into(), make_regexp());
+    globals.insert("Function".into(), make_function());
 
     // ── Error constructors ────────────────────────────────────────────────
     install_error_constructors(globals);
@@ -3881,6 +4007,7 @@ mod tests {
         assert!(globals.contains_key("FinalizationRegistry"));
         assert!(globals.contains_key("Promise"));
         assert!(globals.contains_key("RegExp"));
+        assert!(globals.contains_key("Function"));
         assert!(globals.contains_key("globalThis"));
     }
 
