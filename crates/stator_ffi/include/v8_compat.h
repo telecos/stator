@@ -50,9 +50,15 @@ namespace v8 {
 class Context;
 class FunctionTemplate;
 class Isolate;
+class ObjectTemplate;
 class Script;
 class String;
 class Value;
+class Number;
+class Integer;
+class Boolean;
+class Object;
+class Array;
 template <typename T>
 class Local;
 template <typename T>
@@ -231,6 +237,111 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// Number — inherits Value, wraps a numeric StatorValue
+// ---------------------------------------------------------------------------
+class Number : public Value {
+public:
+    explicit Number(StatorValue *raw, bool owned = true) noexcept
+        : Value(raw, owned) {}
+
+    /// Return the double value.
+    double Value_() const noexcept { return stator_value_as_number(raw_); }
+
+    /// Create a Number from a double.
+    static Local<Number> New(Isolate *isolate, double value);
+};
+
+// ---------------------------------------------------------------------------
+// Integer — inherits Value, wraps an integer StatorValue
+// ---------------------------------------------------------------------------
+class Integer : public Value {
+public:
+    explicit Integer(StatorValue *raw, bool owned = true) noexcept
+        : Value(raw, owned) {}
+
+    /// Return the int64 value.
+    int64_t Value_() const noexcept {
+        return static_cast<int64_t>(stator_value_as_number(raw_));
+    }
+
+    /// Create an Integer from a signed 32-bit value.
+    static Local<Integer> New(Isolate *isolate, int32_t value);
+
+    /// Create an Integer from an unsigned 32-bit value.
+    static Local<Integer> NewFromUnsigned(Isolate *isolate, uint32_t value);
+};
+
+// ---------------------------------------------------------------------------
+// Boolean — inherits Value
+// ---------------------------------------------------------------------------
+class Boolean : public Value {
+public:
+    explicit Boolean(StatorValue *raw, bool owned = true) noexcept
+        : Value(raw, owned) {}
+
+    bool Value_() const noexcept { return stator_value_to_boolean(raw_); }
+
+    /// Create a Boolean value.
+    static Local<Boolean> New(Isolate *isolate, bool value);
+};
+
+// ---------------------------------------------------------------------------
+// Object — wraps StatorObject* with V8-compatible API
+// ---------------------------------------------------------------------------
+class Object : public Value {
+public:
+    explicit Object(StatorValue *raw, bool owned = true) noexcept
+        : Value(raw, owned), obj_(nullptr), obj_owned_(false) {}
+
+    Object(StatorValue *raw, StatorObject *obj, bool owned, bool obj_owned) noexcept
+        : Value(raw, owned), obj_(obj), obj_owned_(obj_owned) {}
+
+    ~Object() noexcept override {
+        if (obj_owned_ && obj_)
+            stator_object_destroy(obj_);
+    }
+
+    /// Create a new empty Object.
+    static Local<Object> New(Isolate *isolate);
+
+    /// Set a named property.  Returns true on success.
+    bool Set(Local<Context> /*ctx*/, Local<Value> key, Local<Value> value);
+
+    /// Get a named property.
+    MaybeLocal<Value> Get(Local<Context> /*ctx*/, Local<Value> key);
+
+    /// Get the number of internal fields (always 0 for plain objects).
+    int InternalFieldCount() const noexcept { return 0; }
+
+    StatorObject *obj() const noexcept { return obj_; }
+
+private:
+    StatorObject *obj_;
+    bool          obj_owned_;
+};
+
+// ---------------------------------------------------------------------------
+// Array — inherits Object
+// ---------------------------------------------------------------------------
+class Array : public Value {
+public:
+    explicit Array(StatorValue *raw, bool owned = true) noexcept
+        : Value(raw, owned), length_(0) {}
+
+    Array(StatorValue *raw, uint32_t len, bool owned = true) noexcept
+        : Value(raw, owned), length_(len) {}
+
+    /// Create a new Array with the given length.
+    static Local<Array> New(Isolate *isolate, int length = 0);
+
+    /// Return the array's length.
+    uint32_t Length() const noexcept { return length_; }
+
+private:
+    uint32_t length_;
+};
+
+// ---------------------------------------------------------------------------
 // Isolate — wraps StatorIsolate*
 //
 // Not copyable or movable (matches v8::Isolate semantics).
@@ -384,6 +495,133 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// EscapableHandleScope — allows one value to escape to the outer scope
+//
+// Like HandleScope, this is structural compatibility.  In the reference-counted
+// Local<T> model used by this shim, escaping is a no-op — the Local<T> copy
+// already extends the value's lifetime.
+// ---------------------------------------------------------------------------
+class EscapableHandleScope {
+public:
+    explicit EscapableHandleScope(Isolate * /*isolate - V8 compat*/) noexcept {}
+    ~EscapableHandleScope() noexcept = default;
+
+    /// "Escape" a value from this scope.  In the reference-counted model this
+    /// simply returns the same Local<T> unchanged.
+    template <typename T>
+    Local<T> Escape(Local<T> value) noexcept { return value; }
+
+    EscapableHandleScope(const EscapableHandleScope &)            = delete;
+    EscapableHandleScope &operator=(const EscapableHandleScope &) = delete;
+};
+
+// ---------------------------------------------------------------------------
+// TryCatch — exception handling across the FFI boundary
+//
+// Mirrors v8::TryCatch RAII semantics.  While a TryCatch is active, any
+// pending exception thrown on the isolate is captured and can be inspected.
+// ---------------------------------------------------------------------------
+class TryCatch {
+public:
+    explicit TryCatch(Isolate *isolate) noexcept
+        : isolate_(isolate),
+          tc_(stator_try_catch_new(isolate ? isolate->raw() : nullptr)) {}
+
+    ~TryCatch() noexcept {
+        if (tc_)
+            stator_try_catch_destroy(tc_);
+    }
+
+    /// Return true if an exception was caught.
+    bool HasCaught() noexcept {
+        return tc_ ? stator_try_catch_has_caught(tc_) : false;
+    }
+
+    /// Return the caught exception value, or an empty Local if none.
+    Local<Value> Exception() noexcept {
+        if (!tc_)
+            return Local<Value>();
+        StatorValue *exc = stator_try_catch_exception(tc_);
+        if (!exc)
+            return Local<Value>();
+        // Non-owning: the exception is owned by the TryCatch scope.
+        return Local<Value>(new Value(exc, /*owned=*/false));
+    }
+
+    /// Reset the TryCatch, clearing any caught exception.
+    void Reset() noexcept {
+        if (tc_)
+            stator_try_catch_reset(tc_);
+    }
+
+    TryCatch(const TryCatch &)            = delete;
+    TryCatch &operator=(const TryCatch &) = delete;
+
+private:
+    Isolate       *isolate_;
+    StatorTryCatch *tc_;
+};
+
+// ---------------------------------------------------------------------------
+// ObjectTemplate — wraps StatorObjectTemplate*
+//
+// Describes the shape of objects that will be created from it.  Used by Blink
+// to set up DOM prototype objects.
+// ---------------------------------------------------------------------------
+class ObjectTemplate {
+public:
+    /// Create a new, empty ObjectTemplate.
+    static Local<ObjectTemplate> New(Isolate *isolate) {
+        StatorObjectTemplate *raw =
+            stator_object_template_new(isolate ? isolate->raw() : nullptr);
+        if (!raw)
+            return Local<ObjectTemplate>();
+        return Local<ObjectTemplate>(new ObjectTemplate(raw));
+    }
+
+    /// Set a named property on the template.
+    void Set(Local<String> name, Local<Value> value) {
+        if (!name || !value || !raw_)
+            return;
+        // Extract the key as a UTF-8 string.
+        size_t len = stator_string_utf8_length(name->raw());
+        std::string key(len + 1, '\0');
+        if (len > 0)
+            stator_string_write_utf8(name->raw(), &key[0], len, nullptr);
+        key[len] = '\0';
+        stator_object_template_set(raw_, key.c_str(), value->raw());
+    }
+
+    /// Set the number of internal fields.
+    void SetInternalFieldCount(int count) noexcept {
+        if (raw_)
+            stator_object_template_set_internal_field_count(raw_, count);
+    }
+
+    /// Get the internal field count.
+    int InternalFieldCount() const noexcept {
+        return raw_ ? stator_object_template_internal_field_count(raw_) : 0;
+    }
+
+    /// Create a new object instance from this template.
+    MaybeLocal<Object> NewInstance(Local<Context> context);
+
+    StatorObjectTemplate *raw() const noexcept { return raw_; }
+
+    ObjectTemplate(const ObjectTemplate &)            = delete;
+    ObjectTemplate &operator=(const ObjectTemplate &) = delete;
+
+    ~ObjectTemplate() noexcept {
+        if (raw_)
+            stator_object_template_destroy(raw_);
+    }
+
+private:
+    explicit ObjectTemplate(StatorObjectTemplate *raw) noexcept : raw_(raw) {}
+    StatorObjectTemplate *raw_;
+};
+
+// ---------------------------------------------------------------------------
 // FunctionTemplate — wraps StatorFunctionTemplate*
 //
 // Freed via stator_function_template_destroy when the last Local copy is
@@ -506,6 +744,83 @@ inline String::Utf8Value::Utf8Value(Isolate * /*isolate*/, Local<Value> val) {
         return;
     buf_.resize(len);
     stator_string_write_utf8(val->raw(), &buf_[0], len, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Deferred typed-value factory definitions (require complete Isolate)
+// ---------------------------------------------------------------------------
+
+inline Local<Number> Number::New(Isolate *isolate, double value) {
+    StatorValue *v = stator_number_new(isolate->raw(), value);
+    if (!v)
+        return Local<Number>();
+    return Local<Number>(new Number(v, /*owned=*/true));
+}
+
+inline Local<Integer> Integer::New(Isolate *isolate, int32_t value) {
+    StatorValue *v = stator_integer_new(isolate->raw(), static_cast<int64_t>(value));
+    if (!v)
+        return Local<Integer>();
+    return Local<Integer>(new Integer(v, /*owned=*/true));
+}
+
+inline Local<Integer> Integer::NewFromUnsigned(Isolate *isolate, uint32_t value) {
+    StatorValue *v = stator_number_new(isolate->raw(), static_cast<double>(value));
+    if (!v)
+        return Local<Integer>();
+    return Local<Integer>(new Integer(v, /*owned=*/true));
+}
+
+inline Local<Boolean> Boolean::New(Isolate *isolate, bool value) {
+    StatorValue *v = stator_boolean_new(isolate->raw(), value);
+    if (!v)
+        return Local<Boolean>();
+    return Local<Boolean>(new Boolean(v, /*owned=*/true));
+}
+
+inline Local<Object> Object::New(Isolate *isolate) {
+    StatorValue *v = stator_value_new_object(isolate->raw());
+    if (!v)
+        return Local<Object>();
+    return Local<Object>(new Object(v, /*owned=*/true));
+}
+
+inline bool Object::Set(Local<Context> /*ctx*/, Local<Value> key, Local<Value> value) {
+    // Object::Set requires a StatorObject; without one, this is a stub.
+    // Blink bindings typically call this on objects returned from
+    // ObjectTemplate::NewInstance which have a backing StatorObject.
+    (void)key;
+    (void)value;
+    return false;
+}
+
+inline MaybeLocal<Value> Object::Get(Local<Context> /*ctx*/, Local<Value> key) {
+    (void)key;
+    return MaybeLocal<Value>();
+}
+
+inline Local<Array> Array::New(Isolate *isolate, int length) {
+    StatorValue *v = stator_value_new_array_tag(isolate->raw());
+    if (!v)
+        return Local<Array>();
+    return Local<Array>(new Array(v, static_cast<uint32_t>(length >= 0 ? length : 0),
+                                  /*owned=*/true));
+}
+
+// ---------------------------------------------------------------------------
+// Deferred ObjectTemplate::NewInstance (requires complete Object)
+// ---------------------------------------------------------------------------
+
+inline MaybeLocal<Object> ObjectTemplate::NewInstance(Local<Context> /*context*/) {
+    if (!raw_)
+        return MaybeLocal<Object>();
+    StatorObject *obj = stator_object_template_new_instance(raw_);
+    if (!obj)
+        return MaybeLocal<Object>();
+    // Create an Object wrapper with a backing StatorObject but no StatorValue.
+    // The StatorObject is owned by this wrapper.
+    return MaybeLocal<Object>(
+        Local<Object>(new Object(nullptr, obj, /*owned=*/false, /*obj_owned=*/true)));
 }
 
 } // namespace v8

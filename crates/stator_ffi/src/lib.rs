@@ -247,6 +247,47 @@ pub unsafe extern "C" fn stator_isolate_get_current_context(
     unsafe { (*isolate).current_context }
 }
 
+/// Return `true` if there is a pending exception on `isolate`.
+///
+/// Returns `false` when `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_has_pending_exception(
+    isolate: *const StatorIsolate,
+) -> bool {
+    if isolate.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe { (*isolate).pending_exception.is_some() }
+}
+
+/// Clear the pending exception on `isolate` and return it.
+///
+/// Returns a null pointer when `isolate` is null or no pending exception is
+/// set.  The caller owns the returned pointer and must eventually pass it to
+/// [`stator_value_destroy`].
+///
+/// # Safety
+/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_clear_pending_exception(
+    isolate: *mut StatorIsolate,
+) -> *mut StatorValue {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe {
+        (*isolate)
+            .pending_exception
+            .take()
+            .unwrap_or(std::ptr::null_mut())
+    }
+}
+
 /// Trigger a minor (young-generation) garbage collection on the isolate's heap.
 ///
 /// # Safety
@@ -3074,6 +3115,306 @@ pub unsafe extern "C" fn stator_escapable_handle_scope_close(
             stator_value_destroy(val);
         }
         drop(Box::from_raw(scope));
+    }
+}
+
+// ── ObjectTemplate ────────────────────────────────────────────────────────────
+
+/// An opaque object template handle.
+///
+/// An object template describes the shape (properties and accessors) of objects
+/// that will be created from it.  This mirrors V8's `ObjectTemplate` and is
+/// used by Blink to set up DOM prototype objects.
+///
+/// Created by [`stator_object_template_new`] and freed by
+/// [`stator_object_template_destroy`].
+pub struct StatorObjectTemplate {
+    isolate: *mut StatorIsolate,
+    /// Named properties to install on each new instance.  Each entry maps a
+    /// property name to a value that is cloned into every instance.
+    properties: HashMap<String, StatorValueInner>,
+    /// The number of internal fields reserved for embedder data.
+    internal_field_count: i32,
+}
+
+// SAFETY: `StatorObjectTemplate` is single-threaded; same rationale as
+// `StatorIsolate`.
+unsafe impl Send for StatorObjectTemplate {}
+
+/// Create a new, empty object template associated with `isolate`.
+///
+/// Returns a null pointer if `isolate` is null.  The caller must eventually
+/// pass the returned pointer to [`stator_object_template_destroy`].
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_template_new(
+    isolate: *mut StatorIsolate,
+) -> *mut StatorObjectTemplate {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    Box::into_raw(Box::new(StatorObjectTemplate {
+        isolate,
+        properties: HashMap::new(),
+        internal_field_count: 0,
+    }))
+}
+
+/// Destroy an object template previously created with
+/// [`stator_object_template_new`].
+///
+/// Does nothing if `tmpl` is null.
+///
+/// # Safety
+/// `tmpl` must be a non-null pointer returned by
+/// [`stator_object_template_new`] and must not be used again after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_template_destroy(tmpl: *mut StatorObjectTemplate) {
+    if !tmpl.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw`.
+        drop(unsafe { Box::from_raw(tmpl) });
+    }
+}
+
+/// Set a named property on the object template.
+///
+/// When a new instance is created via [`stator_object_template_new_instance`],
+/// it will have this property pre-installed.  Does nothing if any argument is
+/// null.
+///
+/// # Safety
+/// - `tmpl` must be a valid, live [`StatorObjectTemplate`] pointer.
+/// - `key` must be a valid, null-terminated C string.
+/// - `val` must be a valid, live [`StatorValue`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_template_set(
+    tmpl: *mut StatorObjectTemplate,
+    key: *const c_char,
+    val: *const StatorValue,
+) {
+    if tmpl.is_null() || key.is_null() || val.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees pointers are valid.
+    let key_str = unsafe { CStr::from_ptr(key) }
+        .to_string_lossy()
+        .into_owned();
+    let inner = match unsafe { &(*val).inner } {
+        StatorValueInner::Number(n) => StatorValueInner::Number(*n),
+        StatorValueInner::Boolean(b) => StatorValueInner::Boolean(*b),
+        StatorValueInner::Undefined => StatorValueInner::Undefined,
+        StatorValueInner::Null => StatorValueInner::Null,
+        StatorValueInner::Str(cs) => StatorValueInner::Str(cs.clone()),
+        StatorValueInner::Object => StatorValueInner::Object,
+        StatorValueInner::Function => StatorValueInner::Function,
+        StatorValueInner::NativeFunctionValue(f) => {
+            StatorValueInner::NativeFunctionValue(Rc::clone(f))
+        }
+        StatorValueInner::Array => StatorValueInner::Array,
+        StatorValueInner::Date => StatorValueInner::Date,
+        StatorValueInner::RegExp => StatorValueInner::RegExp,
+        StatorValueInner::Promise => StatorValueInner::Promise,
+        StatorValueInner::Map => StatorValueInner::Map,
+        StatorValueInner::Set => StatorValueInner::Set,
+    };
+    unsafe { (*tmpl).properties.insert(key_str, inner) };
+}
+
+/// Set the number of internal fields on objects created from this template.
+///
+/// Internal fields are opaque embedder-owned slots (similar to V8's
+/// `SetInternalFieldCount`).  Does nothing if `tmpl` is null.
+///
+/// # Safety
+/// `tmpl` must be a valid, live [`StatorObjectTemplate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_template_set_internal_field_count(
+    tmpl: *mut StatorObjectTemplate,
+    count: i32,
+) {
+    if !tmpl.is_null() {
+        // SAFETY: caller guarantees `tmpl` is valid.
+        unsafe { (*tmpl).internal_field_count = count };
+    }
+}
+
+/// Return the internal field count configured on this template.
+///
+/// Returns `0` if `tmpl` is null.
+///
+/// # Safety
+/// `tmpl` must be either null or a valid, live [`StatorObjectTemplate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_template_internal_field_count(
+    tmpl: *const StatorObjectTemplate,
+) -> i32 {
+    if tmpl.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `tmpl` is valid.
+    unsafe { (*tmpl).internal_field_count }
+}
+
+/// Create a new [`StatorObject`] instance from an object template.
+///
+/// The returned object has all properties defined on the template pre-installed.
+/// Returns a null pointer if `tmpl` is null.  The caller owns the returned
+/// pointer and must eventually pass it to [`stator_object_destroy`].
+///
+/// # Safety
+/// `tmpl` must be either null or a valid, live [`StatorObjectTemplate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_object_template_new_instance(
+    tmpl: *const StatorObjectTemplate,
+) -> *mut StatorObject {
+    if tmpl.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `tmpl` is valid.
+    let isolate = unsafe { (*tmpl).isolate };
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut obj = JsObject::new();
+    // Install template properties onto the new object.
+    // SAFETY: `tmpl` is valid.
+    for (key, val_inner) in unsafe { &(*tmpl).properties } {
+        let js_val = stator_value_inner_to_jsvalue(val_inner);
+        let _ = obj.set_property(key, js_val);
+    }
+    // SAFETY: isolate is valid.
+    unsafe { (*isolate).live_objects += 1 };
+    Box::into_raw(Box::new(StatorObject {
+        inner: obj,
+        isolate,
+    }))
+}
+
+// ── TryCatch ─────────────────────────────────────────────────────────────────
+
+/// An opaque try-catch scope for catching exceptions across the FFI boundary.
+///
+/// Mirrors V8's `TryCatch` RAII scope.  While a try-catch scope is active,
+/// any pending exception thrown via [`stator_isolate_throw_exception`] (or
+/// raised during script execution) is captured and can be inspected via
+/// [`stator_try_catch_has_caught`] and [`stator_try_catch_exception`].
+///
+/// Created by [`stator_try_catch_new`] and freed by
+/// [`stator_try_catch_destroy`].
+pub struct StatorTryCatch {
+    isolate: *mut StatorIsolate,
+    /// The exception value captured when the scope is checked, or null if no
+    /// exception was caught.
+    exception: *mut StatorValue,
+    /// Whether an exception has been caught by this scope.
+    has_caught: bool,
+}
+
+// SAFETY: `StatorTryCatch` is single-threaded; same rationale as `StatorIsolate`.
+unsafe impl Send for StatorTryCatch {}
+
+/// Create a new try-catch scope on `isolate`.
+///
+/// Returns a null pointer if `isolate` is null.  The caller must eventually
+/// pass the returned pointer to [`stator_try_catch_destroy`].
+///
+/// # Safety
+/// `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_try_catch_new(isolate: *mut StatorIsolate) -> *mut StatorTryCatch {
+    if isolate.is_null() {
+        return std::ptr::null_mut();
+    }
+    Box::into_raw(Box::new(StatorTryCatch {
+        isolate,
+        exception: std::ptr::null_mut(),
+        has_caught: false,
+    }))
+}
+
+/// Return `true` if this try-catch scope has caught an exception.
+///
+/// This function checks the isolate for a pending exception and, if found,
+/// captures it into the scope.  Returns `false` if `tc` is null.
+///
+/// # Safety
+/// `tc` must be either null or a valid, live [`StatorTryCatch`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_try_catch_has_caught(tc: *mut StatorTryCatch) -> bool {
+    if tc.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `tc` is valid.
+    let tc_ref = unsafe { &mut *tc };
+    if tc_ref.has_caught {
+        return true;
+    }
+    // Check if the isolate has a pending exception we should capture.
+    if !tc_ref.isolate.is_null() {
+        // SAFETY: isolate is valid.
+        let pending = unsafe { (*tc_ref.isolate).pending_exception.take() };
+        if let Some(exc) = pending {
+            tc_ref.exception = exc;
+            tc_ref.has_caught = true;
+        }
+    }
+    tc_ref.has_caught
+}
+
+/// Return the caught exception, or a null pointer if none was caught.
+///
+/// The returned pointer is owned by the try-catch scope and remains valid
+/// until [`stator_try_catch_reset`] or [`stator_try_catch_destroy`] is called.
+/// The caller must **not** call [`stator_value_destroy`] on it.
+///
+/// # Safety
+/// `tc` must be either null or a valid, live [`StatorTryCatch`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_try_catch_exception(tc: *const StatorTryCatch) -> *mut StatorValue {
+    if tc.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `tc` is valid.
+    unsafe { (*tc).exception }
+}
+
+/// Reset the try-catch scope, clearing any caught exception.
+///
+/// After this call, [`stator_try_catch_has_caught`] returns `false` and
+/// [`stator_try_catch_exception`] returns null until a new exception is caught.
+///
+/// # Safety
+/// `tc` must be either null or a valid, live [`StatorTryCatch`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_try_catch_reset(tc: *mut StatorTryCatch) {
+    if !tc.is_null() {
+        // SAFETY: caller guarantees `tc` is valid.
+        unsafe {
+            (*tc).exception = std::ptr::null_mut();
+            (*tc).has_caught = false;
+        }
+    }
+}
+
+/// Destroy a try-catch scope previously created with [`stator_try_catch_new`].
+///
+/// If the scope holds a caught exception that has not been cleared via
+/// [`stator_try_catch_reset`], the exception value is **not** destroyed (the
+/// caller retains ownership of exception values passed to
+/// [`stator_isolate_throw_exception`]).
+///
+/// Does nothing if `tc` is null.
+///
+/// # Safety
+/// `tc` must be a non-null pointer returned by [`stator_try_catch_new`] and
+/// must not be used again after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_try_catch_destroy(tc: *mut StatorTryCatch) {
+    if !tc.is_null() {
+        // SAFETY: pointer was created by `Box::into_raw`.
+        drop(unsafe { Box::from_raw(tc) });
     }
 }
 
@@ -7104,5 +7445,134 @@ mod tests {
             stator_wasm_instance_destroy(inst);
             stator_wasm_module_destroy(m);
         }
+    }
+
+    // ── ObjectTemplate tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_object_template_create_destroy() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let tmpl = unsafe { stator_object_template_new(iso.as_ptr()) };
+        assert!(!tmpl.is_null());
+        // SAFETY: `tmpl` is non-null and live.
+        unsafe { stator_object_template_destroy(tmpl) };
+    }
+
+    #[test]
+    fn test_object_template_null_isolate_returns_null() {
+        // SAFETY: passing null is safe.
+        let tmpl = unsafe { stator_object_template_new(std::ptr::null_mut()) };
+        assert!(tmpl.is_null());
+    }
+
+    #[test]
+    fn test_object_template_set_and_new_instance() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let tmpl = unsafe { stator_object_template_new(iso.as_ptr()) };
+        let val = unsafe { stator_value_new_number(iso.as_ptr(), 42.0) };
+        let key = c"answer";
+        // SAFETY: all pointers are valid.
+        unsafe { stator_object_template_set(tmpl, key.as_ptr(), val) };
+        let obj = unsafe { stator_object_template_new_instance(tmpl) };
+        assert!(!obj.is_null());
+        // Check that the property was installed.
+        let got = unsafe { stator_object_get(obj, key.as_ptr()) };
+        assert!(!got.is_null());
+        let n = unsafe { stator_value_as_number(got) };
+        assert!((n - 42.0).abs() < f64::EPSILON);
+        // SAFETY: clean up.
+        unsafe {
+            stator_value_destroy(got);
+            stator_object_destroy(obj);
+            stator_value_destroy(val);
+            stator_object_template_destroy(tmpl);
+        }
+    }
+
+    #[test]
+    fn test_object_template_internal_field_count() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let tmpl = unsafe { stator_object_template_new(iso.as_ptr()) };
+        assert_eq!(
+            unsafe { stator_object_template_internal_field_count(tmpl) },
+            0
+        );
+        unsafe { stator_object_template_set_internal_field_count(tmpl, 3) };
+        assert_eq!(
+            unsafe { stator_object_template_internal_field_count(tmpl) },
+            3
+        );
+        unsafe { stator_object_template_destroy(tmpl) };
+    }
+
+    // ── TryCatch tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_try_catch_no_exception() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let tc = unsafe { stator_try_catch_new(iso.as_ptr()) };
+        assert!(!tc.is_null());
+        assert!(!unsafe { stator_try_catch_has_caught(tc) });
+        assert!(unsafe { stator_try_catch_exception(tc) }.is_null());
+        unsafe { stator_try_catch_destroy(tc) };
+    }
+
+    #[test]
+    fn test_try_catch_catches_pending_exception() {
+        let iso = IsolateGuard::new();
+        let tc = unsafe { stator_try_catch_new(iso.as_ptr()) };
+        let exc = unsafe { stator_value_new_string(iso.as_ptr(), c"error".as_ptr(), 5) };
+        // Throw the exception on the isolate.
+        unsafe { stator_isolate_throw_exception(iso.as_ptr(), exc) };
+        // TryCatch should now capture it.
+        assert!(unsafe { stator_try_catch_has_caught(tc) });
+        let caught = unsafe { stator_try_catch_exception(tc) };
+        assert!(!caught.is_null());
+        assert_eq!(caught, exc);
+        // Clean up.
+        unsafe {
+            stator_try_catch_destroy(tc);
+            stator_value_destroy(exc);
+        }
+    }
+
+    #[test]
+    fn test_try_catch_reset_clears_exception() {
+        let iso = IsolateGuard::new();
+        let tc = unsafe { stator_try_catch_new(iso.as_ptr()) };
+        let exc = unsafe { stator_value_new_number(iso.as_ptr(), 99.0) };
+        unsafe { stator_isolate_throw_exception(iso.as_ptr(), exc) };
+        assert!(unsafe { stator_try_catch_has_caught(tc) });
+        unsafe { stator_try_catch_reset(tc) };
+        assert!(!unsafe { stator_try_catch_has_caught(tc) });
+        assert!(unsafe { stator_try_catch_exception(tc) }.is_null());
+        unsafe {
+            stator_try_catch_destroy(tc);
+            stator_value_destroy(exc);
+        }
+    }
+
+    // ── Pending exception helper tests ───────────────────────────────────
+
+    #[test]
+    fn test_isolate_has_pending_exception_initially_false() {
+        let iso = IsolateGuard::new();
+        assert!(!unsafe { stator_isolate_has_pending_exception(iso.as_ptr()) });
+    }
+
+    #[test]
+    fn test_isolate_pending_exception_roundtrip() {
+        let iso = IsolateGuard::new();
+        let exc = unsafe { stator_value_new_number(iso.as_ptr(), 1.0) };
+        unsafe { stator_isolate_throw_exception(iso.as_ptr(), exc) };
+        assert!(unsafe { stator_isolate_has_pending_exception(iso.as_ptr()) });
+        let cleared = unsafe { stator_isolate_clear_pending_exception(iso.as_ptr()) };
+        assert_eq!(cleared, exc);
+        assert!(!unsafe { stator_isolate_has_pending_exception(iso.as_ptr()) });
+        unsafe { stator_value_destroy(exc) };
     }
 }
