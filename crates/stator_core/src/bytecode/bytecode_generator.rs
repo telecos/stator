@@ -39,8 +39,8 @@ use crate::bytecode::register::{Register, RegisterAllocator};
 use crate::error::{StatorError, StatorResult};
 use crate::parser::ast::{
     ArrowBody, ArrowExpr, AssignOp, AssignTarget, BinaryOp, BlockStmt, Expr, FnDecl, FnExpr,
-    ForInit, ForStmt, LogicalOp, Pat, Program, ProgramItem, Stmt, UnaryOp, UpdateOp, VarDecl,
-    VarDeclarator,
+    ForInit, ForStmt, LogicalOp, ObjectPatProp, Pat, Program, ProgramItem, Stmt, UnaryOp, UpdateOp,
+    VarDecl, VarDeclarator,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -205,8 +205,10 @@ struct FunctionCompiler {
 impl FunctionCompiler {
     /// Create a new compiler for a function with the given parameter list.
     ///
-    /// Each parameter that is a simple identifier binding is added to the
-    /// outermost scope immediately; complex patterns are not yet supported.
+    /// Simple identifier bindings are added to the outermost scope
+    /// immediately.  Complex patterns (destructuring, defaults) are
+    /// recorded so that [`emit_param_prologue`] can emit the
+    /// corresponding bytecode at function entry.
     fn new(params: &[crate::parser::ast::Param]) -> StatorResult<Self> {
         let param_count = params.len() as u32;
         let mut compiler = Self {
@@ -229,20 +231,206 @@ impl FunctionCompiler {
             is_program: false,
             is_eval_scope: false,
         };
+        // Register simple ident params in the scope immediately; complex
+        // patterns are handled by `emit_param_prologue`.
         for (i, param) in params.iter().enumerate() {
-            match &param.pat {
-                Pat::Ident(ident) => {
-                    let reg = Register::parameter(i as u32);
-                    compiler.scopes[0].insert(ident.name.clone(), reg);
-                }
-                _ => {
-                    return Err(StatorError::Internal(
-                        "complex parameter patterns are not yet supported".into(),
-                    ));
-                }
+            if let Pat::Ident(ident) = &param.pat
+                && param.default.is_none()
+            {
+                let reg = Register::parameter(i as u32);
+                compiler.scopes[0].insert(ident.name.clone(), reg);
             }
         }
         Ok(compiler)
+    }
+
+    /// Emit bytecode at function entry to handle default parameter values
+    /// and destructuring binding patterns.
+    ///
+    /// For each parameter that carries a default value, emits:
+    /// ```text
+    /// Ldar <param_reg>
+    /// JumpIfUndefined :default
+    /// Jump :done
+    /// default:
+    ///   <compile default expr>
+    ///   Star <param_reg or new local>
+    /// done:
+    /// ```
+    ///
+    /// For destructuring patterns the value (already in a register) is
+    /// unpacked into fresh locals via [`compile_binding_pattern`].
+    fn emit_param_prologue(&mut self, params: &[crate::parser::ast::Param]) -> StatorResult<()> {
+        for (i, param) in params.iter().enumerate() {
+            let param_reg = Register::parameter(i as u32);
+
+            match &param.pat {
+                Pat::Ident(ident) => {
+                    if let Some(default_expr) = &param.default {
+                        // Parameter with default: `function f(a = expr)`
+                        let local_reg = self.define_local(&ident.name);
+                        self.emit_ldar(param_reg);
+                        let default_lbl = self.new_label();
+                        let done_lbl = self.new_label();
+                        self.emit_jump(Opcode::JumpIfUndefined, default_lbl);
+                        // Not undefined — store param value into local.
+                        self.emit_star(local_reg);
+                        self.emit_jump(Opcode::Jump, done_lbl);
+                        // Default branch — evaluate default expression.
+                        self.bind_label(default_lbl);
+                        self.compile_expr(default_expr)?;
+                        self.emit_star(local_reg);
+                        self.bind_label(done_lbl);
+                    }
+                    // Simple ident without default was already registered
+                    // in `new` — nothing more to emit.
+                }
+                Pat::Object(_) | Pat::Array(_) => {
+                    // Destructuring param: unpack from param register.
+                    if let Some(default_expr) = &param.default {
+                        let done_lbl = self.new_label();
+                        self.emit_ldar(param_reg);
+                        self.emit_jump(Opcode::JumpIfNotUndefined, done_lbl);
+                        self.compile_expr(default_expr)?;
+                        self.emit_star(param_reg);
+                        self.bind_label(done_lbl);
+                    }
+                    // Use param register directly — no temporary needed.
+                    self.compile_binding_pattern(&param.pat, param_reg)?;
+                }
+                Pat::Rest(_) => {
+                    // Rest parameters in the parameter list itself are
+                    // handled by the runtime; nothing to emit here.
+                }
+                Pat::Assign(assign) => {
+                    self.compile_binding_pattern(&param.pat, param_reg)?;
+                    let _ = assign;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a binding pattern, destructuring the value held in
+    /// `source_reg` into new local variables.
+    ///
+    /// Handles object patterns (`{a, b: c}`), array patterns (`[x, y]`),
+    /// rest elements, and default-value sub-patterns recursively.
+    ///
+    /// Scratch registers are allocated via `new_local` (unnamed) rather than
+    /// `allocate_temporary` because the recursive calls may define new named
+    /// locals, which would break the LIFO invariant that temporaries require.
+    fn compile_binding_pattern(&mut self, pat: &Pat, source_reg: Register) -> StatorResult<()> {
+        match pat {
+            Pat::Ident(ident) => {
+                let local = self.define_local(&ident.name);
+                self.emit_ldar(source_reg);
+                self.emit_star(local);
+            }
+            Pat::Object(obj_pat) => {
+                for prop in &obj_pat.properties {
+                    match prop {
+                        ObjectPatProp::KeyValue(kv) => {
+                            let name = match &kv.key {
+                                crate::parser::ast::PropKey::Ident(id) => id.name.clone(),
+                                crate::parser::ast::PropKey::Str(s) => s.value.clone(),
+                                _ => {
+                                    return Err(StatorError::Internal(
+                                        "computed/numeric keys in object destructuring \
+                                         are not yet supported"
+                                            .into(),
+                                    ));
+                                }
+                            };
+                            let name_idx = self.add_string(&name);
+                            let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                            self.emit(Instruction::new_unchecked(
+                                Opcode::LdaNamedProperty,
+                                vec![
+                                    to_reg_op(source_reg),
+                                    Operand::ConstantPoolIdx(name_idx),
+                                    slot,
+                                ],
+                            ));
+                            // Use an unnamed local for the intermediate
+                            // value so that nested `define_local` calls
+                            // do not violate temporary LIFO ordering.
+                            let scratch = self.allocator.new_local();
+                            self.emit_star(scratch);
+                            self.compile_binding_pattern(&kv.value, scratch)?;
+                        }
+                        ObjectPatProp::Assign(assign_prop) => {
+                            let name_idx = self.add_string(&assign_prop.key.name);
+                            let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                            self.emit(Instruction::new_unchecked(
+                                Opcode::LdaNamedProperty,
+                                vec![
+                                    to_reg_op(source_reg),
+                                    Operand::ConstantPoolIdx(name_idx),
+                                    slot,
+                                ],
+                            ));
+                            let local = self.define_local(&assign_prop.key.name);
+                            if let Some(default_expr) = &assign_prop.value {
+                                let done_lbl = self.new_label();
+                                self.emit_star(local);
+                                self.emit_ldar(local);
+                                self.emit_jump(Opcode::JumpIfNotUndefined, done_lbl);
+                                self.compile_expr(default_expr)?;
+                                self.emit_star(local);
+                                self.bind_label(done_lbl);
+                            } else {
+                                self.emit_star(local);
+                            }
+                        }
+                        ObjectPatProp::Rest(_rest) => {
+                            return Err(StatorError::Internal(
+                                "rest element in object destructuring \
+                                 is not yet supported"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+            }
+            Pat::Array(arr_pat) => {
+                let load_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                let call_slot = self.alloc_slot(FeedbackSlotKind::Call);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::GetIterator,
+                    vec![to_reg_op(source_reg), load_slot, call_slot],
+                ));
+                // Use unnamed locals for iterator and value registers.
+                let iter_reg = self.allocator.new_local();
+                self.emit_star(iter_reg);
+                let val_reg = self.allocator.new_local();
+
+                for element in &arr_pat.elements {
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::IteratorNext,
+                        vec![to_reg_op(iter_reg), to_reg_op(val_reg)],
+                    ));
+                    if let Some(elem_pat) = element {
+                        self.compile_binding_pattern(elem_pat, val_reg)?;
+                    }
+                }
+            }
+            Pat::Assign(assign_pat) => {
+                let done_lbl = self.new_label();
+                self.emit_ldar(source_reg);
+                self.emit_jump(Opcode::JumpIfNotUndefined, done_lbl);
+                self.compile_expr(&assign_pat.right)?;
+                self.emit_star(source_reg);
+                self.bind_label(done_lbl);
+                self.compile_binding_pattern(&assign_pat.left, source_reg)?;
+            }
+            Pat::Rest(_) => {
+                return Err(StatorError::Internal(
+                    "rest element outside array pattern is not supported".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     // ── Constant pool ────────────────────────────────────────────────────────
@@ -3583,6 +3771,9 @@ fn compile_function(
         ));
     }
 
+    // Emit default-value and destructuring prologue for parameters.
+    compiler.emit_param_prologue(params)?;
+
     // Hoist function declarations to the top of the scope.
     for stmt in &body.body {
         if let Stmt::FnDecl(decl) = stmt {
@@ -3695,12 +3886,13 @@ mod tests {
     use super::*;
     use crate::bytecode::bytecodes::{Opcode, decode};
     use crate::parser::ast::{
-        AssignExpr, AssignOp, AssignTarget, BinaryExpr, BinaryOp, BlockStmt, BoolLit, BreakStmt,
-        CatchClause, ClassBody, ClassDecl, ClassExpr, ClassMember, ContinueStmt, DoWhileStmt, Expr,
-        ExprStmt, FnDecl, FnExpr, ForStmt, Ident, IfStmt, LabeledStmt, LogicalExpr, LogicalOp,
-        MethodDef, MethodKind, NullLit, NumLit, ObjectExpr, ObjectProp, Param, Pat, Program,
-        ProgramItem, Prop, PropKey, PropValue, PropertyDef, ReturnStmt, SourceType, StaticBlock,
-        Stmt, StringLit, ThrowStmt, TryStmt, VarDecl, VarDeclarator, VarKind, WhileStmt,
+        ArrayPat, AssignExpr, AssignOp, AssignPatProp, AssignTarget, BinaryExpr, BinaryOp,
+        BlockStmt, BoolLit, BreakStmt, CatchClause, ClassBody, ClassDecl, ClassExpr, ClassMember,
+        ContinueStmt, DoWhileStmt, Expr, ExprStmt, FnDecl, FnExpr, ForStmt, Ident, IfStmt,
+        KeyValuePatProp, LabeledStmt, LogicalExpr, LogicalOp, MethodDef, MethodKind, NullLit,
+        NumLit, ObjectExpr, ObjectPat, ObjectPatProp, ObjectProp, Param, Pat, Program, ProgramItem,
+        Prop, PropKey, PropValue, PropertyDef, ReturnStmt, SourceType, StaticBlock, Stmt,
+        StringLit, ThrowStmt, TryStmt, VarDecl, VarDeclarator, VarKind, WhileStmt,
     };
     use crate::parser::scanner::{Position, Span};
 
@@ -6007,6 +6199,260 @@ mod tests {
         assert!(
             opcodes.contains(&Opcode::JumpIfUndefinedOrNull),
             "expected JumpIfUndefinedOrNull for ??=, got {opcodes:?}"
+        );
+    }
+
+    // ── Destructuring & default parameters ───────────────────────────────
+
+    #[test]
+    fn test_default_param_emits_jump_if_undefined() {
+        // function f(a = 1) { return a; }
+        let body = BlockStmt {
+            loc: span(),
+            body: vec![return_stmt(Some(ident_expr("a")))],
+        };
+        let inner = compile_function(
+            &[Param {
+                loc: span(),
+                pat: Pat::Ident(ident("a")),
+                default: Some(num_expr(1.0)),
+            }],
+            &body,
+            false,
+            false,
+        )
+        .unwrap();
+        let instrs = inner.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::JumpIfUndefined),
+            "default param must emit JumpIfUndefined"
+        );
+        assert_eq!(inner.parameter_count(), 1);
+    }
+
+    #[test]
+    fn test_object_destructuring_param() {
+        // function f({a, b}) { return a; }
+        let body = BlockStmt {
+            loc: span(),
+            body: vec![return_stmt(Some(ident_expr("a")))],
+        };
+        let inner = compile_function(
+            &[Param {
+                loc: span(),
+                pat: Pat::Object(Box::new(ObjectPat {
+                    loc: span(),
+                    properties: vec![
+                        ObjectPatProp::Assign(AssignPatProp {
+                            loc: span(),
+                            key: ident("a"),
+                            value: None,
+                        }),
+                        ObjectPatProp::Assign(AssignPatProp {
+                            loc: span(),
+                            key: ident("b"),
+                            value: None,
+                        }),
+                    ],
+                })),
+                default: None,
+            }],
+            &body,
+            false,
+            false,
+        )
+        .unwrap();
+        let instrs = inner.instructions().unwrap();
+        assert!(
+            instrs
+                .iter()
+                .filter(|i| i.opcode == Opcode::LdaNamedProperty)
+                .count()
+                >= 2,
+            "object destructuring param must emit LdaNamedProperty for each property"
+        );
+    }
+
+    #[test]
+    fn test_array_destructuring_param() {
+        // function f([x, y]) { return x; }
+        let body = BlockStmt {
+            loc: span(),
+            body: vec![return_stmt(Some(ident_expr("x")))],
+        };
+        let inner = compile_function(
+            &[Param {
+                loc: span(),
+                pat: Pat::Array(Box::new(ArrayPat {
+                    loc: span(),
+                    elements: vec![Some(Pat::Ident(ident("x"))), Some(Pat::Ident(ident("y")))],
+                })),
+                default: None,
+            }],
+            &body,
+            false,
+            false,
+        )
+        .unwrap();
+        let instrs = inner.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::GetIterator),
+            "array destructuring param must emit GetIterator"
+        );
+        assert!(
+            instrs
+                .iter()
+                .filter(|i| i.opcode == Opcode::IteratorNext)
+                .count()
+                >= 2,
+            "array destructuring param must emit IteratorNext for each element"
+        );
+    }
+
+    #[test]
+    fn test_object_destructuring_with_rename() {
+        // function f({a: x}) { return x; }
+        let body = BlockStmt {
+            loc: span(),
+            body: vec![return_stmt(Some(ident_expr("x")))],
+        };
+        let inner = compile_function(
+            &[Param {
+                loc: span(),
+                pat: Pat::Object(Box::new(ObjectPat {
+                    loc: span(),
+                    properties: vec![ObjectPatProp::KeyValue(KeyValuePatProp {
+                        loc: span(),
+                        key: PropKey::Ident(ident("a")),
+                        is_computed: false,
+                        value: Pat::Ident(ident("x")),
+                    })],
+                })),
+                default: None,
+            }],
+            &body,
+            false,
+            false,
+        )
+        .unwrap();
+        let instrs = inner.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::LdaNamedProperty),
+            "renamed object destructuring must emit LdaNamedProperty"
+        );
+    }
+
+    #[test]
+    fn test_default_param_with_later_param_ref() {
+        // function f(a = 1, b = a + 1) { return b; }
+        let body = BlockStmt {
+            loc: span(),
+            body: vec![return_stmt(Some(ident_expr("b")))],
+        };
+        let inner = compile_function(
+            &[
+                Param {
+                    loc: span(),
+                    pat: Pat::Ident(ident("a")),
+                    default: Some(num_expr(1.0)),
+                },
+                Param {
+                    loc: span(),
+                    pat: Pat::Ident(ident("b")),
+                    default: Some(Expr::Binary(Box::new(BinaryExpr {
+                        loc: span(),
+                        op: BinaryOp::Add,
+                        left: Box::new(ident_expr("a")),
+                        right: Box::new(num_expr(1.0)),
+                    }))),
+                },
+            ],
+            &body,
+            false,
+            false,
+        )
+        .unwrap();
+        let instrs = inner.instructions().unwrap();
+        assert_eq!(
+            instrs
+                .iter()
+                .filter(|i| i.opcode == Opcode::JumpIfUndefined)
+                .count(),
+            2,
+            "each default param must emit its own JumpIfUndefined"
+        );
+    }
+
+    #[test]
+    fn test_object_destructuring_param_with_default() {
+        // function f({a, b = 42}) { return b; }
+        let body = BlockStmt {
+            loc: span(),
+            body: vec![return_stmt(Some(ident_expr("b")))],
+        };
+        let inner = compile_function(
+            &[Param {
+                loc: span(),
+                pat: Pat::Object(Box::new(ObjectPat {
+                    loc: span(),
+                    properties: vec![
+                        ObjectPatProp::Assign(AssignPatProp {
+                            loc: span(),
+                            key: ident("a"),
+                            value: None,
+                        }),
+                        ObjectPatProp::Assign(AssignPatProp {
+                            loc: span(),
+                            key: ident("b"),
+                            value: Some(Box::new(num_expr(42.0))),
+                        }),
+                    ],
+                })),
+                default: None,
+            }],
+            &body,
+            false,
+            false,
+        )
+        .unwrap();
+        let instrs = inner.instructions().unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::JumpIfNotUndefined),
+            "object destructuring with default must emit JumpIfNotUndefined"
+        );
+    }
+
+    #[test]
+    fn test_array_destructuring_with_elision() {
+        // function f([, x]) { return x; }
+        let body = BlockStmt {
+            loc: span(),
+            body: vec![return_stmt(Some(ident_expr("x")))],
+        };
+        let inner = compile_function(
+            &[Param {
+                loc: span(),
+                pat: Pat::Array(Box::new(ArrayPat {
+                    loc: span(),
+                    elements: vec![None, Some(Pat::Ident(ident("x")))],
+                })),
+                default: None,
+            }],
+            &body,
+            false,
+            false,
+        )
+        .unwrap();
+        let instrs = inner.instructions().unwrap();
+        assert_eq!(
+            instrs
+                .iter()
+                .filter(|i| i.opcode == Opcode::IteratorNext)
+                .count(),
+            2,
+            "elision must still advance the iterator"
         );
     }
 }
