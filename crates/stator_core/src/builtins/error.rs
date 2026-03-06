@@ -34,6 +34,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::error::{StatorError, StatorResult};
+use crate::objects::value::JsValue;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stack-trace limit
@@ -243,6 +244,8 @@ impl ErrorKind {
 /// | `name` | [`JsError::name`] |
 /// | `message` | [`JsError::message`] |
 /// | `stack` | [`JsError::stack`] |
+/// | `cause` | [`JsError::cause`] (ES2022) |
+/// | `errors` | [`JsError::errors`] (`AggregateError` only) |
 #[derive(Debug, Clone, PartialEq)]
 pub struct JsError {
     /// The kind of this error (determines the `name` property).
@@ -253,6 +256,11 @@ pub struct JsError {
     pub stack: String,
     /// Inner errors for `AggregateError` (empty for all other kinds).
     pub errors: Vec<Rc<JsError>>,
+    /// The ES2022 `cause` property — the underlying reason for this error.
+    ///
+    /// Set when the constructor receives an options object with a `cause`
+    /// property, e.g. `new Error("msg", { cause: originalError })`.
+    pub cause: Option<JsValue>,
 }
 
 impl JsError {
@@ -278,6 +286,7 @@ impl JsError {
             message,
             stack,
             errors: Vec::new(),
+            cause: None,
         }
     }
 
@@ -302,6 +311,7 @@ impl JsError {
             message,
             stack,
             errors,
+            cause: None,
         }
     }
 
@@ -318,6 +328,31 @@ impl JsError {
     /// The ECMAScript `stack` property — the formatted stack trace.
     pub fn stack(&self) -> &str {
         &self.stack
+    }
+
+    /// The ES2022 `cause` property — the underlying error cause, if any.
+    ///
+    /// Returns `None` when the error was constructed without a `cause` option.
+    pub fn cause(&self) -> Option<&JsValue> {
+        self.cause.as_ref()
+    }
+
+    /// Builder: set the `cause` property on this error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stator_core::builtins::error::{JsError, ErrorKind};
+    /// use stator_core::objects::value::JsValue;
+    ///
+    /// let inner = JsValue::String("disk full".to_string());
+    /// let e = JsError::new(ErrorKind::Error, "write failed".to_string())
+    ///     .with_cause(inner.clone());
+    /// assert_eq!(e.cause(), Some(&inner));
+    /// ```
+    pub fn with_cause(mut self, cause: JsValue) -> Self {
+        self.cause = Some(cause);
+        self
     }
 
     /// ECMAScript §20.5.8 `Error.prototype.toString()`.
@@ -643,5 +678,67 @@ mod tests {
             matches!(result, Err(crate::error::StatorError::RangeError(_))),
             "expected RangeError when call stack is full, got {result:?}"
         );
+    }
+
+    // ── cause property (ES2022) ──────────────────────────────────────────────
+
+    #[test]
+    fn test_error_cause_none_by_default() {
+        let e = JsError::new(ErrorKind::Error, "no cause".to_string());
+        assert!(e.cause().is_none());
+    }
+
+    #[test]
+    fn test_error_with_cause() {
+        let cause = JsValue::String("disk full".to_string());
+        let e =
+            JsError::new(ErrorKind::Error, "write failed".to_string()).with_cause(cause.clone());
+        assert_eq!(e.cause(), Some(&cause));
+    }
+
+    #[test]
+    fn test_error_cause_can_be_error_value() {
+        let inner = JsValue::Error(Rc::new(type_error_new("bad type".to_string())));
+        let outer = JsError::new(ErrorKind::Error, "wrapper".to_string()).with_cause(inner.clone());
+        assert_eq!(outer.cause(), Some(&inner));
+    }
+
+    #[test]
+    fn test_aggregate_error_cause_none_by_default() {
+        let agg = aggregate_error_new(vec![], "agg".to_string());
+        assert!(agg.cause().is_none());
+    }
+
+    #[test]
+    fn test_aggregate_error_with_cause() {
+        let cause = JsValue::Smi(42);
+        let mut agg = aggregate_error_new(vec![], "agg".to_string());
+        agg.cause = Some(cause.clone());
+        assert_eq!(agg.cause(), Some(&cause));
+    }
+
+    // ── name/message inheritance ─────────────────────────────────────────────
+
+    #[test]
+    fn test_all_error_kinds_have_correct_names() {
+        let kinds = [
+            (ErrorKind::Error, "Error"),
+            (ErrorKind::TypeError, "TypeError"),
+            (ErrorKind::RangeError, "RangeError"),
+            (ErrorKind::ReferenceError, "ReferenceError"),
+            (ErrorKind::SyntaxError, "SyntaxError"),
+            (ErrorKind::URIError, "URIError"),
+            (ErrorKind::EvalError, "EvalError"),
+            (ErrorKind::AggregateError, "AggregateError"),
+        ];
+        for (kind, expected_name) in kinds {
+            let e = JsError::new(kind, "test".to_string());
+            assert_eq!(e.name(), expected_name, "wrong name for {kind:?}");
+            assert_eq!(e.message(), "test");
+            assert!(
+                e.stack().starts_with(&format!("{expected_name}: test")),
+                "stack should start with error string for {kind:?}"
+            );
+        }
     }
 }
