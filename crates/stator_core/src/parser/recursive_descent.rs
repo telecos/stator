@@ -30,14 +30,14 @@ use crate::parser::ast::{
     ClassBody, ClassDecl, ClassExpr, ClassMember, ContinueStmt, DebuggerStmt, DoWhileStmt,
     EmptyStmt, ExportAllDecl, ExportDefaultDecl, ExportDefaultExpr, ExportNamedDecl,
     ExportSpecifier, Expr, ExprStmt, FnDecl, FnExpr, ForInOfLeft, ForInStmt, ForInit, ForOfStmt,
-    ForStmt, Ident, IfStmt, ImportDecl, ImportDefaultSpecifier, ImportNamedSpecifier,
-    ImportNamespaceSpecifier, ImportSpecifier, KeyValuePatProp, LogicalExpr, LogicalOp, MethodDef,
-    MethodKind, ModuleDecl, ModuleExportName, NewExpr, NullLit, NumLit, ObjectExpr, ObjectPat,
-    ObjectPatProp, ObjectProp, Param, Pat, PrivateIdent, Program, ProgramItem, Prop, PropKey,
-    PropValue, PropertyDef, RegExpLit, RestElement, ReturnStmt, SequenceExpr, SourceLocation,
-    SourceType, SpreadElement, StaticBlock, Stmt, StringLit, SwitchCase, SwitchStmt,
-    TemplateElement, TemplateLit, ThrowStmt, TryStmt, UnaryExpr, UnaryOp, UpdateExpr, UpdateOp,
-    VarDecl, VarDeclarator, VarKind, WhileStmt, WithStmt, YieldExpr,
+    ForStmt, Ident, IfStmt, ImportDecl, ImportDefaultSpecifier, ImportExpr, ImportNamedSpecifier,
+    ImportNamespaceSpecifier, ImportSpecifier, KeyValuePatProp, LogicalExpr, LogicalOp,
+    MetaPropExpr, MethodDef, MethodKind, ModuleDecl, ModuleExportName, NewExpr, NullLit, NumLit,
+    ObjectExpr, ObjectPat, ObjectPatProp, ObjectProp, Param, Pat, PrivateIdent, Program,
+    ProgramItem, Prop, PropKey, PropValue, PropertyDef, RegExpLit, RestElement, ReturnStmt,
+    SequenceExpr, SourceLocation, SourceType, SpreadElement, StaticBlock, Stmt, StringLit,
+    SwitchCase, SwitchStmt, TemplateElement, TemplateLit, ThrowStmt, TryStmt, UnaryExpr, UnaryOp,
+    UpdateExpr, UpdateOp, VarDecl, VarDeclarator, VarKind, WhileStmt, WithStmt, YieldExpr,
 };
 use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue};
 
@@ -214,9 +214,23 @@ impl<'src> Parser<'src> {
         while self.peek_kind() != TokenKind::Eof {
             match self.peek_kind() {
                 TokenKind::Import => {
-                    is_module = true;
-                    let decl = self.parse_import_decl()?;
-                    body.push(ProgramItem::ModuleDecl(ModuleDecl::Import(decl)));
+                    // Peek ahead: `import(` is a dynamic import expression,
+                    // `import.` is import.meta — both are expression statements,
+                    // not module declarations.
+                    let saved_scanner = self.scanner.clone();
+                    let saved_current = self.current.clone();
+                    self.bump()?; // consume `import`
+                    let next = self.peek_kind();
+                    self.scanner = saved_scanner;
+                    self.current = saved_current;
+                    if next == TokenKind::LeftParen || next == TokenKind::Dot {
+                        let stmt = self.parse_stmt()?;
+                        body.push(ProgramItem::Stmt(stmt));
+                    } else {
+                        is_module = true;
+                        let decl = self.parse_import_decl()?;
+                        body.push(ProgramItem::ModuleDecl(ModuleDecl::Import(decl)));
+                    }
                 }
                 TokenKind::Export => {
                     is_module = true;
@@ -2907,6 +2921,50 @@ impl<'src> Parser<'src> {
                         loc: tok.span,
                         name: "async".into(),
                     }))
+                }
+            }
+            TokenKind::Import => {
+                let import_tok = self.bump()?; // consume `import`
+                if self.peek_kind() == TokenKind::Dot {
+                    // `import.meta`
+                    self.bump()?; // consume `.`
+                    let prop_tok = self.bump()?;
+                    let prop_name = self.name_from_token(&prop_tok)?;
+                    let end = prop_tok.span;
+                    Ok(Expr::MetaProp(MetaPropExpr {
+                        loc: Self::merge_spans(import_tok.span, end),
+                        meta: Ident {
+                            loc: import_tok.span,
+                            name: "import".into(),
+                        },
+                        property: Ident {
+                            loc: prop_tok.span,
+                            name: prop_name,
+                        },
+                    }))
+                } else {
+                    // `import(source)` or `import(source, options)`
+                    self.expect(TokenKind::LeftParen)?;
+                    let source = self.parse_assignment_expr()?;
+                    let options = if self.eat(TokenKind::Comma)? {
+                        // Allow trailing comma: `import(x,)`
+                        if self.peek_kind() == TokenKind::RightParen {
+                            None
+                        } else {
+                            let opts = self.parse_assignment_expr()?;
+                            // Consume optional trailing comma.
+                            self.eat(TokenKind::Comma)?;
+                            Some(Box::new(opts))
+                        }
+                    } else {
+                        None
+                    };
+                    let end = self.expect(TokenKind::RightParen)?;
+                    Ok(Expr::Import(Box::new(ImportExpr {
+                        loc: Self::merge_spans(import_tok.span, end.span),
+                        source: Box::new(source),
+                        options,
+                    })))
                 }
             }
             TokenKind::Class => self.parse_class_expr(),
@@ -6514,5 +6572,95 @@ mod tests {
         } else {
             panic!("expected expression statement");
         }
+    }
+
+    #[test]
+    fn test_parse_dynamic_import() {
+        let prog = parse("import('./module.js')").unwrap();
+        assert_eq!(prog.body.len(), 1);
+        if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
+            assert!(matches!(expr.as_ref(), Expr::Import(_)));
+            if let Expr::Import(imp) = expr.as_ref() {
+                assert!(matches!(imp.source.as_ref(), Expr::Str(_)));
+                assert!(imp.options.is_none());
+            }
+        } else {
+            panic!("expected expression statement with import()");
+        }
+    }
+
+    #[test]
+    fn test_parse_dynamic_import_with_options() {
+        let prog = parse("import('./mod.json', { with: { type: 'json' } })").unwrap();
+        assert_eq!(prog.body.len(), 1);
+        if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
+            if let Expr::Import(imp) = expr.as_ref() {
+                assert!(imp.options.is_some());
+            } else {
+                panic!("expected import expression");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_dynamic_import_trailing_comma() {
+        let prog = parse("import('./mod.js',)").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
+            if let Expr::Import(imp) = expr.as_ref() {
+                assert!(imp.options.is_none());
+            } else {
+                panic!("expected import expression");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_dynamic_import_variable_specifier() {
+        let prog = parse("import(url)").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
+            if let Expr::Import(imp) = expr.as_ref() {
+                assert!(matches!(imp.source.as_ref(), Expr::Ident(_)));
+            } else {
+                panic!("expected import expression");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_dynamic_import_not_declaration() {
+        // `import(x)` at top level should not be parsed as an import declaration.
+        let prog = parse("import('./foo.js')").unwrap();
+        assert!(matches!(prog.body[0], ProgramItem::Stmt(_)));
+        assert_eq!(prog.source_type, SourceType::Script);
+    }
+
+    #[test]
+    fn test_parse_import_meta() {
+        let prog = parse("import.meta").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
+            assert!(
+                matches!(expr.as_ref(), Expr::MetaProp(_)),
+                "expected MetaProp, got {expr:?}"
+            );
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_import_decl_still_works() {
+        // Ensure normal import declarations still parse correctly.
+        let prog = parse("import foo from 'bar'").unwrap();
+        assert!(matches!(
+            prog.body[0],
+            ProgramItem::ModuleDecl(ModuleDecl::Import(_))
+        ));
+        assert_eq!(prog.source_type, SourceType::Module);
     }
 }
