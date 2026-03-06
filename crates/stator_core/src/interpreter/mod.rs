@@ -999,10 +999,26 @@ impl Interpreter {
                     byte_offsets: &byte_offsets,
                     handler_table: &handler_table,
                 };
-                match handler(&mut dctx, instr)? {
-                    dispatch::DispatchAction::Continue => {}
-                    dispatch::DispatchAction::Return(v) => return Ok(v),
-                    dispatch::DispatchAction::TailCall => continue 'tail_call,
+                match handler(&mut dctx, instr) {
+                    Ok(action) => match action {
+                        dispatch::DispatchAction::Continue => {}
+                        dispatch::DispatchAction::Return(v) => return Ok(v),
+                        dispatch::DispatchAction::TailCall => continue 'tail_call,
+                    },
+                    Err(e) => {
+                        // If this is a JS-catchable error and the current
+                        // instruction falls inside a try block, materialise a
+                        // JsValue::Error and jump to the catch handler.
+                        let instr_idx = (frame.pc - 1) as u32;
+                        if let Some(js_err) = stator_error_to_js_value(&e)
+                            && let Some(handler_pc) = find_handler(instr_idx, &handler_table)
+                        {
+                            frame.accumulator = js_err;
+                            frame.pc = handler_pc;
+                            continue;
+                        }
+                        return Err(e);
+                    }
                 }
             }
         } // 'tail_call
@@ -1683,6 +1699,28 @@ pub(super) fn error_message_from_value(value: &JsValue) -> String {
             .to_js_string()
             .unwrap_or_else(|_| format!("{other:?}")),
     }
+}
+
+/// Convert a [`StatorError`] into a [`JsValue::Error`] if it represents a
+/// catchable JavaScript error (TypeError, RangeError, ReferenceError,
+/// SyntaxError, URIError).
+///
+/// Returns `None` for internal engine errors and other non-JS error variants
+/// (e.g. `OutOfMemory`, `Internal`, `JsException`, `DebuggerPaused`), which
+/// should propagate to the caller rather than being caught by a JS `catch`
+/// block.
+pub(super) fn stator_error_to_js_value(err: &StatorError) -> Option<JsValue> {
+    use crate::builtins::error::{ErrorKind, JsError};
+
+    let (kind, msg) = match err {
+        StatorError::TypeError(msg) => (ErrorKind::TypeError, msg.clone()),
+        StatorError::RangeError(msg) => (ErrorKind::RangeError, msg.clone()),
+        StatorError::ReferenceError(msg) => (ErrorKind::ReferenceError, msg.clone()),
+        StatorError::SyntaxError(msg) => (ErrorKind::SyntaxError, msg.clone()),
+        StatorError::URIError(msg) => (ErrorKind::URIError, msg.clone()),
+        _ => return None,
+    };
+    Some(JsValue::Error(Rc::new(JsError::new(kind, msg))))
 }
 
 /// Try to interpret a [`JsValue`] as an array index (non-negative integer).
@@ -3488,6 +3526,74 @@ mod tests {
             matches!(err, StatorError::JsException(_)),
             "expected JsException, got {err:?}"
         );
+    }
+
+    /// A `TypeError` thrown by the engine (e.g. calling a non-function) inside
+    /// a try block should be caught, materialised as a `JsValue::Error`, and
+    /// delivered to the catch handler.
+    ///
+    /// ```js
+    /// try { (42)(); } catch(e) { return e; }
+    /// ```
+    #[test]
+    fn test_try_catch_catches_type_error() {
+        use crate::bytecode::bytecode_array::HandlerTableEntry;
+
+        // r0 = 42 (not callable), call r0(), expect TypeError in catch.
+        // Layout:
+        //   0: LdaSmi(42)          — 2 bytes (offset 0)
+        //   1: Star(r1)            — 2 bytes (offset 2)
+        //   2: CallUndefinedReceiver0(r1, slot0) — 3 bytes (offset 4)
+        //   3: Jump(+0)            — 2 bytes (offset 7) — never reached
+        //   4: Star(r0)            — 2 bytes (offset 9) — catch handler
+        //   5: Ldar(r0)            — 2 bytes (offset 11)
+        //   6: Return              — 1 byte  (offset 13)
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(
+                Opcode::CallUndefinedReceiver0,
+                vec![Operand::Register(1), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Jump, vec![Operand::JumpOffset(0)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let handler_table = vec![HandlerTableEntry {
+            try_start: 0,
+            try_end: 3,
+            handler: 4,
+            is_finally: false,
+        }];
+        let ba = make_bytecode_with_handlers(instrs, 2, 0, handler_table);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        // The caught value should be a JsValue::Error with kind TypeError.
+        assert!(
+            matches!(&result, JsValue::Error(e) if e.kind == crate::builtins::error::ErrorKind::TypeError),
+            "expected JsValue::Error(TypeError), got {result:?}"
+        );
+    }
+
+    /// `try { (42)(); } catch(e) { return e.name; }` — catches a TypeError
+    /// thrown by the engine as a proper `JsValue::Error` with `.name` property.
+    #[test]
+    fn test_try_catch_catches_type_error_via_generator() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::parse;
+
+        let src = r#"
+            var name;
+            try { (42)(); } catch(e) { name = e.name; }
+            return name;
+        "#;
+        let program = parse(src).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        crate::builtins::install_globals::install_globals(&mut frame.global_env.borrow_mut());
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::String("TypeError".to_string()));
     }
 
     // ── Generators (SuspendGenerator / ResumeGenerator) ─────────────────────
