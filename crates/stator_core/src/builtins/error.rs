@@ -79,7 +79,14 @@ thread_local! {
 /// matching the behaviour of V8 and SpiderMonkey for infinite-recursion
 /// programs.  Keeping this below the OS thread-stack size prevents a fatal
 /// `stack overflow, aborting` abort that cannot be caught.
-pub const MAX_CALL_STACK_DEPTH: usize = 10_000;
+///
+/// This value is intentionally conservative.  Each recursive call to the
+/// interpreter's `run` function consumes a significant amount of native stack
+/// space (several kilobytes) due to the large opcode-dispatch match statement.
+/// With a 64 MiB thread stack (as used by the Test262 runner) a limit of 500
+/// guarantees less than 4 MiB of native stack is consumed before the guard
+/// fires, leaving ample headroom for unwinding.
+pub const MAX_CALL_STACK_DEPTH: usize = 500;
 
 /// Push a frame name onto the thread-local call stack.
 ///
@@ -129,6 +136,18 @@ pub fn pop_call_frame() {
 /// Used by the CPU profiler to record samples at safe points.
 pub fn capture_call_stack() -> Vec<String> {
     CALL_STACK.with(|cs| cs.borrow().clone())
+}
+
+/// Clear the thread-local call stack entirely.
+///
+/// This is used by the Test262 runner (and similar harnesses) to reset the
+/// call-stack state between test cases.  A `catch_unwind`-caught panic inside
+/// the interpreter may leave frames on the stack (because the panic bypasses
+/// the normal `pop_call_frame` calls), which would cause every subsequent test
+/// to fail immediately with "Maximum call stack size exceeded".  Calling this
+/// function after each test guarantees a clean starting state.
+pub fn clear_call_stack() {
+    CALL_STACK.with(|cs| cs.borrow_mut().clear());
 }
 
 /// Capture the current call stack as a formatted `stack` property string.
