@@ -48,6 +48,23 @@ typedef struct StatorContext StatorContext;
 typedef struct StatorDebugSession StatorDebugSession;
 
 /**
+ * An opaque handle to a DOM object wrapper.
+ *
+ * Created by [`stator_dom_object_wrap_new`] and freed by
+ * [`stator_dom_object_wrap_destroy`].  Stores opaque embedder pointers in
+ * *internal fields* and routes property access through optional interceptors.
+ */
+typedef struct StatorDomObjectWrap StatorDomObjectWrap;
+
+/**
+ * An opaque handle to a DOM weak reference.
+ *
+ * Created by [`stator_dom_weak_ref_new`] and freed by
+ * [`stator_dom_weak_ref_destroy`].
+ */
+typedef struct StatorDomWeakRef StatorDomWeakRef;
+
+/**
  * An opaque escapable handle scope.
  *
  * Works like [`StatorHandleScope`] but allows a single value to be
@@ -273,6 +290,46 @@ typedef struct StatorPlatformVTable {
    */
   double (*current_clock_time_millis)(void);
 } StatorPlatformVTable;
+
+/**
+ * C-callable named-property getter callback.
+ *
+ * Receives the property name, an embedder-data pointer, and an out-pointer
+ * for the result.  Returns `true` if the interceptor handled the access
+ * (and wrote a value into `*out`), `false` to fall through.
+ *
+ * # Safety
+ * - `name` must be a valid, null-terminated C string.
+ * - `out` must be a valid, writable pointer if the callback returns `true`.
+ */
+typedef bool (*StatorDomNamedGetterCb)(const char *name, void *data, struct StatorValue **out);
+
+/**
+ * C-callable named-property setter callback.
+ *
+ * Returns `true` if the interceptor handled the write.
+ */
+typedef bool (*StatorDomNamedSetterCb)(const char *name, const struct StatorValue *value, void *data);
+
+/**
+ * C-callable indexed-property getter callback.
+ *
+ * Returns `true` if the interceptor handled the access.
+ */
+typedef bool (*StatorDomIndexedGetterCb)(uint32_t index, void *data, struct StatorValue **out);
+
+/**
+ * C-callable indexed-property setter callback.
+ *
+ * Returns `true` if the interceptor handled the write.
+ */
+typedef bool (*StatorDomIndexedSetterCb)(uint32_t index, const struct StatorValue *value, void *data);
+
+/**
+ * C-callable weak-reference callback, invoked when the wrapped DOM object is
+ * garbage-collected.
+ */
+typedef void (*StatorDomWeakCb)(void *data);
 
 #ifdef __cplusplus
 extern "C" {
@@ -1970,6 +2027,175 @@ struct StatorValue *stator_debug_session_result(const struct StatorDebugSession 
  * the same pointer.
  */
 void stator_debug_session_destroy(struct StatorDebugSession *session);
+
+/**
+ * Create a new DOM object wrapper with `field_count` internal-field slots.
+ *
+ * Returns a null pointer if `isolate` is null or `field_count` exceeds the
+ * engine's per-object limit (currently 16).  The caller must eventually pass
+ * the returned pointer to [`stator_dom_object_wrap_destroy`].
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorDomObjectWrap *stator_dom_object_wrap_new(struct StatorIsolate *isolate,
+                                                       uint32_t field_count);
+
+/**
+ * Destroy a DOM object wrapper previously created with
+ * [`stator_dom_object_wrap_new`].
+ *
+ * # Safety
+ * `wrap` must be a non-null pointer returned by [`stator_dom_object_wrap_new`]
+ * and must not be used again after this call.
+ */
+void stator_dom_object_wrap_destroy(struct StatorDomObjectWrap *wrap);
+
+/**
+ * Return the number of internal-field slots on `wrap`.
+ *
+ * Returns `0` when `wrap` is null.
+ *
+ * # Safety
+ * `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+ */
+uint32_t stator_dom_object_wrap_internal_field_count(const struct StatorDomObjectWrap *wrap);
+
+/**
+ * Store an opaque embedder pointer in internal field `index`.
+ *
+ * Does nothing when `wrap` is null or `index` is out of range.
+ *
+ * # Safety
+ * - `wrap` must be a non-null, valid pointer to a live [`StatorDomObjectWrap`].
+ * - `ptr` is an opaque value; the engine never dereferences it.
+ */
+void stator_dom_object_wrap_set_internal_field(struct StatorDomObjectWrap *wrap,
+                                               uint32_t index,
+                                               void *ptr);
+
+/**
+ * Retrieve the opaque embedder pointer from internal field `index`.
+ *
+ * Returns a null pointer when `wrap` is null or `index` is out of range.
+ *
+ * # Safety
+ * `wrap` must be either null or a valid, live [`StatorDomObjectWrap`] pointer.
+ */
+void *stator_dom_object_wrap_get_internal_field(const struct StatorDomObjectWrap *wrap,
+                                                uint32_t index);
+
+/**
+ * Install a named-property getter interceptor on `wrap`.
+ *
+ * The callback is invoked for every named-property read (e.g. `element.id`).
+ * Does nothing when `wrap` is null.
+ *
+ * # Safety
+ * - `wrap` must be a non-null, valid pointer to a live [`StatorDomObjectWrap`].
+ * - `cb` must remain valid for the lifetime of the wrapper.
+ */
+void stator_dom_object_wrap_set_named_getter(struct StatorDomObjectWrap *wrap,
+                                             StatorDomNamedGetterCb cb);
+
+/**
+ * Install a named-property setter interceptor on `wrap`.
+ *
+ * The callback is invoked for every named-property write.
+ * Does nothing when `wrap` is null.
+ *
+ * # Safety
+ * - `wrap` must be a non-null, valid pointer to a live [`StatorDomObjectWrap`].
+ * - `cb` must remain valid for the lifetime of the wrapper.
+ */
+void stator_dom_object_wrap_set_named_setter(struct StatorDomObjectWrap *wrap,
+                                             StatorDomNamedSetterCb cb);
+
+/**
+ * Install an indexed-property getter interceptor on `wrap`.
+ *
+ * The callback is invoked for every indexed-property read (e.g.
+ * `nodeList[0]`).  Does nothing when `wrap` is null.
+ *
+ * # Safety
+ * - `wrap` must be a non-null, valid pointer to a live [`StatorDomObjectWrap`].
+ * - `cb` must remain valid for the lifetime of the wrapper.
+ */
+void stator_dom_object_wrap_set_indexed_getter(struct StatorDomObjectWrap *wrap,
+                                               StatorDomIndexedGetterCb cb);
+
+/**
+ * Install an indexed-property setter interceptor on `wrap`.
+ *
+ * The callback is invoked for every indexed-property write.
+ * Does nothing when `wrap` is null.
+ *
+ * # Safety
+ * - `wrap` must be a non-null, valid pointer to a live [`StatorDomObjectWrap`].
+ * - `cb` must remain valid for the lifetime of the wrapper.
+ */
+void stator_dom_object_wrap_set_indexed_setter(struct StatorDomObjectWrap *wrap,
+                                               StatorDomIndexedSetterCb cb);
+
+/**
+ * Create a new weak reference for the given DOM object wrapper.
+ *
+ * When the weak reference is later invoked (by the GC or explicitly), `cb`
+ * will be called with the embedder data pointer from internal field 0.
+ *
+ * Returns a null pointer if `wrap` is null.  The caller must eventually pass
+ * the returned pointer to [`stator_dom_weak_ref_destroy`].
+ *
+ * # Safety
+ * - `wrap` must be a non-null, valid pointer to a live [`StatorDomObjectWrap`].
+ * - `cb` must remain valid until the weak callback fires or the weak ref is
+ *   destroyed.
+ */
+struct StatorDomWeakRef *stator_dom_weak_ref_new(const struct StatorDomObjectWrap *wrap,
+                                                 StatorDomWeakCb cb);
+
+/**
+ * Return `true` if the weak reference has not yet been invalidated.
+ *
+ * Returns `false` when `weak` is null.
+ *
+ * # Safety
+ * `weak` must be either null or a valid, live [`StatorDomWeakRef`] pointer.
+ */
+bool stator_dom_weak_ref_is_alive(const struct StatorDomWeakRef *weak);
+
+/**
+ * Fire the weak callback and mark the reference as dead.
+ *
+ * This is idempotent: calling it after the callback has already fired is a
+ * no-op.  Does nothing when `weak` is null.
+ *
+ * # Safety
+ * `weak` must be either null or a valid, live [`StatorDomWeakRef`] pointer.
+ */
+void stator_dom_weak_ref_invoke(const struct StatorDomWeakRef *weak);
+
+/**
+ * Reset the weak reference without invoking the callback.
+ *
+ * Does nothing when `weak` is null.
+ *
+ * # Safety
+ * `weak` must be either null or a valid, live [`StatorDomWeakRef`] pointer.
+ */
+void stator_dom_weak_ref_clear(const struct StatorDomWeakRef *weak);
+
+/**
+ * Destroy a weak reference previously created with [`stator_dom_weak_ref_new`].
+ *
+ * If the callback has not yet been invoked it will **not** be called; use
+ * [`stator_dom_weak_ref_invoke`] first if you need the callback to fire.
+ *
+ * # Safety
+ * `weak` must be a non-null pointer returned by [`stator_dom_weak_ref_new`]
+ * and must not be used again after this call.
+ */
+void stator_dom_weak_ref_destroy(struct StatorDomWeakRef *weak);
 
 #ifdef __cplusplus
 }  // extern "C"
