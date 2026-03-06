@@ -14,9 +14,30 @@
 //!
 //! * ECMAScript 2025 Language Specification §24.2 — *The Set Objects*
 
-use crate::objects::value::JsValue;
+use std::rc::Rc;
+
+use crate::objects::value::{JsValue, NativeIterator};
 
 use super::util::same_value_zero;
+
+// ── SetIteratorKind ───────────────────────────────────────────────────────────
+
+/// The iteration kind for a `Set` iterator (ECMAScript §24.2.5.1).
+///
+/// Determines what the iterator yields:
+/// - `Values` → individual values
+/// - `Entries` → `[value, value]` pairs (matching `Map` entry format)
+/// - `Keys` → alias for `Values` (per spec, `Set.prototype.keys === Set.prototype.values`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetIteratorKind {
+    /// Yield individual values.
+    Values,
+    /// Yield `[value, value]` pairs (matching the Map entry format).
+    Entries,
+    /// Alias for `Values` — `Set.prototype.keys` is the same function as
+    /// `Set.prototype.values` per the ECMAScript specification.
+    Keys,
+}
 
 // ── JsSet ─────────────────────────────────────────────────────────────────────
 
@@ -309,6 +330,51 @@ pub fn set_iter(set: &JsSet) -> Vec<JsValue> {
     set_values(set)
 }
 
+// ── set_create_iterator ──────────────────────────────────────────────────────
+
+/// Create a [`JsValue::Iterator`] from a `Set` with the given iteration kind
+/// (ECMAScript §24.2.5 `CreateSetIterator`).
+///
+/// - [`SetIteratorKind::Values`] / [`SetIteratorKind::Keys`] yields values.
+/// - [`SetIteratorKind::Entries`] yields `[value, value]` arrays.
+///
+/// The iterator snapshots the current values and yields them in insertion
+/// order.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_create_iterator, SetIteratorKind};
+/// use stator_core::builtins::iterator::iterator_next;
+/// use stator_core::objects::value::JsValue;
+/// use std::rc::Rc;
+///
+/// let mut s = set_new();
+/// set_add(&mut s, JsValue::Smi(1));
+///
+/// let iter = set_create_iterator(&s, SetIteratorKind::Values);
+/// let r = iterator_next(&iter).unwrap();
+/// assert_eq!(r.value, JsValue::Smi(1));
+///
+/// let iter = set_create_iterator(&s, SetIteratorKind::Entries);
+/// let r = iterator_next(&iter).unwrap();
+/// assert_eq!(
+///     r.value,
+///     JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::Smi(1)]))
+/// );
+/// ```
+pub fn set_create_iterator(set: &JsSet, kind: SetIteratorKind) -> JsValue {
+    let items: Vec<JsValue> = match kind {
+        SetIteratorKind::Values | SetIteratorKind::Keys => set.values.clone(),
+        SetIteratorKind::Entries => set
+            .values
+            .iter()
+            .map(|v| JsValue::Array(Rc::new(vec![v.clone(), v.clone()])))
+            .collect(),
+    };
+    JsValue::Iterator(NativeIterator::from_items(items))
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -470,5 +536,74 @@ mod tests {
         set_add(&mut s, JsValue::HeapNumber(0.0_f64));
         set_add(&mut s, JsValue::HeapNumber(-0.0_f64));
         assert_eq!(set_size(&s), 1);
+    }
+
+    // ── set_create_iterator ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_create_iterator_values() {
+        use crate::builtins::iterator::iterator_next;
+        let mut s = set_new();
+        set_add(&mut s, JsValue::Smi(10));
+        set_add(&mut s, JsValue::Smi(20));
+        let iter = set_create_iterator(&s, SetIteratorKind::Values);
+        assert_eq!(iterator_next(&iter).unwrap().value, JsValue::Smi(10));
+        assert_eq!(iterator_next(&iter).unwrap().value, JsValue::Smi(20));
+        assert!(iterator_next(&iter).unwrap().done);
+    }
+
+    #[test]
+    fn test_set_create_iterator_keys_same_as_values() {
+        use crate::builtins::iterator::iterator_next;
+        let mut s = set_new();
+        set_add(&mut s, JsValue::Smi(5));
+        let keys_iter = set_create_iterator(&s, SetIteratorKind::Keys);
+        let vals_iter = set_create_iterator(&s, SetIteratorKind::Values);
+        assert_eq!(
+            iterator_next(&keys_iter).unwrap().value,
+            iterator_next(&vals_iter).unwrap().value
+        );
+    }
+
+    #[test]
+    fn test_set_create_iterator_entries() {
+        use crate::builtins::iterator::iterator_next;
+        let mut s = set_new();
+        set_add(&mut s, JsValue::Smi(1));
+        set_add(&mut s, JsValue::Smi(2));
+        let iter = set_create_iterator(&s, SetIteratorKind::Entries);
+        let r1 = iterator_next(&iter).unwrap();
+        assert_eq!(
+            r1.value,
+            JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::Smi(1)]))
+        );
+        let r2 = iterator_next(&iter).unwrap();
+        assert_eq!(
+            r2.value,
+            JsValue::Array(Rc::new(vec![JsValue::Smi(2), JsValue::Smi(2)]))
+        );
+        assert!(iterator_next(&iter).unwrap().done);
+    }
+
+    #[test]
+    fn test_set_create_iterator_empty() {
+        use crate::builtins::iterator::iterator_next;
+        let s = set_new();
+        let iter = set_create_iterator(&s, SetIteratorKind::Values);
+        assert!(iterator_next(&iter).unwrap().done);
+    }
+
+    #[test]
+    fn test_set_create_iterator_insertion_order() {
+        use crate::builtins::iterator::iterator_next;
+        let mut s = set_new();
+        set_add(&mut s, JsValue::Smi(3));
+        set_add(&mut s, JsValue::Smi(1));
+        set_add(&mut s, JsValue::Smi(2));
+        let iter = set_create_iterator(&s, SetIteratorKind::Values);
+        assert_eq!(iterator_next(&iter).unwrap().value, JsValue::Smi(3));
+        assert_eq!(iterator_next(&iter).unwrap().value, JsValue::Smi(1));
+        assert_eq!(iterator_next(&iter).unwrap().value, JsValue::Smi(2));
+        assert!(iterator_next(&iter).unwrap().done);
     }
 }

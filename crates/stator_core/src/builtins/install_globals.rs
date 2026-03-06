@@ -41,8 +41,8 @@ use crate::builtins::iterator::{
     iterator_to_array,
 };
 use crate::builtins::map::{
-    map_clear, map_delete, map_entries, map_from_iterable, map_get, map_has, map_keys, map_new,
-    map_set, map_size, map_values,
+    MapIteratorKind, map_clear, map_create_iterator, map_delete, map_entries, map_from_iterable,
+    map_get, map_has, map_new, map_set, map_size,
 };
 use crate::builtins::math::{
     MATH_E, MATH_LN2, MATH_LN10, MATH_LOG2E, MATH_LOG10E, MATH_PI, MATH_SQRT1_2, MATH_SQRT2,
@@ -54,8 +54,8 @@ use crate::builtins::math::{
 };
 use crate::builtins::regexp::regexp_construct;
 use crate::builtins::set::{
-    set_add, set_clear, set_delete, set_entries, set_from_iterable, set_has, set_keys, set_new,
-    set_size, set_values,
+    SetIteratorKind, set_add, set_clear, set_create_iterator, set_delete, set_from_iterable,
+    set_has, set_new, set_size, set_values,
 };
 use crate::builtins::string::{
     string_anchor, string_at, string_big, string_blink, string_bold, string_char_at,
@@ -81,7 +81,7 @@ use crate::builtins::weak_map::{
 use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new};
 use crate::builtins::weak_set::{weak_set_add, weak_set_delete, weak_set_has, weak_set_new};
 use crate::error::{StatorError, StatorResult};
-use crate::objects::value::{JsValue, NativeIterator};
+use crate::objects::value::JsValue;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -2363,8 +2363,7 @@ fn make_map_builtin() -> JsValue {
                 obj.insert(
                     "keys".into(),
                     native(move |_| {
-                        let keys = map_keys(&inner.borrow());
-                        Ok(JsValue::Iterator(NativeIterator::from_items(keys)))
+                        Ok(map_create_iterator(&inner.borrow(), MapIteratorKind::Keys))
                     }),
                 );
             }
@@ -2374,8 +2373,10 @@ fn make_map_builtin() -> JsValue {
                 obj.insert(
                     "values".into(),
                     native(move |_| {
-                        let vals = map_values(&inner.borrow());
-                        Ok(JsValue::Iterator(NativeIterator::from_items(vals)))
+                        Ok(map_create_iterator(
+                            &inner.borrow(),
+                            MapIteratorKind::Values,
+                        ))
                     }),
                 );
             }
@@ -2385,12 +2386,23 @@ fn make_map_builtin() -> JsValue {
                 obj.insert(
                     "entries".into(),
                     native(move |_| {
-                        let entries = map_entries(&inner.borrow());
-                        let items: Vec<JsValue> = entries
-                            .into_iter()
-                            .map(|(k, v)| JsValue::Array(Rc::new(vec![k, v])))
-                            .collect();
-                        Ok(JsValue::Iterator(NativeIterator::from_items(items)))
+                        Ok(map_create_iterator(
+                            &inner.borrow(),
+                            MapIteratorKind::Entries,
+                        ))
+                    }),
+                );
+            }
+            // [Symbol.iterator]() — same as entries() per §24.1.3.13
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "@@iterator".into(),
+                    native(move |_| {
+                        Ok(map_create_iterator(
+                            &inner.borrow(),
+                            MapIteratorKind::Entries,
+                        ))
                     }),
                 );
             }
@@ -2499,8 +2511,7 @@ fn make_set_builtin() -> JsValue {
                 obj.insert(
                     "keys".into(),
                     native(move |_| {
-                        let vals = set_keys(&inner.borrow());
-                        Ok(JsValue::Iterator(NativeIterator::from_items(vals)))
+                        Ok(set_create_iterator(&inner.borrow(), SetIteratorKind::Keys))
                     }),
                 );
             }
@@ -2510,8 +2521,10 @@ fn make_set_builtin() -> JsValue {
                 obj.insert(
                     "values".into(),
                     native(move |_| {
-                        let vals = set_values(&inner.borrow());
-                        Ok(JsValue::Iterator(NativeIterator::from_items(vals)))
+                        Ok(set_create_iterator(
+                            &inner.borrow(),
+                            SetIteratorKind::Values,
+                        ))
                     }),
                 );
             }
@@ -2521,12 +2534,23 @@ fn make_set_builtin() -> JsValue {
                 obj.insert(
                     "entries".into(),
                     native(move |_| {
-                        let entries = set_entries(&inner.borrow());
-                        let items: Vec<JsValue> = entries
-                            .into_iter()
-                            .map(|(k, v)| JsValue::Array(Rc::new(vec![k, v])))
-                            .collect();
-                        Ok(JsValue::Iterator(NativeIterator::from_items(items)))
+                        Ok(set_create_iterator(
+                            &inner.borrow(),
+                            SetIteratorKind::Entries,
+                        ))
+                    }),
+                );
+            }
+            // [Symbol.iterator]() — same as values() per §24.2.3.11
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "@@iterator".into(),
+                    native(move |_| {
+                        Ok(set_create_iterator(
+                            &inner.borrow(),
+                            SetIteratorKind::Values,
+                        ))
                     }),
                 );
             }
