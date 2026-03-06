@@ -33,6 +33,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::error::{StatorError, StatorResult};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Stack-trace limit
 // ─────────────────────────────────────────────────────────────────────────────
@@ -68,11 +70,34 @@ thread_local! {
     static CALL_STACK: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Maximum JavaScript call-stack depth.
+///
+/// When the number of nested interpreter frames reaches this limit,
+/// [`push_call_frame`] returns
+/// `Err(StatorError::RangeError("Maximum call stack size exceeded"))`,
+/// matching the behaviour of V8 and SpiderMonkey for infinite-recursion
+/// programs.  Keeping this below the OS thread-stack size prevents a fatal
+/// `stack overflow, aborting` abort that cannot be caught.
+pub const MAX_CALL_STACK_DEPTH: usize = 10_000;
+
 /// Push a frame name onto the thread-local call stack.
 ///
+/// Returns `Err(StatorError::RangeError)` when the call stack would exceed
+/// [`MAX_CALL_STACK_DEPTH`], so that the interpreter can surface a proper
+/// JavaScript `RangeError` instead of aborting on a native stack overflow.
+///
 /// Call this immediately before entering a nested interpreter call.
-pub fn push_call_frame(name: impl Into<String>) {
-    CALL_STACK.with(|cs| cs.borrow_mut().push(name.into()));
+pub fn push_call_frame(name: impl Into<String>) -> StatorResult<()> {
+    CALL_STACK.with(|cs| {
+        let mut stack = cs.borrow_mut();
+        if stack.len() >= MAX_CALL_STACK_DEPTH {
+            return Err(StatorError::RangeError(
+                "Maximum call stack size exceeded".to_string(),
+            ));
+        }
+        stack.push(name.into());
+        Ok(())
+    })
 }
 
 /// Return the current depth of the thread-local call stack.
@@ -599,5 +624,24 @@ mod tests {
         set_stack_trace_limit(5);
         assert_eq!(get_stack_trace_limit(), 5);
         set_stack_trace_limit(original);
+    }
+
+    // ── call-depth guard ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_push_call_frame_exceeds_limit_returns_range_error() {
+        // Push MAX_CALL_STACK_DEPTH frames, then verify the next push fails.
+        for _ in 0..MAX_CALL_STACK_DEPTH {
+            push_call_frame("<test>").expect("should not fail below the limit");
+        }
+        let result = push_call_frame("<test>");
+        // Clean up: pop all the frames we pushed.
+        for _ in 0..MAX_CALL_STACK_DEPTH {
+            pop_call_frame();
+        }
+        assert!(
+            matches!(result, Err(crate::error::StatorError::RangeError(_))),
+            "expected RangeError when call stack is full, got {result:?}"
+        );
     }
 }

@@ -1482,7 +1482,7 @@ impl Interpreter {
                                         args,
                                         Rc::clone(&frame.global_env),
                                     );
-                                    push_call_frame("<anonymous>");
+                                    push_call_frame("<anonymous>")?;
                                     let result = Interpreter::run(&mut callee_frame);
                                     pop_call_frame();
                                     frame.accumulator = result?;
@@ -1552,7 +1552,7 @@ impl Interpreter {
                                         args,
                                         Rc::clone(&frame.global_env),
                                     );
-                                    push_call_frame("<anonymous>");
+                                    push_call_frame("<anonymous>")?;
                                     let result = Interpreter::run(&mut callee_frame);
                                     pop_call_frame();
                                     frame.accumulator = result?;
@@ -1624,7 +1624,7 @@ impl Interpreter {
                                         args,
                                         Rc::clone(&frame.global_env),
                                     );
-                                    push_call_frame("<anonymous>");
+                                    push_call_frame("<anonymous>")?;
                                     let result = Interpreter::run(&mut callee_frame);
                                     pop_call_frame();
                                     frame.accumulator = result?;
@@ -1706,7 +1706,7 @@ impl Interpreter {
                                         args,
                                         Rc::clone(&frame.global_env),
                                     );
-                                    push_call_frame("<anonymous>");
+                                    push_call_frame("<anonymous>")?;
                                     let result = Interpreter::run(&mut callee_frame);
                                     pop_call_frame();
                                     frame.accumulator = result?;
@@ -1789,7 +1789,7 @@ impl Interpreter {
                                     Rc::clone(&frame.global_env),
                                 );
                                 callee_frame.context = Some(this_val);
-                                push_call_frame("<anonymous>");
+                                push_call_frame("<anonymous>")?;
                                 let result = Interpreter::run(&mut callee_frame);
                                 pop_call_frame();
                                 frame.accumulator = result?;
@@ -1859,7 +1859,7 @@ impl Interpreter {
                                     args,
                                     Rc::clone(&frame.global_env),
                                 );
-                                push_call_frame("<anonymous>");
+                                push_call_frame("<anonymous>")?;
                                 let result = Interpreter::run(&mut callee_frame);
                                 pop_call_frame();
                                 frame.accumulator = result?;
@@ -1916,7 +1916,7 @@ impl Interpreter {
                                 args,
                                 Rc::clone(&frame.global_env),
                             );
-                            push_call_frame("<anonymous>");
+                            push_call_frame("<anonymous>")?;
                             let result = Interpreter::run(&mut callee_frame);
                             pop_call_frame();
                             frame.accumulator = result?;
@@ -3790,7 +3790,7 @@ impl Interpreter {
                                 args,
                                 Rc::clone(&frame.global_env),
                             );
-                            push_call_frame("<anonymous>");
+                            push_call_frame("<anonymous>")?;
                             let result = Interpreter::run(&mut callee_frame);
                             pop_call_frame();
                             frame.accumulator = result?;
@@ -4471,7 +4471,7 @@ fn dispatch_call(
                         args,
                         Rc::clone(&frame.global_env),
                     );
-                    push_call_frame("<anonymous>");
+                    push_call_frame("<anonymous>")?;
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
                     frame.accumulator = result?;
