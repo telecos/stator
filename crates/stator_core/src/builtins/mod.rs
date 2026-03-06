@@ -8,6 +8,8 @@
 
 /// ECMAScript §23.1 `Array` built-in static methods and prototype equivalents.
 pub mod array;
+/// ECMAScript §21.4 `Date` built-in constructor and prototype methods.
+pub mod date;
 /// ECMAScript §20.5 `Error` built-in and error hierarchy (`TypeError`, `RangeError`, etc.).
 pub mod error;
 /// ECMAScript §26.2 `FinalizationRegistry` built-in — cleanup callbacks after GC collection.
