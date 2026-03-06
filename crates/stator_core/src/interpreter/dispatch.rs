@@ -22,6 +22,7 @@ use super::{
     walk_context_chain, wire_construct_prototype,
 };
 use crate::builtins::error::{pop_call_frame, push_call_frame};
+use crate::builtins::proxy::{proxy_delete_property, proxy_has, proxy_set};
 use crate::bytecode::bytecode_array::{
     ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD, TIERING_THRESHOLD,
     TURBOFAN_TIERING_THRESHOLD,
@@ -1876,6 +1877,9 @@ fn handle_sta_named_property(
     let val = ctx.frame.accumulator.clone();
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     match obj {
+        JsValue::Proxy(ref p) => {
+            let _ = proxy_set(&mut p.borrow_mut(), &prop_name, val)?;
+        }
         JsValue::PlainObject(ref map) => {
             map.borrow_mut().insert(prop_name, val);
         }
@@ -2143,6 +2147,7 @@ fn handle_type_of(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResu
         JsValue::Iterator(_) => "object",
         JsValue::Promise(_) => "object",
         JsValue::Context(_) => "object",
+        JsValue::Proxy(_) => "object",
     };
     ctx.frame.accumulator = JsValue::String(type_str.to_owned());
     Ok(DispatchAction::Continue)
@@ -2179,6 +2184,7 @@ fn handle_test_type_of(
                 | JsValue::Generator(_)
                 | JsValue::Iterator(_)
                 | JsValue::Promise(_)
+                | JsValue::Proxy(_)
         ),
         _ => false,
     };
@@ -2556,6 +2562,10 @@ fn handle_test_in(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     let key = &ctx.frame.accumulator;
 
     let result = match &object {
+        JsValue::Proxy(p) => {
+            let prop = to_property_key(key)?;
+            proxy_has(&p.borrow(), &prop).unwrap_or(false)
+        }
         JsValue::PlainObject(_) => {
             let prop = to_property_key(key)?;
             // Walk the prototype chain for `in` operator.
@@ -2708,7 +2718,9 @@ fn handle_delete_property_sloppy(
     };
     let key = to_property_key(&ctx.frame.accumulator)?;
     let obj = ctx.frame.read_reg(obj_v)?.clone();
-    let removed = if let JsValue::PlainObject(ref map) = obj {
+    let removed = if let JsValue::Proxy(ref p) = obj {
+        proxy_delete_property(&mut p.borrow_mut(), &key).unwrap_or(false)
+    } else if let JsValue::PlainObject(ref map) = obj {
         map.borrow_mut().remove(&key).is_some()
     } else {
         false
@@ -2726,7 +2738,9 @@ fn handle_delete_property_strict(
     };
     let key = to_property_key(&ctx.frame.accumulator)?;
     let obj = ctx.frame.read_reg(obj_v)?.clone();
-    if let JsValue::PlainObject(ref map) = obj {
+    if let JsValue::Proxy(ref p) = obj {
+        proxy_delete_property(&mut p.borrow_mut(), &key)?;
+    } else if let JsValue::PlainObject(ref map) = obj {
         map.borrow_mut().remove(&key);
     }
     ctx.frame.accumulator = JsValue::Boolean(true);

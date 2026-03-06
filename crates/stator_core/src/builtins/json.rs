@@ -1002,7 +1002,8 @@ fn js_value_to_json_inner(
         | JsValue::Iterator(_)
         | JsValue::Error(_)
         | JsValue::Promise(_)
-        | JsValue::Context(_) => Ok(None),
+        | JsValue::Context(_)
+        | JsValue::Proxy(_) => Ok(None),
         JsValue::Null => Ok(Some(JsonValue::Null)),
         JsValue::Boolean(b) => Ok(Some(JsonValue::Bool(*b))),
         JsValue::Smi(n) => Ok(Some(JsonValue::Number(f64::from(*n)))),

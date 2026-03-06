@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::builtins::error::JsError;
+use crate::builtins::proxy::JsProxy;
 use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::error::{StatorError, StatorResult};
 use crate::gc::trace::{Trace, Tracer};
@@ -283,6 +284,13 @@ pub enum JsValue {
     /// parent pointer forming the scope chain.  Used by context-slot opcodes
     /// (`LdaContextSlot`, `StaContextSlot`, etc.) in the interpreter.
     Context(Rc<RefCell<JsContext>>),
+    /// A JavaScript `Proxy` object wrapping a target with handler traps.
+    ///
+    /// Created by `new Proxy(target, handler)` or `Proxy.revocable(target,
+    /// handler)`.  Operations performed on the proxy are intercepted by the
+    /// handler traps; if no trap is installed the operation falls through to
+    /// the target.
+    Proxy(Rc<RefCell<JsProxy>>),
 }
 
 /// A scope context representing the environment for captured variables.
@@ -330,6 +338,7 @@ impl std::fmt::Debug for JsValue {
             Self::PlainObject(map) => write!(f, "PlainObject({map:?})"),
             Self::Promise(p) => write!(f, "Promise({:?})", p.state()),
             Self::Context(ctx) => write!(f, "Context({ctx:?})"),
+            Self::Proxy(p) => write!(f, "Proxy(revoked={})", p.borrow().is_revoked()),
         }
     }
 }
@@ -360,6 +369,7 @@ impl PartialEq for JsValue {
             (Self::PlainObject(a), Self::PlainObject(b)) => Rc::ptr_eq(a, b),
             (Self::Promise(a), Self::Promise(b)) => a == b,
             (Self::Context(a), Self::Context(b)) => Rc::ptr_eq(a, b),
+            (Self::Proxy(a), Self::Proxy(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -531,7 +541,8 @@ impl JsValue {
             | Self::NativeFunction(_)
             | Self::PlainObject(_)
             | Self::Promise(_)
-            | Self::Context(_) => true,
+            | Self::Context(_)
+            | Self::Proxy(_) => true,
             Self::BigInt(n) => *n != 0,
         }
     }
@@ -721,6 +732,7 @@ impl JsValue {
             Self::PlainObject(_) => "[object Object]".to_string(),
             Self::Promise(_) => "[object Promise]".to_string(),
             Self::Context(_) => "[object Context]".to_string(),
+            Self::Proxy(_) => "[object Object]".to_string(),
             Self::Object(_) => "[object Object]".to_string(),
             // Primitives should not reach here.
             _ => "undefined".to_string(),
@@ -821,6 +833,7 @@ impl JsValue {
             (Self::PlainObject(a), Self::PlainObject(b)) => Rc::ptr_eq(a, b),
             (Self::Promise(a), Self::Promise(b)) => a == b,
             (Self::Context(a), Self::Context(b)) => Rc::ptr_eq(a, b),
+            (Self::Proxy(a), Self::Proxy(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -877,6 +890,8 @@ impl Trace for JsValue {
             Self::Error(_) => {}
             // JsPromise uses Rc<RefCell<_>> internally with no raw GC pointers.
             Self::Promise(_) => {}
+            // JsProxy uses Rc<RefCell<_>> internally with no raw GC pointers.
+            Self::Proxy(_) => {}
             _ => {}
         }
     }
