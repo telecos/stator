@@ -33,11 +33,11 @@ use crate::parser::ast::{
     ForStmt, Ident, IfStmt, ImportDecl, ImportDefaultSpecifier, ImportNamedSpecifier,
     ImportNamespaceSpecifier, ImportSpecifier, KeyValuePatProp, LogicalExpr, LogicalOp, MethodDef,
     MethodKind, ModuleDecl, ModuleExportName, NewExpr, NullLit, NumLit, ObjectExpr, ObjectPat,
-    ObjectPatProp, ObjectProp, Param, Pat, Program, ProgramItem, Prop, PropKey, PropValue,
-    RegExpLit, RestElement, ReturnStmt, SequenceExpr, SourceLocation, SourceType, SpreadElement,
-    Stmt, StringLit, SwitchCase, SwitchStmt, TemplateElement, TemplateLit, ThrowStmt, TryStmt,
-    UnaryExpr, UnaryOp, UpdateExpr, UpdateOp, VarDecl, VarDeclarator, VarKind, WhileStmt, WithStmt,
-    YieldExpr,
+    ObjectPatProp, ObjectProp, Param, Pat, PrivateIdent, Program, ProgramItem, Prop, PropKey,
+    PropValue, PropertyDef, RegExpLit, RestElement, ReturnStmt, SequenceExpr, SourceLocation,
+    SourceType, SpreadElement, StaticBlock, Stmt, StringLit, SwitchCase, SwitchStmt,
+    TemplateElement, TemplateLit, ThrowStmt, TryStmt, UnaryExpr, UnaryOp, UpdateExpr, UpdateOp,
+    VarDecl, VarDeclarator, VarKind, WhileStmt, WithStmt, YieldExpr,
 };
 use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue};
 
@@ -70,6 +70,10 @@ pub struct Parser<'src> {
     /// Current recursion depth – incremented on entry to key recursive
     /// functions and decremented on exit.
     depth: usize,
+    /// Nesting depth of class bodies.  Incremented when entering a class body
+    /// and decremented when leaving.  Used to validate that `#private`
+    /// identifiers only appear inside a class.
+    class_depth: usize,
 }
 
 impl<'src> Parser<'src> {
@@ -84,6 +88,7 @@ impl<'src> Parser<'src> {
             current,
             no_in: false,
             depth: 0,
+            class_depth: 0,
         })
     }
 
@@ -872,6 +877,7 @@ impl<'src> Parser<'src> {
     fn parse_class_body(&mut self) -> StatorResult<ClassBody> {
         let start = self.current_span();
         self.expect(TokenKind::LeftBrace)?;
+        self.class_depth += 1;
         let mut members = Vec::new();
 
         while self.peek_kind() != TokenKind::RightBrace {
@@ -887,20 +893,29 @@ impl<'src> Parser<'src> {
             let member_start = self.current_span();
             let is_static = self.eat(TokenKind::Static)?;
 
+            // `static { … }` — static initialization block.
+            if is_static && self.peek_kind() == TokenKind::LeftBrace {
+                let block = self.parse_block()?;
+                let end = block.loc;
+                members.push(ClassMember::StaticBlock(StaticBlock {
+                    loc: Self::merge_spans(member_start, end),
+                    body: block.body,
+                }));
+                continue;
+            }
+
             // Check for `async` modifier on the method.
             let is_async = if self.peek_kind() == TokenKind::Async {
-                // `async` is only a modifier when the next token after it is
-                // NOT `(` (which would mean a method named "async") and there
-                // is no line terminator between `async` and the method name.
                 let saved_scanner = self.scanner.clone();
                 let saved_current = self.current.clone();
                 self.bump()?; // tentatively consume `async`
-                if self.peek_kind() == TokenKind::LeftParen {
-                    // Method literally named "async".
-                    self.scanner = saved_scanner;
-                    self.current = saved_current;
-                    false
-                } else if self.current.had_line_terminator_before {
+                if self.peek_kind() == TokenKind::LeftParen
+                    || self.peek_kind() == TokenKind::Semicolon
+                    || self.peek_kind() == TokenKind::Equal
+                    || self.peek_kind() == TokenKind::RightBrace
+                    || self.current.had_line_terminator_before
+                {
+                    // Not a modifier — `async` is the element name itself.
                     self.scanner = saved_scanner;
                     self.current = saved_current;
                     false
@@ -911,76 +926,111 @@ impl<'src> Parser<'src> {
                 false
             };
 
-            // Determine method kind: get, set, or regular method.
-            let (kind, key, is_computed) =
-                if self.peek_kind() == TokenKind::Get || self.peek_kind() == TokenKind::Set {
-                    let accessor_kind = if self.peek_kind() == TokenKind::Get {
-                        MethodKind::Get
-                    } else {
-                        MethodKind::Set
-                    };
-                    let accessor_tok = self.bump()?;
-                    // If the next token is `(`, then `get`/`set` is the
-                    // method *name* (a regular method called "get"/"set").
-                    if self.peek_kind() == TokenKind::LeftParen {
-                        let name = format!("{:?}", accessor_tok.kind).to_lowercase();
-                        (
-                            MethodKind::Method,
-                            PropKey::Ident(Ident {
-                                loc: accessor_tok.span,
-                                name,
-                            }),
-                            false,
-                        )
-                    } else {
-                        let (key, is_computed) = self.parse_class_element_name()?;
-                        (accessor_kind, key, is_computed)
-                    }
+            // Check for generator `*` modifier.
+            let is_generator = self.eat(TokenKind::Star)?;
+
+            // Determine method kind: get, set, or regular method / field.
+            let (kind, key, is_computed) = if !is_generator
+                && (self.peek_kind() == TokenKind::Get || self.peek_kind() == TokenKind::Set)
+            {
+                let accessor_kind = if self.peek_kind() == TokenKind::Get {
+                    MethodKind::Get
+                } else {
+                    MethodKind::Set
+                };
+                let accessor_tok = self.bump()?;
+                // If the next token is `(`, `=`, `;`, or `}`, then `get`/`set` is
+                // the element *name* (e.g. a field named "get" or a method "get()").
+                if self.peek_kind() == TokenKind::LeftParen
+                    || self.peek_kind() == TokenKind::Equal
+                    || self.peek_kind() == TokenKind::Semicolon
+                    || self.peek_kind() == TokenKind::RightBrace
+                {
+                    let name = format!("{:?}", accessor_tok.kind).to_lowercase();
+                    (
+                        MethodKind::Method,
+                        PropKey::Ident(Ident {
+                            loc: accessor_tok.span,
+                            name,
+                        }),
+                        false,
+                    )
                 } else {
                     let (key, is_computed) = self.parse_class_element_name()?;
-                    // Check for constructor.
-                    let kind = if !is_static && !is_computed {
-                        if let PropKey::Ident(ref id) = key {
-                            if id.name == "constructor" {
-                                MethodKind::Constructor
-                            } else {
-                                MethodKind::Method
-                            }
+                    (accessor_kind, key, is_computed)
+                }
+            } else {
+                let (key, is_computed) = self.parse_class_element_name()?;
+                // Check for constructor.
+                let kind = if !is_static && !is_computed && !is_generator {
+                    if let PropKey::Ident(ref id) = key {
+                        if id.name == "constructor" {
+                            MethodKind::Constructor
                         } else {
                             MethodKind::Method
                         }
                     } else {
                         MethodKind::Method
-                    };
-                    (kind, key, is_computed)
+                    }
+                } else {
+                    MethodKind::Method
                 };
-
-            // Parse (params) { body } — the method value.
-            let fn_start = self.current_span();
-            self.expect(TokenKind::LeftParen)?;
-            let params = self.parse_formal_params()?;
-            let body = self.parse_block()?;
-            let fn_end = body.loc;
-
-            let value = FnExpr {
-                loc: Self::merge_spans(fn_start, fn_end),
-                id: None,
-                is_async,
-                is_generator: false,
-                params,
-                body,
+                (kind, key, is_computed)
             };
 
-            members.push(ClassMember::Method(MethodDef {
-                loc: Self::merge_spans(member_start, fn_end),
-                is_static,
-                kind,
-                key,
-                is_computed,
-                value,
-            }));
+            // Distinguish method (`(`) from field (everything else).
+            if self.peek_kind() == TokenKind::LeftParen {
+                // Parse (params) { body } — the method value.
+                let fn_start = self.current_span();
+                self.expect(TokenKind::LeftParen)?;
+                let params = self.parse_formal_params()?;
+                let body = self.parse_block()?;
+                let fn_end = body.loc;
+
+                let value = FnExpr {
+                    loc: Self::merge_spans(fn_start, fn_end),
+                    id: None,
+                    is_async,
+                    is_generator,
+                    params,
+                    body,
+                };
+
+                members.push(ClassMember::Method(MethodDef {
+                    loc: Self::merge_spans(member_start, fn_end),
+                    is_static,
+                    kind,
+                    key,
+                    is_computed,
+                    value,
+                }));
+            } else {
+                // Field definition: `key [= value] [;]`
+                let value = if self.eat(TokenKind::Equal)? {
+                    Some(Box::new(self.parse_assignment_expr()?))
+                } else {
+                    None
+                };
+                let end = value.as_ref().map(|v| v.loc()).unwrap_or(match &key {
+                    PropKey::Ident(id) => id.loc,
+                    PropKey::Private(id) => id.loc,
+                    PropKey::Str(s) => s.loc,
+                    PropKey::Num(n) => n.loc,
+                    PropKey::Computed(e) => e.loc(),
+                });
+                members.push(ClassMember::Property(PropertyDef {
+                    loc: Self::merge_spans(member_start, end),
+                    is_static,
+                    key,
+                    is_computed,
+                    value,
+                }));
+                // Consume optional `;` after field.
+                self.eat(TokenKind::Semicolon)?;
+            }
         }
 
+        self.class_depth -= 1;
         let end = self.current_span();
         self.bump()?; // consume '}'
         Ok(ClassBody {
@@ -992,6 +1042,20 @@ impl<'src> Parser<'src> {
     /// Parse a class element name (property key).
     fn parse_class_element_name(&mut self) -> StatorResult<(PropKey, bool)> {
         match self.peek_kind() {
+            TokenKind::PrivateIdentifier => {
+                let tok = self.bump()?;
+                let name = match tok.value {
+                    TokenValue::Str(s) => s,
+                    _ => return Err(Self::error_at(tok.span, "invalid private name token")),
+                };
+                Ok((
+                    PropKey::Private(PrivateIdent {
+                        loc: tok.span,
+                        name,
+                    }),
+                    false,
+                ))
+            }
             TokenKind::LeftBracket => {
                 self.bump()?; // consume '['
                 let key_expr = self.parse_assignment_expr()?;
@@ -2051,6 +2115,32 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_relational(&mut self) -> StatorResult<Expr> {
+        // `#x in obj` — private brand check.
+        if self.peek_kind() == TokenKind::PrivateIdentifier && !self.no_in {
+            let tok = self.bump()?;
+            let name = match tok.value {
+                TokenValue::Str(s) => s,
+                _ => return Err(Self::error_at(tok.span, "invalid private name token")),
+            };
+            if self.peek_kind() != TokenKind::In {
+                return Err(
+                    self.error("private name #... can only appear on the left-hand side of 'in'")
+                );
+            }
+            self.bump()?; // consume `in`
+            let right = self.parse_shift()?;
+            let end = right.loc();
+            return Ok(Expr::Binary(Box::new(BinaryExpr {
+                loc: Self::merge_spans(tok.span, end),
+                left: Box::new(Expr::PrivateName(PrivateIdent {
+                    loc: tok.span,
+                    name,
+                })),
+                op: BinaryOp::In,
+                right: Box::new(right),
+            })));
+        }
+
         if self.no_in {
             self.parse_binary_left_assoc(
                 Self::parse_shift,
@@ -2213,20 +2303,44 @@ impl<'src> Parser<'src> {
             match self.peek_kind() {
                 TokenKind::Dot => {
                     self.bump()?;
-                    // Allow keywords as property names.
-                    let prop_tok = self.bump()?;
-                    let name = self.name_from_token(&prop_tok)?;
-                    let prop_ident = Ident {
-                        loc: prop_tok.span,
-                        name,
-                    };
-                    let end = prop_tok.span;
-                    expr = Expr::Member(Box::new(crate::parser::ast::MemberExpr {
-                        loc: Self::merge_spans(start, end),
-                        object: Box::new(expr),
-                        property: crate::parser::ast::MemberProp::Ident(prop_ident),
-                        is_computed: false,
-                    }));
+                    if self.peek_kind() == TokenKind::PrivateIdentifier {
+                        // Private access: `obj.#field`
+                        let prop_tok = self.bump()?;
+                        let name = match prop_tok.value {
+                            TokenValue::Str(s) => s,
+                            _ => {
+                                return Err(Self::error_at(
+                                    prop_tok.span,
+                                    "invalid private name token",
+                                ));
+                            }
+                        };
+                        let end = prop_tok.span;
+                        expr = Expr::Member(Box::new(crate::parser::ast::MemberExpr {
+                            loc: Self::merge_spans(start, end),
+                            object: Box::new(expr),
+                            property: crate::parser::ast::MemberProp::Private(PrivateIdent {
+                                loc: prop_tok.span,
+                                name,
+                            }),
+                            is_computed: false,
+                        }));
+                    } else {
+                        // Allow keywords as property names.
+                        let prop_tok = self.bump()?;
+                        let name = self.name_from_token(&prop_tok)?;
+                        let prop_ident = Ident {
+                            loc: prop_tok.span,
+                            name,
+                        };
+                        let end = prop_tok.span;
+                        expr = Expr::Member(Box::new(crate::parser::ast::MemberExpr {
+                            loc: Self::merge_spans(start, end),
+                            object: Box::new(expr),
+                            property: crate::parser::ast::MemberProp::Ident(prop_ident),
+                            is_computed: false,
+                        }));
+                    }
                 }
                 TokenKind::LeftBracket => {
                     self.bump()?;
@@ -2684,19 +2798,44 @@ impl<'src> Parser<'src> {
                     match self.peek_kind() {
                         TokenKind::Dot => {
                             self.bump()?;
-                            let prop_tok = self.bump()?;
-                            let name = self.name_from_token(&prop_tok)?;
-                            let prop_ident = Ident {
-                                loc: prop_tok.span,
-                                name,
-                            };
-                            let end = prop_tok.span;
-                            callee = Expr::Member(Box::new(crate::parser::ast::MemberExpr {
-                                loc: Self::merge_spans(new_start, end),
-                                object: Box::new(callee),
-                                property: crate::parser::ast::MemberProp::Ident(prop_ident),
-                                is_computed: false,
-                            }));
+                            if self.peek_kind() == TokenKind::PrivateIdentifier {
+                                let prop_tok = self.bump()?;
+                                let name = match prop_tok.value {
+                                    TokenValue::Str(s) => s,
+                                    _ => {
+                                        return Err(Self::error_at(
+                                            prop_tok.span,
+                                            "invalid private name token",
+                                        ));
+                                    }
+                                };
+                                let end = prop_tok.span;
+                                callee = Expr::Member(Box::new(crate::parser::ast::MemberExpr {
+                                    loc: Self::merge_spans(new_start, end),
+                                    object: Box::new(callee),
+                                    property: crate::parser::ast::MemberProp::Private(
+                                        PrivateIdent {
+                                            loc: prop_tok.span,
+                                            name,
+                                        },
+                                    ),
+                                    is_computed: false,
+                                }));
+                            } else {
+                                let prop_tok = self.bump()?;
+                                let name = self.name_from_token(&prop_tok)?;
+                                let prop_ident = Ident {
+                                    loc: prop_tok.span,
+                                    name,
+                                };
+                                let end = prop_tok.span;
+                                callee = Expr::Member(Box::new(crate::parser::ast::MemberExpr {
+                                    loc: Self::merge_spans(new_start, end),
+                                    object: Box::new(callee),
+                                    property: crate::parser::ast::MemberProp::Ident(prop_ident),
+                                    is_computed: false,
+                                }));
+                            }
                         }
                         TokenKind::LeftBracket => {
                             self.bump()?;
@@ -5763,6 +5902,236 @@ mod tests {
             } else {
                 panic!("expected setter method");
             }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    // ── Private class fields and static blocks (issue #271) ──────────────
+
+    #[test]
+    fn test_class_private_field() {
+        let prog = parse("class C { #x; }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 1);
+            if let ClassMember::Property(p) = &c.body.body[0] {
+                assert!(!p.is_static);
+                assert!(p.value.is_none());
+                if let PropKey::Private(ref id) = p.key {
+                    assert_eq!(id.name, "x");
+                } else {
+                    panic!("expected Private key");
+                }
+            } else {
+                panic!("expected Property");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_private_field_with_initializer() {
+        let prog = parse("class C { #x = 42; }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 1);
+            if let ClassMember::Property(p) = &c.body.body[0] {
+                assert!(p.value.is_some());
+                if let PropKey::Private(ref id) = p.key {
+                    assert_eq!(id.name, "x");
+                } else {
+                    panic!("expected Private key");
+                }
+            } else {
+                panic!("expected Property");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_static_private_field() {
+        let prog = parse("class C { static #count = 0; }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 1);
+            if let ClassMember::Property(p) = &c.body.body[0] {
+                assert!(p.is_static);
+                if let PropKey::Private(ref id) = p.key {
+                    assert_eq!(id.name, "count");
+                } else {
+                    panic!("expected Private key");
+                }
+            } else {
+                panic!("expected Property");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_private_method() {
+        let prog = parse("class C { #foo() { return 1; } }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 1);
+            if let ClassMember::Method(m) = &c.body.body[0] {
+                assert!(matches!(m.kind, MethodKind::Method));
+                if let PropKey::Private(ref id) = m.key {
+                    assert_eq!(id.name, "foo");
+                } else {
+                    panic!("expected Private key");
+                }
+            } else {
+                panic!("expected Method");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_private_getter_setter() {
+        let prog = parse("class C { get #x() { return 1; } set #x(v) { this.v = v; } }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 2);
+            if let ClassMember::Method(m) = &c.body.body[0] {
+                assert!(matches!(m.kind, MethodKind::Get));
+                if let PropKey::Private(ref id) = m.key {
+                    assert_eq!(id.name, "x");
+                } else {
+                    panic!("expected Private key");
+                }
+            } else {
+                panic!("expected getter");
+            }
+            if let ClassMember::Method(m) = &c.body.body[1] {
+                assert!(matches!(m.kind, MethodKind::Set));
+                if let PropKey::Private(ref id) = m.key {
+                    assert_eq!(id.name, "x");
+                } else {
+                    panic!("expected Private key");
+                }
+            } else {
+                panic!("expected setter");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_static_block() {
+        let prog = parse("class C { static { let x = 1; } }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 1);
+            if let ClassMember::StaticBlock(sb) = &c.body.body[0] {
+                assert_eq!(sb.body.len(), 1);
+            } else {
+                panic!("expected StaticBlock");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_static_block_empty() {
+        let prog = parse("class C { static { } }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 1);
+            if let ClassMember::StaticBlock(sb) = &c.body.body[0] {
+                assert!(sb.body.is_empty());
+            } else {
+                panic!("expected StaticBlock");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_public_field() {
+        let prog = parse("class C { x = 1; y; }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 2);
+            if let ClassMember::Property(p) = &c.body.body[0] {
+                assert!(p.value.is_some());
+                if let PropKey::Ident(ref id) = p.key {
+                    assert_eq!(id.name, "x");
+                } else {
+                    panic!("expected Ident key");
+                }
+            } else {
+                panic!("expected Property");
+            }
+            if let ClassMember::Property(p) = &c.body.body[1] {
+                assert!(p.value.is_none());
+                if let PropKey::Ident(ref id) = p.key {
+                    assert_eq!(id.name, "y");
+                } else {
+                    panic!("expected Ident key");
+                }
+            } else {
+                panic!("expected Property");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_private_member_access() {
+        let prog = parse("class C { #x; m() { return this.#x; } }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 2);
+            assert!(matches!(&c.body.body[0], ClassMember::Property(_)));
+            assert!(matches!(&c.body.body[1], ClassMember::Method(_)));
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_private_brand_check() {
+        let prog = parse("class C { #x; check(o) { return #x in o; } }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 2);
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_generator_method() {
+        let prog = parse("class C { *gen() { yield 1; } }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 1);
+            if let ClassMember::Method(m) = &c.body.body[0] {
+                assert!(m.value.is_generator);
+            } else {
+                panic!("expected Method");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_mixed_members() {
+        let prog = parse(
+            "class C { #x = 1; y = 2; static #z = 3; static { } constructor() {} #method() {} get #a() { return 1; } }",
+        )
+        .unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 7);
+            assert!(matches!(&c.body.body[0], ClassMember::Property(_)));
+            assert!(matches!(&c.body.body[1], ClassMember::Property(_)));
+            assert!(matches!(&c.body.body[2], ClassMember::Property(_)));
+            assert!(matches!(&c.body.body[3], ClassMember::StaticBlock(_)));
+            assert!(matches!(&c.body.body[4], ClassMember::Method(_)));
+            assert!(matches!(&c.body.body[5], ClassMember::Method(_)));
+            assert!(matches!(&c.body.body[6], ClassMember::Method(_)));
         } else {
             panic!("expected ClassDecl");
         }

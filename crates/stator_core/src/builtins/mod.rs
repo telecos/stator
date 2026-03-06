@@ -12,6 +12,8 @@ pub mod array;
 pub mod error;
 /// ECMAScript §26.2 `FinalizationRegistry` built-in — cleanup callbacks after GC collection.
 pub mod finalization_registry;
+/// ECMAScript §20.2 `Function` built-in constructor and prototype methods.
+pub mod function;
 /// ECMAScript §19 global object properties and global functions (`isNaN`, `isFinite`,
 /// `parseInt`, `parseFloat`, `encodeURI`, `decodeURI`, `encodeURIComponent`,
 /// `decodeURIComponent`, `eval`, and the `NaN`/`Infinity`/`undefined` constants).

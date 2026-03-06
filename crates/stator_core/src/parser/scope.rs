@@ -1138,6 +1138,7 @@ impl Analyzer {
                     self.visit_expr(opts);
                 }
             }
+            Expr::PrivateName(_) => {}
         }
     }
 
