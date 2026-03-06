@@ -1149,6 +1149,10 @@ impl<'a> BaselineCompiler<'a> {
             Opcode::CreateClass
             | Opcode::TestPrivateBrand
             | Opcode::DefinePrivateBrand
+            | Opcode::LdaModuleVariable
+            | Opcode::StaModuleVariable
+            | Opcode::LdaImportMeta
+            | Opcode::GetModuleNamespace
             | Opcode::Wide
             | Opcode::ExtraWide
             | Opcode::Illegal => {

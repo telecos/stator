@@ -620,6 +620,29 @@ pub enum Opcode {
     /// Define a private brand on `obj`. `[obj]`
     DefinePrivateBrand,
 
+    // ── Module ────────────────────────────────────────────────────────────
+    /// Load a module variable (import binding) into the accumulator.
+    /// `[module_request_idx, cell_idx]`
+    ///
+    /// `module_request_idx` is a constant-pool index for the source module
+    /// specifier string and `cell_idx` identifies the binding cell inside
+    /// that module's environment.  Live bindings are resolved at load time.
+    LdaModuleVariable,
+    /// Store the accumulator to a module variable (export binding).
+    /// `[module_request_idx, cell_idx]`
+    ///
+    /// Used for `export let`/`export var` — writes go through the binding
+    /// cell so importers see the updated value (live binding semantics).
+    StaModuleVariable,
+    /// Load the `import.meta` object for the current module into the accumulator.
+    LdaImportMeta,
+    /// Create a module namespace object (`import * as ns`) and load it into
+    /// the accumulator. `[module_request_idx]`
+    ///
+    /// `module_request_idx` is a constant-pool index holding the module
+    /// specifier string.
+    GetModuleNamespace,
+
     // ── Encoding prefixes ─────────────────────────────────────────────────
     /// Prefix: all operands in the following instruction use 2-byte (wide) encoding.
     Wide,
@@ -867,6 +890,12 @@ impl Opcode {
             Opcode::CreateClass => &[ConstantPoolIdx, Register, FeedbackSlot],
             Opcode::TestPrivateBrand => &[Register, Register],
             Opcode::DefinePrivateBrand => &[Register],
+
+            // Module
+            Opcode::LdaModuleVariable => &[ConstantPoolIdx, Immediate],
+            Opcode::StaModuleVariable => &[ConstantPoolIdx, Immediate],
+            Opcode::LdaImportMeta => &[],
+            Opcode::GetModuleNamespace => &[ConstantPoolIdx],
 
             // Prefixes / trap — no operands of their own
             Opcode::Wide | Opcode::ExtraWide | Opcode::Illegal => &[],
@@ -1488,6 +1517,38 @@ mod tests {
                 vec![Operand::FeedbackSlot(2)],
             ),
         ]);
+    }
+
+    // ── module opcodes ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_round_trip_lda_sta_module_variable() {
+        round_trip(vec![
+            Instruction::new_unchecked(
+                Opcode::LdaModuleVariable,
+                vec![Operand::ConstantPoolIdx(0), Operand::Immediate(1)],
+            ),
+            Instruction::new_unchecked(
+                Opcode::StaModuleVariable,
+                vec![Operand::ConstantPoolIdx(0), Operand::Immediate(2)],
+            ),
+        ]);
+    }
+
+    #[test]
+    fn test_round_trip_lda_import_meta() {
+        round_trip(vec![Instruction::new_unchecked(
+            Opcode::LdaImportMeta,
+            vec![],
+        )]);
+    }
+
+    #[test]
+    fn test_round_trip_get_module_namespace() {
+        round_trip(vec![Instruction::new_unchecked(
+            Opcode::GetModuleNamespace,
+            vec![Operand::ConstantPoolIdx(5)],
+        )]);
     }
 
     // ── wide encoding ─────────────────────────────────────────────────────
