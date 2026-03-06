@@ -36,6 +36,10 @@ pub mod builtins;
 pub mod bytecode;
 /// JIT compiler infrastructure: baseline code generator and macro-assembler.
 pub mod compiler;
+/// DOM integration layer: object wrapping, property interceptors, internal
+/// fields, and weak references for bridging the JS engine with web platform
+/// APIs.
+pub mod dom;
 /// Engine error types and [`StatorResult`] alias.
 pub mod error;
 /// V8-compatible FFI wrapper types (`V8Object`, `V8Array`, `V8Number`, etc.).
