@@ -1613,6 +1613,9 @@ impl FunctionCompiler {
             Expr::MetaProp(_) => Err(StatorError::Internal(
                 "import.meta / new.target are not yet supported".into(),
             )),
+            Expr::PrivateName(_) => Err(StatorError::Internal(
+                "bare private name expression should only appear as LHS of 'in'".into(),
+            )),
         }
     }
 
@@ -1787,6 +1790,34 @@ impl FunctionCompiler {
     /// The pattern is: evaluate RHS → temporary, evaluate LHS → accumulator,
     /// apply operator.  This works for all non-commutative ops.
     fn compile_binary(&mut self, b: &crate::parser::ast::BinaryExpr) -> StatorResult<()> {
+        // `#x in obj` — private brand check.
+        if b.op == BinaryOp::In
+            && let Expr::PrivateName(ref id) = *b.left
+        {
+            self.compile_expr(&b.right)?;
+            let obj_reg = self.allocator.allocate_temporary();
+            self.emit_star(obj_reg);
+            let name_idx = self.add_string(&format!("#{}", id.name));
+            let brand_reg = self.allocator.allocate_temporary();
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaConstant,
+                vec![Operand::ConstantPoolIdx(name_idx)],
+            ));
+            self.emit_star(brand_reg);
+            self.emit_ldar(obj_reg);
+            self.emit(Instruction::new_unchecked(
+                Opcode::TestPrivateBrand,
+                vec![to_reg_op(obj_reg), to_reg_op(brand_reg)],
+            ));
+            self.allocator
+                .release_temporary(brand_reg)
+                .map_err(|e| StatorError::Internal(e.to_string()))?;
+            self.allocator
+                .release_temporary(obj_reg)
+                .map_err(|e| StatorError::Internal(e.to_string()))?;
+            return Ok(());
+        }
+
         // Evaluate RHS first, save to temporary.
         self.compile_expr(&b.right)?;
         let rhs_reg = self.allocator.allocate_temporary();

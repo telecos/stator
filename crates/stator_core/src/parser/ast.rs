@@ -925,6 +925,10 @@ pub enum Expr {
     Import(Box<ImportExpr>),
     /// `import.meta` or `new.target`
     MetaProp(MetaPropExpr),
+
+    // ── Private name (brand-check) ────────────────────────────────────────
+    /// `#name` used as the LHS of an `in` expression (`#x in obj`).
+    PrivateName(PrivateIdent),
 }
 
 impl Expr {
@@ -963,6 +967,7 @@ impl Expr {
             Expr::Await(e) => e.loc,
             Expr::Import(e) => e.loc,
             Expr::MetaProp(e) => e.loc,
+            Expr::PrivateName(e) => e.loc,
         }
     }
 }
