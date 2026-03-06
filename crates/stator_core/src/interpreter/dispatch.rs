@@ -2148,6 +2148,7 @@ fn handle_type_of(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResu
         JsValue::Promise(_) => "object",
         JsValue::Context(_) => "object",
         JsValue::Proxy(_) => "object",
+        JsValue::ArrayBuffer(_) | JsValue::TypedArray(_) | JsValue::DataView(_) => "object",
     };
     ctx.frame.accumulator = JsValue::String(type_str.to_owned());
     Ok(DispatchAction::Continue)

@@ -54,6 +54,8 @@ pub mod string;
 /// ECMAScript §20.4 `Symbol` built-in — unique property keys, well-known symbols,
 /// and the global symbol registry (`Symbol.for()` / `Symbol.keyFor()`).
 pub mod symbol;
+/// ECMAScript §23.2 TypedArray, §25.1 ArrayBuffer, and §25.3 DataView built-ins.
+pub mod typed_array;
 /// Shared utility functions (e.g. `SameValueZero`) used across built-in sub-modules.
 pub(crate) mod util;
 /// WebAssembly JavaScript API built-ins:

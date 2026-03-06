@@ -550,7 +550,10 @@ fn write_jsvalue(buf: &mut Vec<u8>, value: &JsValue, ctx: &mut SerContext) {
         | JsValue::Iterator(_)
         | JsValue::Promise(_)
         | JsValue::Context(_)
-        | JsValue::Proxy(_) => {
+        | JsValue::Proxy(_)
+        | JsValue::ArrayBuffer(_)
+        | JsValue::TypedArray(_)
+        | JsValue::DataView(_) => {
             write_u8(buf, TAG_UNDEFINED);
         }
     }
