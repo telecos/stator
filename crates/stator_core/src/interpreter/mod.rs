@@ -2495,6 +2495,19 @@ impl Interpreter {
                         JsValue::String(ref s) => JsValue::Iterator(NativeIterator::from_string(s)),
                         // Generators and existing iterators pass through unchanged.
                         JsValue::Generator(_) | JsValue::Iterator(_) => iterable,
+                        // PlainObject with @@iterator → call it to get the iterator.
+                        JsValue::PlainObject(ref map)
+                            if map.borrow().contains_key("@@iterator") =>
+                        {
+                            let iter_fn = map.borrow().get("@@iterator").cloned();
+                            if let Some(JsValue::NativeFunction(f)) = iter_fn {
+                                f(vec![])?
+                            } else {
+                                return Err(StatorError::TypeError(
+                                    "GetIterator: @@iterator is not a function".into(),
+                                ));
+                            }
+                        }
                         // PlainObject with a "length" property → array-like.
                         JsValue::PlainObject(ref map) if map.borrow().contains_key("length") => {
                             let items = plain_object_to_array_items(map);
@@ -2523,6 +2536,19 @@ impl Interpreter {
                         }
                         JsValue::String(ref s) => JsValue::Iterator(NativeIterator::from_string(s)),
                         JsValue::Generator(_) | JsValue::Iterator(_) => iterable,
+                        // PlainObject with @@iterator → call it to get the iterator.
+                        JsValue::PlainObject(ref map)
+                            if map.borrow().contains_key("@@iterator") =>
+                        {
+                            let iter_fn = map.borrow().get("@@iterator").cloned();
+                            if let Some(JsValue::NativeFunction(f)) = iter_fn {
+                                f(vec![])?
+                            } else {
+                                return Err(StatorError::TypeError(
+                                    "GetAsyncIterator: @@iterator is not a function".into(),
+                                ));
+                            }
+                        }
                         JsValue::PlainObject(ref map) if map.borrow().contains_key("length") => {
                             let items = plain_object_to_array_items(map);
                             JsValue::Iterator(NativeIterator::from_items(items))

@@ -14,9 +14,29 @@
 //!
 //! * ECMAScript 2025 Language Specification §24.1 — *The Map Objects*
 
-use crate::objects::value::JsValue;
+use std::rc::Rc;
+
+use crate::objects::value::{JsValue, NativeIterator};
 
 use super::util::same_value_zero;
+
+// ── MapIteratorKind ───────────────────────────────────────────────────────────
+
+/// The iteration kind for a `Map` iterator (ECMAScript §24.1.5.1).
+///
+/// Determines which component of each entry the iterator yields:
+/// - `Entries` → `[key, value]` arrays
+/// - `Keys` → keys only
+/// - `Values` → values only
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapIteratorKind {
+    /// Yield `[key, value]` pairs as two-element arrays.
+    Entries,
+    /// Yield keys only.
+    Keys,
+    /// Yield values only.
+    Values,
+}
 
 // ── JsMap ─────────────────────────────────────────────────────────────────────
 
@@ -356,6 +376,57 @@ pub fn map_iter(map: &JsMap) -> Vec<(JsValue, JsValue)> {
     map_entries(map)
 }
 
+// ── map_create_iterator ──────────────────────────────────────────────────────
+
+/// Create a [`JsValue::Iterator`] from a `Map` with the given iteration kind
+/// (ECMAScript §24.1.5 `CreateMapIterator`).
+///
+/// - [`MapIteratorKind::Entries`] yields `[key, value]` arrays.
+/// - [`MapIteratorKind::Keys`] yields keys only.
+/// - [`MapIteratorKind::Values`] yields values only.
+///
+/// The iterator snapshots the current entries and yields them in insertion
+/// order.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::map::{map_new, map_set, map_create_iterator, MapIteratorKind};
+/// use stator_core::builtins::iterator::iterator_next;
+/// use stator_core::objects::value::JsValue;
+/// use std::rc::Rc;
+///
+/// let mut m = map_new();
+/// map_set(&mut m, JsValue::String("a".into()), JsValue::Smi(1));
+///
+/// let iter = map_create_iterator(&m, MapIteratorKind::Entries);
+/// let r = iterator_next(&iter).unwrap();
+/// assert_eq!(
+///     r.value,
+///     JsValue::Array(Rc::new(vec![JsValue::String("a".into()), JsValue::Smi(1)]))
+/// );
+///
+/// let iter = map_create_iterator(&m, MapIteratorKind::Keys);
+/// let r = iterator_next(&iter).unwrap();
+/// assert_eq!(r.value, JsValue::String("a".into()));
+///
+/// let iter = map_create_iterator(&m, MapIteratorKind::Values);
+/// let r = iterator_next(&iter).unwrap();
+/// assert_eq!(r.value, JsValue::Smi(1));
+/// ```
+pub fn map_create_iterator(map: &JsMap, kind: MapIteratorKind) -> JsValue {
+    let items: Vec<JsValue> = match kind {
+        MapIteratorKind::Entries => map
+            .entries
+            .iter()
+            .map(|(k, v)| JsValue::Array(Rc::new(vec![k.clone(), v.clone()])))
+            .collect(),
+        MapIteratorKind::Keys => map.entries.iter().map(|(k, _)| k.clone()).collect(),
+        MapIteratorKind::Values => map.entries.iter().map(|(_, v)| v.clone()).collect(),
+    };
+    JsValue::Iterator(NativeIterator::from_items(items))
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -559,5 +630,79 @@ mod tests {
         map_set(&mut m, JsValue::HeapNumber(0.0_f64), JsValue::Smi(7));
         assert!(map_has(&m, &JsValue::HeapNumber(-0.0_f64)));
         assert_eq!(map_size(&m), 1);
+    }
+
+    // ── map_create_iterator ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_map_create_iterator_entries() {
+        use crate::builtins::iterator::iterator_next;
+        let mut m = map_new();
+        map_set(&mut m, JsValue::Smi(1), JsValue::String("a".into()));
+        map_set(&mut m, JsValue::Smi(2), JsValue::String("b".into()));
+        let iter = map_create_iterator(&m, MapIteratorKind::Entries);
+        let r1 = iterator_next(&iter).unwrap();
+        assert_eq!(
+            r1.value,
+            JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::String("a".into())]))
+        );
+        let r2 = iterator_next(&iter).unwrap();
+        assert_eq!(
+            r2.value,
+            JsValue::Array(Rc::new(vec![JsValue::Smi(2), JsValue::String("b".into())]))
+        );
+        assert!(iterator_next(&iter).unwrap().done);
+    }
+
+    #[test]
+    fn test_map_create_iterator_keys() {
+        use crate::builtins::iterator::iterator_next;
+        let mut m = map_new();
+        map_set(&mut m, JsValue::Smi(1), JsValue::String("a".into()));
+        map_set(&mut m, JsValue::Smi(2), JsValue::String("b".into()));
+        let iter = map_create_iterator(&m, MapIteratorKind::Keys);
+        assert_eq!(iterator_next(&iter).unwrap().value, JsValue::Smi(1));
+        assert_eq!(iterator_next(&iter).unwrap().value, JsValue::Smi(2));
+        assert!(iterator_next(&iter).unwrap().done);
+    }
+
+    #[test]
+    fn test_map_create_iterator_values() {
+        use crate::builtins::iterator::iterator_next;
+        let mut m = map_new();
+        map_set(&mut m, JsValue::Smi(1), JsValue::String("a".into()));
+        map_set(&mut m, JsValue::Smi(2), JsValue::String("b".into()));
+        let iter = map_create_iterator(&m, MapIteratorKind::Values);
+        assert_eq!(
+            iterator_next(&iter).unwrap().value,
+            JsValue::String("a".into())
+        );
+        assert_eq!(
+            iterator_next(&iter).unwrap().value,
+            JsValue::String("b".into())
+        );
+        assert!(iterator_next(&iter).unwrap().done);
+    }
+
+    #[test]
+    fn test_map_create_iterator_empty() {
+        use crate::builtins::iterator::iterator_next;
+        let m = map_new();
+        let iter = map_create_iterator(&m, MapIteratorKind::Entries);
+        assert!(iterator_next(&iter).unwrap().done);
+    }
+
+    #[test]
+    fn test_map_create_iterator_insertion_order() {
+        use crate::builtins::iterator::iterator_next;
+        let mut m = map_new();
+        map_set(&mut m, JsValue::Smi(3), JsValue::Undefined);
+        map_set(&mut m, JsValue::Smi(1), JsValue::Undefined);
+        map_set(&mut m, JsValue::Smi(2), JsValue::Undefined);
+        let iter = map_create_iterator(&m, MapIteratorKind::Keys);
+        assert_eq!(iterator_next(&iter).unwrap().value, JsValue::Smi(3));
+        assert_eq!(iterator_next(&iter).unwrap().value, JsValue::Smi(1));
+        assert_eq!(iterator_next(&iter).unwrap().value, JsValue::Smi(2));
+        assert!(iterator_next(&iter).unwrap().done);
     }
 }
