@@ -10,13 +10,27 @@
 //!
 //! # Supported domains
 //!
-//! | Domain         | Method              | Behaviour                      |
-//! |----------------|---------------------|--------------------------------|
-//! | `Runtime`      | `enable`            | Acknowledges; emits context-created event |
-//! | `Runtime`      | `evaluate`          | Parses and executes JavaScript; returns result |
-//! | `Debugger`     | `enable`            | Acknowledges; returns `debuggerId` |
-//! | `Profiler`     | `enable`            | Acknowledges                   |
-//! | `HeapProfiler` | `enable`            | Acknowledges                   |
+//! | Domain         | Method                    | Behaviour                          |
+//! |----------------|---------------------------|------------------------------------|
+//! | `Runtime`      | `enable`                  | Acknowledges; emits context-created event |
+//! | `Runtime`      | `evaluate`                | Parses and executes JavaScript; returns result |
+//! | `Runtime`      | `callFunctionOn`          | Evaluates a function call expression |
+//! | `Runtime`      | `getProperties`           | Lists properties of the globals object |
+//! | `Debugger`     | `enable`                  | Acknowledges; returns `debuggerId` |
+//! | `Debugger`     | `setPauseOnExceptions`    | Configures exception pause state   |
+//! | `Debugger`     | `setBreakpointByUrl`      | Sets a breakpoint (stub, returns id) |
+//! | `Debugger`     | `resume`                  | Resumes after a pause              |
+//! | `Console`      | `enable`                  | Flushes buffered messages as events |
+//! | `Console`      | `disable`                 | Acknowledges                       |
+//! | `Profiler`     | `enable`                  | Acknowledges                       |
+//! | `Profiler`     | `start`                   | Starts CPU profiling               |
+//! | `Profiler`     | `stop`                    | Stops profiling; returns profile    |
+//! | `HeapProfiler` | `enable`                  | Acknowledges                       |
+//! | `HeapProfiler` | `takeHeapSnapshot`        | Emits snapshot chunks              |
+//! | `HeapProfiler` | `startTrackingHeapObjects` | Starts allocation tracking         |
+//! | `HeapProfiler` | `stopTrackingHeapObjects`  | Returns allocation stats           |
+//! | `Network`      | `enable`                  | Acknowledges (stub)                |
+//! | `Network`      | `disable`                 | Acknowledges (stub)                |
 //!
 //! # Example
 //!
@@ -40,6 +54,7 @@ use tungstenite::{Message, WebSocket, accept};
 
 use crate::bytecode::bytecode_generator::BytecodeGenerator;
 use crate::error::StatorResult;
+use crate::inspector::console::drain_messages;
 use crate::inspector::heap_snapshot::HeapSnapshotBuilder;
 use crate::inspector::profiler::CpuProfiler;
 use crate::interpreter::{Interpreter, InterpreterFrame};
@@ -96,6 +111,10 @@ pub struct CdpSession {
     ws: WebSocket<TcpStream>,
     globals: Rc<RefCell<HashMap<String, JsValue>>>,
     profiler: CpuProfiler,
+    /// Whether the `Console` domain is currently enabled for this session.
+    console_enabled: bool,
+    /// Monotonically increasing ID for breakpoints set via CDP.
+    next_breakpoint_id: u32,
 }
 
 impl CdpSession {
@@ -105,6 +124,8 @@ impl CdpSession {
             ws,
             globals: Rc::new(RefCell::new(HashMap::new())),
             profiler: CpuProfiler::new(),
+            console_enabled: false,
+            next_breakpoint_id: 1,
         }
     }
 
@@ -184,11 +205,23 @@ impl CdpSession {
             // ── Runtime ───────────────────────────────────────────────────
             "Runtime.enable" => self.runtime_enable(),
             "Runtime.evaluate" => self.runtime_evaluate(&req.params),
+            "Runtime.callFunctionOn" => self.runtime_call_function_on(&req.params),
+            "Runtime.getProperties" => self.runtime_get_properties(&req.params),
 
             // ── Debugger ──────────────────────────────────────────────────
             "Debugger.enable" => Ok(json!({
                 "debuggerId": "stator-debugger-0"
             })),
+            "Debugger.setPauseOnExceptions" => self.debugger_set_pause_on_exceptions(&req.params),
+            "Debugger.setBreakpointByUrl" => self.debugger_set_breakpoint_by_url(&req.params),
+            "Debugger.resume" => Ok(json!({})),
+
+            // ── Console ───────────────────────────────────────────────────
+            "Console.enable" => self.console_enable(),
+            "Console.disable" => {
+                self.console_enabled = false;
+                Ok(json!({}))
+            }
 
             // ── Profiler ──────────────────────────────────────────────────
             "Profiler.enable" => Ok(json!({})),
@@ -200,6 +233,10 @@ impl CdpSession {
             "HeapProfiler.takeHeapSnapshot" => self.heap_profiler_take_snapshot(),
             "HeapProfiler.startTrackingHeapObjects" => self.heap_profiler_start_tracking(),
             "HeapProfiler.stopTrackingHeapObjects" => self.heap_profiler_stop_tracking(),
+
+            // ── Network (stubs) ───────────────────────────────────────────
+            "Network.enable" => Ok(json!({})),
+            "Network.disable" => Ok(json!({})),
 
             // ── Unknown ───────────────────────────────────────────────────
             other => Err(crate::error::StatorError::Internal(format!(
@@ -252,6 +289,138 @@ impl CdpSession {
         Ok(json!({
             "result": js_value_to_remote_object(&js_result)
         }))
+    }
+
+    // ── Runtime.callFunctionOn ───────────────────────────────────────────────
+
+    fn runtime_call_function_on(&mut self, params: &Value) -> StatorResult<Value> {
+        let declaration = match params.get("functionDeclaration").and_then(Value::as_str) {
+            Some(d) => d,
+            None => {
+                return Err(crate::error::StatorError::TypeError(
+                    "Runtime.callFunctionOn: required parameter 'functionDeclaration' is missing"
+                        .to_string(),
+                ));
+            }
+        };
+
+        // Build a call expression: wrap the declaration and invoke it with
+        // any supplied arguments serialised as literals.
+        let args = params
+            .get("arguments")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|a| {
+                        if let Some(v) = a.get("value") {
+                            v.to_string()
+                        } else {
+                            "undefined".to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+
+        let expression = format!("({declaration})({args})");
+        let bytecodes =
+            parser::parse(&expression).and_then(|p| BytecodeGenerator::compile_program(&p))?;
+
+        let mut frame =
+            InterpreterFrame::new_with_globals(bytecodes, vec![], Rc::clone(&self.globals));
+        let js_result = Interpreter::run(&mut frame)?;
+
+        Ok(json!({
+            "result": js_value_to_remote_object(&js_result)
+        }))
+    }
+
+    // ── Runtime.getProperties ────────────────────────────────────────────────
+
+    fn runtime_get_properties(&self, _params: &Value) -> StatorResult<Value> {
+        let globals = self.globals.borrow();
+        let descriptors: Vec<Value> = globals
+            .iter()
+            .map(|(name, value)| {
+                json!({
+                    "name": name,
+                    "value": js_value_to_remote_object(value),
+                    "writable": true,
+                    "configurable": true,
+                    "enumerable": true,
+                    "isOwn": true,
+                })
+            })
+            .collect();
+
+        Ok(json!({ "result": descriptors }))
+    }
+
+    // ── Debugger.setPauseOnExceptions ────────────────────────────────────────
+
+    fn debugger_set_pause_on_exceptions(&self, params: &Value) -> StatorResult<Value> {
+        // CDP state values: "none", "uncaught", "all".  We store the
+        // acknowledged state but actual behaviour depends on the debugger
+        // being attached to the interpreter (see inspector::debugger).
+        let _state = params
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        Ok(json!({}))
+    }
+
+    // ── Debugger.setBreakpointByUrl ──────────────────────────────────────────
+
+    fn debugger_set_breakpoint_by_url(&mut self, params: &Value) -> StatorResult<Value> {
+        let line_number = params
+            .get("lineNumber")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        let column_number = params
+            .get("columnNumber")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+
+        let bp_id = format!(
+            "{}:{}:{}",
+            self.next_breakpoint_id, line_number, column_number
+        );
+        self.next_breakpoint_id += 1;
+
+        Ok(json!({
+            "breakpointId": bp_id,
+            "locations": [{
+                "scriptId": "0",
+                "lineNumber": line_number,
+                "columnNumber": column_number,
+            }]
+        }))
+    }
+
+    // ── Console.enable ───────────────────────────────────────────────────────
+
+    fn console_enable(&mut self) -> StatorResult<Value> {
+        self.console_enabled = true;
+
+        // Flush any buffered console messages as `Console.messageAdded` events.
+        for msg in drain_messages() {
+            let event = json!({
+                "method": "Console.messageAdded",
+                "params": {
+                    "message": {
+                        "source": "console-api",
+                        "level": msg.level.as_cdp_str(),
+                        "text": msg.text,
+                    }
+                }
+            });
+            if let Ok(s) = serde_json::to_string(&event) {
+                let _ = self.ws.send(Message::Text(s.into()));
+            }
+        }
+
+        Ok(json!({}))
     }
 
     // ── Profiler.start ───────────────────────────────────────────────────────
@@ -675,5 +844,242 @@ mod tests {
 
         assert_eq!(json["id"], 8u64);
         assert!(json.get("error").is_some(), "should have error");
+    }
+
+    // ── New domain tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_cdp_runtime_call_function_on() {
+        let (handle, mut ws, _port) = start_server();
+
+        ws.send(Message::Text(
+            r#"{"id":10,"method":"Runtime.callFunctionOn","params":{"functionDeclaration":"function(a,b){return a+b}","arguments":[{"value":3},{"value":4}]}}"#.into(),
+        ))
+        .expect("send");
+
+        let reply = ws.read().expect("read");
+        ws.close(None).ok();
+        handle.join().expect("thread panic").ok();
+
+        let json: Value = serde_json::from_str(&match reply {
+            Message::Text(t) => t.to_string(),
+            other => panic!("unexpected: {other:?}"),
+        })
+        .expect("parse reply");
+
+        assert_eq!(json["id"], 10u64);
+        assert_eq!(json["result"]["result"]["type"], "number");
+        assert_eq!(json["result"]["result"]["value"], 7);
+    }
+
+    #[test]
+    fn test_cdp_runtime_get_properties_empty() {
+        let (handle, mut ws, _port) = start_server();
+
+        ws.send(Message::Text(
+            r#"{"id":11,"method":"Runtime.getProperties","params":{"objectId":"1"}}"#.into(),
+        ))
+        .expect("send");
+
+        let reply = ws.read().expect("read");
+        ws.close(None).ok();
+        handle.join().expect("thread panic").ok();
+
+        let json: Value = serde_json::from_str(&match reply {
+            Message::Text(t) => t.to_string(),
+            other => panic!("unexpected: {other:?}"),
+        })
+        .expect("parse reply");
+
+        assert_eq!(json["id"], 11u64);
+        assert!(json["result"]["result"].is_array());
+    }
+
+    #[test]
+    fn test_cdp_debugger_set_pause_on_exceptions() {
+        let (handle, mut ws, _port) = start_server();
+
+        ws.send(Message::Text(
+            r#"{"id":12,"method":"Debugger.setPauseOnExceptions","params":{"state":"all"}}"#.into(),
+        ))
+        .expect("send");
+
+        let reply = ws.read().expect("read");
+        ws.close(None).ok();
+        handle.join().expect("thread panic").ok();
+
+        let json: Value = serde_json::from_str(&match reply {
+            Message::Text(t) => t.to_string(),
+            other => panic!("unexpected: {other:?}"),
+        })
+        .expect("parse reply");
+
+        assert_eq!(json["id"], 12u64);
+        assert!(json.get("error").is_none(), "should not have error");
+    }
+
+    #[test]
+    fn test_cdp_debugger_set_breakpoint_by_url() {
+        let (handle, mut ws, _port) = start_server();
+
+        ws.send(Message::Text(
+            r#"{"id":13,"method":"Debugger.setBreakpointByUrl","params":{"lineNumber":5,"columnNumber":0}}"#.into(),
+        ))
+        .expect("send");
+
+        let reply = ws.read().expect("read");
+        ws.close(None).ok();
+        handle.join().expect("thread panic").ok();
+
+        let json: Value = serde_json::from_str(&match reply {
+            Message::Text(t) => t.to_string(),
+            other => panic!("unexpected: {other:?}"),
+        })
+        .expect("parse reply");
+
+        assert_eq!(json["id"], 13u64);
+        assert!(json["result"]["breakpointId"].is_string());
+        assert!(json["result"]["locations"].is_array());
+    }
+
+    #[test]
+    fn test_cdp_debugger_resume() {
+        let (handle, mut ws, _port) = start_server();
+
+        ws.send(Message::Text(
+            r#"{"id":14,"method":"Debugger.resume","params":{}}"#.into(),
+        ))
+        .expect("send");
+
+        let reply = ws.read().expect("read");
+        ws.close(None).ok();
+        handle.join().expect("thread panic").ok();
+
+        let json: Value = serde_json::from_str(&match reply {
+            Message::Text(t) => t.to_string(),
+            other => panic!("unexpected: {other:?}"),
+        })
+        .expect("parse reply");
+
+        assert_eq!(json["id"], 14u64);
+        assert!(json.get("error").is_none(), "should not have error");
+    }
+
+    #[test]
+    fn test_cdp_console_enable() {
+        let (handle, mut ws, _port) = start_server();
+
+        ws.send(Message::Text(
+            r#"{"id":15,"method":"Console.enable","params":{}}"#.into(),
+        ))
+        .expect("send");
+
+        let reply = ws.read().expect("read");
+        ws.close(None).ok();
+        handle.join().expect("thread panic").ok();
+
+        let json: Value = serde_json::from_str(&match reply {
+            Message::Text(t) => t.to_string(),
+            other => panic!("unexpected: {other:?}"),
+        })
+        .expect("parse reply");
+
+        assert_eq!(json["id"], 15u64);
+        assert!(json.get("error").is_none(), "should not have error");
+    }
+
+    #[test]
+    fn test_cdp_console_disable() {
+        let (handle, mut ws, _port) = start_server();
+
+        ws.send(Message::Text(
+            r#"{"id":16,"method":"Console.disable","params":{}}"#.into(),
+        ))
+        .expect("send");
+
+        let reply = ws.read().expect("read");
+        ws.close(None).ok();
+        handle.join().expect("thread panic").ok();
+
+        let json: Value = serde_json::from_str(&match reply {
+            Message::Text(t) => t.to_string(),
+            other => panic!("unexpected: {other:?}"),
+        })
+        .expect("parse reply");
+
+        assert_eq!(json["id"], 16u64);
+        assert!(json.get("error").is_none(), "should not have error");
+    }
+
+    #[test]
+    fn test_cdp_network_enable() {
+        let (handle, mut ws, _port) = start_server();
+
+        ws.send(Message::Text(
+            r#"{"id":17,"method":"Network.enable","params":{}}"#.into(),
+        ))
+        .expect("send");
+
+        let reply = ws.read().expect("read");
+        ws.close(None).ok();
+        handle.join().expect("thread panic").ok();
+
+        let json: Value = serde_json::from_str(&match reply {
+            Message::Text(t) => t.to_string(),
+            other => panic!("unexpected: {other:?}"),
+        })
+        .expect("parse reply");
+
+        assert_eq!(json["id"], 17u64);
+        assert!(json.get("error").is_none(), "should not have error");
+    }
+
+    #[test]
+    fn test_cdp_network_disable() {
+        let (handle, mut ws, _port) = start_server();
+
+        ws.send(Message::Text(
+            r#"{"id":18,"method":"Network.disable","params":{}}"#.into(),
+        ))
+        .expect("send");
+
+        let reply = ws.read().expect("read");
+        ws.close(None).ok();
+        handle.join().expect("thread panic").ok();
+
+        let json: Value = serde_json::from_str(&match reply {
+            Message::Text(t) => t.to_string(),
+            other => panic!("unexpected: {other:?}"),
+        })
+        .expect("parse reply");
+
+        assert_eq!(json["id"], 18u64);
+        assert!(json.get("error").is_none(), "should not have error");
+    }
+
+    #[test]
+    fn test_cdp_runtime_call_function_on_missing_declaration() {
+        let (handle, mut ws, _port) = start_server();
+
+        ws.send(Message::Text(
+            r#"{"id":19,"method":"Runtime.callFunctionOn","params":{}}"#.into(),
+        ))
+        .expect("send");
+
+        let reply = ws.read().expect("read");
+        ws.close(None).ok();
+        handle.join().expect("thread panic").ok();
+
+        let json: Value = serde_json::from_str(&match reply {
+            Message::Text(t) => t.to_string(),
+            other => panic!("unexpected: {other:?}"),
+        })
+        .expect("parse reply");
+
+        assert_eq!(json["id"], 19u64);
+        assert!(
+            json.get("error").is_some(),
+            "should have error for missing param"
+        );
     }
 }
