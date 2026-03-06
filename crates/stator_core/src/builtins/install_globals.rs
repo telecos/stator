@@ -774,15 +774,14 @@ fn make_object() -> JsValue {
         "create".into(),
         native(|args| {
             let proto = args.first().unwrap_or(&JsValue::Undefined);
+            let mut obj: HashMap<String, JsValue> = HashMap::new();
             match proto {
-                JsValue::Null => Ok(JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())))),
-                JsValue::PlainObject(map) => {
-                    // Start with a copy of the prototype's properties
-                    let new_map = map.borrow().clone();
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(new_map))))
+                JsValue::Null | JsValue::Undefined => {}
+                _ => {
+                    obj.insert("__proto__".to_string(), proto.clone());
                 }
-                _ => Ok(JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())))),
             }
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
         }),
     );
 
@@ -871,10 +870,13 @@ fn make_object() -> JsValue {
         native(|args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined);
             match obj {
-                // PlainObject has no prototype chain — return null.
-                JsValue::PlainObject(_) => Ok(JsValue::Null),
-                // Non-objects: per spec, coerce to object first, but for
-                // primitives the prototype is not observable here.
+                JsValue::PlainObject(map) => {
+                    let borrow = map.borrow();
+                    match borrow.get("__proto__") {
+                        Some(proto) => Ok(proto.clone()),
+                        None => Ok(JsValue::Null),
+                    }
+                }
                 _ => Ok(JsValue::Null),
             }
         }),
@@ -885,7 +887,37 @@ fn make_object() -> JsValue {
         "setPrototypeOf".into(),
         native(|args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
-            // Per spec, return the object itself.
+            let proto = args.get(1).unwrap_or(&JsValue::Undefined).clone();
+            if let JsValue::PlainObject(map) = &obj {
+                // Cycle detection: walk the new proto chain and check for obj.
+                if let JsValue::PlainObject(_) = &proto {
+                    let mut current = proto.clone();
+                    for _ in 0..256 {
+                        if let JsValue::PlainObject(cur_map) = &current {
+                            if Rc::ptr_eq(cur_map, map) {
+                                return Err(StatorError::TypeError(
+                                    "Cyclic __proto__ value".to_string(),
+                                ));
+                            }
+                            let next = cur_map.borrow().get("__proto__").cloned();
+                            match next {
+                                Some(v) => current = v,
+                                None => break,
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                match &proto {
+                    JsValue::Null => {
+                        map.borrow_mut().remove("__proto__");
+                    }
+                    _ => {
+                        map.borrow_mut().insert("__proto__".to_string(), proto);
+                    }
+                }
+            }
             Ok(obj)
         }),
     );
@@ -950,18 +982,51 @@ fn make_object() -> JsValue {
     // ── Object.prototype ─────────────────────────────────────────────────
     let mut obj_proto: HashMap<String, JsValue> = HashMap::new();
 
-    // Annex B §B.2.2.1 — Object.prototype.__proto__ (getter/setter)
-    // __proto__ getter: returns null (no prototype chain in our model).
-    obj_proto.insert("__proto__get__".into(), native(|_args| Ok(JsValue::Null)));
-    // __proto__ setter: no-op (we don't support mutable prototype chains).
+    // Object.prototype.hasOwnProperty(key)
     obj_proto.insert(
-        "__proto__set__".into(),
+        "hasOwnProperty".into(),
         native(|args| {
-            let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
-            Ok(obj)
+            let this = args.first().unwrap_or(&JsValue::Undefined);
+            let key = args.get(1).unwrap_or(&JsValue::Undefined);
+            let prop = key.to_js_string()?;
+            match this {
+                JsValue::PlainObject(map) => {
+                    let has = map.borrow().contains_key(&prop) && prop != "__proto__";
+                    Ok(JsValue::Boolean(has))
+                }
+                _ => Ok(JsValue::Boolean(false)),
+            }
         }),
     );
-    // Expose __proto__ as null for property access.
+
+    // Object.prototype.isPrototypeOf(obj)
+    obj_proto.insert(
+        "isPrototypeOf".into(),
+        native(|args| {
+            let this = args.first().unwrap_or(&JsValue::Undefined);
+            let target = args.get(1).unwrap_or(&JsValue::Undefined);
+            if let (JsValue::PlainObject(this_map), JsValue::PlainObject(_)) = (this, target) {
+                let mut current = target.clone();
+                for _ in 0..256 {
+                    if let JsValue::PlainObject(cur_map) = &current {
+                        let next = cur_map.borrow().get("__proto__").cloned();
+                        match next {
+                            Some(JsValue::PlainObject(ref p)) if Rc::ptr_eq(p, this_map) => {
+                                return Ok(JsValue::Boolean(true));
+                            }
+                            Some(v) => current = v,
+                            None => break,
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Ok(JsValue::Boolean(false))
+        }),
+    );
+
+    // Annex B §B.2.2.1 — Object.prototype.__proto__ (terminal null)
     obj_proto.insert("__proto__".into(), JsValue::Null);
 
     props.insert(
@@ -7407,5 +7472,96 @@ mod tests {
     fn e2e_bigint_constructor_large_positive() {
         let result = global_eval("BigInt('170141183460469231731687303715884105727')").unwrap();
         assert_eq!(result, JsValue::BigInt(i128::MAX));
+    }
+
+    // ── Prototype chain tests ───────────────────────────────────────────
+
+    /// `Object.create(proto)` sets up prototype chain for property lookup.
+    #[test]
+    fn e2e_object_create_prototype_chain() {
+        let result = global_eval(
+            r#"
+            var proto = { x: 42 };
+            var child = Object.create(proto);
+            child.x
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Own property shadows prototype property.
+    #[test]
+    fn e2e_own_property_shadows_prototype() {
+        let result = global_eval(
+            r#"
+            var proto = { x: 1 };
+            var child = Object.create(proto);
+            child.x = 99;
+            child.x
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    /// `Object.getPrototypeOf` returns the prototype set by Object.create.
+    #[test]
+    fn e2e_get_prototype_of_created_object() {
+        let result = global_eval(
+            r#"
+            var proto = { marker: true };
+            var child = Object.create(proto);
+            var p = Object.getPrototypeOf(child);
+            p.marker
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.setPrototypeOf` changes the prototype chain.
+    #[test]
+    fn e2e_set_prototype_of_changes_chain() {
+        let result = global_eval(
+            r#"
+            var a = { val: 10 };
+            var b = { val: 20 };
+            var obj = Object.create(a);
+            Object.setPrototypeOf(obj, b);
+            obj.val
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(20));
+    }
+
+    /// `Object.hasOwn` returns false for inherited properties.
+    #[test]
+    fn e2e_has_own_false_for_inherited() {
+        let result = global_eval(
+            r#"
+            var proto = { x: 1 };
+            var child = Object.create(proto);
+            Object.hasOwn(child, "x")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// Multi-level prototype chain property resolution.
+    #[test]
+    fn e2e_multi_level_prototype_chain() {
+        let result = global_eval(
+            r#"
+            var grandparent = { deep: 777 };
+            var parent = Object.create(grandparent);
+            var child = Object.create(parent);
+            child.deep
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(777));
     }
 }

@@ -2027,10 +2027,8 @@ impl Interpreter {
                 // ── Construct ──────────────────────────────────────────────
                 //
                 // Construct [constructor, args_start, args_count, slot]:
-                //   `new constructor(args…)`.  For the P3 interpreter we
-                //   execute the constructor bytecode and return whatever
-                //   value it produces (full object construction with prototype
-                //   wiring is deferred to a later phase).
+                //   `new constructor(args…)`.  Executes the constructor body
+                //   and wires `[[Prototype]]` on the resulting object.
                 Opcode::Construct | Opcode::ConstructWithSpread => {
                     let Operand::Register(ctor_v) = instr.operands[0] else {
                         return Err(err_bad_operand("Construct", 0));
@@ -2042,6 +2040,8 @@ impl Interpreter {
                         return Err(err_bad_operand("Construct", 2));
                     };
                     let ctor = frame.read_reg(ctor_v)?.clone();
+                    // Resolve constructor's "prototype" for [[Prototype]] wiring.
+                    let ctor_proto = proto_lookup(&ctor, "prototype");
                     match ctor {
                         JsValue::Function(ba) => {
                             let args = collect_args(frame, args_start_v, arg_count)?;
@@ -2053,7 +2053,8 @@ impl Interpreter {
                             push_call_frame("<anonymous>")?;
                             let result = Interpreter::run(&mut callee_frame);
                             pop_call_frame();
-                            frame.accumulator = result?;
+                            let val = result?;
+                            frame.accumulator = wire_construct_prototype(val, &ctor_proto);
                         }
                         JsValue::NativeFunction(f) => {
                             let args = collect_args(frame, args_start_v, arg_count)?;
@@ -3105,9 +3106,10 @@ impl Interpreter {
                     let key = &frame.accumulator;
 
                     let result = match &object {
-                        JsValue::PlainObject(map) => {
+                        JsValue::PlainObject(_) => {
                             let prop = to_property_key(key)?;
-                            map.borrow().contains_key(&prop)
+                            // Walk the prototype chain for `in` operator.
+                            !matches!(proto_lookup(&object, &prop), JsValue::Undefined)
                         }
                         JsValue::Array(items) => {
                             // "length" is always present on arrays.
@@ -3922,6 +3924,7 @@ impl Interpreter {
                     };
                     // operands[1] is a FeedbackSlot, ignored at runtime.
                     let ctor = frame.read_reg(ctor_v)?.clone();
+                    let ctor_proto = proto_lookup(&ctor, "prototype");
                     let param_count = frame.bytecode_array.parameter_count() as usize;
                     let args: Vec<JsValue> =
                         frame.registers.get(..param_count).unwrap_or(&[]).to_vec();
@@ -3935,7 +3938,8 @@ impl Interpreter {
                             push_call_frame("<anonymous>")?;
                             let result = Interpreter::run(&mut callee_frame);
                             pop_call_frame();
-                            frame.accumulator = result?;
+                            let val = result?;
+                            frame.accumulator = wire_construct_prototype(val, &ctor_proto);
                         }
                         JsValue::NativeFunction(f) => {
                             frame.accumulator = f(args)?;
@@ -4901,6 +4905,23 @@ fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         break;
     }
     JsValue::Undefined
+}
+
+/// Wire `[[Prototype]]` on a newly constructed object.
+///
+/// If the constructor body returned a `PlainObject` that does not already have
+/// a `__proto__` link, set it to `ctor_proto` so that `instanceof` and
+/// prototype-chain property lookup work correctly.
+fn wire_construct_prototype(result: JsValue, ctor_proto: &JsValue) -> JsValue {
+    if let JsValue::PlainObject(ref map) = result
+        && !matches!(ctor_proto, JsValue::Undefined)
+    {
+        let mut borrow = map.borrow_mut();
+        if !borrow.contains_key("__proto__") {
+            borrow.insert("__proto__".to_string(), ctor_proto.clone());
+        }
+    }
+    result
 }
 
 fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> {
