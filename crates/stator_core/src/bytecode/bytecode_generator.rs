@@ -47,6 +47,12 @@ use crate::parser::ast::{
 // Small helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Well-known runtime function ID for `import()` expressions.
+///
+/// Used as the `RuntimeId` operand in `CallRuntime` so the interpreter can
+/// dispatch to the dynamic import handler.
+pub(crate) const RUNTIME_DYNAMIC_IMPORT: u32 = 1;
+
 /// Convert a [`Register`] to an [`Operand::Register`].
 ///
 /// Parameter registers (negative `i32` indices) are preserved via bit-cast to
@@ -1836,9 +1842,7 @@ impl FunctionCompiler {
             Expr::Spread(_) => Err(StatorError::Internal(
                 "spread in expression position is not yet supported".into(),
             )),
-            Expr::Import(_) => Err(StatorError::Internal(
-                "dynamic import() is not yet supported".into(),
-            )),
+            Expr::Import(imp) => self.compile_import_call(imp),
             Expr::MetaProp(_) => Err(StatorError::Internal(
                 "import.meta / new.target are not yet supported".into(),
             )),
@@ -2463,6 +2467,48 @@ impl FunctionCompiler {
         }
         self.allocator
             .release_temporary(callee_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Compile a dynamic `import(source)` or `import(source, options)` call.
+    ///
+    /// Emits `CallRuntime [RUNTIME_DYNAMIC_IMPORT, args_start, arg_count]`
+    /// so the interpreter can resolve the import and return a `Promise`.
+    fn compile_import_call(&mut self, imp: &crate::parser::ast::ImportExpr) -> StatorResult<()> {
+        // Compile the specifier into a register.
+        self.compile_expr(&imp.source)?;
+        let source_reg = self.allocator.allocate_temporary();
+        self.emit_star(source_reg);
+
+        // Optionally compile the options argument.
+        let options_reg = if let Some(opts) = &imp.options {
+            self.compile_expr(opts)?;
+            let r = self.allocator.allocate_temporary();
+            self.emit_star(r);
+            Some(r)
+        } else {
+            None
+        };
+
+        let arg_count = if options_reg.is_some() { 2u32 } else { 1u32 };
+
+        self.emit(Instruction::new_unchecked(
+            Opcode::CallRuntime,
+            vec![
+                Operand::RuntimeId(RUNTIME_DYNAMIC_IMPORT),
+                to_reg_op(source_reg),
+                Operand::RegisterCount(arg_count),
+            ],
+        ));
+
+        if let Some(r) = options_reg {
+            self.allocator
+                .release_temporary(r)
+                .map_err(|e| StatorError::Internal(e.to_string()))?;
+        }
+        self.allocator
+            .release_temporary(source_reg)
             .map_err(|e| StatorError::Internal(e.to_string()))?;
         Ok(())
     }
@@ -6494,6 +6540,53 @@ mod tests {
                 .count(),
             2,
             "elision must still advance the iterator"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_import_emits_call_runtime() {
+        use crate::parser::ast::ImportExpr;
+
+        let import_expr = Expr::Import(Box::new(ImportExpr {
+            loc: span(),
+            source: Box::new(str_expr("./mod.js")),
+            options: None,
+        }));
+        let prog = make_program(vec![Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(import_expr),
+        })]);
+        let ba = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = decode(&ba.bytecodes()).unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::CallRuntime),
+            "expected CallRuntime opcode for dynamic import"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_import_with_options_emits_call_runtime() {
+        use crate::parser::ast::ImportExpr;
+
+        let import_expr = Expr::Import(Box::new(ImportExpr {
+            loc: span(),
+            source: Box::new(str_expr("./mod.json")),
+            options: Some(Box::new(ident_expr("opts"))),
+        }));
+        let prog = make_program(vec![Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(import_expr),
+        })]);
+        let ba = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = decode(&ba.bytecodes()).unwrap();
+        let rt_call = instrs
+            .iter()
+            .find(|i| i.opcode == Opcode::CallRuntime)
+            .expect("expected CallRuntime");
+        assert_eq!(
+            rt_call.operands[2],
+            Operand::RegisterCount(2),
+            "import with options should have 2 args"
         );
     }
 }

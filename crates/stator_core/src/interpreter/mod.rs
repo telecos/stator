@@ -3435,11 +3435,36 @@ impl Interpreter {
                 //   functions are optimisation hints that are not
                 //   correctness-critical, so unrecognised IDs are no-ops.
                 Opcode::CallRuntime => {
-                    // Operands validated but the call itself is a stub.
-                    let Operand::RuntimeId(_runtime_id) = instr.operands[0] else {
+                    let Operand::RuntimeId(runtime_id) = instr.operands[0] else {
                         return Err(err_bad_operand("CallRuntime", 0));
                     };
-                    // No-op: accumulator is left unchanged.
+                    let Operand::Register(args_start_v) = instr.operands[1] else {
+                        return Err(err_bad_operand("CallRuntime", 1));
+                    };
+                    let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+                        return Err(err_bad_operand("CallRuntime", 2));
+                    };
+
+                    if runtime_id == crate::bytecode::bytecode_generator::RUNTIME_DYNAMIC_IMPORT {
+                        use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
+
+                        let args = collect_args(frame, args_start_v, arg_count)?;
+                        let specifier = args.first().cloned().unwrap_or(JsValue::Undefined);
+
+                        // Build a namespace object with a default export
+                        // equal to the specifier string (stub for now — a
+                        // full implementation would resolve a module).
+                        let ns = HashMap::new();
+                        let ns_val = JsValue::PlainObject(Rc::new(RefCell::new(ns)));
+
+                        let queue = MicrotaskQueue::new();
+                        let p = promise_resolve(ns_val, &queue);
+                        queue.drain();
+                        frame.accumulator = JsValue::Promise(p);
+
+                        let _ = specifier; // consumed for future use
+                    }
+                    // Unrecognised runtime IDs are no-ops.
                 }
 
                 // ── Named own property / lookup slot ─────────────────────────
@@ -10581,6 +10606,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_call_runtime_dynamic_import_returns_promise() {
+        use crate::bytecode::bytecode_generator::RUNTIME_DYNAMIC_IMPORT;
+        let ba = make_bytecode_with_pool(
+            vec![
+                // Load specifier string into r0.
+                Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(0)]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                // CallRuntime [RUNTIME_DYNAMIC_IMPORT, r0, 1]
+                Instruction::new_unchecked(
+                    Opcode::CallRuntime,
+                    vec![
+                        Operand::RuntimeId(RUNTIME_DYNAMIC_IMPORT),
+                        Operand::Register(0),
+                        Operand::RegisterCount(1),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("./mod.js".into())],
+            1,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert!(
+            matches!(result, JsValue::Promise(_)),
+            "expected Promise, got {result:?}"
+        );
     }
 
     // ── StaNamedOwnProperty ─────────────────────────────────────────────
