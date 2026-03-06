@@ -62,12 +62,12 @@ use crate::builtins::string::{
     string_char_code_at, string_code_point_at, string_concat, string_ends_with, string_fixed,
     string_fontcolor, string_fontsize, string_from_char_code, string_from_code_point,
     string_includes, string_index_of, string_is_well_formed, string_italics, string_iter,
-    string_last_index_of, string_link, string_match, string_match_all, string_normalize,
-    string_pad_end, string_pad_start, string_raw, string_repeat, string_replace,
+    string_last_index_of, string_link, string_locale_compare, string_match, string_match_all,
+    string_normalize, string_pad_end, string_pad_start, string_raw, string_repeat, string_replace,
     string_replace_all, string_search, string_slice, string_small, string_split,
     string_starts_with, string_strike, string_sub, string_substr, string_substring, string_sup,
-    string_to_lower_case, string_to_upper_case, string_to_well_formed, string_trim,
-    string_trim_end, string_trim_start,
+    string_to_locale_lower_case, string_to_locale_upper_case, string_to_lower_case,
+    string_to_upper_case, string_to_well_formed, string_trim, string_trim_end, string_trim_start,
 };
 use crate::builtins::symbol::{
     SYMBOL_ASYNC_ITERATOR, SYMBOL_HAS_INSTANCE, SYMBOL_IS_CONCAT_SPREADABLE, SYMBOL_ITERATOR,
@@ -3471,6 +3471,52 @@ fn make_string() -> JsValue {
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(JsValue::String(string_to_well_formed(&s)))
+        }),
+    );
+
+    // localeCompare(that)
+    proto.insert(
+        "localeCompare".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let that = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(num(string_locale_compare(&s, &that) as f64))
+        }),
+    );
+
+    // toLocaleLowerCase()
+    proto.insert(
+        "toLocaleLowerCase".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_to_locale_lower_case(&s)))
+        }),
+    );
+
+    // toLocaleUpperCase()
+    proto.insert(
+        "toLocaleUpperCase".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_to_locale_upper_case(&s)))
+        }),
+    );
+
+    // toString()
+    proto.insert(
+        "toString".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(s))
+        }),
+    );
+
+    // valueOf()
+    proto.insert(
+        "valueOf".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(s))
         }),
     );
 
