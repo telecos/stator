@@ -5495,9 +5495,13 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
 
     // ── globalThis (ECMAScript §19.1) ───────────────────────────────────
     // `globalThis` is a self-referential property of the global object.
-    // We represent the global object as a PlainObject snapshot.
-    let global_this = JsValue::PlainObject(Rc::new(RefCell::new(globals.clone())));
-    globals.insert("globalThis".into(), global_this);
+    // The inner map is shared via `Rc` so that `globalThis.globalThis`
+    // resolves back to the same object (configurable, writable, not enumerable).
+    let inner = Rc::new(RefCell::new(globals.clone()));
+    inner
+        .borrow_mut()
+        .insert("globalThis".into(), JsValue::PlainObject(Rc::clone(&inner)));
+    globals.insert("globalThis".into(), JsValue::PlainObject(inner));
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -7149,6 +7153,32 @@ mod tests {
             assert!(gt.contains_key("Math"));
             assert!(gt.contains_key("parseInt"));
             assert!(gt.contains_key("Iterator"));
+        } else {
+            panic!("globalThis should be a PlainObject");
+        }
+    }
+
+    /// `globalThis.globalThis` resolves back to the same object (self-referential).
+    #[test]
+    fn test_global_this_is_self_referential() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        if let Some(JsValue::PlainObject(gt)) = globals.get("globalThis") {
+            // globalThis.globalThis should exist and be a PlainObject
+            let inner = gt.borrow();
+            assert!(
+                inner.contains_key("globalThis"),
+                "globalThis should contain a 'globalThis' key"
+            );
+            if let Some(JsValue::PlainObject(gt2)) = inner.get("globalThis") {
+                // The inner Rc should point to the same allocation.
+                assert!(
+                    Rc::ptr_eq(gt, gt2),
+                    "globalThis.globalThis should be the same Rc"
+                );
+            } else {
+                panic!("globalThis.globalThis should be a PlainObject");
+            }
         } else {
             panic!("globalThis should be a PlainObject");
         }
