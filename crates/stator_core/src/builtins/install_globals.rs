@@ -409,9 +409,19 @@ fn json_value_to_js_value(jv: &crate::builtins::json::JsonValue) -> JsValue {
     }
 }
 
+/// A boxed replacer function for `JSON.stringify`.
+type JsonReplacerFn = Box<
+    dyn Fn(
+        &str,
+        &crate::builtins::json::JsonValue,
+    ) -> StatorResult<Option<crate::builtins::json::JsonValue>>,
+>;
+
 /// Build the `JSON` namespace object.
 fn make_json() -> JsValue {
-    use crate::builtins::json::{json_parse, json_stringify_js_value};
+    use crate::builtins::json::{
+        JsonReplacer, JsonSpace, JsonValue, js_value_to_json, json_parse, json_stringify_js_value,
+    };
 
     let mut props: HashMap<String, JsValue> = HashMap::new();
 
@@ -420,14 +430,75 @@ fn make_json() -> JsValue {
         native(|args| {
             let text = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             let json_val = json_parse(&text, None)?;
-            Ok(json_value_to_js_value(&json_val))
+            let js_val = json_value_to_js_value(&json_val);
+
+            // §25.5.1 — apply the optional reviver function bottom-up.
+            match args.get(1) {
+                Some(JsValue::NativeFunction(reviver)) => apply_js_reviver(js_val, "", reviver),
+                _ => Ok(js_val),
+            }
         }),
     );
     props.insert(
         "stringify".into(),
         native(|args| {
             let val = args.first().unwrap_or(&JsValue::Undefined);
-            match json_stringify_js_value(val, None, None)? {
+
+            // Build optional replacer function closure from the second argument.
+            let repl_fn_closure: Option<JsonReplacerFn> = match args.get(1) {
+                Some(JsValue::NativeFunction(f)) => {
+                    let f = f.clone();
+                    Some(Box::new(
+                        move |key: &str, val: &JsonValue| -> StatorResult<Option<JsonValue>> {
+                            let js_key = JsValue::String(key.to_string());
+                            let js_val = json_value_to_js_value(val);
+                            let result = f(vec![js_key, js_val])?;
+                            match result {
+                                JsValue::Undefined => Ok(None),
+                                other => match js_value_to_json(&other)? {
+                                    Some(jv) => Ok(Some(jv)),
+                                    None => Ok(None),
+                                },
+                            }
+                        },
+                    ))
+                }
+                _ => None,
+            };
+
+            // Build optional replacer array from the second argument.
+            let repl_strings: Vec<String> = match args.get(1) {
+                Some(JsValue::Array(items)) => items
+                    .iter()
+                    .filter_map(|v| {
+                        if let JsValue::String(s) = v {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+
+            // Assemble the JsonReplacer enum.
+            let replacer: Option<JsonReplacer<'_>> = if let Some(ref f) = repl_fn_closure {
+                Some(JsonReplacer::Function(f.as_ref()))
+            } else if matches!(args.get(1), Some(JsValue::Array(_))) {
+                Some(JsonReplacer::Array(repl_strings))
+            } else {
+                None
+            };
+
+            // Build optional space from the third argument.
+            let space: Option<JsonSpace> = match args.get(2) {
+                Some(JsValue::Smi(n)) => Some(JsonSpace::Count((*n).max(0) as u32)),
+                Some(JsValue::HeapNumber(n)) => Some(JsonSpace::Count(n.clamp(0.0, 10.0) as u32)),
+                Some(JsValue::String(s)) => Some(JsonSpace::Str(s.clone())),
+                _ => None,
+            };
+
+            match json_stringify_js_value(val, replacer.as_ref(), space.as_ref())? {
                 Some(s) => Ok(JsValue::String(s)),
                 None => Ok(JsValue::Undefined),
             }
@@ -435,6 +506,40 @@ fn make_json() -> JsValue {
     );
 
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+/// Walk a `JsValue` tree bottom-up, calling `reviver(key, value)` at each
+/// node — the ECMAScript `InternalizeJSONProperty` algorithm (§25.5.1.1).
+fn apply_js_reviver(
+    value: JsValue,
+    key: &str,
+    reviver: &crate::objects::value::NativeFn,
+) -> StatorResult<JsValue> {
+    let value = match value {
+        JsValue::PlainObject(ref map) => {
+            let keys: Vec<String> = map.borrow().keys().cloned().collect();
+            for k in keys {
+                let child = map.borrow().get(&k).cloned().unwrap_or(JsValue::Undefined);
+                let new_child = apply_js_reviver(child, &k, reviver)?;
+                if matches!(new_child, JsValue::Undefined) {
+                    map.borrow_mut().remove(&k);
+                } else {
+                    map.borrow_mut().insert(k, new_child);
+                }
+            }
+            value
+        }
+        JsValue::Array(ref items) => {
+            let mut new_items = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let new_item = apply_js_reviver(item.clone(), &i.to_string(), reviver)?;
+                new_items.push(new_item);
+            }
+            JsValue::Array(Rc::new(new_items))
+        }
+        other => other,
+    };
+    reviver(vec![JsValue::String(key.to_string()), value])
 }
 
 // ── Number constructor ───────────────────────────────────────────────────────
@@ -4503,6 +4608,186 @@ mod tests {
     fn e2e_json_parse() {
         let result = global_eval("JSON.parse(\"42\")").unwrap();
         assert_eq!(result, JsValue::Smi(42));
+    }
+
+    // ── JSON Phase 2: stringify with space ──────────────────────────────────
+
+    #[test]
+    fn e2e_json_stringify_with_space() {
+        use crate::builtins::json::{JsonSpace, JsonValue, json_stringify};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let obj = JsonValue::Object(Rc::new(RefCell::new(vec![(
+            "x".to_string(),
+            JsonValue::Number(1.0),
+        )])));
+        let s = json_stringify(&obj, None, Some(&JsonSpace::Count(2)), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s, "{\n  \"x\": 1\n}");
+    }
+
+    // ── JSON Phase 2: stringify replacer function ───────────────────────────
+
+    #[test]
+    fn e2e_json_stringify_replacer_fn() {
+        use crate::builtins::json::{JsonReplacer, JsonValue, json_stringify};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let obj = JsonValue::Object(Rc::new(RefCell::new(vec![
+            ("a".to_string(), JsonValue::Number(1.0)),
+            ("b".to_string(), JsonValue::Number(2.0)),
+        ])));
+        let replacer = JsonReplacer::Function(&|key, val| {
+            if key == "b" {
+                Ok(None)
+            } else {
+                Ok(Some(val.clone()))
+            }
+        });
+        let s = json_stringify(&obj, Some(&replacer), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s, r#"{"a":1}"#);
+    }
+
+    // ── JSON Phase 2: stringify NaN / Infinity → null ───────────────────────
+
+    #[test]
+    fn e2e_json_stringify_nan_infinity() {
+        use crate::builtins::json::json_stringify_js_value;
+
+        let s = json_stringify_js_value(&JsValue::HeapNumber(f64::NAN), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s, "null");
+
+        let s = json_stringify_js_value(&JsValue::HeapNumber(f64::INFINITY), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s, "null");
+    }
+
+    // ── JSON Phase 2: stringify BigInt → TypeError ──────────────────────────
+
+    #[test]
+    fn e2e_json_stringify_bigint_error() {
+        use crate::builtins::json::json_stringify_js_value;
+
+        let result = json_stringify_js_value(&JsValue::BigInt(42), None, None);
+        assert!(result.is_err());
+    }
+
+    // ── JSON Phase 2: parse reviver ─────────────────────────────────────────
+
+    #[test]
+    fn e2e_json_parse_reviver() {
+        use crate::builtins::json::{JsonValue, json_parse};
+
+        let v = json_parse(
+            "[1, 2, 3]",
+            Some(&|_key, val| {
+                Ok(match val {
+                    JsonValue::Number(n) => JsonValue::Number(n * 10.0),
+                    other => other,
+                })
+            }),
+        )
+        .unwrap();
+        if let JsonValue::Array(arr) = &v {
+            let b = arr.borrow();
+            assert_eq!(b[0], JsonValue::Number(10.0));
+            assert_eq!(b[1], JsonValue::Number(20.0));
+            assert_eq!(b[2], JsonValue::Number(30.0));
+        } else {
+            panic!("expected array");
+        }
+    }
+
+    // ── JSON Phase 2: stringify toJSON method ───────────────────────────────
+
+    #[test]
+    fn e2e_json_stringify_to_json_method() {
+        use crate::builtins::json::json_stringify_js_value;
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+
+        // Build a PlainObject with a toJSON method.
+        let mut inner: HashMap<String, JsValue> = HashMap::new();
+        inner.insert("value".into(), JsValue::Smi(42));
+        inner.insert(
+            "toJSON".into(),
+            JsValue::NativeFunction(Rc::new(|_args| {
+                Ok(JsValue::String("custom-serialized".into()))
+            })),
+        );
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(inner)));
+
+        let s = json_stringify_js_value(&obj, None, None).unwrap().unwrap();
+        assert_eq!(s, r#""custom-serialized""#);
+    }
+
+    // ── JSON Phase 2: apply_js_reviver ──────────────────────────────────────
+
+    #[test]
+    fn test_apply_js_reviver_doubles_numbers() {
+        use crate::builtins::json::{JsonValue, json_parse};
+        use std::rc::Rc;
+
+        let json_val = json_parse("[1, 2, 3]", None).unwrap();
+        let js_val = json_value_to_js_value(&json_val);
+
+        let reviver: crate::objects::value::NativeFn = Rc::new(|args| {
+            let val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            match val {
+                JsValue::Smi(n) => Ok(JsValue::Smi(n * 2)),
+                other => Ok(other),
+            }
+        });
+
+        let result = apply_js_reviver(js_val, "", &reviver).unwrap();
+        // The top-level array itself is passed through the reviver too,
+        // so the result should be the array (reviver returns it unchanged).
+        if let JsValue::Array(arr) = result {
+            assert_eq!(arr[0], JsValue::Smi(2));
+            assert_eq!(arr[1], JsValue::Smi(4));
+            assert_eq!(arr[2], JsValue::Smi(6));
+        } else {
+            panic!("expected array, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_apply_js_reviver_removes_undefined() {
+        use crate::builtins::json::json_parse;
+        use std::rc::Rc;
+
+        let json_val = json_parse(r#"{"a":1,"b":2,"c":3}"#, None).unwrap();
+        let js_val = json_value_to_js_value(&json_val);
+
+        // Remove "b" by returning undefined
+        let reviver: crate::objects::value::NativeFn = Rc::new(|args| {
+            let key = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            if key == JsValue::String("b".into()) {
+                Ok(JsValue::Undefined)
+            } else {
+                Ok(val)
+            }
+        });
+
+        let result = apply_js_reviver(js_val, "", &reviver).unwrap();
+        if let JsValue::PlainObject(map) = result {
+            let m = map.borrow();
+            assert!(m.contains_key("a"));
+            assert!(!m.contains_key("b"), "key 'b' should be removed");
+            assert!(m.contains_key("c"));
+        } else {
+            panic!("expected PlainObject");
+        }
     }
 
     /// `Array.isArray` is accessible on the global `Array` object.
