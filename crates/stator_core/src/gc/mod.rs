@@ -4,6 +4,9 @@ pub mod gc_ptr;
 pub mod handle;
 /// Heap allocator with generational memory regions.
 pub mod heap;
+/// Immix-style regional GC: 32 KiB blocks, 128 B line-granularity marking,
+/// opportunistic evacuation, TLABs, and concurrent old-gen marking.
+pub mod immix;
 /// Incremental/concurrent GC: budget-based marking, concurrent sweeping,
 /// idle-time collection, and GC metrics for sub-1 ms pauses.
 pub mod incremental;
