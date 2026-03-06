@@ -6,6 +6,8 @@ pub mod js_array;
 pub mod js_function;
 /// JavaScript ordinary objects with in-object, overflow, and element storage.
 pub mod js_object;
+/// String interning and forwarding types for property-key deduplication.
+pub mod js_string;
 /// Hidden class ([`map::Map`]) and instance-type tag for heap objects.
 pub mod map;
 /// NaN-boxed (tagged-pointer) 64-bit value representation ([issue #265]).

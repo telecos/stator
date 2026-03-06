@@ -39,6 +39,10 @@ pub enum InstanceType {
     // ── String types ─────────────────────────────────────────────────────────
     /// A JavaScript string value.
     JsString = 0x0800,
+    /// An interned string for O(1) property-key identity comparison.
+    InternalizedString = 0x0808,
+    /// A forwarding pointer to an [`InternalizedString`] after internalization.
+    ThinString = 0x0810,
 
     // ── JavaScript object types ───────────────────────────────────────────────
     /// A plain JavaScript object (`{}`).
@@ -284,6 +288,8 @@ mod tests {
             InstanceType::BigInt,
             InstanceType::Symbol,
             InstanceType::JsString,
+            InstanceType::InternalizedString,
+            InstanceType::ThinString,
             InstanceType::JsObject,
             InstanceType::JsArray,
             InstanceType::JsFunction,
@@ -300,8 +306,8 @@ mod tests {
             InstanceType::JsGeneratorObject,
             InstanceType::JsAsyncFunctionObject,
         ];
-        // Verify all 25 variants exist.
-        assert_eq!(types.len(), 25);
+        // Verify all 27 variants exist.
+        assert_eq!(types.len(), 27);
         // Verify every discriminant value is unique (O(n) via a HashSet).
         let discriminants: std::collections::HashSet<u16> =
             types.iter().map(|&t| t as u16).collect();
