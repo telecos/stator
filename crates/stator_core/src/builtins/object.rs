@@ -20,6 +20,7 @@ use std::rc::Rc;
 use crate::error::{StatorError, StatorResult};
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
+use crate::objects::property_descriptor::FullPropertyDescriptor;
 use crate::objects::value::JsValue;
 
 // ── Object.create ─────────────────────────────────────────────────────────────
@@ -389,6 +390,86 @@ pub fn object_get_own_property_descriptors(
 /// symbol-keyed properties.
 pub fn object_get_own_property_symbols(_obj: &JsObject) -> Vec<JsValue> {
     Vec::new()
+}
+
+// ── Object.defineProperty (descriptor object) ────────────────────────────────
+
+/// ECMAScript §20.1.2.4 `Object.defineProperty(obj, key, descriptorObj)`.
+///
+/// Accepts a [`JsValue::PlainObject`] descriptor (as JS code would pass) and
+/// converts it to a [`FullPropertyDescriptor`] before applying it.
+///
+/// Returns [`StatorError::TypeError`] if the descriptor mixes data and
+/// accessor fields, or if the redefinition violates non-configurable
+/// invariants.
+pub fn object_define_property_from_descriptor(
+    obj: &mut JsObject,
+    key: &str,
+    descriptor: &JsValue,
+) -> StatorResult<()> {
+    let desc = FullPropertyDescriptor::from_object(descriptor)?;
+    let attrs = if let Some((_, current_attrs)) = obj.get_own_property_descriptor(key) {
+        desc.validate_against(key, current_attrs)?
+    } else {
+        desc.to_attributes()
+    };
+
+    let value = match &desc {
+        FullPropertyDescriptor::Data { value, .. } => value.clone(),
+        FullPropertyDescriptor::Accessor { .. } | FullPropertyDescriptor::Generic { .. } => {
+            // For accessor/generic descriptors, preserve the existing value
+            // if present, otherwise use undefined.
+            obj.get_own_property(key).unwrap_or(JsValue::Undefined)
+        }
+    };
+    obj.define_own_property(key, value, attrs)
+}
+
+// ── Object.defineProperties ──────────────────────────────────────────────────
+
+/// ECMAScript §20.1.2.3 `Object.defineProperties(obj, props)`.
+///
+/// For each own enumerable property of `props`, extracts a
+/// [`FullPropertyDescriptor`] and applies it to `obj` via
+/// [`object_define_property_from_descriptor`].
+pub fn object_define_properties(obj: &mut JsObject, props: &JsValue) -> StatorResult<()> {
+    let entries: Vec<(String, JsValue)> = match props {
+        JsValue::PlainObject(map) => map
+            .borrow()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        _ => {
+            return Err(StatorError::TypeError(
+                "Property descriptor must be an object".to_string(),
+            ));
+        }
+    };
+    for (key, desc_val) in &entries {
+        object_define_property_from_descriptor(obj, key, desc_val)?;
+    }
+    Ok(())
+}
+
+// ── Object.getOwnPropertyDescriptor (as descriptor object) ──────────────────
+
+/// ECMAScript §20.1.2.8 `Object.getOwnPropertyDescriptor(obj, key)` — returns
+/// a descriptor *object*.
+///
+/// Wraps the internal `(value, attributes)` pair into a
+/// [`FullPropertyDescriptor::Data`] and converts it to a
+/// [`JsValue::PlainObject`] with `value`, `writable`, `enumerable`, and
+/// `configurable` keys.
+pub fn object_get_own_property_descriptor_as_object(obj: &JsObject, key: &str) -> Option<JsValue> {
+    obj.get_own_property_descriptor(key).map(|(value, attrs)| {
+        let desc = FullPropertyDescriptor::Data {
+            value,
+            writable: attrs.contains(PropertyAttributes::WRITABLE),
+            enumerable: attrs.contains(PropertyAttributes::ENUMERABLE),
+            configurable: attrs.contains(PropertyAttributes::CONFIGURABLE),
+        };
+        desc.to_object()
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -926,5 +1007,223 @@ mod tests {
         let mut obj = JsObject::new();
         obj.set_property("x", JsValue::Smi(1)).unwrap();
         assert!(object_get_own_property_symbols(&obj).is_empty());
+    }
+
+    // ── object_define_property_from_descriptor ───────────────────────────
+
+    #[test]
+    fn test_define_property_from_data_descriptor() {
+        use std::collections::HashMap;
+        let mut obj = JsObject::new();
+        let mut desc_map = HashMap::new();
+        desc_map.insert("value".to_string(), JsValue::Smi(42));
+        desc_map.insert("writable".to_string(), JsValue::Boolean(true));
+        desc_map.insert("enumerable".to_string(), JsValue::Boolean(true));
+        desc_map.insert("configurable".to_string(), JsValue::Boolean(true));
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+
+        object_define_property_from_descriptor(&mut obj, "x", &desc).unwrap();
+        assert_eq!(obj.get_own_property("x"), Some(JsValue::Smi(42)));
+        // Verify attributes via get_own_property_descriptor.
+        let (_, attrs) = obj.get_own_property_descriptor("x").unwrap();
+        assert!(attrs.contains(PropertyAttributes::WRITABLE));
+        assert!(attrs.contains(PropertyAttributes::ENUMERABLE));
+        assert!(attrs.contains(PropertyAttributes::CONFIGURABLE));
+    }
+
+    #[test]
+    fn test_define_property_from_descriptor_non_writable() {
+        use std::collections::HashMap;
+        let mut obj = JsObject::new();
+        let mut desc_map = HashMap::new();
+        desc_map.insert("value".to_string(), JsValue::Smi(7));
+        desc_map.insert("writable".to_string(), JsValue::Boolean(false));
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+
+        object_define_property_from_descriptor(&mut obj, "ro", &desc).unwrap();
+        // Attempt to write should fail.
+        let err = obj.set_property("ro", JsValue::Smi(99));
+        assert!(matches!(err, Err(StatorError::TypeError(_))));
+        // Value stays the same.
+        assert_eq!(obj.get_own_property("ro"), Some(JsValue::Smi(7)));
+    }
+
+    #[test]
+    fn test_define_property_from_descriptor_rejects_mixed() {
+        use std::collections::HashMap;
+        let mut obj = JsObject::new();
+        let mut desc_map = HashMap::new();
+        desc_map.insert("value".to_string(), JsValue::Smi(1));
+        desc_map.insert("get".to_string(), JsValue::Undefined);
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+
+        let err = object_define_property_from_descriptor(&mut obj, "bad", &desc);
+        assert!(matches!(err, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn test_define_property_from_descriptor_non_configurable_redefine_rejected() {
+        use std::collections::HashMap;
+        let mut obj = JsObject::new();
+        // First: define non-configurable property.
+        obj.define_own_property("nc", JsValue::Smi(1), PropertyAttributes::WRITABLE)
+            .unwrap();
+        // Try to make it configurable.
+        let mut desc_map = HashMap::new();
+        desc_map.insert("value".to_string(), JsValue::Smi(2));
+        desc_map.insert("configurable".to_string(), JsValue::Boolean(true));
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+
+        let err = object_define_property_from_descriptor(&mut obj, "nc", &desc);
+        assert!(matches!(err, Err(StatorError::TypeError(_))));
+    }
+
+    // ── object_define_properties ─────────────────────────────────────────
+
+    #[test]
+    fn test_define_properties_multiple_keys() {
+        use std::collections::HashMap;
+        let mut obj = JsObject::new();
+
+        let mut desc_a = HashMap::new();
+        desc_a.insert("value".to_string(), JsValue::Smi(10));
+        desc_a.insert("writable".to_string(), JsValue::Boolean(true));
+        desc_a.insert("enumerable".to_string(), JsValue::Boolean(true));
+        desc_a.insert("configurable".to_string(), JsValue::Boolean(true));
+
+        let mut desc_b = HashMap::new();
+        desc_b.insert("value".to_string(), JsValue::Smi(20));
+        desc_b.insert("writable".to_string(), JsValue::Boolean(false));
+        desc_b.insert("enumerable".to_string(), JsValue::Boolean(false));
+        desc_b.insert("configurable".to_string(), JsValue::Boolean(false));
+
+        let mut props_map = HashMap::new();
+        props_map.insert(
+            "a".to_string(),
+            JsValue::PlainObject(Rc::new(RefCell::new(desc_a))),
+        );
+        props_map.insert(
+            "b".to_string(),
+            JsValue::PlainObject(Rc::new(RefCell::new(desc_b))),
+        );
+        let props = JsValue::PlainObject(Rc::new(RefCell::new(props_map)));
+
+        object_define_properties(&mut obj, &props).unwrap();
+        assert_eq!(obj.get_own_property("a"), Some(JsValue::Smi(10)));
+        assert_eq!(obj.get_own_property("b"), Some(JsValue::Smi(20)));
+
+        // 'a' is writable and enumerable.
+        let (_, a_attrs) = obj.get_own_property_descriptor("a").unwrap();
+        assert!(a_attrs.contains(PropertyAttributes::WRITABLE));
+        assert!(a_attrs.contains(PropertyAttributes::ENUMERABLE));
+
+        // 'b' is non-writable and non-enumerable.
+        let (_, b_attrs) = obj.get_own_property_descriptor("b").unwrap();
+        assert!(!b_attrs.contains(PropertyAttributes::WRITABLE));
+        assert!(!b_attrs.contains(PropertyAttributes::ENUMERABLE));
+    }
+
+    #[test]
+    fn test_define_properties_rejects_non_object() {
+        let mut obj = JsObject::new();
+        let err = object_define_properties(&mut obj, &JsValue::Smi(1));
+        assert!(matches!(err, Err(StatorError::TypeError(_))));
+    }
+
+    // ── object_get_own_property_descriptor_as_object ─────────────────────
+
+    #[test]
+    fn test_get_own_property_descriptor_as_object_data() {
+        let mut obj = JsObject::new();
+        let attrs = PropertyAttributes::WRITABLE | PropertyAttributes::ENUMERABLE;
+        obj.define_own_property("k", JsValue::Smi(5), attrs)
+            .unwrap();
+
+        let desc_obj = object_get_own_property_descriptor_as_object(&obj, "k");
+        assert!(desc_obj.is_some());
+        let desc_obj = desc_obj.unwrap();
+        if let JsValue::PlainObject(map) = &desc_obj {
+            let map = map.borrow();
+            assert_eq!(map.get("value"), Some(&JsValue::Smi(5)));
+            assert_eq!(map.get("writable"), Some(&JsValue::Boolean(true)));
+            assert_eq!(map.get("enumerable"), Some(&JsValue::Boolean(true)));
+            assert_eq!(map.get("configurable"), Some(&JsValue::Boolean(false)));
+        } else {
+            panic!("expected PlainObject");
+        }
+    }
+
+    #[test]
+    fn test_get_own_property_descriptor_as_object_missing() {
+        let obj = JsObject::new();
+        assert!(object_get_own_property_descriptor_as_object(&obj, "nope").is_none());
+    }
+
+    // ── Property enforcement via freeze/seal with descriptors ────────────
+
+    #[test]
+    fn test_freeze_sets_non_writable_non_configurable() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        object_freeze(&mut obj).unwrap();
+
+        let desc_obj = object_get_own_property_descriptor_as_object(&obj, "x").unwrap();
+        if let JsValue::PlainObject(map) = &desc_obj {
+            let map = map.borrow();
+            assert_eq!(map.get("writable"), Some(&JsValue::Boolean(false)));
+            assert_eq!(map.get("configurable"), Some(&JsValue::Boolean(false)));
+        } else {
+            panic!("expected PlainObject");
+        }
+    }
+
+    #[test]
+    fn test_seal_sets_non_configurable_preserves_writable() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        object_seal(&mut obj).unwrap();
+
+        let desc_obj = object_get_own_property_descriptor_as_object(&obj, "x").unwrap();
+        if let JsValue::PlainObject(map) = &desc_obj {
+            let map = map.borrow();
+            // Writable is preserved (it was true from set_property).
+            assert_eq!(map.get("writable"), Some(&JsValue::Boolean(true)));
+            assert_eq!(map.get("configurable"), Some(&JsValue::Boolean(false)));
+        } else {
+            panic!("expected PlainObject");
+        }
+    }
+
+    #[test]
+    fn test_non_enumerable_property_hidden_from_keys() {
+        use std::collections::HashMap;
+        let mut obj = JsObject::new();
+        let mut desc_map = HashMap::new();
+        desc_map.insert("value".to_string(), JsValue::Smi(42));
+        desc_map.insert("writable".to_string(), JsValue::Boolean(true));
+        desc_map.insert("enumerable".to_string(), JsValue::Boolean(false));
+        desc_map.insert("configurable".to_string(), JsValue::Boolean(true));
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+
+        object_define_property_from_descriptor(&mut obj, "hidden", &desc).unwrap();
+        let keys = object_keys(&obj);
+        assert!(!keys.contains(&"hidden".to_string()));
+        // But Object.getOwnPropertyNames includes it.
+        let names = object_get_own_property_names(&obj);
+        assert!(names.contains(&"hidden".to_string()));
+    }
+
+    #[test]
+    fn test_non_configurable_property_cannot_be_deleted() {
+        use std::collections::HashMap;
+        let mut obj = JsObject::new();
+        let mut desc_map = HashMap::new();
+        desc_map.insert("value".to_string(), JsValue::Smi(1));
+        desc_map.insert("configurable".to_string(), JsValue::Boolean(false));
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+
+        object_define_property_from_descriptor(&mut obj, "sticky", &desc).unwrap();
+        let deleted = obj.delete_own_property("sticky").unwrap();
+        assert!(!deleted);
     }
 }
