@@ -172,6 +172,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::builtins::error::{pop_call_frame, push_call_frame};
+use crate::builtins::proxy::{proxy_get, proxy_set};
 use crate::builtins::symbol::symbol_description;
 use crate::bytecode::bytecode_array::{
     BytecodeArray, ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD,
@@ -1725,6 +1726,10 @@ pub(super) fn to_property_key(key: &JsValue) -> StatorResult<String> {
 /// Returns `JsValue::Undefined` if the property is not found after exhausting
 /// the chain or hitting a depth limit of 256 links.
 pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
+    // Handle JsValue::Proxy — delegate to the proxy get trap.
+    if let JsValue::Proxy(p) = obj {
+        return proxy_get(&p.borrow(), key).unwrap_or(JsValue::Undefined);
+    }
     // Handle JsValue::Symbol — expose description, toString, valueOf.
     if let JsValue::Symbol(id) = obj {
         let id = *id;
@@ -1859,6 +1864,10 @@ pub(super) fn wire_construct_prototype(result: JsValue, ctor_proto: &JsValue) ->
 
 pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> {
     match obj {
+        JsValue::Proxy(_) => {
+            let prop_name = to_property_key(key)?;
+            Ok(proto_lookup(obj, &prop_name))
+        }
         JsValue::PlainObject(_map) => {
             let prop_name = to_property_key(key)?;
             Ok(proto_lookup(obj, &prop_name))
@@ -1904,6 +1913,10 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
 /// silently discarded (matching the existing `StaNamedProperty` behaviour).
 pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> StatorResult<()> {
     match obj {
+        JsValue::Proxy(p) => {
+            let prop_name = to_property_key(key)?;
+            let _ = proxy_set(&mut p.borrow_mut(), &prop_name, value)?;
+        }
         JsValue::PlainObject(map) => {
             let prop_name = to_property_key(key)?;
             map.borrow_mut().insert(prop_name, value);

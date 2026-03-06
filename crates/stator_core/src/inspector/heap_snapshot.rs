@@ -294,6 +294,7 @@ impl HeapSnapshotBuilder {
             JsValue::Generator(_) | JsValue::Iterator(_) | JsValue::Error(_) => NODE_TYPE_OBJECT,
             JsValue::Promise(_) => NODE_TYPE_OBJECT,
             JsValue::Context(_) => NODE_TYPE_OBJECT,
+            JsValue::Proxy(_) => NODE_TYPE_OBJECT,
         }
     }
 
@@ -342,6 +343,7 @@ impl HeapSnapshotBuilder {
             }
             JsValue::Promise(_) => "Promise".to_string(),
             JsValue::Context(_) => "Context".to_string(),
+            JsValue::Proxy(_) => "Proxy".to_string(),
         }
     }
 

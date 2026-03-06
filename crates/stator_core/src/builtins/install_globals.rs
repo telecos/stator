@@ -73,6 +73,13 @@ use crate::builtins::math::{
     math_min, math_pow, math_random, math_round, math_sign, math_sin, math_sinh, math_sqrt,
     math_tan, math_tanh, math_trunc,
 };
+use crate::builtins::proxy::{ProxyHandler, proxy_new, proxy_revocable, proxy_revoke};
+use crate::builtins::reflect::{
+    reflect_define_property, reflect_delete_property, reflect_get,
+    reflect_get_own_property_descriptor, reflect_get_prototype_of, reflect_has,
+    reflect_is_extensible, reflect_own_keys, reflect_prevent_extensions, reflect_set,
+    reflect_set_prototype_of,
+};
 use crate::builtins::regexp::regexp_construct;
 use crate::builtins::set::{
     SetIteratorKind, set_add, set_clear, set_create_iterator, set_delete, set_from_iterable,
@@ -102,6 +109,8 @@ use crate::builtins::weak_map::{
 use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new};
 use crate::builtins::weak_set::{weak_set_add, weak_set_delete, weak_set_has, weak_set_new};
 use crate::error::{StatorError, StatorResult};
+use crate::objects::js_object::JsObject;
+use crate::objects::map::PropertyAttributes;
 use crate::objects::value::JsValue;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -5339,6 +5348,330 @@ fn make_intl() -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(ns)))
 }
 
+// ── Proxy ────────────────────────────────────────────────────────────────────
+
+/// Build the `Proxy` constructor namespace.
+///
+/// Provides `Proxy(target, handler)` as a callable constructor and
+/// `Proxy.revocable(target, handler)` as a static method.
+fn make_proxy() -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    // Proxy as a constructor: new Proxy(target, handler)
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let target_val = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let handler_val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            // target must be an object-like value
+            let target = match &target_val {
+                JsValue::PlainObject(map) => {
+                    let mut obj = JsObject::new();
+                    for (k, v) in map.borrow().iter() {
+                        obj.set_property(k, v.clone()).ok();
+                    }
+                    obj
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "Proxy: target must be an object".to_string(),
+                    ));
+                }
+            };
+            // Build a ProxyHandler from the handler PlainObject's trap functions
+            let handler = build_proxy_handler(&handler_val);
+            let proxy = proxy_new(target, handler);
+            Ok(JsValue::Proxy(Rc::new(RefCell::new(proxy))))
+        }),
+    );
+
+    // Proxy.revocable(target, handler)
+    props.insert(
+        "revocable".into(),
+        native(|args| {
+            let target_val = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let handler_val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let target = match &target_val {
+                JsValue::PlainObject(map) => {
+                    let mut obj = JsObject::new();
+                    for (k, v) in map.borrow().iter() {
+                        obj.set_property(k, v.clone()).ok();
+                    }
+                    obj
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "Proxy.revocable: target must be an object".to_string(),
+                    ));
+                }
+            };
+            let handler = build_proxy_handler(&handler_val);
+            let proxy = proxy_revocable(target, handler);
+            let proxy_rc = Rc::new(RefCell::new(proxy));
+            let proxy_val = JsValue::Proxy(Rc::clone(&proxy_rc));
+            let revoke_fn = JsValue::NativeFunction(Rc::new(move |_args| {
+                proxy_revoke(&mut proxy_rc.borrow_mut());
+                Ok(JsValue::Undefined)
+            }));
+            let mut result = HashMap::new();
+            result.insert("proxy".to_string(), proxy_val);
+            result.insert("revoke".to_string(), revoke_fn);
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
+        }),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+/// Extract proxy handler traps from a JS handler object.
+fn build_proxy_handler(handler_val: &JsValue) -> ProxyHandler {
+    let mut handler = ProxyHandler::default();
+    if let JsValue::PlainObject(map) = handler_val {
+        let borrow = map.borrow();
+
+        if let Some(JsValue::NativeFunction(f)) = borrow.get("get").cloned() {
+            handler.get = Some(Box::new(move |_target, key| {
+                f(vec![JsValue::Undefined, JsValue::String(key.to_string())])
+            }));
+        }
+        if let Some(JsValue::NativeFunction(f)) = borrow.get("set").cloned() {
+            handler.set = Some(Box::new(move |_target, key, value| {
+                let result = f(vec![
+                    JsValue::Undefined,
+                    JsValue::String(key.to_string()),
+                    value,
+                ])?;
+                Ok(result.to_boolean())
+            }));
+        }
+        if let Some(JsValue::NativeFunction(f)) = borrow.get("has").cloned() {
+            handler.has = Some(Box::new(move |_target, key| {
+                let result = f(vec![JsValue::Undefined, JsValue::String(key.to_string())])?;
+                Ok(result.to_boolean())
+            }));
+        }
+        if let Some(JsValue::NativeFunction(f)) = borrow.get("deleteProperty").cloned() {
+            handler.delete_property = Some(Box::new(move |_target, key| {
+                let result = f(vec![JsValue::Undefined, JsValue::String(key.to_string())])?;
+                Ok(result.to_boolean())
+            }));
+        }
+        if let Some(JsValue::NativeFunction(f)) = borrow.get("apply").cloned() {
+            handler.apply = Some(Box::new(move |this, args| {
+                f(vec![
+                    JsValue::Undefined,
+                    this,
+                    JsValue::Array(Rc::new(args)),
+                ])
+            }));
+        }
+    }
+    handler
+}
+
+// ── Reflect ──────────────────────────────────────────────────────────────────
+
+/// Build the `Reflect` namespace object with all 13 static methods.
+fn make_reflect() -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    props.insert(
+        "get".into(),
+        native(|args| {
+            let target = require_object_arg(&args, 0, "Reflect.get")?;
+            let key = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(reflect_get(&target, &key))
+        }),
+    );
+
+    props.insert(
+        "set".into(),
+        native(|args| {
+            let mut target = require_object_arg(&args, 0, "Reflect.set")?;
+            let key = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let value = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+            Ok(JsValue::Boolean(reflect_set(&mut target, &key, value)?))
+        }),
+    );
+
+    props.insert(
+        "has".into(),
+        native(|args| {
+            let target = require_object_arg(&args, 0, "Reflect.has")?;
+            let key = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::Boolean(reflect_has(&target, &key)))
+        }),
+    );
+
+    props.insert(
+        "deleteProperty".into(),
+        native(|args| {
+            let mut target = require_object_arg(&args, 0, "Reflect.deleteProperty")?;
+            let key = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::Boolean(reflect_delete_property(
+                &mut target,
+                &key,
+            )?))
+        }),
+    );
+
+    props.insert(
+        "defineProperty".into(),
+        native(|args| {
+            let mut target = require_object_arg(&args, 0, "Reflect.defineProperty")?;
+            let key = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let value = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+            let attrs = PropertyAttributes::WRITABLE
+                | PropertyAttributes::ENUMERABLE
+                | PropertyAttributes::CONFIGURABLE;
+            Ok(JsValue::Boolean(reflect_define_property(
+                &mut target,
+                &key,
+                value,
+                attrs,
+            )?))
+        }),
+    );
+
+    props.insert(
+        "getOwnPropertyDescriptor".into(),
+        native(|args| {
+            let target = require_object_arg(&args, 0, "Reflect.getOwnPropertyDescriptor")?;
+            let key = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            match reflect_get_own_property_descriptor(&target, &key) {
+                Some((val, attrs)) => {
+                    let mut desc = HashMap::new();
+                    desc.insert("value".to_string(), val);
+                    desc.insert(
+                        "writable".to_string(),
+                        JsValue::Boolean(attrs.contains(PropertyAttributes::WRITABLE)),
+                    );
+                    desc.insert(
+                        "enumerable".to_string(),
+                        JsValue::Boolean(attrs.contains(PropertyAttributes::ENUMERABLE)),
+                    );
+                    desc.insert(
+                        "configurable".to_string(),
+                        JsValue::Boolean(attrs.contains(PropertyAttributes::CONFIGURABLE)),
+                    );
+                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(desc))))
+                }
+                None => Ok(JsValue::Undefined),
+            }
+        }),
+    );
+
+    props.insert(
+        "getPrototypeOf".into(),
+        native(|args| {
+            let target = require_object_arg(&args, 0, "Reflect.getPrototypeOf")?;
+            match reflect_get_prototype_of(&target) {
+                Some(_) => Ok(JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())))),
+                None => Ok(JsValue::Null),
+            }
+        }),
+    );
+
+    props.insert(
+        "setPrototypeOf".into(),
+        native(|args| {
+            let mut target = require_object_arg(&args, 0, "Reflect.setPrototypeOf")?;
+            let proto_arg = args.get(1).cloned().unwrap_or(JsValue::Null);
+            let proto = if proto_arg.is_null() {
+                None
+            } else {
+                Some(Rc::new(RefCell::new(JsObject::new())))
+            };
+            Ok(JsValue::Boolean(reflect_set_prototype_of(
+                &mut target,
+                proto,
+            )))
+        }),
+    );
+
+    props.insert(
+        "isExtensible".into(),
+        native(|args| {
+            let target = require_object_arg(&args, 0, "Reflect.isExtensible")?;
+            Ok(JsValue::Boolean(reflect_is_extensible(&target)))
+        }),
+    );
+
+    props.insert(
+        "preventExtensions".into(),
+        native(|args| {
+            let mut target = require_object_arg(&args, 0, "Reflect.preventExtensions")?;
+            Ok(JsValue::Boolean(reflect_prevent_extensions(&mut target)))
+        }),
+    );
+
+    props.insert(
+        "ownKeys".into(),
+        native(|args| {
+            let target = require_object_arg(&args, 0, "Reflect.ownKeys")?;
+            let keys: Vec<JsValue> = reflect_own_keys(&target)
+                .into_iter()
+                .map(JsValue::String)
+                .collect();
+            Ok(JsValue::Array(Rc::new(keys)))
+        }),
+    );
+
+    props.insert(
+        "apply".into(),
+        native(|args| {
+            let _target = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let _this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let arg_list = match args.get(2) {
+                Some(JsValue::Array(arr)) => arr.as_ref().clone(),
+                _ => vec![],
+            };
+            match &_target {
+                JsValue::NativeFunction(f) => f(arg_list),
+                _ => Err(StatorError::TypeError(
+                    "Reflect.apply: target is not callable".to_string(),
+                )),
+            }
+        }),
+    );
+
+    props.insert(
+        "construct".into(),
+        native(|args| {
+            let target = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let arg_list = match args.get(1) {
+                Some(JsValue::Array(arr)) => arr.as_ref().clone(),
+                _ => vec![],
+            };
+            match &target {
+                JsValue::NativeFunction(f) => f(arg_list),
+                _ => Err(StatorError::TypeError(
+                    "Reflect.construct: target is not a constructor".to_string(),
+                )),
+            }
+        }),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+/// Helper to extract a `JsObject` from the first argument, converting from
+/// `PlainObject` when necessary.
+fn require_object_arg(args: &[JsValue], idx: usize, name: &str) -> StatorResult<JsObject> {
+    match args.get(idx) {
+        Some(JsValue::PlainObject(map)) => {
+            let mut obj = JsObject::new();
+            for (k, v) in map.borrow().iter() {
+                obj.set_property(k, v.clone()).ok();
+            }
+            Ok(obj)
+        }
+        _ => Err(StatorError::TypeError(format!(
+            "{name}: argument is not an object"
+        ))),
+    }
+}
+
 // ── install_globals ──────────────────────────────────────────────────────────
 
 /// Pre-populate `globals` with all ECMAScript built-in names.
@@ -5375,6 +5708,8 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     globals.insert("RegExp".into(), make_regexp());
     globals.insert("BigInt".into(), make_bigint());
     globals.insert("Function".into(), make_function());
+    globals.insert("Proxy".into(), make_proxy());
+    globals.insert("Reflect".into(), make_reflect());
 
     // ── Error constructors ────────────────────────────────────────────────
     install_error_constructors(globals);
@@ -5537,6 +5872,8 @@ mod tests {
         assert!(globals.contains_key("RegExp"));
         assert!(globals.contains_key("BigInt"));
         assert!(globals.contains_key("Function"));
+        assert!(globals.contains_key("Proxy"));
+        assert!(globals.contains_key("Reflect"));
         assert!(globals.contains_key("globalThis"));
         assert!(globals.contains_key("Intl"));
         // Error constructors

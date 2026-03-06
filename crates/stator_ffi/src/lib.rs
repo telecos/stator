@@ -2888,7 +2888,7 @@ fn jsvalue_to_stator_value_inner(v: &JsValue) -> StatorValueInner {
         | JsValue::Error(_)
         | JsValue::Promise(_)
         | JsValue::PlainObject(_) => StatorValueInner::Object,
-        JsValue::Symbol(_) | JsValue::BigInt(_) | JsValue::Context(_) => {
+        JsValue::Symbol(_) | JsValue::BigInt(_) | JsValue::Context(_) | JsValue::Proxy(_) => {
             // Symbols, BigInts, and Contexts are not yet representable in StatorValueInner;
             // fall back to a string representation so callers can inspect them.
             let s = v.to_js_string().unwrap_or_else(|_| "undefined".to_owned());
