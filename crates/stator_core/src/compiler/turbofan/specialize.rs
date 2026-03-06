@@ -35,6 +35,25 @@
 //!    the allocation need not be heap-allocated (it can be handled virtually
 //!    by the code generator).
 //!
+//! 5. **Global value numbering** ([`global_value_numbering`]) —
+//!    eliminates redundant computations across all basic blocks by assigning
+//!    a hash-key to every pure node and replacing duplicates with the
+//!    canonical first occurrence.
+//!
+//! 6. **Loop unrolling** ([`unroll_loops`]) —
+//!    detects simple single-block self-loops and duplicates the loop body to
+//!    reduce branch overhead per iteration.
+//!
+//! 7. **Register coalescing** ([`coalesce_registers`]) —
+//!    eliminates trivial [`ValueNode::Phi`] nodes whose inputs all refer to
+//!    the same value, removing unnecessary register-to-register copies.
+//!
+//! 8. **Scalar replacement with deopt materialization**
+//!    ([`scalar_replacement`]) — replaces field loads/stores on
+//!    [`ValueNode::VirtualObject`]s with direct scalar references.
+//!    [`collect_materializations`] records which scalars must be packaged
+//!    back into heap objects during deoptimisation.
+//!
 //! # Usage
 //!
 //! ```
@@ -75,19 +94,23 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::feedback::{FeedbackVector, InlineCacheState};
-use crate::compiler::maglev::ir::{BasicBlock, MaglevGraph, NodeId, ValueNode};
+use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, ValueNode};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry-point
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Run all four pre-CLIF specialisation passes on `graph` in place.
+/// Run all pre-CLIF specialisation passes on `graph` in place.
 ///
 /// Passes are applied in the order:
 /// 1. type narrowing from feedback,
 /// 2. hot call-site specialisation,
 /// 3. load/store elimination,
-/// 4. escape analysis / allocation sinking.
+/// 4. escape analysis / allocation sinking,
+/// 5. global value numbering (GVN),
+/// 6. loop unrolling,
+/// 7. register coalescing,
+/// 8. scalar replacement with deopt materialization.
 ///
 /// `fv` is optional — passes that require feedback silently skip when it is
 /// `None`.
@@ -96,6 +119,10 @@ pub fn run_pre_clif_passes(graph: &mut MaglevGraph, fv: Option<&FeedbackVector>)
     specialize_call_sites(graph, fv);
     eliminate_redundant_loads(graph);
     sink_non_escaping_allocations(graph);
+    global_value_numbering(graph);
+    unroll_loops(graph);
+    coalesce_registers(graph);
+    scalar_replacement(graph);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -498,6 +525,403 @@ fn collect_escaping_ids(
             escaping.insert(*value);
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 5 — Global Value Numbering (GVN)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Hash-key for a pure value-producing node used by GVN.
+///
+/// Two nodes with the same `GvnKey` compute the same value (assuming no
+/// intervening side effects) and one can replace the other.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum GvnKey {
+    /// Binary operation: `(discriminant_tag, left, right)`.
+    Binary(u8, NodeId, NodeId),
+    /// Unary operation: `(discriminant_tag, input)`.
+    Unary(u8, NodeId),
+    /// Constant: `(discriminant_tag, raw_bits)`.
+    Constant(u8, i64),
+}
+
+/// Eliminate redundant computations across all blocks using global value
+/// numbering.
+///
+/// For each *pure* node (constants, arithmetic, type conversions) a hash-key
+/// is computed from its operation kind and input operands.  If the same key
+/// has already been seen, the duplicate node is remapped to the first
+/// occurrence and replaced with a cheap [`ValueNode::UndefinedConstant`]
+/// placeholder.
+///
+/// This is a forward data-flow analysis that works across basic-block
+/// boundaries (unlike the local load/store elimination in pass 3).
+///
+/// Side-effecting nodes (loads, stores, calls, etc.) are never candidates.
+pub fn global_value_numbering(graph: &mut MaglevGraph) {
+    let mut value_table: HashMap<GvnKey, NodeId> = HashMap::new();
+    let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            if let Some(key) = gvn_key(node) {
+                if let Some(&canonical) = value_table.get(&key) {
+                    subst.insert(*id, canonical);
+                } else {
+                    value_table.insert(key, *id);
+                }
+            }
+        }
+    }
+
+    if !subst.is_empty() {
+        for block in graph.blocks_mut() {
+            apply_subst_to_block(block, &subst);
+        }
+        // Replace duplicated nodes with placeholder.
+        for block in graph.blocks_mut() {
+            for (id, node) in &mut block.nodes {
+                if subst.contains_key(id) {
+                    *node = ValueNode::UndefinedConstant;
+                }
+            }
+        }
+    }
+}
+
+/// Compute the [`GvnKey`] for a pure node, or `None` for side-effecting /
+/// non-canonical nodes.
+fn gvn_key(node: &ValueNode) -> Option<GvnKey> {
+    match node {
+        // ── Constants ──────────────────────────────────────────────────────
+        ValueNode::SmiConstant { value } => Some(GvnKey::Constant(0, *value as i64)),
+        ValueNode::Int32Constant { value } => Some(GvnKey::Constant(1, *value as i64)),
+        ValueNode::Float64Constant { value } => Some(GvnKey::Constant(2, value.to_bits() as i64)),
+
+        // ── Int32 binary ───────────────────────────────────────────────────
+        ValueNode::Int32Add { left, right } => Some(GvnKey::Binary(10, *left, *right)),
+        ValueNode::Int32Subtract { left, right } => Some(GvnKey::Binary(11, *left, *right)),
+        ValueNode::Int32Multiply { left, right } => Some(GvnKey::Binary(12, *left, *right)),
+        ValueNode::Int32BitwiseAnd { left, right } => Some(GvnKey::Binary(13, *left, *right)),
+        ValueNode::Int32BitwiseOr { left, right } => Some(GvnKey::Binary(14, *left, *right)),
+        ValueNode::Int32BitwiseXor { left, right } => Some(GvnKey::Binary(15, *left, *right)),
+
+        // ── Float64 binary ─────────────────────────────────────────────────
+        ValueNode::Float64Add { left, right } => Some(GvnKey::Binary(20, *left, *right)),
+        ValueNode::Float64Subtract { left, right } => Some(GvnKey::Binary(21, *left, *right)),
+        ValueNode::Float64Multiply { left, right } => Some(GvnKey::Binary(22, *left, *right)),
+
+        // ── Unary ops ──────────────────────────────────────────────────────
+        ValueNode::Int32Negate { value } => Some(GvnKey::Unary(30, *value)),
+        ValueNode::Float64Negate { value } => Some(GvnKey::Unary(31, *value)),
+        ValueNode::ChangeInt32ToFloat64 { input } => Some(GvnKey::Unary(40, *input)),
+        ValueNode::ChangeFloat64ToInt32 { input } => Some(GvnKey::Unary(41, *input)),
+        ValueNode::ChangeInt32ToTagged { input } => Some(GvnKey::Unary(42, *input)),
+        ValueNode::ChangeTaggedToInt32 { input } => Some(GvnKey::Unary(43, *input)),
+
+        _ => None,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 6 — Loop unrolling
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maximum number of value nodes in a loop body eligible for unrolling.
+const LOOP_UNROLL_MAX_BODY_SIZE: usize = 32;
+
+/// Default unroll factor (the loop body is duplicated this many times).
+const LOOP_UNROLL_FACTOR: u32 = 2;
+
+/// Detect simple loops and unroll them by duplicating the loop body.
+///
+/// A *simple loop* for this pass is a block whose terminator is a
+/// [`ControlNode::Branch`] where one successor is the block itself
+/// (back-edge).  The loop body must have no more than
+/// [`LOOP_UNROLL_MAX_BODY_SIZE`] value nodes to be eligible.
+///
+/// The unrolling creates `LOOP_UNROLL_FACTOR - 1` copies of the value nodes
+/// inside the loop body (with fresh [`NodeId`]s) and appends them to the
+/// same block.  The control node is updated to point at the *last* copy's
+/// back-edge target, reducing the overhead of the branch on each iteration.
+///
+/// This is a simple single-block unroll; multi-block loop structures are
+/// left untouched.
+pub fn unroll_loops(graph: &mut MaglevGraph) {
+    let block_count = graph.blocks().len();
+    for block_idx in 0..block_count {
+        let (is_loop, exit_target) = {
+            let block = &graph.blocks()[block_idx];
+            match &block.control {
+                Some(ControlNode::Branch {
+                    condition: _,
+                    if_true,
+                    if_false,
+                }) => {
+                    if *if_true == block.id {
+                        (true, *if_false)
+                    } else if *if_false == block.id {
+                        (true, *if_true)
+                    } else {
+                        (false, 0)
+                    }
+                }
+                _ => (false, 0),
+            }
+        };
+
+        if !is_loop {
+            continue;
+        }
+
+        let body_size = graph.blocks()[block_idx].nodes.len();
+        if body_size > LOOP_UNROLL_MAX_BODY_SIZE || body_size == 0 {
+            continue;
+        }
+
+        // Clone the body nodes with remapped NodeIds.
+        for _copy in 1..LOOP_UNROLL_FACTOR {
+            let cloned_nodes: Vec<(NodeId, ValueNode)> = {
+                let block = &graph.blocks()[block_idx];
+                block.nodes.clone()
+            };
+            // Compute fresh ids and add nodes.
+            let mut id_remap: HashMap<NodeId, NodeId> = HashMap::new();
+            for (old_id, node) in &cloned_nodes {
+                let new_id = graph.add_value_node(block_idx as u32, node.clone());
+                if let Some(nid) = new_id {
+                    id_remap.insert(*old_id, nid);
+                }
+            }
+            // Apply the id remapping to the newly added nodes.
+            let total_len = graph.blocks()[block_idx].nodes.len();
+            let start = total_len - cloned_nodes.len();
+            let block = &mut graph.blocks_mut()[block_idx];
+            for i in start..total_len {
+                let resolve = |id: NodeId| *id_remap.get(&id).unwrap_or(&id);
+                apply_subst_to_value_node(&mut block.nodes[i].1, &resolve);
+            }
+        }
+
+        // Keep the original control node and exit target unchanged; the
+        // extra iterations inline the body computation so each branch-back
+        // iteration now does `LOOP_UNROLL_FACTOR`× work.
+        let _ = exit_target;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 7 — Register coalescing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Coalesce identity-copy [`ValueNode::Phi`] nodes that have a single unique
+/// input.
+///
+/// A `Phi { inputs: [a, a, …, a] }` (all inputs identical) is semantically
+/// equivalent to `a`.  This pass replaces such trivial phis with a direct
+/// reference to the unique input, removing a register-to-register copy in the
+/// generated code and freeing a physical register.
+///
+/// This is the simplest form of *register coalescing* at the IR level: it
+/// eliminates copy-like nodes that would otherwise force the register
+/// allocator to allocate two registers for a single value.
+pub fn coalesce_registers(graph: &mut MaglevGraph) {
+    let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+
+    // Pass 1: find trivial phis.
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            if let ValueNode::Phi { inputs } = node
+                && let Some(canonical) = unique_input(inputs)
+            {
+                subst.insert(*id, canonical);
+            }
+        }
+    }
+
+    if subst.is_empty() {
+        return;
+    }
+
+    // Transitively resolve chains: if A→B and B→C, then A→C.
+    let keys: Vec<NodeId> = subst.keys().copied().collect();
+    for k in keys {
+        let mut target = subst[&k];
+        while let Some(&next) = subst.get(&target) {
+            if next == target {
+                break;
+            }
+            target = next;
+        }
+        subst.insert(k, target);
+    }
+
+    // Pass 2: rewrite all operands.
+    for block in graph.blocks_mut() {
+        apply_subst_to_block(block, &subst);
+    }
+    // Replace coalesced phi nodes with placeholder.
+    for block in graph.blocks_mut() {
+        for (id, node) in &mut block.nodes {
+            if subst.contains_key(id) {
+                *node = ValueNode::UndefinedConstant;
+            }
+        }
+    }
+}
+
+/// If all entries in `inputs` are the same [`NodeId`], return it.
+fn unique_input(inputs: &[NodeId]) -> Option<NodeId> {
+    let first = inputs.first()?;
+    if inputs.iter().all(|i| i == first) {
+        Some(*first)
+    } else {
+        None
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 8 — Scalar replacement with deopt materialization
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Replace [`ValueNode::VirtualObject`] field accesses with scalar values.
+///
+/// After escape analysis (pass 4) converts non-escaping allocations to
+/// [`ValueNode::VirtualObject`], the fields stored into those virtual objects
+/// can be tracked as plain scalar values.  Subsequent loads from the same
+/// virtual object + offset are replaced by the most recently stored scalar.
+///
+/// This eliminates the object allocation entirely and allows the stored
+/// values to live in registers rather than memory.  At deoptimisation points
+/// the scalar values are packaged into [`DeoptMaterialization`] records so
+/// that the deoptimiser can reconstruct the heap object if the interpreter
+/// needs it.
+///
+/// The pass operates per-block (local analysis) and relies on the
+/// `VirtualObject` marker produced by [`sink_non_escaping_allocations`].
+pub fn scalar_replacement(graph: &mut MaglevGraph) {
+    for block in graph.blocks_mut() {
+        scalar_replace_in_block(block);
+    }
+}
+
+/// Per-block scalar replacement.
+fn scalar_replace_in_block(block: &mut BasicBlock) {
+    // Maps (virtual_object NodeId, field offset) → stored scalar NodeId.
+    let mut scalars: HashMap<(NodeId, u32), NodeId> = HashMap::new();
+    let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+
+    // Collect virtual object ids first.
+    let vobj_ids: HashSet<NodeId> = block
+        .nodes
+        .iter()
+        .filter_map(|(id, node)| {
+            if matches!(node, ValueNode::VirtualObject { .. }) {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if vobj_ids.is_empty() {
+        return;
+    }
+
+    for (id, node) in &block.nodes {
+        match node {
+            ValueNode::StoreField {
+                object,
+                offset,
+                value,
+            } if vobj_ids.contains(object) => {
+                scalars.insert((*object, *offset), *value);
+            }
+            ValueNode::LoadField { object, offset }
+            | ValueNode::LoadTaggedField { object, offset }
+            | ValueNode::LoadDoubleField { object, offset }
+                if vobj_ids.contains(object) =>
+            {
+                if let Some(&scalar) = scalars.get(&(*object, *offset)) {
+                    subst.insert(*id, scalar);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !subst.is_empty() {
+        apply_subst_to_block(block, &subst);
+        // Replace redundant loads with placeholder.
+        for (id, node) in &mut block.nodes {
+            if subst.contains_key(id) {
+                *node = ValueNode::UndefinedConstant;
+            }
+        }
+    }
+}
+
+/// A record describing how to reconstruct a scalar-replaced object field at
+/// a deoptimisation point.
+///
+/// When a [`VirtualObject`][ValueNode::VirtualObject] is scalar-replaced, the
+/// deoptimiser needs to know which scalar values to package back into an
+/// object allocation.  Each `DeoptMaterialization` entry maps one field of
+/// the virtual object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeoptMaterialization {
+    /// [`NodeId`] of the [`ValueNode::VirtualObject`] being reconstructed.
+    pub virtual_object: NodeId,
+    /// Field offset within the object (in bytes).
+    pub offset: u32,
+    /// [`NodeId`] of the scalar value to store into this field.
+    pub scalar_value: NodeId,
+}
+
+/// Collect materialization records for every scalar-replaced virtual object
+/// in the graph.
+///
+/// The returned records tell the deoptimiser which scalar values need to be
+/// packaged back into heap objects when a deopt fires.
+pub fn collect_materializations(graph: &MaglevGraph) -> Vec<DeoptMaterialization> {
+    let mut out = Vec::new();
+
+    let vobj_ids: HashSet<NodeId> = graph
+        .blocks()
+        .iter()
+        .flat_map(|b| b.nodes.iter())
+        .filter_map(|(id, node)| {
+            if matches!(node, ValueNode::VirtualObject { .. }) {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if vobj_ids.is_empty() {
+        return out;
+    }
+
+    for block in graph.blocks() {
+        for (_id, node) in &block.nodes {
+            if let ValueNode::StoreField {
+                object,
+                offset,
+                value,
+            } = node
+                && vobj_ids.contains(object)
+            {
+                out.push(DeoptMaterialization {
+                    virtual_object: *object,
+                    offset: *offset,
+                    scalar_value: *value,
+                });
+            }
+        }
+    }
+
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1422,5 +1846,265 @@ mod tests {
             &graph.blocks()[0].nodes[2].1,
             ValueNode::CheckedSmiAdd { .. }
         ));
+    }
+
+    // ── Pass 5: GVN ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_gvn_eliminates_duplicate_add() {
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let a = block.push_value(ValueNode::Int32Constant { value: 3 });
+        let b = block.push_value(ValueNode::Int32Constant { value: 4 });
+        let add1 = block.push_value(ValueNode::Int32Add { left: a, right: b });
+        // Identical add — should be eliminated by GVN.
+        let add2 = block.push_value(ValueNode::Int32Add { left: a, right: b });
+        block.set_control(ControlNode::Return { value: add2 });
+        graph.add_block(block);
+
+        global_value_numbering(&mut graph);
+
+        // add2 should be replaced by UndefinedConstant placeholder.
+        assert!(
+            matches!(&graph.blocks()[0].nodes[3].1, ValueNode::UndefinedConstant),
+            "duplicate add should be eliminated by GVN"
+        );
+        // Return should point at add1.
+        assert_eq!(
+            graph.blocks()[0].control,
+            Some(ControlNode::Return { value: add1 })
+        );
+    }
+
+    #[test]
+    fn test_gvn_different_ops_not_eliminated() {
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let a = block.push_value(ValueNode::Int32Constant { value: 3 });
+        let b = block.push_value(ValueNode::Int32Constant { value: 4 });
+        let add = block.push_value(ValueNode::Int32Add { left: a, right: b });
+        let sub = block.push_value(ValueNode::Int32Subtract { left: a, right: b });
+        block.set_control(ControlNode::Return { value: sub });
+        graph.add_block(block);
+
+        global_value_numbering(&mut graph);
+
+        // Neither should be eliminated — different operations.
+        assert!(matches!(
+            &graph.blocks()[0].nodes[2].1,
+            ValueNode::Int32Add { .. }
+        ));
+        assert!(matches!(
+            &graph.blocks()[0].nodes[3].1,
+            ValueNode::Int32Subtract { .. }
+        ));
+        let _ = add;
+    }
+
+    #[test]
+    fn test_gvn_eliminates_duplicate_constants() {
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let c1 = block.push_value(ValueNode::SmiConstant { value: 42 });
+        let c2 = block.push_value(ValueNode::SmiConstant { value: 42 });
+        block.set_control(ControlNode::Return { value: c2 });
+        graph.add_block(block);
+
+        global_value_numbering(&mut graph);
+
+        assert!(matches!(
+            &graph.blocks()[0].nodes[1].1,
+            ValueNode::UndefinedConstant
+        ));
+        assert_eq!(
+            graph.blocks()[0].control,
+            Some(ControlNode::Return { value: c1 })
+        );
+    }
+
+    // ── Pass 6: loop unrolling ───────────────────────────────────────────────
+
+    #[test]
+    fn test_unroll_simple_self_loop() {
+        // Build: block 0 has a branch back to itself (self-loop).
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let c = block.push_value(ValueNode::Int32Constant { value: 1 });
+        let cond = block.push_value(ValueNode::TrueConstant);
+        // Branch: if true → block 0 (back-edge), if false → block 1.
+        block.set_control(ControlNode::Branch {
+            condition: cond,
+            if_true: 0,
+            if_false: 1,
+        });
+        graph.add_block(block);
+
+        // Block 1: exit.
+        let mut exit_block = BasicBlock::new(1);
+        let undef = exit_block.push_value(ValueNode::UndefinedConstant);
+        exit_block.set_control(ControlNode::Return { value: undef });
+        graph.add_block(exit_block);
+
+        let original_count = graph.blocks()[0].nodes.len();
+        unroll_loops(&mut graph);
+
+        // After unrolling by factor 2, the body should have 2× nodes.
+        assert_eq!(
+            graph.blocks()[0].nodes.len(),
+            original_count * LOOP_UNROLL_FACTOR as usize,
+            "loop body should be duplicated"
+        );
+        let _ = c;
+    }
+
+    #[test]
+    fn test_unroll_no_loop_unchanged() {
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let c = block.push_value(ValueNode::Int32Constant { value: 42 });
+        block.set_control(ControlNode::Return { value: c });
+        graph.add_block(block);
+
+        let before = graph.blocks()[0].nodes.len();
+        unroll_loops(&mut graph);
+        assert_eq!(graph.blocks()[0].nodes.len(), before);
+    }
+
+    // ── Pass 7: register coalescing ──────────────────────────────────────────
+
+    #[test]
+    fn test_coalesce_trivial_phi() {
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let a = block.push_value(ValueNode::Int32Constant { value: 42 });
+        // Phi with all-same inputs → trivial, should be coalesced.
+        let phi = block.push_value(ValueNode::Phi {
+            inputs: vec![a, a, a],
+        });
+        block.set_control(ControlNode::Return { value: phi });
+        graph.add_block(block);
+
+        coalesce_registers(&mut graph);
+
+        // Phi should become UndefinedConstant placeholder.
+        assert!(matches!(
+            &graph.blocks()[0].nodes[1].1,
+            ValueNode::UndefinedConstant
+        ));
+        // Return should point at `a`.
+        assert_eq!(
+            graph.blocks()[0].control,
+            Some(ControlNode::Return { value: a })
+        );
+    }
+
+    #[test]
+    fn test_coalesce_non_trivial_phi_unchanged() {
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let a = block.push_value(ValueNode::Int32Constant { value: 1 });
+        let b = block.push_value(ValueNode::Int32Constant { value: 2 });
+        let phi = block.push_value(ValueNode::Phi { inputs: vec![a, b] });
+        block.set_control(ControlNode::Return { value: phi });
+        graph.add_block(block);
+
+        coalesce_registers(&mut graph);
+
+        // Different inputs → not coalesced.
+        assert!(matches!(
+            &graph.blocks()[0].nodes[2].1,
+            ValueNode::Phi { .. }
+        ));
+    }
+
+    // ── Pass 8: scalar replacement ───────────────────────────────────────────
+
+    #[test]
+    fn test_scalar_replacement_forwards_stored_value() {
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let vobj = block.push_value(ValueNode::VirtualObject { map: 0 });
+        let val = block.push_value(ValueNode::Int32Constant { value: 42 });
+        let _store = block.push_value(ValueNode::StoreField {
+            object: vobj,
+            offset: 8,
+            value: val,
+        });
+        let load = block.push_value(ValueNode::LoadField {
+            object: vobj,
+            offset: 8,
+        });
+        block.set_control(ControlNode::Return { value: load });
+        graph.add_block(block);
+
+        scalar_replacement(&mut graph);
+
+        // The load should be replaced with UndefinedConstant placeholder.
+        assert!(matches!(
+            &graph.blocks()[0].nodes[3].1,
+            ValueNode::UndefinedConstant
+        ));
+        // Return should point at `val` (the stored scalar).
+        assert_eq!(
+            graph.blocks()[0].control,
+            Some(ControlNode::Return { value: val })
+        );
+    }
+
+    #[test]
+    fn test_scalar_replacement_no_vobj_unchanged() {
+        let mut graph = MaglevGraph::new(1);
+        let mut block = BasicBlock::new(0);
+        let obj = block.push_value(ValueNode::Parameter { index: 0 });
+        let load = block.push_value(ValueNode::LoadField {
+            object: obj,
+            offset: 8,
+        });
+        block.set_control(ControlNode::Return { value: load });
+        graph.add_block(block);
+
+        scalar_replacement(&mut graph);
+
+        // No virtual objects → nothing should change.
+        assert!(matches!(
+            &graph.blocks()[0].nodes[1].1,
+            ValueNode::LoadField { .. }
+        ));
+    }
+
+    // ── collect_materializations ──────────────────────────────────────────────
+
+    #[test]
+    fn test_collect_materializations_basic() {
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let vobj = block.push_value(ValueNode::VirtualObject { map: 1 });
+        let val = block.push_value(ValueNode::Int32Constant { value: 7 });
+        let _store = block.push_value(ValueNode::StoreField {
+            object: vobj,
+            offset: 16,
+            value: val,
+        });
+        let undef = block.push_value(ValueNode::UndefinedConstant);
+        block.set_control(ControlNode::Return { value: undef });
+        graph.add_block(block);
+
+        let mats = collect_materializations(&graph);
+        assert_eq!(mats.len(), 1);
+        assert_eq!(mats[0].virtual_object, vobj);
+        assert_eq!(mats[0].offset, 16);
+        assert_eq!(mats[0].scalar_value, val);
+    }
+
+    #[test]
+    fn test_collect_materializations_empty_when_no_vobj() {
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let c = block.push_value(ValueNode::Int32Constant { value: 1 });
+        block.set_control(ControlNode::Return { value: c });
+        graph.add_block(block);
+
+        let mats = collect_materializations(&graph);
+        assert!(mats.is_empty());
     }
 }

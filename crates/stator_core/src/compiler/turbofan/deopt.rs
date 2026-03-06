@@ -91,6 +91,86 @@ use crate::error::{StatorError, StatorResult};
 use crate::objects::value::JsValue;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ValueRecovery — how to recover a single JS value during deopt
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Describes how to recover a single value when reconstructing an interpreter
+/// frame from a JIT deoptimisation.
+///
+/// Each entry in a [`DeoptEntry::register_map`] tells the deoptimiser where
+/// to find the corresponding register value:
+///
+/// - **InRegister** — the value lives in a JIT register-file slot.
+/// - **Constant** — the value is a compile-time constant.
+/// - **Materialized** — the value must be reconstructed from scalar fields
+///   (see scalar replacement / allocation sinking).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValueRecovery {
+    /// Value lives in JIT register-file slot `index`.
+    InRegister {
+        /// Zero-based register-file slot index.
+        index: u32,
+    },
+    /// Value is the compile-time constant `value`.
+    Constant {
+        /// The constant JS value.
+        value: JsValue,
+    },
+    /// Value is a scalar-replaced object that must be materialized from its
+    /// stored field scalars.
+    Materialized {
+        /// Map ID (hidden class / shape) for the reconstructed object.
+        map: u32,
+        /// `(field_offset, recovery)` pairs for each stored field.
+        fields: Vec<(u32, Box<ValueRecovery>)>,
+    },
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DeoptEntry — rich deopt metadata for speculative optimizations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Rich deoptimisation metadata recorded for every speculative optimisation.
+///
+/// Unlike the simpler [`DeoptPoint`] (which records only an index, bytecode
+/// offset, and a textual reason), `DeoptEntry` carries a full
+/// [`register_map`](DeoptEntry::register_map) describing how to recover each
+/// interpreter register from the JIT state.
+///
+/// A `DeoptEntry` is created for each speculative guard (type check, bounds
+/// check, etc.) and stored alongside the compiled code.  When the guard
+/// fires, the deoptimiser uses `register_map` to reconstruct the interpreter
+/// frame.
+#[derive(Debug, Clone)]
+pub struct DeoptEntry {
+    /// Byte offset in the original bytecode at which to resume interpretation.
+    pub bytecode_offset: u32,
+    /// Per-register recovery descriptors for frame reconstruction.
+    pub register_map: Vec<ValueRecovery>,
+    /// The reason the speculation failed.
+    pub reason: DeoptReason,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DeoptKind — eager vs lazy deopt
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The mechanism by which a deoptimisation is triggered.
+///
+/// * **Eager** — a speculative type guard fires synchronously at a check
+///   instruction (e.g. a Smi-add overflow or a `CheckMaps` failure).
+/// * **Lazy** — a dependency is invalidated asynchronously (e.g. a map
+///   transition on a prototype object) and the next re-entry into the
+///   compiled code triggers the deopt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeoptKind {
+    /// Synchronous guard failure (e.g. type-check, overflow).
+    Eager,
+    /// Asynchronous dependency invalidation.
+    Lazy,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // TurbofanFrameState
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -180,6 +260,96 @@ pub fn deoptimize_turbofan(
     };
 
     deoptimize(bytecode_array, feedback, info, global_env)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rich deopt with DeoptEntry
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reconstruct an interpreter frame using a rich [`DeoptEntry`] and resume
+/// bytecode execution.
+///
+/// This is the enhanced counterpart of [`deoptimize_turbofan`] that uses the
+/// per-register [`ValueRecovery`] descriptors from a [`DeoptEntry`] instead
+/// of blindly converting all register-file slots.
+///
+/// # Recovery procedure
+///
+/// For each entry in `entry.register_map`:
+/// - [`ValueRecovery::InRegister`]: read the raw `i64` from `raw_regs` and
+///   decode via [`jit_to_jsvalue`].
+/// - [`ValueRecovery::Constant`]: use the constant directly.
+/// - [`ValueRecovery::Materialized`]: recursively recover field values and
+///   produce a fallback [`JsValue::Undefined`] (full materialisation requires
+///   heap allocation which is deferred to the GC integration layer).
+///
+/// # Errors
+///
+/// Returns [`StatorError::Internal`] if the interpreter itself returns an
+/// error.
+pub fn deoptimize_with_entry(
+    bytecode_array: BytecodeArray,
+    feedback: &mut FeedbackVector,
+    entry: &DeoptEntry,
+    raw_regs: &[i64],
+    global_env: Rc<RefCell<HashMap<String, JsValue>>>,
+) -> StatorResult<JsValue> {
+    let registers: Vec<JsValue> = entry
+        .register_map
+        .iter()
+        .map(|recovery| recover_value(recovery, raw_regs))
+        .collect();
+
+    let info = DeoptInfo {
+        reason: entry.reason,
+        bytecode_offset: entry.bytecode_offset,
+        frame_state: FrameState {
+            registers,
+            accumulator: JsValue::Undefined,
+        },
+    };
+
+    deoptimize(bytecode_array, feedback, info, global_env)
+}
+
+/// Recover a single [`JsValue`] from a [`ValueRecovery`] descriptor.
+fn recover_value(recovery: &ValueRecovery, raw_regs: &[i64]) -> JsValue {
+    match recovery {
+        ValueRecovery::InRegister { index } => {
+            let idx = *index as usize;
+            if idx < raw_regs.len() {
+                jit_to_jsvalue(raw_regs[idx]).unwrap_or(JsValue::Undefined)
+            } else {
+                JsValue::Undefined
+            }
+        }
+        ValueRecovery::Constant { value } => value.clone(),
+        ValueRecovery::Materialized { .. } => {
+            // Full heap materialisation is deferred to the GC integration
+            // layer.  At this stage we return Undefined as a safe fallback.
+            JsValue::Undefined
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Frame reconstruction helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reconstruct an interpreter [`FrameState`] from a raw JIT register file.
+///
+/// This is a low-level helper used by both [`deoptimize_turbofan`] and
+/// [`deoptimize_with_entry`].  It converts a slice of raw `i64` register
+/// values into a [`FrameState`] suitable for the Maglev deoptimiser.
+pub fn reconstruct_frame(raw_regs: &[i64]) -> FrameState {
+    let registers: Vec<JsValue> = raw_regs
+        .iter()
+        .map(|&r| jit_to_jsvalue(r).unwrap_or(JsValue::Undefined))
+        .collect();
+    FrameState {
+        registers,
+        accumulator: JsValue::Undefined,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -344,5 +514,106 @@ mod tests {
             .expect("interpreter fallback must succeed");
         // The JIT overflowed and fell back to the interpreter which returns Smi(42).
         assert_eq!(result, JsValue::Smi(42));
+    }
+
+    // ── ValueRecovery / DeoptEntry tests ─────────────────────────────────────
+
+    /// `ValueRecovery::InRegister` fetches the correct slot.
+    #[test]
+    fn test_value_recovery_in_register() {
+        // jit_to_jsvalue treats the raw i64 as a direct Smi value.
+        let raw_regs: Vec<i64> = vec![10, 20, 30];
+        let recovery = ValueRecovery::InRegister { index: 1 };
+        let val = recover_value(&recovery, &raw_regs);
+        assert_eq!(val, JsValue::Smi(20));
+    }
+
+    /// `ValueRecovery::Constant` returns the constant value.
+    #[test]
+    fn test_value_recovery_constant() {
+        let recovery = ValueRecovery::Constant {
+            value: JsValue::Smi(99),
+        };
+        let val = recover_value(&recovery, &[]);
+        assert_eq!(val, JsValue::Smi(99));
+    }
+
+    /// `ValueRecovery::Materialized` falls back to Undefined.
+    #[test]
+    fn test_value_recovery_materialized_fallback() {
+        let recovery = ValueRecovery::Materialized {
+            map: 0,
+            fields: vec![],
+        };
+        let val = recover_value(&recovery, &[]);
+        assert_eq!(val, JsValue::Undefined);
+    }
+
+    /// `ValueRecovery::InRegister` out of bounds returns Undefined.
+    #[test]
+    fn test_value_recovery_in_register_oob() {
+        let recovery = ValueRecovery::InRegister { index: 100 };
+        let val = recover_value(&recovery, &[1, 2]);
+        assert_eq!(val, JsValue::Undefined);
+    }
+
+    /// `deoptimize_with_entry` resumes the interpreter via a DeoptEntry.
+    #[test]
+    fn test_deoptimize_with_entry_trivial() {
+        let ba = make_lda_return(33);
+        let mut fv = FeedbackVector::new(ba.feedback_metadata());
+        let entry = DeoptEntry {
+            bytecode_offset: 0,
+            register_map: vec![],
+            reason: DeoptReason::UnsupportedOperation,
+        };
+        let result = deoptimize_with_entry(ba, &mut fv, &entry, &[], empty_globals()).unwrap();
+        assert_eq!(result, JsValue::Smi(33));
+    }
+
+    /// `deoptimize_with_entry` with register recovery.
+    #[test]
+    fn test_deoptimize_with_entry_register_recovery() {
+        let ba = make_lda_return(11);
+        let mut fv = FeedbackVector::new(ba.feedback_metadata());
+        let entry = DeoptEntry {
+            bytecode_offset: 0,
+            register_map: vec![
+                ValueRecovery::Constant {
+                    value: JsValue::Smi(5),
+                },
+                ValueRecovery::InRegister { index: 0 },
+            ],
+            reason: DeoptReason::TypeCheckFailure,
+        };
+        let result = deoptimize_with_entry(ba, &mut fv, &entry, &[20], empty_globals()).unwrap();
+        assert_eq!(result, JsValue::Smi(11));
+    }
+
+    /// `reconstruct_frame` produces a valid FrameState.
+    #[test]
+    fn test_reconstruct_frame_basic() {
+        // jit_to_jsvalue treats raw i64 as direct Smi values.
+        let frame = reconstruct_frame(&[10, 20]);
+        assert_eq!(frame.registers.len(), 2);
+        assert_eq!(frame.registers[0], JsValue::Smi(10));
+        assert_eq!(frame.registers[1], JsValue::Smi(20));
+        assert_eq!(frame.accumulator, JsValue::Undefined);
+    }
+
+    /// `reconstruct_frame` with empty register file.
+    #[test]
+    fn test_reconstruct_frame_empty() {
+        let frame = reconstruct_frame(&[]);
+        assert!(frame.registers.is_empty());
+    }
+
+    // ── DeoptKind tests ──────────────────────────────────────────────────────
+
+    /// `DeoptKind` variants are distinct.
+    #[test]
+    fn test_deopt_kind_variants() {
+        assert_ne!(DeoptKind::Eager, DeoptKind::Lazy);
+        assert_eq!(DeoptKind::Eager, DeoptKind::Eager);
     }
 }

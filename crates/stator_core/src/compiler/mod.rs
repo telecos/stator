@@ -23,12 +23,17 @@
 //!   - [`turbofan::compile_with_feedback`] — Like `compile`, but first applies
 //!     the pre-CLIF specialisation passes from [`turbofan::specialize`].
 //!   - [`turbofan::specialize`] — Pre-CLIF optimisation passes: type narrowing
-//!     from feedback, hot call-site specialisation, load/store elimination, and
-//!     escape analysis / allocation sinking.
+//!     from feedback, hot call-site specialisation, load/store elimination,
+//!     escape analysis / allocation sinking, global value numbering (GVN),
+//!     loop unrolling, register coalescing, and scalar replacement with
+//!     deopt materialization.
 //!   - [`turbofan::JsType`] — JS value-type → Cranelift type mapping.
 //!   - [`turbofan::TurbofanCompiledCode`] — Compiled function wrapper with
 //!     execute-and-deopt support.
 //!   - [`turbofan::DeoptPoint`] — Metadata for deoptimisation sites.
+//!   - [`turbofan::deopt::DeoptEntry`] — Rich deopt metadata with per-register
+//!     [`ValueRecovery`][`turbofan::deopt::ValueRecovery`] descriptors.
+//!   - [`turbofan::deopt::DeoptKind`] — Eager vs lazy deoptimisation trigger.
 
 /// Non-optimising baseline JIT compiler.
 pub mod baseline;

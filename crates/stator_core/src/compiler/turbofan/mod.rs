@@ -94,7 +94,8 @@ use crate::compiler::maglev::ir::{ControlNode, MaglevGraph, NodeId, ValueNode};
 use crate::error::{StatorError, StatorResult};
 
 /// Pre-CLIF type-specialisation passes (type narrowing, call-site
-/// specialisation, load/store elimination, escape analysis).
+/// specialisation, load/store elimination, escape analysis, GVN,
+/// loop unrolling, register coalescing, scalar replacement).
 pub mod specialize;
 
 /// Cranelift deoptimiser: frame reconstruction and interpreter resume.
