@@ -83,6 +83,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 
 use crate::builtins::error::{ErrorKind, JsError};
@@ -161,6 +162,62 @@ impl StartupSnapshot {
     /// Consume the snapshot and return its underlying `Vec<u8>`.
     pub fn into_bytes(self) -> Vec<u8> {
         self.data
+    }
+
+    /// Return the size of the snapshot blob in bytes.
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Return `true` if the snapshot blob is empty.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Write the snapshot blob to a file at `path`.
+    ///
+    /// Creates or truncates the file.  The raw binary format is written
+    /// directly; the resulting file can later be loaded with
+    /// [`StartupSnapshot::read_from_file`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatorError::Internal`] if the file cannot be written.
+    pub fn write_to_file(&self, path: &Path) -> StatorResult<()> {
+        std::fs::write(path, &self.data).map_err(|e| {
+            StatorError::Internal(format!(
+                "snapshot: failed to write to {}: {e}",
+                path.display()
+            ))
+        })
+    }
+
+    /// Read a snapshot blob from a file at `path`.
+    ///
+    /// The file must contain a raw snapshot blob previously produced by
+    /// [`serialize_globals`] and written with [`StartupSnapshot::write_to_file`]
+    /// (or any other mechanism that stores [`StartupSnapshot::as_bytes`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatorError::Internal`] if the file cannot be read.
+    pub fn read_from_file(path: &Path) -> StatorResult<Self> {
+        let data = std::fs::read(path).map_err(|e| {
+            StatorError::Internal(format!(
+                "snapshot: failed to read from {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(Self { data })
+    }
+
+    /// Validate the snapshot header without performing a full deserialization.
+    ///
+    /// Returns `Ok(())` if the magic bytes and version are correct, or an
+    /// error describing the mismatch.
+    pub fn validate(&self) -> StatorResult<()> {
+        let mut cursor = 0usize;
+        read_magic_header(&self.data, &mut cursor)
     }
 }
 
@@ -1190,5 +1247,75 @@ mod tests {
         for i in 0..100u32 {
             assert_eq!(r.get(&format!("key{i}")), Some(&JsValue::Smi(i as i32)));
         }
+    }
+
+    // ── file I/O ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_write_and_read_from_file() {
+        let dir = std::env::temp_dir().join("stator_snapshot_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test_snap.bin");
+
+        let mut g = HashMap::new();
+        g.insert("x".to_string(), JsValue::Smi(99));
+        g.insert("s".to_string(), JsValue::String("hello".to_string()));
+        let snap = serialize_globals(&g);
+        snap.write_to_file(&path).expect("write should succeed");
+
+        let loaded = StartupSnapshot::read_from_file(&path).expect("read should succeed");
+        assert_eq!(loaded.as_bytes(), snap.as_bytes());
+
+        let restored = deserialize_globals(loaded.as_bytes()).expect("deser should succeed");
+        assert_eq!(restored.get("x"), Some(&JsValue::Smi(99)));
+        assert_eq!(
+            restored.get("s"),
+            Some(&JsValue::String("hello".to_string()))
+        );
+
+        // Clean up.
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_read_from_nonexistent_file() {
+        let path = std::path::PathBuf::from("/tmp/stator_no_such_snapshot.bin");
+        let err = StartupSnapshot::read_from_file(&path).unwrap_err();
+        assert!(err.to_string().contains("failed to read"));
+    }
+
+    // ── validation ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_validate_good_snapshot() {
+        let g: HashMap<String, JsValue> = HashMap::new();
+        let snap = serialize_globals(&g);
+        snap.validate()
+            .expect("valid snapshot should pass validation");
+    }
+
+    #[test]
+    fn test_validate_bad_magic() {
+        let snap = StartupSnapshot::from_bytes(vec![0x00; 8]);
+        let err = snap.validate().unwrap_err();
+        assert!(err.to_string().contains("invalid magic"));
+    }
+
+    #[test]
+    fn test_validate_too_short() {
+        let snap = StartupSnapshot::from_bytes(vec![0x00; 4]);
+        assert!(snap.validate().is_err());
+    }
+
+    #[test]
+    fn test_len_and_is_empty() {
+        let empty = StartupSnapshot::from_bytes(vec![]);
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+
+        let snap = serialize_globals(&HashMap::new());
+        assert!(!snap.is_empty());
+        assert!(snap.len() > 0);
     }
 }
