@@ -35,6 +35,11 @@ use crate::builtins::global::{
     global_encode_uri_component, global_escape, global_eval, global_is_finite, global_is_nan,
     global_parse_float, global_parse_int, global_unescape,
 };
+use crate::builtins::intl::{
+    collator_compare_js, date_time_format_js, display_names_of, list_format_js, locale_base_name,
+    locale_language, number_format_js, plural_rules_select_js, relative_time_format_js,
+    segmenter_segment,
+};
 use crate::builtins::iterator::{
     async_iterator_drop, async_iterator_every, async_iterator_filter, async_iterator_find,
     async_iterator_flat_map, async_iterator_for_each, async_iterator_from, async_iterator_map,
@@ -4454,6 +4459,258 @@ fn extract_handler(val: &JsValue) -> Option<crate::builtins::promise::PromiseHan
     }
 }
 
+// ── Intl ─────────────────────────────────────────────────────────────────────
+
+/// Build the `Intl` namespace object (ECMA-402).
+///
+/// Each property is a constructor-like `PlainObject` with a `__call__` method
+/// that returns an instance (another `PlainObject`) carrying a `format` (or
+/// `compare` / `select`) method.
+fn make_intl() -> JsValue {
+    let mut ns: HashMap<String, JsValue> = HashMap::new();
+
+    // ── Intl.NumberFormat ────────────────────────────────────────────────
+    ns.insert("NumberFormat".into(), {
+        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        ctor.insert(
+            "__call__".into(),
+            native(|_args| {
+                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                obj.insert("format".into(), native(|a| number_format_js(&a)));
+                obj.insert(
+                    "resolvedOptions".into(),
+                    native(|_| {
+                        let mut opts: HashMap<String, JsValue> = HashMap::new();
+                        opts.insert("locale".into(), JsValue::String("en-US".into()));
+                        opts.insert("numberingSystem".into(), JsValue::String("latn".into()));
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+                    }),
+                );
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            }),
+        );
+        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+    });
+
+    // ── Intl.DateTimeFormat ──────────────────────────────────────────────
+    ns.insert("DateTimeFormat".into(), {
+        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        ctor.insert(
+            "__call__".into(),
+            native(|_args| {
+                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                obj.insert("format".into(), native(|a| date_time_format_js(&a)));
+                obj.insert(
+                    "resolvedOptions".into(),
+                    native(|_| {
+                        let mut opts: HashMap<String, JsValue> = HashMap::new();
+                        opts.insert("locale".into(), JsValue::String("en-US".into()));
+                        opts.insert("calendar".into(), JsValue::String("gregory".into()));
+                        opts.insert("timeZone".into(), JsValue::String("UTC".into()));
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+                    }),
+                );
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            }),
+        );
+        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+    });
+
+    // ── Intl.Collator ───────────────────────────────────────────────────
+    ns.insert("Collator".into(), {
+        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        ctor.insert(
+            "__call__".into(),
+            native(|_args| {
+                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                obj.insert("compare".into(), native(|a| collator_compare_js(&a)));
+                obj.insert(
+                    "resolvedOptions".into(),
+                    native(|_| {
+                        let mut opts: HashMap<String, JsValue> = HashMap::new();
+                        opts.insert("locale".into(), JsValue::String("en-US".into()));
+                        opts.insert("sensitivity".into(), JsValue::String("variant".into()));
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+                    }),
+                );
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            }),
+        );
+        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+    });
+
+    // ── Intl.PluralRules ────────────────────────────────────────────────
+    ns.insert("PluralRules".into(), {
+        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        ctor.insert(
+            "__call__".into(),
+            native(|_args| {
+                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                obj.insert("select".into(), native(|a| plural_rules_select_js(&a)));
+                obj.insert(
+                    "resolvedOptions".into(),
+                    native(|_| {
+                        let mut opts: HashMap<String, JsValue> = HashMap::new();
+                        opts.insert("locale".into(), JsValue::String("en-US".into()));
+                        opts.insert("type".into(), JsValue::String("cardinal".into()));
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+                    }),
+                );
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            }),
+        );
+        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+    });
+
+    // ── Intl.ListFormat ─────────────────────────────────────────────────
+    ns.insert("ListFormat".into(), {
+        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        ctor.insert(
+            "__call__".into(),
+            native(|args| {
+                let list_type = if let Some(JsValue::PlainObject(opts)) = args.get(1) {
+                    opts.borrow()
+                        .get("type")
+                        .and_then(|v| {
+                            if let JsValue::String(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_else(|| "conjunction".to_string())
+                } else {
+                    "conjunction".to_string()
+                };
+                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                obj.insert(
+                    "format".into(),
+                    native(move |a| list_format_js(&a, &list_type)),
+                );
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            }),
+        );
+        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+    });
+
+    // ── Intl.RelativeTimeFormat ─────────────────────────────────────────
+    ns.insert("RelativeTimeFormat".into(), {
+        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        ctor.insert(
+            "__call__".into(),
+            native(|_args| {
+                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                obj.insert("format".into(), native(|a| relative_time_format_js(&a)));
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            }),
+        );
+        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+    });
+
+    // ── Intl.Segmenter ──────────────────────────────────────────────────
+    ns.insert("Segmenter".into(), {
+        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        ctor.insert(
+            "__call__".into(),
+            native(|_args| {
+                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                obj.insert(
+                    "segment".into(),
+                    native(|a| {
+                        let s = a.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+                        let segs: Vec<JsValue> = segmenter_segment(&s)
+                            .into_iter()
+                            .map(JsValue::String)
+                            .collect();
+                        Ok(JsValue::Array(Rc::new(segs)))
+                    }),
+                );
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            }),
+        );
+        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+    });
+
+    // ── Intl.DisplayNames ───────────────────────────────────────────────
+    ns.insert("DisplayNames".into(), {
+        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        ctor.insert(
+            "__call__".into(),
+            native(|_args| {
+                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                obj.insert(
+                    "of".into(),
+                    native(|a| {
+                        let code = a.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+                        Ok(JsValue::String(display_names_of(&code)))
+                    }),
+                );
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            }),
+        );
+        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+    });
+
+    // ── Intl.Locale ─────────────────────────────────────────────────────
+    ns.insert("Locale".into(), {
+        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        ctor.insert(
+            "__call__".into(),
+            native(|args| {
+                let tag = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                obj.insert("language".into(), JsValue::String(locale_language(&tag)));
+                obj.insert("baseName".into(), JsValue::String(locale_base_name(&tag)));
+                obj.insert(
+                    "toString".into(),
+                    native(move |_| Ok(JsValue::String(tag.clone()))),
+                );
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            }),
+        );
+        JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+    });
+
+    // ── Intl.getCanonicalLocales ────────────────────────────────────────
+    ns.insert(
+        "getCanonicalLocales".into(),
+        native(|args| {
+            let locales: Vec<JsValue> = match args.first() {
+                Some(JsValue::Array(arr)) => arr
+                    .iter()
+                    .map(|v| match v {
+                        JsValue::String(s) => Ok(JsValue::String(s.clone())),
+                        other => Ok(JsValue::String(other.to_js_string()?)),
+                    })
+                    .collect::<StatorResult<Vec<_>>>()?,
+                Some(JsValue::String(s)) => vec![JsValue::String(s.clone())],
+                _ => Vec::new(),
+            };
+            Ok(JsValue::Array(Rc::new(locales)))
+        }),
+    );
+
+    // ── Intl.supportedValuesOf ──────────────────────────────────────────
+    ns.insert(
+        "supportedValuesOf".into(),
+        native(|args| {
+            let key = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let values: Vec<JsValue> = match key.as_str() {
+                "calendar" => vec![JsValue::String("gregory".into())],
+                "collation" => vec![JsValue::String("default".into())],
+                "currency" => vec![JsValue::String("USD".into())],
+                "numberingSystem" => vec![JsValue::String("latn".into())],
+                "timeZone" => vec![JsValue::String("UTC".into())],
+                "unit" => vec![],
+                _ => Vec::new(),
+            };
+            Ok(JsValue::Array(Rc::new(values)))
+        }),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(ns)))
+}
+
 // ── install_globals ──────────────────────────────────────────────────────────
 
 /// Pre-populate `globals` with all ECMAScript built-in names.
@@ -4467,6 +4724,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     globals.insert("Math".into(), make_math());
     globals.insert("console".into(), make_console());
     globals.insert("JSON".into(), make_json());
+    globals.insert("Intl".into(), make_intl());
 
     // ── Constructor / namespace objects ──────────────────────────────────
     globals.insert("Number".into(), make_number());
@@ -4650,6 +4908,7 @@ mod tests {
         assert!(globals.contains_key("BigInt"));
         assert!(globals.contains_key("Function"));
         assert!(globals.contains_key("globalThis"));
+        assert!(globals.contains_key("Intl"));
         // Error constructors
         assert!(globals.contains_key("Error"));
         assert!(globals.contains_key("TypeError"));
