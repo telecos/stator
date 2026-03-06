@@ -466,6 +466,20 @@ impl FunctionCompiler {
         idx
     }
 
+    /// Add a `BigInt` entry, reusing an existing entry with the same value.
+    fn add_bigint(&mut self, value: i128) -> u32 {
+        for (i, e) in self.constant_pool.iter().enumerate() {
+            if let ConstantPoolEntry::BigInt(v) = e
+                && *v == value
+            {
+                return i as u32;
+            }
+        }
+        let idx = self.constant_pool.len() as u32;
+        self.constant_pool.push(ConstantPoolEntry::BigInt(value));
+        idx
+    }
+
     /// Add a [`ConstantPoolEntry`] without deduplication.
     fn add_constant_raw(&mut self, entry: ConstantPoolEntry) -> u32 {
         let idx = self.constant_pool.len() as u32;
@@ -1695,9 +1709,36 @@ impl FunctionCompiler {
                 ));
                 Ok(())
             }
-            Expr::BigInt(_) => Err(StatorError::Internal(
-                "BigInt literals are not yet supported".into(),
-            )),
+            Expr::BigInt(b) => {
+                let raw = b.value.replace('_', "");
+                let n: i128 = if let Some(hex) =
+                    raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X"))
+                {
+                    i128::from_str_radix(hex, 16).map_err(|e| {
+                        StatorError::Internal(format!("invalid BigInt hex literal: {e}"))
+                    })?
+                } else if let Some(oct) = raw.strip_prefix("0o").or_else(|| raw.strip_prefix("0O"))
+                {
+                    i128::from_str_radix(oct, 8).map_err(|e| {
+                        StatorError::Internal(format!("invalid BigInt octal literal: {e}"))
+                    })?
+                } else if let Some(bin) = raw.strip_prefix("0b").or_else(|| raw.strip_prefix("0B"))
+                {
+                    i128::from_str_radix(bin, 2).map_err(|e| {
+                        StatorError::Internal(format!("invalid BigInt binary literal: {e}"))
+                    })?
+                } else {
+                    raw.parse::<i128>().map_err(|e| {
+                        StatorError::Internal(format!("invalid BigInt literal: {e}"))
+                    })?
+                };
+                let idx = self.add_bigint(n);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaConstant,
+                    vec![Operand::ConstantPoolIdx(idx)],
+                ));
+                Ok(())
+            }
             Expr::Regexp(r) => {
                 let pattern_idx = self.add_string(&r.pattern);
                 // Encode flags as a bitfield: g=1, i=2, m=4, s=8, u=16, y=32

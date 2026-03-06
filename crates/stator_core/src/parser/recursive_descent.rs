@@ -26,18 +26,18 @@
 use crate::error::{StatorError, StatorResult};
 use crate::parser::ast::{
     ArrayExpr, ArrayPat, ArrowBody, ArrowExpr, AssignExpr, AssignOp, AssignPat, AssignPatProp,
-    AssignTarget, AwaitExpr, BinaryExpr, BinaryOp, BlockStmt, BoolLit, BreakStmt, ClassBody,
-    ClassDecl, ClassExpr, ClassMember, ContinueStmt, DebuggerStmt, DoWhileStmt, EmptyStmt,
-    ExportAllDecl, ExportDefaultDecl, ExportDefaultExpr, ExportNamedDecl, ExportSpecifier, Expr,
-    ExprStmt, FnDecl, FnExpr, ForInOfLeft, ForInStmt, ForInit, ForOfStmt, ForStmt, Ident, IfStmt,
-    ImportDecl, ImportDefaultSpecifier, ImportNamedSpecifier, ImportNamespaceSpecifier,
-    ImportSpecifier, KeyValuePatProp, LogicalExpr, LogicalOp, MethodDef, MethodKind, ModuleDecl,
-    ModuleExportName, NewExpr, NullLit, NumLit, ObjectExpr, ObjectPat, ObjectPatProp, ObjectProp,
-    Param, Pat, PrivateIdent, Program, ProgramItem, Prop, PropKey, PropValue, PropertyDef,
-    RegExpLit, RestElement, ReturnStmt, SequenceExpr, SourceLocation, SourceType, SpreadElement,
-    StaticBlock, Stmt, StringLit, SwitchCase, SwitchStmt, TemplateElement, TemplateLit, ThrowStmt,
-    TryStmt, UnaryExpr, UnaryOp, UpdateExpr, UpdateOp, VarDecl, VarDeclarator, VarKind, WhileStmt,
-    WithStmt, YieldExpr,
+    AssignTarget, AwaitExpr, BigIntLit, BinaryExpr, BinaryOp, BlockStmt, BoolLit, BreakStmt,
+    ClassBody, ClassDecl, ClassExpr, ClassMember, ContinueStmt, DebuggerStmt, DoWhileStmt,
+    EmptyStmt, ExportAllDecl, ExportDefaultDecl, ExportDefaultExpr, ExportNamedDecl,
+    ExportSpecifier, Expr, ExprStmt, FnDecl, FnExpr, ForInOfLeft, ForInStmt, ForInit, ForOfStmt,
+    ForStmt, Ident, IfStmt, ImportDecl, ImportDefaultSpecifier, ImportNamedSpecifier,
+    ImportNamespaceSpecifier, ImportSpecifier, KeyValuePatProp, LogicalExpr, LogicalOp, MethodDef,
+    MethodKind, ModuleDecl, ModuleExportName, NewExpr, NullLit, NumLit, ObjectExpr, ObjectPat,
+    ObjectPatProp, ObjectProp, Param, Pat, PrivateIdent, Program, ProgramItem, Prop, PropKey,
+    PropValue, PropertyDef, RegExpLit, RestElement, ReturnStmt, SequenceExpr, SourceLocation,
+    SourceType, SpreadElement, StaticBlock, Stmt, StringLit, SwitchCase, SwitchStmt,
+    TemplateElement, TemplateLit, ThrowStmt, TryStmt, UnaryExpr, UnaryOp, UpdateExpr, UpdateOp,
+    VarDecl, VarDeclarator, VarKind, WhileStmt, WithStmt, YieldExpr,
 };
 use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue};
 
@@ -2426,15 +2426,18 @@ impl<'src> Parser<'src> {
         match self.peek_kind() {
             TokenKind::NumericLiteral => {
                 let tok = self.bump()?;
-                let value = match tok.value {
-                    TokenValue::Number(n) => n,
-                    _ => return Err(Self::error_at(tok.span, "invalid numeric token")),
-                };
-                Ok(Expr::Num(NumLit {
-                    loc: tok.span,
-                    value,
-                    raw: String::new(),
-                }))
+                match tok.value {
+                    TokenValue::Number(n) => Ok(Expr::Num(NumLit {
+                        loc: tok.span,
+                        value: n,
+                        raw: String::new(),
+                    })),
+                    TokenValue::BigInt(s) => Ok(Expr::BigInt(BigIntLit {
+                        loc: tok.span,
+                        value: s,
+                    })),
+                    _ => Err(Self::error_at(tok.span, "invalid numeric token")),
+                }
             }
             TokenKind::StringLiteral => {
                 let tok = self.bump()?;
