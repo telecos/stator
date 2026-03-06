@@ -17,6 +17,9 @@ pub mod nan_boxing;
 /// ECMAScript §6.2.6 Property Descriptor specification type with data,
 /// accessor, and generic variants plus validation logic.
 pub mod property_descriptor;
+/// A [`HashMap`]-like property store that pairs each value with
+/// [`map::PropertyAttributes`] flags for ECMAScript attribute enforcement.
+pub mod property_map;
 /// JavaScript `RegExp` object with ECMAScript flag and built-in method support.
 pub mod regexp;
 /// V8-style hidden-class (shape) system with transition trees and descriptor

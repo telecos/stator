@@ -8,8 +8,9 @@
 #![allow(clippy::too_many_lines)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
+
+use crate::objects::property_map::PropertyMap;
 
 use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
@@ -1483,8 +1484,7 @@ fn handle_construct(
             // [[Construct]]: create a fresh object for `this`,
             // wire its __proto__ to the constructor's prototype,
             // then run the constructor body with `this` bound.
-            let this_obj: Rc<RefCell<HashMap<String, JsValue>>> =
-                Rc::new(RefCell::new(HashMap::new()));
+            let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
             if !matches!(ctor_proto, JsValue::Undefined) {
                 this_obj
                     .borrow_mut()
@@ -1881,6 +1881,12 @@ fn handle_sta_named_property(
             let _ = proxy_set(&mut p.borrow_mut(), &prop_name, val)?;
         }
         JsValue::PlainObject(ref map) => {
+            let pm = map.borrow();
+            // Existing non-writable property: silently ignore (sloppy mode).
+            if pm.contains_key(&prop_name) && !pm.is_writable(&prop_name) {
+                return Ok(DispatchAction::Continue);
+            }
+            drop(pm);
             map.borrow_mut().insert(prop_name, val);
         }
         JsValue::Function(ref ba) => {
@@ -2288,7 +2294,7 @@ fn handle_create_empty_object_literal(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())));
+    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
     Ok(DispatchAction::Continue)
 }
 
@@ -2297,7 +2303,7 @@ fn handle_create_empty_array_literal(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     // operands[0] is a FeedbackSlot, ignored at runtime.
-    let mut map = HashMap::new();
+    let mut map = PropertyMap::new();
     map.insert("length".to_string(), JsValue::Smi(0));
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
@@ -2308,7 +2314,7 @@ fn handle_create_array_literal(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
-    let mut map = HashMap::new();
+    let mut map = PropertyMap::new();
     map.insert("length".to_string(), JsValue::Smi(0));
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
@@ -2334,7 +2340,7 @@ fn handle_create_array_from_iterable(
         }
         _ => vec![],
     };
-    let mut map = HashMap::new();
+    let mut map = PropertyMap::new();
     for (i, v) in items.iter().enumerate() {
         map.insert(i.to_string(), v.clone());
     }
@@ -2348,7 +2354,7 @@ fn handle_create_object_literal(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())));
+    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
     Ok(DispatchAction::Continue)
 }
 
@@ -2387,7 +2393,7 @@ fn handle_create_reg_exp_literal(
     if flags_val & 0x20 != 0 {
         flags_str.push('y');
     }
-    let mut map = HashMap::new();
+    let mut map = PropertyMap::new();
     map.insert("source".to_string(), JsValue::String(pattern.clone()));
     map.insert("flags".to_string(), JsValue::String(flags_str.clone()));
     // toString() representation: /pattern/flags
@@ -2601,7 +2607,7 @@ fn handle_for_in_enumerate(
     let keys: Vec<JsValue> = match &obj {
         JsValue::PlainObject(map) => map
             .borrow()
-            .keys()
+            .enumerable_keys()
             .map(|k| JsValue::String(k.clone()))
             .collect(),
         JsValue::Array(items) => {
@@ -2721,7 +2727,14 @@ fn handle_delete_property_sloppy(
     let removed = if let JsValue::Proxy(ref p) = obj {
         proxy_delete_property(&mut p.borrow_mut(), &key).unwrap_or(false)
     } else if let JsValue::PlainObject(ref map) = obj {
-        map.borrow_mut().remove(&key).is_some()
+        let pm = map.borrow();
+        if pm.contains_key(&key) && !pm.is_configurable(&key) {
+            // Non-configurable: silently fail in sloppy mode.
+            false
+        } else {
+            drop(pm);
+            map.borrow_mut().remove(&key).is_some()
+        }
     } else {
         false
     };
@@ -2741,6 +2754,13 @@ fn handle_delete_property_strict(
     if let JsValue::Proxy(ref p) = obj {
         proxy_delete_property(&mut p.borrow_mut(), &key)?;
     } else if let JsValue::PlainObject(ref map) = obj {
+        let pm = map.borrow();
+        if pm.contains_key(&key) && !pm.is_configurable(&key) {
+            return Err(StatorError::TypeError(format!(
+                "Cannot delete property '{key}' of object"
+            )));
+        }
+        drop(pm);
         map.borrow_mut().remove(&key);
     }
     ctx.frame.accumulator = JsValue::Boolean(true);
@@ -2772,15 +2792,11 @@ fn handle_create_mapped_arguments(
         .get(..param_count)
         .unwrap_or(&[])
         .to_vec();
-    let map: HashMap<String, JsValue> = args
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (i.to_string(), v.clone()))
-        .chain(std::iter::once((
-            "length".to_string(),
-            JsValue::Smi(args.len() as i32),
-        )))
-        .collect();
+    let mut map = PropertyMap::new();
+    for (i, v) in args.iter().enumerate() {
+        map.insert(i.to_string(), v.clone());
+    }
+    map.insert("length".to_string(), JsValue::Smi(args.len() as i32));
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
 }
@@ -2796,15 +2812,11 @@ fn handle_create_unmapped_arguments(
         .get(..param_count)
         .unwrap_or(&[])
         .to_vec();
-    let map: HashMap<String, JsValue> = args
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (i.to_string(), v.clone()))
-        .chain(std::iter::once((
-            "length".to_string(),
-            JsValue::Smi(args.len() as i32),
-        )))
-        .collect();
+    let mut map = PropertyMap::new();
+    for (i, v) in args.iter().enumerate() {
+        map.insert(i.to_string(), v.clone());
+    }
+    map.insert("length".to_string(), JsValue::Smi(args.len() as i32));
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
 }
@@ -2926,7 +2938,7 @@ fn handle_call_runtime(
         // Build a namespace object with a default export
         // equal to the specifier string (stub for now — a
         // full implementation would resolve a module).
-        let ns = HashMap::new();
+        let ns = PropertyMap::new();
         let ns_val = JsValue::PlainObject(Rc::new(RefCell::new(ns)));
 
         let queue = MicrotaskQueue::new();
@@ -3552,10 +3564,10 @@ fn handle_create_object_from_iterable(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     let iterable = ctx.frame.accumulator.clone();
-    let map: HashMap<String, JsValue> = match &iterable {
+    let map: PropertyMap = match &iterable {
         JsValue::PlainObject(obj) => obj.borrow().clone(),
         JsValue::Array(arr) => {
-            let mut m = HashMap::new();
+            let mut m = PropertyMap::new();
             for (i, v) in arr.iter().enumerate() {
                 m.insert(i.to_string(), v.clone());
             }
@@ -3563,7 +3575,7 @@ fn handle_create_object_from_iterable(
             m
         }
         JsValue::Iterator(iter) => {
-            let mut m = HashMap::new();
+            let mut m = PropertyMap::new();
             let mut idx = 0usize;
             loop {
                 let mut it = iter.borrow_mut();
@@ -3578,7 +3590,7 @@ fn handle_create_object_from_iterable(
             m.insert("length".to_string(), JsValue::Smi(idx as i32));
             m
         }
-        _ => HashMap::new(),
+        _ => PropertyMap::new(),
     };
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)

@@ -515,9 +515,9 @@ mod tests {
 
     #[test]
     fn test_has_instance_object_like() {
+        use crate::objects::property_map::PropertyMap;
         use std::cell::RefCell;
-        use std::collections::HashMap;
-        let obj = JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
         assert!(function_has_instance(&obj, &JsValue::Undefined));
     }
 

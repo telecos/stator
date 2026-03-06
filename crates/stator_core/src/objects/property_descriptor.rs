@@ -14,11 +14,11 @@
 //! `Object.defineProperty` and `Object.getOwnPropertyDescriptor`).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::error::{StatorError, StatorResult};
 use crate::objects::map::PropertyAttributes;
+use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 
 /// ECMAScript §6.2.6 Property Descriptor.
@@ -220,7 +220,7 @@ impl FullPropertyDescriptor {
     /// The returned [`JsValue::PlainObject`] has the appropriate keys
     /// (`value`, `writable`, `get`, `set`, `enumerable`, `configurable`).
     pub fn to_object(&self) -> JsValue {
-        let mut map = HashMap::new();
+        let mut map = PropertyMap::new();
         match self {
             Self::Data {
                 value,
@@ -506,7 +506,7 @@ mod tests {
 
     #[test]
     fn test_from_object_rejects_mixed_data_accessor() {
-        let mut map = HashMap::new();
+        let mut map = PropertyMap::new();
         map.insert("value".to_string(), JsValue::Smi(1));
         map.insert("get".to_string(), JsValue::Undefined);
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_from_object_empty_yields_generic() {
-        let map = HashMap::new();
+        let map = PropertyMap::new();
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
         let desc = FullPropertyDescriptor::from_object(&obj).unwrap();
         assert!(desc.is_generic());

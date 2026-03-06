@@ -1013,9 +1013,9 @@ mod tests {
 
     #[test]
     fn test_define_property_from_data_descriptor() {
-        use std::collections::HashMap;
+        use crate::objects::property_map::PropertyMap;
         let mut obj = JsObject::new();
-        let mut desc_map = HashMap::new();
+        let mut desc_map = PropertyMap::new();
         desc_map.insert("value".to_string(), JsValue::Smi(42));
         desc_map.insert("writable".to_string(), JsValue::Boolean(true));
         desc_map.insert("enumerable".to_string(), JsValue::Boolean(true));
@@ -1033,9 +1033,9 @@ mod tests {
 
     #[test]
     fn test_define_property_from_descriptor_non_writable() {
-        use std::collections::HashMap;
+        use crate::objects::property_map::PropertyMap;
         let mut obj = JsObject::new();
-        let mut desc_map = HashMap::new();
+        let mut desc_map = PropertyMap::new();
         desc_map.insert("value".to_string(), JsValue::Smi(7));
         desc_map.insert("writable".to_string(), JsValue::Boolean(false));
         let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
@@ -1050,9 +1050,9 @@ mod tests {
 
     #[test]
     fn test_define_property_from_descriptor_rejects_mixed() {
-        use std::collections::HashMap;
+        use crate::objects::property_map::PropertyMap;
         let mut obj = JsObject::new();
-        let mut desc_map = HashMap::new();
+        let mut desc_map = PropertyMap::new();
         desc_map.insert("value".to_string(), JsValue::Smi(1));
         desc_map.insert("get".to_string(), JsValue::Undefined);
         let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
@@ -1063,13 +1063,13 @@ mod tests {
 
     #[test]
     fn test_define_property_from_descriptor_non_configurable_redefine_rejected() {
-        use std::collections::HashMap;
+        use crate::objects::property_map::PropertyMap;
         let mut obj = JsObject::new();
         // First: define non-configurable property.
         obj.define_own_property("nc", JsValue::Smi(1), PropertyAttributes::WRITABLE)
             .unwrap();
         // Try to make it configurable.
-        let mut desc_map = HashMap::new();
+        let mut desc_map = PropertyMap::new();
         desc_map.insert("value".to_string(), JsValue::Smi(2));
         desc_map.insert("configurable".to_string(), JsValue::Boolean(true));
         let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
@@ -1082,22 +1082,22 @@ mod tests {
 
     #[test]
     fn test_define_properties_multiple_keys() {
-        use std::collections::HashMap;
+        use crate::objects::property_map::PropertyMap;
         let mut obj = JsObject::new();
 
-        let mut desc_a = HashMap::new();
+        let mut desc_a = PropertyMap::new();
         desc_a.insert("value".to_string(), JsValue::Smi(10));
         desc_a.insert("writable".to_string(), JsValue::Boolean(true));
         desc_a.insert("enumerable".to_string(), JsValue::Boolean(true));
         desc_a.insert("configurable".to_string(), JsValue::Boolean(true));
 
-        let mut desc_b = HashMap::new();
+        let mut desc_b = PropertyMap::new();
         desc_b.insert("value".to_string(), JsValue::Smi(20));
         desc_b.insert("writable".to_string(), JsValue::Boolean(false));
         desc_b.insert("enumerable".to_string(), JsValue::Boolean(false));
         desc_b.insert("configurable".to_string(), JsValue::Boolean(false));
 
-        let mut props_map = HashMap::new();
+        let mut props_map = PropertyMap::new();
         props_map.insert(
             "a".to_string(),
             JsValue::PlainObject(Rc::new(RefCell::new(desc_a))),
@@ -1196,9 +1196,9 @@ mod tests {
 
     #[test]
     fn test_non_enumerable_property_hidden_from_keys() {
-        use std::collections::HashMap;
+        use crate::objects::property_map::PropertyMap;
         let mut obj = JsObject::new();
-        let mut desc_map = HashMap::new();
+        let mut desc_map = PropertyMap::new();
         desc_map.insert("value".to_string(), JsValue::Smi(42));
         desc_map.insert("writable".to_string(), JsValue::Boolean(true));
         desc_map.insert("enumerable".to_string(), JsValue::Boolean(false));
@@ -1215,9 +1215,9 @@ mod tests {
 
     #[test]
     fn test_non_configurable_property_cannot_be_deleted() {
-        use std::collections::HashMap;
+        use crate::objects::property_map::PropertyMap;
         let mut obj = JsObject::new();
-        let mut desc_map = HashMap::new();
+        let mut desc_map = PropertyMap::new();
         desc_map.insert("value".to_string(), JsValue::Smi(1));
         desc_map.insert("configurable".to_string(), JsValue::Boolean(false));
         let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));

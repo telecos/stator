@@ -20,6 +20,7 @@
 //!   newline, to standard output.
 //! - `console.log(...args)` — alias for `print`.
 
+use stator_core::objects::property_map::PropertyMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::process;
@@ -197,7 +198,7 @@ fn build_globals() -> Rc<RefCell<HashMap<String, JsValue>>> {
     );
 
     // console.log(...args) — alias for print
-    let console_obj: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+    let console_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
     console_obj.borrow_mut().insert(
         "log".to_string(),
         JsValue::NativeFunction(Rc::new(print_args)),

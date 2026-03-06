@@ -116,6 +116,7 @@ use crate::bytecode::bytecode_array::{
 };
 use crate::bytecode::feedback::{FeedbackMetadata, FeedbackSlotKind};
 use crate::error::{StatorError, StatorResult};
+use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -817,7 +818,7 @@ fn read_defined_ref(
     match inner_tag {
         TAG_PLAIN_OBJECT => {
             let count = read_u32(bytes, cursor)? as usize;
-            let map = Rc::new(RefCell::new(HashMap::with_capacity(count)));
+            let map = Rc::new(RefCell::new(PropertyMap::with_capacity(count)));
             let value = JsValue::PlainObject(Rc::clone(&map));
             // Register before reading entries to allow circular references.
             ctx.register(ref_id, value.clone());
@@ -906,7 +907,7 @@ fn read_jsvalue_by_tag(
         }
         TAG_PLAIN_OBJECT => {
             let count = read_u32(bytes, cursor)? as usize;
-            let mut map = HashMap::with_capacity(count);
+            let mut map = PropertyMap::with_capacity(count);
             for _ in 0..count {
                 let k = read_str32(bytes, cursor)?;
                 let v = read_jsvalue(bytes, cursor, ctx)?;
@@ -1269,7 +1270,7 @@ mod tests {
 
     #[test]
     fn test_round_trip_plain_object() {
-        let mut map = HashMap::new();
+        let mut map = PropertyMap::new();
         map.insert("x".to_string(), JsValue::Smi(10));
         map.insert("y".to_string(), JsValue::Boolean(true));
         let mut g = HashMap::new();
@@ -1582,10 +1583,9 @@ mod tests {
 
     #[test]
     fn test_round_trip_shared_plain_object() {
-        let shared = Rc::new(RefCell::new(HashMap::from([(
-            "x".to_string(),
-            JsValue::Smi(1),
-        )])));
+        let mut shared_map = PropertyMap::new();
+        shared_map.insert("x".to_string(), JsValue::Smi(1));
+        let shared = Rc::new(RefCell::new(shared_map));
         let mut g = HashMap::new();
         g.insert("a".to_string(), JsValue::PlainObject(Rc::clone(&shared)));
         g.insert("b".to_string(), JsValue::PlainObject(Rc::clone(&shared)));
@@ -1604,7 +1604,7 @@ mod tests {
 
     #[test]
     fn test_round_trip_circular_plain_object() {
-        let obj = Rc::new(RefCell::new(HashMap::new()));
+        let obj = Rc::new(RefCell::new(PropertyMap::new()));
         obj.borrow_mut()
             .insert("self".to_string(), JsValue::PlainObject(Rc::clone(&obj)));
         obj.borrow_mut().insert("val".to_string(), JsValue::Smi(42));
@@ -1677,11 +1677,10 @@ mod tests {
     #[test]
     fn test_round_trip_prototype_chain() {
         // Simulate a prototype chain: child.__proto__ = parent
-        let parent = Rc::new(RefCell::new(HashMap::from([(
-            "greet".to_string(),
-            JsValue::String("hello".to_string()),
-        )])));
-        let mut child_map = HashMap::new();
+        let mut parent_map = PropertyMap::new();
+        parent_map.insert("greet".to_string(), JsValue::String("hello".to_string()));
+        let parent = Rc::new(RefCell::new(parent_map));
+        let mut child_map = PropertyMap::new();
         child_map.insert("x".to_string(), JsValue::Smi(10));
         child_map.insert(
             "__proto__".to_string(),
@@ -1690,7 +1689,7 @@ mod tests {
         let child = Rc::new(RefCell::new(child_map));
 
         // A second child shares the same parent prototype.
-        let mut child2_map = HashMap::new();
+        let mut child2_map = PropertyMap::new();
         child2_map.insert("y".to_string(), JsValue::Smi(20));
         child2_map.insert(
             "__proto__".to_string(),

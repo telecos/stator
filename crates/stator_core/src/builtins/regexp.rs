@@ -10,8 +10,9 @@
 //! the Rust-level API.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
+
+use crate::objects::property_map::PropertyMap;
 
 use crate::error::StatorResult;
 use crate::objects::regexp::{JsRegExp, RegExpFlags, SymbolMatchResult};
@@ -40,7 +41,7 @@ pub fn regexp_construct(args: &[JsValue]) -> StatorResult<JsValue> {
 /// ECMAScript `RegExp.prototype` properties and methods.
 pub fn wrap_regexp(re: JsRegExp) -> JsValue {
     let re = Rc::new(re);
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // ── Read-only accessors ─────────────────────────────────────────────
     props.insert("source".into(), JsValue::String(re.pattern().to_string()));
@@ -207,7 +208,7 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
 /// * `groups` → named groups object (or `undefined`)
 /// * `indices` → `{ 0: [s,e], 1: [s,e], …, groups: {…} }` when `/d` flag
 fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // [0] = full match
     props.insert("0".into(), JsValue::String(m.matched.clone()));
@@ -229,11 +230,10 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
     if m.named_groups.is_empty() {
         props.insert("groups".into(), JsValue::Undefined);
     } else {
-        let groups: HashMap<String, JsValue> = m
-            .named_groups
-            .iter()
-            .map(|(k, v)| (k.clone(), JsValue::String(v.clone())))
-            .collect();
+        let mut groups = PropertyMap::new();
+        for (k, v) in &m.named_groups {
+            groups.insert(k.clone(), JsValue::String(v.clone()));
+        }
         props.insert(
             "groups".into(),
             JsValue::PlainObject(Rc::new(RefCell::new(groups))),
@@ -242,7 +242,7 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
 
     // indices (only present when /d flag was used)
     if let Some(ref idx) = m.indices {
-        let mut idx_props: HashMap<String, JsValue> = HashMap::new();
+        let mut idx_props = PropertyMap::new();
         for (i, pair) in idx.pairs.iter().enumerate() {
             let val = match pair {
                 Some((s, e)) => JsValue::Array(Rc::new(vec![
@@ -254,19 +254,16 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
             idx_props.insert(i.to_string(), val);
         }
         if !idx.groups.is_empty() {
-            let g: HashMap<String, JsValue> = idx
-                .groups
-                .iter()
-                .map(|(k, (s, e))| {
-                    (
-                        k.clone(),
-                        JsValue::Array(Rc::new(vec![
-                            JsValue::Smi(*s as i32),
-                            JsValue::Smi(*e as i32),
-                        ])),
-                    )
-                })
-                .collect();
+            let mut g = PropertyMap::new();
+            for (k, (s, e)) in &idx.groups {
+                g.insert(
+                    k.clone(),
+                    JsValue::Array(Rc::new(vec![
+                        JsValue::Smi(*s as i32),
+                        JsValue::Smi(*e as i32),
+                    ])),
+                );
+            }
             idx_props.insert(
                 "groups".into(),
                 JsValue::PlainObject(Rc::new(RefCell::new(g))),

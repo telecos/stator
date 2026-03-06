@@ -28,7 +28,6 @@
 //!   `Vec<JsValue>` and is surfaced as [`JsValue::Iterator`].
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::builtins::error::JsError;
@@ -37,6 +36,7 @@ use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::error::{StatorError, StatorResult};
 use crate::gc::trace::{Trace, Tracer};
 use crate::objects::heap_object::HeapObject;
+use crate::objects::property_map::PropertyMap;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Generator support types
@@ -268,10 +268,10 @@ pub enum JsValue {
     NativeFunction(NativeFn),
     /// A lightweight property map representing a plain JavaScript object.
     ///
-    /// Provides named-property access without going through the GC heap.
-    /// Used to construct host objects (e.g. `console`) that carry
-    /// [`NativeFunction`][Self::NativeFunction] properties.
-    PlainObject(Rc<RefCell<HashMap<String, JsValue>>>),
+    /// Each property carries [`PropertyAttributes`] flags alongside its
+    /// value, enabling ECMAScript attribute enforcement (writable,
+    /// enumerable, configurable) at the interpreter level.
+    PlainObject(Rc<RefCell<crate::objects::property_map::PropertyMap>>),
     /// A JavaScript `Promise` object backed by the [`JsPromise`] state machine.
     ///
     /// Wraps the shared-state [`JsPromise`] handle from the promise module so
@@ -685,7 +685,7 @@ impl JsValue {
             | Self::String(_)
             | Self::Symbol(_)
             | Self::BigInt(_) => {
-                let mut map = HashMap::new();
+                let mut map = PropertyMap::new();
                 map.insert("[[PrimitiveValue]]".to_string(), self.clone());
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(map))))
             }
@@ -991,7 +991,7 @@ fn string_to_number(s: &str) -> f64 {
 /// `"toString"` in the order dictated by `hint`.  Returns the first primitive
 /// result, or falls back to `"[object Object]"`.
 fn ordinary_to_primitive_plain_object(
-    map: &Rc<RefCell<HashMap<String, JsValue>>>,
+    map: &Rc<RefCell<PropertyMap>>,
     hint: ToPrimitiveHint,
 ) -> StatorResult<JsValue> {
     let method_names: [&str; 2] = match hint {
@@ -1000,7 +1000,7 @@ fn ordinary_to_primitive_plain_object(
     };
 
     for name in &method_names {
-        let maybe_fn = map.borrow().get(*name).cloned();
+        let maybe_fn = map.borrow().get(name).cloned();
         if let Some(JsValue::NativeFunction(f)) = maybe_fn {
             let result = f(vec![])?;
             if result.is_primitive() {
@@ -1254,7 +1254,7 @@ mod tests {
         assert!(JsValue::String("".to_string()).is_primitive());
         assert!(JsValue::Symbol(0).is_primitive());
         assert!(JsValue::BigInt(0).is_primitive());
-        assert!(!JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new()))).is_primitive());
+        assert!(!JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))).is_primitive());
         assert!(!JsValue::Array(Rc::new(vec![])).is_primitive());
     }
 
@@ -1262,7 +1262,7 @@ mod tests {
     fn test_is_object_like() {
         assert!(!JsValue::Undefined.is_object_like());
         assert!(!JsValue::Smi(42).is_object_like());
-        assert!(JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new()))).is_object_like());
+        assert!(JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))).is_object_like());
         assert!(JsValue::Array(Rc::new(vec![])).is_object_like());
     }
 
@@ -1349,14 +1349,14 @@ mod tests {
 
     #[test]
     fn test_to_primitive_plain_object_default() {
-        let obj = JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
         let prim = obj.to_primitive(ToPrimitiveHint::Default).unwrap();
         assert_eq!(prim, JsValue::String("[object Object]".to_string()));
     }
 
     #[test]
     fn test_to_primitive_plain_object_with_valueof() {
-        let mut map = HashMap::new();
+        let mut map = PropertyMap::new();
         let f: NativeFn = Rc::new(|_| Ok(JsValue::Smi(42)));
         map.insert("valueOf".to_string(), JsValue::NativeFunction(f));
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
@@ -1367,7 +1367,7 @@ mod tests {
 
     #[test]
     fn test_to_primitive_plain_object_with_tostring() {
-        let mut map = HashMap::new();
+        let mut map = PropertyMap::new();
         let f: NativeFn = Rc::new(|_| Ok(JsValue::String("custom".to_string())));
         map.insert("toString".to_string(), JsValue::NativeFunction(f));
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
@@ -1515,7 +1515,7 @@ mod tests {
 
     #[test]
     fn test_to_number_plain_object_is_nan() {
-        let obj = JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
         let n = obj.to_number().unwrap();
         assert!(n.is_nan());
     }
@@ -1625,7 +1625,7 @@ mod tests {
 
     #[test]
     fn test_to_js_string_plain_object() {
-        let obj = JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
         assert_eq!(obj.to_js_string().unwrap(), "[object Object]");
     }
 
@@ -1773,7 +1773,7 @@ mod tests {
 
     #[test]
     fn test_to_object_object_passthrough() {
-        let obj = JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
         let result = obj.to_object().unwrap();
         assert!(result.is_object_like());
     }
