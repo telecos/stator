@@ -291,6 +291,12 @@ pub enum JsValue {
     /// handler traps; if no trap is installed the operation falls through to
     /// the target.
     Proxy(Rc<RefCell<JsProxy>>),
+    /// A JavaScript `ArrayBuffer` (ECMAScript §25.1) — raw binary data store.
+    ArrayBuffer(Rc<RefCell<crate::builtins::typed_array::JsArrayBuffer>>),
+    /// A JavaScript TypedArray (ECMAScript §23.2) — typed view over an `ArrayBuffer`.
+    TypedArray(Rc<RefCell<crate::builtins::typed_array::JsTypedArray>>),
+    /// A JavaScript `DataView` (ECMAScript §25.3) — byte-level buffer accessor.
+    DataView(Rc<RefCell<crate::builtins::typed_array::JsDataView>>),
 }
 
 /// A scope context representing the environment for captured variables.
@@ -339,6 +345,12 @@ impl std::fmt::Debug for JsValue {
             Self::Promise(p) => write!(f, "Promise({:?})", p.state()),
             Self::Context(ctx) => write!(f, "Context({ctx:?})"),
             Self::Proxy(p) => write!(f, "Proxy(revoked={})", p.borrow().is_revoked()),
+            Self::ArrayBuffer(buf) => write!(f, "ArrayBuffer({})", buf.borrow().data.len()),
+            Self::TypedArray(ta) => {
+                let ta = ta.borrow();
+                write!(f, "TypedArray({}, len={})", ta.kind.name(), ta.length)
+            }
+            Self::DataView(dv) => write!(f, "DataView(len={})", dv.borrow().byte_length),
         }
     }
 }
@@ -370,6 +382,9 @@ impl PartialEq for JsValue {
             (Self::Promise(a), Self::Promise(b)) => a == b,
             (Self::Context(a), Self::Context(b)) => Rc::ptr_eq(a, b),
             (Self::Proxy(a), Self::Proxy(b)) => Rc::ptr_eq(a, b),
+            (Self::ArrayBuffer(a), Self::ArrayBuffer(b)) => Rc::ptr_eq(a, b),
+            (Self::TypedArray(a), Self::TypedArray(b)) => Rc::ptr_eq(a, b),
+            (Self::DataView(a), Self::DataView(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -542,7 +557,10 @@ impl JsValue {
             | Self::PlainObject(_)
             | Self::Promise(_)
             | Self::Context(_)
-            | Self::Proxy(_) => true,
+            | Self::Proxy(_)
+            | Self::ArrayBuffer(_)
+            | Self::TypedArray(_)
+            | Self::DataView(_) => true,
             Self::BigInt(n) => *n != 0,
         }
     }
@@ -734,6 +752,11 @@ impl JsValue {
             Self::Context(_) => "[object Context]".to_string(),
             Self::Proxy(_) => "[object Object]".to_string(),
             Self::Object(_) => "[object Object]".to_string(),
+            Self::ArrayBuffer(_) => "[object ArrayBuffer]".to_string(),
+            Self::TypedArray(ta) => {
+                format!("[object {}]", ta.borrow().kind.name())
+            }
+            Self::DataView(_) => "[object DataView]".to_string(),
             // Primitives should not reach here.
             _ => "undefined".to_string(),
         }
@@ -834,6 +857,9 @@ impl JsValue {
             (Self::Promise(a), Self::Promise(b)) => a == b,
             (Self::Context(a), Self::Context(b)) => Rc::ptr_eq(a, b),
             (Self::Proxy(a), Self::Proxy(b)) => Rc::ptr_eq(a, b),
+            (Self::ArrayBuffer(a), Self::ArrayBuffer(b)) => Rc::ptr_eq(a, b),
+            (Self::TypedArray(a), Self::TypedArray(b)) => Rc::ptr_eq(a, b),
+            (Self::DataView(a), Self::DataView(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -892,6 +918,8 @@ impl Trace for JsValue {
             Self::Promise(_) => {}
             // JsProxy uses Rc<RefCell<_>> internally with no raw GC pointers.
             Self::Proxy(_) => {}
+            // ArrayBuffer, TypedArray, DataView use Rc<RefCell<_>> — no raw GC pointers.
+            Self::ArrayBuffer(_) | Self::TypedArray(_) | Self::DataView(_) => {}
             _ => {}
         }
     }

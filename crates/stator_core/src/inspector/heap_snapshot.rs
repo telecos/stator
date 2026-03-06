@@ -295,6 +295,9 @@ impl HeapSnapshotBuilder {
             JsValue::Promise(_) => NODE_TYPE_OBJECT,
             JsValue::Context(_) => NODE_TYPE_OBJECT,
             JsValue::Proxy(_) => NODE_TYPE_OBJECT,
+            JsValue::ArrayBuffer(_) | JsValue::TypedArray(_) | JsValue::DataView(_) => {
+                NODE_TYPE_OBJECT
+            }
         }
     }
 
@@ -344,6 +347,9 @@ impl HeapSnapshotBuilder {
             JsValue::Promise(_) => "Promise".to_string(),
             JsValue::Context(_) => "Context".to_string(),
             JsValue::Proxy(_) => "Proxy".to_string(),
+            JsValue::ArrayBuffer(_) => "ArrayBuffer".to_string(),
+            JsValue::TypedArray(ta) => ta.borrow().kind.name().to_string(),
+            JsValue::DataView(_) => "DataView".to_string(),
         }
     }
 

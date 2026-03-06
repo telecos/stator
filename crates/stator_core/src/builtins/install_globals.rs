@@ -103,6 +103,19 @@ use crate::builtins::symbol::{
     SYMBOL_TO_PRIMITIVE, SYMBOL_TO_STRING_TAG, SYMBOL_UNSCOPABLES, symbol_create,
     symbol_description, symbol_for, symbol_key_for,
 };
+use crate::builtins::typed_array::{
+    TypedArrayKind, arraybuffer_is_view, arraybuffer_new, dataview_get_bigint64,
+    dataview_get_biguint64, dataview_get_float32, dataview_get_float64, dataview_get_int8,
+    dataview_get_int16, dataview_get_int32, dataview_get_uint8, dataview_get_uint16,
+    dataview_get_uint32, dataview_new, dataview_set_bigint64, dataview_set_biguint64,
+    dataview_set_float32, dataview_set_float64, dataview_set_int8, dataview_set_int16,
+    dataview_set_int32, dataview_set_uint8, dataview_set_uint16, dataview_set_uint32,
+    typed_array_at, typed_array_copy_within, typed_array_entries, typed_array_fill,
+    typed_array_from_values, typed_array_get, typed_array_includes, typed_array_index_of,
+    typed_array_join, typed_array_keys, typed_array_last_index_of, typed_array_new_from_buffer,
+    typed_array_new_from_length, typed_array_reverse, typed_array_set_from, typed_array_slice,
+    typed_array_sort, typed_array_subarray, typed_array_values,
+};
 use crate::builtins::weak_map::{
     weak_map_delete, weak_map_get, weak_map_has, weak_map_new, weak_map_set,
 };
@@ -5672,6 +5685,861 @@ fn require_object_arg(args: &[JsValue], idx: usize, name: &str) -> StatorResult<
     }
 }
 
+// ── ArrayBuffer / DataView / TypedArray constructors ─────────────────────────
+
+/// Build the `ArrayBuffer` constructor object.
+fn make_arraybuffer() -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    // ArrayBuffer(byteLength)
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let len = match args.first() {
+                Some(v) => v.to_number()?.floor() as usize,
+                None => 0,
+            };
+            let buf = arraybuffer_new(len);
+            Ok(JsValue::ArrayBuffer(Rc::new(RefCell::new(buf))))
+        }),
+    );
+
+    // ArrayBuffer.isView(arg)
+    props.insert(
+        "isView".into(),
+        native(|args| {
+            let arg = args.first().unwrap_or(&JsValue::Undefined);
+            Ok(JsValue::Boolean(arraybuffer_is_view(arg)))
+        }),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+/// Build the `DataView` constructor object.
+fn make_dataview() -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let buf_rc = match args.first() {
+                Some(JsValue::ArrayBuffer(b)) => Rc::clone(b),
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "First argument must be an ArrayBuffer".into(),
+                    ));
+                }
+            };
+            let offset = match args.get(1) {
+                Some(v) if !v.is_undefined() => v.to_number()?.floor() as usize,
+                _ => 0,
+            };
+            let length = match args.get(2) {
+                Some(v) if !v.is_undefined() => Some(v.to_number()?.floor() as usize),
+                _ => None,
+            };
+            let dv = dataview_new(buf_rc, offset, length)?;
+            let inner = Rc::new(RefCell::new(dv));
+            let mut obj: HashMap<String, JsValue> = HashMap::new();
+
+            // byteLength
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "byteLength".into(),
+                    JsValue::Smi(inner.borrow().byte_length as i32),
+                );
+            }
+            // byteOffset
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "byteOffset".into(),
+                    JsValue::Smi(inner.borrow().byte_offset as i32),
+                );
+            }
+            // buffer
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "buffer".into(),
+                    JsValue::ArrayBuffer(Rc::clone(&inner.borrow().buffer)),
+                );
+            }
+
+            // DataView get/set methods helper macro
+            macro_rules! dv_getter {
+                ($name:expr, $fn_get:expr) => {{
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        $name.into(),
+                        native(move |a| {
+                            let off = a
+                                .first()
+                                .map(|v| v.to_number().unwrap_or(0.0) as usize)
+                                .unwrap_or(0);
+                            let le = a.get(1).map(|v| v.to_boolean()).unwrap_or(false);
+                            let dv_ref = inner.borrow();
+                            let val = $fn_get(&dv_ref, off, le)?;
+                            Ok(num_value(val))
+                        }),
+                    );
+                }};
+            }
+
+            macro_rules! dv_setter {
+                ($name:expr, $fn_set:expr, $conv:expr) => {{
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        $name.into(),
+                        native(move |a| {
+                            let off = a
+                                .first()
+                                .map(|v| v.to_number().unwrap_or(0.0) as usize)
+                                .unwrap_or(0);
+                            let raw_val = a.get(1).unwrap_or(&JsValue::Undefined);
+                            let le = a.get(2).map(|v| v.to_boolean()).unwrap_or(false);
+                            let dv_ref = inner.borrow();
+                            $fn_set(&dv_ref, off, $conv(raw_val)?, le)?;
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                }};
+            }
+
+            dv_getter!("getInt8", dataview_get_int8);
+            dv_getter!("getUint8", dataview_get_uint8);
+            dv_getter!("getInt16", dataview_get_int16);
+            dv_getter!("getUint16", dataview_get_uint16);
+            dv_getter!("getInt32", dataview_get_int32);
+            dv_getter!("getUint32", dataview_get_uint32);
+            dv_getter!("getFloat32", dataview_get_float32);
+            dv_getter!("getFloat64", dataview_get_float64);
+
+            // BigInt getters return JsValue::BigInt directly.
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "getBigInt64".into(),
+                    native(move |a| {
+                        let off = a
+                            .first()
+                            .map(|v| v.to_number().unwrap_or(0.0) as usize)
+                            .unwrap_or(0);
+                        let le = a.get(1).map(|v| v.to_boolean()).unwrap_or(false);
+                        let val = dataview_get_bigint64(&inner.borrow(), off, le)?;
+                        Ok(JsValue::BigInt(i128::from(val)))
+                    }),
+                );
+            }
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "getBigUint64".into(),
+                    native(move |a| {
+                        let off = a
+                            .first()
+                            .map(|v| v.to_number().unwrap_or(0.0) as usize)
+                            .unwrap_or(0);
+                        let le = a.get(1).map(|v| v.to_boolean()).unwrap_or(false);
+                        let val = dataview_get_biguint64(&inner.borrow(), off, le)?;
+                        Ok(JsValue::BigInt(i128::from(val)))
+                    }),
+                );
+            }
+
+            dv_setter!("setInt8", dataview_set_int8, |v: &JsValue| Ok::<
+                i8,
+                StatorError,
+            >(
+                v.to_int32()? as i8
+            ));
+            dv_setter!("setUint8", dataview_set_uint8, |v: &JsValue| Ok::<
+                u8,
+                StatorError,
+            >(
+                v.to_int32()? as u8
+            ));
+            dv_setter!("setInt16", dataview_set_int16, |v: &JsValue| Ok::<
+                i16,
+                StatorError,
+            >(
+                v.to_int32()? as i16
+            ));
+            dv_setter!("setUint16", dataview_set_uint16, |v: &JsValue| Ok::<
+                u16,
+                StatorError,
+            >(
+                v.to_int32()? as u16
+            ));
+            dv_setter!("setInt32", dataview_set_int32, |v: &JsValue| v.to_int32());
+            dv_setter!("setUint32", dataview_set_uint32, |v: &JsValue| v
+                .to_uint32());
+            dv_setter!("setFloat32", dataview_set_float32, |v: &JsValue| Ok::<
+                f32,
+                StatorError,
+            >(
+                v.to_number()? as f32
+            ));
+            dv_setter!("setFloat64", dataview_set_float64, |v: &JsValue| v
+                .to_number());
+            dv_setter!("setBigInt64", dataview_set_bigint64, |v: &JsValue| {
+                match v {
+                    JsValue::BigInt(n) => Ok::<i64, StatorError>(*n as i64),
+                    _ => Ok(v.to_number()? as i64),
+                }
+            });
+            dv_setter!("setBigUint64", dataview_set_biguint64, |v: &JsValue| {
+                match v {
+                    JsValue::BigInt(n) => Ok::<u64, StatorError>(*n as u64),
+                    _ => Ok(v.to_number()? as u64),
+                }
+            });
+
+            Ok(JsValue::DataView(inner))
+        }),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+/// Helper to convert a numeric value to `JsValue`.
+fn num_value<T: Into<f64>>(v: T) -> JsValue {
+    let f: f64 = v.into();
+    if f.fract() == 0.0 && f >= f64::from(i32::MIN) && f <= f64::from(i32::MAX) {
+        JsValue::Smi(f as i32)
+    } else {
+        JsValue::HeapNumber(f)
+    }
+}
+
+/// Build a typed-array constructor for the given `TypedArrayKind`.
+fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    // BYTES_PER_ELEMENT
+    props.insert(
+        "BYTES_PER_ELEMENT".into(),
+        JsValue::Smi(kind.bytes_per_element() as i32),
+    );
+
+    // Constructor: TypedArray(length) | TypedArray(array) | TypedArray(buffer, offset?, length?)
+    props.insert(
+        "__call__".into(),
+        native(move |args| {
+            let ta = match args.first() {
+                // From ArrayBuffer
+                Some(JsValue::ArrayBuffer(buf)) => {
+                    let offset = match args.get(1) {
+                        Some(v) if !v.is_undefined() => v.to_number()?.floor() as usize,
+                        _ => 0,
+                    };
+                    let length = match args.get(2) {
+                        Some(v) if !v.is_undefined() => Some(v.to_number()?.floor() as usize),
+                        _ => None,
+                    };
+                    typed_array_new_from_buffer(kind, Rc::clone(buf), offset, length)?
+                }
+                // From another TypedArray
+                Some(JsValue::TypedArray(src_rc)) => {
+                    let src = src_rc.borrow();
+                    let vals: Vec<JsValue> =
+                        (0..src.length).map(|i| typed_array_get(&src, i)).collect();
+                    typed_array_from_values(kind, &vals)?
+                }
+                // From Array
+                Some(JsValue::Array(arr)) => typed_array_from_values(kind, arr)?,
+                // From length (number)
+                Some(v) => {
+                    let len = v.to_number()?.floor() as usize;
+                    typed_array_new_from_length(kind, len)
+                }
+                None => typed_array_new_from_length(kind, 0),
+            };
+            let inner = Rc::new(RefCell::new(ta));
+            Ok(make_typed_array_instance(kind, inner))
+        }),
+    );
+
+    // TypedArray.from(source)
+    props.insert(
+        "from".into(),
+        native(move |args| {
+            let source = match args.first() {
+                Some(JsValue::Array(arr)) => arr.as_ref().clone(),
+                _ => Vec::new(),
+            };
+            let ta = typed_array_from_values(kind, &source)?;
+            let inner = Rc::new(RefCell::new(ta));
+            Ok(make_typed_array_instance(kind, inner))
+        }),
+    );
+
+    // TypedArray.of(...items)
+    props.insert(
+        "of".into(),
+        native(move |args| {
+            let ta = typed_array_from_values(kind, &args)?;
+            let inner = Rc::new(RefCell::new(ta));
+            Ok(make_typed_array_instance(kind, inner))
+        }),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+/// Build the prototype methods for a `JsValue::TypedArray` instance.
+fn make_typed_array_instance(
+    kind: TypedArrayKind,
+    inner: Rc<RefCell<crate::builtins::typed_array::JsTypedArray>>,
+) -> JsValue {
+    let _ = kind;
+    let typed_array_val = JsValue::TypedArray(Rc::clone(&inner));
+    let mut obj: HashMap<String, JsValue> = HashMap::new();
+
+    // BYTES_PER_ELEMENT
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "BYTES_PER_ELEMENT".into(),
+            JsValue::Smi(inner.borrow().kind.bytes_per_element() as i32),
+        );
+    }
+    // length
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert("length".into(), JsValue::Smi(inner.borrow().length as i32));
+    }
+    // byteLength
+    {
+        let inner = Rc::clone(&inner);
+        let ta = inner.borrow();
+        obj.insert(
+            "byteLength".into(),
+            JsValue::Smi((ta.length * ta.kind.bytes_per_element()) as i32),
+        );
+    }
+    // byteOffset
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "byteOffset".into(),
+            JsValue::Smi(inner.borrow().byte_offset as i32),
+        );
+    }
+    // buffer
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "buffer".into(),
+            JsValue::ArrayBuffer(Rc::clone(&inner.borrow().buffer)),
+        );
+    }
+    // at(index)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "at".into(),
+            native(move |a| {
+                let idx = a
+                    .first()
+                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                    .unwrap_or(0);
+                Ok(typed_array_at(&inner.borrow(), idx))
+            }),
+        );
+    }
+    // copyWithin(target, start, end?)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "copyWithin".into(),
+            native(move |a| {
+                let target = a
+                    .first()
+                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                    .unwrap_or(0);
+                let start = a
+                    .get(1)
+                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                    .unwrap_or(0);
+                let end = a
+                    .get(2)
+                    .map(|v| v.to_number().unwrap_or(inner.borrow().length as f64) as i64)
+                    .unwrap_or(inner.borrow().length as i64);
+                typed_array_copy_within(&inner.borrow(), target, start, end);
+                Ok(JsValue::Undefined)
+            }),
+        );
+    }
+    // entries()
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "entries".into(),
+            native(move |_| {
+                let items = typed_array_entries(&inner.borrow());
+                Ok(JsValue::Array(Rc::new(items)))
+            }),
+        );
+    }
+    // every(callbackfn)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "every".into(),
+            native(move |a| {
+                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                let ta = inner.borrow();
+                for i in 0..ta.length {
+                    let v = typed_array_get(&ta, i);
+                    if let JsValue::NativeFunction(f) = &cb {
+                        let result = f(vec![v, JsValue::Smi(i as i32)])?;
+                        if !result.to_boolean() {
+                            return Ok(JsValue::Boolean(false));
+                        }
+                    }
+                }
+                Ok(JsValue::Boolean(true))
+            }),
+        );
+    }
+    // fill(value, start?, end?)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "fill".into(),
+            native(move |a| {
+                let val = a.first().unwrap_or(&JsValue::Undefined).clone();
+                let ta = inner.borrow();
+                let start = a
+                    .get(1)
+                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                    .unwrap_or(0);
+                let end = a
+                    .get(2)
+                    .map(|v| v.to_number().unwrap_or(ta.length as f64) as i64)
+                    .unwrap_or(ta.length as i64);
+                typed_array_fill(&ta, &val, start, end)?;
+                Ok(JsValue::Undefined)
+            }),
+        );
+    }
+    // filter(callbackfn)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "filter".into(),
+            native(move |a| {
+                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                let ta = inner.borrow();
+                let mut kept = Vec::new();
+                for i in 0..ta.length {
+                    let v = typed_array_get(&ta, i);
+                    if let JsValue::NativeFunction(f) = &cb {
+                        let result = f(vec![v.clone(), JsValue::Smi(i as i32)])?;
+                        if result.to_boolean() {
+                            kept.push(v);
+                        }
+                    }
+                }
+                let result = typed_array_from_values(ta.kind, &kept)?;
+                Ok(JsValue::TypedArray(Rc::new(RefCell::new(result))))
+            }),
+        );
+    }
+    // find(callbackfn)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "find".into(),
+            native(move |a| {
+                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                let ta = inner.borrow();
+                for i in 0..ta.length {
+                    let v = typed_array_get(&ta, i);
+                    if let JsValue::NativeFunction(f) = &cb {
+                        let result = f(vec![v.clone(), JsValue::Smi(i as i32)])?;
+                        if result.to_boolean() {
+                            return Ok(v);
+                        }
+                    }
+                }
+                Ok(JsValue::Undefined)
+            }),
+        );
+    }
+    // findIndex(callbackfn)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "findIndex".into(),
+            native(move |a| {
+                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                let ta = inner.borrow();
+                for i in 0..ta.length {
+                    let v = typed_array_get(&ta, i);
+                    if let JsValue::NativeFunction(f) = &cb {
+                        let result = f(vec![v, JsValue::Smi(i as i32)])?;
+                        if result.to_boolean() {
+                            return Ok(JsValue::Smi(i as i32));
+                        }
+                    }
+                }
+                Ok(JsValue::Smi(-1))
+            }),
+        );
+    }
+    // findLast(callbackfn)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "findLast".into(),
+            native(move |a| {
+                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                let ta = inner.borrow();
+                for i in (0..ta.length).rev() {
+                    let v = typed_array_get(&ta, i);
+                    if let JsValue::NativeFunction(f) = &cb {
+                        let result = f(vec![v.clone(), JsValue::Smi(i as i32)])?;
+                        if result.to_boolean() {
+                            return Ok(v);
+                        }
+                    }
+                }
+                Ok(JsValue::Undefined)
+            }),
+        );
+    }
+    // findLastIndex(callbackfn)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "findLastIndex".into(),
+            native(move |a| {
+                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                let ta = inner.borrow();
+                for i in (0..ta.length).rev() {
+                    let v = typed_array_get(&ta, i);
+                    if let JsValue::NativeFunction(f) = &cb {
+                        let result = f(vec![v, JsValue::Smi(i as i32)])?;
+                        if result.to_boolean() {
+                            return Ok(JsValue::Smi(i as i32));
+                        }
+                    }
+                }
+                Ok(JsValue::Smi(-1))
+            }),
+        );
+    }
+    // forEach(callbackfn)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "forEach".into(),
+            native(move |a| {
+                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                let ta = inner.borrow();
+                for i in 0..ta.length {
+                    let v = typed_array_get(&ta, i);
+                    if let JsValue::NativeFunction(f) = &cb {
+                        f(vec![v, JsValue::Smi(i as i32)])?;
+                    }
+                }
+                Ok(JsValue::Undefined)
+            }),
+        );
+    }
+    // includes(searchElement, fromIndex?)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "includes".into(),
+            native(move |a| {
+                let search = a.first().unwrap_or(&JsValue::Undefined);
+                let from = a
+                    .get(1)
+                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                    .unwrap_or(0);
+                Ok(JsValue::Boolean(typed_array_includes(
+                    &inner.borrow(),
+                    search,
+                    from,
+                )))
+            }),
+        );
+    }
+    // indexOf(searchElement, fromIndex?)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "indexOf".into(),
+            native(move |a| {
+                let search = a.first().unwrap_or(&JsValue::Undefined);
+                let from = a
+                    .get(1)
+                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                    .unwrap_or(0);
+                Ok(JsValue::Smi(
+                    typed_array_index_of(&inner.borrow(), search, from) as i32,
+                ))
+            }),
+        );
+    }
+    // join(separator?)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "join".into(),
+            native(move |a| {
+                let sep = match a.first() {
+                    Some(v) if !v.is_undefined() => v.to_js_string()?,
+                    _ => ",".to_string(),
+                };
+                Ok(JsValue::String(typed_array_join(&inner.borrow(), &sep)?))
+            }),
+        );
+    }
+    // keys()
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "keys".into(),
+            native(move |_| {
+                let items = typed_array_keys(&inner.borrow());
+                Ok(JsValue::Array(Rc::new(items)))
+            }),
+        );
+    }
+    // lastIndexOf(searchElement, fromIndex?)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "lastIndexOf".into(),
+            native(move |a| {
+                let search = a.first().unwrap_or(&JsValue::Undefined);
+                let ta = inner.borrow();
+                let from = a
+                    .get(1)
+                    .map(|v| v.to_number().unwrap_or(ta.length as f64 - 1.0) as i64)
+                    .unwrap_or(ta.length as i64 - 1);
+                Ok(JsValue::Smi(
+                    typed_array_last_index_of(&ta, search, from) as i32
+                ))
+            }),
+        );
+    }
+    // map(callbackfn)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "map".into(),
+            native(move |a| {
+                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                let ta = inner.borrow();
+                let mut mapped = Vec::with_capacity(ta.length);
+                for i in 0..ta.length {
+                    let v = typed_array_get(&ta, i);
+                    if let JsValue::NativeFunction(f) = &cb {
+                        mapped.push(f(vec![v, JsValue::Smi(i as i32)])?);
+                    } else {
+                        mapped.push(v);
+                    }
+                }
+                let result = typed_array_from_values(ta.kind, &mapped)?;
+                Ok(JsValue::TypedArray(Rc::new(RefCell::new(result))))
+            }),
+        );
+    }
+    // reduce(callbackfn, initialValue?)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "reduce".into(),
+            native(move |a| {
+                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                let ta = inner.borrow();
+                let mut start = 0;
+                let mut acc = if a.len() > 1 {
+                    a[1].clone()
+                } else {
+                    if ta.length == 0 {
+                        return Err(StatorError::TypeError(
+                            "Reduce of empty array with no initial value".into(),
+                        ));
+                    }
+                    start = 1;
+                    typed_array_get(&ta, 0)
+                };
+                for i in start..ta.length {
+                    let v = typed_array_get(&ta, i);
+                    if let JsValue::NativeFunction(f) = &cb {
+                        acc = f(vec![acc, v, JsValue::Smi(i as i32)])?;
+                    }
+                }
+                Ok(acc)
+            }),
+        );
+    }
+    // reduceRight(callbackfn, initialValue?)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "reduceRight".into(),
+            native(move |a| {
+                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                let ta = inner.borrow();
+                let len = ta.length;
+                let mut acc = if a.len() > 1 {
+                    a[1].clone()
+                } else {
+                    if len == 0 {
+                        return Err(StatorError::TypeError(
+                            "Reduce of empty array with no initial value".into(),
+                        ));
+                    }
+                    typed_array_get(&ta, len - 1)
+                };
+                let end = if a.len() <= 1 && len > 0 {
+                    len - 1
+                } else {
+                    len
+                };
+                for i in (0..end).rev() {
+                    let v = typed_array_get(&ta, i);
+                    if let JsValue::NativeFunction(f) = &cb {
+                        acc = f(vec![acc, v, JsValue::Smi(i as i32)])?;
+                    }
+                }
+                Ok(acc)
+            }),
+        );
+    }
+    // reverse()
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "reverse".into(),
+            native(move |_| {
+                typed_array_reverse(&inner.borrow());
+                Ok(JsValue::Undefined)
+            }),
+        );
+    }
+    // set(source, offset?)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "set".into(),
+            native(move |a| {
+                let source: Vec<JsValue> = match a.first() {
+                    Some(JsValue::Array(arr)) => arr.as_ref().clone(),
+                    Some(JsValue::TypedArray(src_rc)) => {
+                        let src = src_rc.borrow();
+                        (0..src.length).map(|i| typed_array_get(&src, i)).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                let offset = a
+                    .get(1)
+                    .map(|v| v.to_number().unwrap_or(0.0) as usize)
+                    .unwrap_or(0);
+                typed_array_set_from(&inner.borrow(), &source, offset)?;
+                Ok(JsValue::Undefined)
+            }),
+        );
+    }
+    // slice(start?, end?)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "slice".into(),
+            native(move |a| {
+                let ta = inner.borrow();
+                let start = a
+                    .first()
+                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                    .unwrap_or(0);
+                let end = a
+                    .get(1)
+                    .map(|v| v.to_number().unwrap_or(ta.length as f64) as i64)
+                    .unwrap_or(ta.length as i64);
+                let result = typed_array_slice(&ta, start, end)?;
+                Ok(JsValue::TypedArray(Rc::new(RefCell::new(result))))
+            }),
+        );
+    }
+    // some(callbackfn)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "some".into(),
+            native(move |a| {
+                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                let ta = inner.borrow();
+                for i in 0..ta.length {
+                    let v = typed_array_get(&ta, i);
+                    if let JsValue::NativeFunction(f) = &cb {
+                        let result = f(vec![v, JsValue::Smi(i as i32)])?;
+                        if result.to_boolean() {
+                            return Ok(JsValue::Boolean(true));
+                        }
+                    }
+                }
+                Ok(JsValue::Boolean(false))
+            }),
+        );
+    }
+    // sort(comparefn?)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "sort".into(),
+            native(move |_| {
+                typed_array_sort(&inner.borrow());
+                Ok(JsValue::Undefined)
+            }),
+        );
+    }
+    // subarray(begin?, end?)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "subarray".into(),
+            native(move |a| {
+                let ta = inner.borrow();
+                let begin = a
+                    .first()
+                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                    .unwrap_or(0);
+                let end = a
+                    .get(1)
+                    .map(|v| v.to_number().unwrap_or(ta.length as f64) as i64)
+                    .unwrap_or(ta.length as i64);
+                let sub = typed_array_subarray(&ta, begin, end);
+                let sub_inner = Rc::new(RefCell::new(sub));
+                Ok(make_typed_array_instance(ta.kind, sub_inner))
+            }),
+        );
+    }
+    // values()
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "values".into(),
+            native(move |_| {
+                let items = typed_array_values(&inner.borrow());
+                Ok(JsValue::Array(Rc::new(items)))
+            }),
+        );
+    }
+    // Store the TypedArray value for identity purposes.
+    obj.insert("__typed_array__".into(), typed_array_val);
+
+    JsValue::PlainObject(Rc::new(RefCell::new(obj)))
+}
+
 // ── install_globals ──────────────────────────────────────────────────────────
 
 /// Pre-populate `globals` with all ECMAScript built-in names.
@@ -5723,6 +6591,54 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         }),
     );
     globals.insert("String".into(), make_string());
+
+    // ── TypedArray / ArrayBuffer / DataView constructors ─────────────────
+    globals.insert("ArrayBuffer".into(), make_arraybuffer());
+    globals.insert("DataView".into(), make_dataview());
+    globals.insert(
+        "Int8Array".into(),
+        make_typed_array_constructor(TypedArrayKind::Int8),
+    );
+    globals.insert(
+        "Uint8Array".into(),
+        make_typed_array_constructor(TypedArrayKind::Uint8),
+    );
+    globals.insert(
+        "Uint8ClampedArray".into(),
+        make_typed_array_constructor(TypedArrayKind::Uint8Clamped),
+    );
+    globals.insert(
+        "Int16Array".into(),
+        make_typed_array_constructor(TypedArrayKind::Int16),
+    );
+    globals.insert(
+        "Uint16Array".into(),
+        make_typed_array_constructor(TypedArrayKind::Uint16),
+    );
+    globals.insert(
+        "Int32Array".into(),
+        make_typed_array_constructor(TypedArrayKind::Int32),
+    );
+    globals.insert(
+        "Uint32Array".into(),
+        make_typed_array_constructor(TypedArrayKind::Uint32),
+    );
+    globals.insert(
+        "Float32Array".into(),
+        make_typed_array_constructor(TypedArrayKind::Float32),
+    );
+    globals.insert(
+        "Float64Array".into(),
+        make_typed_array_constructor(TypedArrayKind::Float64),
+    );
+    globals.insert(
+        "BigInt64Array".into(),
+        make_typed_array_constructor(TypedArrayKind::BigInt64),
+    );
+    globals.insert(
+        "BigUint64Array".into(),
+        make_typed_array_constructor(TypedArrayKind::BigUint64),
+    );
 
     // ── Global constants ────────────────────────────────────────────────
     globals.insert("undefined".into(), JsValue::Undefined);
@@ -5889,6 +6805,20 @@ mod tests {
         assert!(globals.contains_key("URIError"));
         assert!(globals.contains_key("EvalError"));
         assert!(globals.contains_key("AggregateError"));
+        // TypedArray family
+        assert!(globals.contains_key("ArrayBuffer"));
+        assert!(globals.contains_key("DataView"));
+        assert!(globals.contains_key("Int8Array"));
+        assert!(globals.contains_key("Uint8Array"));
+        assert!(globals.contains_key("Uint8ClampedArray"));
+        assert!(globals.contains_key("Int16Array"));
+        assert!(globals.contains_key("Uint16Array"));
+        assert!(globals.contains_key("Int32Array"));
+        assert!(globals.contains_key("Uint32Array"));
+        assert!(globals.contains_key("Float32Array"));
+        assert!(globals.contains_key("Float64Array"));
+        assert!(globals.contains_key("BigInt64Array"));
+        assert!(globals.contains_key("BigUint64Array"));
     }
 
     /// Verify that the `Math` object has the expected properties.
