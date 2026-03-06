@@ -83,7 +83,6 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F64, I8, I32, I64};
 use cranelift_codegen::ir::{AbiParam, BlockArg, Function, InstBuilder, MemFlags, Signature};
 use cranelift_codegen::ir::{Block, Value};
-use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
@@ -377,7 +376,8 @@ impl TurbofanCodegen {
         // Build the Cranelift function signature:
         //   extern "C" fn(regs: *mut i64) -> i64
         let pointer_type = self.module.target_config().pointer_type();
-        let mut sig = Signature::new(CallConv::SystemV);
+        let call_conv = self.module.isa().default_call_conv();
+        let mut sig = Signature::new(call_conv);
         sig.params.push(AbiParam::new(pointer_type));
         sig.returns.push(AbiParam::new(I64));
 
