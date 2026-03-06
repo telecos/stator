@@ -35,6 +35,7 @@
 //! assert_eq!(arr.length(), 2);
 //! ```
 
+use crate::objects::plain_object_storage::PlainObjectStorage;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -201,7 +202,7 @@ impl V8Object {
     /// Create a new, empty JavaScript object.
     pub fn new() -> Self {
         Self {
-            inner: JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new()))),
+            inner: JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::new()))),
         }
     }
 
@@ -1034,7 +1035,7 @@ impl V8ObjectTemplate {
     /// predefined properties from this template.
     pub fn new_instance(&self) -> JsValue {
         let map: HashMap<String, JsValue> = self.properties.clone();
-        JsValue::PlainObject(Rc::new(RefCell::new(map)))
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))))
     }
 }
 
@@ -1224,7 +1225,7 @@ mod tests {
 
     #[test]
     fn test_v8object_from_jsvalue() {
-        let map = Rc::new(RefCell::new(HashMap::new()));
+        let map = Rc::new(RefCell::new(PlainObjectStorage::new()));
         map.borrow_mut().insert("key".to_string(), JsValue::Smi(10));
         let val = JsValue::PlainObject(map);
         let obj = V8Object::from(val);
@@ -1605,7 +1606,7 @@ mod tests {
 
     #[test]
     fn test_v8value_try_into_object() {
-        let obj_val = JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())));
+        let obj_val = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::new())));
         let v = V8Value::new(obj_val);
         assert!(v.is_object());
         let obj = v.try_into_object().unwrap();
@@ -1744,7 +1745,9 @@ mod tests {
     #[test]
     fn test_trycatch_set_caught_object() {
         let mut tc = V8TryCatch::new();
-        tc.set_caught(JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new()))));
+        tc.set_caught(JsValue::PlainObject(Rc::new(RefCell::new(
+            PlainObjectStorage::new(),
+        ))));
         assert!(tc.has_caught());
         assert_eq!(tc.message(), Some("[object]"));
     }

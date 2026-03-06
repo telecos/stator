@@ -1077,8 +1077,9 @@ fn js_value_to_json_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objects::plain_object_storage::PlainObjectStorage;
 
-    // ── json_parse — primitives ───────────────────────────────────────────────
+    // ── json_parse — primitives───────────────────────────────────────────────
 
     #[test]
     fn test_parse_null() {
@@ -1716,7 +1717,7 @@ mod tests {
             "toJSON".into(),
             JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::String("replaced".into())))),
         );
-        let obj = JsValue::PlainObject(Rc::new(RefCell::new(inner)));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(inner))));
 
         let json = js_value_to_json(&obj).unwrap().unwrap();
         assert_eq!(json, JsonValue::Str("replaced".to_string()));
@@ -1730,7 +1731,7 @@ mod tests {
         map.insert("a".into(), JsValue::Smi(1));
         map.insert("b".into(), JsValue::Smi(2));
         map.insert("c".into(), JsValue::Smi(3));
-        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))));
 
         let replacer = JsonReplacer::Array(vec!["a".to_string(), "c".to_string()]);
         let s = json_stringify_js_value(&obj, Some(&replacer), None)

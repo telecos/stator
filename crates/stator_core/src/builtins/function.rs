@@ -284,6 +284,7 @@ pub fn function_constructor(args: &[JsValue]) -> StatorResult<JsValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objects::plain_object_storage::PlainObjectStorage;
 
     fn make_adder() -> NativeFn {
         Rc::new(|args: Vec<JsValue>| {
@@ -516,8 +517,7 @@ mod tests {
     #[test]
     fn test_has_instance_object_like() {
         use std::cell::RefCell;
-        use std::collections::HashMap;
-        let obj = JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::new())));
         assert!(function_has_instance(&obj, &JsValue::Undefined));
     }
 

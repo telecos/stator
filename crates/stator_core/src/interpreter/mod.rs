@@ -165,6 +165,7 @@
 //! one [`Instruction`] per iteration, advances the program counter, then
 //! dispatches on the [`Opcode`] via an exhaustive `match`.
 
+use crate::objects::plain_object_storage::PlainObjectStorage;
 mod dispatch;
 
 use std::cell::{Cell, RefCell};
@@ -1196,7 +1197,7 @@ fn make_iterator_result(value: JsValue, done: bool) -> JsValue {
     ]
     .into_iter()
     .collect();
-    JsValue::PlainObject(Rc::new(RefCell::new(map)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))))
 }
 
 /// Look up the innermost exception handler for the instruction at `instr_idx`.
@@ -1331,10 +1332,10 @@ fn build_template_object(cooked: &[Option<String>], raw: &[String]) -> JsValue {
 
     map.insert(
         "raw".to_string(),
-        JsValue::PlainObject(Rc::new(RefCell::new(raw_map))),
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(raw_map)))),
     );
 
-    JsValue::PlainObject(Rc::new(RefCell::new(map)))
+    JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))))
 }
 
 /// Decode a constant-pool string entry into its runtime string value.
@@ -1982,9 +1983,7 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
 
 /// Extract array elements from a PlainObject that represents an array-like
 /// value (has a `"length"` property and numeric-string keys).
-pub(super) fn plain_object_to_array_items(
-    map: &Rc<RefCell<HashMap<String, JsValue>>>,
-) -> Vec<JsValue> {
+pub(super) fn plain_object_to_array_items(map: &Rc<RefCell<PlainObjectStorage>>) -> Vec<JsValue> {
     let borrow = map.borrow();
     let len = match borrow.get("length") {
         Some(JsValue::Smi(n)) => *n as usize,
@@ -5243,7 +5242,7 @@ mod tests {
     fn make_plain_object(pairs: Vec<(&str, JsValue)>) -> JsValue {
         let map: HashMap<String, JsValue> =
             pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
-        JsValue::PlainObject(Rc::new(RefCell::new(map)))
+        JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))))
     }
 
     #[test]
@@ -5582,16 +5581,16 @@ mod tests {
         // Build: constructor.prototype = proto_obj
         //        instance.__proto__   = proto_obj
         // TestInstanceOf should find the match.
-        let proto = Rc::new(RefCell::new(HashMap::new()));
+        let proto = Rc::new(RefCell::new(PlainObjectStorage::new()));
         proto
             .borrow_mut()
             .insert("kind".to_string(), JsValue::String("proto".to_string()));
 
-        let mut ctor_map = HashMap::new();
+        let mut ctor_map = PlainObjectStorage::new();
         ctor_map.insert("prototype".to_string(), JsValue::PlainObject(proto.clone()));
         let constructor = JsValue::PlainObject(Rc::new(RefCell::new(ctor_map)));
 
-        let mut inst_map = HashMap::new();
+        let mut inst_map = PlainObjectStorage::new();
         inst_map.insert("__proto__".to_string(), JsValue::PlainObject(proto.clone()));
         let instance = JsValue::PlainObject(Rc::new(RefCell::new(inst_map)));
 
@@ -5611,14 +5610,14 @@ mod tests {
     #[test]
     fn test_test_instance_of_no_match() {
         // Two different prototypes — should return false.
-        let proto_a = Rc::new(RefCell::new(HashMap::new()));
-        let proto_b = Rc::new(RefCell::new(HashMap::new()));
+        let proto_a = Rc::new(RefCell::new(PlainObjectStorage::new()));
+        let proto_b = Rc::new(RefCell::new(PlainObjectStorage::new()));
 
-        let mut ctor_map = HashMap::new();
+        let mut ctor_map = PlainObjectStorage::new();
         ctor_map.insert("prototype".to_string(), JsValue::PlainObject(proto_a));
         let constructor = JsValue::PlainObject(Rc::new(RefCell::new(ctor_map)));
 
-        let mut inst_map = HashMap::new();
+        let mut inst_map = PlainObjectStorage::new();
         inst_map.insert("__proto__".to_string(), JsValue::PlainObject(proto_b));
         let instance = JsValue::PlainObject(Rc::new(RefCell::new(inst_map)));
 
@@ -5641,7 +5640,7 @@ mod tests {
         // "x" in { x: 1 } → true
         let mut map = HashMap::new();
         map.insert("x".to_string(), JsValue::Smi(1));
-        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))));
 
         let result = run_with_acc_and_regs(
             JsValue::String("x".to_string()),
@@ -5660,7 +5659,7 @@ mod tests {
         // "y" in { x: 1 } → false
         let mut map = HashMap::new();
         map.insert("x".to_string(), JsValue::Smi(1));
-        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(map))));
 
         let result = run_with_acc_and_regs(
             JsValue::String("y".to_string()),
@@ -6348,7 +6347,7 @@ mod tests {
     fn test_plain_object_to_array_items() {
         // Build a PlainObject with numeric keys and verify
         // plain_object_to_array_items extracts elements correctly.
-        let map: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+        let map: Rc<RefCell<PlainObjectStorage>> = Rc::new(RefCell::new(PlainObjectStorage::new()));
         {
             let mut borrow = map.borrow_mut();
             borrow.insert("0".to_string(), JsValue::Smi(10));

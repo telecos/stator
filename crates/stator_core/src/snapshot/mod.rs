@@ -105,6 +105,7 @@
 //! assert_eq!(restored.get("greeting"), Some(&JsValue::String("hello".to_string())));
 //! ```
 
+use crate::objects::plain_object_storage::PlainObjectStorage;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -820,7 +821,7 @@ fn read_defined_ref(
     match inner_tag {
         TAG_PLAIN_OBJECT => {
             let count = read_u32(bytes, cursor)? as usize;
-            let map = Rc::new(RefCell::new(HashMap::with_capacity(count)));
+            let map = Rc::new(RefCell::new(PlainObjectStorage::new()));
             let value = JsValue::PlainObject(Rc::clone(&map));
             // Register before reading entries to allow circular references.
             ctx.register(ref_id, value.clone());
@@ -915,7 +916,9 @@ fn read_jsvalue_by_tag(
                 let v = read_jsvalue(bytes, cursor, ctx)?;
                 map.insert(k, v);
             }
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(map))))
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                PlainObjectStorage::from(map),
+            ))))
         }
         TAG_ERROR => {
             let kind_byte = read_u8(bytes, cursor)?;
@@ -1272,7 +1275,7 @@ mod tests {
 
     #[test]
     fn test_round_trip_plain_object() {
-        let mut map = HashMap::new();
+        let mut map = PlainObjectStorage::new();
         map.insert("x".to_string(), JsValue::Smi(10));
         map.insert("y".to_string(), JsValue::Boolean(true));
         let mut g = HashMap::new();
@@ -1282,7 +1285,10 @@ mod tests {
         );
         let r = round_trip(g);
         if let Some(JsValue::PlainObject(restored)) = r.get("obj") {
-            assert_eq!(*restored.borrow(), map);
+            let borrow = restored.borrow();
+            assert_eq!(borrow.get("x"), Some(&JsValue::Smi(10)));
+            assert_eq!(borrow.get("y"), Some(&JsValue::Boolean(true)));
+            assert_eq!(borrow.len(), 2);
         } else {
             panic!("expected PlainObject");
         }
@@ -1585,10 +1591,10 @@ mod tests {
 
     #[test]
     fn test_round_trip_shared_plain_object() {
-        let shared = Rc::new(RefCell::new(HashMap::from([(
+        let shared = Rc::new(RefCell::new(PlainObjectStorage::from(HashMap::from([(
             "x".to_string(),
             JsValue::Smi(1),
-        )])));
+        )]))));
         let mut g = HashMap::new();
         g.insert("a".to_string(), JsValue::PlainObject(Rc::clone(&shared)));
         g.insert("b".to_string(), JsValue::PlainObject(Rc::clone(&shared)));
@@ -1607,7 +1613,7 @@ mod tests {
 
     #[test]
     fn test_round_trip_circular_plain_object() {
-        let obj = Rc::new(RefCell::new(HashMap::new()));
+        let obj = Rc::new(RefCell::new(PlainObjectStorage::new()));
         obj.borrow_mut()
             .insert("self".to_string(), JsValue::PlainObject(Rc::clone(&obj)));
         obj.borrow_mut().insert("val".to_string(), JsValue::Smi(42));
@@ -1680,11 +1686,11 @@ mod tests {
     #[test]
     fn test_round_trip_prototype_chain() {
         // Simulate a prototype chain: child.__proto__ = parent
-        let parent = Rc::new(RefCell::new(HashMap::from([(
+        let parent = Rc::new(RefCell::new(PlainObjectStorage::from(HashMap::from([(
             "greet".to_string(),
             JsValue::String("hello".to_string()),
-        )])));
-        let mut child_map = HashMap::new();
+        )]))));
+        let mut child_map = PlainObjectStorage::new();
         child_map.insert("x".to_string(), JsValue::Smi(10));
         child_map.insert(
             "__proto__".to_string(),
@@ -1693,7 +1699,7 @@ mod tests {
         let child = Rc::new(RefCell::new(child_map));
 
         // A second child shares the same parent prototype.
-        let mut child2_map = HashMap::new();
+        let mut child2_map = PlainObjectStorage::new();
         child2_map.insert("y".to_string(), JsValue::Smi(20));
         child2_map.insert(
             "__proto__".to_string(),

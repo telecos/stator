@@ -482,6 +482,7 @@ mod tests {
     use super::*;
     use crate::objects::js_object::JsObject;
     use crate::objects::map::PropertyAttributes;
+    use crate::objects::plain_object_storage::PlainObjectStorage;
     use crate::objects::value::JsValue;
 
     // ── object_create ────────────────────────────────────────────────────────
@@ -1020,7 +1021,7 @@ mod tests {
         desc_map.insert("writable".to_string(), JsValue::Boolean(true));
         desc_map.insert("enumerable".to_string(), JsValue::Boolean(true));
         desc_map.insert("configurable".to_string(), JsValue::Boolean(true));
-        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(desc_map))));
 
         object_define_property_from_descriptor(&mut obj, "x", &desc).unwrap();
         assert_eq!(obj.get_own_property("x"), Some(JsValue::Smi(42)));
@@ -1038,7 +1039,7 @@ mod tests {
         let mut desc_map = HashMap::new();
         desc_map.insert("value".to_string(), JsValue::Smi(7));
         desc_map.insert("writable".to_string(), JsValue::Boolean(false));
-        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(desc_map))));
 
         object_define_property_from_descriptor(&mut obj, "ro", &desc).unwrap();
         // Attempt to write should fail.
@@ -1055,7 +1056,7 @@ mod tests {
         let mut desc_map = HashMap::new();
         desc_map.insert("value".to_string(), JsValue::Smi(1));
         desc_map.insert("get".to_string(), JsValue::Undefined);
-        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(desc_map))));
 
         let err = object_define_property_from_descriptor(&mut obj, "bad", &desc);
         assert!(matches!(err, Err(StatorError::TypeError(_))));
@@ -1072,7 +1073,7 @@ mod tests {
         let mut desc_map = HashMap::new();
         desc_map.insert("value".to_string(), JsValue::Smi(2));
         desc_map.insert("configurable".to_string(), JsValue::Boolean(true));
-        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(desc_map))));
 
         let err = object_define_property_from_descriptor(&mut obj, "nc", &desc);
         assert!(matches!(err, Err(StatorError::TypeError(_))));
@@ -1100,13 +1101,14 @@ mod tests {
         let mut props_map = HashMap::new();
         props_map.insert(
             "a".to_string(),
-            JsValue::PlainObject(Rc::new(RefCell::new(desc_a))),
+            JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(desc_a)))),
         );
         props_map.insert(
             "b".to_string(),
-            JsValue::PlainObject(Rc::new(RefCell::new(desc_b))),
+            JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(desc_b)))),
         );
-        let props = JsValue::PlainObject(Rc::new(RefCell::new(props_map)));
+        let props =
+            JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(props_map))));
 
         object_define_properties(&mut obj, &props).unwrap();
         assert_eq!(obj.get_own_property("a"), Some(JsValue::Smi(10)));
@@ -1203,7 +1205,7 @@ mod tests {
         desc_map.insert("writable".to_string(), JsValue::Boolean(true));
         desc_map.insert("enumerable".to_string(), JsValue::Boolean(false));
         desc_map.insert("configurable".to_string(), JsValue::Boolean(true));
-        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(desc_map))));
 
         object_define_property_from_descriptor(&mut obj, "hidden", &desc).unwrap();
         let keys = object_keys(&obj);
@@ -1220,7 +1222,7 @@ mod tests {
         let mut desc_map = HashMap::new();
         desc_map.insert("value".to_string(), JsValue::Smi(1));
         desc_map.insert("configurable".to_string(), JsValue::Boolean(false));
-        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(PlainObjectStorage::from(desc_map))));
 
         object_define_property_from_descriptor(&mut obj, "sticky", &desc).unwrap();
         let deleted = obj.delete_own_property("sticky").unwrap();

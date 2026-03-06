@@ -512,9 +512,10 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+    use crate::objects::plain_object_storage::PlainObjectStorage;
     use crate::objects::value::JsValue;
 
-    // ── HeapSnapshotBuilder::build ────────────────────────────────────────────
+    // ── HeapSnapshotBuilder::build────────────────────────────────────────────
 
     #[test]
     fn test_snapshot_empty_globals_has_root_node() {
@@ -556,7 +557,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_plain_object_edges() {
-        let mut inner = HashMap::new();
+        let mut inner = PlainObjectStorage::new();
         inner.insert("a".to_string(), JsValue::Smi(1));
         inner.insert("b".to_string(), JsValue::Smi(2));
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(inner)));
