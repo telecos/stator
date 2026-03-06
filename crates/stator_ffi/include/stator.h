@@ -118,6 +118,18 @@ typedef struct StatorIsolate StatorIsolate;
 typedef struct StatorObject StatorObject;
 
 /**
+ * An opaque object template handle.
+ *
+ * An object template describes the shape (properties and accessors) of objects
+ * that will be created from it.  This mirrors V8's `ObjectTemplate` and is
+ * used by Blink to set up DOM prototype objects.
+ *
+ * Created by [`stator_object_template_new`] and freed by
+ * [`stator_object_template_destroy`].
+ */
+typedef struct StatorObjectTemplate StatorObjectTemplate;
+
+/**
  * An opaque handle to an embedder-provided platform implementation.
  *
  * Created by [`stator_platform_new`] and destroyed by
@@ -140,6 +152,19 @@ typedef struct StatorPropertyNames StatorPropertyNames;
  * Created by [`stator_script_compile`] and released by [`stator_script_free`].
  */
 typedef struct StatorScript StatorScript;
+
+/**
+ * An opaque try-catch scope for catching exceptions across the FFI boundary.
+ *
+ * Mirrors V8's `TryCatch` RAII scope.  While a try-catch scope is active,
+ * any pending exception thrown via [`stator_isolate_throw_exception`] (or
+ * raised during script execution) is captured and can be inspected via
+ * [`stator_try_catch_has_caught`] and [`stator_try_catch_exception`].
+ *
+ * Created by [`stator_try_catch_new`] and freed by
+ * [`stator_try_catch_destroy`].
+ */
+typedef struct StatorTryCatch StatorTryCatch;
 
 /**
  * An opaque handle to a JavaScript value (number or string).
@@ -366,6 +391,28 @@ void stator_isolate_throw_exception(struct StatorIsolate *isolate, struct Stator
  * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
  */
 struct StatorContext *stator_isolate_get_current_context(const struct StatorIsolate *isolate);
+
+/**
+ * Return `true` if there is a pending exception on `isolate`.
+ *
+ * Returns `false` when `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ */
+bool stator_isolate_has_pending_exception(const struct StatorIsolate *isolate);
+
+/**
+ * Clear the pending exception on `isolate` and return it.
+ *
+ * Returns a null pointer when `isolate` is null or no pending exception is
+ * set.  The caller owns the returned pointer and must eventually pass it to
+ * [`stator_value_destroy`].
+ *
+ * # Safety
+ * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ */
+struct StatorValue *stator_isolate_clear_pending_exception(struct StatorIsolate *isolate);
 
 /**
  * Trigger a minor (young-generation) garbage collection on the isolate's heap.
@@ -1426,6 +1473,140 @@ struct StatorValue *stator_escapable_handle_scope_escape(struct StatorEscapableH
  * - `scope` must not be used again after this call.
  */
 void stator_escapable_handle_scope_close(struct StatorEscapableHandleScope *scope);
+
+/**
+ * Create a new, empty object template associated with `isolate`.
+ *
+ * Returns a null pointer if `isolate` is null.  The caller must eventually
+ * pass the returned pointer to [`stator_object_template_destroy`].
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorObjectTemplate *stator_object_template_new(struct StatorIsolate *isolate);
+
+/**
+ * Destroy an object template previously created with
+ * [`stator_object_template_new`].
+ *
+ * Does nothing if `tmpl` is null.
+ *
+ * # Safety
+ * `tmpl` must be a non-null pointer returned by
+ * [`stator_object_template_new`] and must not be used again after this call.
+ */
+void stator_object_template_destroy(struct StatorObjectTemplate *tmpl);
+
+/**
+ * Set a named property on the object template.
+ *
+ * When a new instance is created via [`stator_object_template_new_instance`],
+ * it will have this property pre-installed.  Does nothing if any argument is
+ * null.
+ *
+ * # Safety
+ * - `tmpl` must be a valid, live [`StatorObjectTemplate`] pointer.
+ * - `key` must be a valid, null-terminated C string.
+ * - `val` must be a valid, live [`StatorValue`] pointer.
+ */
+void stator_object_template_set(struct StatorObjectTemplate *tmpl,
+                                const char *key,
+                                const struct StatorValue *val);
+
+/**
+ * Set the number of internal fields on objects created from this template.
+ *
+ * Internal fields are opaque embedder-owned slots (similar to V8's
+ * `SetInternalFieldCount`).  Does nothing if `tmpl` is null.
+ *
+ * # Safety
+ * `tmpl` must be a valid, live [`StatorObjectTemplate`] pointer.
+ */
+void stator_object_template_set_internal_field_count(struct StatorObjectTemplate *tmpl,
+                                                     int32_t count);
+
+/**
+ * Return the internal field count configured on this template.
+ *
+ * Returns `0` if `tmpl` is null.
+ *
+ * # Safety
+ * `tmpl` must be either null or a valid, live [`StatorObjectTemplate`] pointer.
+ */
+int32_t stator_object_template_internal_field_count(const struct StatorObjectTemplate *tmpl);
+
+/**
+ * Create a new [`StatorObject`] instance from an object template.
+ *
+ * The returned object has all properties defined on the template pre-installed.
+ * Returns a null pointer if `tmpl` is null.  The caller owns the returned
+ * pointer and must eventually pass it to [`stator_object_destroy`].
+ *
+ * # Safety
+ * `tmpl` must be either null or a valid, live [`StatorObjectTemplate`] pointer.
+ */
+struct StatorObject *stator_object_template_new_instance(const struct StatorObjectTemplate *tmpl);
+
+/**
+ * Create a new try-catch scope on `isolate`.
+ *
+ * Returns a null pointer if `isolate` is null.  The caller must eventually
+ * pass the returned pointer to [`stator_try_catch_destroy`].
+ *
+ * # Safety
+ * `isolate` must be a non-null, valid pointer to a live [`StatorIsolate`].
+ */
+struct StatorTryCatch *stator_try_catch_new(struct StatorIsolate *isolate);
+
+/**
+ * Return `true` if this try-catch scope has caught an exception.
+ *
+ * This function checks the isolate for a pending exception and, if found,
+ * captures it into the scope.  Returns `false` if `tc` is null.
+ *
+ * # Safety
+ * `tc` must be either null or a valid, live [`StatorTryCatch`] pointer.
+ */
+bool stator_try_catch_has_caught(struct StatorTryCatch *tc);
+
+/**
+ * Return the caught exception, or a null pointer if none was caught.
+ *
+ * The returned pointer is owned by the try-catch scope and remains valid
+ * until [`stator_try_catch_reset`] or [`stator_try_catch_destroy`] is called.
+ * The caller must **not** call [`stator_value_destroy`] on it.
+ *
+ * # Safety
+ * `tc` must be either null or a valid, live [`StatorTryCatch`] pointer.
+ */
+struct StatorValue *stator_try_catch_exception(const struct StatorTryCatch *tc);
+
+/**
+ * Reset the try-catch scope, clearing any caught exception.
+ *
+ * After this call, [`stator_try_catch_has_caught`] returns `false` and
+ * [`stator_try_catch_exception`] returns null until a new exception is caught.
+ *
+ * # Safety
+ * `tc` must be either null or a valid, live [`StatorTryCatch`] pointer.
+ */
+void stator_try_catch_reset(struct StatorTryCatch *tc);
+
+/**
+ * Destroy a try-catch scope previously created with [`stator_try_catch_new`].
+ *
+ * If the scope holds a caught exception that has not been cleared via
+ * [`stator_try_catch_reset`], the exception value is **not** destroyed (the
+ * caller retains ownership of exception values passed to
+ * [`stator_isolate_throw_exception`]).
+ *
+ * Does nothing if `tc` is null.
+ *
+ * # Safety
+ * `tc` must be a non-null pointer returned by [`stator_try_catch_new`] and
+ * must not be used again after this call.
+ */
+void stator_try_catch_destroy(struct StatorTryCatch *tc);
 
 /**
  * Create a new platform from an embedder-supplied vtable.
