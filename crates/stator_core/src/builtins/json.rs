@@ -986,7 +986,7 @@ fn stringify_object(
 /// # Errors
 ///
 /// Returns `TypeError` for `BigInt` and for circular `Array` values.
-fn js_value_to_json(value: &JsValue) -> StatorResult<Option<JsonValue>> {
+pub fn js_value_to_json(value: &JsValue) -> StatorResult<Option<JsonValue>> {
     js_value_to_json_inner(value, &mut HashSet::new())
 }
 
@@ -1033,6 +1033,20 @@ fn js_value_to_json_inner(
         // NativeFunction and PlainObject are not JSON-serializable.
         JsValue::NativeFunction(_) => Ok(None),
         JsValue::PlainObject(map) => {
+            // §25.5.2 step 2: if the object has a callable `toJSON` property,
+            // invoke it and serialise the return value instead.
+            let to_json_fn = map.borrow().get("toJSON").and_then(|v| {
+                if let JsValue::NativeFunction(f) = v {
+                    Some(f.clone())
+                } else {
+                    None
+                }
+            });
+            if let Some(f) = to_json_fn {
+                let result = f(vec![JsValue::String(String::new())])?;
+                return js_value_to_json_inner(&result, seen);
+            }
+
             let ptr = Rc::as_ptr(map) as usize;
             if seen.contains(&ptr) {
                 return Err(StatorError::TypeError(
@@ -1684,5 +1698,55 @@ mod tests {
         ]));
         let result = json_stringify_js_value(&arr, None, None).unwrap().unwrap();
         assert_eq!(result, "[1,false,null]");
+    }
+
+    // ── js_value_to_json: toJSON method ──────────────────────────────────────
+
+    #[test]
+    fn test_js_value_to_json_with_to_json_method() {
+        use std::collections::HashMap;
+
+        let mut inner: HashMap<String, JsValue> = HashMap::new();
+        inner.insert("value".into(), JsValue::Smi(42));
+        inner.insert(
+            "toJSON".into(),
+            JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::String("replaced".into())))),
+        );
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(inner)));
+
+        let json = js_value_to_json(&obj).unwrap().unwrap();
+        assert_eq!(json, JsonValue::Str("replaced".to_string()));
+    }
+
+    #[test]
+    fn test_js_value_stringify_plain_object_with_replacer() {
+        use std::collections::HashMap;
+
+        let mut map: HashMap<String, JsValue> = HashMap::new();
+        map.insert("a".into(), JsValue::Smi(1));
+        map.insert("b".into(), JsValue::Smi(2));
+        map.insert("c".into(), JsValue::Smi(3));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+
+        let replacer = JsonReplacer::Array(vec!["a".to_string(), "c".to_string()]);
+        let s = json_stringify_js_value(&obj, Some(&replacer), None)
+            .unwrap()
+            .unwrap();
+        // Only "a" and "c" should appear.
+        assert!(s.contains("\"a\""), "should contain a: {s}");
+        assert!(s.contains("\"c\""), "should contain c: {s}");
+        assert!(!s.contains("\"b\""), "should not contain b: {s}");
+    }
+
+    #[test]
+    fn test_js_value_stringify_with_space() {
+        let s = json_stringify_js_value(
+            &JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::Smi(2)])),
+            None,
+            Some(&JsonSpace::Count(2)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(s, "[\n  1,\n  2\n]");
     }
 }
