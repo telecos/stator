@@ -1,6 +1,8 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::mem::align_of;
+use std::ptr::NonNull;
 
+use crate::gc::gc_ptr::{GcObject, GcPtr};
 pub use crate::objects::heap_object::HeapObject;
 
 /// A contiguous, fixed-size memory region used as a semi-space or generation.
@@ -490,6 +492,43 @@ impl Heap {
             crate::gc::mark_sweep_compact::MarkSweepCompactor::new(&mut self.old_space)
                 .collect(roots)
         };
+    }
+
+    /// Allocate a typed `T` on the GC heap and return a [`GcPtr<T>`].
+    ///
+    /// The value is written into the allocation and the [`HeapObject`] header
+    /// is initialised with the correct `alloc_size`.  The returned pointer is
+    /// **not rooted** — the caller must register it with a
+    /// [`HandleScope`][crate::gc::handle::HandleScope] or
+    /// [`PersistentRoots`][crate::gc::handle::PersistentRoots] before a GC
+    /// cycle can occur.
+    ///
+    /// Returns `None` if the allocation fails (e.g. the heap is exhausted even
+    /// after a minor GC).
+    pub fn alloc<T: GcObject>(&mut self, value: T) -> Option<GcPtr<T>> {
+        let layout = Layout::new::<T>();
+        let raw = self.allocate(layout);
+        if raw.is_null() {
+            return None;
+        }
+        let typed = raw as *mut T;
+        // Write the user's value into the allocation.  This overwrites the
+        // zero-initialised HeapObject header (including alloc_size), so we
+        // must re-initialise the header fields below.
+        // SAFETY: `raw` is non-null, properly aligned for `T` (the allocator
+        // ensures at least `HeapObject` alignment, and T: GcObject starts
+        // with HeapObject), and `layout.size()` bytes are available.
+        unsafe { typed.write(value) };
+        // Restore alloc_size using the same padded layout that `allocate`
+        // computed internally.
+        let padded = layout
+            .align_to(align_of::<HeapObject>())
+            .expect("HeapObject alignment is valid")
+            .pad_to_align();
+        // SAFETY: raw is a valid HeapObject pointer.
+        unsafe { (*raw).init_alloc_size(padded.size() as u32) };
+        // SAFETY: typed is non-null and points to a fully initialised T.
+        Some(unsafe { GcPtr::from_raw(NonNull::new_unchecked(typed)) })
     }
 }
 
