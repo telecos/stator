@@ -1,3 +1,5 @@
+/// GC-managed typed pointer ([`gc_ptr::GcPtr<T>`]) and the [`gc_ptr::GcObject`] trait.
+pub mod gc_ptr;
 /// Handle scopes and persistent roots for safe GC-pointer access.
 pub mod handle;
 /// Heap allocator with generational memory regions.
