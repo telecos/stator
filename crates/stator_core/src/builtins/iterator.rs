@@ -12,6 +12,7 @@
 
 use std::rc::Rc;
 
+use crate::builtins::promise::{MicrotaskQueue, promise_reject, promise_resolve};
 use crate::error::{StatorError, StatorResult};
 use crate::objects::value::{GeneratorStep, JsValue, NativeIterator};
 
@@ -541,6 +542,166 @@ pub fn iterator_from(iterable: &JsValue) -> StatorResult<JsValue> {
         _ => Err(StatorError::TypeError(format!(
             "Iterator.from: value is not iterable (got {iterable:?})"
         ))),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Async Iterator Helpers — ES2025 (§27.1.4.2)
+//
+// Each async helper mirrors the corresponding sync helper but wraps the
+// result (or error) in a Promise.  Since the engine currently models async
+// iteration through the same Iterator/Generator types, the helpers eagerly
+// consume the source and settle the returned promise synchronously.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Async version of [`iterator_map`].
+///
+/// Returns a `Promise` that fulfills with a new iterator whose elements are
+/// the result of applying `mapper` to each element of `iter`.
+pub fn async_iterator_map(iter: &JsValue, mapper: &JsValue, queue: &MicrotaskQueue) -> JsValue {
+    match iterator_map(iter, mapper) {
+        Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+    }
+}
+
+/// Async version of [`iterator_filter`].
+///
+/// Returns a `Promise` that fulfills with a new iterator containing only the
+/// elements for which `predicate` returns a truthy value.
+pub fn async_iterator_filter(
+    iter: &JsValue,
+    predicate: &JsValue,
+    queue: &MicrotaskQueue,
+) -> JsValue {
+    match iterator_filter(iter, predicate) {
+        Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+    }
+}
+
+/// Async version of [`iterator_take`].
+///
+/// Returns a `Promise` that fulfills with a new iterator yielding at most
+/// `limit` elements.
+pub fn async_iterator_take(iter: &JsValue, limit: usize, queue: &MicrotaskQueue) -> JsValue {
+    match iterator_take(iter, limit) {
+        Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+    }
+}
+
+/// Async version of [`iterator_drop`].
+///
+/// Returns a `Promise` that fulfills with a new iterator that skips the first
+/// `count` elements.
+pub fn async_iterator_drop(iter: &JsValue, count: usize, queue: &MicrotaskQueue) -> JsValue {
+    match iterator_drop(iter, count) {
+        Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+    }
+}
+
+/// Async version of [`iterator_flat_map`].
+///
+/// Returns a `Promise` that fulfills with a new iterator whose elements are
+/// the concatenation of iterators produced by `mapper`.
+pub fn async_iterator_flat_map(
+    iter: &JsValue,
+    mapper: &JsValue,
+    queue: &MicrotaskQueue,
+) -> JsValue {
+    match iterator_flat_map(iter, mapper) {
+        Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+    }
+}
+
+/// Async version of [`iterator_reduce`].
+///
+/// Returns a `Promise` that fulfills with the reduced value.
+pub fn async_iterator_reduce(
+    iter: &JsValue,
+    reducer: &JsValue,
+    initial: Option<JsValue>,
+    queue: &MicrotaskQueue,
+) -> JsValue {
+    match iterator_reduce(iter, reducer, initial) {
+        Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+    }
+}
+
+/// Async version of [`iterator_to_array`].
+///
+/// Returns a `Promise` that fulfills with a `JsValue::Array` of all elements.
+pub fn async_iterator_to_array(iter: &JsValue, queue: &MicrotaskQueue) -> JsValue {
+    match iterator_to_array(iter) {
+        Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+    }
+}
+
+/// Async version of [`iterator_for_each`].
+///
+/// Returns a `Promise` that fulfills with `undefined` after calling `callback`
+/// for each element.
+pub fn async_iterator_for_each(
+    iter: &JsValue,
+    callback: &JsValue,
+    queue: &MicrotaskQueue,
+) -> JsValue {
+    match iterator_for_each(iter, callback) {
+        Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+    }
+}
+
+/// Async version of [`iterator_some`].
+///
+/// Returns a `Promise` that fulfills with `true` if `predicate` returns truthy
+/// for any element, `false` otherwise.
+pub fn async_iterator_some(iter: &JsValue, predicate: &JsValue, queue: &MicrotaskQueue) -> JsValue {
+    match iterator_some(iter, predicate) {
+        Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+    }
+}
+
+/// Async version of [`iterator_every`].
+///
+/// Returns a `Promise` that fulfills with `true` if `predicate` returns truthy
+/// for every element, `false` otherwise.
+pub fn async_iterator_every(
+    iter: &JsValue,
+    predicate: &JsValue,
+    queue: &MicrotaskQueue,
+) -> JsValue {
+    match iterator_every(iter, predicate) {
+        Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+    }
+}
+
+/// Async version of [`iterator_find`].
+///
+/// Returns a `Promise` that fulfills with the first matching element, or
+/// `undefined` if none match.
+pub fn async_iterator_find(iter: &JsValue, predicate: &JsValue, queue: &MicrotaskQueue) -> JsValue {
+    match iterator_find(iter, predicate) {
+        Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+    }
+}
+
+/// Async version of [`iterator_from`].
+///
+/// Returns a `Promise` that fulfills with an iterator wrapping the given
+/// iterable.
+pub fn async_iterator_from(iterable: &JsValue, queue: &MicrotaskQueue) -> JsValue {
+    match iterator_from(iterable) {
+        Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
     }
 }
 
@@ -1142,5 +1303,257 @@ mod tests {
     fn test_iterator_from_non_iterable_errors() {
         let err = iterator_from(&JsValue::Smi(42)).unwrap_err();
         assert!(matches!(err, StatorError::TypeError(_)));
+    }
+
+    // ── async iterator helpers ───────────────────────────────────────────────
+
+    fn make_queue() -> MicrotaskQueue {
+        MicrotaskQueue::new()
+    }
+
+    #[test]
+    fn test_async_iterator_map() {
+        let q = make_queue();
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        let mapper = make_native_fn(|args| {
+            let n = args[0].to_number()?;
+            Ok(JsValue::Smi((n * 2.0) as i32))
+        });
+        let result = async_iterator_map(&iter, &mapper, &q);
+        if let JsValue::Promise(p) = result {
+            assert!(p.is_fulfilled());
+            let inner = p.value().unwrap();
+            let items = iterator_to_vec(&inner).unwrap();
+            assert_eq!(items, vec![JsValue::Smi(2), JsValue::Smi(4)]);
+        } else {
+            panic!("expected Promise");
+        }
+    }
+
+    #[test]
+    fn test_async_iterator_filter() {
+        let q = make_queue();
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let pred = make_native_fn(|args| {
+            let n = args[0].to_number()?;
+            Ok(JsValue::Boolean(n as i64 % 2 == 0))
+        });
+        let result = async_iterator_filter(&iter, &pred, &q);
+        if let JsValue::Promise(p) = result {
+            assert!(p.is_fulfilled());
+            let inner = p.value().unwrap();
+            let items = iterator_to_vec(&inner).unwrap();
+            assert_eq!(items, vec![JsValue::Smi(2)]);
+        } else {
+            panic!("expected Promise");
+        }
+    }
+
+    #[test]
+    fn test_async_iterator_take() {
+        let q = make_queue();
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let result = async_iterator_take(&iter, 2, &q);
+        if let JsValue::Promise(p) = result {
+            assert!(p.is_fulfilled());
+            let inner = p.value().unwrap();
+            let items = iterator_to_vec(&inner).unwrap();
+            assert_eq!(items, vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        } else {
+            panic!("expected Promise");
+        }
+    }
+
+    #[test]
+    fn test_async_iterator_drop() {
+        let q = make_queue();
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let result = async_iterator_drop(&iter, 1, &q);
+        if let JsValue::Promise(p) = result {
+            assert!(p.is_fulfilled());
+            let inner = p.value().unwrap();
+            let items = iterator_to_vec(&inner).unwrap();
+            assert_eq!(items, vec![JsValue::Smi(2), JsValue::Smi(3)]);
+        } else {
+            panic!("expected Promise");
+        }
+    }
+
+    #[test]
+    fn test_async_iterator_flat_map() {
+        let q = make_queue();
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        let mapper = make_native_fn(|args| {
+            let n = args[0].to_number()? as i32;
+            Ok(JsValue::Array(Rc::new(vec![
+                JsValue::Smi(n),
+                JsValue::Smi(n * 10),
+            ])))
+        });
+        let result = async_iterator_flat_map(&iter, &mapper, &q);
+        if let JsValue::Promise(p) = result {
+            assert!(p.is_fulfilled());
+            let inner = p.value().unwrap();
+            let items = iterator_to_vec(&inner).unwrap();
+            assert_eq!(
+                items,
+                vec![
+                    JsValue::Smi(1),
+                    JsValue::Smi(10),
+                    JsValue::Smi(2),
+                    JsValue::Smi(20)
+                ]
+            );
+        } else {
+            panic!("expected Promise");
+        }
+    }
+
+    #[test]
+    fn test_async_iterator_reduce() {
+        let q = make_queue();
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let reducer = make_native_fn(|args| {
+            let a = args[0].to_number()?;
+            let b = args[1].to_number()?;
+            Ok(JsValue::Smi((a + b) as i32))
+        });
+        let result = async_iterator_reduce(&iter, &reducer, Some(JsValue::Smi(0)), &q);
+        if let JsValue::Promise(p) = result {
+            assert!(p.is_fulfilled());
+            assert_eq!(p.value(), Some(JsValue::Smi(6)));
+        } else {
+            panic!("expected Promise");
+        }
+    }
+
+    #[test]
+    fn test_async_iterator_reduce_error_rejects() {
+        let q = make_queue();
+        let iter = make_array_iterator(vec![]);
+        let reducer = make_native_fn(|_| Ok(JsValue::Undefined));
+        let result = async_iterator_reduce(&iter, &reducer, None, &q);
+        if let JsValue::Promise(p) = result {
+            assert!(p.is_rejected());
+        } else {
+            panic!("expected Promise");
+        }
+    }
+
+    #[test]
+    fn test_async_iterator_to_array() {
+        let q = make_queue();
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        let result = async_iterator_to_array(&iter, &q);
+        if let JsValue::Promise(p) = result {
+            assert!(p.is_fulfilled());
+            assert_eq!(
+                p.value(),
+                Some(JsValue::Array(Rc::new(vec![
+                    JsValue::Smi(1),
+                    JsValue::Smi(2)
+                ])))
+            );
+        } else {
+            panic!("expected Promise");
+        }
+    }
+
+    #[test]
+    fn test_async_iterator_for_each() {
+        use std::cell::Cell;
+        let q = make_queue();
+        let count = Rc::new(Cell::new(0i32));
+        let count_clone = count.clone();
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        let callback = make_native_fn(move |_| {
+            count_clone.set(count_clone.get() + 1);
+            Ok(JsValue::Undefined)
+        });
+        let result = async_iterator_for_each(&iter, &callback, &q);
+        if let JsValue::Promise(p) = result {
+            assert!(p.is_fulfilled());
+            assert_eq!(p.value(), Some(JsValue::Undefined));
+        } else {
+            panic!("expected Promise");
+        }
+        assert_eq!(count.get(), 2);
+    }
+
+    #[test]
+    fn test_async_iterator_some() {
+        let q = make_queue();
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        let pred = make_native_fn(|args| {
+            let n = args[0].to_number()?;
+            Ok(JsValue::Boolean(n == 2.0))
+        });
+        let result = async_iterator_some(&iter, &pred, &q);
+        if let JsValue::Promise(p) = result {
+            assert!(p.is_fulfilled());
+            assert_eq!(p.value(), Some(JsValue::Boolean(true)));
+        } else {
+            panic!("expected Promise");
+        }
+    }
+
+    #[test]
+    fn test_async_iterator_every() {
+        let q = make_queue();
+        let iter = make_array_iterator(vec![JsValue::Smi(2), JsValue::Smi(4)]);
+        let pred = make_native_fn(|args| {
+            let n = args[0].to_number()?;
+            Ok(JsValue::Boolean(n as i64 % 2 == 0))
+        });
+        let result = async_iterator_every(&iter, &pred, &q);
+        if let JsValue::Promise(p) = result {
+            assert!(p.is_fulfilled());
+            assert_eq!(p.value(), Some(JsValue::Boolean(true)));
+        } else {
+            panic!("expected Promise");
+        }
+    }
+
+    #[test]
+    fn test_async_iterator_find() {
+        let q = make_queue();
+        let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        let pred = make_native_fn(|args| {
+            let n = args[0].to_number()?;
+            Ok(JsValue::Boolean(n == 2.0))
+        });
+        let result = async_iterator_find(&iter, &pred, &q);
+        if let JsValue::Promise(p) = result {
+            assert!(p.is_fulfilled());
+            assert_eq!(p.value(), Some(JsValue::Smi(2)));
+        } else {
+            panic!("expected Promise");
+        }
+    }
+
+    #[test]
+    fn test_async_iterator_from_array() {
+        let q = make_queue();
+        let arr = JsValue::Array(Rc::new(vec![JsValue::Smi(1)]));
+        let result = async_iterator_from(&arr, &q);
+        if let JsValue::Promise(p) = result {
+            assert!(p.is_fulfilled());
+            let inner = p.value().unwrap();
+            let items = iterator_to_vec(&inner).unwrap();
+            assert_eq!(items, vec![JsValue::Smi(1)]);
+        } else {
+            panic!("expected Promise");
+        }
+    }
+
+    #[test]
+    fn test_async_iterator_from_non_iterable_rejects() {
+        let q = make_queue();
+        let result = async_iterator_from(&JsValue::Smi(42), &q);
+        if let JsValue::Promise(p) = result {
+            assert!(p.is_rejected());
+        } else {
+            panic!("expected Promise");
+        }
     }
 }
