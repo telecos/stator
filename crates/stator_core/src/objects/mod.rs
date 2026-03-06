@@ -13,6 +13,9 @@ pub mod map;
 pub mod property_descriptor;
 /// JavaScript `RegExp` object with ECMAScript flag and built-in method support.
 pub mod regexp;
+/// V8-style hidden-class (shape) system with transition trees and descriptor
+/// arrays for fast property access.
+pub mod shapes;
 /// JavaScript string types with multiple internal representations.
 pub mod string;
 /// Tagged pointer representation for JavaScript values.

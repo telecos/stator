@@ -27,6 +27,7 @@ use smallvec::SmallVec;
 use crate::error::{StatorError, StatorResult};
 use crate::gc::trace::{Trace, Tracer};
 use crate::objects::map::{InstanceType, Map, PropertyAttributes, PropertyDescriptor};
+use crate::objects::shapes::{ShapeId, ShapeTable};
 use crate::objects::value::JsValue;
 
 /// Number of named-property slots stored directly in the object before the
@@ -98,6 +99,10 @@ enum NamedProperties {
 pub struct JsObject {
     /// Hidden class (shape descriptor) for named fast properties.
     map: Map,
+    /// Optional shape identifier for the new transition-tree based shape
+    /// system.  When `Some`, shape-based property lookup via a [`ShapeTable`]
+    /// is available alongside the legacy [`Map`]-based path.
+    shape_id: Option<ShapeId>,
     /// Backing store for named (string-keyed) properties.
     named_properties: NamedProperties,
     /// Backing store for indexed (u32-keyed per ECMAScript) properties.
@@ -114,6 +119,7 @@ impl JsObject {
     pub fn new() -> Self {
         Self {
             map: Map::new(InstanceType::JsObject, 0),
+            shape_id: None,
             named_properties: NamedProperties::Fast(Box::new(SmallVec::new())),
             elements: Vec::new(),
             prototype: None,
@@ -129,6 +135,7 @@ impl JsObject {
     pub fn new_with_instance_type(instance_type: InstanceType) -> Self {
         Self {
             map: Map::new(instance_type, 0),
+            shape_id: None,
             named_properties: NamedProperties::Fast(Box::new(SmallVec::new())),
             elements: Vec::new(),
             prototype: None,
@@ -140,6 +147,7 @@ impl JsObject {
     pub fn with_prototype(prototype: Rc<RefCell<JsObject>>) -> Self {
         Self {
             map: Map::new(InstanceType::JsObject, 0),
+            shape_id: None,
             named_properties: NamedProperties::Fast(Box::new(SmallVec::new())),
             elements: Vec::new(),
             prototype: Some(prototype),
@@ -150,6 +158,36 @@ impl JsObject {
     /// Returns a reference to this object's hidden class ([`Map`]).
     pub fn map(&self) -> &Map {
         &self.map
+    }
+
+    /// Returns the [`ShapeId`] associated with this object, if any.
+    ///
+    /// When `Some`, the object participates in the transition-tree shape
+    /// system and its properties can be looked up via a [`ShapeTable`].
+    pub fn shape_id(&self) -> Option<ShapeId> {
+        self.shape_id
+    }
+
+    /// Associates this object with a [`ShapeId`] in the global shape
+    /// transition tree.
+    pub fn set_shape_id(&mut self, id: ShapeId) {
+        self.shape_id = Some(id);
+    }
+
+    /// Looks up an own property value using the shape system, falling back to
+    /// the legacy [`Map`]-based / `HashMap`-based lookup.
+    ///
+    /// When the object has an associated [`ShapeId`] and the property is
+    /// found in the shape's descriptor array, the value is read directly by
+    /// its `field_index` from the fast-mode backing store.  Otherwise the
+    /// lookup delegates to [`get_own_property`][Self::get_own_property].
+    pub fn get_property_by_shape(&self, table: &ShapeTable, key: &str) -> Option<JsValue> {
+        if let Some(sid) = self.shape_id
+            && let Some(desc) = table.lookup(sid, key)
+        {
+            return self.get_fast_property_at_index(desc.field_index() as usize);
+        }
+        self.get_own_property(key)
     }
 
     /// Returns `true` if this object is in fast (descriptor-backed) mode.
