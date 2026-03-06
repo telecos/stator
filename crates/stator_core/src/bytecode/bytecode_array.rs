@@ -235,6 +235,8 @@ pub struct BytecodeArray {
     is_generator: bool,
     /// `true` if this bytecode belongs to an async function or async generator.
     is_async: bool,
+    /// `true` if this bytecode belongs to an ES module (as opposed to a script).
+    is_module: bool,
     // ─── Tiering state (shared across clones via Rc / Arc) ───────────────────
     /// Number of times this function has been invoked.
     ///
@@ -285,6 +287,7 @@ impl PartialEq for BytecodeArray {
             && self.handler_table == other.handler_table
             && self.is_generator == other.is_generator
             && self.is_async == other.is_async
+            && self.is_module == other.is_module
     }
 }
 
@@ -321,6 +324,7 @@ impl BytecodeArray {
             handler_table,
             is_generator: false,
             is_async: false,
+            is_module: false,
             invocation_count: Rc::new(Cell::new(0)),
             jit_code: Rc::new(RefCell::new(None)),
             maglev_jit_code: Arc::new(Mutex::new(None)),
@@ -363,6 +367,17 @@ impl BytecodeArray {
     /// `async function*`.
     pub fn is_async(&self) -> bool {
         self.is_async
+    }
+
+    /// Mark this [`BytecodeArray`] as belonging to an ES module.
+    pub fn with_module_flag(mut self, flag: bool) -> Self {
+        self.is_module = flag;
+        self
+    }
+
+    /// Returns `true` if this bytecode belongs to an ES module.
+    pub fn is_module(&self) -> bool {
+        self.is_module
     }
 
     /// The raw encoded bytecode bytes.

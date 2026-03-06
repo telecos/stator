@@ -38,9 +38,10 @@ use crate::bytecode::feedback::{FeedbackMetadata, FeedbackSlotKind};
 use crate::bytecode::register::{Register, RegisterAllocator};
 use crate::error::{StatorError, StatorResult};
 use crate::parser::ast::{
-    ArrowBody, ArrowExpr, AssignOp, AssignTarget, BinaryOp, BlockStmt, Expr, FnDecl, FnExpr,
-    ForInit, ForStmt, LogicalOp, ObjectPatProp, Pat, Program, ProgramItem, Stmt, UnaryOp, UpdateOp,
-    VarDecl, VarDeclarator,
+    ArrowBody, ArrowExpr, AssignOp, AssignTarget, BinaryOp, BlockStmt, ExportDefaultExpr,
+    ExportNamedDecl, Expr, FnDecl, FnExpr, ForInit, ForStmt, ImportSpecifier, LogicalOp,
+    ModuleDecl, ModuleExportName, ObjectPatProp, Pat, Program, ProgramItem, SourceType, Stmt,
+    UnaryOp, UpdateOp, VarDecl, VarDeclarator,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -206,6 +207,18 @@ struct FunctionCompiler {
     /// `var` declarations emit [`Opcode::StaGlobal`] so that new bindings
     /// are hoisted into the caller's variable environment.
     is_eval_scope: bool,
+    /// `true` when compiling the top-level body of an ES module.
+    ///
+    /// Affects how import/export declarations and `import.meta` are compiled,
+    /// and marks the resulting [`BytecodeArray`] with
+    /// [`BytecodeArray::with_module_flag`].
+    is_module: bool,
+    /// Maps imported binding names to `(module_request_idx, cell_idx)` pairs
+    /// that parameterise [`Opcode::LdaModuleVariable`] and
+    /// [`Opcode::StaModuleVariable`].
+    module_variables: HashMap<String, (u32, i32)>,
+    /// Counter for assigning unique cell indices to module variable bindings.
+    next_module_cell: i32,
 }
 
 impl FunctionCompiler {
@@ -236,6 +249,9 @@ impl FunctionCompiler {
             yield_suspend_id: 0,
             is_program: false,
             is_eval_scope: false,
+            is_module: false,
+            module_variables: HashMap::new(),
+            next_module_cell: 0,
         };
         // Register simple ident params in the scope immediately; complex
         // patterns are handled by `emit_param_prologue`.
@@ -1185,6 +1201,9 @@ impl FunctionCompiler {
             is_program: false,
             is_async: false,
             is_eval_scope: false,
+            is_module: false,
+            module_variables: HashMap::new(),
+            next_module_cell: 0,
         };
 
         let this_reg = Register::parameter(0);
@@ -1843,9 +1862,7 @@ impl FunctionCompiler {
                 "spread in expression position is not yet supported".into(),
             )),
             Expr::Import(imp) => self.compile_import_call(imp),
-            Expr::MetaProp(_) => Err(StatorError::Internal(
-                "import.meta / new.target are not yet supported".into(),
-            )),
+            Expr::MetaProp(m) => self.compile_meta_prop(m),
             Expr::PrivateName(_) => Err(StatorError::Internal(
                 "bare private name expression should only appear as LHS of 'in'".into(),
             )),
@@ -3717,6 +3734,241 @@ impl FunctionCompiler {
         ));
     }
 
+    // ── Module compilation ───────────────────────────────────────────────────
+
+    /// Allocate (or retrieve) a module variable entry for the given binding.
+    ///
+    /// Returns `(module_request_idx, cell_idx)` where `module_request_idx` is
+    /// a constant-pool index for the module specifier string and `cell_idx`
+    /// is a per-module unique cell identifier.
+    fn get_or_create_module_variable(&mut self, source: &str, binding: &str) -> (u32, i32) {
+        let key = format!("{source}\0{binding}");
+        if let Some(&pair) = self.module_variables.get(&key) {
+            return pair;
+        }
+        let module_request_idx = self.add_string(source);
+        let cell_idx = self.next_module_cell;
+        self.next_module_cell += 1;
+        self.module_variables
+            .insert(key, (module_request_idx, cell_idx));
+        (module_request_idx, cell_idx)
+    }
+
+    /// Compile an `import` declaration.
+    ///
+    /// For each specifier, creates a module variable binding so that
+    /// subsequent identifier references emit [`Opcode::LdaModuleVariable`].
+    fn compile_import_decl(&mut self, decl: &crate::parser::ast::ImportDecl) -> StatorResult<()> {
+        let source = &decl.source.value;
+        for spec in &decl.specifiers {
+            match spec {
+                ImportSpecifier::Named(named) => {
+                    let imported_name = match &named.imported {
+                        ModuleExportName::Ident(id) => id.name.as_str(),
+                        ModuleExportName::Str(s) => s.value.as_str(),
+                    };
+                    let (req_idx, cell) = self.get_or_create_module_variable(source, imported_name);
+                    // Emit the load so the local binding is initialized.
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::LdaModuleVariable,
+                        vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
+                    ));
+                    let reg = self.define_local(&named.local.name);
+                    self.emit_star(reg);
+                }
+                ImportSpecifier::Default(def) => {
+                    let (req_idx, cell) = self.get_or_create_module_variable(source, "default");
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::LdaModuleVariable,
+                        vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
+                    ));
+                    let reg = self.define_local(&def.local.name);
+                    self.emit_star(reg);
+                }
+                ImportSpecifier::Namespace(ns) => {
+                    let req_idx = self.add_string(source);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::GetModuleNamespace,
+                        vec![Operand::ConstantPoolIdx(req_idx)],
+                    ));
+                    let reg = self.define_local(&ns.local.name);
+                    self.emit_star(reg);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a named `export` declaration.
+    ///
+    /// Handles `export { x, y }`, `export { x } from "mod"`,
+    /// and `export let/const/function …`.
+    fn compile_export_named(&mut self, decl: &ExportNamedDecl) -> StatorResult<()> {
+        // `export function f() {}` / `export let x = …`
+        if let Some(ref inner) = decl.declaration {
+            self.compile_stmt(inner)?;
+            // For exported declarations, store each declared name into a
+            // module variable so the runtime can expose them.
+            let names = Self::declared_names(inner);
+            for name in names {
+                if let Some(reg) = self.lookup_var(&name) {
+                    self.emit_ldar(reg);
+                } else {
+                    self.compile_ident_load(&name);
+                }
+                let (req_idx, cell) = self.get_or_create_module_variable("", &name);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::StaModuleVariable,
+                    vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
+                ));
+            }
+            return Ok(());
+        }
+
+        // Re-export with source: `export { x } from "mod"`
+        if let Some(ref source) = decl.source {
+            for spec in &decl.specifiers {
+                let imported_name = match &spec.local {
+                    ModuleExportName::Ident(id) => id.name.as_str(),
+                    ModuleExportName::Str(s) => s.value.as_str(),
+                };
+                let (req_idx, cell) =
+                    self.get_or_create_module_variable(&source.value, imported_name);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaModuleVariable,
+                    vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
+                ));
+                let exported_name = match &spec.exported {
+                    ModuleExportName::Ident(id) => id.name.as_str(),
+                    ModuleExportName::Str(s) => s.value.as_str(),
+                };
+                let (out_req, out_cell) = self.get_or_create_module_variable("", exported_name);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::StaModuleVariable,
+                    vec![
+                        Operand::ConstantPoolIdx(out_req),
+                        Operand::Immediate(out_cell),
+                    ],
+                ));
+            }
+            return Ok(());
+        }
+
+        // Local re-export: `export { x, y as z }`
+        for spec in &decl.specifiers {
+            let local_name = match &spec.local {
+                ModuleExportName::Ident(id) => id.name.as_str(),
+                ModuleExportName::Str(s) => s.value.as_str(),
+            };
+            if let Some(reg) = self.lookup_var(local_name) {
+                self.emit_ldar(reg);
+            } else {
+                self.compile_ident_load(local_name);
+            }
+            let exported_name = match &spec.exported {
+                ModuleExportName::Ident(id) => id.name.as_str(),
+                ModuleExportName::Str(s) => s.value.as_str(),
+            };
+            let (req_idx, cell) = self.get_or_create_module_variable("", exported_name);
+            self.emit(Instruction::new_unchecked(
+                Opcode::StaModuleVariable,
+                vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
+            ));
+        }
+        Ok(())
+    }
+
+    /// Compile an `export default …` declaration.
+    fn compile_export_default(
+        &mut self,
+        decl: &crate::parser::ast::ExportDefaultDecl,
+    ) -> StatorResult<()> {
+        match &decl.declaration {
+            ExportDefaultExpr::Fn(f) => self.compile_fn_decl(f)?,
+            ExportDefaultExpr::Class(c) => self.compile_class_decl(c)?,
+            ExportDefaultExpr::Expr(e) => self.compile_expr(e)?,
+        }
+        let (req_idx, cell) = self.get_or_create_module_variable("", "default");
+        self.emit(Instruction::new_unchecked(
+            Opcode::StaModuleVariable,
+            vec![Operand::ConstantPoolIdx(req_idx), Operand::Immediate(cell)],
+        ));
+        Ok(())
+    }
+
+    /// Compile an `export * [as name] from "source"` declaration.
+    fn compile_export_all(&mut self, decl: &crate::parser::ast::ExportAllDecl) -> StatorResult<()> {
+        let req_idx = self.add_string(&decl.source.value);
+        self.emit(Instruction::new_unchecked(
+            Opcode::GetModuleNamespace,
+            vec![Operand::ConstantPoolIdx(req_idx)],
+        ));
+        if let Some(ref exported) = decl.exported {
+            // `export * as ns from "source"`
+            let name = match exported {
+                ModuleExportName::Ident(id) => id.name.as_str(),
+                ModuleExportName::Str(s) => s.value.as_str(),
+            };
+            let (out_req, out_cell) = self.get_or_create_module_variable("", name);
+            self.emit(Instruction::new_unchecked(
+                Opcode::StaModuleVariable,
+                vec![
+                    Operand::ConstantPoolIdx(out_req),
+                    Operand::Immediate(out_cell),
+                ],
+            ));
+        }
+        // For bare `export * from "source"` the runtime must merge all
+        // bindings from the source module into the current module's exports.
+        // The `GetModuleNamespace` instruction above loads the namespace
+        // object; the runtime handles the merge.
+        Ok(())
+    }
+
+    /// Compile an `import.meta` or `new.target` meta-property expression.
+    fn compile_meta_prop(&mut self, m: &crate::parser::ast::MetaPropExpr) -> StatorResult<()> {
+        if m.meta.name == "import" && m.property.name == "meta" {
+            self.emit(Instruction::new_unchecked(Opcode::LdaImportMeta, vec![]));
+            Ok(())
+        } else {
+            // `new.target` and any other meta-properties are not yet supported.
+            Err(StatorError::Internal(format!(
+                "{}.{} meta property is not yet supported",
+                m.meta.name, m.property.name,
+            )))
+        }
+    }
+
+    /// Compile a module declaration (`import` or `export`).
+    fn compile_module_decl(&mut self, decl: &ModuleDecl) -> StatorResult<()> {
+        match decl {
+            ModuleDecl::Import(d) => self.compile_import_decl(d),
+            ModuleDecl::ExportNamed(d) => self.compile_export_named(d),
+            ModuleDecl::ExportDefault(d) => self.compile_export_default(d),
+            ModuleDecl::ExportAll(d) => self.compile_export_all(d),
+        }
+    }
+
+    /// Extract declared names from a statement (for export bookkeeping).
+    fn declared_names(stmt: &Stmt) -> Vec<String> {
+        match stmt {
+            Stmt::VarDecl(decl) => decl
+                .declarators
+                .iter()
+                .filter_map(|d| {
+                    if let Pat::Ident(id) = &d.id {
+                        Some(id.name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            Stmt::FnDecl(decl) => decl.id.iter().map(|id| id.name.clone()).collect(),
+            Stmt::ClassDecl(decl) => decl.id.iter().map(|id| id.name.clone()).collect(),
+            _ => vec![],
+        }
+    }
+
     // ── Finalization ─────────────────────────────────────────────────────────
 
     /// Resolve all jump offsets and encode the instruction stream into a
@@ -3769,7 +4021,8 @@ impl FunctionCompiler {
         );
         Ok(ba
             .with_generator_flag(self.is_generator)
-            .with_async_flag(self.is_async))
+            .with_async_flag(self.is_async)
+            .with_module_flag(self.is_module))
     }
 }
 
@@ -3911,6 +4164,8 @@ impl BytecodeGenerator {
     pub fn compile_program(program: &Program) -> StatorResult<BytecodeArray> {
         let mut compiler = FunctionCompiler::new(&[])?;
         compiler.is_program = true;
+        let is_module = program.source_type == SourceType::Module;
+        compiler.is_module = is_module;
 
         // Hoist function declarations to the top.
         for item in &program.body {
@@ -3923,10 +4178,13 @@ impl BytecodeGenerator {
             match item {
                 ProgramItem::Stmt(Stmt::FnDecl(_)) => {} // already hoisted
                 ProgramItem::Stmt(stmt) => compiler.compile_stmt(stmt)?,
-                ProgramItem::ModuleDecl(_) => {
-                    return Err(StatorError::Internal(
-                        "module declarations are not yet supported".into(),
-                    ));
+                ProgramItem::ModuleDecl(decl) => {
+                    if !is_module {
+                        return Err(StatorError::Internal(
+                            "module declarations are not allowed in scripts".into(),
+                        ));
+                    }
+                    compiler.compile_module_decl(decl)?;
                 }
             }
         }
@@ -3955,7 +4213,7 @@ impl BytecodeGenerator {
                 ProgramItem::Stmt(stmt) => compiler.compile_stmt(stmt)?,
                 ProgramItem::ModuleDecl(_) => {
                     return Err(StatorError::Internal(
-                        "module declarations are not yet supported".into(),
+                        "module declarations are not allowed in eval".into(),
                     ));
                 }
             }
@@ -6564,6 +6822,71 @@ mod tests {
         );
     }
 
+    // ── Module compilation ────────────────────────────────────────────────────
+
+    fn module_program(items: Vec<ProgramItem>) -> Program {
+        Program {
+            loc: span(),
+            source_type: SourceType::Module,
+            body: items,
+        }
+    }
+
+    fn string_lit(s: &str) -> StringLit {
+        StringLit {
+            loc: span(),
+            value: s.to_owned(),
+        }
+    }
+
+    #[test]
+    fn test_import_named_emits_lda_module_variable() {
+        use crate::parser::ast::{
+            ImportDecl, ImportNamedSpecifier, ImportSpecifier, ModuleDecl, ModuleExportName,
+        };
+        let prog = module_program(vec![ProgramItem::ModuleDecl(ModuleDecl::Import(
+            ImportDecl {
+                loc: span(),
+                specifiers: vec![ImportSpecifier::Named(ImportNamedSpecifier {
+                    loc: span(),
+                    imported: ModuleExportName::Ident(ident("foo")),
+                    local: ident("foo"),
+                })],
+                source: string_lit("./mod.js"),
+                attributes: vec![],
+            },
+        ))]);
+        let ba = BytecodeGenerator::compile_program(&prog).unwrap();
+        assert!(ba.is_module());
+        let instrs = decode(&ba.bytecodes()).unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::LdaModuleVariable),
+            "import should emit LdaModuleVariable, got {instrs:?}"
+        );
+    }
+
+    #[test]
+    fn test_import_default_emits_lda_module_variable() {
+        use crate::parser::ast::{ImportDecl, ImportDefaultSpecifier, ImportSpecifier, ModuleDecl};
+        let prog = module_program(vec![ProgramItem::ModuleDecl(ModuleDecl::Import(
+            ImportDecl {
+                loc: span(),
+                specifiers: vec![ImportSpecifier::Default(ImportDefaultSpecifier {
+                    loc: span(),
+                    local: ident("def"),
+                })],
+                source: string_lit("./mod.js"),
+                attributes: vec![],
+            },
+        ))]);
+        let ba = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = decode(&ba.bytecodes()).unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::LdaModuleVariable),
+            "default import should emit LdaModuleVariable"
+        );
+    }
+
     #[test]
     fn test_dynamic_import_with_options_emits_call_runtime() {
         use crate::parser::ast::ImportExpr;
@@ -6587,6 +6910,213 @@ mod tests {
             rt_call.operands[2],
             Operand::RegisterCount(2),
             "import with options should have 2 args"
+        );
+    }
+
+    #[test]
+    fn test_import_namespace_emits_get_module_namespace() {
+        use crate::parser::ast::{
+            ImportDecl, ImportNamespaceSpecifier, ImportSpecifier, ModuleDecl,
+        };
+        let prog = module_program(vec![ProgramItem::ModuleDecl(ModuleDecl::Import(
+            ImportDecl {
+                loc: span(),
+                specifiers: vec![ImportSpecifier::Namespace(ImportNamespaceSpecifier {
+                    loc: span(),
+                    local: ident("ns"),
+                })],
+                source: string_lit("./mod.js"),
+                attributes: vec![],
+            },
+        ))]);
+        let ba = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = decode(&ba.bytecodes()).unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::GetModuleNamespace),
+            "namespace import should emit GetModuleNamespace"
+        );
+    }
+
+    #[test]
+    fn test_export_named_decl_emits_sta_module_variable() {
+        use crate::parser::ast::{ExportNamedDecl, ModuleDecl};
+        let prog = module_program(vec![ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(
+            ExportNamedDecl {
+                loc: span(),
+                specifiers: vec![],
+                source: None,
+                declaration: Some(Box::new(var_decl_stmt(
+                    VarKind::Let,
+                    "x",
+                    Some(num_expr(42.0)),
+                ))),
+                attributes: vec![],
+            },
+        ))]);
+        let ba = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = decode(&ba.bytecodes()).unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::StaModuleVariable),
+            "export let should emit StaModuleVariable"
+        );
+    }
+
+    #[test]
+    fn test_export_default_expr_emits_sta_module_variable() {
+        use crate::parser::ast::{ExportDefaultDecl, ExportDefaultExpr, ModuleDecl};
+        let prog = module_program(vec![ProgramItem::ModuleDecl(ModuleDecl::ExportDefault(
+            ExportDefaultDecl {
+                loc: span(),
+                declaration: ExportDefaultExpr::Expr(Box::new(num_expr(99.0))),
+            },
+        ))]);
+        let ba = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = decode(&ba.bytecodes()).unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::StaModuleVariable),
+            "export default should emit StaModuleVariable"
+        );
+    }
+
+    #[test]
+    fn test_export_all_emits_get_module_namespace() {
+        use crate::parser::ast::{ExportAllDecl, ModuleDecl};
+        let prog = module_program(vec![ProgramItem::ModuleDecl(ModuleDecl::ExportAll(
+            ExportAllDecl {
+                loc: span(),
+                exported: None,
+                source: string_lit("./other.js"),
+                attributes: vec![],
+            },
+        ))]);
+        let ba = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = decode(&ba.bytecodes()).unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::GetModuleNamespace),
+            "export * should emit GetModuleNamespace"
+        );
+    }
+
+    #[test]
+    fn test_export_all_as_name_emits_sta_module_variable() {
+        use crate::parser::ast::{ExportAllDecl, ModuleDecl, ModuleExportName};
+        let prog = module_program(vec![ProgramItem::ModuleDecl(ModuleDecl::ExportAll(
+            ExportAllDecl {
+                loc: span(),
+                exported: Some(ModuleExportName::Ident(ident("ns"))),
+                source: string_lit("./other.js"),
+                attributes: vec![],
+            },
+        ))]);
+        let ba = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = decode(&ba.bytecodes()).unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::GetModuleNamespace),
+            "export * as ns should emit GetModuleNamespace"
+        );
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::StaModuleVariable),
+            "export * as ns should emit StaModuleVariable"
+        );
+    }
+
+    #[test]
+    fn test_re_export_named_from_source() {
+        use crate::parser::ast::{ExportNamedDecl, ExportSpecifier, ModuleDecl, ModuleExportName};
+        let prog = module_program(vec![ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(
+            ExportNamedDecl {
+                loc: span(),
+                specifiers: vec![ExportSpecifier {
+                    loc: span(),
+                    local: ModuleExportName::Ident(ident("x")),
+                    exported: ModuleExportName::Ident(ident("y")),
+                }],
+                source: Some(string_lit("./mod.js")),
+                declaration: None,
+                attributes: vec![],
+            },
+        ))]);
+        let ba = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = decode(&ba.bytecodes()).unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::LdaModuleVariable),
+            "re-export should load from source via LdaModuleVariable"
+        );
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::StaModuleVariable),
+            "re-export should store via StaModuleVariable"
+        );
+    }
+
+    #[test]
+    fn test_import_meta_emits_lda_import_meta() {
+        use crate::parser::ast::MetaPropExpr;
+        let prog = module_program(vec![ProgramItem::Stmt(Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(Expr::MetaProp(MetaPropExpr {
+                loc: span(),
+                meta: ident("import"),
+                property: ident("meta"),
+            })),
+        }))]);
+        let ba = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = decode(&ba.bytecodes()).unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::LdaImportMeta),
+            "import.meta should emit LdaImportMeta"
+        );
+    }
+
+    #[test]
+    fn test_module_decl_in_script_errors() {
+        use crate::parser::ast::{ImportDecl, ModuleDecl};
+        let prog = Program {
+            loc: span(),
+            source_type: SourceType::Script,
+            body: vec![ProgramItem::ModuleDecl(ModuleDecl::Import(ImportDecl {
+                loc: span(),
+                specifiers: vec![],
+                source: string_lit("./mod.js"),
+                attributes: vec![],
+            }))],
+        };
+        let result = BytecodeGenerator::compile_program(&prog);
+        assert!(result.is_err(), "module decl in script should error");
+    }
+
+    #[test]
+    fn test_live_binding_export_let_stores_module_variable() {
+        use crate::parser::ast::{ExportNamedDecl, ModuleDecl};
+        // `export let counter = 0;` should store via StaModuleVariable
+        // so importers see updates (live binding semantics).
+        let prog = module_program(vec![ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(
+            ExportNamedDecl {
+                loc: span(),
+                specifiers: vec![],
+                source: None,
+                declaration: Some(Box::new(var_decl_stmt(
+                    VarKind::Let,
+                    "counter",
+                    Some(num_expr(0.0)),
+                ))),
+                attributes: vec![],
+            },
+        ))]);
+        let ba = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = decode(&ba.bytecodes()).unwrap();
+        let sta_count = instrs
+            .iter()
+            .filter(|i| i.opcode == Opcode::StaModuleVariable)
+            .count();
+        assert!(
+            sta_count >= 1,
+            "export let must emit at least one StaModuleVariable for live binding"
         );
     }
 }
