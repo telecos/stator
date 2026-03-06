@@ -11,6 +11,8 @@ pub mod incremental;
 pub mod mark_sweep_compact;
 /// Cheney semi-space scavenger (minor GC) and write-barrier remembered set.
 pub mod scavenger;
+/// Thread-local allocation buffers (TLABs) for fast bump-pointer allocation.
+pub mod tlab;
 /// Mark-and-trace infrastructure for garbage collection.
 pub mod trace;
 /// Write barrier for tracking old-generation → young-generation pointer edges.

@@ -30,6 +30,8 @@
 //!     execute-and-deopt support.
 //!   - [`turbofan::DeoptPoint`] — Metadata for deoptimisation sites.
 
+/// Background compilation thread pool and priority job queue.
+pub mod background;
 /// Non-optimising baseline JIT compiler.
 pub mod baseline;
 /// Maglev optimising compiler tier.
