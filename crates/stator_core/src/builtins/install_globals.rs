@@ -21,6 +21,19 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::builtins::date::{
+    date_construct_components, date_construct_now, date_construct_value, date_get_date,
+    date_get_day, date_get_full_year, date_get_hours, date_get_milliseconds, date_get_minutes,
+    date_get_month, date_get_seconds, date_get_time, date_get_timezone_offset, date_get_utc_date,
+    date_get_utc_day, date_get_utc_full_year, date_get_utc_hours, date_get_utc_milliseconds,
+    date_get_utc_minutes, date_get_utc_month, date_get_utc_seconds, date_now, date_parse,
+    date_set_date, date_set_full_year, date_set_hours, date_set_milliseconds, date_set_minutes,
+    date_set_month, date_set_seconds, date_set_time, date_set_utc_date, date_set_utc_full_year,
+    date_set_utc_hours, date_set_utc_milliseconds, date_set_utc_minutes, date_set_utc_month,
+    date_set_utc_seconds, date_to_date_string, date_to_iso_string, date_to_json,
+    date_to_locale_date_string, date_to_locale_string, date_to_locale_time_string, date_to_string,
+    date_to_time_string, date_to_utc_string, date_utc, date_value_of,
+};
 use crate::builtins::error::{ErrorKind, JsError};
 use crate::builtins::finalization_registry::{
     finalization_registry_drain, finalization_registry_new, finalization_registry_notify,
@@ -593,6 +606,621 @@ fn apply_js_reviver(
         other => other,
     };
     reviver(vec![JsValue::String(key.to_string()), value])
+}
+
+// ── Date constructor ─────────────────────────────────────────────────────────
+
+/// Build the `Date` constructor/namespace object.
+///
+/// The returned `PlainObject` has:
+/// - `__call__`: the constructor (`new Date(...)` / `Date()`)
+/// - `now`: `Date.now()`
+/// - `parse`: `Date.parse(string)`
+/// - `UTC`: `Date.UTC(year, month, ...)`
+fn make_date() -> JsValue {
+    let mut props: HashMap<String, JsValue> = HashMap::new();
+
+    // ── Constructor: new Date() / Date(value) / Date(y, m, d, ...) ──────
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let timestamp = match args.len() {
+                0 => date_construct_now(),
+                1 => {
+                    let arg = args.first().unwrap();
+                    match arg {
+                        JsValue::String(s) => date_parse(s),
+                        _ => date_construct_value(arg.to_number()?),
+                    }
+                }
+                _ => {
+                    let year = args[0].to_number()?;
+                    let month = args[1].to_number()?;
+                    let date_val = args
+                        .get(2)
+                        .map(|v| v.to_number())
+                        .transpose()?
+                        .unwrap_or(1.0);
+                    let hours = args
+                        .get(3)
+                        .map(|v| v.to_number())
+                        .transpose()?
+                        .unwrap_or(0.0);
+                    let minutes = args
+                        .get(4)
+                        .map(|v| v.to_number())
+                        .transpose()?
+                        .unwrap_or(0.0);
+                    let seconds = args
+                        .get(5)
+                        .map(|v| v.to_number())
+                        .transpose()?
+                        .unwrap_or(0.0);
+                    let ms = args
+                        .get(6)
+                        .map(|v| v.to_number())
+                        .transpose()?
+                        .unwrap_or(0.0);
+                    date_construct_components(year, month, date_val, hours, minutes, seconds, ms)
+                }
+            };
+            Ok(make_date_instance(timestamp))
+        }),
+    );
+
+    // ── Date.now() ──────────────────────────────────────────────────────
+    props.insert("now".into(), native(|_| Ok(num(date_now()))));
+
+    // ── Date.parse(string) ──────────────────────────────────────────────
+    props.insert(
+        "parse".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(num(date_parse(&s)))
+        }),
+    );
+
+    // ── Date.UTC(year, month, ...) ──────────────────────────────────────
+    props.insert(
+        "UTC".into(),
+        native(|args| {
+            let year = arg_f64(&args, 0)?;
+            let month = if args.len() > 1 {
+                args[1].to_number()?
+            } else {
+                0.0
+            };
+            let date_val = if args.len() > 2 {
+                args[2].to_number()?
+            } else {
+                1.0
+            };
+            let hours = if args.len() > 3 {
+                args[3].to_number()?
+            } else {
+                0.0
+            };
+            let minutes = if args.len() > 4 {
+                args[4].to_number()?
+            } else {
+                0.0
+            };
+            let seconds = if args.len() > 5 {
+                args[5].to_number()?
+            } else {
+                0.0
+            };
+            let ms = if args.len() > 6 {
+                args[6].to_number()?
+            } else {
+                0.0
+            };
+            Ok(num(date_utc(
+                year, month, date_val, hours, minutes, seconds, ms,
+            )))
+        }),
+    );
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+/// Create a Date instance object with all prototype methods.
+///
+/// The returned `PlainObject` holds a shared `Rc<RefCell<f64>>` timestamp
+/// that all getter/setter methods close over.
+fn make_date_instance(t: f64) -> JsValue {
+    let inner = Rc::new(RefCell::new(t));
+    let mut obj: HashMap<String, JsValue> = HashMap::new();
+
+    // ── getTime / valueOf ────────────────────────────────────────────────
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getTime".into(),
+            native(move |_| Ok(num(date_get_time(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "valueOf".into(),
+            native(move |_| Ok(num(date_value_of(*inner.borrow())))),
+        );
+    }
+
+    // ── Local getters ───────────────────────────────────────────────────
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getFullYear".into(),
+            native(move |_| Ok(num(date_get_full_year(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getMonth".into(),
+            native(move |_| Ok(num(date_get_month(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getDate".into(),
+            native(move |_| Ok(num(date_get_date(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getDay".into(),
+            native(move |_| Ok(num(date_get_day(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getHours".into(),
+            native(move |_| Ok(num(date_get_hours(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getMinutes".into(),
+            native(move |_| Ok(num(date_get_minutes(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getSeconds".into(),
+            native(move |_| Ok(num(date_get_seconds(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getMilliseconds".into(),
+            native(move |_| Ok(num(date_get_milliseconds(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getTimezoneOffset".into(),
+            native(move |_| Ok(num(date_get_timezone_offset(*inner.borrow())))),
+        );
+    }
+
+    // ── UTC getters ─────────────────────────────────────────────────────
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getUTCFullYear".into(),
+            native(move |_| Ok(num(date_get_utc_full_year(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getUTCMonth".into(),
+            native(move |_| Ok(num(date_get_utc_month(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getUTCDate".into(),
+            native(move |_| Ok(num(date_get_utc_date(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getUTCDay".into(),
+            native(move |_| Ok(num(date_get_utc_day(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getUTCHours".into(),
+            native(move |_| Ok(num(date_get_utc_hours(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getUTCMinutes".into(),
+            native(move |_| Ok(num(date_get_utc_minutes(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getUTCSeconds".into(),
+            native(move |_| Ok(num(date_get_utc_seconds(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "getUTCMilliseconds".into(),
+            native(move |_| Ok(num(date_get_utc_milliseconds(*inner.borrow())))),
+        );
+    }
+
+    // ── Local setters ───────────────────────────────────────────────────
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "setTime".into(),
+            native(move |args| {
+                let v = arg_f64(&args, 0)?;
+                let result = date_set_time(v);
+                *inner.borrow_mut() = result;
+                Ok(num(result))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "setMilliseconds".into(),
+            native(move |args| {
+                let ms = arg_f64(&args, 0)?;
+                let result = date_set_milliseconds(*inner.borrow(), ms);
+                *inner.borrow_mut() = result;
+                Ok(num(result))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "setSeconds".into(),
+            native(move |args| {
+                let sec = arg_f64(&args, 0)?;
+                let ms = if args.len() > 1 {
+                    Some(args[1].to_number()?)
+                } else {
+                    None
+                };
+                let result = date_set_seconds(*inner.borrow(), sec, ms);
+                *inner.borrow_mut() = result;
+                Ok(num(result))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "setMinutes".into(),
+            native(move |args| {
+                let min = arg_f64(&args, 0)?;
+                let sec = if args.len() > 1 {
+                    Some(args[1].to_number()?)
+                } else {
+                    None
+                };
+                let ms = if args.len() > 2 {
+                    Some(args[2].to_number()?)
+                } else {
+                    None
+                };
+                let result = date_set_minutes(*inner.borrow(), min, sec, ms);
+                *inner.borrow_mut() = result;
+                Ok(num(result))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "setHours".into(),
+            native(move |args| {
+                let hour = arg_f64(&args, 0)?;
+                let min = if args.len() > 1 {
+                    Some(args[1].to_number()?)
+                } else {
+                    None
+                };
+                let sec = if args.len() > 2 {
+                    Some(args[2].to_number()?)
+                } else {
+                    None
+                };
+                let ms = if args.len() > 3 {
+                    Some(args[3].to_number()?)
+                } else {
+                    None
+                };
+                let result = date_set_hours(*inner.borrow(), hour, min, sec, ms);
+                *inner.borrow_mut() = result;
+                Ok(num(result))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "setDate".into(),
+            native(move |args| {
+                let date_val = arg_f64(&args, 0)?;
+                let result = date_set_date(*inner.borrow(), date_val);
+                *inner.borrow_mut() = result;
+                Ok(num(result))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "setMonth".into(),
+            native(move |args| {
+                let month = arg_f64(&args, 0)?;
+                let date_val = if args.len() > 1 {
+                    Some(args[1].to_number()?)
+                } else {
+                    None
+                };
+                let result = date_set_month(*inner.borrow(), month, date_val);
+                *inner.borrow_mut() = result;
+                Ok(num(result))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "setFullYear".into(),
+            native(move |args| {
+                let year = arg_f64(&args, 0)?;
+                let month = if args.len() > 1 {
+                    Some(args[1].to_number()?)
+                } else {
+                    None
+                };
+                let date_val = if args.len() > 2 {
+                    Some(args[2].to_number()?)
+                } else {
+                    None
+                };
+                let result = date_set_full_year(*inner.borrow(), year, month, date_val);
+                *inner.borrow_mut() = result;
+                Ok(num(result))
+            }),
+        );
+    }
+
+    // ── UTC setters ─────────────────────────────────────────────────────
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "setUTCMilliseconds".into(),
+            native(move |args| {
+                let ms = arg_f64(&args, 0)?;
+                let result = date_set_utc_milliseconds(*inner.borrow(), ms);
+                *inner.borrow_mut() = result;
+                Ok(num(result))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "setUTCSeconds".into(),
+            native(move |args| {
+                let sec = arg_f64(&args, 0)?;
+                let ms = if args.len() > 1 {
+                    Some(args[1].to_number()?)
+                } else {
+                    None
+                };
+                let result = date_set_utc_seconds(*inner.borrow(), sec, ms);
+                *inner.borrow_mut() = result;
+                Ok(num(result))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "setUTCMinutes".into(),
+            native(move |args| {
+                let min = arg_f64(&args, 0)?;
+                let sec = if args.len() > 1 {
+                    Some(args[1].to_number()?)
+                } else {
+                    None
+                };
+                let ms = if args.len() > 2 {
+                    Some(args[2].to_number()?)
+                } else {
+                    None
+                };
+                let result = date_set_utc_minutes(*inner.borrow(), min, sec, ms);
+                *inner.borrow_mut() = result;
+                Ok(num(result))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "setUTCHours".into(),
+            native(move |args| {
+                let hour = arg_f64(&args, 0)?;
+                let min = if args.len() > 1 {
+                    Some(args[1].to_number()?)
+                } else {
+                    None
+                };
+                let sec = if args.len() > 2 {
+                    Some(args[2].to_number()?)
+                } else {
+                    None
+                };
+                let ms = if args.len() > 3 {
+                    Some(args[3].to_number()?)
+                } else {
+                    None
+                };
+                let result = date_set_utc_hours(*inner.borrow(), hour, min, sec, ms);
+                *inner.borrow_mut() = result;
+                Ok(num(result))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "setUTCDate".into(),
+            native(move |args| {
+                let date_val = arg_f64(&args, 0)?;
+                let result = date_set_utc_date(*inner.borrow(), date_val);
+                *inner.borrow_mut() = result;
+                Ok(num(result))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "setUTCMonth".into(),
+            native(move |args| {
+                let month = arg_f64(&args, 0)?;
+                let date_val = if args.len() > 1 {
+                    Some(args[1].to_number()?)
+                } else {
+                    None
+                };
+                let result = date_set_utc_month(*inner.borrow(), month, date_val);
+                *inner.borrow_mut() = result;
+                Ok(num(result))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "setUTCFullYear".into(),
+            native(move |args| {
+                let year = arg_f64(&args, 0)?;
+                let month = if args.len() > 1 {
+                    Some(args[1].to_number()?)
+                } else {
+                    None
+                };
+                let date_val = if args.len() > 2 {
+                    Some(args[2].to_number()?)
+                } else {
+                    None
+                };
+                let result = date_set_utc_full_year(*inner.borrow(), year, month, date_val);
+                *inner.borrow_mut() = result;
+                Ok(num(result))
+            }),
+        );
+    }
+
+    // ── String conversion methods ───────────────────────────────────────
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "toString".into(),
+            native(move |_| Ok(JsValue::String(date_to_string(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "toDateString".into(),
+            native(move |_| Ok(JsValue::String(date_to_date_string(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "toTimeString".into(),
+            native(move |_| Ok(JsValue::String(date_to_time_string(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "toISOString".into(),
+            native(move |_| Ok(JsValue::String(date_to_iso_string(*inner.borrow())?))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "toUTCString".into(),
+            native(move |_| Ok(JsValue::String(date_to_utc_string(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "toGMTString".into(),
+            native(move |_| Ok(JsValue::String(date_to_utc_string(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "toJSON".into(),
+            native(move |_| match date_to_json(*inner.borrow()) {
+                Some(s) => Ok(JsValue::String(s)),
+                None => Ok(JsValue::Null),
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "toLocaleDateString".into(),
+            native(move |_| Ok(JsValue::String(date_to_locale_date_string(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "toLocaleString".into(),
+            native(move |_| Ok(JsValue::String(date_to_locale_string(*inner.borrow())))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "toLocaleTimeString".into(),
+            native(move |_| Ok(JsValue::String(date_to_locale_time_string(*inner.borrow())))),
+        );
+    }
+
+    JsValue::PlainObject(Rc::new(RefCell::new(obj)))
 }
 
 // ── Number constructor ───────────────────────────────────────────────────────
@@ -4470,6 +5098,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
 
     // ── Constructor / namespace objects ──────────────────────────────────
     globals.insert("Number".into(), make_number());
+    globals.insert("Date".into(), make_date());
     globals.insert("Object".into(), make_object());
     globals.insert("Array".into(), make_array());
     globals.insert("Symbol".into(), make_symbol());
@@ -4628,6 +5257,7 @@ mod tests {
         assert!(globals.contains_key("console"));
         assert!(globals.contains_key("JSON"));
         assert!(globals.contains_key("Number"));
+        assert!(globals.contains_key("Date"));
         assert!(globals.contains_key("Object"));
         assert!(globals.contains_key("Array"));
         assert!(globals.contains_key("parseInt"));
