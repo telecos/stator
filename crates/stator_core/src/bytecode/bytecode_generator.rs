@@ -219,6 +219,12 @@ struct FunctionCompiler {
     module_variables: HashMap<String, (u32, i32)>,
     /// Counter for assigning unique cell indices to module variable bindings.
     next_module_cell: i32,
+    /// `true` when the expression currently being compiled is in tail
+    /// position (i.e. its value is immediately returned).  Set by
+    /// [`compile_return`] and consumed by [`compile_call`] /
+    /// [`compile_method_call`] to emit [`Opcode::TailCall`] instead of a
+    /// regular call.
+    in_tail_position: bool,
 }
 
 impl FunctionCompiler {
@@ -252,6 +258,7 @@ impl FunctionCompiler {
             is_module: false,
             module_variables: HashMap::new(),
             next_module_cell: 0,
+            in_tail_position: false,
         };
         // Register simple ident params in the scope immediately; complex
         // patterns are handled by `emit_param_prologue`.
@@ -1204,6 +1211,7 @@ impl FunctionCompiler {
             is_module: false,
             module_variables: HashMap::new(),
             next_module_cell: 0,
+            in_tail_position: false,
         };
 
         let this_reg = Register::parameter(0);
@@ -1433,7 +1441,11 @@ impl FunctionCompiler {
     /// Compile a `return [argument]` statement.
     fn compile_return(&mut self, s: &crate::parser::ast::ReturnStmt) -> StatorResult<()> {
         if let Some(arg) = &s.argument {
+            // Mark expressions in return position as tail calls so that
+            // compile_call / compile_conditional can emit TailCall opcodes.
+            self.in_tail_position = true;
             self.compile_expr(arg)?;
+            self.in_tail_position = false;
         } else {
             self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
         }
@@ -1707,6 +1719,18 @@ impl FunctionCompiler {
 
     /// Compile an expression, leaving the result in the accumulator.
     fn compile_expr(&mut self, expr: &Expr) -> StatorResult<()> {
+        // Only Call, Conditional, Logical, and Sequence expressions can
+        // propagate tail position to sub-expressions.  All other expression
+        // types clear the flag so that nested calls are not incorrectly
+        // marked as tail calls (e.g. `return n + f(n-1)` — the call f() is
+        // NOT in tail position because its result feeds into `+`).
+        match expr {
+            Expr::Call(_) | Expr::Conditional(_) | Expr::Logical(_) | Expr::Sequence(_) => {}
+            _ => {
+                self.in_tail_position = false;
+            }
+        }
+
         match expr {
             // ── Literals ──────────────────────────────────────────────────
             Expr::Null(_) => {
@@ -1826,9 +1850,15 @@ impl FunctionCompiler {
             Expr::Conditional(c) => self.compile_conditional(c),
             Expr::Assign(a) => self.compile_assign(a),
             Expr::Sequence(s) => {
-                for expr in &s.expressions {
+                let saved_tail = self.in_tail_position;
+                let len = s.expressions.len();
+                for (i, expr) in s.expressions.iter().enumerate() {
+                    // Only the last expression in a comma sequence inherits
+                    // tail position; all preceding ones are for side effects.
+                    self.in_tail_position = saved_tail && i == len - 1;
                     self.compile_expr(expr)?;
                 }
+                self.in_tail_position = false;
                 Ok(())
             }
 
@@ -2127,7 +2157,10 @@ impl FunctionCompiler {
     fn compile_logical(&mut self, l: &crate::parser::ast::LogicalExpr) -> StatorResult<()> {
         let end_label = self.new_label();
 
+        let saved_tail = self.in_tail_position;
+        self.in_tail_position = false;
         self.compile_expr(&l.left)?;
+        self.in_tail_position = saved_tail;
 
         match l.op {
             LogicalOp::And => {
@@ -2147,12 +2180,14 @@ impl FunctionCompiler {
                 self.emit_jump(Opcode::Jump, end_label);
                 self.bind_label(eval_right_label);
                 self.compile_expr(&l.right)?;
+                self.in_tail_position = false;
                 self.bind_label(end_label);
                 return Ok(());
             }
         }
 
         self.compile_expr(&l.right)?;
+        self.in_tail_position = false;
         self.bind_label(end_label);
         Ok(())
     }
@@ -2162,12 +2197,17 @@ impl FunctionCompiler {
         let else_label = self.new_label();
         let end_label = self.new_label();
 
+        let saved_tail = self.in_tail_position;
+        self.in_tail_position = false;
         self.compile_expr(&c.test)?;
         self.emit_jump(Opcode::JumpIfToBooleanFalse, else_label);
+        self.in_tail_position = saved_tail;
         self.compile_expr(&c.consequent)?;
         self.emit_jump(Opcode::Jump, end_label);
         self.bind_label(else_label);
+        self.in_tail_position = saved_tail;
         self.compile_expr(&c.alternate)?;
+        self.in_tail_position = false;
         self.bind_label(end_label);
         Ok(())
     }
@@ -2454,8 +2494,14 @@ impl FunctionCompiler {
 
     /// Compile a call expression `callee(args…)`.
     fn compile_call(&mut self, c: &crate::parser::ast::CallExpr) -> StatorResult<()> {
+        // Consume the tail-position flag before compiling sub-expressions.
+        let is_tail = self.in_tail_position;
+        self.in_tail_position = false;
+
         // Check for method call: `obj.method(args)`.
         if let Expr::Member(m) = c.callee.as_ref() {
+            // Propagate tail position into method call compilation.
+            self.in_tail_position = is_tail;
             return self.compile_method_call(m, &c.arguments);
         }
 
@@ -2472,6 +2518,8 @@ impl FunctionCompiler {
 
         if is_direct_eval {
             self.emit_call_direct_eval(callee_reg, &arg_regs)?;
+        } else if is_tail {
+            self.emit_tail_call(callee_reg, &arg_regs)?;
         } else {
             self.emit_call_any_receiver(callee_reg, &arg_regs)?;
         }
@@ -2570,6 +2618,10 @@ impl FunctionCompiler {
         m: &crate::parser::ast::MemberExpr,
         args: &[Expr],
     ) -> StatorResult<()> {
+        // Consume tail-position flag — method calls in tail position are not
+        // optimised (the receiver binding requires a full frame), so we clear
+        // it to prevent inner expressions from being incorrectly marked.
+        self.in_tail_position = false;
         // Load the object (receiver).
         self.compile_expr(&m.object)?;
         let recv_reg = self.allocator.allocate_temporary();
@@ -2663,6 +2715,25 @@ impl FunctionCompiler {
         let slot = self.alloc_slot(FeedbackSlotKind::Call);
         self.emit(Instruction::new_unchecked(
             Opcode::CallAnyReceiver,
+            vec![
+                to_reg_op(callee_reg),
+                to_reg_op(args_start),
+                Operand::RegisterCount(arg_count),
+                slot,
+            ],
+        ));
+        Ok(())
+    }
+
+    /// Emit a `TailCall` instruction (same operand layout as
+    /// [`Self::emit_call_any_receiver`] but signals tail-position semantics
+    /// so the interpreter can reuse the current frame).
+    fn emit_tail_call(&mut self, callee_reg: Register, arg_regs: &[Register]) -> StatorResult<()> {
+        let arg_count = arg_regs.len() as u32;
+        let args_start = arg_regs.first().copied().unwrap_or(callee_reg);
+        let slot = self.alloc_slot(FeedbackSlotKind::Call);
+        self.emit(Instruction::new_unchecked(
+            Opcode::TailCall,
             vec![
                 to_reg_op(callee_reg),
                 to_reg_op(args_start),

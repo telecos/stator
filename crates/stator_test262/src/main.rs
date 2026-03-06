@@ -340,8 +340,6 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "regexp-v-flag",
     // Internationalisation
     "Intl",
-    // Tail-call optimisation
-    "tail-call-optimization",
     // Miscellaneous
     "globalThis",
 ];
