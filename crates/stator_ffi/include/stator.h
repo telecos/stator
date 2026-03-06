@@ -78,6 +78,11 @@ typedef struct StatorDomWeakRef StatorDomWeakRef;
 typedef struct StatorEscapableHandleScope StatorEscapableHandleScope;
 
 /**
+ * Opaque event loop handle.
+ */
+typedef struct StatorEventLoop StatorEventLoop;
+
+/**
  * Call-site information passed to a function-template callback.
  *
  * The lifetime of a `StatorFunctionCallbackInfo` value is limited to the
@@ -330,6 +335,39 @@ typedef bool (*StatorDomIndexedSetterCb)(uint32_t index, const struct StatorValu
  * garbage-collected.
  */
 typedef void (*StatorDomWeakCb)(void *data);
+
+/**
+ * C function pointer types for embedder callbacks.
+ */
+typedef void (*StatorPostTaskFn)(void *task_data);
+
+typedef void (*StatorPostDelayedTaskFn)(void *task_data, double delay_secs);
+
+typedef void (*StatorRequestIdleCallbackFn)(void *cb_data, double idle_time);
+
+typedef double (*StatorMonotonicTimeFn)(void);
+
+/**
+ * C-compatible vtable for embedder callbacks.
+ */
+typedef struct StatorEmbedderCallbacks {
+  /**
+   * Post a task to the embedder's main thread.
+   */
+  StatorPostTaskFn post_task;
+  /**
+   * Post a delayed task.
+   */
+  StatorPostDelayedTaskFn post_delayed_task;
+  /**
+   * Request an idle callback.
+   */
+  StatorRequestIdleCallbackFn request_idle_callback;
+  /**
+   * Monotonic time source.
+   */
+  StatorMonotonicTimeFn monotonic_time;
+} StatorEmbedderCallbacks;
 
 #ifdef __cplusplus
 extern "C" {
@@ -2196,6 +2234,99 @@ void stator_dom_weak_ref_clear(const struct StatorDomWeakRef *weak);
  * and must not be used again after this call.
  */
 void stator_dom_weak_ref_destroy(struct StatorDomWeakRef *weak);
+
+/**
+ * Create a new event loop with default (no-op) callbacks.
+ *
+ * The returned pointer must be freed with [`stator_event_loop_destroy`].
+ */
+struct StatorEventLoop *stator_event_loop_create(void);
+
+/**
+ * Create a new event loop with embedder-provided callbacks.
+ *
+ * # Safety
+ * All function pointers in `cbs` must be valid for the lifetime of the
+ * returned event loop.
+ */
+struct StatorEventLoop *stator_event_loop_create_with_callbacks(struct StatorEmbedderCallbacks cbs);
+
+/**
+ * Destroy an event loop.
+ *
+ * # Safety
+ * `el` must be a non-null pointer returned by `stator_event_loop_create*`.
+ */
+void stator_event_loop_destroy(struct StatorEventLoop *el);
+
+/**
+ * Post a macrotask.  The provided C callback will be invoked with `data` on
+ * the next turn of the event loop.
+ *
+ * # Safety
+ * `el` must be a valid event loop pointer.  `callback` must be a valid
+ * function pointer.  `data` is passed through opaquely.
+ */
+void stator_event_loop_post_task(struct StatorEventLoop *el, void (*callback)(void*), void *data);
+
+/**
+ * Schedule a one-shot timer.  Returns the timer id (0 on null input).
+ *
+ * # Safety
+ * `el` must be a valid event loop pointer.
+ */
+uint64_t stator_event_loop_set_timer(struct StatorEventLoop *el,
+                                     double delay_secs,
+                                     void (*callback)(void*),
+                                     void *data);
+
+/**
+ * Cancel a previously scheduled timer.
+ *
+ * # Safety
+ * `el` must be a valid event loop pointer.
+ */
+void stator_event_loop_cancel_timer(struct StatorEventLoop *el, uint64_t timer_id);
+
+/**
+ * Run one tick of the event loop.  Returns `true` if a macrotask ran.
+ *
+ * # Safety
+ * `el` must be a valid event loop pointer.
+ */
+bool stator_event_loop_tick(struct StatorEventLoop *el);
+
+/**
+ * Spin the event loop until idle.
+ *
+ * # Safety
+ * `el` must be a valid event loop pointer.
+ */
+void stator_event_loop_run_until_idle(struct StatorEventLoop *el);
+
+/**
+ * Drain pending microtasks.
+ *
+ * # Safety
+ * `el` must be a valid event loop pointer.
+ */
+void stator_event_loop_drain_microtasks(struct StatorEventLoop *el);
+
+/**
+ * Returns `true` when the event loop has no pending work.
+ *
+ * # Safety
+ * `el` must be a valid event loop pointer.
+ */
+bool stator_event_loop_is_idle(struct StatorEventLoop *el);
+
+/**
+ * Returns the number of pending macrotasks.
+ *
+ * # Safety
+ * `el` must be a valid event loop pointer.
+ */
+size_t stator_event_loop_pending_task_count(struct StatorEventLoop *el);
 
 #ifdef __cplusplus
 }  // extern "C"
