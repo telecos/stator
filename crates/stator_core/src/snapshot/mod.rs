@@ -5,18 +5,21 @@
 //! that can be persisted to disk and restored later to skip the bootstrapping
 //! phase on subsequent engine starts.
 //!
-//! # Binary format
+//! # Binary format (v2)
 //!
 //! ```text
 //! Header (8 bytes):
 //!   magic   : [u8; 4]  = b"STSS"  (Stator Startup Snapshot)
-//!   version : u32 LE   = SNAPSHOT_VERSION
+//!   version : u32 LE   = 2
 //!
 //! Globals section:
 //!   count   : u32 LE
 //!   [entry] * count:
 //!     key   : str32    (u32-length-prefixed UTF-8)
 //!     value : JsValue  (tagged encoding described below)
+//!
+//! Footer (4 bytes):
+//!   checksum: u32 LE   (FNV-1a hash of all preceding bytes)
 //!
 //! JsValue tag byte:
 //!   0x00  Undefined
@@ -32,7 +35,19 @@
 //!   0x0A  PlainObject  : u32 LE count, then count × (str32, JsValue)
 //!   0x0B  Error        : u8 ErrorKind, str32 message
 //!   0x0C  NativeFunction placeholder : str32 name
+//!   0x0D  DefineRef    : u32 LE ref_id, then inner JsValue
+//!   0x0E  BackRef      : u32 LE ref_id
 //!   -- Object, Generator, Iterator serialize as Undefined (0x00) --
+//!
+//! DefineRef / BackRef enable shared and circular object references.
+//! Every Rc-wrapped value (PlainObject, Array, Function, Error) is
+//! assigned a monotonic ref_id on first encounter.  Subsequent
+//! occurrences of the same Rc emit a BackRef tag, avoiding duplicate
+//! serialization and preserving object identity across the snapshot.
+//! Circular references within PlainObject are supported: the object is
+//! registered in the reference table before its entries are read, so
+//! back-references encountered during entry deserialization resolve
+//! correctly.
 //!
 //! BytecodeArray encoding:
 //!   bytecodes       : bytes32  (u32-length-prefixed bytes)
@@ -52,6 +67,15 @@
 //!   0x04  Undefined
 //!   0x05  Function  : BytecodeArray (nested)
 //! ```
+//!
+//! # Shared and circular references
+//!
+//! Rc-wrapped values (PlainObject, Array, Function, Error) are tracked
+//! by pointer identity during serialization.  The first occurrence is
+//! wrapped in a `DefineRef(ref_id)` tag; later occurrences are replaced
+//! by `BackRef(ref_id)`.  This preserves prototype chains (multiple
+//! globals sharing the same prototype PlainObject) and handles circular
+//! structures (a PlainObject whose property points back to itself).
 //!
 //! # Limitations
 //!
@@ -102,7 +126,10 @@ use crate::objects::value::JsValue;
 const MAGIC: [u8; 4] = *b"STSS";
 
 /// Format version; increment when the layout changes in an incompatible way.
-const SNAPSHOT_VERSION: u32 = 1;
+///
+/// **v2** added: `DefineRef`/`BackRef` tags for shared and circular references,
+/// and a 4-byte FNV-1a checksum footer.
+const SNAPSHOT_VERSION: u32 = 2;
 
 // JsValue tag bytes
 const TAG_UNDEFINED: u8 = 0x00;
@@ -118,6 +145,11 @@ const TAG_ARRAY: u8 = 0x09;
 const TAG_PLAIN_OBJECT: u8 = 0x0A;
 const TAG_ERROR: u8 = 0x0B;
 const TAG_NATIVE_FUNCTION: u8 = 0x0C;
+/// Marks the first occurrence of an Rc-wrapped value; followed by a ref_id
+/// and the inner tagged value.
+const TAG_DEFINE_REF: u8 = 0x0D;
+/// Back-reference to a previously defined Rc-wrapped value by ref_id.
+const TAG_BACK_REF: u8 = 0x0E;
 
 // ConstantPoolEntry tag bytes
 const CPE_NUMBER: u8 = 0x00;
@@ -211,13 +243,76 @@ impl StartupSnapshot {
         Ok(Self { data })
     }
 
-    /// Validate the snapshot header without performing a full deserialization.
+    /// Validate the snapshot header and checksum without a full deserialization.
     ///
-    /// Returns `Ok(())` if the magic bytes and version are correct, or an
-    /// error describing the mismatch.
+    /// Returns `Ok(())` if the magic bytes, version, and integrity checksum are
+    /// correct, or an error describing the mismatch.
     pub fn validate(&self) -> StatorResult<()> {
+        if self.data.len() < 12 {
+            return Err(StatorError::Internal(
+                "snapshot: blob too small for header + checksum".into(),
+            ));
+        }
         let mut cursor = 0usize;
-        read_magic_header(&self.data, &mut cursor)
+        read_magic_header(&self.data, &mut cursor)?;
+        verify_checksum(&self.data)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Serialization / deserialization contexts
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Tracks Rc pointer identity during serialization so that shared and circular
+/// references are emitted as `DefineRef` / `BackRef` pairs.
+struct SerContext {
+    next_id: u32,
+    seen: HashMap<usize, u32>,
+}
+
+impl SerContext {
+    fn new() -> Self {
+        Self {
+            next_id: 0,
+            seen: HashMap::new(),
+        }
+    }
+
+    /// Return `Some(ref_id)` if the pointer was already seen, or `None` after
+    /// registering a new ref_id for it.
+    fn track_ptr(&mut self, addr: usize) -> Option<u32> {
+        if let Some(&id) = self.seen.get(&addr) {
+            Some(id)
+        } else {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.seen.insert(addr, id);
+            None
+        }
+    }
+}
+
+/// Resolves `BackRef` tags during deserialization by mapping ref_ids back to
+/// already-deserialized [`JsValue`]s.
+struct DeserContext {
+    ref_table: HashMap<u32, JsValue>,
+}
+
+impl DeserContext {
+    fn new() -> Self {
+        Self {
+            ref_table: HashMap::new(),
+        }
+    }
+
+    fn register(&mut self, id: u32, value: JsValue) {
+        self.ref_table.insert(id, value);
+    }
+
+    fn lookup(&self, id: u32) -> StatorResult<JsValue> {
+        self.ref_table.get(&id).cloned().ok_or_else(|| {
+            StatorError::Internal(format!("snapshot: unresolved back-reference {id}"))
+        })
     }
 }
 
@@ -247,6 +342,7 @@ impl StartupSnapshot {
 /// ```
 pub fn serialize_globals(globals: &HashMap<String, JsValue>) -> StartupSnapshot {
     let mut buf = Vec::new();
+    let mut ctx = SerContext::new();
     write_magic_header(&mut buf);
     write_u32(&mut buf, globals.len() as u32);
     // Sort keys for deterministic output.
@@ -255,8 +351,11 @@ pub fn serialize_globals(globals: &HashMap<String, JsValue>) -> StartupSnapshot 
     for key in keys {
         let value = &globals[key];
         write_str32(&mut buf, key);
-        write_jsvalue(&mut buf, value);
+        write_jsvalue(&mut buf, value, &mut ctx);
     }
+    // Append FNV-1a checksum footer.
+    let checksum = fnv1a_32(&buf);
+    write_u32(&mut buf, checksum);
     StartupSnapshot { data: buf }
 }
 
@@ -281,13 +380,28 @@ pub fn serialize_globals(globals: &HashMap<String, JsValue>) -> StartupSnapshot 
 /// assert_eq!(restored.get("pi"), Some(&JsValue::HeapNumber(3.14)));
 /// ```
 pub fn deserialize_globals(bytes: &[u8]) -> StatorResult<HashMap<String, JsValue>> {
+    // Minimum: 8 (header) + 4 (count) + 4 (checksum).
+    if bytes.len() < 16 {
+        return Err(StatorError::Internal("snapshot: blob too small".into()));
+    }
+
+    // Validate header (magic + version) *before* checksum so that wrong-file
+    // and wrong-version errors are reported with clear messages.
     let mut cursor = 0usize;
     read_magic_header(bytes, &mut cursor)?;
-    let count = read_u32(bytes, &mut cursor)?;
+
+    // Verify FNV-1a checksum stored in the last 4 bytes.
+    verify_checksum(bytes)?;
+
+    // Read from the body (everything except the trailing checksum).
+    let body = &bytes[..bytes.len() - 4];
+
+    let mut ctx = DeserContext::new();
+    let count = read_u32(body, &mut cursor)?;
     let mut globals = HashMap::with_capacity(count as usize);
     for _ in 0..count {
-        let key = read_str32(bytes, &mut cursor)?;
-        let value = read_jsvalue(bytes, &mut cursor)?;
+        let key = read_str32(body, &mut cursor)?;
+        let value = read_jsvalue(body, &mut cursor, &mut ctx)?;
         globals.insert(key, value);
     }
     Ok(globals)
@@ -333,7 +447,7 @@ fn write_str32(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(bytes);
 }
 
-fn write_jsvalue(buf: &mut Vec<u8>, value: &JsValue) {
+fn write_jsvalue(buf: &mut Vec<u8>, value: &JsValue, ctx: &mut SerContext) {
     match value {
         JsValue::Undefined => write_u8(buf, TAG_UNDEFINED),
         JsValue::Null => write_u8(buf, TAG_NULL),
@@ -362,32 +476,68 @@ fn write_jsvalue(buf: &mut Vec<u8>, value: &JsValue) {
             write_i128(buf, *n);
         }
         JsValue::Function(rc) => {
-            write_u8(buf, TAG_FUNCTION);
-            write_bytecode_array(buf, rc);
-        }
-        JsValue::Array(items) => {
-            write_u8(buf, TAG_ARRAY);
-            write_u32(buf, items.len() as u32);
-            for item in items.iter() {
-                write_jsvalue(buf, item);
+            let addr = Rc::as_ptr(rc) as *const () as usize;
+            if let Some(id) = ctx.track_ptr(addr) {
+                write_u8(buf, TAG_BACK_REF);
+                write_u32(buf, id);
+            } else {
+                let id = ctx.next_id - 1;
+                write_u8(buf, TAG_DEFINE_REF);
+                write_u32(buf, id);
+                write_u8(buf, TAG_FUNCTION);
+                write_bytecode_array(buf, rc);
             }
         }
-        JsValue::PlainObject(map) => {
-            let borrow = map.borrow();
-            write_u8(buf, TAG_PLAIN_OBJECT);
-            write_u32(buf, borrow.len() as u32);
-            // Sort for determinism.
-            let mut entries: Vec<(&String, &JsValue)> = borrow.iter().collect();
-            entries.sort_by_key(|(k, _)| k.as_str());
-            for (k, v) in entries {
-                write_str32(buf, k);
-                write_jsvalue(buf, v);
+        JsValue::Array(rc) => {
+            let addr = Rc::as_ptr(rc) as *const () as usize;
+            if let Some(id) = ctx.track_ptr(addr) {
+                write_u8(buf, TAG_BACK_REF);
+                write_u32(buf, id);
+            } else {
+                let id = ctx.next_id - 1;
+                write_u8(buf, TAG_DEFINE_REF);
+                write_u32(buf, id);
+                write_u8(buf, TAG_ARRAY);
+                write_u32(buf, rc.len() as u32);
+                for item in rc.iter() {
+                    write_jsvalue(buf, item, ctx);
+                }
+            }
+        }
+        JsValue::PlainObject(rc) => {
+            let addr = Rc::as_ptr(rc) as *const () as usize;
+            if let Some(id) = ctx.track_ptr(addr) {
+                write_u8(buf, TAG_BACK_REF);
+                write_u32(buf, id);
+            } else {
+                let id = ctx.next_id - 1;
+                write_u8(buf, TAG_DEFINE_REF);
+                write_u32(buf, id);
+                let borrow = rc.borrow();
+                write_u8(buf, TAG_PLAIN_OBJECT);
+                write_u32(buf, borrow.len() as u32);
+                // Sort for determinism.
+                let mut entries: Vec<(&String, &JsValue)> = borrow.iter().collect();
+                entries.sort_by_key(|(k, _)| k.as_str());
+                for (k, v) in entries {
+                    write_str32(buf, k);
+                    write_jsvalue(buf, v, ctx);
+                }
             }
         }
         JsValue::Error(rc) => {
-            write_u8(buf, TAG_ERROR);
-            write_u8(buf, error_kind_to_byte(rc.kind));
-            write_str32(buf, &rc.message);
+            let addr = Rc::as_ptr(rc) as *const () as usize;
+            if let Some(id) = ctx.track_ptr(addr) {
+                write_u8(buf, TAG_BACK_REF);
+                write_u32(buf, id);
+            } else {
+                let id = ctx.next_id - 1;
+                write_u8(buf, TAG_DEFINE_REF);
+                write_u32(buf, id);
+                write_u8(buf, TAG_ERROR);
+                write_u8(buf, error_kind_to_byte(rc.kind));
+                write_str32(buf, &rc.message);
+            }
         }
         JsValue::NativeFunction(_) => {
             // Native closures cannot be serialized; store a placeholder.
@@ -636,8 +786,84 @@ fn read_str32(bytes: &[u8], cursor: &mut usize) -> StatorResult<String> {
     Ok(owned)
 }
 
-fn read_jsvalue(bytes: &[u8], cursor: &mut usize) -> StatorResult<JsValue> {
+fn read_jsvalue(bytes: &[u8], cursor: &mut usize, ctx: &mut DeserContext) -> StatorResult<JsValue> {
     let tag = read_u8(bytes, cursor)?;
+    match tag {
+        TAG_DEFINE_REF => {
+            let ref_id = read_u32(bytes, cursor)?;
+            let inner_tag = read_u8(bytes, cursor)?;
+            read_defined_ref(bytes, cursor, ctx, ref_id, inner_tag)
+        }
+        TAG_BACK_REF => {
+            let ref_id = read_u32(bytes, cursor)?;
+            ctx.lookup(ref_id)
+        }
+        other => read_jsvalue_by_tag(bytes, cursor, ctx, other),
+    }
+}
+
+/// Deserialize a `DefineRef`-wrapped value and register it in the context.
+///
+/// For `PlainObject` the Rc is registered *before* entries are read so that
+/// circular back-references resolve correctly.
+fn read_defined_ref(
+    bytes: &[u8],
+    cursor: &mut usize,
+    ctx: &mut DeserContext,
+    ref_id: u32,
+    inner_tag: u8,
+) -> StatorResult<JsValue> {
+    match inner_tag {
+        TAG_PLAIN_OBJECT => {
+            let count = read_u32(bytes, cursor)? as usize;
+            let map = Rc::new(RefCell::new(HashMap::with_capacity(count)));
+            let value = JsValue::PlainObject(Rc::clone(&map));
+            // Register before reading entries to allow circular references.
+            ctx.register(ref_id, value.clone());
+            for _ in 0..count {
+                let k = read_str32(bytes, cursor)?;
+                let v = read_jsvalue(bytes, cursor, ctx)?;
+                map.borrow_mut().insert(k, v);
+            }
+            Ok(value)
+        }
+        TAG_ARRAY => {
+            let count = read_u32(bytes, cursor)? as usize;
+            let mut items = Vec::with_capacity(count);
+            for _ in 0..count {
+                items.push(read_jsvalue(bytes, cursor, ctx)?);
+            }
+            let value = JsValue::Array(Rc::new(items));
+            ctx.register(ref_id, value.clone());
+            Ok(value)
+        }
+        TAG_FUNCTION => {
+            let ba = read_bytecode_array(bytes, cursor)?;
+            let value = JsValue::Function(Rc::new(ba));
+            ctx.register(ref_id, value.clone());
+            Ok(value)
+        }
+        TAG_ERROR => {
+            let kind_byte = read_u8(bytes, cursor)?;
+            let kind = byte_to_error_kind(kind_byte)?;
+            let message = read_str32(bytes, cursor)?;
+            let value = JsValue::Error(Rc::new(JsError::new(kind, message)));
+            ctx.register(ref_id, value.clone());
+            Ok(value)
+        }
+        other => Err(StatorError::Internal(format!(
+            "snapshot: DefineRef wrapping unexpected tag {other:#04x}"
+        ))),
+    }
+}
+
+/// Read a JsValue given its already-consumed tag byte.
+fn read_jsvalue_by_tag(
+    bytes: &[u8],
+    cursor: &mut usize,
+    ctx: &mut DeserContext,
+    tag: u8,
+) -> StatorResult<JsValue> {
     match tag {
         TAG_UNDEFINED => Ok(JsValue::Undefined),
         TAG_NULL => Ok(JsValue::Null),
@@ -673,7 +899,7 @@ fn read_jsvalue(bytes: &[u8], cursor: &mut usize) -> StatorResult<JsValue> {
             let count = read_u32(bytes, cursor)? as usize;
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                items.push(read_jsvalue(bytes, cursor)?);
+                items.push(read_jsvalue(bytes, cursor, ctx)?);
             }
             Ok(JsValue::Array(Rc::new(items)))
         }
@@ -682,7 +908,7 @@ fn read_jsvalue(bytes: &[u8], cursor: &mut usize) -> StatorResult<JsValue> {
             let mut map = HashMap::with_capacity(count);
             for _ in 0..count {
                 let k = read_str32(bytes, cursor)?;
-                let v = read_jsvalue(bytes, cursor)?;
+                let v = read_jsvalue(bytes, cursor, ctx)?;
                 map.insert(k, v);
             }
             Ok(JsValue::PlainObject(Rc::new(RefCell::new(map))))
@@ -868,6 +1094,38 @@ fn byte_to_feedback_slot_kind(b: u8) -> StatorResult<FeedbackSlotKind> {
             "snapshot: unknown FeedbackSlotKind byte {other}"
         ))),
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Checksum
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compute FNV-1a 32-bit hash for snapshot integrity checking.
+fn fnv1a_32(data: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for &byte in data {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Verify the FNV-1a checksum stored in the last 4 bytes of `bytes`.
+fn verify_checksum(bytes: &[u8]) -> StatorResult<()> {
+    if bytes.len() < 4 {
+        return Err(StatorError::Internal(
+            "snapshot: blob too small for checksum".into(),
+        ));
+    }
+    let body = &bytes[..bytes.len() - 4];
+    let stored = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().expect("4-byte slice"));
+    let computed = fnv1a_32(body);
+    if stored != computed {
+        return Err(StatorError::Internal(format!(
+            "snapshot: checksum mismatch (stored {stored:#010x}, computed {computed:#010x})"
+        )));
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1297,7 +1555,7 @@ mod tests {
 
     #[test]
     fn test_validate_bad_magic() {
-        let snap = StartupSnapshot::from_bytes(vec![0x00; 8]);
+        let snap = StartupSnapshot::from_bytes(vec![0x00; 16]);
         let err = snap.validate().unwrap_err();
         assert!(err.to_string().contains("invalid magic"));
     }
@@ -1317,5 +1575,174 @@ mod tests {
         let snap = serialize_globals(&HashMap::new());
         assert!(!snap.is_empty());
         assert!(snap.len() > 0);
+    }
+
+    // ── shared and circular references ────────────────────────────────────────
+
+    #[test]
+    fn test_round_trip_shared_plain_object() {
+        let shared = Rc::new(RefCell::new(HashMap::from([(
+            "x".to_string(),
+            JsValue::Smi(1),
+        )])));
+        let mut g = HashMap::new();
+        g.insert("a".to_string(), JsValue::PlainObject(Rc::clone(&shared)));
+        g.insert("b".to_string(), JsValue::PlainObject(Rc::clone(&shared)));
+        let snap = serialize_globals(&g);
+        let r = deserialize_globals(snap.as_bytes()).expect("deser");
+        // Both globals must point to the same Rc (identity preserved).
+        if let (Some(JsValue::PlainObject(a)), Some(JsValue::PlainObject(b))) =
+            (r.get("a"), r.get("b"))
+        {
+            assert!(Rc::ptr_eq(a, b), "shared object identity must be preserved");
+            assert_eq!(a.borrow().get("x"), Some(&JsValue::Smi(1)));
+        } else {
+            panic!("expected two PlainObjects");
+        }
+    }
+
+    #[test]
+    fn test_round_trip_circular_plain_object() {
+        let obj = Rc::new(RefCell::new(HashMap::new()));
+        obj.borrow_mut()
+            .insert("self".to_string(), JsValue::PlainObject(Rc::clone(&obj)));
+        obj.borrow_mut().insert("val".to_string(), JsValue::Smi(42));
+        let mut g = HashMap::new();
+        g.insert("circ".to_string(), JsValue::PlainObject(obj));
+        let snap = serialize_globals(&g);
+        let r = deserialize_globals(snap.as_bytes()).expect("deser");
+        if let Some(JsValue::PlainObject(restored)) = r.get("circ") {
+            let borrow = restored.borrow();
+            assert_eq!(borrow.get("val"), Some(&JsValue::Smi(42)));
+            if let Some(JsValue::PlainObject(inner)) = borrow.get("self") {
+                assert!(
+                    Rc::ptr_eq(restored, inner),
+                    "circular reference must restore to same Rc"
+                );
+            } else {
+                panic!("expected self-reference as PlainObject");
+            }
+        } else {
+            panic!("expected PlainObject");
+        }
+    }
+
+    #[test]
+    fn test_round_trip_shared_array() {
+        let shared = Rc::new(vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        let mut g = HashMap::new();
+        g.insert("a".to_string(), JsValue::Array(Rc::clone(&shared)));
+        g.insert("b".to_string(), JsValue::Array(Rc::clone(&shared)));
+        let snap = serialize_globals(&g);
+        let r = deserialize_globals(snap.as_bytes()).expect("deser");
+        if let (Some(JsValue::Array(a)), Some(JsValue::Array(b))) = (r.get("a"), r.get("b")) {
+            assert!(Rc::ptr_eq(a, b), "shared array identity must be preserved");
+            assert_eq!(a.as_ref(), &[JsValue::Smi(1), JsValue::Smi(2)]);
+        } else {
+            panic!("expected two Arrays");
+        }
+    }
+
+    #[test]
+    fn test_round_trip_shared_function() {
+        let ba = BytecodeArray::new(
+            vec![0x01],
+            vec![],
+            1,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        );
+        let shared = Rc::new(ba.clone());
+        let mut g = HashMap::new();
+        g.insert("f1".to_string(), JsValue::Function(Rc::clone(&shared)));
+        g.insert("f2".to_string(), JsValue::Function(Rc::clone(&shared)));
+        let snap = serialize_globals(&g);
+        let r = deserialize_globals(snap.as_bytes()).expect("deser");
+        if let (Some(JsValue::Function(f1)), Some(JsValue::Function(f2))) =
+            (r.get("f1"), r.get("f2"))
+        {
+            assert!(
+                Rc::ptr_eq(f1, f2),
+                "shared function identity must be preserved"
+            );
+            assert_eq!(f1.as_ref(), &ba);
+        } else {
+            panic!("expected two Functions");
+        }
+    }
+
+    #[test]
+    fn test_round_trip_prototype_chain() {
+        // Simulate a prototype chain: child.__proto__ = parent
+        let parent = Rc::new(RefCell::new(HashMap::from([(
+            "greet".to_string(),
+            JsValue::String("hello".to_string()),
+        )])));
+        let mut child_map = HashMap::new();
+        child_map.insert("x".to_string(), JsValue::Smi(10));
+        child_map.insert(
+            "__proto__".to_string(),
+            JsValue::PlainObject(Rc::clone(&parent)),
+        );
+        let child = Rc::new(RefCell::new(child_map));
+
+        // A second child shares the same parent prototype.
+        let mut child2_map = HashMap::new();
+        child2_map.insert("y".to_string(), JsValue::Smi(20));
+        child2_map.insert(
+            "__proto__".to_string(),
+            JsValue::PlainObject(Rc::clone(&parent)),
+        );
+        let child2 = Rc::new(RefCell::new(child2_map));
+
+        let mut g = HashMap::new();
+        g.insert("c1".to_string(), JsValue::PlainObject(child));
+        g.insert("c2".to_string(), JsValue::PlainObject(child2));
+
+        let snap = serialize_globals(&g);
+        let r = deserialize_globals(snap.as_bytes()).expect("deser");
+
+        if let (Some(JsValue::PlainObject(c1)), Some(JsValue::PlainObject(c2))) =
+            (r.get("c1"), r.get("c2"))
+        {
+            let proto1 = c1.borrow().get("__proto__").cloned();
+            let proto2 = c2.borrow().get("__proto__").cloned();
+            if let (Some(JsValue::PlainObject(p1)), Some(JsValue::PlainObject(p2))) =
+                (&proto1, &proto2)
+            {
+                assert!(
+                    Rc::ptr_eq(p1, p2),
+                    "shared prototype must be the same Rc across children"
+                );
+                assert_eq!(
+                    p1.borrow().get("greet"),
+                    Some(&JsValue::String("hello".to_string()))
+                );
+            } else {
+                panic!("expected __proto__ to be PlainObject");
+            }
+        } else {
+            panic!("expected two PlainObject children");
+        }
+    }
+
+    // ── checksum ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_checksum_corruption_detected() {
+        let mut g = HashMap::new();
+        g.insert("k".to_string(), JsValue::Smi(1));
+        let mut bytes = serialize_globals(&g).into_bytes();
+        // Corrupt a data byte (not part of header or checksum).
+        if bytes.len() > 12 {
+            bytes[10] ^= 0xFF;
+        }
+        let err = deserialize_globals(&bytes).unwrap_err();
+        assert!(
+            err.to_string().contains("checksum"),
+            "corruption should be caught by checksum: {err}"
+        );
     }
 }
