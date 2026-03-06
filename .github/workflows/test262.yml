@@ -47,10 +47,11 @@ jobs:
         run: cargo build --package stator_test262 --release
 
       - name: Run Test262 suite
-        # Threshold raised as engine conformance improves.
-        # Current measured pass rate: ~14% (install_globals + native harness
-        # + spec-compliant [[Construct]] + PlainObject constructor support).
+        # Threshold tracks conformance progress. Features enabled:
+        # async, generators, classes, symbols, BigInt, destructuring,
+        # for-of, dynamic-import, Proxy/Reflect, WeakRef, Intl, RegExp
+        # advanced, tail-call-optimization, globalThis.
         run: |
           ./target/release/stator_test262 \
             --test262-dir test262 \
-            --threshold 10.0
+            --threshold 25.0
