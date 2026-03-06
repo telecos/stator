@@ -43,10 +43,10 @@
 //! [WebAssembly JavaScript API]: https://webassembly.github.io/spec/js-api/
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::error::{StatorError, StatorResult};
+use crate::objects::property_map::PropertyMap;
 use crate::objects::value::{JsValue, NativeFn};
 use crate::wasm::{
     WasmEngine, WasmInstance, WasmModule, js_value_to_wasm_val, wasm_val_to_js_value,
@@ -123,7 +123,7 @@ fn compile_bytes(engine: &WasmEngine, bytes: &[u8]) -> StatorResult<WasmModule> 
 /// - `__wasm_bytes__` → `Array` of `Smi` (byte values 0–255)
 /// - `exports` → `Array` of export descriptor objects `{name, kind}`
 fn make_module_object(module: &WasmModule, bytes: Vec<u8>) -> JsValue {
-    let map: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+    let map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
 
     // Tag the object type for later detection.
     map.borrow_mut().insert(
@@ -143,7 +143,7 @@ fn make_module_object(module: &WasmModule, bytes: Vec<u8>) -> JsValue {
         .inner()
         .exports()
         .map(|exp| {
-            let desc: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+            let desc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
             desc.borrow_mut()
                 .insert("name".to_string(), JsValue::String(exp.name().to_string()));
             let kind = match exp.ty() {
@@ -237,7 +237,7 @@ fn make_instance_object(module: &WasmModule, engine: &WasmEngine) -> StatorResul
         Rc::new(RefCell::new(WasmInstance::new(engine, module)?));
 
     // Build the exports map with one NativeFunction per exported function.
-    let exports_map: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+    let exports_map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
     for (name, is_func) in export_info {
         if is_func {
             let inst_ref = Rc::clone(&instance_rc);
@@ -263,7 +263,7 @@ fn make_instance_object(module: &WasmModule, engine: &WasmEngine) -> StatorResul
         // Non-function exports (memory, table, global) are not yet exposed.
     }
 
-    let instance_map: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+    let instance_map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
     instance_map.borrow_mut().insert(
         "__wasm_type__".to_string(),
         JsValue::String("WebAssembly.Instance".to_string()),
@@ -385,7 +385,7 @@ pub fn wasm_instantiate(args: Vec<JsValue>) -> StatorResult<JsValue> {
         let module_obj = make_module_object(&module, bytes);
         let instance_obj = make_instance_object(&module, &engine)?;
 
-        let result: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+        let result: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
         result.borrow_mut().insert("module".to_string(), module_obj);
         result
             .borrow_mut()
@@ -462,13 +462,13 @@ pub fn wasm_instance_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
 /// # Examples
 ///
 /// ```
-/// use std::collections::HashMap;
+/// use stator_core::objects::property_map::PropertyMap;
 /// use std::cell::RefCell;
 /// use std::rc::Rc;
 /// use stator_core::builtins::wasm::wasm_memory_ctor;
 /// use stator_core::objects::value::JsValue;
 ///
-/// let desc: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+/// let desc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
 /// desc.borrow_mut().insert("initial".to_string(), JsValue::Smi(1));
 /// let mem = wasm_memory_ctor(vec![JsValue::PlainObject(desc)]).unwrap();
 /// assert!(matches!(mem, JsValue::PlainObject(_)));
@@ -519,7 +519,7 @@ pub fn wasm_memory_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
         }
     });
 
-    let memory_map: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+    let memory_map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
     memory_map.borrow_mut().insert(
         "__wasm_type__".to_string(),
         JsValue::String("WebAssembly.Memory".to_string()),
@@ -590,7 +590,7 @@ pub fn wasm_table_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
 
     // `table_map` is built after the closures but shared with `grow_fn` so that
     // grow() can update the `length` property to reflect the new size.
-    let table_map: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+    let table_map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
     let table_map_for_grow = Rc::clone(&table_map);
 
     let get_fn: NativeFn = Rc::new(move |args: Vec<JsValue>| {
@@ -698,13 +698,13 @@ pub fn wasm_table_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
 /// # Examples
 ///
 /// ```
-/// use std::collections::HashMap;
+/// use stator_core::objects::property_map::PropertyMap;
 /// use std::cell::RefCell;
 /// use std::rc::Rc;
 /// use stator_core::builtins::wasm::wasm_global_ctor;
 /// use stator_core::objects::value::JsValue;
 ///
-/// let desc: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+/// let desc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
 /// desc.borrow_mut().insert("value".to_string(), JsValue::String("i32".to_string()));
 /// desc.borrow_mut().insert("mutable".to_string(), JsValue::Boolean(true));
 /// let global = wasm_global_ctor(vec![JsValue::PlainObject(desc), JsValue::Smi(42)]).unwrap();
@@ -739,7 +739,7 @@ pub fn wasm_global_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
     let valueof_fn: NativeFn =
         Rc::new(move |_args: Vec<JsValue>| Ok(current_for_valueof.borrow().clone()));
 
-    let global_map: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+    let global_map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
     global_map.borrow_mut().insert(
         "__wasm_type__".to_string(),
         JsValue::String("WebAssembly.Global".to_string()),
@@ -786,7 +786,7 @@ pub fn wasm_global_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
 /// assert!(matches!(wasm_obj, JsValue::PlainObject(_)));
 /// ```
 pub fn make_webassembly_object() -> JsValue {
-    let map: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+    let map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
 
     map.borrow_mut().insert(
         "validate".to_string(),
@@ -831,10 +831,10 @@ pub fn make_webassembly_object() -> JsValue {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::HashMap;
     use std::rc::Rc;
 
     use super::*;
+    use crate::objects::property_map::PropertyMap;
 
     // ── WAT helpers ──────────────────────────────────────────────────────────
 
@@ -883,7 +883,7 @@ mod tests {
 
     /// Helper: plain descriptor object `{key: value}`.
     fn descriptor(pairs: &[(&str, JsValue)]) -> JsValue {
-        let map: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+        let map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
         for (k, v) in pairs {
             map.borrow_mut().insert(k.to_string(), v.clone());
         }

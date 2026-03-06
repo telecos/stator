@@ -124,6 +124,7 @@ use crate::builtins::weak_set::{weak_set_add, weak_set_delete, weak_set_has, wea
 use crate::error::{StatorError, StatorResult};
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
+use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -249,7 +250,7 @@ fn arg_f64(args: &[JsValue], idx: usize) -> StatorResult<f64> {
 
 /// Build the `Math` namespace object with all constants and methods.
 fn make_math() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // ── Constants ────────────────────────────────────────────────────────
     props.insert("E".into(), JsValue::HeapNumber(MATH_E));
@@ -440,7 +441,7 @@ fn make_math() -> JsValue {
 
 /// Build the `console` namespace object.
 fn make_console() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     props.insert(
         "log".into(),
@@ -493,7 +494,7 @@ fn json_value_to_js_value(jv: &crate::builtins::json::JsonValue) -> JsValue {
             JsValue::Array(Rc::new(items))
         }
         JsonValue::Object(entries) => {
-            let mut map = HashMap::new();
+            let mut map = PropertyMap::new();
             for (k, v) in entries.borrow().iter() {
                 map.insert(k.clone(), json_value_to_js_value(v));
             }
@@ -516,7 +517,7 @@ fn make_json() -> JsValue {
         JsonReplacer, JsonSpace, JsonValue, js_value_to_json, json_parse, json_stringify_js_value,
     };
 
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     props.insert(
         "parse".into(),
@@ -645,7 +646,7 @@ fn apply_js_reviver(
 /// - `parse`: `Date.parse(string)`
 /// - `UTC`: `Date.UTC(year, month, ...)`
 fn make_date() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // ── Constructor: new Date() / Date(value) / Date(y, m, d, ...) ──────
     props.insert(
@@ -757,7 +758,7 @@ fn make_date() -> JsValue {
 /// that all getter/setter methods close over.
 fn make_date_instance(t: f64) -> JsValue {
     let inner = Rc::new(RefCell::new(t));
-    let mut obj: HashMap<String, JsValue> = HashMap::new();
+    let mut obj = PropertyMap::new();
 
     // ── getTime / valueOf ────────────────────────────────────────────────
     {
@@ -1254,7 +1255,7 @@ fn make_date_instance(t: f64) -> JsValue {
 
 /// Build the `Number` constructor/namespace object.
 fn make_number() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // Number.isNaN — does NOT coerce (unlike global isNaN)
     props.insert(
@@ -1360,7 +1361,7 @@ fn make_number() -> JsValue {
 
 /// Build the `Object` constructor/namespace object.
 fn make_object() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     props.insert(
         "keys".into(),
@@ -1383,7 +1384,7 @@ fn make_object() -> JsValue {
         native(|args| {
             let val = args.first().unwrap_or(&JsValue::Undefined);
             if let JsValue::PlainObject(map) = val {
-                let values: Vec<JsValue> = map.borrow().values().cloned().collect();
+                let values: Vec<JsValue> = map.borrow().iter().map(|(_, v)| v.clone()).collect();
                 Ok(JsValue::Array(Rc::new(values)))
             } else {
                 Ok(JsValue::Array(Rc::new(vec![])))
@@ -1450,7 +1451,7 @@ fn make_object() -> JsValue {
             if let JsValue::PlainObject(map) = obj {
                 let borrowed = map.borrow();
                 if let Some(value) = borrowed.get(&key) {
-                    let mut desc: HashMap<String, JsValue> = HashMap::new();
+                    let mut desc = PropertyMap::new();
                     desc.insert("value".into(), value.clone());
                     desc.insert("writable".into(), JsValue::Boolean(true));
                     desc.insert("enumerable".into(), JsValue::Boolean(true));
@@ -1587,7 +1588,7 @@ fn make_object() -> JsValue {
         "create".into(),
         native(|args| {
             let proto = args.first().unwrap_or(&JsValue::Undefined);
-            let mut obj: HashMap<String, JsValue> = HashMap::new();
+            let mut obj = PropertyMap::new();
             match proto {
                 JsValue::Null | JsValue::Undefined => {}
                 _ => {
@@ -1646,7 +1647,7 @@ fn make_object() -> JsValue {
         "fromEntries".into(),
         native(|args| {
             let iterable = args.first().unwrap_or(&JsValue::Undefined);
-            let mut result: HashMap<String, JsValue> = HashMap::new();
+            let mut result = PropertyMap::new();
 
             if let JsValue::Array(arr) = iterable {
                 for entry in arr.iter() {
@@ -1764,9 +1765,9 @@ fn make_object() -> JsValue {
         native(|args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined);
             if let JsValue::PlainObject(map) = obj {
-                let mut result: HashMap<String, JsValue> = HashMap::new();
+                let mut result = PropertyMap::new();
                 for (key, value) in map.borrow().iter() {
-                    let mut desc: HashMap<String, JsValue> = HashMap::new();
+                    let mut desc = PropertyMap::new();
                     desc.insert("value".into(), value.clone());
                     desc.insert("writable".into(), JsValue::Boolean(true));
                     desc.insert("enumerable".into(), JsValue::Boolean(true));
@@ -1778,7 +1779,9 @@ fn make_object() -> JsValue {
                 }
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
             } else {
-                Ok(JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new()))))
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    PropertyMap::new(),
+                ))))
             }
         }),
     );
@@ -1793,7 +1796,7 @@ fn make_object() -> JsValue {
     );
 
     // ── Object.prototype ─────────────────────────────────────────────────
-    let mut obj_proto: HashMap<String, JsValue> = HashMap::new();
+    let mut obj_proto = PropertyMap::new();
 
     // Object.prototype.hasOwnProperty(key)
     obj_proto.insert(
@@ -1860,7 +1863,7 @@ fn make_object() -> JsValue {
 /// - `of` — `Array.of(...items)`.
 /// - `prototype` — an object with all `Array.prototype.*` methods.
 fn make_array() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // ── Static methods ──────────────────────────────────────────────────
 
@@ -1900,7 +1903,7 @@ fn make_array() -> JsValue {
     // parameters.  The interpreter rewrites `arr.push(x)` into
     // `Array.prototype.push(arr, x)` at the bytecode level.
 
-    let mut proto: HashMap<String, JsValue> = HashMap::new();
+    let mut proto = PropertyMap::new();
 
     // push(...items)
     proto.insert(
@@ -2790,7 +2793,7 @@ fn make_array() -> JsValue {
 /// creates symbols, and the static properties are patched onto the
 /// surrounding `PlainObject` wrapper.
 fn make_symbol() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // ── Static methods ────────────────────────────────────────────────────
 
@@ -2845,7 +2848,7 @@ fn make_symbol() -> JsValue {
 
     // ── Symbol.prototype ─────────────────────────────────────────────────
     {
-        let mut proto: HashMap<String, JsValue> = HashMap::new();
+        let mut proto = PropertyMap::new();
 
         // Symbol.prototype.description — getter returning the description.
         proto.insert(
@@ -2933,7 +2936,7 @@ fn make_symbol() -> JsValue {
 
 /// Build the `Iterator` constructor/namespace object with prototype helpers.
 fn make_iterator() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // ── Static method: Iterator.from ──────────────────────────────────────
     props.insert(
@@ -2950,7 +2953,7 @@ fn make_iterator() -> JsValue {
     // attach them as own properties so that `Iterator.prototype.map(…)` is
     // accessible as `Iterator.map(iter, mapper)` for direct testing and for
     // the bytecode to call via property lookup.
-    let mut proto: HashMap<String, JsValue> = HashMap::new();
+    let mut proto = PropertyMap::new();
 
     proto.insert(
         "map".into(),
@@ -3064,7 +3067,7 @@ fn make_iterator() -> JsValue {
 fn make_async_iterator() -> JsValue {
     use crate::builtins::promise::MicrotaskQueue;
 
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
     let queue = MicrotaskQueue::new();
 
     // ── Static method: AsyncIterator.from ─────────────────────────────────
@@ -3080,7 +3083,7 @@ fn make_async_iterator() -> JsValue {
     }
 
     // ── Prototype (instance) methods ─────────────────────────────────────
-    let mut proto: HashMap<String, JsValue> = HashMap::new();
+    let mut proto = PropertyMap::new();
 
     {
         let q = queue.clone();
@@ -3229,7 +3232,7 @@ fn make_async_iterator() -> JsValue {
 /// methods (`get`, `set`, `has`, `delete`, `clear`, `forEach`, `keys`,
 /// `values`, `entries`, `size`).
 fn make_map_builtin() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // ── Constructor: new Map() / new Map(iterable) ───────────────────────
     props.insert(
@@ -3250,7 +3253,7 @@ fn make_map_builtin() -> JsValue {
             };
             // Store the JsMap in a RefCell so prototype methods can mutate it.
             let inner = Rc::new(RefCell::new(m));
-            let mut obj: HashMap<String, JsValue> = HashMap::new();
+            let mut obj = PropertyMap::new();
             // size getter
             {
                 let inner = Rc::clone(&inner);
@@ -3398,7 +3401,7 @@ fn make_map_builtin() -> JsValue {
 /// (`add`, `has`, `delete`, `clear`, `forEach`, `keys`, `values`,
 /// `entries`, `size`).
 fn make_set_builtin() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // ── Constructor: new Set() / new Set(iterable) ───────────────────────
     props.insert(
@@ -3410,7 +3413,7 @@ fn make_set_builtin() -> JsValue {
                 set_new()
             };
             let inner = Rc::new(RefCell::new(s));
-            let mut obj: HashMap<String, JsValue> = HashMap::new();
+            let mut obj = PropertyMap::new();
             // size getter
             {
                 let inner = Rc::clone(&inner);
@@ -3546,13 +3549,13 @@ fn make_set_builtin() -> JsValue {
 /// `delete`).  Keys must be `Object` pointers; non-object keys cause a
 /// `TypeError`.
 fn make_weak_map_builtin() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     props.insert(
         "__call__".into(),
         native(|_args| {
             let inner = Rc::new(RefCell::new(weak_map_new()));
-            let mut obj: HashMap<String, JsValue> = HashMap::new();
+            let mut obj = PropertyMap::new();
 
             // get(key)
             {
@@ -3637,13 +3640,13 @@ fn make_weak_map_builtin() -> JsValue {
 /// a new `WeakSet` instance with prototype methods (`add`, `has`, `delete`).
 /// Values must be `Object` pointers; non-object values cause a `TypeError`.
 fn make_weak_set_builtin() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     props.insert(
         "__call__".into(),
         native(|_args| {
             let inner = Rc::new(RefCell::new(weak_set_new()));
-            let mut obj: HashMap<String, JsValue> = HashMap::new();
+            let mut obj = PropertyMap::new();
 
             // add(value)
             {
@@ -3712,7 +3715,7 @@ fn make_weak_set_builtin() -> JsValue {
 /// a new `WeakRef` instance with a `deref` prototype method.  The target
 /// must be an `Object` pointer; non-object targets cause a `TypeError`.
 fn make_weak_ref_builtin() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     props.insert(
         "__call__".into(),
@@ -3720,7 +3723,7 @@ fn make_weak_ref_builtin() -> JsValue {
             let target = args.first().unwrap_or(&JsValue::Undefined);
             if let JsValue::Object(ptr) = target {
                 let inner = Rc::new(RefCell::new(weak_ref_new(*ptr)?));
-                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                let mut obj = PropertyMap::new();
 
                 // deref()
                 {
@@ -3752,7 +3755,7 @@ fn make_weak_ref_builtin() -> JsValue {
 /// prototype methods.  The cleanup callback is stored as a JS-level value;
 /// actual invocation happens when the GC integration is complete.
 fn make_finalization_registry_builtin() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     props.insert(
         "__call__".into(),
@@ -3766,7 +3769,7 @@ fn make_finalization_registry_builtin() -> JsValue {
 
             let inner = Rc::new(RefCell::new(finalization_registry_new()));
             let callback = Rc::new(callback);
-            let mut obj: HashMap<String, JsValue> = HashMap::new();
+            let mut obj = PropertyMap::new();
 
             // register(target, heldValue [, unregisterToken])
             {
@@ -3876,7 +3879,7 @@ fn make_finalization_registry_builtin() -> JsValue {
 /// - `prototype` — an object with `bind`, `call`, `apply`, `toString`,
 ///   `Symbol.hasInstance`, `name`, and `length`.
 fn make_function() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // ── Constructor: new Function(…args, body) ──────────────────────────
     props.insert(
@@ -3885,7 +3888,7 @@ fn make_function() -> JsValue {
     );
 
     // ── Function.prototype ──────────────────────────────────────────────
-    let mut proto: HashMap<String, JsValue> = HashMap::new();
+    let mut proto = PropertyMap::new();
 
     // Function.prototype.call(thisArg, ...args)
     proto.insert(
@@ -3996,7 +3999,7 @@ fn make_function() -> JsValue {
 /// - Static methods: `fromCharCode`, `fromCodePoint`, `raw`.
 /// - `prototype` — an object with all `String.prototype.*` methods.
 fn make_string() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // ── Callable: String(value) ─────────────────────────────────────────
     props.insert(
@@ -4065,7 +4068,7 @@ fn make_string() -> JsValue {
     );
 
     // ── Prototype methods ───────────────────────────────────────────────
-    let mut proto: HashMap<String, JsValue> = HashMap::new();
+    let mut proto = PropertyMap::new();
 
     // charAt(pos)
     proto.insert(
@@ -4694,7 +4697,7 @@ fn make_promise() -> JsValue {
         promise_with_resolvers,
     };
 
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
     let queue = MicrotaskQueue::new();
 
     // ── Constructor: new Promise(executor) ─────────────────────────────────
@@ -4825,7 +4828,7 @@ fn make_promise() -> JsValue {
                 let wr = promise_with_resolvers(&q);
                 let resolve_box = Rc::new(RefCell::new(Some(wr.resolve)));
                 let reject_box = Rc::new(RefCell::new(Some(wr.reject)));
-                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                let mut obj = PropertyMap::new();
                 obj.insert("promise".into(), JsValue::Promise(wr.promise));
                 obj.insert(
                     "resolve".into(),
@@ -4945,7 +4948,7 @@ fn make_promise() -> JsValue {
 
 /// Build the `RegExp` constructor.
 fn make_regexp() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // Callable: new RegExp(pattern, flags)
     props.insert("__call__".into(), native(|args| regexp_construct(&args)));
@@ -4965,7 +4968,7 @@ fn make_regexp() -> JsValue {
 
 /// Build the `BigInt` global constructor with `asIntN` and `asUintN` static methods.
 fn make_bigint() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // BigInt(value) — callable constructor (must not be called with `new`)
     props.insert(
@@ -5117,20 +5120,20 @@ fn extract_handler(val: &JsValue) -> Option<crate::builtins::promise::PromiseHan
 /// that returns an instance (another `PlainObject`) carrying a `format` (or
 /// `compare` / `select`) method.
 fn make_intl() -> JsValue {
-    let mut ns: HashMap<String, JsValue> = HashMap::new();
+    let mut ns = PropertyMap::new();
 
     // ── Intl.NumberFormat ────────────────────────────────────────────────
     ns.insert("NumberFormat".into(), {
-        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        let mut ctor = PropertyMap::new();
         ctor.insert(
             "__call__".into(),
             native(|_args| {
-                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                let mut obj = PropertyMap::new();
                 obj.insert("format".into(), native(|a| number_format_js(&a)));
                 obj.insert(
                     "resolvedOptions".into(),
                     native(|_| {
-                        let mut opts: HashMap<String, JsValue> = HashMap::new();
+                        let mut opts = PropertyMap::new();
                         opts.insert("locale".into(), JsValue::String("en-US".into()));
                         opts.insert("numberingSystem".into(), JsValue::String("latn".into()));
                         Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
@@ -5144,16 +5147,16 @@ fn make_intl() -> JsValue {
 
     // ── Intl.DateTimeFormat ──────────────────────────────────────────────
     ns.insert("DateTimeFormat".into(), {
-        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        let mut ctor = PropertyMap::new();
         ctor.insert(
             "__call__".into(),
             native(|_args| {
-                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                let mut obj = PropertyMap::new();
                 obj.insert("format".into(), native(|a| date_time_format_js(&a)));
                 obj.insert(
                     "resolvedOptions".into(),
                     native(|_| {
-                        let mut opts: HashMap<String, JsValue> = HashMap::new();
+                        let mut opts = PropertyMap::new();
                         opts.insert("locale".into(), JsValue::String("en-US".into()));
                         opts.insert("calendar".into(), JsValue::String("gregory".into()));
                         opts.insert("timeZone".into(), JsValue::String("UTC".into()));
@@ -5168,16 +5171,16 @@ fn make_intl() -> JsValue {
 
     // ── Intl.Collator ───────────────────────────────────────────────────
     ns.insert("Collator".into(), {
-        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        let mut ctor = PropertyMap::new();
         ctor.insert(
             "__call__".into(),
             native(|_args| {
-                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                let mut obj = PropertyMap::new();
                 obj.insert("compare".into(), native(|a| collator_compare_js(&a)));
                 obj.insert(
                     "resolvedOptions".into(),
                     native(|_| {
-                        let mut opts: HashMap<String, JsValue> = HashMap::new();
+                        let mut opts = PropertyMap::new();
                         opts.insert("locale".into(), JsValue::String("en-US".into()));
                         opts.insert("sensitivity".into(), JsValue::String("variant".into()));
                         Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
@@ -5191,16 +5194,16 @@ fn make_intl() -> JsValue {
 
     // ── Intl.PluralRules ────────────────────────────────────────────────
     ns.insert("PluralRules".into(), {
-        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        let mut ctor = PropertyMap::new();
         ctor.insert(
             "__call__".into(),
             native(|_args| {
-                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                let mut obj = PropertyMap::new();
                 obj.insert("select".into(), native(|a| plural_rules_select_js(&a)));
                 obj.insert(
                     "resolvedOptions".into(),
                     native(|_| {
-                        let mut opts: HashMap<String, JsValue> = HashMap::new();
+                        let mut opts = PropertyMap::new();
                         opts.insert("locale".into(), JsValue::String("en-US".into()));
                         opts.insert("type".into(), JsValue::String("cardinal".into()));
                         Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
@@ -5214,7 +5217,7 @@ fn make_intl() -> JsValue {
 
     // ── Intl.ListFormat ─────────────────────────────────────────────────
     ns.insert("ListFormat".into(), {
-        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        let mut ctor = PropertyMap::new();
         ctor.insert(
             "__call__".into(),
             native(|args| {
@@ -5232,7 +5235,7 @@ fn make_intl() -> JsValue {
                 } else {
                     "conjunction".to_string()
                 };
-                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                let mut obj = PropertyMap::new();
                 obj.insert(
                     "format".into(),
                     native(move |a| list_format_js(&a, &list_type)),
@@ -5245,11 +5248,11 @@ fn make_intl() -> JsValue {
 
     // ── Intl.RelativeTimeFormat ─────────────────────────────────────────
     ns.insert("RelativeTimeFormat".into(), {
-        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        let mut ctor = PropertyMap::new();
         ctor.insert(
             "__call__".into(),
             native(|_args| {
-                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                let mut obj = PropertyMap::new();
                 obj.insert("format".into(), native(|a| relative_time_format_js(&a)));
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
@@ -5259,11 +5262,11 @@ fn make_intl() -> JsValue {
 
     // ── Intl.Segmenter ──────────────────────────────────────────────────
     ns.insert("Segmenter".into(), {
-        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        let mut ctor = PropertyMap::new();
         ctor.insert(
             "__call__".into(),
             native(|_args| {
-                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                let mut obj = PropertyMap::new();
                 obj.insert(
                     "segment".into(),
                     native(|a| {
@@ -5283,11 +5286,11 @@ fn make_intl() -> JsValue {
 
     // ── Intl.DisplayNames ───────────────────────────────────────────────
     ns.insert("DisplayNames".into(), {
-        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        let mut ctor = PropertyMap::new();
         ctor.insert(
             "__call__".into(),
             native(|_args| {
-                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                let mut obj = PropertyMap::new();
                 obj.insert(
                     "of".into(),
                     native(|a| {
@@ -5303,12 +5306,12 @@ fn make_intl() -> JsValue {
 
     // ── Intl.Locale ─────────────────────────────────────────────────────
     ns.insert("Locale".into(), {
-        let mut ctor: HashMap<String, JsValue> = HashMap::new();
+        let mut ctor = PropertyMap::new();
         ctor.insert(
             "__call__".into(),
             native(|args| {
                 let tag = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let mut obj: HashMap<String, JsValue> = HashMap::new();
+                let mut obj = PropertyMap::new();
                 obj.insert("language".into(), JsValue::String(locale_language(&tag)));
                 obj.insert("baseName".into(), JsValue::String(locale_base_name(&tag)));
                 obj.insert(
@@ -5368,7 +5371,7 @@ fn make_intl() -> JsValue {
 /// Provides `Proxy(target, handler)` as a callable constructor and
 /// `Proxy.revocable(target, handler)` as a static method.
 fn make_proxy() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // Proxy as a constructor: new Proxy(target, handler)
     props.insert(
@@ -5426,7 +5429,7 @@ fn make_proxy() -> JsValue {
                 proxy_revoke(&mut proxy_rc.borrow_mut());
                 Ok(JsValue::Undefined)
             }));
-            let mut result = HashMap::new();
+            let mut result = PropertyMap::new();
             result.insert("proxy".to_string(), proxy_val);
             result.insert("revoke".to_string(), revoke_fn);
             Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
@@ -5486,7 +5489,7 @@ fn build_proxy_handler(handler_val: &JsValue) -> ProxyHandler {
 
 /// Build the `Reflect` namespace object with all 13 static methods.
 fn make_reflect() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     props.insert(
         "get".into(),
@@ -5553,7 +5556,7 @@ fn make_reflect() -> JsValue {
             let key = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
             match reflect_get_own_property_descriptor(&target, &key) {
                 Some((val, attrs)) => {
-                    let mut desc = HashMap::new();
+                    let mut desc = PropertyMap::new();
                     desc.insert("value".to_string(), val);
                     desc.insert(
                         "writable".to_string(),
@@ -5579,7 +5582,9 @@ fn make_reflect() -> JsValue {
         native(|args| {
             let target = require_object_arg(&args, 0, "Reflect.getPrototypeOf")?;
             match reflect_get_prototype_of(&target) {
-                Some(_) => Ok(JsValue::PlainObject(Rc::new(RefCell::new(HashMap::new())))),
+                Some(_) => Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    PropertyMap::new(),
+                )))),
                 None => Ok(JsValue::Null),
             }
         }),
@@ -6748,7 +6753,11 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     // `globalThis` is a self-referential property of the global object.
     // The inner map is shared via `Rc` so that `globalThis.globalThis`
     // resolves back to the same object (configurable, writable, not enumerable).
-    let inner = Rc::new(RefCell::new(globals.clone()));
+    let mut inner_props = PropertyMap::new();
+    for (k, v) in globals.iter() {
+        inner_props.insert(k.clone(), v.clone());
+    }
+    let inner = Rc::new(RefCell::new(inner_props));
     inner
         .borrow_mut()
         .insert("globalThis".into(), JsValue::PlainObject(Rc::clone(&inner)));
@@ -7168,11 +7177,10 @@ mod tests {
     fn e2e_json_stringify_to_json_method() {
         use crate::builtins::json::json_stringify_js_value;
         use std::cell::RefCell;
-        use std::collections::HashMap;
         use std::rc::Rc;
 
         // Build a PlainObject with a toJSON method.
-        let mut inner: HashMap<String, JsValue> = HashMap::new();
+        let mut inner = PropertyMap::new();
         inner.insert("value".into(), JsValue::Smi(42));
         inner.insert(
             "toJSON".into(),
@@ -8061,9 +8069,9 @@ mod tests {
         if let JsValue::PlainObject(map) = obj {
             let assign = map.borrow().get("assign").cloned().unwrap();
             if let JsValue::NativeFunction(f) = assign {
-                let target_map: HashMap<String, JsValue> = HashMap::new();
+                let target_map = PropertyMap::new();
                 let target = JsValue::PlainObject(Rc::new(RefCell::new(target_map)));
-                let mut src_map: HashMap<String, JsValue> = HashMap::new();
+                let mut src_map = PropertyMap::new();
                 src_map.insert("b".into(), JsValue::Smi(2));
                 let source = JsValue::PlainObject(Rc::new(RefCell::new(src_map)));
                 let result = f(vec![target.clone(), source]).unwrap();
@@ -8088,13 +8096,13 @@ mod tests {
         if let JsValue::PlainObject(map) = obj {
             let assign = map.borrow().get("assign").cloned().unwrap();
             if let JsValue::NativeFunction(f) = assign {
-                let mut t: HashMap<String, JsValue> = HashMap::new();
+                let mut t = PropertyMap::new();
                 t.insert("a".into(), JsValue::Smi(1));
                 let target = JsValue::PlainObject(Rc::new(RefCell::new(t)));
-                let mut s1: HashMap<String, JsValue> = HashMap::new();
+                let mut s1 = PropertyMap::new();
                 s1.insert("b".into(), JsValue::Smi(2));
                 let src1 = JsValue::PlainObject(Rc::new(RefCell::new(s1)));
-                let mut s2: HashMap<String, JsValue> = HashMap::new();
+                let mut s2 = PropertyMap::new();
                 s2.insert("c".into(), JsValue::Smi(3));
                 let src2 = JsValue::PlainObject(Rc::new(RefCell::new(s2)));
                 let result = f(vec![target, src1, src2]).unwrap();

@@ -183,6 +183,7 @@ use crate::bytecode::bytecode_array::{MaglevJitCodeCache, TurbofanJitCodeCache};
 use crate::bytecode::bytecodes::decode_with_byte_offsets;
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::debugger::Debugger;
+use crate::objects::property_map::PropertyMap;
 use crate::objects::value::{JsContext, JsValue};
 
 // Re-export generator types and bring them into scope so external code can
@@ -1190,12 +1191,9 @@ impl Interpreter {
 
 /// Create a `{ value, done }` iterator result object.
 fn make_iterator_result(value: JsValue, done: bool) -> JsValue {
-    let map: HashMap<String, JsValue> = [
-        ("value".to_string(), value),
-        ("done".to_string(), JsValue::Boolean(done)),
-    ]
-    .into_iter()
-    .collect();
+    let mut map = PropertyMap::new();
+    map.insert("value".to_string(), value);
+    map.insert("done".to_string(), JsValue::Boolean(done));
     JsValue::PlainObject(Rc::new(RefCell::new(map)))
 }
 
@@ -1313,7 +1311,7 @@ pub(super) fn constant_to_value(entry: &ConstantPoolEntry) -> JsValue {
 /// property, and a `raw` sub-object with the same layout holding the raw
 /// (un-escaped) strings.
 fn build_template_object(cooked: &[Option<String>], raw: &[String]) -> JsValue {
-    let mut map = HashMap::new();
+    let mut map = PropertyMap::new();
     for (i, c) in cooked.iter().enumerate() {
         let val = match c {
             Some(s) => JsValue::String(s.clone()),
@@ -1323,7 +1321,7 @@ fn build_template_object(cooked: &[Option<String>], raw: &[String]) -> JsValue {
     }
     map.insert("length".to_string(), JsValue::Smi(cooked.len() as i32));
 
-    let mut raw_map = HashMap::new();
+    let mut raw_map = PropertyMap::new();
     for (i, r) in raw.iter().enumerate() {
         raw_map.insert(i.to_string(), JsValue::String(r.clone()));
     }
@@ -1957,6 +1955,13 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
         }
         JsValue::PlainObject(map) => {
             let prop_name = to_property_key(key)?;
+            // Existing non-writable property: silently ignore (sloppy mode).
+            {
+                let pm = map.borrow();
+                if pm.contains_key(&prop_name) && !pm.is_writable(&prop_name) {
+                    return Ok(());
+                }
+            }
             map.borrow_mut().insert(prop_name, value);
             // If this is an array-like PlainObject, update "length".
             if let Some(idx) = to_array_index(key) {
@@ -1982,9 +1987,7 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
 
 /// Extract array elements from a PlainObject that represents an array-like
 /// value (has a `"length"` property and numeric-string keys).
-pub(super) fn plain_object_to_array_items(
-    map: &Rc<RefCell<HashMap<String, JsValue>>>,
-) -> Vec<JsValue> {
+pub(super) fn plain_object_to_array_items(map: &Rc<RefCell<PropertyMap>>) -> Vec<JsValue> {
     let borrow = map.borrow();
     let len = match borrow.get("length") {
         Some(JsValue::Smi(n)) => *n as usize,
@@ -5241,8 +5244,10 @@ mod tests {
 
     /// Helper: create a PlainObject from key-value pairs.
     fn make_plain_object(pairs: Vec<(&str, JsValue)>) -> JsValue {
-        let map: HashMap<String, JsValue> =
-            pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        let mut map = PropertyMap::new();
+        for (k, v) in pairs {
+            map.insert(k.to_string(), v);
+        }
         JsValue::PlainObject(Rc::new(RefCell::new(map)))
     }
 
@@ -5582,16 +5587,16 @@ mod tests {
         // Build: constructor.prototype = proto_obj
         //        instance.__proto__   = proto_obj
         // TestInstanceOf should find the match.
-        let proto = Rc::new(RefCell::new(HashMap::new()));
+        let proto = Rc::new(RefCell::new(PropertyMap::new()));
         proto
             .borrow_mut()
             .insert("kind".to_string(), JsValue::String("proto".to_string()));
 
-        let mut ctor_map = HashMap::new();
+        let mut ctor_map = PropertyMap::new();
         ctor_map.insert("prototype".to_string(), JsValue::PlainObject(proto.clone()));
         let constructor = JsValue::PlainObject(Rc::new(RefCell::new(ctor_map)));
 
-        let mut inst_map = HashMap::new();
+        let mut inst_map = PropertyMap::new();
         inst_map.insert("__proto__".to_string(), JsValue::PlainObject(proto.clone()));
         let instance = JsValue::PlainObject(Rc::new(RefCell::new(inst_map)));
 
@@ -5611,14 +5616,14 @@ mod tests {
     #[test]
     fn test_test_instance_of_no_match() {
         // Two different prototypes — should return false.
-        let proto_a = Rc::new(RefCell::new(HashMap::new()));
-        let proto_b = Rc::new(RefCell::new(HashMap::new()));
+        let proto_a = Rc::new(RefCell::new(PropertyMap::new()));
+        let proto_b = Rc::new(RefCell::new(PropertyMap::new()));
 
-        let mut ctor_map = HashMap::new();
+        let mut ctor_map = PropertyMap::new();
         ctor_map.insert("prototype".to_string(), JsValue::PlainObject(proto_a));
         let constructor = JsValue::PlainObject(Rc::new(RefCell::new(ctor_map)));
 
-        let mut inst_map = HashMap::new();
+        let mut inst_map = PropertyMap::new();
         inst_map.insert("__proto__".to_string(), JsValue::PlainObject(proto_b));
         let instance = JsValue::PlainObject(Rc::new(RefCell::new(inst_map)));
 
@@ -5639,7 +5644,7 @@ mod tests {
     #[test]
     fn test_test_in_plain_object_existing_key() {
         // "x" in { x: 1 } → true
-        let mut map = HashMap::new();
+        let mut map = PropertyMap::new();
         map.insert("x".to_string(), JsValue::Smi(1));
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
 
@@ -5658,7 +5663,7 @@ mod tests {
     #[test]
     fn test_test_in_plain_object_missing_key() {
         // "y" in { x: 1 } → false
-        let mut map = HashMap::new();
+        let mut map = PropertyMap::new();
         map.insert("x".to_string(), JsValue::Smi(1));
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
 
@@ -6348,7 +6353,7 @@ mod tests {
     fn test_plain_object_to_array_items() {
         // Build a PlainObject with numeric keys and verify
         // plain_object_to_array_items extracts elements correctly.
-        let map: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+        let map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
         {
             let mut borrow = map.borrow_mut();
             borrow.insert("0".to_string(), JsValue::Smi(10));

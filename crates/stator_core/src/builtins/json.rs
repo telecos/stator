@@ -1708,9 +1708,9 @@ mod tests {
 
     #[test]
     fn test_js_value_to_json_with_to_json_method() {
-        use std::collections::HashMap;
+        use crate::objects::property_map::PropertyMap;
 
-        let mut inner: HashMap<String, JsValue> = HashMap::new();
+        let mut inner = PropertyMap::new();
         inner.insert("value".into(), JsValue::Smi(42));
         inner.insert(
             "toJSON".into(),
@@ -1724,9 +1724,9 @@ mod tests {
 
     #[test]
     fn test_js_value_stringify_plain_object_with_replacer() {
-        use std::collections::HashMap;
+        use crate::objects::property_map::PropertyMap;
 
-        let mut map: HashMap<String, JsValue> = HashMap::new();
+        let mut map = PropertyMap::new();
         map.insert("a".into(), JsValue::Smi(1));
         map.insert("b".into(), JsValue::Smi(2));
         map.insert("c".into(), JsValue::Smi(3));
