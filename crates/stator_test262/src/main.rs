@@ -23,6 +23,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use stator_core::builtins::error::clear_call_stack;
 use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_core::error::StatorError;
 use stator_core::interpreter::{Interpreter, InterpreterFrame};
@@ -428,6 +429,11 @@ fn run_test(source: &str, harness_prefix: &str, meta: &TestMeta) -> TestOutcome 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         execute_source(source, harness_prefix)
     }));
+
+    // A panic inside the interpreter may leave frames on the thread-local
+    // call stack (because panics bypass the normal pop_call_frame() calls).
+    // Clear it unconditionally so the next test starts with a clean slate.
+    clear_call_stack();
 
     let result = match result {
         Ok(r) => r,
