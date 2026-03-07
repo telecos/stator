@@ -284,9 +284,6 @@ impl HarnessCache {
 /// skipped rather than run-and-failed, keeping the measured pass rate
 /// meaningful.
 const UNSUPPORTED_FEATURES: &[&str] = &[
-    // Advanced RegExp features not yet fully supported
-    "regexp-unicode-property-escapes",
-    "regexp-v-flag",
     // Temporal (stage 3 proposal — very large surface area)
     "Temporal",
     // Resizable ArrayBuffer — not yet implemented
