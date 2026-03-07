@@ -2798,6 +2798,16 @@ fn handle_create_mapped_arguments(
         map.insert(i.to_string(), v.clone());
     }
     map.insert("length".to_string(), JsValue::Smi(args.len() as i32));
+    // callee: reference to the executing function (sloppy mode only)
+    map.insert(
+        "callee".to_string(),
+        JsValue::Function(Rc::new(ctx.frame.bytecode_array.clone())),
+    );
+    // @@iterator: array-like iteration support
+    map.insert(
+        "@@iterator".to_string(),
+        JsValue::NativeFunction(Rc::new(|_args: Vec<JsValue>| Ok(JsValue::Undefined))),
+    );
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
 }
@@ -2818,6 +2828,20 @@ fn handle_create_unmapped_arguments(
         map.insert(i.to_string(), v.clone());
     }
     map.insert("length".to_string(), JsValue::Smi(args.len() as i32));
+    // callee: throws TypeError in strict mode
+    map.insert(
+        "callee".to_string(),
+        JsValue::NativeFunction(Rc::new(|_args: Vec<JsValue>| {
+            Err(StatorError::TypeError(
+                "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them".into(),
+            ))
+        })),
+    );
+    // @@iterator: array-like iteration support
+    map.insert(
+        "@@iterator".to_string(),
+        JsValue::NativeFunction(Rc::new(|_args: Vec<JsValue>| Ok(JsValue::Undefined))),
+    );
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
 }

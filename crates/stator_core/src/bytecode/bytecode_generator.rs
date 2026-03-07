@@ -4217,6 +4217,15 @@ fn compile_function(
     // Emit default-value and destructuring prologue for parameters.
     compiler.emit_param_prologue(params)?;
 
+    // Create the `arguments` object and bind it as a local variable.
+    // Non-arrow functions always get an arguments binding.
+    compiler.emit(Instruction::new_unchecked(
+        Opcode::CreateMappedArguments,
+        vec![],
+    ));
+    let args_reg = compiler.define_local("arguments");
+    compiler.emit_star(args_reg);
+
     // Hoist function declarations to the top of the scope.
     for stmt in &body.body {
         if let Stmt::FnDecl(decl) = stmt {
