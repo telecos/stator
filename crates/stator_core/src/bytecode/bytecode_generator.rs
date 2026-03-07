@@ -4030,8 +4030,10 @@ impl FunctionCompiler {
         if m.meta.name == "import" && m.property.name == "meta" {
             self.emit(Instruction::new_unchecked(Opcode::LdaImportMeta, vec![]));
             Ok(())
+        } else if m.meta.name == "new" && m.property.name == "target" {
+            self.emit(Instruction::new_unchecked(Opcode::LdaNewTarget, vec![]));
+            Ok(())
         } else {
-            // `new.target` and any other meta-properties are not yet supported.
             Err(StatorError::Internal(format!(
                 "{}.{} meta property is not yet supported",
                 m.meta.name, m.property.name,

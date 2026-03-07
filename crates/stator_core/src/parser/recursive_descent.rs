@@ -2903,6 +2903,30 @@ impl<'src> Parser<'src> {
             TokenKind::New => {
                 let new_start = self.current_span();
                 self.bump()?; // consume `new`
+                // Handle `new.target` meta-property
+                if self.peek_kind() == TokenKind::Dot {
+                    self.bump()?; // consume `.`
+                    let prop_tok = self.bump()?;
+                    let name = self.name_from_token(&prop_tok)?;
+                    if name == "target" {
+                        let end = prop_tok.span;
+                        return Ok(Expr::MetaProp(MetaPropExpr {
+                            loc: Self::merge_spans(new_start, end),
+                            meta: Ident {
+                                loc: new_start,
+                                name: "new".into(),
+                            },
+                            property: Ident {
+                                loc: prop_tok.span,
+                                name: "target".into(),
+                            },
+                        }));
+                    }
+                    return Err(Self::error_at(
+                        prop_tok.span,
+                        &format!("expected 'target' after 'new.', got '{name}'"),
+                    ));
+                }
                 // Parse the constructor target. Using parse_primary() allows
                 // nested `new` (e.g. `new new Foo()`) while avoiding the
                 // call-expression `()` being consumed by parse_call_member().
