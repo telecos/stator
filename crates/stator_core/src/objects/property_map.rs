@@ -6,6 +6,11 @@
 //! [`PropertyAttributes`] to every entry.  Newly inserted properties default
 //! to `WRITABLE | ENUMERABLE | CONFIGURABLE` (the ECMAScript default for
 //! ordinary user-created data properties).
+//!
+//! Internally, property values are stored in a flat `Vec<JsValue>` for
+//! cache-friendly iteration and O(1) slot-based access.  A secondary
+//! `HashMap<String, usize>` maps property names to slot indices for
+//! efficient lookup.
 
 use std::collections::HashMap;
 
@@ -22,26 +27,39 @@ const DEFAULT_ATTRS: PropertyAttributes = PropertyAttributes::from_bits_truncate
 
 /// A map of named properties with ECMAScript attribute flags.
 ///
-/// Each entry carries a [`JsValue`] and its [`PropertyAttributes`].
-/// The API mirrors `HashMap<String, JsValue>` for ease of migration while
-/// adding attribute-aware accessors.
+/// Property values are stored in a flat `Vec` for cache-friendly iteration
+/// and O(1) slot-based access.  The `index` HashMap provides O(1) name
+/// lookups into the flat storage.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PropertyMap {
-    entries: HashMap<String, (JsValue, PropertyAttributes)>,
+    /// Property names in insertion order.
+    keys: Vec<String>,
+    /// Property values, one per key.
+    values: Vec<JsValue>,
+    /// Property attributes, one per key.
+    attrs: Vec<PropertyAttributes>,
+    /// Name → slot-index mapping for O(1) lookup.
+    index: HashMap<String, usize>,
 }
 
 impl PropertyMap {
     /// Creates an empty property map.
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            keys: Vec::new(),
+            values: Vec::new(),
+            attrs: Vec::new(),
+            index: HashMap::new(),
         }
     }
 
     /// Creates a property map pre-allocated for `capacity` entries.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            entries: HashMap::with_capacity(capacity),
+            keys: Vec::with_capacity(capacity),
+            values: Vec::with_capacity(capacity),
+            attrs: Vec::with_capacity(capacity),
+            index: HashMap::with_capacity(capacity),
         }
     }
 
@@ -49,73 +67,104 @@ impl PropertyMap {
 
     /// Returns the value for `key`, ignoring attributes.
     pub fn get(&self, key: &str) -> Option<&JsValue> {
-        self.entries.get(key).map(|(v, _)| v)
+        self.index.get(key).map(|&i| &self.values[i])
     }
 
     /// Returns a clone of the value for `key`, ignoring attributes.
     pub fn get_cloned(&self, key: &str) -> Option<JsValue> {
-        self.entries.get(key).map(|(v, _)| v.clone())
+        self.index.get(key).map(|&i| self.values[i].clone())
     }
 
     /// Returns `true` if the map contains an entry for `key`.
     pub fn contains_key(&self, key: &str) -> bool {
-        self.entries.contains_key(key)
+        self.index.contains_key(key)
     }
 
     /// Inserts a property with default attributes (writable, enumerable,
     /// configurable).  If the key already exists the value is replaced but
     /// the existing attributes are preserved.
     pub fn insert(&mut self, key: String, value: JsValue) {
-        let attrs = self
-            .entries
-            .get(&key)
-            .map(|(_, a)| *a)
-            .unwrap_or(DEFAULT_ATTRS);
-        self.entries.insert(key, (value, attrs));
+        if let Some(&i) = self.index.get(&key) {
+            self.values[i] = value;
+        } else {
+            let i = self.keys.len();
+            self.index.insert(key.clone(), i);
+            self.keys.push(key);
+            self.values.push(value);
+            self.attrs.push(DEFAULT_ATTRS);
+        }
     }
 
     /// Removes the entry for `key`, returning the old value (if any).
     pub fn remove(&mut self, key: &str) -> Option<JsValue> {
-        self.entries.remove(key).map(|(v, _)| v)
+        if let Some(i) = self.index.remove(key) {
+            let val = self.values[i].clone();
+            // Swap-remove to keep storage compact.
+            let last = self.keys.len() - 1;
+            if i != last {
+                self.keys.swap(i, last);
+                self.values.swap(i, last);
+                self.attrs.swap(i, last);
+                // Update the index for the swapped-in key.
+                self.index.insert(self.keys[i].clone(), i);
+            }
+            self.keys.pop();
+            self.values.pop();
+            self.attrs.pop();
+            Some(val)
+        } else {
+            None
+        }
     }
 
     /// Returns an iterator over the property keys.
     pub fn keys(&self) -> impl Iterator<Item = &String> {
-        self.entries.keys()
+        self.keys.iter()
     }
 
     /// Returns an iterator over `(key, value)` pairs, ignoring attributes.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &JsValue)> {
-        self.entries.iter().map(|(k, (v, _))| (k, v))
+        self.keys.iter().zip(self.values.iter())
     }
 
     /// Returns the number of entries.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.keys.len()
     }
 
     /// Returns `true` if the map contains no entries.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.keys.is_empty()
     }
 
     // ── Attribute-aware API ───────────────────────────────────────────────
 
     /// Returns the value and attribute flags for `key`.
     pub fn get_with_attrs(&self, key: &str) -> Option<(&JsValue, PropertyAttributes)> {
-        self.entries.get(key).map(|(v, a)| (v, *a))
+        self.index
+            .get(key)
+            .map(|&i| (&self.values[i], self.attrs[i]))
     }
 
     /// Inserts a property with explicit attribute flags.
     pub fn insert_with_attrs(&mut self, key: String, value: JsValue, attrs: PropertyAttributes) {
-        self.entries.insert(key, (value, attrs));
+        if let Some(&i) = self.index.get(&key) {
+            self.values[i] = value;
+            self.attrs[i] = attrs;
+        } else {
+            let i = self.keys.len();
+            self.index.insert(key.clone(), i);
+            self.keys.push(key);
+            self.values.push(value);
+            self.attrs.push(attrs);
+        }
     }
 
     /// Updates the attribute flags for an existing property.
     /// Returns `true` if the property existed and was updated.
     pub fn set_attrs(&mut self, key: &str, attrs: PropertyAttributes) -> bool {
-        if let Some(entry) = self.entries.get_mut(key) {
-            entry.1 = attrs;
+        if let Some(&i) = self.index.get(key) {
+            self.attrs[i] = attrs;
             true
         } else {
             false
@@ -124,44 +173,49 @@ impl PropertyMap {
 
     /// Returns the attribute flags for `key`, or `None` if absent.
     pub fn attrs(&self, key: &str) -> Option<PropertyAttributes> {
-        self.entries.get(key).map(|(_, a)| *a)
+        self.index.get(key).map(|&i| self.attrs[i])
     }
 
     /// Returns `true` if the property exists and is writable.
     pub fn is_writable(&self, key: &str) -> bool {
-        self.entries
+        self.index
             .get(key)
-            .map(|(_, a)| a.contains(PropertyAttributes::WRITABLE))
+            .map(|&i| self.attrs[i].contains(PropertyAttributes::WRITABLE))
             .unwrap_or(false)
     }
 
     /// Returns `true` if the property exists and is configurable.
     pub fn is_configurable(&self, key: &str) -> bool {
-        self.entries
+        self.index
             .get(key)
-            .map(|(_, a)| a.contains(PropertyAttributes::CONFIGURABLE))
+            .map(|&i| self.attrs[i].contains(PropertyAttributes::CONFIGURABLE))
             .unwrap_or(false)
     }
 
     /// Returns `true` if the property exists and is enumerable.
     pub fn is_enumerable(&self, key: &str) -> bool {
-        self.entries
+        self.index
             .get(key)
-            .map(|(_, a)| a.contains(PropertyAttributes::ENUMERABLE))
+            .map(|&i| self.attrs[i].contains(PropertyAttributes::ENUMERABLE))
             .unwrap_or(false)
     }
 
     /// Returns an iterator over only the enumerable property keys.
     pub fn enumerable_keys(&self) -> impl Iterator<Item = &String> {
-        self.entries
+        self.keys
             .iter()
-            .filter(|(_, (_, a))| a.contains(PropertyAttributes::ENUMERABLE))
+            .zip(self.attrs.iter())
+            .filter(|(_, a)| a.contains(PropertyAttributes::ENUMERABLE))
             .map(|(k, _)| k)
     }
 
     /// Returns an iterator over `(key, value, attrs)` triples.
     pub fn iter_with_attrs(&self) -> impl Iterator<Item = (&String, &JsValue, PropertyAttributes)> {
-        self.entries.iter().map(|(k, (v, a))| (k, v, *a))
+        self.keys
+            .iter()
+            .zip(self.values.iter())
+            .zip(self.attrs.iter())
+            .map(|((k, v), a)| (k, v, *a))
     }
 }
 
