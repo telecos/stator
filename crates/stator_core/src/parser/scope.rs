@@ -798,7 +798,7 @@ impl Analyzer {
                 VarKind::Var => {
                     // Already hoisted — just visit the initialiser.
                 }
-                VarKind::Let => {
+                VarKind::Let | VarKind::Using | VarKind::AwaitUsing => {
                     self.declare_pat_bindings(&decl.id, BindingKind::Let);
                 }
                 VarKind::Const => {
@@ -810,7 +810,10 @@ impl Analyzer {
             }
             // After visiting the initialiser, the binding is past its
             // declaration point — lift it out of the TDZ.
-            if matches!(v.kind, VarKind::Let | VarKind::Const) {
+            if matches!(
+                v.kind,
+                VarKind::Let | VarKind::Const | VarKind::Using | VarKind::AwaitUsing
+            ) {
                 self.exit_tdz_pat(&decl.id);
             }
         }

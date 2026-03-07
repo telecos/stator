@@ -163,6 +163,8 @@ pub enum TokenKind {
     Target,
     /// `meta`
     Meta,
+    /// `using`
+    Using,
 
     // ── Punctuators ───────────────────────────────────────────────────────
     /// `{`
@@ -423,6 +425,7 @@ fn keyword_kind(s: &str) -> Option<TokenKind> {
         "set" => Some(TokenKind::Set),
         "target" => Some(TokenKind::Target),
         "meta" => Some(TokenKind::Meta),
+        "using" => Some(TokenKind::Using),
         _ => None,
     }
 }

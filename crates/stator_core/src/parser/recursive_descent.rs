@@ -115,6 +115,19 @@ impl<'src> Parser<'src> {
         self.current.kind
     }
 
+    /// Check if current position is `await using` (two-token lookahead).
+    fn is_await_using_lookahead(&self) -> bool {
+        if self.current.kind != TokenKind::Await {
+            return false;
+        }
+        // Peek at the next token without consuming.
+        let mut scanner_clone = self.scanner.clone();
+        matches!(
+            Self::next_significant(&mut scanner_clone),
+            Ok(tok) if tok.kind == TokenKind::Using
+        )
+    }
+
     /// Return the span of the current lookahead token.
     fn current_span(&self) -> Span {
         self.current.span
@@ -318,6 +331,10 @@ impl<'src> Parser<'src> {
                 let tok = self.bump()?;
                 self.parse_var_decl(VarKind::Const, tok.span)
             }
+            TokenKind::Using => {
+                let tok = self.bump()?;
+                self.parse_var_decl(VarKind::Using, tok.span)
+            }
             TokenKind::If => self.parse_if(),
             TokenKind::While => self.parse_while(),
             TokenKind::Do => self.parse_do_while(),
@@ -359,6 +376,13 @@ impl<'src> Parser<'src> {
                 self.parse_expr_stmt()
             }
             TokenKind::Class => self.parse_class_decl(),
+            // `await using x = …` — async resource management declaration.
+            TokenKind::Await if self.is_await_using_lookahead() => {
+                let start = self.current_span();
+                self.bump()?; // consume `await`
+                let tok = self.bump()?; // consume `using`
+                self.parse_var_decl(VarKind::AwaitUsing, Self::merge_spans(start, tok.span))
+            }
             _ => self.parse_expr_stmt(),
         }
     }

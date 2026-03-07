@@ -98,10 +98,10 @@ use crate::builtins::string::{
     string_to_upper_case, string_to_well_formed, string_trim, string_trim_end, string_trim_start,
 };
 use crate::builtins::symbol::{
-    SYMBOL_ASYNC_ITERATOR, SYMBOL_HAS_INSTANCE, SYMBOL_IS_CONCAT_SPREADABLE, SYMBOL_ITERATOR,
-    SYMBOL_MATCH, SYMBOL_MATCH_ALL, SYMBOL_REPLACE, SYMBOL_SEARCH, SYMBOL_SPECIES, SYMBOL_SPLIT,
-    SYMBOL_TO_PRIMITIVE, SYMBOL_TO_STRING_TAG, SYMBOL_UNSCOPABLES, symbol_create,
-    symbol_description, symbol_for, symbol_key_for,
+    SYMBOL_ASYNC_DISPOSE, SYMBOL_ASYNC_ITERATOR, SYMBOL_DISPOSE, SYMBOL_HAS_INSTANCE,
+    SYMBOL_IS_CONCAT_SPREADABLE, SYMBOL_ITERATOR, SYMBOL_MATCH, SYMBOL_MATCH_ALL, SYMBOL_REPLACE,
+    SYMBOL_SEARCH, SYMBOL_SPECIES, SYMBOL_SPLIT, SYMBOL_TO_PRIMITIVE, SYMBOL_TO_STRING_TAG,
+    SYMBOL_UNSCOPABLES, symbol_create, symbol_description, symbol_for, symbol_key_for,
 };
 use crate::builtins::typed_array::{
     TypedArrayKind, arraybuffer_is_view, arraybuffer_new, dataview_get_bigint64,
@@ -194,6 +194,27 @@ fn make_aggregate_error_constructor() -> JsValue {
     })
 }
 
+/// Build the `SuppressedError` constructor (TC39 explicit resource management).
+///
+/// `SuppressedError(error, suppressed, message)` creates an Error with
+/// `.error`, `.suppressed`, and `.message` properties.
+fn make_suppressed_error_constructor() -> JsValue {
+    native(|args| {
+        let error_val = args.first().cloned().unwrap_or(JsValue::Undefined);
+        let suppressed_val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+        let message = match args.get(2) {
+            Some(JsValue::Undefined) | None => String::new(),
+            Some(v) => v.to_js_string()?,
+        };
+        let mut props = PropertyMap::new();
+        props.insert("name".into(), JsValue::String("SuppressedError".into()));
+        props.insert("message".into(), JsValue::String(message));
+        props.insert("error".into(), error_val);
+        props.insert("suppressed".into(), suppressed_val);
+        Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
+    })
+}
+
 /// Register all ECMAScript error constructors in the global environment.
 fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
     globals.insert("Error".into(), make_error_constructor(ErrorKind::Error));
@@ -222,6 +243,10 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
         make_error_constructor(ErrorKind::EvalError),
     );
     globals.insert("AggregateError".into(), make_aggregate_error_constructor());
+    globals.insert(
+        "SuppressedError".into(),
+        make_suppressed_error_constructor(),
+    );
 }
 
 /// Convert an `f64` to the most compact `JsValue` representation.
@@ -2881,6 +2906,8 @@ fn make_symbol() -> JsValue {
         JsValue::Symbol(SYMBOL_ASYNC_ITERATOR),
     );
     props.insert("matchAll".into(), JsValue::Symbol(SYMBOL_MATCH_ALL));
+    props.insert("dispose".into(), JsValue::Symbol(SYMBOL_DISPOSE));
+    props.insert("asyncDispose".into(), JsValue::Symbol(SYMBOL_ASYNC_DISPOSE));
 
     // ── Symbol.prototype ─────────────────────────────────────────────────
     {
@@ -6583,6 +6610,92 @@ fn make_typed_array_instance(
 
 // ── install_globals ──────────────────────────────────────────────────────────
 
+/// Build the `DisposableStack` constructor.
+///
+/// `DisposableStack` manages a stack of disposable resources and calls their
+/// `[Symbol.dispose]()` methods in reverse order when `.dispose()` is called.
+fn make_disposable_stack() -> JsValue {
+    native(|_args| {
+        let resources: Rc<RefCell<Vec<JsValue>>> = Rc::new(RefCell::new(Vec::new()));
+        let disposed: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+        let mut props = PropertyMap::new();
+
+        // use(value) — add a disposable resource.
+        {
+            let res = Rc::clone(&resources);
+            props.insert(
+                "use".into(),
+                native(move |args| {
+                    let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    res.borrow_mut().push(val.clone());
+                    Ok(val)
+                }),
+            );
+        }
+
+        // disposed — whether the stack has been disposed.
+        {
+            let d = Rc::clone(&disposed);
+            props.insert(
+                "disposed".into(),
+                native(move |_args| Ok(JsValue::Boolean(*d.borrow()))),
+            );
+        }
+
+        // dispose() — dispose all resources in reverse order.
+        {
+            let res = Rc::clone(&resources);
+            let d = Rc::clone(&disposed);
+            props.insert(
+                "dispose".into(),
+                native(move |_args| {
+                    if *d.borrow() {
+                        return Ok(JsValue::Undefined);
+                    }
+                    *d.borrow_mut() = true;
+                    let items: Vec<JsValue> = res.borrow_mut().drain(..).rev().collect();
+                    for item in &items {
+                        if let JsValue::PlainObject(obj) = item
+                            && let Some(JsValue::NativeFunction(f)) =
+                                obj.borrow().get("@@dispose").cloned()
+                        {
+                            let _ = f(vec![item.clone()]);
+                        }
+                    }
+                    Ok(JsValue::Undefined)
+                }),
+            );
+        }
+
+        // [Symbol.dispose]() — aliases dispose() for using protocol.
+        {
+            let res2 = Rc::clone(&resources);
+            let d2 = Rc::clone(&disposed);
+            props.insert(
+                "@@dispose".into(),
+                native(move |_args| {
+                    if *d2.borrow() {
+                        return Ok(JsValue::Undefined);
+                    }
+                    *d2.borrow_mut() = true;
+                    let items: Vec<JsValue> = res2.borrow_mut().drain(..).rev().collect();
+                    for item in &items {
+                        if let JsValue::PlainObject(obj) = item
+                            && let Some(JsValue::NativeFunction(f)) =
+                                obj.borrow().get("@@dispose").cloned()
+                        {
+                            let _ = f(vec![item.clone()]);
+                        }
+                    }
+                    Ok(JsValue::Undefined)
+                }),
+            );
+        }
+
+        Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
+    })
+}
+
 /// Pre-populate `globals` with all ECMAScript built-in names.
 ///
 /// This includes namespace objects (`Math`, `console`, `JSON`), constructor
@@ -6622,6 +6735,9 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
 
     // ── Error constructors ────────────────────────────────────────────────
     install_error_constructors(globals);
+
+    // ── Explicit resource management ────────────────────────────────────
+    globals.insert("DisposableStack".into(), make_disposable_stack());
 
     // ── Simple constructor-like wrappers ─────────────────────────────────
     globals.insert(

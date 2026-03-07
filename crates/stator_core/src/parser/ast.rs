@@ -428,6 +428,10 @@ pub enum VarKind {
     Let,
     /// `const` — block-scoped, non-reassignable.
     Const,
+    /// `using` — block-scoped, sync disposal via `Symbol.dispose`.
+    Using,
+    /// `await using` — block-scoped, async disposal via `Symbol.asyncDispose`.
+    AwaitUsing,
 }
 
 /// A single `pattern [= initializer]` in a variable declaration.
