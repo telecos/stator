@@ -44,6 +44,10 @@ struct Options {
     inspect_port: Option<u16>,
     /// Whether to pause before the first statement (`--inspect-brk`).
     inspect_brk: bool,
+    /// If set, emit a startup snapshot to this path and exit.
+    emit_snapshot: Option<String>,
+    /// If set, load a startup snapshot from this path for fast startup.
+    snapshot_path: Option<String>,
 }
 
 /// Parse command-line arguments into [`Options`].
@@ -53,6 +57,8 @@ fn parse_args() -> Options {
     let mut inspect_brk = false;
     let mut positional: Vec<String> = Vec::new();
     let mut eval_expr: Option<String> = None;
+    let mut emit_snapshot: Option<String> = None;
+    let mut snapshot_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -73,6 +79,10 @@ fn parse_args() -> Options {
                 process::exit(1);
             }));
             inspect_brk = true;
+        } else if let Some(path) = arg.strip_prefix("--emit-snapshot=") {
+            emit_snapshot = Some(path.to_string());
+        } else if let Some(path) = arg.strip_prefix("--snapshot=") {
+            snapshot_path = Some(path.to_string());
         } else if arg == "-e" {
             i += 1;
             if i < args.len() {
@@ -90,7 +100,10 @@ fn parse_args() -> Options {
         i += 1;
     }
 
-    let (source, source_name) = if let Some(expr) = eval_expr {
+    let (source, source_name) = if emit_snapshot.is_some() && positional.is_empty() {
+        // --emit-snapshot doesn't require a source file.
+        (String::new(), String::new())
+    } else if let Some(expr) = eval_expr {
         (expr, "<eval>".to_string())
     } else if let Some(file) = positional.first() {
         let s = match std::fs::read_to_string(file) {
@@ -102,7 +115,9 @@ fn parse_args() -> Options {
         };
         (s, file.clone())
     } else {
-        eprintln!("Usage: st8 <file.js>\n       st8 -e '<code>'\n       st8 --inspect <file.js>");
+        eprintln!(
+            "Usage: st8 <file.js>\n       st8 -e '<code>'\n       st8 --inspect <file.js>\n       st8 --emit-snapshot=<path>\n       st8 --snapshot=<path> <file.js>"
+        );
         process::exit(1);
     };
 
@@ -111,12 +126,26 @@ fn parse_args() -> Options {
         source_name,
         inspect_port,
         inspect_brk,
+        emit_snapshot,
+        snapshot_path,
     }
 }
 
 fn main() {
     let opts = parse_args();
-    let globals = build_globals();
+
+    // --emit-snapshot: serialize globals to disk and exit.
+    if let Some(ref snap_path) = opts.emit_snapshot {
+        emit_startup_snapshot(snap_path);
+        return;
+    }
+
+    // --snapshot: load globals from a snapshot for fast startup.
+    let globals = if let Some(ref snap_path) = opts.snapshot_path {
+        load_globals_from_snapshot(snap_path)
+    } else {
+        build_globals()
+    };
 
     let bytecodes =
         match parser::parse(&opts.source).and_then(|p| BytecodeGenerator::compile_program(&p)) {
@@ -197,6 +226,46 @@ fn run_with_inspector(
 }
 
 /// Build the initial global environment with the built-in shell functions.
+/// Serialize the engine's built-in globals to a snapshot file and exit.
+fn emit_startup_snapshot(path: &str) {
+    use stator_core::snapshot::serialize_globals;
+
+    let globals = build_globals();
+    let map = globals.borrow();
+    let snap = serialize_globals(&map);
+    if let Err(e) = snap.write_to_file(std::path::Path::new(path)) {
+        eprintln!("st8: failed to write snapshot: {e}");
+        process::exit(1);
+    }
+    eprintln!(
+        "st8: snapshot written to {path} ({} bytes, {} globals)",
+        snap.len(),
+        map.len()
+    );
+}
+
+/// Load globals from a pre-built snapshot for fast startup.
+///
+/// Falls back to `build_globals()` if the snapshot is invalid.
+fn load_globals_from_snapshot(path: &str) -> Rc<RefCell<HashMap<String, JsValue>>> {
+    use stator_core::snapshot::{StartupSnapshot, deserialize_globals};
+
+    let snap = match StartupSnapshot::read_from_file(std::path::Path::new(path)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("st8: cannot load snapshot: {e} — falling back to bootstrap");
+            return build_globals();
+        }
+    };
+    match deserialize_globals(snap.as_bytes()) {
+        Ok(map) => Rc::new(RefCell::new(map)),
+        Err(e) => {
+            eprintln!("st8: invalid snapshot: {e} — falling back to bootstrap");
+            build_globals()
+        }
+    }
+}
+
 fn build_globals() -> Rc<RefCell<HashMap<String, JsValue>>> {
     let globals: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
 
