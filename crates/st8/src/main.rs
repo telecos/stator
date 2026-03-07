@@ -48,6 +48,8 @@ struct Options {
     emit_snapshot: Option<String>,
     /// If set, load a startup snapshot from this path for fast startup.
     snapshot_path: Option<String>,
+    /// Print JIT compilation statistics after execution.
+    jit_stats: bool,
 }
 
 /// Parse command-line arguments into [`Options`].
@@ -59,6 +61,7 @@ fn parse_args() -> Options {
     let mut eval_expr: Option<String> = None;
     let mut emit_snapshot: Option<String> = None;
     let mut snapshot_path: Option<String> = None;
+    let mut jit_stats = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -83,6 +86,8 @@ fn parse_args() -> Options {
             emit_snapshot = Some(path.to_string());
         } else if let Some(path) = arg.strip_prefix("--snapshot=") {
             snapshot_path = Some(path.to_string());
+        } else if arg == "--jit-stats" {
+            jit_stats = true;
         } else if arg == "-e" {
             i += 1;
             if i < args.len() {
@@ -128,6 +133,7 @@ fn parse_args() -> Options {
         inspect_brk,
         emit_snapshot,
         snapshot_path,
+        jit_stats,
     }
 }
 
@@ -181,6 +187,11 @@ fn main() {
             process::exit(1);
         }
     }
+
+    // --jit-stats: print JIT compilation statistics.
+    if opts.jit_stats {
+        print_jit_stats();
+    }
 }
 
 /// Start the CDP WebSocket server, wait for a DevTools connection, then
@@ -226,6 +237,26 @@ fn run_with_inspector(
 }
 
 /// Build the initial global environment with the built-in shell functions.
+/// Print JIT compilation statistics for benchmarking.
+fn print_jit_stats() {
+    use stator_core::interpreter::{jit_stats, maglev_stats, turbofan_stats};
+
+    let (baseline_fns, baseline_bytes) = jit_stats();
+    let (maglev_fns, maglev_bytes) = maglev_stats();
+    let (turbofan_fns, turbofan_bytes) = turbofan_stats();
+
+    eprintln!("── JIT compilation statistics ──────────────────────────");
+    eprintln!("  Baseline:  {baseline_fns:>5} functions, {baseline_bytes:>8} bytes");
+    eprintln!("  Maglev:    {maglev_fns:>5} functions, {maglev_bytes:>8} bytes");
+    eprintln!("  Turbofan:  {turbofan_fns:>5} functions, {turbofan_bytes:>8} bytes");
+    eprintln!(
+        "  Total:     {:>5} functions, {:>8} bytes",
+        baseline_fns as usize + maglev_fns as usize + turbofan_fns as usize,
+        baseline_bytes + maglev_bytes + turbofan_bytes
+    );
+    eprintln!("────────────────────────────────────────────────────────");
+}
+
 /// Serialize the engine's built-in globals to a snapshot file and exit.
 fn emit_startup_snapshot(path: &str) {
     use stator_core::snapshot::serialize_globals;
