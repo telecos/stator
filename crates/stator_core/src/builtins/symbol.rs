@@ -50,6 +50,10 @@ pub const SYMBOL_UNSCOPABLES: u64 = 11;
 pub const SYMBOL_ASYNC_ITERATOR: u64 = 12;
 /// `Symbol.matchAll` — customises `String.prototype.matchAll`.
 pub const SYMBOL_MATCH_ALL: u64 = 13;
+/// Well-known `Symbol.dispose` — sync disposal protocol.
+pub const SYMBOL_DISPOSE: u64 = 14;
+/// Well-known `Symbol.asyncDispose` — async disposal protocol.
+pub const SYMBOL_ASYNC_DISPOSE: u64 = 15;
 
 /// First ID available for user-created symbols (everything below is reserved).
 const FIRST_USER_SYMBOL_ID: u64 = 100;
@@ -111,6 +115,10 @@ impl SymbolRegistry {
             .insert(SYMBOL_ASYNC_ITERATOR, Some("Symbol.asyncIterator".into()));
         reg.descriptions
             .insert(SYMBOL_MATCH_ALL, Some("Symbol.matchAll".into()));
+        reg.descriptions
+            .insert(SYMBOL_DISPOSE, Some("Symbol.dispose".into()));
+        reg.descriptions
+            .insert(SYMBOL_ASYNC_DISPOSE, Some("Symbol.asyncDispose".into()));
         reg
     }
 }

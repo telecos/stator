@@ -41,7 +41,7 @@ use crate::parser::ast::{
     ArrowBody, ArrowExpr, AssignOp, AssignTarget, BinaryOp, BlockStmt, ExportDefaultExpr,
     ExportNamedDecl, Expr, FnDecl, FnExpr, ForInit, ForStmt, ImportSpecifier, LogicalOp,
     ModuleDecl, ModuleExportName, ObjectPatProp, Pat, Program, ProgramItem, SourceType, Stmt,
-    UnaryOp, UpdateOp, VarDecl, VarDeclarator,
+    UnaryOp, UpdateOp, VarDecl, VarDeclarator, VarKind,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -227,6 +227,9 @@ struct FunctionCompiler {
     in_tail_position: bool,
     /// `true` when compiling in strict mode.
     is_strict: bool,
+    /// Stack of `using` variable registers for disposal at scope exit.
+    /// Each entry corresponds to a scope level in `scopes`.
+    using_vars: Vec<Vec<Register>>,
 }
 
 impl FunctionCompiler {
@@ -262,6 +265,7 @@ impl FunctionCompiler {
             next_module_cell: 0,
             in_tail_position: false,
             is_strict: false,
+            using_vars: vec![Vec::new()],
         };
         // Register simple ident params in the scope immediately; complex
         // patterns are handled by `emit_param_prologue`.
@@ -603,10 +607,46 @@ impl FunctionCompiler {
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        self.using_vars.push(Vec::new());
     }
 
     fn pop_scope(&mut self) {
+        // Emit disposal calls for any `using` variables in this scope.
+        if let Some(vars) = self.using_vars.pop() {
+            for reg in vars.into_iter().rev() {
+                self.emit_using_dispose(reg);
+            }
+        }
         self.scopes.pop();
+    }
+
+    /// Emit a call to `[Symbol.dispose]()` on the value in `reg`.
+    fn emit_using_dispose(&mut self, reg: Register) {
+        // Load the resource into acc.
+        self.emit_ldar(reg);
+        // CallProperty @@dispose — reuse method-call pattern.
+        let dispose_key = self.add_constant_raw(ConstantPoolEntry::String("@@dispose".into()));
+        let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+        // LdaNamedProperty [obj, name_idx, slot]
+        self.emit(Instruction::new_unchecked(
+            Opcode::LdaNamedProperty,
+            vec![to_reg_op(reg), Operand::ConstantPoolIdx(dispose_key), slot],
+        ));
+        // Store the method into a temp register.
+        let method_reg = self.allocator.new_local();
+        self.emit_star(method_reg);
+        // CallProperty [callee, receiver, args_start, args_count, slot]
+        let call_slot = self.alloc_slot(FeedbackSlotKind::Call);
+        self.emit(Instruction::new_unchecked(
+            Opcode::CallProperty,
+            vec![
+                to_reg_op(method_reg),
+                to_reg_op(reg),
+                Operand::Register(0),
+                Operand::RegisterCount(0),
+                call_slot,
+            ],
+        ));
     }
 
     /// Define a new local variable in the innermost scope and return its
@@ -729,15 +769,22 @@ impl FunctionCompiler {
         Ok(())
     }
 
-    /// Compile `var` / `let` / `const` declarations.
+    /// Compile `var` / `let` / `const` / `using` / `await using` declarations.
     fn compile_var_decl(&mut self, decl: &VarDecl) -> StatorResult<()> {
+        let is_using = matches!(decl.kind, VarKind::Using | VarKind::AwaitUsing);
         for declarator in &decl.declarators {
-            self.compile_var_declarator(declarator)?;
+            let reg = self.compile_var_declarator(declarator)?;
+            if is_using && let Some(r) = reg {
+                self.using_vars.last_mut().unwrap().push(r);
+            }
         }
         Ok(())
     }
 
-    fn compile_var_declarator(&mut self, declarator: &VarDeclarator) -> StatorResult<()> {
+    fn compile_var_declarator(
+        &mut self,
+        declarator: &VarDeclarator,
+    ) -> StatorResult<Option<Register>> {
         match &declarator.id {
             Pat::Ident(ident) => {
                 if self.is_eval_scope {
@@ -750,6 +797,7 @@ impl FunctionCompiler {
                         self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
                     }
                     self.compile_ident_store(&ident.name);
+                    Ok(None)
                 } else {
                     // Normal scope: allocate the local register.
                     let reg = self.define_local(&ident.name);
@@ -759,8 +807,8 @@ impl FunctionCompiler {
                         self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
                     }
                     self.emit_star(reg);
+                    Ok(Some(reg))
                 }
-                Ok(())
             }
             _ => Err(StatorError::Internal(
                 "destructuring declarations are not yet supported".into(),
@@ -1227,6 +1275,7 @@ impl FunctionCompiler {
             next_module_cell: 0,
             in_tail_position: false,
             is_strict: false,
+            using_vars: vec![Vec::new()],
         };
 
         let this_reg = Register::parameter(0);
@@ -4283,6 +4332,10 @@ impl BytecodeGenerator {
         compiler.is_module = is_module;
         // Modules are always strict; scripts inherit the AST flag.
         compiler.is_strict = program.is_strict || is_module;
+        // Modules implicitly support top-level `await` (ES2022).
+        if is_module {
+            compiler.is_async = true;
+        }
 
         // Hoist function declarations to the top.
         for item in &program.body {
@@ -6996,10 +7049,44 @@ mod tests {
         ))]);
         let ba = BytecodeGenerator::compile_program(&prog).unwrap();
         assert!(ba.is_module());
+        // Modules are implicitly async (top-level await).
+        assert!(ba.is_async());
         let instrs = decode(&ba.bytecodes()).unwrap();
         assert!(
             instrs.iter().any(|i| i.opcode == Opcode::LdaModuleVariable),
             "import should emit LdaModuleVariable, got {instrs:?}"
+        );
+    }
+
+    #[test]
+    fn test_module_top_level_await_compiles() {
+        use crate::parser::ast::{
+            AwaitExpr, ExprStmt, ImportDecl, ImportDefaultSpecifier, ImportSpecifier, ModuleDecl,
+        };
+        let await_stmt = ProgramItem::Stmt(Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(Expr::Await(Box::new(AwaitExpr {
+                loc: span(),
+                argument: Box::new(num_expr(42.0)),
+            }))),
+        }));
+        let import = ProgramItem::ModuleDecl(ModuleDecl::Import(ImportDecl {
+            loc: span(),
+            specifiers: vec![ImportSpecifier::Default(ImportDefaultSpecifier {
+                loc: span(),
+                local: ident("m"),
+            })],
+            source: string_lit("./mod.js"),
+            attributes: vec![],
+        }));
+        let prog = module_program(vec![import, await_stmt]);
+        let ba = BytecodeGenerator::compile_program(&prog).unwrap();
+        assert!(ba.is_module());
+        assert!(ba.is_async());
+        let instrs = decode(&ba.bytecodes()).unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::SuspendGenerator),
+            "top-level await should emit SuspendGenerator, got {instrs:?}"
         );
     }
 
