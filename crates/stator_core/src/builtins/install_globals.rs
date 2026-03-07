@@ -8268,6 +8268,32 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
+    /// `arguments.length` returns the number of arguments passed.
+    #[test]
+    fn e2e_arguments_length() {
+        let result = global_eval(
+            r#"
+            function f(a, b) { return arguments.length; }
+            f(1, 2)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `arguments[i]` returns the i-th argument.
+    #[test]
+    fn e2e_arguments_indexing() {
+        let result = global_eval(
+            r#"
+            function f(a, b) { return arguments[1]; }
+            f(10, 20)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(20));
+    }
+
     /// `Object.is(0, -0)` returns false.
     #[test]
     fn e2e_object_is_zero_neg_zero() {

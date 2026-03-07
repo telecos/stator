@@ -7583,6 +7583,11 @@ mod tests {
             assert_eq!(m.get("0"), Some(&JsValue::Smi(10)));
             assert_eq!(m.get("1"), Some(&JsValue::Smi(20)));
             assert_eq!(m.get("length"), Some(&JsValue::Smi(2)));
+            // callee should be present in mapped (sloppy) arguments
+            assert!(m.get("callee").is_some());
+            assert!(matches!(m.get("callee"), Some(JsValue::Function(_))));
+            // @@iterator should be present
+            assert!(m.get("@@iterator").is_some());
         } else {
             panic!("expected PlainObject, got {result:?}");
         }
@@ -7606,6 +7611,11 @@ mod tests {
             assert_eq!(m.get("0"), Some(&JsValue::Smi(5)));
             assert_eq!(m.get("1"), Some(&JsValue::Smi(6)));
             assert_eq!(m.get("length"), Some(&JsValue::Smi(2)));
+            // callee in unmapped (strict) arguments should be a throwing accessor
+            assert!(m.get("callee").is_some());
+            assert!(matches!(m.get("callee"), Some(JsValue::NativeFunction(_))));
+            // @@iterator should be present
+            assert!(m.get("@@iterator").is_some());
         } else {
             panic!("expected PlainObject, got {result:?}");
         }
