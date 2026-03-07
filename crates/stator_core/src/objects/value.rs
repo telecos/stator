@@ -589,8 +589,26 @@ impl JsValue {
             | Self::Symbol(_)
             | Self::BigInt(_) => Ok(self.clone()),
 
-            // PlainObject — check for callable valueOf/toString.
-            Self::PlainObject(map) => ordinary_to_primitive_plain_object(map, hint),
+            // PlainObject — check @@toPrimitive, then OrdinaryToPrimitive.
+            Self::PlainObject(map) => {
+                // §7.1.1 step 2: check for @@toPrimitive method
+                let exotic = map.borrow().get("@@toPrimitive").cloned();
+                if let Some(JsValue::NativeFunction(f)) = exotic {
+                    let hint_str = match hint {
+                        ToPrimitiveHint::String => "string",
+                        ToPrimitiveHint::Number => "number",
+                        ToPrimitiveHint::Default => "default",
+                    };
+                    let result = f(vec![self.clone(), JsValue::String(hint_str.into())])?;
+                    if result.is_primitive() {
+                        return Ok(result);
+                    }
+                    return Err(StatorError::TypeError(
+                        "Symbol.toPrimitive returned a non-primitive".into(),
+                    ));
+                }
+                ordinary_to_primitive_plain_object(map, hint)
+            }
 
             // All other object-like types: default string representation.
             _ => Ok(JsValue::String(self.default_obj_to_string())),
@@ -747,7 +765,13 @@ impl JsValue {
             Self::Iterator(_) => "[object Iterator]".to_string(),
             Self::Error(e) => e.to_error_string(),
             Self::NativeFunction(_) => "function () { [native code] }".to_string(),
-            Self::PlainObject(_) => "[object Object]".to_string(),
+            Self::PlainObject(map) => {
+                // §19.1.3.6: check @@toStringTag
+                if let Some(JsValue::String(tag)) = map.borrow().get("@@toStringTag").cloned() {
+                    return format!("[object {tag}]");
+                }
+                "[object Object]".to_string()
+            }
             Self::Promise(_) => "[object Promise]".to_string(),
             Self::Context(_) => "[object Context]".to_string(),
             Self::Proxy(_) => "[object Object]".to_string(),
@@ -1409,6 +1433,37 @@ mod tests {
         let arr = JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::Smi(2)]));
         let prim = arr.to_primitive(ToPrimitiveHint::String).unwrap();
         assert_eq!(prim, JsValue::String("1,2".to_string()));
+    }
+
+    #[test]
+    fn test_to_primitive_with_symbol_to_primitive() {
+        let mut map = PropertyMap::new();
+        let f: NativeFn = Rc::new(|args| {
+            let hint = args.get(1).unwrap_or(&JsValue::Undefined).clone();
+            if let JsValue::String(h) = hint {
+                Ok(JsValue::String(format!("hint:{h}")))
+            } else {
+                Ok(JsValue::Smi(0))
+            }
+        });
+        map.insert("@@toPrimitive".to_string(), JsValue::NativeFunction(f));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        let prim = obj.to_primitive(ToPrimitiveHint::Number).unwrap();
+        assert_eq!(prim, JsValue::String("hint:number".to_string()));
+    }
+
+    #[test]
+    fn test_to_string_tag() {
+        let mut map = PropertyMap::new();
+        map.insert(
+            "@@toStringTag".to_string(),
+            JsValue::String("CustomType".to_string()),
+        );
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert_eq!(
+            obj.default_obj_to_string(),
+            "[object CustomType]".to_string()
+        );
     }
 
     // ── to_number ────────────────────────────────────────────────────────────

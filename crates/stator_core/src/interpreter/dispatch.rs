@@ -2522,6 +2522,15 @@ fn handle_test_instance_of(
     };
     let constructor = ctx.frame.read_reg(v)?.clone();
 
+    // §7.3.21 OrdinaryHasInstance — first check @@hasInstance
+    if let JsValue::PlainObject(map) = &constructor
+        && let Some(JsValue::NativeFunction(f)) = map.borrow().get("@@hasInstance").cloned()
+    {
+        let result = f(vec![ctx.frame.accumulator.clone()])?;
+        ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
+        return Ok(DispatchAction::Continue);
+    }
+
     // Obtain the constructor's "prototype" property.
     let ctor_proto = match &constructor {
         JsValue::PlainObject(map) => map.borrow().get("prototype").cloned(),
@@ -2533,17 +2542,14 @@ fn handle_test_instance_of(
         let mut current = ctx.frame.accumulator.clone();
         let mut found = false;
         for _ in 0..256 {
-            // Check if current is the same object as proto_val
             match &current {
                 JsValue::PlainObject(map) => {
-                    // If this object *is* the prototype, match.
                     if let JsValue::PlainObject(p) = &proto_val
                         && Rc::ptr_eq(map, p)
                     {
                         found = true;
                         break;
                     }
-                    // Walk up via __proto__
                     let next = map.borrow().get("__proto__").cloned();
                     match next {
                         Some(v) => current = v,
