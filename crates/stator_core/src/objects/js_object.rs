@@ -632,6 +632,22 @@ impl JsObject {
         self.elements.truncate(new_len);
     }
 
+    /// Returns an immutable slice of the element backing store.
+    ///
+    /// This provides zero-copy access to the underlying `Vec<JsValue>`,
+    /// enabling optimised fast paths in array built-ins.
+    pub fn elements_as_slice(&self) -> &[JsValue] {
+        &self.elements
+    }
+
+    /// Returns a mutable slice of the element backing store.
+    ///
+    /// This provides zero-copy mutable access for in-place operations such as
+    /// `Array.prototype.reverse` and `Array.prototype.sort`.
+    pub fn elements_as_mut_slice(&mut self) -> &mut [JsValue] {
+        &mut self.elements
+    }
+
     // ── Write-barrier–aware store operations ─────────────────────────────────
 
     /// ECMAScript `[[Set]]` with a generational write barrier.
