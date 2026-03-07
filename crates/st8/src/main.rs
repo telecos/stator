@@ -136,6 +136,15 @@ fn main() {
             port,
             opts.inspect_brk,
         );
+    } else if bytecodes.is_module() && bytecodes.is_async() {
+        // Top-level await: run the module as an async function.
+        match Interpreter::run_async_function(bytecodes, vec![]) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("{e}");
+                process::exit(1);
+            }
+        }
     } else {
         let mut frame = InterpreterFrame::new_with_globals(bytecodes, vec![], globals);
         if let Err(e) = Interpreter::run(&mut frame) {

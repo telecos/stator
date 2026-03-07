@@ -49,10 +49,12 @@ impl TestMeta {
         self.flags.iter().any(|f| f == flag)
     }
 
+    #[allow(dead_code)]
     fn is_async(&self) -> bool {
         self.has_flag("async")
     }
 
+    #[allow(dead_code)]
     fn is_module(&self) -> bool {
         self.has_flag("module")
     }
@@ -563,11 +565,16 @@ fn execute_source(
     parser::parse(&combined)
         .and_then(|p| BytecodeGenerator::compile_program(&p))
         .and_then(|bc| {
-            let mut frame = InterpreterFrame::new_with_globals(bc, vec![], globals);
-            // Limit each test to 10 million instructions to prevent infinite
-            // loops from hanging the runner.
-            frame.instruction_limit = 10_000_000;
-            Interpreter::run(&mut frame)
+            if bc.is_module() && bc.is_async() {
+                // Top-level await module: execute as async function.
+                Interpreter::run_async_function(bc, vec![])
+            } else {
+                let mut frame = InterpreterFrame::new_with_globals(bc, vec![], globals);
+                // Limit each test to 10 million instructions to prevent infinite
+                // loops from hanging the runner.
+                frame.instruction_limit = 10_000_000;
+                Interpreter::run(&mut frame)
+            }
         })
 }
 
@@ -881,11 +888,7 @@ fn main_inner() {
         let meta = parse_frontmatter(&source);
 
         // ── Skip decision ─────────────────────────────────────────────────────
-        let skip_reason: Option<String> = if meta.is_module() {
-            Some("ES module".to_string())
-        } else if meta.is_async() {
-            Some("async".to_string())
-        } else if meta.is_can_block() {
+        let skip_reason: Option<String> = if meta.is_can_block() {
             Some("CanBlock flag".to_string())
         } else if has_unsupported_feature(&meta.features) {
             let f = meta

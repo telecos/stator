@@ -4283,6 +4283,10 @@ impl BytecodeGenerator {
         compiler.is_module = is_module;
         // Modules are always strict; scripts inherit the AST flag.
         compiler.is_strict = program.is_strict || is_module;
+        // Modules implicitly support top-level `await` (ES2022).
+        if is_module {
+            compiler.is_async = true;
+        }
 
         // Hoist function declarations to the top.
         for item in &program.body {
@@ -6996,10 +7000,44 @@ mod tests {
         ))]);
         let ba = BytecodeGenerator::compile_program(&prog).unwrap();
         assert!(ba.is_module());
+        // Modules are implicitly async (top-level await).
+        assert!(ba.is_async());
         let instrs = decode(&ba.bytecodes()).unwrap();
         assert!(
             instrs.iter().any(|i| i.opcode == Opcode::LdaModuleVariable),
             "import should emit LdaModuleVariable, got {instrs:?}"
+        );
+    }
+
+    #[test]
+    fn test_module_top_level_await_compiles() {
+        use crate::parser::ast::{
+            AwaitExpr, ExprStmt, ImportDecl, ImportDefaultSpecifier, ImportSpecifier, ModuleDecl,
+        };
+        let await_stmt = ProgramItem::Stmt(Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(Expr::Await(Box::new(AwaitExpr {
+                loc: span(),
+                argument: Box::new(num_expr(42.0)),
+            }))),
+        }));
+        let import = ProgramItem::ModuleDecl(ModuleDecl::Import(ImportDecl {
+            loc: span(),
+            specifiers: vec![ImportSpecifier::Default(ImportDefaultSpecifier {
+                loc: span(),
+                local: ident("m"),
+            })],
+            source: string_lit("./mod.js"),
+            attributes: vec![],
+        }));
+        let prog = module_program(vec![import, await_stmt]);
+        let ba = BytecodeGenerator::compile_program(&prog).unwrap();
+        assert!(ba.is_module());
+        assert!(ba.is_async());
+        let instrs = decode(&ba.bytecodes()).unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::SuspendGenerator),
+            "top-level await should emit SuspendGenerator, got {instrs:?}"
         );
     }
 
