@@ -1148,7 +1148,7 @@ mod tests {
     #[test]
     fn test_has_unsupported_feature_symbol() {
         assert!(has_unsupported_feature(&[
-            "Symbol".to_string(),
+            "Atomics".to_string(),
             "other".to_string()
         ]));
     }

@@ -1678,6 +1678,42 @@ fn make_object() -> JsValue {
         }),
     );
 
+    // ── Object.groupBy(items, callbackFn) ────────────────────────────────
+    props.insert(
+        "groupBy".into(),
+        native(|args| {
+            let items = args.first().unwrap_or(&JsValue::Undefined).clone();
+            let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let arr = match &items {
+                JsValue::Array(a) => a.clone(),
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "Object.groupBy: first argument must be iterable".into(),
+                    ));
+                }
+            };
+            let result = PropertyMap::new();
+            let result_rc = Rc::new(RefCell::new(result));
+            for (i, item) in arr.iter().enumerate() {
+                let key = if let JsValue::NativeFunction(f) = &cb {
+                    f(vec![item.clone(), JsValue::Smi(i as i32)])?
+                } else {
+                    JsValue::Undefined
+                };
+                let group_key = key.to_js_string()?;
+                let mut borrow = result_rc.borrow_mut();
+                if let Some(JsValue::Array(existing)) = borrow.get(&group_key).cloned() {
+                    let mut v = existing.as_ref().clone();
+                    v.push(item.clone());
+                    borrow.insert(group_key, JsValue::Array(Rc::new(v)));
+                } else {
+                    borrow.insert(group_key, JsValue::Array(Rc::new(vec![item.clone()])));
+                }
+            }
+            Ok(JsValue::PlainObject(result_rc))
+        }),
+    );
+
     // ── Object.getPrototypeOf(obj) ───────────────────────────────────────
     props.insert(
         "getPrototypeOf".into(),
@@ -8130,6 +8166,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `Object.groupBy` groups array elements by callback return value.
+    #[test]
+    fn test_object_group_by_native() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let obj = globals.get("Object").unwrap();
+        if let JsValue::PlainObject(map) = obj {
+            let group_by = map.borrow().get("groupBy").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = group_by {
+                let items = JsValue::Array(Rc::new(vec![
+                    JsValue::Smi(1),
+                    JsValue::Smi(2),
+                    JsValue::Smi(3),
+                    JsValue::Smi(4),
+                ]));
+                let cb = JsValue::NativeFunction(Rc::new(|args: Vec<JsValue>| {
+                    let v = args.first().unwrap_or(&JsValue::Undefined).clone();
+                    let n = v.to_number().unwrap_or(0.0) as i32;
+                    if n % 2 == 0 {
+                        Ok(JsValue::String("even".into()))
+                    } else {
+                        Ok(JsValue::String("odd".into()))
+                    }
+                }));
+                let result = f(vec![items, cb]).unwrap();
+                if let JsValue::PlainObject(r) = &result {
+                    let borrow = r.borrow();
+                    let odd = borrow.get("odd").cloned().unwrap();
+                    let even = borrow.get("even").cloned().unwrap();
+                    if let JsValue::Array(odd_arr) = odd {
+                        assert_eq!(odd_arr.len(), 2);
+                        assert_eq!(odd_arr[0], JsValue::Smi(1));
+                        assert_eq!(odd_arr[1], JsValue::Smi(3));
+                    } else {
+                        panic!("odd should be Array");
+                    }
+                    if let JsValue::Array(even_arr) = even {
+                        assert_eq!(even_arr.len(), 2);
+                        assert_eq!(even_arr[0], JsValue::Smi(2));
+                        assert_eq!(even_arr[1], JsValue::Smi(4));
+                    } else {
+                        panic!("even should be Array");
+                    }
+                } else {
+                    panic!("Expected PlainObject");
+                }
+            } else {
+                panic!("groupBy should be NativeFunction");
+            }
+        }
     }
 
     /// `Object.seal` returns the object.
