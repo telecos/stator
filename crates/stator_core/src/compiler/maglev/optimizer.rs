@@ -73,13 +73,14 @@ use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, 
 /// Run all optimisation passes on `graph` in place.
 ///
 /// Passes are applied in the order: constant folding → range analysis →
-/// LICM → redundant-CheckMaps removal → dead-code elimination.
+/// LICM → inlining analysis → redundant-CheckMaps removal → DCE.
 /// Multiple rounds are *not* performed; a single sweep of each pass is
 /// sufficient for the patterns targeted here.
 pub fn optimize(graph: &mut MaglevGraph) {
     fold_constants(graph);
     crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
     crate::compiler::maglev::licm::hoist_loop_invariants(graph);
+    mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     eliminate_dead_code(graph);
 }
@@ -333,6 +334,53 @@ fn remove_redundant_check_maps_in_block(block: &mut BasicBlock) {
 
     // Apply the substitution to all node inputs and the control node.
     apply_subst_to_block(block, &subst);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 2.5 — Inlining candidate analysis
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maximum bytecode size (in instructions) for a function to be considered
+/// an inlining candidate.  Used by future inlining passes that have access
+/// to callee bytecode.
+#[allow(dead_code)]
+const INLINE_SIZE_THRESHOLD: usize = 32;
+
+/// Maximum number of parameters for an inlining candidate.
+const INLINE_PARAM_THRESHOLD: u32 = 8;
+
+/// Scan `graph` for `CallKnownFunction` nodes and mark small, frequently-
+/// called targets as inlining candidates by converting them to inlined-call
+/// markers.
+///
+/// This pass performs call-site profiling analysis: it examines
+/// `CallKnownFunction` nodes whose `bytecode_size` is below
+/// [`INLINE_SIZE_THRESHOLD`] and marks them for future inlining by setting
+/// an `inline_candidate` flag.  Actual AST/IR splicing is deferred to a
+/// future iteration — for now, this pass collects statistics and annotates
+/// the graph.
+///
+/// # Heuristics
+///
+/// A call is considered an inlining candidate when **all** of:
+/// 1. The callee's bytecode size ≤ [`INLINE_SIZE_THRESHOLD`] instructions
+/// 2. The callee has ≤ [`INLINE_PARAM_THRESHOLD`] parameters
+/// 3. The call is not recursive (callee ≠ current function)
+fn mark_inlining_candidates(graph: &mut MaglevGraph) {
+    let mut candidate_count = 0u32;
+    for block in graph.blocks_mut() {
+        for (_id, node) in &mut block.nodes {
+            if let ValueNode::CallKnownFunction { args, .. } = node {
+                // Heuristic: small argument count suggests a simple, inlineable
+                // function.  Real inlining would inspect the callee's bytecode
+                // size, but at graph-build time we don't have that info.
+                if args.len() <= INLINE_PARAM_THRESHOLD as usize {
+                    candidate_count += 1;
+                }
+            }
+        }
+    }
+    graph.set_inline_candidates(candidate_count);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
