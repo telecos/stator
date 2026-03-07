@@ -62,7 +62,7 @@ pub(super) type OpcodeHandler =
     fn(&mut DispatchContext, &Instruction) -> StatorResult<DispatchAction>;
 
 /// Number of opcode variants (= `Opcode::Illegal as usize + 1`).
-const OPCODE_COUNT: usize = 189;
+const OPCODE_COUNT: usize = 190;
 
 fn handle_lda_zero(
     ctx: &mut DispatchContext,
@@ -1497,6 +1497,7 @@ fn handle_construct(
                 Rc::clone(&ctx.frame.global_env),
             );
             callee_frame.context = Some(this_val.clone());
+            callee_frame.new_target = JsValue::Function(Rc::clone(&ba));
             push_call_frame("<anonymous>")?;
             let result = Interpreter::run(&mut callee_frame);
             pop_call_frame();
@@ -3708,6 +3709,15 @@ fn handle_call_direct_eval(
     Ok(DispatchAction::Continue)
 }
 
+/// Load `new.target` into the accumulator.
+fn handle_lda_new_target(
+    ctx: &mut DispatchContext,
+    _instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    ctx.frame.accumulator = ctx.frame.new_target.clone();
+    Ok(DispatchAction::Continue)
+}
+
 fn handle_unimplemented(
     _ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -3914,6 +3924,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::LdaModuleVariable as usize] = handle_unimplemented;
     table[Opcode::StaModuleVariable as usize] = handle_unimplemented;
     table[Opcode::LdaImportMeta as usize] = handle_unimplemented;
+    table[Opcode::LdaNewTarget as usize] = handle_lda_new_target;
     table[Opcode::GetModuleNamespace as usize] = handle_unimplemented;
     table[Opcode::Wide as usize] = handle_wide;
     table[Opcode::ExtraWide as usize] = handle_wide;

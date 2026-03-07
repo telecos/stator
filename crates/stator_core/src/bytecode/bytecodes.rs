@@ -644,6 +644,11 @@ pub enum Opcode {
     StaModuleVariable,
     /// Load the `import.meta` object for the current module into the accumulator.
     LdaImportMeta,
+    /// Load `new.target` into the accumulator.
+    ///
+    /// Inside a `[[Construct]]` call this is the constructor function;
+    /// in a normal call it is `undefined`.
+    LdaNewTarget,
     /// Create a module namespace object (`import * as ns`) and load it into
     /// the accumulator. `[module_request_idx]`
     ///
@@ -904,6 +909,7 @@ impl Opcode {
             Opcode::LdaModuleVariable => &[ConstantPoolIdx, Immediate],
             Opcode::StaModuleVariable => &[ConstantPoolIdx, Immediate],
             Opcode::LdaImportMeta => &[],
+            Opcode::LdaNewTarget => &[],
             Opcode::GetModuleNamespace => &[ConstantPoolIdx],
 
             // Prefixes / trap — no operands of their own

@@ -831,6 +831,9 @@ pub struct InterpreterFrame {
     /// Cache of frozen template objects keyed by bytecode offset, used by
     /// `GetTemplateObject`.
     pub template_cache: HashMap<u32, JsValue>,
+    /// The `new.target` value for this frame.  Set to the constructor function
+    /// when invoked via `[[Construct]]`, or `undefined` for normal calls.
+    pub new_target: JsValue,
 }
 
 impl InterpreterFrame {
@@ -864,6 +867,7 @@ impl InterpreterFrame {
             instructions_executed: 0,
             pending_message: JsValue::Undefined,
             template_cache: HashMap::new(),
+            new_target: JsValue::Undefined,
         }
     }
 
@@ -1083,6 +1087,7 @@ impl Interpreter {
             instructions_executed: 0,
             pending_message: JsValue::Undefined,
             template_cache: std::collections::HashMap::new(),
+            new_target: JsValue::Undefined,
         };
 
         state.borrow_mut().status = GeneratorStatus::Executing;

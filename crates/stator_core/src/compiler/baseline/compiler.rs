@@ -1156,6 +1156,7 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::GetModuleNamespace
             | Opcode::Wide
             | Opcode::ExtraWide
+            | Opcode::LdaNewTarget
             | Opcode::Illegal => {
                 return Err(StatorError::Internal(format!(
                     "unexpected opcode in compilation: {:?}",
