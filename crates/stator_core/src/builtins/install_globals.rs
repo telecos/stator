@@ -6610,6 +6610,64 @@ fn make_typed_array_instance(
 
 // ── install_globals ──────────────────────────────────────────────────────────
 
+/// Build the `ShadowRealm` constructor.
+///
+/// Each `new ShadowRealm()` creates an isolated evaluation environment with
+/// its own set of global builtins.  `evaluate(code)` parses and runs code
+/// inside the realm.
+fn make_shadow_realm() -> JsValue {
+    use crate::bytecode::bytecode_generator::BytecodeGenerator;
+    use crate::interpreter::{Interpreter, InterpreterFrame};
+    native(|_args| {
+        // Create a fresh set of globals for this realm.
+        let mut realm_globals = HashMap::new();
+        install_globals(&mut realm_globals);
+        let realm_globals = Rc::new(RefCell::new(realm_globals));
+
+        let mut props = PropertyMap::new();
+
+        // evaluate(sourceText)
+        {
+            let globals = Rc::clone(&realm_globals);
+            props.insert(
+                "evaluate".into(),
+                native(move |args| {
+                    let source = args
+                        .first()
+                        .map(|v| v.to_js_string())
+                        .transpose()?
+                        .unwrap_or_default();
+                    let program = crate::parser::recursive_descent::parse(&source)?;
+                    let bc = BytecodeGenerator::compile_program(&program)?;
+                    let mut frame =
+                        InterpreterFrame::new_with_globals(bc, vec![], Rc::clone(&globals));
+                    let result = Interpreter::run(&mut frame)?;
+                    // ShadowRealm boundary: only primitives pass through.
+                    match &result {
+                        JsValue::Smi(_)
+                        | JsValue::HeapNumber(_)
+                        | JsValue::String(_)
+                        | JsValue::Boolean(_)
+                        | JsValue::Null
+                        | JsValue::Undefined
+                        | JsValue::BigInt(_)
+                        | JsValue::Symbol(_) => Ok(result),
+                        _ => Err(StatorError::TypeError(
+                            "ShadowRealm evaluate: cannot pass non-primitive across realm boundary"
+                                .into(),
+                        )),
+                    }
+                }),
+            );
+        }
+
+        // importValue(specifier, exportName) — stub returning undefined
+        props.insert("importValue".into(), native(|_args| Ok(JsValue::Undefined)));
+
+        Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
+    })
+}
+
 /// Build the `SharedArrayBuffer` constructor.
 fn make_shared_arraybuffer() -> JsValue {
     native(|args| {
@@ -7081,6 +7139,9 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     // ── Atomics / SharedArrayBuffer ─────────────────────────────────────
     globals.insert("Atomics".into(), make_atomics());
     globals.insert("SharedArrayBuffer".into(), make_shared_arraybuffer());
+
+    // ── ShadowRealm ────────────────────────────────────────────────────
+    globals.insert("ShadowRealm".into(), make_shadow_realm());
 
     // ── Error constructors ────────────────────────────────────────────────
     install_error_constructors(globals);

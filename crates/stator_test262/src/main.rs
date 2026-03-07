@@ -291,8 +291,6 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "Temporal",
     // Resizable ArrayBuffer — not yet implemented
     "resizable-arraybuffer",
-    // ShadowRealm — not implemented
-    "ShadowRealm",
     // Module features that need runtime module loader
     "arbitrary-module-namespace-names",
     "import-assertions",
