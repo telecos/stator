@@ -22,7 +22,7 @@
 //! * ECMAScript 2025 Language Specification §23.1 — *The Array Constructor*
 
 use crate::error::{StatorError, StatorResult};
-use crate::objects::js_array::JsArray;
+use crate::objects::js_array::{ElementKind, JsArray};
 use crate::objects::js_object::JsObject;
 use crate::objects::map::InstanceType;
 use crate::objects::value::JsValue;
@@ -374,6 +374,23 @@ pub fn array_every(arr: &JsArray, mut f: impl FnMut(&JsValue, u32) -> bool) -> b
 pub fn array_includes(arr: &JsArray, value: &JsValue, from_index: Option<i64>) -> bool {
     let len = arr.length();
     let start = resolve_relative_index(from_index.unwrap_or(0), len);
+    // Fast path: when the array holds only Smis and the needle is a Smi, we
+    // can compare raw i32 values directly without dynamic dispatch.
+    if matches!(
+        arr.element_kind(),
+        ElementKind::PackedSmi | ElementKind::HoleSmi
+    ) && let JsValue::Smi(needle) = value
+    {
+        let slice = arr.elements_as_slice();
+        for v in &slice[start as usize..] {
+            if let JsValue::Smi(s) = v
+                && *s == *needle
+            {
+                return true;
+            }
+        }
+        return false;
+    }
     for i in start..len {
         if same_value_zero(arr.get(i), value) {
             return true;
@@ -393,6 +410,22 @@ pub fn array_includes(arr: &JsArray, value: &JsValue, from_index: Option<i64>) -
 pub fn array_index_of(arr: &JsArray, value: &JsValue, from_index: Option<i64>) -> Option<u32> {
     let len = arr.length();
     let start = resolve_relative_index(from_index.unwrap_or(0), len);
+    // Fast path: Smi-only arrays with a Smi needle.
+    if matches!(
+        arr.element_kind(),
+        ElementKind::PackedSmi | ElementKind::HoleSmi
+    ) && let JsValue::Smi(needle) = value
+    {
+        let slice = arr.elements_as_slice();
+        for (i, v) in slice[start as usize..].iter().enumerate() {
+            if let JsValue::Smi(s) = v
+                && *s == *needle
+            {
+                return Some(start + i as u32);
+            }
+        }
+        return None;
+    }
     (start..len).find(|&i| strict_equal(&arr.get(i), value))
 }
 
@@ -451,6 +484,28 @@ pub fn array_join(arr: &JsArray, separator: Option<&str>) -> StatorResult<String
     if len == 0 {
         return Ok(String::new());
     }
+    // Fast path: Smi-only arrays can format integers directly.
+    if matches!(
+        arr.element_kind(),
+        ElementKind::PackedSmi | ElementKind::HoleSmi
+    ) {
+        let mut out = String::with_capacity(len as usize * 4);
+        let slice = arr.elements_as_slice();
+        for (i, v) in slice.iter().enumerate() {
+            if i > 0 {
+                out.push_str(sep);
+            }
+            match v {
+                JsValue::Smi(n) => {
+                    use std::fmt::Write;
+                    let _ = write!(out, "{n}");
+                }
+                JsValue::Undefined => {}
+                other => out.push_str(&other.to_js_string()?),
+            }
+        }
+        return Ok(out);
+    }
     let mut parts: Vec<String> = Vec::with_capacity(len as usize);
     for i in 0..len {
         let v = arr.get(i);
@@ -474,16 +529,9 @@ pub fn array_reverse(arr: &mut JsArray) {
     if len < 2 {
         return;
     }
-    let mut lo = 0u32;
-    let mut hi = len - 1;
-    while lo < hi {
-        let a = arr.get(lo);
-        let b = arr.get(hi);
-        arr.set(lo, b);
-        arr.set(hi, a);
-        lo += 1;
-        hi -= 1;
-    }
+    // Fast path: reverse the backing slice directly instead of going through
+    // get/set (which re-widen element kinds on each write).
+    arr.elements_as_mut_slice().reverse();
 }
 
 // ── sort ──────────────────────────────────────────────────────────────────────
@@ -505,28 +553,45 @@ pub fn array_sort(
     if len < 2 {
         return Ok(());
     }
-    // Snapshot elements into a Vec so we can use the standard sort.
-    let mut elems: Vec<JsValue> = (0..len as u32).map(|i| arr.get(i)).collect();
 
     if let Some(mut cmp) = comparator {
+        // User-supplied comparator: snapshot elements, sort, write back.
+        let mut elems: Vec<JsValue> = (0..len as u32).map(|i| arr.get(i)).collect();
         elems.sort_by(|a, b| cmp(a, b));
+        arr.as_object_mut().truncate_elements(0);
+        for v in elems {
+            arr.push(v);
+        }
+    } else if matches!(
+        arr.element_kind(),
+        ElementKind::PackedSmi | ElementKind::HoleSmi
+    ) {
+        // Fast path: Smi-only arrays can be sorted numerically in-place
+        // without string conversion.
+        let slice = arr.elements_as_mut_slice();
+        slice.sort_by(|a, b| {
+            let ai = if let JsValue::Smi(v) = a { *v } else { 0 };
+            let bi = if let JsValue::Smi(v) = b { *v } else { 0 };
+            // Default ECMAScript sort is string-based; for Smis this means
+            // comparing their string representations lexicographically.
+            let sa = ai.to_string();
+            let sb = bi.to_string();
+            sa.cmp(&sb)
+        });
     } else {
-        // Default: sort as strings.  Collect string representations first so
-        // that the closure passed to sort_by can remain infallible.
+        // Default: sort as strings.
+        let mut elems: Vec<JsValue> = (0..len as u32).map(|i| arr.get(i)).collect();
         let mut strs: Vec<String> = Vec::with_capacity(len);
         for v in &elems {
             strs.push(v.to_js_string()?);
         }
-        // Pair each element with its string and sort by string.
         let mut paired: Vec<(JsValue, String)> = elems.into_iter().zip(strs).collect();
         paired.sort_by(|(_, a), (_, b)| a.cmp(b));
         elems = paired.into_iter().map(|(v, _)| v).collect();
-    }
-
-    // Write sorted elements back.
-    arr.as_object_mut().truncate_elements(0);
-    for v in elems {
-        arr.push(v);
+        arr.as_object_mut().truncate_elements(0);
+        for v in elems {
+            arr.push(v);
+        }
     }
     Ok(())
 }

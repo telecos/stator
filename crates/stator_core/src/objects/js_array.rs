@@ -183,6 +183,22 @@ impl JsArray {
     pub fn as_object_mut(&mut self) -> &mut JsObject {
         &mut self.object
     }
+
+    /// Returns a read-only slice of the element backing store.
+    ///
+    /// This enables zero-copy fast paths for array operations when the
+    /// [`ElementKind`] guarantees a uniform element type (e.g. all `Smi`).
+    pub fn elements_as_slice(&self) -> &[JsValue] {
+        self.object.elements_as_slice()
+    }
+
+    /// Returns a mutable slice of the element backing store.
+    ///
+    /// Callers are responsible for updating the [`ElementKind`] if they write
+    /// values of a wider type.
+    pub fn elements_as_mut_slice(&mut self) -> &mut [JsValue] {
+        self.object.elements_as_mut_slice()
+    }
 }
 
 impl Default for JsArray {
