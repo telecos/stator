@@ -223,7 +223,10 @@ pub fn string_code_point_at(s: &str, pos: i64) -> Option<u32> {
 /// assert_eq!(string_concat("a", &[]), "a");
 /// ```
 pub fn string_concat(s: &str, others: &[&str]) -> String {
-    let mut result = s.to_string();
+    // Pre-calculate total capacity to avoid reallocation during concatenation.
+    let total_len: usize = s.len() + others.iter().map(|o| o.len()).sum::<usize>();
+    let mut result = String::with_capacity(total_len);
+    result.push_str(s);
     for other in others {
         result.push_str(other);
     }

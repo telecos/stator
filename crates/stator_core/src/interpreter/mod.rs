@@ -218,6 +218,14 @@ thread_local! {
     /// clones.
     static FUNCTION_PROPS: RefCell<HashMap<usize, FnPropMap>> =
         RefCell::new(HashMap::new());
+
+    /// Thread-local string interning table for property key deduplication.
+    ///
+    /// Property keys that appear in hot loops (e.g. `"length"`, `"prototype"`,
+    /// `"constructor"`) are interned so that repeated lookups compare interned
+    /// pointer identity instead of full string equality.
+    static STRING_TABLE: RefCell<crate::objects::js_string::StringTable> =
+        RefCell::new(crate::objects::js_string::StringTable::new());
 }
 
 /// Attach a [`Debugger`] to the current thread's interpreter.
@@ -235,6 +243,22 @@ pub fn attach_debugger(dbg: Rc<RefCell<Debugger>>) {
 /// safe to call this even if no debugger was attached.
 pub fn detach_debugger() {
     ACTIVE_DEBUGGER.with(|d| *d.borrow_mut() = None);
+}
+
+/// Intern a property key string in the thread-local string table.
+///
+/// Returns a shared reference-counted handle to the canonical interned copy.
+/// Two calls with equal strings return pointer-equal handles, enabling O(1)
+/// identity comparison for frequently-used property keys.
+pub fn intern_property_key(
+    key: &str,
+) -> std::sync::Arc<crate::objects::js_string::InternalizedString> {
+    STRING_TABLE.with(|table| table.borrow_mut().intern_str(key))
+}
+
+/// Returns the number of strings currently interned in the thread-local table.
+pub fn interned_string_count() -> usize {
+    STRING_TABLE.with(|table| table.borrow().len())
 }
 
 /// Run `f` with mutable access to the currently-attached [`Debugger`], if
@@ -1429,7 +1453,11 @@ pub(super) fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
     if lhs.is_string() || rhs.is_string() {
         let l = lhs.to_js_string()?;
         let r = rhs.to_js_string()?;
-        Ok(JsValue::String(l + &r))
+        // Pre-allocate exact capacity to avoid reallocation during concat.
+        let mut result = String::with_capacity(l.len() + r.len());
+        result.push_str(&l);
+        result.push_str(&r);
+        Ok(JsValue::String(result))
     } else if lhs.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(lhs)?;
         let r = to_bigint(rhs)?;
