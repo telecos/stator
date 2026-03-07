@@ -104,7 +104,7 @@ use crate::builtins::symbol::{
     SYMBOL_UNSCOPABLES, symbol_create, symbol_description, symbol_for, symbol_key_for,
 };
 use crate::builtins::typed_array::{
-    TypedArrayKind, arraybuffer_is_view, arraybuffer_new, dataview_get_bigint64,
+    JsArrayBuffer, TypedArrayKind, arraybuffer_is_view, arraybuffer_new, dataview_get_bigint64,
     dataview_get_biguint64, dataview_get_float32, dataview_get_float64, dataview_get_int8,
     dataview_get_int16, dataview_get_int32, dataview_get_uint8, dataview_get_uint16,
     dataview_get_uint32, dataview_new, dataview_set_bigint64, dataview_set_biguint64,
@@ -6610,6 +6610,351 @@ fn make_typed_array_instance(
 
 // ── install_globals ──────────────────────────────────────────────────────────
 
+/// Build the `SharedArrayBuffer` constructor.
+fn make_shared_arraybuffer() -> JsValue {
+    native(|args| {
+        let byte_length = match args.first() {
+            Some(v) => v.to_number()? as usize,
+            None => 0,
+        };
+        let buf = arraybuffer_new(byte_length);
+        let mut props = PropertyMap::new();
+        let inner = Rc::new(RefCell::new(buf));
+        {
+            let inner2 = Rc::clone(&inner);
+            props.insert(
+                "byteLength".into(),
+                native(move |_| Ok(JsValue::Smi(inner2.borrow().data.len() as i32))),
+            );
+        }
+        props.insert(
+            "slice".into(),
+            native({
+                let inner2 = Rc::clone(&inner);
+                move |args| {
+                    let len = inner2.borrow().data.len();
+                    let start = args
+                        .first()
+                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                        .unwrap_or(0);
+                    let end = args
+                        .get(1)
+                        .map(|v| v.to_number().unwrap_or(len as f64) as i64)
+                        .unwrap_or(len as i64);
+                    let s = start.max(0) as usize;
+                    let e = end.clamp(0, len as i64) as usize;
+                    let data = inner2.borrow().data[s..e].to_vec();
+                    Ok(JsValue::ArrayBuffer(Rc::new(RefCell::new(JsArrayBuffer {
+                        data,
+                    }))))
+                }
+            }),
+        );
+        props.insert("__buffer__".into(), JsValue::ArrayBuffer(Rc::clone(&inner)));
+        Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
+    })
+}
+
+/// Helper: read an integer value from a buffer at a given byte offset.
+fn atomics_read(buf: &[u8], byte_offset: usize, kind: TypedArrayKind) -> JsValue {
+    let bpe = kind.bytes_per_element();
+    if byte_offset + bpe > buf.len() {
+        return JsValue::Undefined;
+    }
+    let slice = &buf[byte_offset..byte_offset + bpe];
+    match kind {
+        TypedArrayKind::Int8 => JsValue::Smi(i8::from_ne_bytes([slice[0]]) as i32),
+        TypedArrayKind::Uint8 | TypedArrayKind::Uint8Clamped => JsValue::Smi(slice[0] as i32),
+        TypedArrayKind::Int16 => JsValue::Smi(i16::from_ne_bytes([slice[0], slice[1]]) as i32),
+        TypedArrayKind::Uint16 => JsValue::Smi(u16::from_ne_bytes([slice[0], slice[1]]) as i32),
+        TypedArrayKind::Int32 => {
+            JsValue::Smi(i32::from_ne_bytes([slice[0], slice[1], slice[2], slice[3]]))
+        }
+        TypedArrayKind::Uint32 => {
+            let v = u32::from_ne_bytes([slice[0], slice[1], slice[2], slice[3]]);
+            JsValue::HeapNumber(v as f64)
+        }
+        TypedArrayKind::Float32 => {
+            JsValue::HeapNumber(f32::from_ne_bytes([slice[0], slice[1], slice[2], slice[3]]) as f64)
+        }
+        TypedArrayKind::Float64 => {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(slice);
+            JsValue::HeapNumber(f64::from_ne_bytes(bytes))
+        }
+        TypedArrayKind::BigInt64 => {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(slice);
+            JsValue::HeapNumber(i64::from_ne_bytes(bytes) as f64)
+        }
+        TypedArrayKind::BigUint64 => {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(slice);
+            JsValue::HeapNumber(u64::from_ne_bytes(bytes) as f64)
+        }
+    }
+}
+
+/// Helper: write a numeric JS value into a buffer at a given byte offset.
+fn atomics_write(buf: &mut [u8], byte_offset: usize, kind: TypedArrayKind, val: f64) {
+    let bpe = kind.bytes_per_element();
+    if byte_offset + bpe > buf.len() {
+        return;
+    }
+    let slice = &mut buf[byte_offset..byte_offset + bpe];
+    match kind {
+        TypedArrayKind::Int8 => slice[0] = (val as i8) as u8,
+        TypedArrayKind::Uint8 | TypedArrayKind::Uint8Clamped => slice[0] = val as u8,
+        TypedArrayKind::Int16 => slice.copy_from_slice(&(val as i16).to_ne_bytes()),
+        TypedArrayKind::Uint16 => slice.copy_from_slice(&(val as u16).to_ne_bytes()),
+        TypedArrayKind::Int32 => slice.copy_from_slice(&(val as i32).to_ne_bytes()),
+        TypedArrayKind::Uint32 => slice.copy_from_slice(&(val as u32).to_ne_bytes()),
+        TypedArrayKind::Float32 => slice.copy_from_slice(&(val as f32).to_ne_bytes()),
+        TypedArrayKind::Float64 => slice.copy_from_slice(&val.to_ne_bytes()),
+        TypedArrayKind::BigInt64 => slice.copy_from_slice(&(val as i64).to_ne_bytes()),
+        TypedArrayKind::BigUint64 => slice.copy_from_slice(&(val as u64).to_ne_bytes()),
+    }
+}
+
+/// Extract the buffer, kind, and element index from the first two Atomics args.
+fn atomics_extract_ta(
+    args: &[JsValue],
+) -> StatorResult<(Rc<RefCell<JsArrayBuffer>>, TypedArrayKind, usize)> {
+    let ta = args.first().ok_or_else(|| {
+        StatorError::TypeError("Atomics: first argument must be a TypedArray".into())
+    })?;
+    let (buf, kind) = match ta {
+        JsValue::TypedArray(inner) => {
+            let inner_ref = inner.borrow();
+            (Rc::clone(&inner_ref.buffer), inner_ref.kind)
+        }
+        _ => {
+            return Err(StatorError::TypeError(
+                "Atomics: first argument must be a TypedArray".into(),
+            ));
+        }
+    };
+    let idx = args
+        .get(1)
+        .map(|v| v.to_number().unwrap_or(0.0) as usize)
+        .unwrap_or(0);
+    let byte_offset = idx * kind.bytes_per_element();
+    Ok((buf, kind, byte_offset))
+}
+
+/// Build the `Atomics` namespace object.
+///
+/// Since stator is single-threaded, all atomic operations are plain
+/// reads/writes — sequentially consistent by default.
+fn make_atomics() -> JsValue {
+    let mut props = PropertyMap::new();
+
+    // Atomics.load(typedArray, index)
+    props.insert(
+        "load".into(),
+        native(|args| {
+            let (buf, kind, byte_offset) = atomics_extract_ta(&args)?;
+            Ok(atomics_read(&buf.borrow().data, byte_offset, kind))
+        }),
+    );
+
+    // Atomics.store(typedArray, index, value)
+    props.insert(
+        "store".into(),
+        native(|args| {
+            let (buf, kind, byte_offset) = atomics_extract_ta(&args)?;
+            let val = args
+                .get(2)
+                .map(|v| v.to_number().unwrap_or(0.0))
+                .unwrap_or(0.0);
+            atomics_write(&mut buf.borrow_mut().data, byte_offset, kind, val);
+            Ok(JsValue::HeapNumber(val))
+        }),
+    );
+
+    // Atomics.add(typedArray, index, value)
+    props.insert(
+        "add".into(),
+        native(|args| {
+            let (buf, kind, byte_offset) = atomics_extract_ta(&args)?;
+            let old = atomics_read(&buf.borrow().data, byte_offset, kind);
+            let old_num = old.to_number()?;
+            let val = args
+                .get(2)
+                .map(|v| v.to_number().unwrap_or(0.0))
+                .unwrap_or(0.0);
+            atomics_write(&mut buf.borrow_mut().data, byte_offset, kind, old_num + val);
+            Ok(old)
+        }),
+    );
+
+    // Atomics.sub(typedArray, index, value)
+    props.insert(
+        "sub".into(),
+        native(|args| {
+            let (buf, kind, byte_offset) = atomics_extract_ta(&args)?;
+            let old = atomics_read(&buf.borrow().data, byte_offset, kind);
+            let old_num = old.to_number()?;
+            let val = args
+                .get(2)
+                .map(|v| v.to_number().unwrap_or(0.0))
+                .unwrap_or(0.0);
+            atomics_write(&mut buf.borrow_mut().data, byte_offset, kind, old_num - val);
+            Ok(old)
+        }),
+    );
+
+    // Atomics.and(typedArray, index, value)
+    props.insert(
+        "and".into(),
+        native(|args| {
+            let (buf, kind, byte_offset) = atomics_extract_ta(&args)?;
+            let old = atomics_read(&buf.borrow().data, byte_offset, kind);
+            let old_i = old.to_number()? as i64;
+            let val = args
+                .get(2)
+                .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                .unwrap_or(0);
+            atomics_write(
+                &mut buf.borrow_mut().data,
+                byte_offset,
+                kind,
+                (old_i & val) as f64,
+            );
+            Ok(old)
+        }),
+    );
+
+    // Atomics.or(typedArray, index, value)
+    props.insert(
+        "or".into(),
+        native(|args| {
+            let (buf, kind, byte_offset) = atomics_extract_ta(&args)?;
+            let old = atomics_read(&buf.borrow().data, byte_offset, kind);
+            let old_i = old.to_number()? as i64;
+            let val = args
+                .get(2)
+                .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                .unwrap_or(0);
+            atomics_write(
+                &mut buf.borrow_mut().data,
+                byte_offset,
+                kind,
+                (old_i | val) as f64,
+            );
+            Ok(old)
+        }),
+    );
+
+    // Atomics.xor(typedArray, index, value)
+    props.insert(
+        "xor".into(),
+        native(|args| {
+            let (buf, kind, byte_offset) = atomics_extract_ta(&args)?;
+            let old = atomics_read(&buf.borrow().data, byte_offset, kind);
+            let old_i = old.to_number()? as i64;
+            let val = args
+                .get(2)
+                .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                .unwrap_or(0);
+            atomics_write(
+                &mut buf.borrow_mut().data,
+                byte_offset,
+                kind,
+                (old_i ^ val) as f64,
+            );
+            Ok(old)
+        }),
+    );
+
+    // Atomics.exchange(typedArray, index, value)
+    props.insert(
+        "exchange".into(),
+        native(|args| {
+            let (buf, kind, byte_offset) = atomics_extract_ta(&args)?;
+            let old = atomics_read(&buf.borrow().data, byte_offset, kind);
+            let val = args
+                .get(2)
+                .map(|v| v.to_number().unwrap_or(0.0))
+                .unwrap_or(0.0);
+            atomics_write(&mut buf.borrow_mut().data, byte_offset, kind, val);
+            Ok(old)
+        }),
+    );
+
+    // Atomics.compareExchange(typedArray, index, expected, replacement)
+    props.insert(
+        "compareExchange".into(),
+        native(|args| {
+            let (buf, kind, byte_offset) = atomics_extract_ta(&args)?;
+            let old = atomics_read(&buf.borrow().data, byte_offset, kind);
+            let old_num = old.to_number()?;
+            let expected = args
+                .get(2)
+                .map(|v| v.to_number().unwrap_or(0.0))
+                .unwrap_or(0.0);
+            if (old_num - expected).abs() < f64::EPSILON {
+                let replacement = args
+                    .get(3)
+                    .map(|v| v.to_number().unwrap_or(0.0))
+                    .unwrap_or(0.0);
+                atomics_write(&mut buf.borrow_mut().data, byte_offset, kind, replacement);
+            }
+            Ok(old)
+        }),
+    );
+
+    // Atomics.isLockFree(size)
+    props.insert(
+        "isLockFree".into(),
+        native(|args| {
+            let size = args
+                .first()
+                .map(|v| v.to_number().unwrap_or(0.0) as usize)
+                .unwrap_or(0);
+            Ok(JsValue::Boolean(matches!(size, 1 | 2 | 4 | 8)))
+        }),
+    );
+
+    // Atomics.wait — single-threaded, always returns "not-equal" or "timed-out"
+    props.insert(
+        "wait".into(),
+        native(|args| {
+            let (buf, kind, byte_offset) = atomics_extract_ta(&args)?;
+            let current = atomics_read(&buf.borrow().data, byte_offset, kind);
+            let expected = args
+                .get(2)
+                .map(|v| v.to_number().unwrap_or(0.0))
+                .unwrap_or(0.0);
+            let current_num = current.to_number()?;
+            if (current_num - expected).abs() >= f64::EPSILON {
+                Ok(JsValue::String("not-equal".into()))
+            } else {
+                Ok(JsValue::String("timed-out".into()))
+            }
+        }),
+    );
+
+    // Atomics.notify — single-threaded no-op, returns 0
+    props.insert("notify".into(), native(|_args| Ok(JsValue::Smi(0))));
+
+    // Atomics.waitAsync — returns { async: false, value: "timed-out" }
+    props.insert(
+        "waitAsync".into(),
+        native(|_args| {
+            let mut props = PropertyMap::new();
+            props.insert("async".into(), JsValue::Boolean(false));
+            props.insert("value".into(), JsValue::String("timed-out".into()));
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
+        }),
+    );
+
+    // @@toStringTag
+    props.insert("@@toStringTag".into(), JsValue::String("Atomics".into()));
+
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 /// Build the `DisposableStack` constructor.
 ///
 /// `DisposableStack` manages a stack of disposable resources and calls their
@@ -6732,6 +7077,10 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     globals.insert("Function".into(), make_function());
     globals.insert("Proxy".into(), make_proxy());
     globals.insert("Reflect".into(), make_reflect());
+
+    // ── Atomics / SharedArrayBuffer ─────────────────────────────────────
+    globals.insert("Atomics".into(), make_atomics());
+    globals.insert("SharedArrayBuffer".into(), make_shared_arraybuffer());
 
     // ── Error constructors ────────────────────────────────────────────────
     install_error_constructors(globals);

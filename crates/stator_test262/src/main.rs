@@ -284,24 +284,15 @@ impl HarnessCache {
 /// skipped rather than run-and-failed, keeping the measured pass rate
 /// meaningful.
 const UNSUPPORTED_FEATURES: &[&str] = &[
-    // Async: partially implemented but not yet robust enough for Test262
-    "top-level-await",
-    // SharedArrayBuffer / Atomics — not implemented
-    "Atomics",
-    "SharedArrayBuffer",
     // Advanced RegExp features not yet fully supported
     "regexp-unicode-property-escapes",
     "regexp-v-flag",
     // Temporal (stage 3 proposal — very large surface area)
     "Temporal",
-    // TypedArrays / ArrayBuffer — not implemented
-    "TypedArray",
-    "ArrayBuffer",
-    "DataView",
+    // Resizable ArrayBuffer — not yet implemented
     "resizable-arraybuffer",
-    // ShadowRealm / Disposable — not implemented
+    // ShadowRealm — not implemented
     "ShadowRealm",
-    "explicit-resource-management",
     // Module features that need runtime module loader
     "arbitrary-module-namespace-names",
     "import-assertions",
@@ -1151,7 +1142,7 @@ mod tests {
     #[test]
     fn test_has_unsupported_feature_symbol() {
         assert!(has_unsupported_feature(&[
-            "Atomics".to_string(),
+            "Temporal".to_string(),
             "other".to_string()
         ]));
     }
