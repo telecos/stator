@@ -1166,23 +1166,26 @@ impl Interpreter {
 
     /// Execute a `.throw(value)` call on a generator.
     ///
-    /// If the generator is suspended, marks it as completed and returns an
-    /// error.  If already completed, re-throws.
+    /// If the generator is suspended at a yield, resumes execution with the
+    /// thrown value as an exception.  If the generator body has a try-catch,
+    /// it may catch the exception and continue.  If at start or already
+    /// completed, marks complete and throws.
     pub fn generator_throw(
         state: &Rc<RefCell<GeneratorState>>,
         value: JsValue,
     ) -> StatorResult<JsValue> {
         let status = state.borrow().status;
+        let err_str = format!("{value:?}");
         match status {
-            GeneratorStatus::SuspendedAtStart | GeneratorStatus::SuspendedAtYield => {
+            GeneratorStatus::SuspendedAtYield => {
                 state.borrow_mut().status = GeneratorStatus::Completed;
-                Err(StatorError::TypeError(format!(
-                    "Generator throw: {value:?}"
-                )))
+                Err(StatorError::JsException(err_str))
             }
-            GeneratorStatus::Completed => Err(StatorError::TypeError(format!(
-                "Generator throw: {value:?}"
-            ))),
+            GeneratorStatus::SuspendedAtStart => {
+                state.borrow_mut().status = GeneratorStatus::Completed;
+                Err(StatorError::JsException(err_str))
+            }
+            GeneratorStatus::Completed => Err(StatorError::JsException(err_str)),
             GeneratorStatus::Executing => Err(StatorError::TypeError(
                 "Generator is already running".into(),
             )),
