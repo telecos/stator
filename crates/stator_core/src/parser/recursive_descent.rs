@@ -74,6 +74,10 @@ pub struct Parser<'src> {
     /// and decremented when leaving.  Used to validate that `#private`
     /// identifiers only appear inside a class.
     class_depth: usize,
+    /// `true` when the parser is inside a strict-mode context (either the
+    /// top-level program had a `"use strict"` directive or we are inside a
+    /// function whose body contains one).
+    strict_mode: bool,
 }
 
 impl<'src> Parser<'src> {
@@ -89,6 +93,7 @@ impl<'src> Parser<'src> {
             no_in: false,
             depth: 0,
             class_depth: 0,
+            strict_mode: false,
         })
     }
 
@@ -198,6 +203,25 @@ impl<'src> Parser<'src> {
         Ok(())
     }
 
+    /// Check whether the current token is a `"use strict"` directive string.
+    fn is_use_strict_directive(&self) -> bool {
+        if self.current.kind != TokenKind::StringLiteral {
+            return false;
+        }
+        matches!(
+            &self.current.value,
+            TokenValue::Str(s) if s == "\"use strict\"" || s == "'use strict'"
+        )
+    }
+
+    /// Detect a `"use strict"` directive prologue at the start of a body.
+    /// Returns `true` if a directive was found.  Does **not** consume any
+    /// tokens — the directive is still parsed as a normal expression
+    /// statement later.
+    fn check_directive_prologue(&self) -> bool {
+        self.is_use_strict_directive()
+    }
+
     // ── Top-level ────────────────────────────────────────────────────────────
 
     /// Parse a complete source file as a [`Program`].
@@ -210,6 +234,12 @@ impl<'src> Parser<'src> {
         let start = self.current_span();
         let mut body = Vec::new();
         let mut is_module = false;
+
+        // Detect "use strict" directive prologue.
+        let is_strict = self.check_directive_prologue();
+        if is_strict {
+            self.strict_mode = true;
+        }
 
         while self.peek_kind() != TokenKind::Eof {
             match self.peek_kind() {
@@ -245,6 +275,8 @@ impl<'src> Parser<'src> {
         }
 
         let end = self.current_span();
+        // Modules are always strict.
+        let is_strict = is_strict || is_module;
         Ok(Program {
             loc: Self::merge_spans(start, end),
             source_type: if is_module {
@@ -253,6 +285,7 @@ impl<'src> Parser<'src> {
                 SourceType::Script
             },
             body,
+            is_strict,
         })
     }
 
@@ -741,6 +774,9 @@ impl<'src> Parser<'src> {
 
     /// Parse a `with (expr) stmt` statement (sloppy mode only).
     fn parse_with(&mut self) -> StatorResult<Stmt> {
+        if self.strict_mode {
+            return Err(self.error("'with' statements are not allowed in strict mode"));
+        }
         let start = self.current_span();
         self.bump()?; // 'with'
         self.expect(TokenKind::LeftParen)?;
@@ -820,7 +856,12 @@ impl<'src> Parser<'src> {
         };
         self.expect(TokenKind::LeftParen)?;
         let params = self.parse_formal_params()?;
-        let body = self.parse_block()?;
+
+        // Save enclosing strict mode, then parse function body.
+        let outer_strict = self.strict_mode;
+        let (body, fn_strict) = self.parse_function_body()?;
+        self.strict_mode = outer_strict;
+
         let end = body.loc;
         Ok(Stmt::FnDecl(Box::new(FnDecl {
             loc: Self::merge_spans(fn_span, end),
@@ -829,7 +870,40 @@ impl<'src> Parser<'src> {
             is_generator,
             params,
             body,
+            is_strict: fn_strict,
         })))
+    }
+
+    /// Parse a function body block `{ … }`, detecting a `"use strict"`
+    /// directive prologue.  Returns `(block, is_strict)` where `is_strict`
+    /// is `true` when the function inherits or declares strict mode.
+    fn parse_function_body(&mut self) -> StatorResult<(BlockStmt, bool)> {
+        let start = self.current_span();
+        self.expect(TokenKind::LeftBrace)?;
+
+        // Check for "use strict" directive before parsing statements.
+        let has_directive = self.check_directive_prologue();
+        let is_strict = self.strict_mode || has_directive;
+        if has_directive {
+            self.strict_mode = true;
+        }
+
+        let mut body = Vec::new();
+        while self.peek_kind() != TokenKind::RightBrace {
+            if self.peek_kind() == TokenKind::Eof {
+                return Err(self.error("unexpected end of input inside block"));
+            }
+            body.push(self.parse_stmt()?);
+        }
+        let end = self.current_span();
+        self.bump()?; // consume '}'
+        Ok((
+            BlockStmt {
+                loc: Self::merge_spans(start, end),
+                body,
+            },
+            is_strict,
+        ))
     }
 
     // ── Class parsing ──────────────────────────────────────────────────────
@@ -1008,6 +1082,7 @@ impl<'src> Parser<'src> {
                     is_generator,
                     params,
                     body,
+                    is_strict: false,
                 };
 
                 members.push(ClassMember::Method(MethodDef {
@@ -1560,6 +1635,14 @@ impl<'src> Parser<'src> {
             TokenKind::Identifier => {
                 let tok = self.bump()?;
                 let ident = self.ident_from_token(&tok)?;
+                // In strict mode, `eval` and `arguments` cannot be used as
+                // binding identifiers.
+                if self.strict_mode && (ident.name == "eval" || ident.name == "arguments") {
+                    return Err(self.error(&format!(
+                        "'{}' cannot be used as a binding name in strict mode",
+                        ident.name
+                    )));
+                }
                 Ok(Pat::Ident(ident))
             }
             TokenKind::LeftBracket => self.parse_array_pat(),
@@ -1837,6 +1920,7 @@ impl<'src> Parser<'src> {
                                 is_async: true,
                                 params: vec![],
                                 body,
+                                is_strict: self.strict_mode,
                             })));
                         }
                         // `async()` not followed by `=>` — restore to just
@@ -1870,6 +1954,7 @@ impl<'src> Parser<'src> {
                             is_async: true,
                             params,
                             body,
+                            is_strict: self.strict_mode,
                         })));
                     }
                     // Not `async x =>` — restore to just after `async`.
@@ -1932,6 +2017,7 @@ impl<'src> Parser<'src> {
                         is_async: false,
                         params: vec![],
                         body,
+                        is_strict: self.strict_mode,
                     })));
                 }
                 // `()` not followed by `=>` — restore and let normal
@@ -1975,6 +2061,7 @@ impl<'src> Parser<'src> {
                     is_async: true,
                     params,
                     body,
+                    is_strict: self.strict_mode,
                 })));
             }
 
@@ -1986,6 +2073,7 @@ impl<'src> Parser<'src> {
                 is_async: false,
                 params,
                 body,
+                is_strict: self.strict_mode,
             })));
         }
 
@@ -2739,6 +2827,7 @@ impl<'src> Parser<'src> {
                                 is_generator: false,
                                 params,
                                 body,
+                                is_strict: false,
                             };
                             match accessor_kind {
                                 MethodKind::Get => PropValue::Get(fn_expr),
@@ -2763,6 +2852,7 @@ impl<'src> Parser<'src> {
                                 is_generator: is_generator_method,
                                 params,
                                 body,
+                                is_strict: false,
                             })
                         } else if self.eat(TokenKind::Colon)? {
                             PropValue::Value(Box::new(self.parse_assignment_expr()?))
@@ -3059,7 +3149,11 @@ impl<'src> Parser<'src> {
         };
         self.expect(TokenKind::LeftParen)?;
         let params = self.parse_formal_params()?;
-        let body = self.parse_block()?;
+
+        let outer_strict = self.strict_mode;
+        let (body, fn_strict) = self.parse_function_body()?;
+        self.strict_mode = outer_strict;
+
         let end = body.loc;
         Ok(Expr::Fn(Box::new(crate::parser::ast::FnExpr {
             loc: Self::merge_spans(fn_span, end),
@@ -3068,6 +3162,7 @@ impl<'src> Parser<'src> {
             is_generator,
             params,
             body,
+            is_strict: fn_strict,
         })))
     }
 
@@ -6662,5 +6757,65 @@ mod tests {
             ProgramItem::ModuleDecl(ModuleDecl::Import(_))
         ));
         assert_eq!(prog.source_type, SourceType::Module);
+    }
+
+    // ── Strict mode tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_use_strict_directive_sets_flag() {
+        let prog = parse("\"use strict\"; var x = 1;").unwrap();
+        assert!(prog.is_strict);
+    }
+
+    #[test]
+    fn test_no_use_strict_directive_is_sloppy() {
+        let prog = parse("var x = 1;").unwrap();
+        assert!(!prog.is_strict);
+    }
+
+    #[test]
+    fn test_module_is_always_strict() {
+        let prog = parse("import x from 'y';").unwrap();
+        assert!(prog.is_strict);
+    }
+
+    #[test]
+    fn test_strict_mode_function() {
+        let prog = parse("function f() { \"use strict\"; return 1; }").unwrap();
+        if let ProgramItem::Stmt(Stmt::FnDecl(decl)) = &prog.body[0] {
+            assert!(decl.is_strict);
+        } else {
+            panic!("expected FnDecl");
+        }
+    }
+
+    #[test]
+    fn test_strict_mode_with_statement_error() {
+        let result = parse("\"use strict\"; with (obj) { x; }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_mode_eval_binding_error() {
+        let result = parse("\"use strict\"; var eval = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_mode_arguments_binding_error() {
+        let result = parse("\"use strict\"; var arguments = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_inherited_in_nested_function() {
+        let prog = parse("\"use strict\"; function f() { function g() { return 1; } }").unwrap();
+        assert!(prog.is_strict);
+        if let ProgramItem::Stmt(Stmt::FnDecl(decl)) = &prog.body[1] {
+            // f inherits strict from the program
+            assert!(decl.is_strict);
+        } else {
+            panic!("expected FnDecl");
+        }
     }
 }

@@ -159,6 +159,8 @@ pub struct Scope {
     pub uses_super: bool,
     /// Names declared in this scope that are captured by inner function scopes.
     pub captures: HashSet<String>,
+    /// `true` when this scope is in strict mode.
+    pub is_strict: bool,
 }
 
 impl Scope {
@@ -174,6 +176,7 @@ impl Scope {
             uses_this: false,
             uses_super: false,
             captures: HashSet::new(),
+            is_strict: false,
         }
     }
 }
@@ -592,7 +595,11 @@ impl Analyzer {
         } else {
             ScopeKind::Global
         };
-        self.push_scope(kind);
+        let scope_id = self.push_scope(kind);
+        // Modules are always strict; scripts inherit from the AST flag.
+        if program.is_strict || program.source_type == SourceType::Module {
+            self.scopes[scope_id].is_strict = true;
+        }
 
         // Collect top-level var / function hoisted declarations first.
         let stmts: Vec<Stmt> = program
@@ -860,16 +867,13 @@ impl Analyzer {
     }
 
     fn visit_fn_decl(&mut self, f: &FnDecl) {
-        // The function name is already hoisted in the outer scope; here we just
-        // analyse the function body.
-        self.push_scope(ScopeKind::Function);
-        // Declare parameters in the new function scope.
+        let parent_strict = self.scopes[self.current_scope()].is_strict;
+        let scope_id = self.push_scope(ScopeKind::Function);
+        self.scopes[scope_id].is_strict = f.is_strict || parent_strict;
         for param in &f.params {
             self.declare_param(param);
         }
-        // Hoist var/function declarations inside the body.
         self.hoist_stmts(&f.body.body);
-        // Visit the body without creating an extra block scope.
         for stmt in &f.body.body {
             self.visit_stmt(stmt);
         }
@@ -877,8 +881,9 @@ impl Analyzer {
     }
 
     fn visit_fn_expr(&mut self, f: &FnExpr) {
-        self.push_scope(ScopeKind::Function);
-        // A named function expression can self-reference by its name.
+        let parent_strict = self.scopes[self.current_scope()].is_strict;
+        let scope_id = self.push_scope(ScopeKind::Function);
+        self.scopes[scope_id].is_strict = f.is_strict || parent_strict;
         if let Some(id) = &f.id {
             self.declare(
                 &id.name,
@@ -898,11 +903,9 @@ impl Analyzer {
     }
 
     fn visit_arrow_expr(&mut self, a: &crate::parser::ast::ArrowExpr) {
-        // Arrow functions share `this`/`arguments`/`super` with the enclosing
-        // scope, so we still create a new scope but with `Function` kind (the
-        // `is_function_boundary` predicate applies).  For simplicity we use a
-        // dedicated variant — but for this implementation we re-use Function.
-        self.push_scope(ScopeKind::Function);
+        let parent_strict = self.scopes[self.current_scope()].is_strict;
+        let scope_id = self.push_scope(ScopeKind::Function);
+        self.scopes[scope_id].is_strict = a.is_strict || parent_strict;
         for param in &a.params {
             self.declare_param(param);
         }
@@ -1245,6 +1248,7 @@ mod tests {
             loc: loc(),
             source_type: SourceType::Script,
             body: vec![],
+            is_strict: false,
         }
     }
 
@@ -1293,6 +1297,7 @@ mod tests {
             loc: loc(),
             source_type: SourceType::Module,
             body: vec![],
+            is_strict: true,
         };
         let tree = analyze(&prog);
         assert_eq!(tree.scopes[0].kind, ScopeKind::Module);
@@ -1309,6 +1314,7 @@ mod tests {
                 VarKind::Var,
                 "x",
             )))],
+            is_strict: false,
         };
         let tree = analyze(&prog);
         assert!(tree.scopes[0].bindings.contains_key("x"));
@@ -1327,6 +1333,7 @@ mod tests {
             loc: loc(),
             source_type: SourceType::Script,
             body: vec![ProgramItem::Stmt(block)],
+            is_strict: false,
         };
         let tree = analyze(&prog);
         // Global scope (id=0) must contain x.
@@ -1348,11 +1355,13 @@ mod tests {
                 loc: loc(),
                 body: vec![],
             },
+            is_strict: false,
         }));
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
             body: vec![ProgramItem::Stmt(fn_decl)],
+            is_strict: false,
         };
         let tree = analyze(&prog);
         assert!(tree.scopes[0].bindings.contains_key("f"));
@@ -1372,6 +1381,7 @@ mod tests {
             loc: loc(),
             source_type: SourceType::Script,
             body: vec![ProgramItem::Stmt(block)],
+            is_strict: false,
         };
         let tree = analyze(&prog);
         // y must be in the inner block scope, not the global scope.
@@ -1396,6 +1406,7 @@ mod tests {
                 ProgramItem::Stmt(Stmt::VarDecl(var_decl(VarKind::Var, "x"))),
                 ProgramItem::Stmt(Stmt::VarDecl(var_decl(VarKind::Var, "x"))),
             ],
+            is_strict: false,
         };
         let tree = analyze(&prog);
         assert!(
@@ -1413,6 +1424,7 @@ mod tests {
                 ProgramItem::Stmt(Stmt::VarDecl(var_decl(VarKind::Let, "x"))),
                 ProgramItem::Stmt(Stmt::VarDecl(var_decl(VarKind::Let, "x"))),
             ],
+            is_strict: false,
         };
         let tree = analyze(&prog);
         assert_eq!(tree.errors.len(), 1);
@@ -1432,6 +1444,7 @@ mod tests {
                 ProgramItem::Stmt(Stmt::VarDecl(var_decl(VarKind::Const, "C"))),
                 ProgramItem::Stmt(Stmt::VarDecl(var_decl(VarKind::Const, "C"))),
             ],
+            is_strict: false,
         };
         let tree = analyze(&prog);
         assert_eq!(tree.errors.len(), 1);
@@ -1452,6 +1465,7 @@ mod tests {
                 "x",
                 init_expr,
             )))],
+            is_strict: false,
         };
         let tree = analyze(&prog);
         assert!(
@@ -1488,6 +1502,7 @@ mod tests {
             loc: loc(),
             source_type: SourceType::Script,
             body: vec![ProgramItem::Stmt(x_decl), ProgramItem::Stmt(y_decl)],
+            is_strict: false,
         };
         let tree = analyze(&prog);
         assert!(tree.errors.is_empty(), "no TDZ error expected");
@@ -1511,11 +1526,13 @@ mod tests {
                 loc: loc(),
                 body: vec![],
             },
+            is_strict: false,
         }));
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
             body: vec![ProgramItem::Stmt(fn_stmt)],
+            is_strict: false,
         };
         let tree = analyze(&prog);
         // There should be a Function scope.
@@ -1548,6 +1565,7 @@ mod tests {
                     argument: Some(Box::new(ident_expr("x"))),
                 })],
             },
+            is_strict: false,
         }));
         let outer_fn = Stmt::FnDecl(Box::new(FnDecl {
             loc: loc(),
@@ -1559,11 +1577,13 @@ mod tests {
                 loc: loc(),
                 body: vec![Stmt::VarDecl(var_decl(VarKind::Var, "x")), inner_fn],
             },
+            is_strict: false,
         }));
         let prog = Program {
             loc: loc(),
             source_type: SourceType::Script,
             body: vec![ProgramItem::Stmt(outer_fn)],
+            is_strict: false,
         };
         let tree = analyze(&prog);
         // Find the outer function scope (the one that declares x).
@@ -1606,6 +1626,7 @@ mod tests {
             loc: loc(),
             source_type: SourceType::Script,
             body: vec![ProgramItem::Stmt(try_stmt)],
+            is_strict: false,
         };
         let tree = analyze(&prog);
         let catch_scope = tree
@@ -1632,6 +1653,7 @@ mod tests {
             loc: loc(),
             source_type: SourceType::Script,
             body: vec![ProgramItem::Stmt(with_stmt)],
+            is_strict: false,
         };
         let tree = analyze(&prog);
         assert!(tree.scopes.iter().any(|s| s.kind == ScopeKind::With));
@@ -1659,6 +1681,7 @@ mod tests {
                 loc: loc(),
                 expr: Box::new(call),
             }))],
+            is_strict: false,
         };
         let tree = analyze(&prog);
         assert!(tree.scopes[0].uses_eval);
@@ -1675,6 +1698,7 @@ mod tests {
                 loc: loc(),
                 expr: Box::new(Expr::This(ThisExpr { loc: loc() })),
             }))],
+            is_strict: false,
         };
         let tree = analyze(&prog);
         assert!(tree.scopes[0].uses_this);

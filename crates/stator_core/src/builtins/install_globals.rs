@@ -5694,7 +5694,7 @@ fn require_object_arg(args: &[JsValue], idx: usize, name: &str) -> StatorResult<
 
 /// Build the `ArrayBuffer` constructor object.
 fn make_arraybuffer() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // ArrayBuffer(byteLength)
     props.insert(
@@ -5723,7 +5723,7 @@ fn make_arraybuffer() -> JsValue {
 
 /// Build the `DataView` constructor object.
 fn make_dataview() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     props.insert(
         "__call__".into(),
@@ -5921,7 +5921,7 @@ fn num_value<T: Into<f64>>(v: T) -> JsValue {
 
 /// Build a typed-array constructor for the given `TypedArrayKind`.
 fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // BYTES_PER_ELEMENT
     props.insert(
@@ -6001,7 +6001,7 @@ fn make_typed_array_instance(
 ) -> JsValue {
     let _ = kind;
     let typed_array_val = JsValue::TypedArray(Rc::clone(&inner));
-    let mut obj: HashMap<String, JsValue> = HashMap::new();
+    let mut obj = PropertyMap::new();
 
     // BYTES_PER_ELEMENT
     {

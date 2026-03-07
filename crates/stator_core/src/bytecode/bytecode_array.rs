@@ -237,6 +237,8 @@ pub struct BytecodeArray {
     is_async: bool,
     /// `true` if this bytecode belongs to an ES module (as opposed to a script).
     is_module: bool,
+    /// `true` if this bytecode was compiled in strict mode (`"use strict"`).
+    is_strict: bool,
     // ─── Tiering state (shared across clones via Rc / Arc) ───────────────────
     /// Number of times this function has been invoked.
     ///
@@ -288,6 +290,7 @@ impl PartialEq for BytecodeArray {
             && self.is_generator == other.is_generator
             && self.is_async == other.is_async
             && self.is_module == other.is_module
+            && self.is_strict == other.is_strict
     }
 }
 
@@ -325,6 +328,7 @@ impl BytecodeArray {
             is_generator: false,
             is_async: false,
             is_module: false,
+            is_strict: false,
             invocation_count: Rc::new(Cell::new(0)),
             jit_code: Rc::new(RefCell::new(None)),
             maglev_jit_code: Arc::new(Mutex::new(None)),
@@ -378,6 +382,17 @@ impl BytecodeArray {
     /// Returns `true` if this bytecode belongs to an ES module.
     pub fn is_module(&self) -> bool {
         self.is_module
+    }
+
+    /// Mark this [`BytecodeArray`] as compiled in strict mode.
+    pub fn with_strict_flag(mut self, flag: bool) -> Self {
+        self.is_strict = flag;
+        self
+    }
+
+    /// Returns `true` if this bytecode was compiled in strict mode.
+    pub fn is_strict(&self) -> bool {
+        self.is_strict
     }
 
     /// The raw encoded bytecode bytes.

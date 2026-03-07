@@ -2706,6 +2706,7 @@ mod tests {
             loc: span(),
             source_type: SourceType::Script,
             body: stmts.into_iter().map(ProgramItem::Stmt).collect(),
+            is_strict: false,
         };
         let ba = BytecodeGenerator::compile_program(&program)?;
         let mut frame = InterpreterFrame::new(ba, vec![]);
@@ -3080,6 +3081,7 @@ mod tests {
                     ident_expr("b"),
                 )))],
             },
+            is_strict: false,
         }));
 
         // return add(3, 4);
@@ -3113,6 +3115,7 @@ mod tests {
                 loc: span(),
                 body: vec![return_stmt(Some(num_expr(42.0)))],
             },
+            is_strict: false,
         }));
 
         let call_stmt = return_stmt(Some(Expr::Call(Box::new(CallExpr {
@@ -3156,6 +3159,7 @@ mod tests {
                     num_expr(2.0),
                 )))],
             },
+            is_strict: false,
         }));
 
         let call_stmt = return_stmt(Some(Expr::Call(Box::new(CallExpr {
@@ -3203,6 +3207,7 @@ mod tests {
                     num_expr(1.0),
                 )))],
             },
+            is_strict: false,
         }));
 
         let new_stmt = return_stmt(Some(Expr::New(Box::new(NewExpr {

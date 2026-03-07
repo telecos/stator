@@ -46,6 +46,8 @@ pub struct Program {
     pub source_type: SourceType,
     /// Top-level statements and module declarations.
     pub body: Vec<ProgramItem>,
+    /// `true` when the source begins with a `"use strict"` directive prologue.
+    pub is_strict: bool,
 }
 
 /// A top-level item inside a [`Program`].
@@ -459,6 +461,9 @@ pub struct FnDecl {
     pub params: Vec<Param>,
     /// Function body.
     pub body: BlockStmt,
+    /// `true` when the function body has a `"use strict"` directive prologue
+    /// or inherits strict mode from an enclosing strict context.
+    pub is_strict: bool,
 }
 
 /// `function [id] (params) { body }` used as an expression.
@@ -476,6 +481,9 @@ pub struct FnExpr {
     pub params: Vec<Param>,
     /// Function body.
     pub body: BlockStmt,
+    /// `true` when the function body has a `"use strict"` directive prologue
+    /// or inherits strict mode from an enclosing strict context.
+    pub is_strict: bool,
 }
 
 /// `[async] (params) => body`
@@ -489,6 +497,8 @@ pub struct ArrowExpr {
     pub params: Vec<Param>,
     /// Either a block body `{ … }` or a concise expression body.
     pub body: ArrowBody,
+    /// `true` when the arrow inherits strict mode from an enclosing context.
+    pub is_strict: bool,
 }
 
 /// The body of an arrow function.
@@ -1545,6 +1555,7 @@ mod tests {
             loc: dummy_loc(),
             source_type: SourceType::Script,
             body: vec![],
+            is_strict: false,
         };
         assert!(prog.body.is_empty());
         assert_eq!(prog.source_type, SourceType::Script);
@@ -1557,6 +1568,7 @@ mod tests {
             loc: dummy_loc(),
             source_type: SourceType::Module,
             body: vec![ProgramItem::Stmt(stmt)],
+            is_strict: true,
         };
         assert_eq!(prog.body.len(), 1);
     }
@@ -1594,6 +1606,7 @@ mod tests {
                 is_generator: false,
                 params: vec![],
                 body: BlockStmt { loc, body: vec![] },
+                is_strict: false,
             })),
             Stmt::ClassDecl(Box::new(ClassDecl {
                 loc,
@@ -1769,12 +1782,14 @@ mod tests {
                 is_generator: false,
                 params: vec![],
                 body: BlockStmt { loc, body: vec![] },
+                is_strict: false,
             })),
             Expr::Arrow(Box::new(ArrowExpr {
                 loc,
                 is_async: false,
                 params: vec![],
                 body: ArrowBody::Expr(null()),
+                is_strict: false,
             })),
             Expr::Class(Box::new(ClassExpr {
                 loc,

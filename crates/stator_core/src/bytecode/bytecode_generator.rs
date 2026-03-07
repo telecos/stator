@@ -225,6 +225,8 @@ struct FunctionCompiler {
     /// [`compile_method_call`] to emit [`Opcode::TailCall`] instead of a
     /// regular call.
     in_tail_position: bool,
+    /// `true` when compiling in strict mode.
+    is_strict: bool,
 }
 
 impl FunctionCompiler {
@@ -259,6 +261,7 @@ impl FunctionCompiler {
             module_variables: HashMap::new(),
             next_module_cell: 0,
             in_tail_position: false,
+            is_strict: false,
         };
         // Register simple ident params in the scope immediately; complex
         // patterns are handled by `emit_param_prologue`.
@@ -769,8 +772,13 @@ impl FunctionCompiler {
     /// resulting [`BytecodeArray`] to the constant pool, emit `CreateClosure`,
     /// and bind the name to the resulting register.
     fn compile_fn_decl(&mut self, decl: &FnDecl) -> StatorResult<()> {
-        let func_array =
-            compile_function(&decl.params, &decl.body, decl.is_generator, decl.is_async)?;
+        let func_array = compile_function(
+            &decl.params,
+            &decl.body,
+            decl.is_generator,
+            decl.is_async,
+            decl.is_strict,
+        )?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         // Emit CreateClosure: [func_idx, slot, flags]
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
@@ -856,13 +864,19 @@ impl FunctionCompiler {
             _ => None,
         });
         let ctor_array = if let Some(ctor) = ctor_method {
-            compile_function(&ctor.value.params, &ctor.value.body, false, false)?
+            compile_function(
+                &ctor.value.params,
+                &ctor.value.body,
+                false,
+                false,
+                self.is_strict,
+            )?
         } else {
             let empty_body = BlockStmt {
                 loc: body.loc,
                 body: vec![],
             };
-            compile_function(&[], &empty_body, false, false)?
+            compile_function(&[], &empty_body, false, false, self.is_strict)?
         };
         let ctor_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(ctor_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
@@ -1212,6 +1226,7 @@ impl FunctionCompiler {
             module_variables: HashMap::new(),
             next_module_cell: 0,
             in_tail_position: false,
+            is_strict: false,
         };
 
         let this_reg = Register::parameter(0);
@@ -1985,7 +2000,7 @@ impl FunctionCompiler {
                 self.emit(Instruction::new_unchecked(Opcode::BitwiseNot, vec![slot]));
             }
             UnaryOp::Delete => {
-                // Simplified: compile argument, emit sloppy-mode delete.
+                // Emit strict or sloppy delete depending on compilation mode.
                 match u.argument.as_ref() {
                     Expr::Member(m) => {
                         self.compile_expr(&m.object)?;
@@ -2008,16 +2023,29 @@ impl FunctionCompiler {
                                 ));
                             }
                         }
+                        let delete_op = if self.is_strict {
+                            Opcode::DeletePropertyStrict
+                        } else {
+                            Opcode::DeletePropertySloppy
+                        };
                         self.emit(Instruction::new_unchecked(
-                            Opcode::DeletePropertySloppy,
+                            delete_op,
                             vec![to_reg_op(obj_reg)],
                         ));
                         self.allocator
                             .release_temporary(obj_reg)
                             .map_err(|e| StatorError::Internal(e.to_string()))?;
                     }
+                    Expr::Ident(_) if self.is_strict => {
+                        // In strict mode, `delete x` on an unqualified
+                        // identifier is a SyntaxError.
+                        return Err(StatorError::SyntaxError(
+                            "delete of an unqualified identifier is not allowed in strict mode"
+                                .into(),
+                        ));
+                    }
                     _ => {
-                        // delete on non-member always returns true.
+                        // delete on non-member always returns true in sloppy mode.
                         self.emit(Instruction::new_unchecked(Opcode::LdaTrue, vec![]));
                     }
                 }
@@ -2800,7 +2828,8 @@ impl FunctionCompiler {
 
     /// Compile a function expression.
     fn compile_fn_expr(&mut self, f: &FnExpr) -> StatorResult<()> {
-        let func_array = compile_function(&f.params, &f.body, f.is_generator, f.is_async)?;
+        let func_array =
+            compile_function(&f.params, &f.body, f.is_generator, f.is_async, f.is_strict)?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
@@ -2828,7 +2857,7 @@ impl FunctionCompiler {
                 }
             }
         };
-        let func_array = compile_function(&a.params, &body_block, false, a.is_async)?;
+        let func_array = compile_function(&a.params, &body_block, false, a.is_async, a.is_strict)?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
@@ -4093,7 +4122,8 @@ impl FunctionCompiler {
         Ok(ba
             .with_generator_flag(self.is_generator)
             .with_async_flag(self.is_async)
-            .with_module_flag(self.is_module))
+            .with_module_flag(self.is_module)
+            .with_strict_flag(self.is_strict))
     }
 }
 
@@ -4167,10 +4197,12 @@ fn compile_function(
     body: &BlockStmt,
     is_generator: bool,
     is_async: bool,
+    is_strict: bool,
 ) -> StatorResult<BytecodeArray> {
     let mut compiler = FunctionCompiler::new(params)?;
     compiler.is_generator = is_generator;
     compiler.is_async = is_async;
+    compiler.is_strict = is_strict;
 
     // Generator / async / async-generator prologue: jump to the saved resume
     // point on re-entry.  Async functions are desugared to generators internally,
@@ -4220,6 +4252,7 @@ fn compile_function(
 ///     loc,
 ///     source_type: SourceType::Script,
 ///     body: vec![],
+///     is_strict: false,
 /// };
 /// let array = BytecodeGenerator::compile_program(&program)
 ///     .expect("compilation should succeed");
@@ -4237,6 +4270,8 @@ impl BytecodeGenerator {
         compiler.is_program = true;
         let is_module = program.source_type == SourceType::Module;
         compiler.is_module = is_module;
+        // Modules are always strict; scripts inherit the AST flag.
+        compiler.is_strict = program.is_strict || is_module;
 
         // Hoist function declarations to the top.
         for item in &program.body {
@@ -4271,6 +4306,7 @@ impl BytecodeGenerator {
         let mut compiler = FunctionCompiler::new(&[])?;
         compiler.is_program = true;
         compiler.is_eval_scope = true;
+        compiler.is_strict = program.is_strict;
 
         for item in &program.body {
             if let ProgramItem::Stmt(Stmt::FnDecl(decl)) = item {
@@ -4382,6 +4418,7 @@ mod tests {
             loc: span(),
             source_type: SourceType::Script,
             body: stmts.into_iter().map(ProgramItem::Stmt).collect(),
+            is_strict: false,
         }
     }
 
@@ -4745,6 +4782,7 @@ mod tests {
                 },
             ],
             body,
+            is_strict: false,
         }))]);
         let arr = BytecodeGenerator::compile_program(&prog).unwrap();
         let instrs = arr.instructions().unwrap();
@@ -4783,6 +4821,7 @@ mod tests {
                 },
             ],
             &body,
+            false,
             false,
             false,
         )
@@ -5111,6 +5150,7 @@ mod tests {
                 },
             ],
             body,
+            is_strict: false,
         }))]);
         let kinds = slot_kinds_for(&prog);
         assert!(
@@ -5364,6 +5404,7 @@ mod tests {
             body: BlockStmt { loc: span(), body },
             is_generator: true,
             is_async: false,
+            is_strict: false,
         }
     }
 
@@ -5605,6 +5646,7 @@ mod tests {
             },
             is_generator: true,
             is_async: false,
+            is_strict: false,
         };
         let prog = make_program(vec![Stmt::FnDecl(Box::new(decl))]);
         // Must compile without error.
@@ -5813,6 +5855,7 @@ mod tests {
                 loc: span(),
                 body: vec![],
             },
+            is_strict: false,
         }
     }
 
@@ -5968,6 +6011,7 @@ mod tests {
             body: BlockStmt { loc: span(), body },
             is_generator: true,
             is_async: true,
+            is_strict: false,
         }
     }
 
@@ -6062,6 +6106,7 @@ mod tests {
             },
             is_generator: true,
             is_async: true,
+            is_strict: false,
         }));
         let prog = make_program(vec![var_decl_stmt(VarKind::Var, "f", Some(fn_expr))]);
         let arr = BytecodeGenerator::compile_program(&prog).unwrap();
@@ -6418,6 +6463,7 @@ mod tests {
             },
             is_generator: false,
             is_async: true,
+            is_strict: false,
         };
         let prog = make_program(vec![Stmt::FnDecl(Box::new(decl))]);
         let arr = BytecodeGenerator::compile_program(&prog).unwrap();
@@ -6457,6 +6503,7 @@ mod tests {
             },
             is_generator: false,
             is_async: true,
+            is_strict: false,
         }));
         let prog = make_program(vec![var_decl_stmt(VarKind::Var, "f", Some(fn_expr))]);
         let arr = BytecodeGenerator::compile_program(&prog).unwrap();
@@ -6481,6 +6528,7 @@ mod tests {
                 body: vec![await_stmt(num_expr(1.0))],
             }),
             is_async: true,
+            is_strict: false,
         }));
         let prog = make_program(vec![var_decl_stmt(VarKind::Var, "f", Some(arrow))]);
         let arr = BytecodeGenerator::compile_program(&prog).unwrap();
@@ -6636,6 +6684,7 @@ mod tests {
             &body,
             false,
             false,
+            false,
         )
         .unwrap();
         let instrs = inner.instructions().unwrap();
@@ -6676,6 +6725,7 @@ mod tests {
             &body,
             false,
             false,
+            false,
         )
         .unwrap();
         let instrs = inner.instructions().unwrap();
@@ -6706,6 +6756,7 @@ mod tests {
                 default: None,
             }],
             &body,
+            false,
             false,
             false,
         )
@@ -6749,6 +6800,7 @@ mod tests {
             &body,
             false,
             false,
+            false,
         )
         .unwrap();
         let instrs = inner.instructions().unwrap();
@@ -6784,6 +6836,7 @@ mod tests {
                 },
             ],
             &body,
+            false,
             false,
             false,
         )
@@ -6829,6 +6882,7 @@ mod tests {
             &body,
             false,
             false,
+            false,
         )
         .unwrap();
         let instrs = inner.instructions().unwrap();
@@ -6857,6 +6911,7 @@ mod tests {
                 default: None,
             }],
             &body,
+            false,
             false,
             false,
         )
@@ -6900,6 +6955,7 @@ mod tests {
             loc: span(),
             source_type: SourceType::Module,
             body: items,
+            is_strict: true,
         }
     }
 
@@ -7156,6 +7212,7 @@ mod tests {
                 source: string_lit("./mod.js"),
                 attributes: vec![],
             }))],
+            is_strict: false,
         };
         let result = BytecodeGenerator::compile_program(&prog);
         assert!(result.is_err(), "module decl in script should error");
