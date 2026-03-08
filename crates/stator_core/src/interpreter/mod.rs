@@ -1903,6 +1903,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 drop(borrow);
                 return JsValue::Undefined;
             }
+            "toString" => {
+                drop(borrow);
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String("[object Object]".to_string()))
+                }));
+            }
             _ => {}
         }
         // Walk __proto__ chain.

@@ -1284,6 +1284,18 @@ fn make_date_instance(t: f64) -> JsValue {
 fn make_number() -> JsValue {
     let mut props = PropertyMap::new();
 
+    // Number(value) — type conversion when called as a function
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            let val = args.first().unwrap_or(&JsValue::Undefined);
+            if matches!(val, JsValue::Undefined) && args.is_empty() {
+                return Ok(JsValue::Smi(0));
+            }
+            Ok(num(val.to_number()?))
+        }),
+    );
+
     // Number.isNaN — does NOT coerce (unlike global isNaN)
     props.insert(
         "isNaN".into(),
