@@ -2332,15 +2332,39 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             match key {
                 "length" => return JsValue::Smi(arr.borrow().len() as i32),
                 "push" => {
-                    return JsValue::NativeFunction(Rc::new(move |_args| {
-                        // push is a no-op on immutable Rc<Vec>; return current length.
-                        Ok(JsValue::Smi(arr_rc.borrow().len() as i32))
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let mut v = arr_rc.borrow_mut();
+                        for arg in &args {
+                            v.push(arg.clone());
+                        }
+                        Ok(JsValue::Smi(v.len() as i32))
                     }));
                 }
                 "pop" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |_args| {
-                        Ok(a.borrow().last().cloned().unwrap_or(JsValue::Undefined))
+                        Ok(a.borrow_mut().pop().unwrap_or(JsValue::Undefined))
+                    }));
+                }
+                "shift" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        let mut v = a.borrow_mut();
+                        if v.is_empty() {
+                            Ok(JsValue::Undefined)
+                        } else {
+                            Ok(v.remove(0))
+                        }
+                    }));
+                }
+                "unshift" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let mut v = a.borrow_mut();
+                        for (i, arg) in args.iter().enumerate() {
+                            v.insert(i, arg.clone());
+                        }
+                        Ok(JsValue::Smi(v.len() as i32))
                     }));
                 }
                 "join" => {
@@ -2579,9 +2603,8 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 "reverse" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |_args| {
-                        let mut v = a.borrow().clone();
-                        v.reverse();
-                        Ok(JsValue::new_array(v))
+                        a.borrow_mut().reverse();
+                        Ok(JsValue::Array(Rc::clone(&a)))
                     }));
                 }
                 "flat" => {
@@ -2621,9 +2644,35 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let fill_val = args.first().cloned().unwrap_or(JsValue::Undefined);
-                        let result: Vec<JsValue> =
-                            a.borrow().iter().map(|_| fill_val.clone()).collect();
-                        Ok(JsValue::new_array(result))
+                        let mut v = a.borrow_mut();
+                        let len = v.len();
+                        let start = match args.get(1) {
+                            Some(JsValue::Smi(i)) => {
+                                let i = *i;
+                                if i < 0 {
+                                    (len as i32 + i).max(0) as usize
+                                } else {
+                                    (i as usize).min(len)
+                                }
+                            }
+                            _ => 0,
+                        };
+                        let end = match args.get(2) {
+                            Some(JsValue::Smi(i)) => {
+                                let i = *i;
+                                if i < 0 {
+                                    (len as i32 + i).max(0) as usize
+                                } else {
+                                    (i as usize).min(len)
+                                }
+                            }
+                            _ => len,
+                        };
+                        for item in v.iter_mut().skip(start).take(end.saturating_sub(start)) {
+                            *item = fill_val.clone();
+                        }
+                        drop(v);
+                        Ok(JsValue::Array(Rc::clone(&a)))
                     }));
                 }
                 "keys" => {
@@ -2673,20 +2722,33 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }
                 "sort" => {
                     let a = Rc::clone(&arr_rc);
-                    return JsValue::NativeFunction(Rc::new(move |_args| {
-                        let mut sorted = a.borrow().clone();
-                        sorted.sort_by(|a, b| {
-                            let a_str = js_to_string(a);
-                            let b_str = js_to_string(b);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let cmp_fn = args.first().cloned();
+                        let mut v = a.borrow_mut();
+                        v.sort_by(|x, y| {
+                            if let Some(ref cb) = cmp_fn
+                                && let Ok(r) = dispatch_call_value(cb, vec![x.clone(), y.clone()])
+                            {
+                                let n = match &r {
+                                    JsValue::Smi(i) => *i as f64,
+                                    JsValue::HeapNumber(f) => *f,
+                                    _ => 0.0,
+                                };
+                                return n.partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal);
+                            }
+                            let a_str = js_to_string(x);
+                            let b_str = js_to_string(y);
                             a_str.cmp(&b_str)
                         });
-                        Ok(JsValue::new_array(sorted))
+                        drop(v);
+                        Ok(JsValue::Array(Rc::clone(&a)))
                     }));
                 }
                 "splice" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
-                        let len = a.borrow().len() as i32;
+                        let mut v = a.borrow_mut();
+                        let len = v.len() as i32;
                         let start_raw = match args.first() {
                             Some(JsValue::Smi(i)) => *i,
                             Some(JsValue::HeapNumber(n)) => *n as i32,
@@ -2702,8 +2764,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             Some(JsValue::HeapNumber(n)) => (*n as i32).max(0) as usize,
                             _ => (len as usize).saturating_sub(start),
                         };
-                        let end = (start + delete_count).min(a.borrow().len());
-                        let removed: Vec<JsValue> = a.borrow()[start..end].to_vec();
+                        let end = (start + delete_count).min(v.len());
+                        let removed: Vec<JsValue> = v.drain(start..end).collect();
+                        // Insert new elements
+                        let insert_items: Vec<JsValue> = args.iter().skip(2).cloned().collect();
+                        for (i, item) in insert_items.into_iter().enumerate() {
+                            v.insert(start + i, item);
+                        }
                         Ok(JsValue::new_array(removed))
                     }));
                 }
@@ -3208,6 +3275,16 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
         JsValue::Function(ba) => {
             let prop_name = to_property_key(key)?;
             fn_props_set(ba, prop_name, value);
+        }
+        JsValue::Array(arr) => {
+            if let Some(idx) = to_array_index(key) {
+                let mut v = arr.borrow_mut();
+                // Extend the array if needed
+                if idx >= v.len() {
+                    v.resize(idx + 1, JsValue::Undefined);
+                }
+                v[idx] = value;
+            }
         }
         _ => {}
     }
