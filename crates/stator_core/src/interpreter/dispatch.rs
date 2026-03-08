@@ -160,7 +160,18 @@ fn handle_add(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Add", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi + Smi → Smi (no allocation, overflow → HeapNumber)
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = match a.checked_add(*b) {
+            Some(r) => JsValue::Smi(r),
+            None => JsValue::HeapNumber(a as f64 + *b as f64),
+        };
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.clone();
     ctx.frame.accumulator = js_add(&ctx.frame.accumulator, &rhs)?;
     Ok(DispatchAction::Continue)
 }
@@ -169,7 +180,18 @@ fn handle_sub(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Sub", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi - Smi → Smi
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = match a.checked_sub(*b) {
+            Some(r) => JsValue::Smi(r),
+            None => JsValue::HeapNumber(a as f64 - *b as f64),
+        };
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(&rhs)?;
@@ -186,7 +208,18 @@ fn handle_mul(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Mul", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi * Smi → Smi
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = match a.checked_mul(*b) {
+            Some(r) => JsValue::Smi(r),
+            None => JsValue::HeapNumber(a as f64 * *b as f64),
+        };
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(&rhs)?;
@@ -380,6 +413,14 @@ fn handle_add_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("AddSmi", 0));
     };
+    // Fast path: Smi + immediate
+    if let JsValue::Smi(n) = ctx.frame.accumulator {
+        ctx.frame.accumulator = match n.checked_add(imm) {
+            Some(r) => JsValue::Smi(r),
+            None => JsValue::HeapNumber(n as f64 + imm as f64),
+        };
+        return Ok(DispatchAction::Continue);
+    }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n.wrapping_add(i128::from(imm)));
     } else {
@@ -393,6 +434,14 @@ fn handle_sub_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("SubSmi", 0));
     };
+    // Fast path: Smi - immediate
+    if let JsValue::Smi(n) = ctx.frame.accumulator {
+        ctx.frame.accumulator = match n.checked_sub(imm) {
+            Some(r) => JsValue::Smi(r),
+            None => JsValue::HeapNumber(n as f64 - imm as f64),
+        };
+        return Ok(DispatchAction::Continue);
+    }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n.wrapping_sub(i128::from(imm)));
     } else {
@@ -406,6 +455,14 @@ fn handle_mul_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("MulSmi", 0));
     };
+    // Fast path: Smi * immediate
+    if let JsValue::Smi(n) = ctx.frame.accumulator {
+        ctx.frame.accumulator = match n.checked_mul(imm) {
+            Some(r) => JsValue::Smi(r),
+            None => JsValue::HeapNumber(n as f64 * imm as f64),
+        };
+        return Ok(DispatchAction::Continue);
+    }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n.wrapping_mul(i128::from(imm)));
     } else {
@@ -616,7 +673,15 @@ fn handle_test_equal_strict(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("TestEqualStrict", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi === Smi
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = JsValue::Boolean(a == *b);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.clone();
     let result = strict_eq(&ctx.frame.accumulator, &rhs);
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
@@ -629,7 +694,15 @@ fn handle_test_less_than(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("TestLessThan", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi < Smi
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = JsValue::Boolean(a < *b);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.clone();
     let result = js_less_than(&ctx.frame.accumulator, &rhs)?;
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
@@ -642,7 +715,15 @@ fn handle_test_greater_than(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("TestGreaterThan", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi > Smi
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = JsValue::Boolean(a > *b);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.clone();
     // a > b  ≡  b < a
     let result = js_less_than(&rhs, &ctx.frame.accumulator)?;
     ctx.frame.accumulator = JsValue::Boolean(result);
@@ -656,7 +737,15 @@ fn handle_test_less_than_or_equal(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("TestLessThanOrEqual", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi <= Smi
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = JsValue::Boolean(a <= *b);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.clone();
     // a <= b  ≡  !(b < a)
     let result = !js_less_than(&rhs, &ctx.frame.accumulator)?;
     ctx.frame.accumulator = JsValue::Boolean(result);
@@ -670,7 +759,15 @@ fn handle_test_greater_than_or_equal(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("TestGreaterThanOrEqual", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi >= Smi
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = JsValue::Boolean(a >= *b);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.clone();
     // a >= b  ≡  !(a < b)
     let result = !js_less_than(&ctx.frame.accumulator, &rhs)?;
     ctx.frame.accumulator = JsValue::Boolean(result);
