@@ -2856,8 +2856,113 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         if !matches!(val, JsValue::Undefined) {
             return val;
         }
-        // Fall through to proto chain lookup for built-in Function.prototype
-        // methods like `call`, `apply`, `bind`.
+        // Built-in Function.prototype methods.
+        match key {
+            "call" => {
+                let ba = Rc::clone(ba);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    // call(thisArg, ...args) — thisArg is ignored for now.
+                    let call_args = if args.len() > 1 {
+                        args[1..].to_vec()
+                    } else {
+                        vec![]
+                    };
+                    dispatch_call_value(&JsValue::Function(Rc::clone(&ba)), call_args)
+                }));
+            }
+            "apply" => {
+                let ba = Rc::clone(ba);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    // apply(thisArg, argsArray) — thisArg is ignored for now.
+                    let call_args = match args.get(1) {
+                        Some(JsValue::Array(arr)) => (**arr).clone(),
+                        _ => vec![],
+                    };
+                    dispatch_call_value(&JsValue::Function(Rc::clone(&ba)), call_args)
+                }));
+            }
+            "bind" => {
+                let ba = Rc::clone(ba);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    // bind(thisArg, ...args) — returns a new function with bound args.
+                    let bound_args: Vec<JsValue> = if args.len() > 1 {
+                        args[1..].to_vec()
+                    } else {
+                        vec![]
+                    };
+                    let ba2 = Rc::clone(&ba);
+                    Ok(JsValue::NativeFunction(Rc::new(move |call_args| {
+                        let mut all_args = bound_args.clone();
+                        all_args.extend(call_args);
+                        dispatch_call_value(&JsValue::Function(Rc::clone(&ba2)), all_args)
+                    })))
+                }));
+            }
+            "name" => {
+                return JsValue::String(String::new());
+            }
+            "length" => {
+                return JsValue::Smi(ba.parameter_count() as i32);
+            }
+            "toString" => {
+                return JsValue::NativeFunction(Rc::new(|_args| {
+                    Ok(JsValue::String("function () { [native code] }".to_string()))
+                }));
+            }
+            "constructor" => return JsValue::Undefined,
+            _ => {}
+        }
+    }
+    // Same for NativeFunction.
+    if let JsValue::NativeFunction(f) = obj {
+        match key {
+            "call" => {
+                let f = Rc::clone(f);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let call_args = if args.len() > 1 {
+                        args[1..].to_vec()
+                    } else {
+                        vec![]
+                    };
+                    f(call_args)
+                }));
+            }
+            "apply" => {
+                let f = Rc::clone(f);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let call_args = match args.get(1) {
+                        Some(JsValue::Array(arr)) => (**arr).clone(),
+                        _ => vec![],
+                    };
+                    f(call_args)
+                }));
+            }
+            "bind" => {
+                let f = Rc::clone(f);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let bound_args: Vec<JsValue> = if args.len() > 1 {
+                        args[1..].to_vec()
+                    } else {
+                        vec![]
+                    };
+                    let f2 = Rc::clone(&f);
+                    Ok(JsValue::NativeFunction(Rc::new(move |call_args| {
+                        let mut all_args = bound_args.clone();
+                        all_args.extend(call_args);
+                        f2(all_args)
+                    })))
+                }));
+            }
+            "name" => return JsValue::String(String::new()),
+            "length" => return JsValue::Smi(0),
+            "toString" => {
+                return JsValue::NativeFunction(Rc::new(|_args| {
+                    Ok(JsValue::String("function () { [native code] }".to_string()))
+                }));
+            }
+            "constructor" => return JsValue::Undefined,
+            _ => {}
+        }
     }
     let mut current = obj.clone();
     for _ in 0..256 {

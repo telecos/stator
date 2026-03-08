@@ -3104,25 +3104,44 @@ impl FunctionCompiler {
         let ctor_reg = self.allocator.allocate_temporary();
         self.emit_star(ctor_reg);
 
-        let arg_regs = self.compile_arguments(&n.arguments)?;
-        let arg_count = arg_regs.len() as u32;
-        let args_start = arg_regs.first().copied().unwrap_or(ctor_reg);
+        let has_spread = n.arguments.iter().any(|a| matches!(a, Expr::Spread(_)));
 
-        let slot = self.alloc_slot(FeedbackSlotKind::Call);
-        self.emit(Instruction::new_unchecked(
-            Opcode::Construct,
-            vec![
-                to_reg_op(ctor_reg),
-                to_reg_op(args_start),
-                Operand::RegisterCount(arg_count),
-                slot,
-            ],
-        ));
-
-        for r in arg_regs.into_iter().rev() {
+        if has_spread {
+            let arr_reg = self.compile_arguments_as_array(&n.arguments)?;
+            let slot = self.alloc_slot(FeedbackSlotKind::Call);
+            self.emit(Instruction::new_unchecked(
+                Opcode::ConstructWithSpread,
+                vec![
+                    to_reg_op(ctor_reg),
+                    to_reg_op(arr_reg),
+                    Operand::RegisterCount(1),
+                    slot,
+                ],
+            ));
             self.allocator
-                .release_temporary(r)
+                .release_temporary(arr_reg)
                 .map_err(|e| StatorError::Internal(e.to_string()))?;
+        } else {
+            let arg_regs = self.compile_arguments(&n.arguments)?;
+            let arg_count = arg_regs.len() as u32;
+            let args_start = arg_regs.first().copied().unwrap_or(ctor_reg);
+
+            let slot = self.alloc_slot(FeedbackSlotKind::Call);
+            self.emit(Instruction::new_unchecked(
+                Opcode::Construct,
+                vec![
+                    to_reg_op(ctor_reg),
+                    to_reg_op(args_start),
+                    Operand::RegisterCount(arg_count),
+                    slot,
+                ],
+            ));
+
+            for r in arg_regs.into_iter().rev() {
+                self.allocator
+                    .release_temporary(r)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+            }
         }
         self.allocator
             .release_temporary(ctor_reg)

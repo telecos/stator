@@ -1543,6 +1543,80 @@ fn handle_construct(
     Ok(DispatchAction::Continue)
 }
 
+/// Like `handle_construct` but expands a single Array argument into the
+/// actual constructor arguments (used when `new Foo(...args)` is compiled).
+fn handle_construct_with_spread(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(ctor_v) = instr.operands[0] else {
+        return Err(err_bad_operand("ConstructWithSpread", 0));
+    };
+    let Operand::Register(args_start_v) = instr.operands[1] else {
+        return Err(err_bad_operand("ConstructWithSpread", 1));
+    };
+    let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+        return Err(err_bad_operand("ConstructWithSpread", 2));
+    };
+    let ctor = ctx.frame.read_reg(ctor_v)?.clone();
+    let ctor_proto = proto_lookup(&ctor, "prototype");
+    let raw_args = collect_args(ctx.frame, args_start_v, arg_count)?;
+    let args = if raw_args.len() == 1 {
+        if let JsValue::Array(ref items) = raw_args[0] {
+            (**items).clone()
+        } else {
+            raw_args
+        }
+    } else {
+        raw_args
+    };
+    match ctor {
+        JsValue::Function(ba) => {
+            let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+            if !matches!(ctor_proto, JsValue::Undefined) {
+                this_obj
+                    .borrow_mut()
+                    .insert("__proto__".to_string(), ctor_proto.clone());
+            }
+            let this_val = JsValue::PlainObject(this_obj);
+            let mut callee_frame = InterpreterFrame::new_with_globals(
+                (*ba).clone(),
+                args,
+                Rc::clone(&ctx.frame.global_env),
+            );
+            callee_frame.context = Some(this_val.clone());
+            callee_frame.new_target = JsValue::Function(Rc::clone(&ba));
+            push_call_frame("<anonymous>")?;
+            let result = Interpreter::run(&mut callee_frame);
+            pop_call_frame();
+            let val = result?;
+            ctx.frame.accumulator = match val {
+                JsValue::PlainObject(_) | JsValue::Object(_) => val,
+                _ => this_val,
+            };
+        }
+        JsValue::NativeFunction(f) => {
+            ctx.frame.accumulator = f(args)?;
+        }
+        JsValue::PlainObject(ref map) => {
+            if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
+                let val = f(args)?;
+                ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
+            } else {
+                return Err(StatorError::TypeError(
+                    "ConstructWithSpread: constructor is not a function".to_string(),
+                ));
+            }
+        }
+        other => {
+            return Err(StatorError::TypeError(format!(
+                "ConstructWithSpread: constructor is not a function (got {other:?})"
+            )));
+        }
+    }
+    Ok(DispatchAction::Continue)
+}
+
 fn handle_push_context(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -4163,7 +4237,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::CallDirectEval as usize] = handle_call_direct_eval;
     table[Opcode::TailCall as usize] = handle_tail_call;
     table[Opcode::Construct as usize] = handle_construct;
-    table[Opcode::ConstructWithSpread as usize] = handle_construct;
+    table[Opcode::ConstructWithSpread as usize] = handle_construct_with_spread;
     table[Opcode::ConstructForwardAllArgs as usize] = handle_construct_forward_all_args;
     table[Opcode::GetIterator as usize] = handle_get_iterator;
     table[Opcode::GetAsyncIterator as usize] = handle_get_async_iterator;
