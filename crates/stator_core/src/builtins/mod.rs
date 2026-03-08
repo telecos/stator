@@ -54,6 +54,9 @@ pub mod string;
 /// ECMAScript §20.4 `Symbol` built-in — unique property keys, well-known symbols,
 /// and the global symbol registry (`Symbol.for()` / `Symbol.keyFor()`).
 pub mod symbol;
+/// TC39 Stage 3 Temporal API — modern date/time types
+/// (`Temporal.PlainDate`, `Temporal.Instant`, `Temporal.Duration`, etc.).
+pub mod temporal;
 /// ECMAScript §23.2 TypedArray, §25.1 ArrayBuffer, and §25.3 DataView built-ins.
 pub mod typed_array;
 /// Shared utility functions (e.g. `SameValueZero`) used across built-in sub-modules.
