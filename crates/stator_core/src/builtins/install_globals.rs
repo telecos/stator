@@ -1435,6 +1435,16 @@ fn make_object() -> JsValue {
         }),
     );
 
+    // ── Object.is(x, y) — SameValue comparison (ECMAScript §19.1.2.10) ──
+    props.insert(
+        "is".into(),
+        native(|args| {
+            let x = args.first().unwrap_or(&JsValue::Undefined);
+            let y = args.get(1).unwrap_or(&JsValue::Undefined);
+            Ok(JsValue::Boolean(x.same_value(y)))
+        }),
+    );
+
     // ── Object.defineProperty(obj, prop, descriptor) ─────────────────────
     props.insert(
         "defineProperty".into(),

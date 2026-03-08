@@ -2615,15 +2615,32 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }
                 "flat" => {
                     let a = Rc::clone(&arr_rc);
-                    return JsValue::NativeFunction(Rc::new(move |_args| {
-                        let mut result = Vec::new();
-                        for item in a.borrow().iter() {
-                            if let JsValue::Array(inner) = item {
-                                result.extend_from_slice(&inner.borrow());
-                            } else {
-                                result.push(item.clone());
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let depth: u32 = match args.first() {
+                            Some(JsValue::Smi(i)) => (*i).max(0) as u32,
+                            Some(JsValue::HeapNumber(n)) => {
+                                if n.is_infinite() && n.is_sign_positive() {
+                                    u32::MAX
+                                } else {
+                                    (*n as i32).max(0) as u32
+                                }
+                            }
+                            Some(JsValue::Undefined) | None => 1,
+                            _ => 0,
+                        };
+                        fn flatten(items: &[JsValue], depth: u32, out: &mut Vec<JsValue>) {
+                            for item in items {
+                                if depth > 0
+                                    && let JsValue::Array(inner) = item
+                                {
+                                    flatten(&inner.borrow(), depth - 1, out);
+                                    continue;
+                                }
+                                out.push(item.clone());
                             }
                         }
+                        let mut result = Vec::new();
+                        flatten(&a.borrow(), depth, &mut result);
                         Ok(JsValue::new_array(result))
                     }));
                 }
