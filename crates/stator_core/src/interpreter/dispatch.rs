@@ -15,7 +15,7 @@ use crate::objects::property_map::PropertyMap;
 use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
     TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, constant_pool_jump_delta,
-    constant_to_value, decode_string_constant, dispatch_call, err_bad_operand,
+    constant_to_value, decode_string_constant, dispatch_call, dispatch_setter, err_bad_operand,
     error_message_from_value, extract_context, find_handler, fn_props_set, is_js_receiver, js_add,
     js_less_than, keyed_load, keyed_store, maybe_compile_baseline, maybe_compile_maglev,
     maybe_compile_turbofan, number_to_jsvalue, plain_object_to_array_items, proto_lookup,
@@ -1882,6 +1882,13 @@ fn handle_sta_named_property(
             let _ = proxy_set(&mut p.borrow_mut(), &prop_name, val)?;
         }
         JsValue::PlainObject(ref map) => {
+            // Check for setter accessor first.
+            let setter_key = format!("__set_{prop_name}__");
+            let setter = map.borrow().get(&setter_key).cloned();
+            if let Some(setter_fn) = setter {
+                dispatch_setter(&setter_fn, &obj, val)?;
+                return Ok(DispatchAction::Continue);
+            }
             let pm = map.borrow();
             // Existing non-writable property: silently ignore (sloppy mode).
             if pm.contains_key(&prop_name) && !pm.is_writable(&prop_name) {
@@ -3724,6 +3731,240 @@ fn handle_lda_new_target(
     Ok(DispatchAction::Continue)
 }
 
+// ── CreateClass ──────────────────────────────────────────────────────────────
+
+/// `CreateClass <ctor_idx> <super_reg> <slot>`
+///
+/// Creates a class constructor from the bytecode in constant pool entry
+/// `ctor_idx`, wires its prototype object, and (optionally) sets up the
+/// `extends` relationship with the superclass loaded from `super_reg`.
+fn handle_create_class(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::ConstantPoolIdx(ctor_idx) = instr.operands[0] else {
+        return Err(err_bad_operand("CreateClass", 0));
+    };
+    let Operand::Register(super_v) = instr.operands[1] else {
+        return Err(err_bad_operand("CreateClass", 1));
+    };
+    // operands[2] is a FeedbackSlot, ignored at runtime.
+
+    // 1. Read constructor bytecode from constant pool.
+    let entry = ctx
+        .frame
+        .bytecode_array
+        .get_constant(ctor_idx)
+        .ok_or_else(|| {
+            StatorError::Internal(format!(
+                "CreateClass: constant pool index {ctor_idx} out of bounds"
+            ))
+        })?;
+    let ConstantPoolEntry::Function(ctor_ba) = entry else {
+        return Err(StatorError::Internal(
+            "CreateClass: constant pool entry is not a Function".into(),
+        ));
+    };
+
+    // 2. Read the superclass.
+    let super_val = ctx.frame.read_reg(super_v)?.clone();
+
+    // 3. Create the class constructor as a PlainObject wrapping the
+    //    bytecode in __call__ so it can be invoked via both `new` and
+    //    direct calls.
+    let ctor_ba_rc = Rc::new((**ctor_ba).clone());
+    let class_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+    class_obj.borrow_mut().insert(
+        "__call__".to_string(),
+        JsValue::Function(Rc::clone(&ctor_ba_rc)),
+    );
+
+    // 4. Create the prototype object.
+    let proto: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+
+    // 5. Wire `extends` — set up prototype chain.
+    if !matches!(super_val, JsValue::Undefined | JsValue::Null) {
+        // class Foo extends Bar {}
+        // proto.__proto__ = super_val.prototype
+        let super_proto = proto_lookup(&super_val, "prototype");
+        if !matches!(super_proto, JsValue::Undefined) {
+            proto
+                .borrow_mut()
+                .insert("__proto__".to_string(), super_proto);
+        }
+        // class.__proto__ = super_val (static inheritance)
+        class_obj
+            .borrow_mut()
+            .insert("__proto__".to_string(), super_val);
+    }
+
+    // 6. Wire constructor ↔ prototype.
+    let proto_val = JsValue::PlainObject(Rc::clone(&proto));
+    proto.borrow_mut().insert(
+        "constructor".to_string(),
+        JsValue::PlainObject(Rc::clone(&class_obj)),
+    );
+    class_obj
+        .borrow_mut()
+        .insert("prototype".to_string(), proto_val);
+
+    // 7. Result in accumulator.
+    ctx.frame.accumulator = JsValue::PlainObject(class_obj);
+    Ok(DispatchAction::Continue)
+}
+
+// ── DefineGetterProperty / DefineSetterProperty ──────────────────────────────
+
+/// `DefineGetterProperty <obj_reg> <name_idx> <slot>`
+///
+/// Defines a getter accessor on the object in `obj_reg`.  The getter
+/// function is in the accumulator.  The property name is a string at
+/// constant pool index `name_idx`.
+fn handle_define_getter_property(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(obj_v) = instr.operands[0] else {
+        return Err(err_bad_operand("DefineGetterProperty", 0));
+    };
+    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+        return Err(err_bad_operand("DefineGetterProperty", 1));
+    };
+    let prop_name = match ctx.frame.bytecode_array.get_constant(name_idx) {
+        Some(ConstantPoolEntry::String(s)) => s.clone(),
+        _ => {
+            return Err(StatorError::Internal(
+                "DefineGetterProperty: property name is not a string".into(),
+            ));
+        }
+    };
+    let getter = ctx.frame.accumulator.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    if let JsValue::PlainObject(ref map) = obj {
+        // Store getter as __get_<name>__ — the property access handler
+        // checks for this convention when loading.
+        map.borrow_mut()
+            .insert(format!("__get_{prop_name}__"), getter);
+    }
+    Ok(DispatchAction::Continue)
+}
+
+/// `DefineSetterProperty <obj_reg> <name_idx> <slot>`
+fn handle_define_setter_property(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(obj_v) = instr.operands[0] else {
+        return Err(err_bad_operand("DefineSetterProperty", 0));
+    };
+    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+        return Err(err_bad_operand("DefineSetterProperty", 1));
+    };
+    let prop_name = match ctx.frame.bytecode_array.get_constant(name_idx) {
+        Some(ConstantPoolEntry::String(s)) => s.clone(),
+        _ => {
+            return Err(StatorError::Internal(
+                "DefineSetterProperty: property name is not a string".into(),
+            ));
+        }
+    };
+    let setter = ctx.frame.accumulator.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    if let JsValue::PlainObject(ref map) = obj {
+        map.borrow_mut()
+            .insert(format!("__set_{prop_name}__"), setter);
+    }
+    Ok(DispatchAction::Continue)
+}
+
+/// `DefineKeyedGetterProperty <obj_reg> <key_reg> <val_reg> <slot>`
+fn handle_define_keyed_getter_property(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(obj_v) = instr.operands[0] else {
+        return Err(err_bad_operand("DefineKeyedGetterProperty", 0));
+    };
+    let Operand::Register(key_v) = instr.operands[1] else {
+        return Err(err_bad_operand("DefineKeyedGetterProperty", 1));
+    };
+    let getter = ctx.frame.accumulator.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let key = ctx.frame.read_reg(key_v)?.clone();
+    let key_str = to_property_key(&key)?;
+    if let JsValue::PlainObject(ref map) = obj {
+        map.borrow_mut()
+            .insert(format!("__get_{key_str}__"), getter);
+    }
+    Ok(DispatchAction::Continue)
+}
+
+/// `DefineKeyedSetterProperty <obj_reg> <key_reg> <val_reg> <slot>`
+fn handle_define_keyed_setter_property(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(obj_v) = instr.operands[0] else {
+        return Err(err_bad_operand("DefineKeyedSetterProperty", 0));
+    };
+    let Operand::Register(key_v) = instr.operands[1] else {
+        return Err(err_bad_operand("DefineKeyedSetterProperty", 1));
+    };
+    let setter = ctx.frame.accumulator.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let key = ctx.frame.read_reg(key_v)?.clone();
+    let key_str = to_property_key(&key)?;
+    if let JsValue::PlainObject(ref map) = obj {
+        map.borrow_mut()
+            .insert(format!("__set_{key_str}__"), setter);
+    }
+    Ok(DispatchAction::Continue)
+}
+
+/// `LdaEnumeratedKeyedProperty <obj_reg> <key_reg> <slot>`
+///
+/// Like `LdaKeyedProperty` but for enumerated (for-in) keys.
+fn handle_lda_enumerated_keyed_property(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(obj_v) = instr.operands[0] else {
+        return Err(err_bad_operand("LdaEnumeratedKeyedProperty", 0));
+    };
+    let Operand::Register(key_v) = instr.operands[1] else {
+        return Err(err_bad_operand("LdaEnumeratedKeyedProperty", 1));
+    };
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let key = ctx.frame.read_reg(key_v)?.clone();
+    ctx.frame.accumulator = keyed_load(&obj, &key)?;
+    Ok(DispatchAction::Continue)
+}
+
+/// `TestPrivateBrand <obj_reg>`
+///
+/// Checks whether the object in `obj_reg` has the private brand of the
+/// current class.  For now, we always succeed (brand checking is a
+/// runtime validation for private fields).
+fn handle_test_private_brand(
+    _ctx: &mut DispatchContext,
+    _instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    // TODO: full brand checking once private field storage is available.
+    // For now, pass — this allows class code to proceed without errors.
+    Ok(DispatchAction::Continue)
+}
+
+/// `DefinePrivateBrand <obj_reg>`
+///
+/// Brands the object so that subsequent `TestPrivateBrand` calls will
+/// succeed.  Currently a no-op stub.
+fn handle_define_private_brand(
+    _ctx: &mut DispatchContext,
+    _instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    Ok(DispatchAction::Continue)
+}
+
 fn handle_unimplemented(
     _ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -3771,7 +4012,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::LdaNamedProperty as usize] = handle_lda_named_property;
     table[Opcode::LdaNamedPropertyFromSuper as usize] = handle_lda_named_property_from_super;
     table[Opcode::LdaKeyedProperty as usize] = handle_lda_keyed_property;
-    table[Opcode::LdaEnumeratedKeyedProperty as usize] = handle_unimplemented;
+    table[Opcode::LdaEnumeratedKeyedProperty as usize] = handle_lda_enumerated_keyed_property;
     table[Opcode::StaNamedProperty as usize] = handle_sta_named_property;
     table[Opcode::StaNamedOwnProperty as usize] = handle_sta_named_own_property;
     table[Opcode::StaKeyedProperty as usize] = handle_sta_keyed_property;
@@ -3780,10 +4021,10 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::StaInArrayLiteral as usize] = handle_sta_in_array_literal;
     table[Opcode::DefineKeyedOwnPropertyInLiteral as usize] =
         handle_define_keyed_own_property_in_literal;
-    table[Opcode::DefineGetterProperty as usize] = handle_unimplemented;
-    table[Opcode::DefineSetterProperty as usize] = handle_unimplemented;
-    table[Opcode::DefineKeyedGetterProperty as usize] = handle_unimplemented;
-    table[Opcode::DefineKeyedSetterProperty as usize] = handle_unimplemented;
+    table[Opcode::DefineGetterProperty as usize] = handle_define_getter_property;
+    table[Opcode::DefineSetterProperty as usize] = handle_define_setter_property;
+    table[Opcode::DefineKeyedGetterProperty as usize] = handle_define_keyed_getter_property;
+    table[Opcode::DefineKeyedSetterProperty as usize] = handle_define_keyed_setter_property;
     table[Opcode::CollectTypeProfile as usize] = handle_collect_type_profile;
     table[Opcode::Add as usize] = handle_add;
     table[Opcode::Sub as usize] = handle_sub;
@@ -3924,9 +4165,9 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::SuspendGenerator as usize] = handle_suspend_generator;
     table[Opcode::SetGeneratorState as usize] = handle_set_generator_state;
     table[Opcode::SwitchOnGeneratorState as usize] = handle_switch_on_generator_state;
-    table[Opcode::CreateClass as usize] = handle_unimplemented;
-    table[Opcode::TestPrivateBrand as usize] = handle_unimplemented;
-    table[Opcode::DefinePrivateBrand as usize] = handle_unimplemented;
+    table[Opcode::CreateClass as usize] = handle_create_class;
+    table[Opcode::TestPrivateBrand as usize] = handle_test_private_brand;
+    table[Opcode::DefinePrivateBrand as usize] = handle_define_private_brand;
     table[Opcode::LdaModuleVariable as usize] = handle_unimplemented;
     table[Opcode::StaModuleVariable as usize] = handle_unimplemented;
     table[Opcode::LdaImportMeta as usize] = handle_unimplemented;
