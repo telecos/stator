@@ -2472,9 +2472,12 @@ impl FunctionCompiler {
                     vec![to_reg_op(obj_reg), slot],
                 ));
             }
-            crate::parser::ast::MemberProp::Private(_) => {
-                return Err(StatorError::Internal(
-                    "private member access is not yet supported".into(),
+            crate::parser::ast::MemberProp::Private(id) => {
+                let name_idx = self.add_string(&format!("#{}", id.name));
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaNamedProperty,
+                    vec![to_reg_op(obj_reg), Operand::ConstantPoolIdx(name_idx), slot],
                 ));
             }
         }
@@ -2517,9 +2520,12 @@ impl FunctionCompiler {
                     vec![to_reg_op(obj_reg), slot],
                 ));
             }
-            crate::parser::ast::MemberProp::Private(_) => {
-                return Err(StatorError::Internal(
-                    "private member access is not yet supported".into(),
+            crate::parser::ast::MemberProp::Private(id) => {
+                let name_idx = self.add_string(&format!("#{}", id.name));
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaNamedProperty,
+                    vec![to_reg_op(obj_reg), Operand::ConstantPoolIdx(name_idx), slot],
                 ));
             }
         }
@@ -2573,9 +2579,14 @@ impl FunctionCompiler {
                     .release_temporary(key_reg)
                     .map_err(|e| StatorError::Internal(e.to_string()))?;
             }
-            crate::parser::ast::MemberProp::Private(_) => {
-                return Err(StatorError::Internal(
-                    "private member store is not yet supported".into(),
+            crate::parser::ast::MemberProp::Private(id) => {
+                let name_idx = self.add_string(&format!("#{}", id.name));
+                let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+                // Reload value.
+                self.emit_ldar(val_reg);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::StaNamedProperty,
+                    vec![to_reg_op(obj_reg), Operand::ConstantPoolIdx(name_idx), slot],
                 ));
             }
         }
@@ -2745,9 +2756,16 @@ impl FunctionCompiler {
                     vec![to_reg_op(recv_reg), slot],
                 ));
             }
-            crate::parser::ast::MemberProp::Private(_) => {
-                return Err(StatorError::Internal(
-                    "private method calls are not yet supported".into(),
+            crate::parser::ast::MemberProp::Private(id) => {
+                let name_idx = self.add_string(&format!("#{}", id.name));
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaNamedProperty,
+                    vec![
+                        to_reg_op(recv_reg),
+                        Operand::ConstantPoolIdx(name_idx),
+                        slot,
+                    ],
                 ));
             }
         }
@@ -3415,9 +3433,16 @@ impl FunctionCompiler {
                     vec![to_reg_op(recv_reg), slot],
                 ));
             }
-            crate::parser::ast::MemberProp::Private(_) => {
-                return Err(StatorError::Internal(
-                    "private tagged-template method calls are not yet supported".into(),
+            crate::parser::ast::MemberProp::Private(id) => {
+                let name_idx = self.add_string(&format!("#{}", id.name));
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaNamedProperty,
+                    vec![
+                        to_reg_op(recv_reg),
+                        Operand::ConstantPoolIdx(name_idx),
+                        slot,
+                    ],
                 ));
             }
         }
