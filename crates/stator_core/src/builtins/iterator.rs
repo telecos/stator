@@ -10,8 +10,6 @@
 //! - [`iterator_next`] — advance any [`JsValue`] iterator one step.
 //! - [`iterator_to_vec`] — exhaust an iterator into a `Vec<JsValue>`.
 
-use std::rc::Rc;
-
 use crate::builtins::promise::{MicrotaskQueue, promise_reject, promise_resolve};
 use crate::error::{StatorError, StatorResult};
 use crate::objects::value::{GeneratorStep, JsValue, NativeIterator};
@@ -136,15 +134,16 @@ pub fn make_string_iterator(s: &str) -> JsValue {
 /// ];
 /// let iter = make_map_iterator(entries);
 /// let result = iterator_next(&iter).unwrap();
-/// assert_eq!(
-///     result.value,
-///     JsValue::Array(Rc::new(vec![JsValue::String("a".into()), JsValue::Smi(1)]))
-/// );
+/// if let JsValue::Array(arr) = &result.value {
+///     assert_eq!(*arr.borrow(), vec![JsValue::String("a".into()), JsValue::Smi(1)]);
+/// } else {
+///     panic!("expected Array");
+/// }
 /// ```
 pub fn make_map_iterator(entries: Vec<(JsValue, JsValue)>) -> JsValue {
     let items = entries
         .into_iter()
-        .map(|(k, v)| JsValue::Array(Rc::new(vec![k, v])))
+        .map(|(k, v)| JsValue::new_array(vec![k, v]))
         .collect();
     JsValue::Iterator(NativeIterator::from_items(items))
 }
@@ -365,7 +364,7 @@ pub fn iterator_flat_map(iter: &JsValue, mapper: &JsValue) -> StatorResult<JsVal
                 out.extend(inner);
             }
             JsValue::Array(arr) => {
-                out.extend(arr.iter().cloned());
+                out.extend(arr.borrow().iter().cloned());
             }
             _ => {
                 out.push(mapped);
@@ -424,7 +423,7 @@ pub fn iterator_reduce(
 /// Propagates any error from the source iterator.
 pub fn iterator_to_array(iter: &JsValue) -> StatorResult<JsValue> {
     let items = iterator_to_vec(iter)?;
-    Ok(JsValue::Array(Rc::new(items)))
+    Ok(JsValue::new_array(items))
 }
 
 /// ES2025 `Iterator.prototype.forEach(callback)`.
@@ -537,7 +536,7 @@ pub fn iterator_find(iter: &JsValue, predicate: &JsValue) -> StatorResult<JsValu
 pub fn iterator_from(iterable: &JsValue) -> StatorResult<JsValue> {
     match iterable {
         JsValue::Iterator(_) | JsValue::Generator(_) => Ok(iterable.clone()),
-        JsValue::Array(arr) => Ok(make_array_iterator(arr.as_ref().clone())),
+        JsValue::Array(arr) => Ok(make_array_iterator(arr.borrow().clone())),
         JsValue::String(s) => Ok(make_string_iterator(s)),
         _ => Err(StatorError::TypeError(format!(
             "Iterator.from: value is not iterable (got {iterable:?})"
@@ -716,6 +715,7 @@ mod tests {
     use crate::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
     use crate::bytecode::feedback::FeedbackMetadata;
     use crate::objects::value::GeneratorState;
+    use std::rc::Rc;
 
     // ── IteratorRecord ────────────────────────────────────────────────────────
 
@@ -785,22 +785,29 @@ mod tests {
 
     #[test]
     fn test_map_iterator_yields_key_value_pairs() {
-        use std::rc::Rc;
         let iter = make_map_iterator(vec![
             (JsValue::String("x".into()), JsValue::Smi(10)),
             (JsValue::String("y".into()), JsValue::Smi(20)),
         ]);
         let r1 = iterator_next(&iter).unwrap();
-        assert_eq!(
-            r1.value,
-            JsValue::Array(Rc::new(vec![JsValue::String("x".into()), JsValue::Smi(10)]))
-        );
+        if let JsValue::Array(arr) = &r1.value {
+            assert_eq!(
+                *arr.borrow(),
+                vec![JsValue::String("x".into()), JsValue::Smi(10)]
+            );
+        } else {
+            panic!("expected Array");
+        }
         assert!(!r1.done);
         let r2 = iterator_next(&iter).unwrap();
-        assert_eq!(
-            r2.value,
-            JsValue::Array(Rc::new(vec![JsValue::String("y".into()), JsValue::Smi(20)]))
-        );
+        if let JsValue::Array(arr) = &r2.value {
+            assert_eq!(
+                *arr.borrow(),
+                vec![JsValue::String("y".into()), JsValue::Smi(20)]
+            );
+        } else {
+            panic!("expected Array");
+        }
         assert!(!r2.done);
         assert!(iterator_next(&iter).unwrap().done);
     }
@@ -1078,10 +1085,10 @@ mod tests {
         let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2)]);
         let mapper = make_native_fn(|args| {
             let n = args[0].to_number()? as i32;
-            Ok(JsValue::Array(Rc::new(vec![
+            Ok(JsValue::new_array(vec![
                 JsValue::Smi(n),
                 JsValue::Smi(n * 10),
-            ])))
+            ]))
         });
         let result = iterator_flat_map(&iter, &mapper).unwrap();
         let items = iterator_to_vec(&result).unwrap();
@@ -1145,17 +1152,22 @@ mod tests {
     fn test_iterator_to_array_returns_js_array() {
         let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2)]);
         let result = iterator_to_array(&iter).unwrap();
-        assert_eq!(
-            result,
-            JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::Smi(2)]))
-        );
+        if let JsValue::Array(arr) = result {
+            assert_eq!(*arr.borrow(), vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        } else {
+            panic!("expected Array");
+        }
     }
 
     #[test]
     fn test_iterator_to_array_empty() {
         let iter = make_array_iterator(vec![]);
         let result = iterator_to_array(&iter).unwrap();
-        assert_eq!(result, JsValue::Array(Rc::new(vec![])));
+        if let JsValue::Array(arr) = result {
+            assert!(arr.borrow().is_empty());
+        } else {
+            panic!("expected Array");
+        }
     }
 
     // ── iterator_for_each ────────────────────────────────────────────────────
@@ -1274,7 +1286,7 @@ mod tests {
 
     #[test]
     fn test_iterator_from_array() {
-        let arr = JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::Smi(2)]));
+        let arr = JsValue::new_array(vec![JsValue::Smi(1), JsValue::Smi(2)]);
         let iter = iterator_from(&arr).unwrap();
         let items = iterator_to_vec(&iter).unwrap();
         assert_eq!(items, vec![JsValue::Smi(1), JsValue::Smi(2)]);
@@ -1385,10 +1397,10 @@ mod tests {
         let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2)]);
         let mapper = make_native_fn(|args| {
             let n = args[0].to_number()? as i32;
-            Ok(JsValue::Array(Rc::new(vec![
+            Ok(JsValue::new_array(vec![
                 JsValue::Smi(n),
                 JsValue::Smi(n * 10),
-            ])))
+            ]))
         });
         let result = async_iterator_flat_map(&iter, &mapper, &q);
         if let JsValue::Promise(p) = result {
@@ -1447,13 +1459,11 @@ mod tests {
         let result = async_iterator_to_array(&iter, &q);
         if let JsValue::Promise(p) = result {
             assert!(p.is_fulfilled());
-            assert_eq!(
-                p.value(),
-                Some(JsValue::Array(Rc::new(vec![
-                    JsValue::Smi(1),
-                    JsValue::Smi(2)
-                ])))
-            );
+            if let Some(JsValue::Array(arr)) = p.value() {
+                assert_eq!(*arr.borrow(), vec![JsValue::Smi(1), JsValue::Smi(2)]);
+            } else {
+                panic!("expected Array value in promise");
+            }
         } else {
             panic!("expected Promise");
         }
@@ -1534,7 +1544,7 @@ mod tests {
     #[test]
     fn test_async_iterator_from_array() {
         let q = make_queue();
-        let arr = JsValue::Array(Rc::new(vec![JsValue::Smi(1)]));
+        let arr = JsValue::new_array(vec![JsValue::Smi(1)]);
         let result = async_iterator_from(&arr, &q);
         if let JsValue::Promise(p) = result {
             assert!(p.is_fulfilled());

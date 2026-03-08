@@ -14,8 +14,6 @@
 //!
 //! * ECMAScript 2025 Language Specification §24.1 — *The Map Objects*
 
-use std::rc::Rc;
-
 use crate::objects::value::{JsValue, NativeIterator};
 
 use super::util::same_value_zero;
@@ -401,10 +399,11 @@ pub fn map_iter(map: &JsMap) -> Vec<(JsValue, JsValue)> {
 ///
 /// let iter = map_create_iterator(&m, MapIteratorKind::Entries);
 /// let r = iterator_next(&iter).unwrap();
-/// assert_eq!(
-///     r.value,
-///     JsValue::Array(Rc::new(vec![JsValue::String("a".into()), JsValue::Smi(1)]))
-/// );
+/// if let JsValue::Array(arr) = &r.value {
+///     assert_eq!(*arr.borrow(), vec![JsValue::String("a".into()), JsValue::Smi(1)]);
+/// } else {
+///     panic!("expected Array");
+/// }
 ///
 /// let iter = map_create_iterator(&m, MapIteratorKind::Keys);
 /// let r = iterator_next(&iter).unwrap();
@@ -419,7 +418,7 @@ pub fn map_create_iterator(map: &JsMap, kind: MapIteratorKind) -> JsValue {
         MapIteratorKind::Entries => map
             .entries
             .iter()
-            .map(|(k, v)| JsValue::Array(Rc::new(vec![k.clone(), v.clone()])))
+            .map(|(k, v)| JsValue::new_array(vec![k.clone(), v.clone()]))
             .collect(),
         MapIteratorKind::Keys => map.entries.iter().map(|(k, _)| k.clone()).collect(),
         MapIteratorKind::Values => map.entries.iter().map(|(_, v)| v.clone()).collect(),
@@ -642,15 +641,23 @@ mod tests {
         map_set(&mut m, JsValue::Smi(2), JsValue::String("b".into()));
         let iter = map_create_iterator(&m, MapIteratorKind::Entries);
         let r1 = iterator_next(&iter).unwrap();
-        assert_eq!(
-            r1.value,
-            JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::String("a".into())]))
-        );
+        if let JsValue::Array(arr) = &r1.value {
+            assert_eq!(
+                *arr.borrow(),
+                vec![JsValue::Smi(1), JsValue::String("a".into())]
+            );
+        } else {
+            panic!("expected Array");
+        }
         let r2 = iterator_next(&iter).unwrap();
-        assert_eq!(
-            r2.value,
-            JsValue::Array(Rc::new(vec![JsValue::Smi(2), JsValue::String("b".into())]))
-        );
+        if let JsValue::Array(arr) = &r2.value {
+            assert_eq!(
+                *arr.borrow(),
+                vec![JsValue::Smi(2), JsValue::String("b".into())]
+            );
+        } else {
+            panic!("expected Array");
+        }
         assert!(iterator_next(&iter).unwrap().done);
     }
 

@@ -359,7 +359,7 @@ impl HeapSnapshotBuilder {
         match value {
             JsValue::String(s) => (size_of::<String>() + s.len()) as u32,
             JsValue::Array(rc) => {
-                (size_of::<Vec<JsValue>>() + rc.len() * size_of::<JsValue>()) as u32
+                (size_of::<Vec<JsValue>>() + rc.borrow().len() * size_of::<JsValue>()) as u32
             }
             JsValue::PlainObject(rc) => {
                 let map = rc.borrow();
@@ -398,7 +398,7 @@ impl HeapSnapshotBuilder {
 
         match value {
             JsValue::Array(rc) => {
-                for (i, elem) in rc.iter().enumerate() {
+                for (i, elem) in rc.borrow().iter().enumerate() {
                     let child_offset = self.visit(elem);
                     child_edges.push((EDGE_TYPE_ELEMENT, i as u32, child_offset));
                 }
@@ -574,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_array_element_edges() {
-        let arr = JsValue::Array(Rc::new(vec![JsValue::Smi(10), JsValue::Smi(20)]));
+        let arr = JsValue::new_array(vec![JsValue::Smi(10), JsValue::Smi(20)]);
         let mut globals = HashMap::new();
         globals.insert("arr".to_string(), arr);
 
@@ -587,8 +587,8 @@ mod tests {
 
     #[test]
     fn test_snapshot_shared_rc_deduplication() {
-        // Two globals pointing to the same Rc<Vec<JsValue>>.
-        let shared = Rc::new(vec![JsValue::Smi(1)]);
+        // Two globals pointing to the same Rc<RefCell<Vec<JsValue>>>.
+        let shared = Rc::new(RefCell::new(vec![JsValue::Smi(1)]));
         let mut globals = HashMap::new();
         globals.insert("a".to_string(), JsValue::Array(Rc::clone(&shared)));
         globals.insert("b".to_string(), JsValue::Array(Rc::clone(&shared)));

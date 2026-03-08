@@ -78,8 +78,8 @@ fn is_wat(bytes: &[u8]) -> bool {
 fn bytes_from_js_value(val: &JsValue) -> StatorResult<Vec<u8>> {
     match val {
         JsValue::Array(items) => {
-            let mut bytes = Vec::with_capacity(items.len());
-            for (i, item) in items.iter().enumerate() {
+            let mut bytes = Vec::with_capacity(items.borrow().len());
+            for (i, item) in items.borrow().iter().enumerate() {
                 let n = match item {
                     JsValue::Smi(n) => *n,
                     JsValue::HeapNumber(f) => *f as i32,
@@ -133,10 +133,8 @@ fn make_module_object(module: &WasmModule, bytes: Vec<u8>) -> JsValue {
 
     // Store the original bytes so we can re-compile when instantiating.
     let js_bytes: Vec<JsValue> = bytes.iter().map(|&b| JsValue::Smi(i32::from(b))).collect();
-    map.borrow_mut().insert(
-        "__wasm_bytes__".to_string(),
-        JsValue::Array(Rc::new(js_bytes)),
-    );
+    map.borrow_mut()
+        .insert("__wasm_bytes__".to_string(), JsValue::new_array(js_bytes));
 
     // Build the exports descriptor array (`WebAssembly.Module.exports(mod)`).
     let export_descs: Vec<JsValue> = module
@@ -159,7 +157,7 @@ fn make_module_object(module: &WasmModule, bytes: Vec<u8>) -> JsValue {
         })
         .collect();
     map.borrow_mut()
-        .insert("exports".to_string(), JsValue::Array(Rc::new(export_descs)));
+        .insert("exports".to_string(), JsValue::new_array(export_descs));
 
     JsValue::PlainObject(map)
 }
@@ -192,6 +190,7 @@ fn extract_bytes_from_module(module_obj: &JsValue) -> StatorResult<Vec<u8>> {
 
     match map.borrow().get("__wasm_bytes__").cloned() {
         Some(JsValue::Array(arr)) => arr
+            .borrow()
             .iter()
             .enumerate()
             .map(|(i, v)| match v {
@@ -299,7 +298,7 @@ fn make_instance_object(module: &WasmModule, engine: &WasmEngine) -> StatorResul
 ///     .into_iter()
 ///     .map(|b: u8| JsValue::Smi(b as i32))
 ///     .collect();
-/// let result = wasm_validate(vec![JsValue::Array(std::rc::Rc::new(bytes))]).unwrap();
+/// let result = wasm_validate(vec![JsValue::new_array(bytes)]).unwrap();
 /// assert_eq!(result, JsValue::Boolean(true));
 /// ```
 pub fn wasm_validate(args: Vec<JsValue>) -> StatorResult<JsValue> {
@@ -878,7 +877,7 @@ mod tests {
             .iter()
             .map(|&b| JsValue::Smi(i32::from(b)))
             .collect();
-        JsValue::Array(Rc::new(bytes))
+        JsValue::new_array(bytes)
     }
 
     /// Helper: plain descriptor object `{key: value}`.
@@ -894,14 +893,14 @@ mod tests {
 
     #[test]
     fn test_bytes_from_array_of_smis() {
-        let arr = JsValue::Array(Rc::new(vec![JsValue::Smi(0), JsValue::Smi(255)]));
+        let arr = JsValue::new_array(vec![JsValue::Smi(0), JsValue::Smi(255)]);
         let bytes = bytes_from_js_value(&arr).unwrap();
         assert_eq!(bytes, vec![0u8, 255u8]);
     }
 
     #[test]
     fn test_bytes_from_heap_number() {
-        let arr = JsValue::Array(Rc::new(vec![JsValue::HeapNumber(1.0)]));
+        let arr = JsValue::new_array(vec![JsValue::HeapNumber(1.0)]);
         let bytes = bytes_from_js_value(&arr).unwrap();
         assert_eq!(bytes, vec![1u8]);
     }
@@ -921,7 +920,7 @@ mod tests {
 
     #[test]
     fn test_bytes_out_of_range_returns_error() {
-        let arr = JsValue::Array(Rc::new(vec![JsValue::Smi(256)]));
+        let arr = JsValue::new_array(vec![JsValue::Smi(256)]);
         let err = bytes_from_js_value(&arr).unwrap_err();
         assert!(matches!(err, StatorError::TypeError(_)));
     }
@@ -954,7 +953,7 @@ mod tests {
 
     #[test]
     fn test_validate_invalid_bytes_returns_false() {
-        let bad = JsValue::Array(Rc::new(vec![JsValue::Smi(0x00), JsValue::Smi(0x00)]));
+        let bad = JsValue::new_array(vec![JsValue::Smi(0x00), JsValue::Smi(0x00)]);
         let result = wasm_validate(vec![bad]).unwrap();
         assert_eq!(result, JsValue::Boolean(false));
     }
@@ -1013,8 +1012,8 @@ mod tests {
         if let JsValue::PlainObject(map) = m {
             let exports = map.borrow().get("exports").cloned().unwrap();
             if let JsValue::Array(arr) = exports {
-                assert_eq!(arr.len(), 1);
-                if let JsValue::PlainObject(desc) = &arr[0] {
+                assert_eq!(arr.borrow().len(), 1);
+                if let JsValue::PlainObject(desc) = &arr.borrow()[0] {
                     let name = desc.borrow().get("name").cloned();
                     let kind = desc.borrow().get("kind").cloned();
                     assert_eq!(name, Some(JsValue::String("add".to_string())));
@@ -1066,7 +1065,7 @@ mod tests {
         let m = wasm_module_ctor(vec![wat_val(ADD_WAT)]).unwrap();
         if let JsValue::PlainObject(map) = m {
             if let Some(JsValue::Array(arr)) = map.borrow().get("exports").cloned() {
-                assert_eq!(arr.len(), 1);
+                assert_eq!(arr.borrow().len(), 1);
             } else {
                 panic!("expected exports array with one entry");
             }
@@ -1080,7 +1079,7 @@ mod tests {
         let m = wasm_module_ctor(vec![wat_val(MULTI_EXPORT_WAT)]).unwrap();
         if let JsValue::PlainObject(map) = m {
             if let Some(JsValue::Array(arr)) = map.borrow().get("exports").cloned() {
-                assert_eq!(arr.len(), 2);
+                assert_eq!(arr.borrow().len(), 2);
             } else {
                 panic!("expected exports array with two entries");
             }

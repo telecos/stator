@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_has_instance_array() {
-        let arr = JsValue::Array(Rc::new(vec![]));
+        let arr = JsValue::new_array(vec![]);
         assert!(function_has_instance(&arr, &JsValue::Undefined));
     }
 

@@ -1415,7 +1415,7 @@ fn handle_call_with_spread(
     // expand it into the real argument list.
     let args = if raw_args.len() == 1 {
         if let JsValue::Array(ref items) = raw_args[0] {
-            (**items).clone()
+            items.borrow().clone()
         } else {
             raw_args
         }
@@ -1565,7 +1565,7 @@ fn handle_construct_with_spread(
     let raw_args = collect_args(ctx.frame, args_start_v, arg_count)?;
     let args = if raw_args.len() == 1 {
         if let JsValue::Array(ref items) = raw_args[0] {
-            (**items).clone()
+            items.borrow().clone()
         } else {
             raw_args
         }
@@ -2042,7 +2042,7 @@ fn handle_get_iterator(
     let iterable = ctx.frame.read_reg(iter_v)?.clone();
     ctx.frame.accumulator = match iterable {
         JsValue::Array(items) => {
-            let items_vec: Vec<JsValue> = (*items).clone();
+            let items_vec: Vec<JsValue> = items.borrow().clone();
             JsValue::Iterator(NativeIterator::from_items(items_vec))
         }
         JsValue::String(ref s) => JsValue::Iterator(NativeIterator::from_string(s)),
@@ -2083,7 +2083,7 @@ fn handle_get_async_iterator(
     let iterable = ctx.frame.read_reg(iter_v)?.clone();
     ctx.frame.accumulator = match iterable {
         JsValue::Array(items) => {
-            let items_vec: Vec<JsValue> = (*items).clone();
+            let items_vec: Vec<JsValue> = items.borrow().clone();
             JsValue::Iterator(NativeIterator::from_items(items_vec))
         }
         JsValue::String(ref s) => JsValue::Iterator(NativeIterator::from_string(s)),
@@ -2458,7 +2458,7 @@ fn handle_create_array_from_iterable(
 ) -> StatorResult<DispatchAction> {
     let iterable = ctx.frame.accumulator.clone();
     let items: Vec<JsValue> = match &iterable {
-        JsValue::Array(arr) => (**arr).clone(),
+        JsValue::Array(arr) => arr.borrow().clone(),
         JsValue::Iterator(iter) => {
             let mut out = Vec::new();
             loop {
@@ -2722,7 +2722,7 @@ fn handle_test_in(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
             {
                 true
             } else if let Some(idx) = to_array_index(key) {
-                idx < items.len()
+                idx < items.borrow().len()
             } else {
                 false
             }
@@ -2749,7 +2749,7 @@ fn handle_for_in_enumerate(
             .map(|k| JsValue::String(k.clone()))
             .collect(),
         JsValue::Array(items) => {
-            let mut ks: Vec<JsValue> = (0..items.len())
+            let mut ks: Vec<JsValue> = (0..items.borrow().len())
                 .map(|i| JsValue::String(i.to_string()))
                 .collect();
             ks.push(JsValue::String("length".to_string()));
@@ -2758,7 +2758,7 @@ fn handle_for_in_enumerate(
         JsValue::Null | JsValue::Undefined => vec![],
         _ => vec![],
     };
-    ctx.frame.accumulator = JsValue::Array(Rc::new(keys));
+    ctx.frame.accumulator = JsValue::new_array(keys);
     Ok(DispatchAction::Continue)
 }
 
@@ -2772,7 +2772,7 @@ fn handle_for_in_prepare(
     // operands[1] is a FeedbackSlot, ignored at runtime.
     let keys = ctx.frame.read_reg(keys_v)?.clone();
     let len = match &keys {
-        JsValue::Array(items) => items.len() as i32,
+        JsValue::Array(items) => items.borrow().len() as i32,
         _ => 0,
     };
     ctx.frame.accumulator = JsValue::Smi(len);
@@ -2799,7 +2799,11 @@ fn handle_for_in_next(
     };
     let keys = ctx.frame.read_reg(keys_v)?.clone();
     let key = match &keys {
-        JsValue::Array(items) => items.get(idx).cloned().unwrap_or(JsValue::Undefined),
+        JsValue::Array(items) => items
+            .borrow()
+            .get(idx)
+            .cloned()
+            .unwrap_or(JsValue::Undefined),
         _ => JsValue::Undefined,
     };
     ctx.frame.accumulator = key;
@@ -2915,7 +2919,7 @@ fn handle_create_rest_parameter(
     } else {
         vec![]
     };
-    ctx.frame.accumulator = JsValue::Array(Rc::new(rest));
+    ctx.frame.accumulator = JsValue::new_array(rest);
     Ok(DispatchAction::Continue)
 }
 
@@ -3730,10 +3734,13 @@ fn handle_create_object_from_iterable(
         JsValue::PlainObject(obj) => obj.borrow().clone(),
         JsValue::Array(arr) => {
             let mut m = PropertyMap::new();
-            for (i, v) in arr.iter().enumerate() {
+            for (i, v) in arr.borrow().iter().enumerate() {
                 m.insert(i.to_string(), v.clone());
             }
-            m.insert("length".to_string(), JsValue::Smi(arr.len() as i32));
+            m.insert(
+                "length".to_string(),
+                JsValue::Smi(arr.borrow().len() as i32),
+            );
             m
         }
         JsValue::Iterator(iter) => {

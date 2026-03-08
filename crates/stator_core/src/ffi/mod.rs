@@ -314,7 +314,7 @@ impl V8Array {
     pub fn new(len: u32) -> Self {
         let items: Vec<JsValue> = vec![JsValue::Undefined; len as usize];
         Self {
-            inner: JsValue::Array(Rc::new(items)),
+            inner: JsValue::new_array(items),
         }
     }
 
@@ -326,14 +326,14 @@ impl V8Array {
     /// Create an array from a `Vec<JsValue>`.
     pub fn from_vec(items: Vec<JsValue>) -> Self {
         Self {
-            inner: JsValue::Array(Rc::new(items)),
+            inner: JsValue::new_array(items),
         }
     }
 
     /// Return the number of elements.
     pub fn length(&self) -> u32 {
         match &self.inner {
-            JsValue::Array(items) => items.len() as u32,
+            JsValue::Array(items) => items.borrow().len() as u32,
             _ => 0,
         }
     }
@@ -342,6 +342,7 @@ impl V8Array {
     pub fn get(&self, index: u32) -> JsValue {
         match &self.inner {
             JsValue::Array(items) => items
+                .borrow()
                 .get(index as usize)
                 .cloned()
                 .unwrap_or(JsValue::Undefined),
@@ -357,31 +358,31 @@ impl V8Array {
         // JsValue::Array uses Rc<Vec<JsValue>>, so we need to make_mut.
         // Since Rc doesn't have make_mut, we reconstruct.
         if let JsValue::Array(items) = &self.inner {
-            let mut new_items: Vec<JsValue> = items.as_ref().clone();
+            let mut new_items: Vec<JsValue> = items.borrow().clone();
             let idx = index as usize;
             if idx >= new_items.len() {
                 new_items.resize(idx + 1, JsValue::Undefined);
             }
             new_items[idx] = value;
-            self.inner = JsValue::Array(Rc::new(new_items));
+            self.inner = JsValue::new_array(new_items);
         }
     }
 
     /// Append a value to the end of the array.
     pub fn push(&mut self, value: JsValue) {
         if let JsValue::Array(items) = &self.inner {
-            let mut new_items: Vec<JsValue> = items.as_ref().clone();
+            let mut new_items: Vec<JsValue> = items.borrow().clone();
             new_items.push(value);
-            self.inner = JsValue::Array(Rc::new(new_items));
+            self.inner = JsValue::new_array(new_items);
         }
     }
 
     /// Remove and return the last element, or `None` if empty.
     pub fn pop(&mut self) -> Option<JsValue> {
         if let JsValue::Array(items) = &self.inner {
-            let mut new_items: Vec<JsValue> = items.as_ref().clone();
+            let mut new_items: Vec<JsValue> = items.borrow().clone();
             let result = new_items.pop();
-            self.inner = JsValue::Array(Rc::new(new_items));
+            self.inner = JsValue::new_array(new_items);
             result
         } else {
             None
@@ -1320,8 +1321,7 @@ mod tests {
 
     #[test]
     fn test_v8array_from_jsvalue() {
-        let items = Rc::new(vec![JsValue::Smi(5)]);
-        let val = JsValue::Array(items);
+        let val = JsValue::new_array(vec![JsValue::Smi(5)]);
         let arr = V8Array::from(val);
         assert_eq!(arr.length(), 1);
         assert_eq!(arr.get(0), JsValue::Smi(5));
@@ -1618,7 +1618,7 @@ mod tests {
 
     #[test]
     fn test_v8value_try_into_array() {
-        let arr_val = JsValue::Array(Rc::new(vec![JsValue::Smi(1)]));
+        let arr_val = JsValue::new_array(vec![JsValue::Smi(1)]);
         let v = V8Value::new(arr_val);
         assert!(v.is_array());
         let arr = v.try_into_array().unwrap();

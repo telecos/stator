@@ -580,12 +580,16 @@ pub fn promise_finally(
 ///     &queue,
 /// );
 /// queue.drain();
-/// assert_eq!(p.value(), Some(JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::Smi(2)]))));
+/// if let Some(JsValue::Array(arr)) = p.value() {
+///     assert_eq!(*arr.borrow(), vec![JsValue::Smi(1), JsValue::Smi(2)]);
+/// } else {
+///     panic!("expected Array");
+/// }
 /// ```
 pub fn promise_all(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromise {
     let count = promises.len();
     if count == 0 {
-        return promise_resolve(JsValue::Array(Rc::new(Vec::new())), queue);
+        return promise_resolve(JsValue::new_array(Vec::new()), queue);
     }
 
     let results: Rc<RefCell<Vec<Option<JsValue>>>> = Rc::new(RefCell::new(vec![None; count]));
@@ -612,7 +616,7 @@ pub fn promise_all(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromis
                     .iter()
                     .map(|r| r.clone().expect("slot filled by preceding reaction"))
                     .collect();
-                p_result_f.resolve(JsValue::Array(Rc::new(all)), &q_f);
+                p_result_f.resolve(JsValue::new_array(all), &q_f);
             }
             Ok(JsValue::Undefined)
         }) as PromiseHandler);
@@ -642,7 +646,7 @@ pub fn promise_all(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromis
 pub fn promise_all_settled(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromise {
     let count = promises.len();
     if count == 0 {
-        return promise_resolve(JsValue::Array(Rc::new(Vec::new())), queue);
+        return promise_resolve(JsValue::new_array(Vec::new()), queue);
     }
 
     let results: Rc<RefCell<Vec<Option<JsValue>>>> = Rc::new(RefCell::new(vec![None; count]));
@@ -661,19 +665,19 @@ pub fn promise_all_settled(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> 
         let q_r = queue.clone();
 
         let on_fulfilled = Some(Box::new(move |v: JsValue| {
-            results_f.borrow_mut()[i] = Some(JsValue::Array(Rc::new(vec![
+            results_f.borrow_mut()[i] = Some(JsValue::new_array(vec![
                 JsValue::String("fulfilled".to_string()),
                 v,
-            ])));
+            ]));
             settle_all_settled(&results_f, &remaining_f, &p_result_f, &q_f);
             Ok(JsValue::Undefined)
         }) as PromiseHandler);
 
         let on_rejected = Some(Box::new(move |r: JsValue| {
-            results_r.borrow_mut()[i] = Some(JsValue::Array(Rc::new(vec![
+            results_r.borrow_mut()[i] = Some(JsValue::new_array(vec![
                 JsValue::String("rejected".to_string()),
                 r.clone(),
-            ])));
+            ]));
             settle_all_settled(&results_r, &remaining_r, &p_result_r, &q_r);
             Ok(JsValue::Undefined)
         }) as PromiseHandler);
@@ -701,7 +705,7 @@ fn settle_all_settled(
             .iter()
             .map(|r| r.clone().expect("slot filled by preceding reaction"))
             .collect();
-        p_result.resolve(JsValue::Array(Rc::new(all)), queue);
+        p_result.resolve(JsValue::new_array(all), queue);
     }
 }
 
@@ -718,7 +722,7 @@ fn settle_all_settled(
 pub fn promise_any(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromise {
     let count = promises.len();
     if count == 0 {
-        return promise_reject(JsValue::Array(Rc::new(Vec::new())), queue);
+        return promise_reject(JsValue::new_array(Vec::new()), queue);
     }
 
     let errors: Rc<RefCell<Vec<Option<JsValue>>>> = Rc::new(RefCell::new(vec![None; count]));
@@ -750,7 +754,7 @@ pub fn promise_any(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromis
                     .iter()
                     .map(|e| e.clone().expect("slot filled by preceding reaction"))
                     .collect();
-                p_result_r.reject(JsValue::Array(Rc::new(all)), &q_r);
+                p_result_r.reject(JsValue::new_array(all), &q_r);
             }
             Err(r)
         }) as PromiseHandler);
@@ -1224,14 +1228,14 @@ mod tests {
             &queue,
         );
         queue.drain();
-        assert_eq!(
-            p.value(),
-            Some(JsValue::Array(Rc::new(vec![
-                JsValue::Smi(1),
-                JsValue::Smi(2),
-                JsValue::Smi(3),
-            ])))
-        );
+        if let Some(JsValue::Array(arr)) = p.value() {
+            assert_eq!(
+                *arr.borrow(),
+                vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]
+            );
+        } else {
+            panic!("expected Array");
+        }
     }
 
     #[test]
@@ -1255,7 +1259,11 @@ mod tests {
         let queue = MicrotaskQueue::new();
         let p = promise_all(vec![], &queue);
         assert!(p.is_fulfilled());
-        assert_eq!(p.value(), Some(JsValue::Array(Rc::new(vec![]))));
+        if let Some(JsValue::Array(arr)) = p.value() {
+            assert!(arr.borrow().is_empty());
+        } else {
+            panic!("expected Array");
+        }
     }
 
     // ── promise_all_settled ───────────────────────────────────────────────────
@@ -1273,21 +1281,26 @@ mod tests {
         queue.drain();
         assert!(p.is_fulfilled());
         if let Some(JsValue::Array(arr)) = p.value() {
-            assert_eq!(arr.len(), 2);
-            assert_eq!(
-                arr[0],
-                JsValue::Array(Rc::new(vec![
-                    JsValue::String("fulfilled".to_string()),
-                    JsValue::Smi(1),
-                ]))
-            );
-            assert_eq!(
-                arr[1],
-                JsValue::Array(Rc::new(vec![
-                    JsValue::String("rejected".to_string()),
-                    JsValue::String("boom".to_string()),
-                ]))
-            );
+            assert_eq!(arr.borrow().len(), 2);
+            if let JsValue::Array(inner0) = &arr.borrow()[0] {
+                assert_eq!(
+                    *inner0.borrow(),
+                    vec![JsValue::String("fulfilled".to_string()), JsValue::Smi(1)]
+                );
+            } else {
+                panic!("expected inner Array at [0]");
+            }
+            if let JsValue::Array(inner1) = &arr.borrow()[1] {
+                assert_eq!(
+                    *inner1.borrow(),
+                    vec![
+                        JsValue::String("rejected".to_string()),
+                        JsValue::String("boom".to_string()),
+                    ]
+                );
+            } else {
+                panic!("expected inner Array at [1]");
+            }
         } else {
             panic!("expected JsValue::Array");
         }
@@ -1323,13 +1336,11 @@ mod tests {
         );
         queue.drain();
         assert!(p.is_rejected());
-        assert_eq!(
-            p.reason(),
-            Some(JsValue::Array(Rc::new(vec![
-                JsValue::Smi(1),
-                JsValue::Smi(2)
-            ])))
-        );
+        if let Some(JsValue::Array(arr)) = p.reason() {
+            assert_eq!(*arr.borrow(), vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        } else {
+            panic!("expected Array reason");
+        }
     }
 
     // ── promise_race ──────────────────────────────────────────────────────────

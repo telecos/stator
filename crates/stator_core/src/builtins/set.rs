@@ -14,8 +14,6 @@
 //!
 //! * ECMAScript 2025 Language Specification §24.2 — *The Set Objects*
 
-use std::rc::Rc;
-
 use crate::objects::value::{JsValue, NativeIterator};
 
 use super::util::same_value_zero;
@@ -358,10 +356,11 @@ pub fn set_iter(set: &JsSet) -> Vec<JsValue> {
 ///
 /// let iter = set_create_iterator(&s, SetIteratorKind::Entries);
 /// let r = iterator_next(&iter).unwrap();
-/// assert_eq!(
-///     r.value,
-///     JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::Smi(1)]))
-/// );
+/// if let JsValue::Array(arr) = &r.value {
+///     assert_eq!(*arr.borrow(), vec![JsValue::Smi(1), JsValue::Smi(1)]);
+/// } else {
+///     panic!("expected Array");
+/// }
 /// ```
 pub fn set_create_iterator(set: &JsSet, kind: SetIteratorKind) -> JsValue {
     let items: Vec<JsValue> = match kind {
@@ -369,7 +368,7 @@ pub fn set_create_iterator(set: &JsSet, kind: SetIteratorKind) -> JsValue {
         SetIteratorKind::Entries => set
             .values
             .iter()
-            .map(|v| JsValue::Array(Rc::new(vec![v.clone(), v.clone()])))
+            .map(|v| JsValue::new_array(vec![v.clone(), v.clone()]))
             .collect(),
     };
     JsValue::Iterator(NativeIterator::from_items(items))
@@ -573,15 +572,17 @@ mod tests {
         set_add(&mut s, JsValue::Smi(2));
         let iter = set_create_iterator(&s, SetIteratorKind::Entries);
         let r1 = iterator_next(&iter).unwrap();
-        assert_eq!(
-            r1.value,
-            JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::Smi(1)]))
-        );
+        if let JsValue::Array(arr) = &r1.value {
+            assert_eq!(*arr.borrow(), vec![JsValue::Smi(1), JsValue::Smi(1)]);
+        } else {
+            panic!("expected Array");
+        }
         let r2 = iterator_next(&iter).unwrap();
-        assert_eq!(
-            r2.value,
-            JsValue::Array(Rc::new(vec![JsValue::Smi(2), JsValue::Smi(2)]))
-        );
+        if let JsValue::Array(arr) = &r2.value {
+            assert_eq!(*arr.borrow(), vec![JsValue::Smi(2), JsValue::Smi(2)]);
+        } else {
+            panic!("expected Array");
+        }
         assert!(iterator_next(&iter).unwrap().done);
     }
 
