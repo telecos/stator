@@ -184,6 +184,7 @@ use crate::bytecode::bytecodes::decode_with_byte_offsets;
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::debugger::Debugger;
 use crate::objects::property_map::PropertyMap;
+use crate::objects::string_intern::intern;
 use crate::objects::value::{JsContext, JsValue};
 
 // Re-export generator types and bring them into scope so external code can
@@ -969,7 +970,7 @@ impl InterpreterFrame {
             return Ok(Rc::clone(cached));
         }
         let s = match self.bytecode_array.get_constant(idx) {
-            Some(ConstantPoolEntry::String(s)) => Rc::from(s.as_str()),
+            Some(ConstantPoolEntry::String(s)) => intern(s.as_str()),
             _ => {
                 return Err(StatorError::Internal(
                     "get_string_constant: constant is not a string".into(),

@@ -27,6 +27,8 @@ pub mod regexp;
 pub mod shapes;
 /// JavaScript string types with multiple internal representations.
 pub mod string;
+/// Thread-local string interning pool for property-name deduplication.
+pub mod string_intern;
 /// Tagged pointer representation for JavaScript values.
 pub mod tagged;
 /// Top-level JavaScript value enum and ECMAScript §7.1 type conversions.
