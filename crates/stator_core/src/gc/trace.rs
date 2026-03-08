@@ -52,6 +52,71 @@ pub trait Trace {
     fn trace(&self, tracer: &mut Tracer);
 }
 
+/// Dispatch `Trace::trace` on a raw `HeapObject` pointer by reading the
+/// object's `instance_type()` from its [`Map`][crate::objects::map::Map]
+/// and down-casting to the concrete Rust type.
+///
+/// # Safety
+///
+/// `ptr` must point to a valid, live `HeapObject` whose map pointer has
+/// been properly initialised.  The object must actually be of the type
+/// indicated by its `InstanceType`.
+pub unsafe fn trace_heap_object(
+    ptr: *mut crate::objects::heap_object::HeapObject,
+    tracer: &mut Tracer,
+) {
+    use crate::objects::map::InstanceType;
+
+    if ptr.is_null() {
+        return;
+    }
+
+    // Guard: skip objects with null or invalid map words (e.g. freshly
+    // allocated objects with HeapObject::new_null() or forwarding ptrs).
+    // SAFETY: ptr is a valid HeapObject per caller contract.
+    if !unsafe { (*ptr).has_map() } {
+        return;
+    }
+
+    // SAFETY: caller guarantees `ptr` is a valid HeapObject with a live map.
+    let instance_type = unsafe { (*ptr).instance_type() };
+
+    match instance_type {
+        InstanceType::JsObject => {
+            // SAFETY: caller guarantees the object type matches.
+            let obj = unsafe { &*(ptr as *const crate::objects::js_object::JsObject) };
+            obj.trace(tracer);
+        }
+        InstanceType::JsArray => {
+            let obj = unsafe { &*(ptr as *const crate::objects::js_array::JsArray) };
+            obj.trace(tracer);
+        }
+        InstanceType::JsFunction => {
+            let obj = unsafe { &*(ptr as *const crate::objects::js_function::JsFunction) };
+            obj.trace(tracer);
+        }
+        // Primitive heap types (HeapNumber, BigInt, Symbol) hold no outgoing
+        // heap references — nothing to trace.
+        InstanceType::HeapNumber | InstanceType::BigInt | InstanceType::Symbol => {}
+
+        // String types: flat strings hold no GC pointers.
+        InstanceType::JsString | InstanceType::InternalizedString | InstanceType::ThinString => {}
+
+        // Internal engine types that don't hold JS-level heap pointers.
+        InstanceType::Map
+        | InstanceType::FixedArray
+        | InstanceType::ByteArray
+        | InstanceType::SharedFunctionInfo
+        | InstanceType::Code
+        | InstanceType::FunctionTemplate => {}
+
+        // Remaining JS types: conservatively skip tracing for now.
+        // As concrete Trace impls are added for JsRegExp, JsDate, etc.,
+        // additional arms should be added here.
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

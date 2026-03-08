@@ -21,6 +21,7 @@ use std::cell::RefCell;
 
 use crate::gc::gc_ptr::{GcObject, GcPtr};
 use crate::gc::heap::Heap;
+use crate::gc::immix::{ImmixSpace, Tlab};
 use crate::objects::heap_object::HeapObject;
 
 thread_local! {
@@ -29,6 +30,12 @@ thread_local! {
 
     /// Simple allocation counter for triggering GC heuristics.
     static GC_STATS: RefCell<GcRuntimeStats> = RefCell::new(GcRuntimeStats::new());
+
+    /// Thread-local Immix allocation buffer.
+    static IMMIX_TLAB: RefCell<Tlab> = RefCell::new(Tlab::new());
+
+    /// Shared Immix block space (thread-local for single-threaded engine).
+    static IMMIX_SPACE: RefCell<ImmixSpace> = RefCell::new(ImmixSpace::with_defaults());
 }
 
 /// GC runtime statistics.
@@ -158,6 +165,42 @@ pub fn gc_set_threshold(threshold: usize) {
 /// within the closure `f`.
 pub fn with_heap<R>(f: impl FnOnce(&mut Heap) -> R) -> R {
     GC_HEAP.with(|heap| f(&mut heap.borrow_mut()))
+}
+
+/// Allocate from the Immix block-based allocator via the thread-local TLAB.
+///
+/// Returns a pointer to the allocated bytes, or `None` if the Immix space
+/// cannot provide a block.  The returned pointer is **not** typed; callers
+/// must initialise the object header.
+pub fn gc_alloc_immix(layout: Layout) -> Option<*mut u8> {
+    IMMIX_TLAB.with(|tlab| {
+        IMMIX_SPACE.with(|space| {
+            let ptr = tlab
+                .borrow_mut()
+                .allocate(layout, &mut space.borrow_mut())?;
+
+            GC_STATS.with(|stats| {
+                let mut s = stats.borrow_mut();
+                s.bytes_allocated += layout.size();
+            });
+
+            Some(ptr)
+        })
+    })
+}
+
+/// Access the thread-local Immix space for collection operations.
+pub fn with_immix_space<R>(f: impl FnOnce(&mut ImmixSpace) -> R) -> R {
+    IMMIX_SPACE.with(|space| f(&mut space.borrow_mut()))
+}
+
+/// Flush the thread-local TLAB back to the Immix space (e.g. before GC).
+pub fn flush_immix_tlab() {
+    IMMIX_TLAB.with(|tlab| {
+        IMMIX_SPACE.with(|space| {
+            tlab.borrow_mut().flush(&mut space.borrow_mut());
+        });
+    });
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
