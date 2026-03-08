@@ -2134,6 +2134,338 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             _ => {}
         },
+        JsValue::Array(arr) => {
+            let arr_rc = Rc::clone(arr);
+            match key {
+                "length" => return JsValue::Smi(arr.len() as i32),
+                "push" => {
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        // push is a no-op on immutable Rc<Vec>; return current length.
+                        Ok(JsValue::Smi(arr_rc.len() as i32))
+                    }));
+                }
+                "pop" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        Ok(a.last().cloned().unwrap_or(JsValue::Undefined))
+                    }));
+                }
+                "join" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let sep = match args.first() {
+                            Some(JsValue::String(s)) => s.clone(),
+                            _ => ",".to_string(),
+                        };
+                        let parts: Vec<String> = a
+                            .iter()
+                            .map(|v| match v {
+                                JsValue::String(s) => s.clone(),
+                                JsValue::Smi(n) => n.to_string(),
+                                JsValue::HeapNumber(n) => format!("{n}"),
+                                JsValue::Boolean(b) => b.to_string(),
+                                JsValue::Null => "null".to_string(),
+                                JsValue::Undefined => "".to_string(),
+                                _ => String::new(),
+                            })
+                            .collect();
+                        Ok(JsValue::String(parts.join(&sep)))
+                    }));
+                }
+                "toString" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        let parts: Vec<String> = a
+                            .iter()
+                            .map(|v| match v {
+                                JsValue::String(s) => s.clone(),
+                                JsValue::Smi(n) => n.to_string(),
+                                JsValue::HeapNumber(n) => format!("{n}"),
+                                JsValue::Boolean(b) => b.to_string(),
+                                JsValue::Null => "null".to_string(),
+                                JsValue::Undefined => "".to_string(),
+                                _ => String::new(),
+                            })
+                            .collect();
+                        Ok(JsValue::String(parts.join(",")))
+                    }));
+                }
+                "indexOf" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let search = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        Ok(JsValue::Smi(
+                            a.iter()
+                                .position(|v| strict_eq(v, &search))
+                                .map_or(-1, |i| i as i32),
+                        ))
+                    }));
+                }
+                "includes" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let search = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        Ok(JsValue::Boolean(a.iter().any(|v| strict_eq(v, &search))))
+                    }));
+                }
+                "slice" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let len = a.len() as i32;
+                        let start = match args.first() {
+                            Some(JsValue::Smi(i)) => {
+                                if *i < 0 {
+                                    (len + *i).max(0) as usize
+                                } else {
+                                    (*i as usize).min(len as usize)
+                                }
+                            }
+                            _ => 0,
+                        };
+                        let end = match args.get(1) {
+                            Some(JsValue::Smi(i)) => {
+                                if *i < 0 {
+                                    (len + *i).max(0) as usize
+                                } else {
+                                    (*i as usize).min(len as usize)
+                                }
+                            }
+                            _ => len as usize,
+                        };
+                        if start >= end {
+                            Ok(JsValue::Array(Rc::new(vec![])))
+                        } else {
+                            Ok(JsValue::Array(Rc::new(a[start..end].to_vec())))
+                        }
+                    }));
+                }
+                "concat" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let mut result = a.as_ref().clone();
+                        for arg in args {
+                            match arg {
+                                JsValue::Array(other) => result.extend_from_slice(&other),
+                                v => result.push(v),
+                            }
+                        }
+                        Ok(JsValue::Array(Rc::new(result)))
+                    }));
+                }
+                "map" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let mut results = Vec::with_capacity(a.len());
+                        for (i, item) in a.iter().enumerate() {
+                            let val = dispatch_call_value(
+                                &callback,
+                                vec![item.clone(), JsValue::Smi(i as i32)],
+                            )?;
+                            results.push(val);
+                        }
+                        Ok(JsValue::Array(Rc::new(results)))
+                    }));
+                }
+                "filter" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let mut results = Vec::new();
+                        for (i, item) in a.iter().enumerate() {
+                            let val = dispatch_call_value(
+                                &callback,
+                                vec![item.clone(), JsValue::Smi(i as i32)],
+                            )?;
+                            if val.to_boolean() {
+                                results.push(item.clone());
+                            }
+                        }
+                        Ok(JsValue::Array(Rc::new(results)))
+                    }));
+                }
+                "forEach" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        for (i, item) in a.iter().enumerate() {
+                            dispatch_call_value(
+                                &callback,
+                                vec![item.clone(), JsValue::Smi(i as i32)],
+                            )?;
+                        }
+                        Ok(JsValue::Undefined)
+                    }));
+                }
+                "reduce" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let mut acc = args
+                            .get(1)
+                            .cloned()
+                            .unwrap_or_else(|| a.first().cloned().unwrap_or(JsValue::Undefined));
+                        let start = if args.get(1).is_some() { 0 } else { 1 };
+                        for (i, item) in a.iter().enumerate().skip(start) {
+                            acc = dispatch_call_value(
+                                &callback,
+                                vec![acc, item.clone(), JsValue::Smi(i as i32)],
+                            )?;
+                        }
+                        Ok(acc)
+                    }));
+                }
+                "find" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        for (i, item) in a.iter().enumerate() {
+                            let val = dispatch_call_value(
+                                &callback,
+                                vec![item.clone(), JsValue::Smi(i as i32)],
+                            )?;
+                            if val.to_boolean() {
+                                return Ok(item.clone());
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }));
+                }
+                "findIndex" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        for (i, item) in a.iter().enumerate() {
+                            let val = dispatch_call_value(
+                                &callback,
+                                vec![item.clone(), JsValue::Smi(i as i32)],
+                            )?;
+                            if val.to_boolean() {
+                                return Ok(JsValue::Smi(i as i32));
+                            }
+                        }
+                        Ok(JsValue::Smi(-1))
+                    }));
+                }
+                "every" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        for (i, item) in a.iter().enumerate() {
+                            let val = dispatch_call_value(
+                                &callback,
+                                vec![item.clone(), JsValue::Smi(i as i32)],
+                            )?;
+                            if !val.to_boolean() {
+                                return Ok(JsValue::Boolean(false));
+                            }
+                        }
+                        Ok(JsValue::Boolean(true))
+                    }));
+                }
+                "some" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        for (i, item) in a.iter().enumerate() {
+                            let val = dispatch_call_value(
+                                &callback,
+                                vec![item.clone(), JsValue::Smi(i as i32)],
+                            )?;
+                            if val.to_boolean() {
+                                return Ok(JsValue::Boolean(true));
+                            }
+                        }
+                        Ok(JsValue::Boolean(false))
+                    }));
+                }
+                "reverse" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        let mut v = a.as_ref().clone();
+                        v.reverse();
+                        Ok(JsValue::Array(Rc::new(v)))
+                    }));
+                }
+                "flat" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        let mut result = Vec::new();
+                        for item in a.iter() {
+                            if let JsValue::Array(inner) = item {
+                                result.extend_from_slice(inner);
+                            } else {
+                                result.push(item.clone());
+                            }
+                        }
+                        Ok(JsValue::Array(Rc::new(result)))
+                    }));
+                }
+                "flatMap" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let mut result = Vec::new();
+                        for (i, item) in a.iter().enumerate() {
+                            let val = dispatch_call_value(
+                                &callback,
+                                vec![item.clone(), JsValue::Smi(i as i32)],
+                            )?;
+                            if let JsValue::Array(inner) = val {
+                                result.extend_from_slice(&inner);
+                            } else {
+                                result.push(val);
+                            }
+                        }
+                        Ok(JsValue::Array(Rc::new(result)))
+                    }));
+                }
+                "fill" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let fill_val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let result: Vec<JsValue> = a.iter().map(|_| fill_val.clone()).collect();
+                        Ok(JsValue::Array(Rc::new(result)))
+                    }));
+                }
+                "keys" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        let keys: Vec<JsValue> =
+                            (0..a.len()).map(|i| JsValue::Smi(i as i32)).collect();
+                        Ok(JsValue::Array(Rc::new(keys)))
+                    }));
+                }
+                "values" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        Ok(JsValue::Array(Rc::clone(&a)))
+                    }));
+                }
+                "entries" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        let entries: Vec<JsValue> = a
+                            .iter()
+                            .enumerate()
+                            .map(|(i, v)| {
+                                JsValue::Array(Rc::new(vec![JsValue::Smi(i as i32), v.clone()]))
+                            })
+                            .collect();
+                        Ok(JsValue::Array(Rc::new(entries)))
+                    }));
+                }
+                _ => {
+                    // Numeric index access: arr[0], arr[1], etc.
+                    if let Ok(idx) = key.parse::<usize>()
+                        && idx < arr.len()
+                    {
+                        return arr[idx].clone();
+                    }
+                }
+            }
+            return JsValue::Undefined;
+        }
         _ => {}
     }
     // Handle JsValue::Proxy — delegate to the proxy get trap.
@@ -2323,6 +2655,19 @@ pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) ->
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+/// Invoke a callable JsValue (Function or NativeFunction) with the given
+/// arguments and return the result.
+fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult<JsValue> {
+    match callee {
+        JsValue::Function(ba) => {
+            let mut frame = InterpreterFrame::new((**ba).clone(), args);
+            Interpreter::run(&mut frame)
+        }
+        JsValue::NativeFunction(f) => f(args),
+        _ => Ok(JsValue::Undefined),
     }
 }
 
