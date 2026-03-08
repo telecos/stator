@@ -1075,6 +1075,7 @@ fn handle_tail_call(
                     ctx.frame.context = None;
                     ctx.frame.string_cache.clear();
                     ctx.frame.mono_load_cache.clear();
+                    ctx.frame.poly_load_cache.clear();
                     return Ok(DispatchAction::TailCall);
                 }
             }
@@ -1932,26 +1933,50 @@ fn handle_lda_named_property(
         u32::MAX
     };
     let obj = ctx.frame.read_reg(obj_v)?.clone();
-    // Monomorphic cache: check if the object's PropertyMap identity matches.
-    if let JsValue::PlainObject(ref map) = obj {
-        let map_ptr = Rc::as_ptr(map) as usize;
-        if let Some(&(cached_ptr, ref cached_val)) = ctx.frame.mono_load_cache.get(&slot)
-            && cached_ptr == map_ptr
+    // Polymorphic cache: check if any cached entry matches by pointer identity.
+    if slot != u32::MAX {
+        let obj_ptr = match &obj {
+            JsValue::PlainObject(map) => Some(Rc::as_ptr(map) as usize),
+            JsValue::Array(arr) => Some(Rc::as_ptr(arr) as usize),
+            JsValue::Function(ba) => Some(Rc::as_ptr(ba) as usize),
+            _ => None,
+        };
+        if let Some(ptr) = obj_ptr
+            && let Some(entries) = ctx.frame.poly_load_cache.get(&slot)
         {
-            ctx.frame.accumulator = cached_val.clone();
-            return Ok(DispatchAction::Continue);
+            for &(cached_ptr, ref cached_val) in entries {
+                if cached_ptr == ptr {
+                    ctx.frame.accumulator = cached_val.clone();
+                    return Ok(DispatchAction::Continue);
+                }
+            }
         }
     }
     let prop_name = ctx.frame.get_string_constant(name_idx)?;
     let result = proto_lookup(&obj, &prop_name);
-    // Update monomorphic cache for PlainObject accesses.
-    if let JsValue::PlainObject(ref map) = obj
-        && slot != u32::MAX
-    {
-        let map_ptr = Rc::as_ptr(map) as usize;
-        ctx.frame
-            .mono_load_cache
-            .insert(slot, (map_ptr, result.clone()));
+    // Update polymorphic cache (up to 4 entries per slot).
+    if slot != u32::MAX {
+        let obj_ptr = match &obj {
+            JsValue::PlainObject(map) => Some(Rc::as_ptr(map) as usize),
+            JsValue::Array(arr) => Some(Rc::as_ptr(arr) as usize),
+            JsValue::Function(ba) => Some(Rc::as_ptr(ba) as usize),
+            _ => None,
+        };
+        if let Some(ptr) = obj_ptr {
+            let entries = ctx.frame.poly_load_cache.entry(slot).or_default();
+            // Check if we already have this pointer; update in place.
+            let mut found = false;
+            for entry in entries.iter_mut() {
+                if entry.0 == ptr {
+                    entry.1 = result.clone();
+                    found = true;
+                    break;
+                }
+            }
+            if !found && entries.len() < 4 {
+                entries.push((ptr, result.clone()));
+            }
+        }
     }
     ctx.frame.accumulator = result;
     Ok(DispatchAction::Continue)
@@ -1989,11 +2014,15 @@ fn handle_sta_named_property(
             }
             drop(pm);
             map.borrow_mut().insert(prop_name.to_string(), val);
-            // Invalidate monomorphic cache entries for this object.
+            // Invalidate caches entries for this object.
             let map_ptr = Rc::as_ptr(map) as usize;
             ctx.frame
                 .mono_load_cache
                 .retain(|_, (ptr, _)| *ptr != map_ptr);
+            ctx.frame.poly_load_cache.retain(|_, entries| {
+                entries.retain(|(ptr, _)| *ptr != map_ptr);
+                !entries.is_empty()
+            });
         }
         JsValue::Function(ref ba) => {
             fn_props_set(ba, prop_name.to_string(), val);

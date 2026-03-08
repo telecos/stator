@@ -862,6 +862,9 @@ pub struct InterpreterFrame {
     /// When the same PropertyMap is seen again, the cached value is returned
     /// without a full `proto_lookup` scan.
     pub mono_load_cache: HashMap<u32, (usize, JsValue)>,
+    /// Polymorphic property-load cache: `slot → [(ptr, cached_value)]`.
+    /// Holds up to 4 entries per feedback slot, supporting polymorphic sites.
+    pub poly_load_cache: HashMap<u32, Vec<(usize, JsValue)>>,
     /// Pre-decoded string constants from the constant pool, keyed by index.
     /// Avoids repeated `String::clone()` from the constant pool.
     pub string_cache: HashMap<u32, Rc<str>>,
@@ -900,6 +903,7 @@ impl InterpreterFrame {
             template_cache: HashMap::new(),
             new_target: JsValue::Undefined,
             mono_load_cache: HashMap::new(),
+            poly_load_cache: HashMap::new(),
             string_cache: HashMap::new(),
         }
     }
@@ -1139,6 +1143,7 @@ impl Interpreter {
             template_cache: std::collections::HashMap::new(),
             new_target: JsValue::Undefined,
             mono_load_cache: std::collections::HashMap::new(),
+            poly_load_cache: std::collections::HashMap::new(),
             string_cache: std::collections::HashMap::new(),
         };
 
