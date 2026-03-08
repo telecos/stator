@@ -284,8 +284,6 @@ impl HarnessCache {
 /// skipped rather than run-and-failed, keeping the measured pass rate
 /// meaningful.
 const UNSUPPORTED_FEATURES: &[&str] = &[
-    // Temporal (stage 3 proposal — very large surface area)
-    "Temporal",
     // Resizable ArrayBuffer — not yet implemented
     "resizable-arraybuffer",
     // Module features that need runtime module loader
@@ -454,10 +452,32 @@ fn make_test_globals() -> HashMap<String, JsValue> {
     // assert.throws(expectedErrorConstructor, func, message)
     assert_obj.borrow_mut().insert(
         "throws".to_string(),
-        JsValue::NativeFunction(Rc::new(|_args| {
-            // Stub: always pass (we don't have enough infrastructure to
-            // actually invoke the func and match the error constructor).
-            Ok(JsValue::Undefined)
+        JsValue::NativeFunction(Rc::new(|args| {
+            let _expected_ctor = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let func = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let message = args
+                .get(2)
+                .and_then(|v| match v {
+                    JsValue::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "Expected a throw".to_string());
+
+            // Invoke the function and check if it throws.
+            let threw = match &func {
+                JsValue::Function(ba) => {
+                    let mut frame = InterpreterFrame::new((**ba).clone(), vec![]);
+                    Interpreter::run(&mut frame).is_err()
+                }
+                JsValue::NativeFunction(f) => f(vec![]).is_err(),
+                _ => false,
+            };
+
+            if threw {
+                Ok(JsValue::Undefined)
+            } else {
+                Err(StatorError::TypeError(message))
+            }
         })),
     );
 
@@ -1137,7 +1157,7 @@ mod tests {
     #[test]
     fn test_has_unsupported_feature_symbol() {
         assert!(has_unsupported_feature(&[
-            "Temporal".to_string(),
+            "resizable-arraybuffer".to_string(),
             "other".to_string()
         ]));
     }
