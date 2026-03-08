@@ -1448,9 +1448,36 @@ fn make_object() -> JsValue {
             if let JsValue::PlainObject(map) = &obj {
                 if let JsValue::PlainObject(desc_map) = descriptor {
                     let desc = desc_map.borrow();
-                    // Extract value from descriptor, default to undefined
-                    let value = desc.get("value").cloned().unwrap_or(JsValue::Undefined);
-                    map.borrow_mut().insert(key, value);
+                    // Check for accessor descriptor (get/set)
+                    let has_get = desc.contains_key("get");
+                    let has_set = desc.contains_key("set");
+                    if has_get || has_set {
+                        // Accessor property: store getter/setter using __get/__set convention.
+                        if let Some(getter) = desc.get("get").cloned() {
+                            let getter_key = format!("__get_{key}__");
+                            map.borrow_mut().insert(getter_key, getter);
+                        }
+                        if let Some(setter) = desc.get("set").cloned() {
+                            let setter_key = format!("__set_{key}__");
+                            map.borrow_mut().insert(setter_key, setter);
+                        }
+                    } else {
+                        // Data descriptor: extract value.
+                        let value = desc.get("value").cloned().unwrap_or(JsValue::Undefined);
+                        map.borrow_mut().insert(key.clone(), value);
+                    }
+                    // Apply writable attribute
+                    if let Some(JsValue::Boolean(false)) = desc.get("writable") {
+                        map.borrow_mut().set_writable(&key, false);
+                    }
+                    // Apply enumerable attribute
+                    if let Some(JsValue::Boolean(false)) = desc.get("enumerable") {
+                        map.borrow_mut().set_enumerable(&key, false);
+                    }
+                    // Apply configurable attribute
+                    if let Some(JsValue::Boolean(false)) = desc.get("configurable") {
+                        map.borrow_mut().set_configurable(&key, false);
+                    }
                 } else {
                     // If descriptor is not an object, just set undefined
                     map.borrow_mut().insert(key, JsValue::Undefined);
@@ -1475,12 +1502,45 @@ fn make_object() -> JsValue {
 
             if let JsValue::PlainObject(map) = obj {
                 let borrowed = map.borrow();
-                if let Some(value) = borrowed.get(&key) {
+                // Check for accessor property first
+                let getter_key = format!("__get_{key}__");
+                let setter_key = format!("__set_{key}__");
+                let has_getter = borrowed.contains_key(&getter_key);
+                let has_setter = borrowed.contains_key(&setter_key);
+                if has_getter || has_setter {
                     let mut desc = PropertyMap::new();
-                    desc.insert("value".into(), value.clone());
-                    desc.insert("writable".into(), JsValue::Boolean(true));
+                    desc.insert(
+                        "get".into(),
+                        borrowed
+                            .get(&getter_key)
+                            .cloned()
+                            .unwrap_or(JsValue::Undefined),
+                    );
+                    desc.insert(
+                        "set".into(),
+                        borrowed
+                            .get(&setter_key)
+                            .cloned()
+                            .unwrap_or(JsValue::Undefined),
+                    );
                     desc.insert("enumerable".into(), JsValue::Boolean(true));
                     desc.insert("configurable".into(), JsValue::Boolean(true));
+                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(desc))))
+                } else if let Some(value) = borrowed.get(&key) {
+                    let mut desc = PropertyMap::new();
+                    desc.insert("value".into(), value.clone());
+                    desc.insert(
+                        "writable".into(),
+                        JsValue::Boolean(borrowed.is_writable(&key)),
+                    );
+                    desc.insert(
+                        "enumerable".into(),
+                        JsValue::Boolean(borrowed.is_enumerable(&key)),
+                    );
+                    desc.insert(
+                        "configurable".into(),
+                        JsValue::Boolean(borrowed.is_configurable(&key)),
+                    );
                     Ok(JsValue::PlainObject(Rc::new(RefCell::new(desc))))
                 } else {
                     Ok(JsValue::Undefined)
@@ -1561,15 +1621,18 @@ fn make_object() -> JsValue {
     );
 
     // ── Object.freeze(obj) ───────────────────────────────────────────────
-    // For PlainObject, we return the object itself (properties are still
-    // mutable in our simplified model; full descriptor storage would be
-    // needed for a complete implementation).
     props.insert(
         "freeze".into(),
         native(|args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
-            // Return the object itself per spec (even if we can't fully
-            // enforce immutability on PlainObject without descriptor storage).
+            if let JsValue::PlainObject(map) = &obj {
+                let keys: Vec<String> = map.borrow().keys().cloned().collect();
+                let mut pm = map.borrow_mut();
+                for key in &keys {
+                    pm.set_writable(key, false);
+                    pm.set_configurable(key, false);
+                }
+            }
             Ok(obj)
         }),
     );
@@ -1579,6 +1642,13 @@ fn make_object() -> JsValue {
         "seal".into(),
         native(|args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
+            if let JsValue::PlainObject(map) = &obj {
+                let keys: Vec<String> = map.borrow().keys().cloned().collect();
+                let mut pm = map.borrow_mut();
+                for key in &keys {
+                    pm.set_configurable(key, false);
+                }
+            }
             Ok(obj)
         }),
     );
@@ -1589,8 +1659,13 @@ fn make_object() -> JsValue {
         native(|args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined);
             match obj {
-                // Non-objects are trivially frozen per spec
-                JsValue::PlainObject(_) => Ok(JsValue::Boolean(false)),
+                JsValue::PlainObject(map) => {
+                    let pm = map.borrow();
+                    let frozen = pm
+                        .keys()
+                        .all(|k| !pm.is_writable(k) && !pm.is_configurable(k));
+                    Ok(JsValue::Boolean(frozen))
+                }
                 _ => Ok(JsValue::Boolean(true)),
             }
         }),
@@ -1602,7 +1677,11 @@ fn make_object() -> JsValue {
         native(|args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined);
             match obj {
-                JsValue::PlainObject(_) => Ok(JsValue::Boolean(false)),
+                JsValue::PlainObject(map) => {
+                    let pm = map.borrow();
+                    let sealed = pm.keys().all(|k| !pm.is_configurable(k));
+                    Ok(JsValue::Boolean(sealed))
+                }
                 _ => Ok(JsValue::Boolean(true)),
             }
         }),
