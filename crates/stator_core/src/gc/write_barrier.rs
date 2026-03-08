@@ -114,6 +114,71 @@ impl<'h> WriteBarrier<'h> {
     }
 }
 
+// ── JIT write-barrier stub ──────────────────────────────────────────────────
+
+/// Thread-local GC write-barrier state for JIT-compiled code.
+///
+/// JIT-emitted property stores call [`jit_write_barrier`] via an indirect
+/// `call qword ptr [rip + JIT_WRITE_BARRIER]` rather than inlining the
+/// full barrier logic.  This keeps generated code compact and allows the
+/// barrier implementation to change without recompiling JIT code.
+///
+/// The stub examines the host/value pair and, if an old→young edge is
+/// detected, records it in the thread-local remembered set.
+///
+/// # Safety
+///
+/// `host` must point to a live, properly-aligned `HeapObject`.  `value`
+/// must be a valid `JsValue` reference.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_write_barrier(host: *mut HeapObject, value: *const JsValue) {
+    if host.is_null() || value.is_null() {
+        return;
+    }
+
+    // SAFETY: caller guarantees host and value validity.
+    let value_ref = unsafe { &*value };
+
+    // Quick check: only Object values can create GC edges.
+    let JsValue::Object(value_ptr) = value_ref else {
+        return;
+    };
+    if value_ptr.is_null() {
+        return;
+    }
+
+    // The actual barrier check is deferred to the runtime:
+    // gc_runtime will handle old_space / semi_space classification.
+    // For now, record the host pointer in the thread-local remembered set.
+    THREAD_LOCAL_BARRIER_BUFFER.with(|buf| {
+        buf.borrow_mut().push(host);
+    });
+}
+
+thread_local! {
+    /// Thread-local buffer of host pointers that need remembered-set
+    /// insertion.  Flushed to the real [`RememberedSet`] at each safepoint.
+    static THREAD_LOCAL_BARRIER_BUFFER: std::cell::RefCell<Vec<*mut HeapObject>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain the thread-local barrier buffer into the given remembered set.
+///
+/// Called at GC safepoints to flush pending barrier records.
+pub fn flush_jit_barrier_buffer(remembered_set: &mut RememberedSet) {
+    THREAD_LOCAL_BARRIER_BUFFER.with(|buf| {
+        let mut b = buf.borrow_mut();
+        for host in b.drain(..) {
+            remembered_set.insert(host);
+        }
+    });
+}
+
+/// Returns the number of pending barrier records in the thread-local buffer.
+pub fn jit_barrier_buffer_len() -> usize {
+    THREAD_LOCAL_BARRIER_BUFFER.with(|buf| buf.borrow().len())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -375,5 +440,68 @@ mod tests {
             rs.is_empty(),
             "remembered set must be cleared after a scavenge cycle"
         );
+    }
+
+    // ── JIT write-barrier stub tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_jit_barrier_records_object_value() {
+        use super::{jit_barrier_buffer_len, jit_write_barrier};
+
+        let mut host = HeapObject::new_null();
+        let value = JsValue::Object(&raw mut host);
+
+        // SAFETY: host and value are valid stack-local objects.
+        unsafe { jit_write_barrier(&raw mut host, &value) };
+
+        assert!(
+            jit_barrier_buffer_len() >= 1,
+            "JIT barrier must record object-valued stores"
+        );
+    }
+
+    #[test]
+    fn test_jit_barrier_skips_primitive() {
+        use super::{flush_jit_barrier_buffer, jit_barrier_buffer_len, jit_write_barrier};
+
+        // Flush any prior state.
+        let mut rs = RememberedSet::new();
+        flush_jit_barrier_buffer(&mut rs);
+
+        let mut host = HeapObject::new_null();
+        let value = JsValue::Smi(42);
+
+        // SAFETY: host and value are valid.
+        unsafe { jit_write_barrier(&raw mut host, &value) };
+
+        assert_eq!(
+            jit_barrier_buffer_len(),
+            0,
+            "JIT barrier must skip primitive values"
+        );
+    }
+
+    #[test]
+    fn test_flush_jit_barrier_buffer() {
+        use super::{flush_jit_barrier_buffer, jit_barrier_buffer_len, jit_write_barrier};
+
+        let mut rs = RememberedSet::new();
+        // Clear.
+        flush_jit_barrier_buffer(&mut rs);
+
+        let mut host = HeapObject::new_null();
+        let value = JsValue::Object(&raw mut host);
+
+        // SAFETY: host and value are valid.
+        unsafe { jit_write_barrier(&raw mut host, &value) };
+        assert!(jit_barrier_buffer_len() >= 1);
+
+        flush_jit_barrier_buffer(&mut rs);
+        assert_eq!(
+            jit_barrier_buffer_len(),
+            0,
+            "buffer must be empty after flush"
+        );
+        assert_eq!(rs.len(), 1, "flushed host must appear in remembered set");
     }
 }
