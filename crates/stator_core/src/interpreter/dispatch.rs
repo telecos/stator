@@ -1408,9 +1408,20 @@ fn handle_call_with_spread(
         return Err(err_bad_operand("CallWithSpread", 2));
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
+    let raw_args = collect_args(ctx.frame, args_start_v, arg_count)?;
+    // If the bytecode generator packed all arguments into a single array,
+    // expand it into the real argument list.
+    let args = if raw_args.len() == 1 {
+        if let JsValue::Array(ref items) = raw_args[0] {
+            (**items).clone()
+        } else {
+            raw_args
+        }
+    } else {
+        raw_args
+    };
     match callee {
         JsValue::Function(ba) => {
-            let args = collect_args(ctx.frame, args_start_v, arg_count)?;
             // ── Tiering ──────────────────────────────────────
             let count = ba.increment_invocation_count();
             if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
@@ -1440,12 +1451,10 @@ fn handle_call_with_spread(
             }
         }
         JsValue::NativeFunction(f) => {
-            let args = collect_args(ctx.frame, args_start_v, arg_count)?;
             ctx.frame.accumulator = f(args)?;
         }
         JsValue::PlainObject(ref map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                let args = collect_args(ctx.frame, args_start_v, arg_count)?;
                 ctx.frame.accumulator = f(args)?;
             } else {
                 return Err(StatorError::TypeError(

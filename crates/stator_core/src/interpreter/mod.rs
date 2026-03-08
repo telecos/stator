@@ -2707,29 +2707,39 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
             }
             // Integer index
             if let Some(idx) = to_array_index(key) {
-                Ok(items.get(idx).cloned().unwrap_or(JsValue::Undefined))
-            } else {
-                Ok(JsValue::Undefined)
+                return Ok(items.get(idx).cloned().unwrap_or(JsValue::Undefined));
             }
+            // Named property — delegate to proto_lookup for method access.
+            let prop_name = to_property_key(key)?;
+            Ok(proto_lookup(obj, &prop_name))
         }
-        JsValue::String(s) => {
+        JsValue::String(_) => {
             // "length" property
             if let JsValue::String(k) = key
                 && k == "length"
+                && let JsValue::String(s) = obj
             {
                 return Ok(JsValue::Smi(s.len() as i32));
             }
             // Character-at-index
-            if let Some(idx) = to_array_index(key) {
-                Ok(s.chars()
+            if let Some(idx) = to_array_index(key)
+                && let JsValue::String(s) = obj
+            {
+                return Ok(s
+                    .chars()
                     .nth(idx)
                     .map(|c| JsValue::String(c.to_string()))
-                    .unwrap_or(JsValue::Undefined))
-            } else {
-                Ok(JsValue::Undefined)
+                    .unwrap_or(JsValue::Undefined));
             }
+            // Named property — delegate to proto_lookup for method access.
+            let prop_name = to_property_key(key)?;
+            Ok(proto_lookup(obj, &prop_name))
         }
-        _ => Ok(JsValue::Undefined),
+        _ => {
+            // For any other type, try proto_lookup for method access.
+            let prop_name = to_property_key(key)?;
+            Ok(proto_lookup(obj, &prop_name))
+        }
     }
 }
 
