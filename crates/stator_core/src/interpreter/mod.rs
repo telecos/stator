@@ -2881,6 +2881,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Ok(JsValue::new_array(new_arr))
                     }));
                 }
+                "valueOf" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        Ok(JsValue::Array(Rc::clone(&a)))
+                    }));
+                }
                 "constructor" => return JsValue::Undefined,
                 _ => {
                     // Numeric index access: arr[0], arr[1], etc.
@@ -2893,6 +2899,19 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             return JsValue::Undefined;
         }
+        JsValue::BigInt(n) => match key {
+            "toString" | "toLocaleString" => {
+                let s = format!("{n}");
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(s.clone()))
+                }));
+            }
+            "valueOf" => {
+                let n = *n;
+                return JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::BigInt(n))));
+            }
+            _ => {}
+        },
         _ => {}
     }
     // Handle JsValue::Proxy — delegate to the proxy get trap.
@@ -2940,6 +2959,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toString" => JsValue::NativeFunction(Rc::new(move |_args| {
                 Ok(JsValue::String(err.to_error_string()))
             })),
+            "valueOf" => {
+                let e2 = Rc::clone(e);
+                JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Error(Rc::clone(&e2)))))
+            }
             _ => JsValue::Undefined,
         };
     }
