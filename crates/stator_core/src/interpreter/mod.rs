@@ -2957,30 +2957,30 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "call" => {
                 let ba = Rc::clone(ba);
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    // call(thisArg, ...args) — thisArg is ignored for now.
+                    let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
                     let call_args = if args.len() > 1 {
                         args[1..].to_vec()
                     } else {
                         vec![]
                     };
-                    dispatch_call_value(&JsValue::Function(Rc::clone(&ba)), call_args)
+                    dispatch_call_with_this(&JsValue::Function(Rc::clone(&ba)), this_arg, call_args)
                 }));
             }
             "apply" => {
                 let ba = Rc::clone(ba);
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    // apply(thisArg, argsArray) — thisArg is ignored for now.
+                    let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
                     let call_args = match args.get(1) {
                         Some(JsValue::Array(arr)) => arr.borrow().clone(),
                         _ => vec![],
                     };
-                    dispatch_call_value(&JsValue::Function(Rc::clone(&ba)), call_args)
+                    dispatch_call_with_this(&JsValue::Function(Rc::clone(&ba)), this_arg, call_args)
                 }));
             }
             "bind" => {
                 let ba = Rc::clone(ba);
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    // bind(thisArg, ...args) — returns a new function with bound args.
+                    let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
                     let bound_args: Vec<JsValue> = if args.len() > 1 {
                         args[1..].to_vec()
                     } else {
@@ -2990,7 +2990,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     Ok(JsValue::NativeFunction(Rc::new(move |call_args| {
                         let mut all_args = bound_args.clone();
                         all_args.extend(call_args);
-                        dispatch_call_value(&JsValue::Function(Rc::clone(&ba2)), all_args)
+                        dispatch_call_with_this(
+                            &JsValue::Function(Rc::clone(&ba2)),
+                            this_arg.clone(),
+                            all_args,
+                        )
                     })))
                 }));
             }
@@ -3156,6 +3160,29 @@ fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult<JsV
     match callee {
         JsValue::Function(ba) => {
             let mut frame = InterpreterFrame::new((**ba).clone(), args);
+            Interpreter::run(&mut frame)
+        }
+        JsValue::NativeFunction(f) => f(args),
+        _ => Ok(JsValue::Undefined),
+    }
+}
+
+/// Invoke a callable JsValue with a specific `this` receiver.
+///
+/// Sets `"this"` in the global environment so that `Expr::This` (which compiles
+/// to `LdaGlobal("this")`) resolves to the given receiver.
+fn dispatch_call_with_this(
+    callee: &JsValue,
+    this_val: JsValue,
+    args: Vec<JsValue>,
+) -> StatorResult<JsValue> {
+    match callee {
+        JsValue::Function(ba) => {
+            let mut frame = InterpreterFrame::new((**ba).clone(), args);
+            frame
+                .global_env
+                .borrow_mut()
+                .insert("this".to_string(), this_val);
             Interpreter::run(&mut frame)
         }
         JsValue::NativeFunction(f) => f(args),

@@ -1368,7 +1368,11 @@ fn handle_call_property(
                     args,
                     Rc::clone(&ctx.frame.global_env),
                 );
-                callee_frame.context = Some(this_val);
+                callee_frame.context = Some(this_val.clone());
+                callee_frame
+                    .global_env
+                    .borrow_mut()
+                    .insert("this".to_string(), this_val);
                 push_call_frame("<anonymous>")?;
                 let result = Interpreter::run(&mut callee_frame);
                 pop_call_frame();
