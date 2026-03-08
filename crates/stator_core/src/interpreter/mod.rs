@@ -862,6 +862,9 @@ pub struct InterpreterFrame {
     /// When the same PropertyMap is seen again, the cached value is returned
     /// without a full `proto_lookup` scan.
     pub mono_load_cache: HashMap<u32, (usize, JsValue)>,
+    /// Pre-decoded string constants from the constant pool, keyed by index.
+    /// Avoids repeated `String::clone()` from the constant pool.
+    pub string_cache: HashMap<u32, Rc<str>>,
 }
 
 impl InterpreterFrame {
@@ -897,6 +900,7 @@ impl InterpreterFrame {
             template_cache: HashMap::new(),
             new_target: JsValue::Undefined,
             mono_load_cache: HashMap::new(),
+            string_cache: HashMap::new(),
         }
     }
 
@@ -953,6 +957,23 @@ impl InterpreterFrame {
         let idx = self.reg_index(v)?;
         self.registers[idx] = value;
         Ok(())
+    }
+
+    /// Get a string constant from the constant pool, caching the result.
+    pub fn get_string_constant(&mut self, idx: u32) -> StatorResult<Rc<str>> {
+        if let Some(cached) = self.string_cache.get(&idx) {
+            return Ok(Rc::clone(cached));
+        }
+        let s = match self.bytecode_array.get_constant(idx) {
+            Some(ConstantPoolEntry::String(s)) => Rc::from(s.as_str()),
+            _ => {
+                return Err(StatorError::Internal(
+                    "get_string_constant: constant is not a string".into(),
+                ));
+            }
+        };
+        self.string_cache.insert(idx, Rc::clone(&s));
+        Ok(s)
     }
 }
 
@@ -1118,6 +1139,7 @@ impl Interpreter {
             template_cache: std::collections::HashMap::new(),
             new_target: JsValue::Undefined,
             mono_load_cache: std::collections::HashMap::new(),
+            string_cache: std::collections::HashMap::new(),
         };
 
         state.borrow_mut().status = GeneratorStatus::Executing;

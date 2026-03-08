@@ -1073,6 +1073,8 @@ fn handle_tail_call(
                     ctx.frame.accumulator = JsValue::Undefined;
                     ctx.frame.pc = 0;
                     ctx.frame.context = None;
+                    ctx.frame.string_cache.clear();
+                    ctx.frame.mono_load_cache.clear();
                     return Ok(DispatchAction::TailCall);
                 }
             }
@@ -1879,19 +1881,12 @@ fn handle_lda_global(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
         return Err(err_bad_operand("LdaGlobal", 0));
     };
-    let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
-        Some(ConstantPoolEntry::String(s)) => s.clone(),
-        _ => {
-            return Err(StatorError::Internal(
-                "LdaGlobal: constant is not a string".into(),
-            ));
-        }
-    };
+    let name = ctx.frame.get_string_constant(name_idx)?;
     ctx.frame.accumulator = ctx
         .frame
         .global_env
         .borrow()
-        .get(&name)
+        .get(name.as_ref())
         .cloned()
         .unwrap_or(JsValue::Undefined);
     Ok(DispatchAction::Continue)
@@ -1943,14 +1938,7 @@ fn handle_lda_named_property(
             return Ok(DispatchAction::Continue);
         }
     }
-    let prop_name = match ctx.frame.bytecode_array.get_constant(name_idx) {
-        Some(ConstantPoolEntry::String(s)) => s.clone(),
-        _ => {
-            return Err(StatorError::Internal(
-                "LdaNamedProperty: property name is not a string".into(),
-            ));
-        }
-    };
+    let prop_name = ctx.frame.get_string_constant(name_idx)?;
     let result = proto_lookup(&obj, &prop_name);
     // Update monomorphic cache for PlainObject accesses.
     if let JsValue::PlainObject(ref map) = obj
@@ -1975,14 +1963,7 @@ fn handle_sta_named_property(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
         return Err(err_bad_operand("StaNamedProperty", 1));
     };
-    let prop_name = match ctx.frame.bytecode_array.get_constant(name_idx) {
-        Some(ConstantPoolEntry::String(s)) => s.clone(),
-        _ => {
-            return Err(StatorError::Internal(
-                "StaNamedProperty: property name is not a string".into(),
-            ));
-        }
-    };
+    let prop_name = ctx.frame.get_string_constant(name_idx)?;
     let val = ctx.frame.accumulator.clone();
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     match obj {
@@ -1999,11 +1980,11 @@ fn handle_sta_named_property(
             }
             let pm = map.borrow();
             // Existing non-writable property: silently ignore (sloppy mode).
-            if pm.contains_key(&prop_name) && !pm.is_writable(&prop_name) {
+            if pm.contains_key(prop_name.as_ref()) && !pm.is_writable(prop_name.as_ref()) {
                 return Ok(DispatchAction::Continue);
             }
             drop(pm);
-            map.borrow_mut().insert(prop_name, val);
+            map.borrow_mut().insert(prop_name.to_string(), val);
             // Invalidate monomorphic cache entries for this object.
             let map_ptr = Rc::as_ptr(map) as usize;
             ctx.frame
@@ -2011,7 +1992,7 @@ fn handle_sta_named_property(
                 .retain(|_, (ptr, _)| *ptr != map_ptr);
         }
         JsValue::Function(ref ba) => {
-            fn_props_set(ba, prop_name, val);
+            fn_props_set(ba, prop_name.to_string(), val);
         }
         _ => {}
     }
