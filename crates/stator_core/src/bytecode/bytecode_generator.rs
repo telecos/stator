@@ -810,9 +810,19 @@ impl FunctionCompiler {
                     Ok(Some(reg))
                 }
             }
-            _ => Err(StatorError::Internal(
-                "destructuring declarations are not yet supported".into(),
-            )),
+            pat => {
+                // Destructuring declaration: evaluate init into a temp,
+                // then unpack via compile_binding_pattern.
+                let source_reg = self.allocator.new_local();
+                if let Some(init) = &declarator.init {
+                    self.compile_expr(init)?;
+                } else {
+                    self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                }
+                self.emit_star(source_reg);
+                self.compile_binding_pattern(pat, source_reg)?;
+                Ok(Some(source_reg))
+            }
         }
     }
 
@@ -1716,10 +1726,11 @@ impl FunctionCompiler {
                         let reg = self.define_local(&ident.name);
                         self.emit_star(reg);
                     }
-                    _ => {
-                        return Err(StatorError::Internal(
-                            "destructuring catch parameter is not yet supported".into(),
-                        ));
+                    pat => {
+                        // Destructuring catch param: acc holds thrown value.
+                        let source_reg = self.allocator.new_local();
+                        self.emit_star(source_reg);
+                        self.compile_binding_pattern(pat, source_reg)?;
                     }
                 }
             }
@@ -1952,9 +1963,11 @@ impl FunctionCompiler {
             }
 
             Expr::TaggedTemplate(t) => self.compile_tagged_template(t),
-            Expr::Spread(_) => Err(StatorError::Internal(
-                "spread in expression position is not yet supported".into(),
-            )),
+            Expr::Spread(s) => {
+                // Spread in expression position: compile the argument.
+                // The parent context (array literal, function call) handles iteration.
+                self.compile_expr(&s.argument)
+            }
             Expr::Import(imp) => self.compile_import_call(imp),
             Expr::MetaProp(m) => self.compile_meta_prop(m),
             Expr::PrivateName(_) => Err(StatorError::Internal(
@@ -2404,9 +2417,11 @@ impl FunctionCompiler {
                     "unsupported assignment target".into(),
                 )),
             },
-            AssignTarget::Pat(_) => Err(StatorError::Internal(
-                "destructuring assignment is not yet supported".into(),
-            )),
+            AssignTarget::Pat(_pat) => {
+                // The real unpack happens in compile_assign_target_store.
+                self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                Ok(())
+            }
         }
     }
 
@@ -2423,9 +2438,13 @@ impl FunctionCompiler {
                     "unsupported assignment target".into(),
                 )),
             },
-            AssignTarget::Pat(_) => Err(StatorError::Internal(
-                "destructuring assignment is not yet supported".into(),
-            )),
+            AssignTarget::Pat(pat) => {
+                // Destructuring assignment: acc holds the RHS value.
+                let source_reg = self.allocator.new_local();
+                self.emit_star(source_reg);
+                self.compile_binding_pattern(pat, source_reg)?;
+                Ok(())
+            }
         }
     }
 
@@ -2453,9 +2472,12 @@ impl FunctionCompiler {
                     vec![to_reg_op(obj_reg), slot],
                 ));
             }
-            crate::parser::ast::MemberProp::Private(_) => {
-                return Err(StatorError::Internal(
-                    "private member access is not yet supported".into(),
+            crate::parser::ast::MemberProp::Private(id) => {
+                let name_idx = self.add_string(&format!("#{}", id.name));
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaNamedProperty,
+                    vec![to_reg_op(obj_reg), Operand::ConstantPoolIdx(name_idx), slot],
                 ));
             }
         }
@@ -2498,9 +2520,12 @@ impl FunctionCompiler {
                     vec![to_reg_op(obj_reg), slot],
                 ));
             }
-            crate::parser::ast::MemberProp::Private(_) => {
-                return Err(StatorError::Internal(
-                    "private member access is not yet supported".into(),
+            crate::parser::ast::MemberProp::Private(id) => {
+                let name_idx = self.add_string(&format!("#{}", id.name));
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaNamedProperty,
+                    vec![to_reg_op(obj_reg), Operand::ConstantPoolIdx(name_idx), slot],
                 ));
             }
         }
@@ -2554,9 +2579,14 @@ impl FunctionCompiler {
                     .release_temporary(key_reg)
                     .map_err(|e| StatorError::Internal(e.to_string()))?;
             }
-            crate::parser::ast::MemberProp::Private(_) => {
-                return Err(StatorError::Internal(
-                    "private member store is not yet supported".into(),
+            crate::parser::ast::MemberProp::Private(id) => {
+                let name_idx = self.add_string(&format!("#{}", id.name));
+                let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+                // Reload value.
+                self.emit_ldar(val_reg);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::StaNamedProperty,
+                    vec![to_reg_op(obj_reg), Operand::ConstantPoolIdx(name_idx), slot],
                 ));
             }
         }
@@ -2726,9 +2756,16 @@ impl FunctionCompiler {
                     vec![to_reg_op(recv_reg), slot],
                 ));
             }
-            crate::parser::ast::MemberProp::Private(_) => {
-                return Err(StatorError::Internal(
-                    "private method calls are not yet supported".into(),
+            crate::parser::ast::MemberProp::Private(id) => {
+                let name_idx = self.add_string(&format!("#{}", id.name));
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaNamedProperty,
+                    vec![
+                        to_reg_op(recv_reg),
+                        Operand::ConstantPoolIdx(name_idx),
+                        slot,
+                    ],
                 ));
             }
         }
@@ -2918,6 +2955,11 @@ impl FunctionCompiler {
 
     /// Compile an array literal.
     fn compile_array(&mut self, a: &crate::parser::ast::ArrayExpr) -> StatorResult<()> {
+        let has_spread = a
+            .elements
+            .iter()
+            .any(|e| matches!(e, Some(Expr::Spread(_))));
+
         // Create an empty array, then fill each element slot.
         let arr_slot = self.alloc_slot(FeedbackSlotKind::Literal);
         self.emit(Instruction::new_unchecked(
@@ -2927,29 +2969,111 @@ impl FunctionCompiler {
         let arr_reg = self.allocator.allocate_temporary();
         self.emit_star(arr_reg);
 
-        for (i, elem) in a.elements.iter().enumerate() {
-            if let Some(elem_expr) = elem {
-                // Allocate idx_reg only when an element is present.
-                let idx_reg = self.allocator.allocate_temporary();
-                // Load index.
-                let idx_val = i as i32;
-                self.emit(Instruction::new_unchecked(
-                    Opcode::LdaSmi,
-                    vec![Operand::Immediate(idx_val)],
-                ));
-                self.emit_star(idx_reg);
-                // Load element value.
-                self.compile_expr(elem_expr)?;
-                // StaInArrayLiteral [array_reg, index_reg, slot]
-                let elem_slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
-                self.emit(Instruction::new_unchecked(
-                    Opcode::StaInArrayLiteral,
-                    vec![to_reg_op(arr_reg), to_reg_op(idx_reg), elem_slot],
-                ));
-                self.allocator
-                    .release_temporary(idx_reg)
-                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+        if !has_spread {
+            // Fast path: no spread, use static indices.
+            for (i, elem) in a.elements.iter().enumerate() {
+                if let Some(elem_expr) = elem {
+                    let idx_reg = self.allocator.allocate_temporary();
+                    let idx_val = i as i32;
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::LdaSmi,
+                        vec![Operand::Immediate(idx_val)],
+                    ));
+                    self.emit_star(idx_reg);
+                    self.compile_expr(elem_expr)?;
+                    let elem_slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::StaInArrayLiteral,
+                        vec![to_reg_op(arr_reg), to_reg_op(idx_reg), elem_slot],
+                    ));
+                    self.allocator
+                        .release_temporary(idx_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
+                }
             }
+        } else {
+            // Slow path: has spread — use a dynamic index counter.
+            let idx_reg = self.allocator.allocate_temporary();
+            self.emit(Instruction::new_unchecked(Opcode::LdaZero, vec![]));
+            self.emit_star(idx_reg);
+
+            for elem in &a.elements {
+                match elem {
+                    None => {
+                        // Elision: increment index only.
+                        self.emit_ldar(idx_reg);
+                        let inc_slot = self.alloc_slot(FeedbackSlotKind::BinaryOp);
+                        self.emit(Instruction::new_unchecked(Opcode::Inc, vec![inc_slot]));
+                        self.emit_star(idx_reg);
+                    }
+                    Some(Expr::Spread(s)) => {
+                        // Spread: iterate the argument, pushing each value.
+                        self.compile_expr(&s.argument)?;
+                        let iterable_reg = self.allocator.allocate_temporary();
+                        self.emit_star(iterable_reg);
+                        let load_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                        let call_slot = self.alloc_slot(FeedbackSlotKind::Call);
+                        self.emit(Instruction::new_unchecked(
+                            Opcode::GetIterator,
+                            vec![to_reg_op(iterable_reg), load_slot, call_slot],
+                        ));
+                        let iter_reg = self.allocator.allocate_temporary();
+                        self.emit_star(iter_reg);
+                        let val_reg = self.allocator.allocate_temporary();
+
+                        let loop_lbl = self.new_label();
+                        let done_lbl = self.new_label();
+                        self.bind_label(loop_lbl);
+
+                        self.emit(Instruction::new_unchecked(
+                            Opcode::IteratorNext,
+                            vec![to_reg_op(iter_reg), to_reg_op(val_reg)],
+                        ));
+                        self.emit_jump_if_true_to(done_lbl);
+
+                        // Store val at arr[idx], then increment idx.
+                        self.emit_ldar(val_reg);
+                        let elem_slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
+                        self.emit(Instruction::new_unchecked(
+                            Opcode::StaInArrayLiteral,
+                            vec![to_reg_op(arr_reg), to_reg_op(idx_reg), elem_slot],
+                        ));
+                        self.emit_ldar(idx_reg);
+                        let inc_slot2 = self.alloc_slot(FeedbackSlotKind::BinaryOp);
+                        self.emit(Instruction::new_unchecked(Opcode::Inc, vec![inc_slot2]));
+                        self.emit_star(idx_reg);
+                        self.emit_jump_loop_to(loop_lbl);
+                        self.bind_label(done_lbl);
+
+                        self.allocator
+                            .release_temporary(val_reg)
+                            .map_err(|e| StatorError::Internal(e.to_string()))?;
+                        self.allocator
+                            .release_temporary(iter_reg)
+                            .map_err(|e| StatorError::Internal(e.to_string()))?;
+                        self.allocator
+                            .release_temporary(iterable_reg)
+                            .map_err(|e| StatorError::Internal(e.to_string()))?;
+                    }
+                    Some(expr) => {
+                        // Normal element at dynamic index.
+                        self.compile_expr(expr)?;
+                        let elem_slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
+                        self.emit(Instruction::new_unchecked(
+                            Opcode::StaInArrayLiteral,
+                            vec![to_reg_op(arr_reg), to_reg_op(idx_reg), elem_slot],
+                        ));
+                        self.emit_ldar(idx_reg);
+                        let inc_slot3 = self.alloc_slot(FeedbackSlotKind::BinaryOp);
+                        self.emit(Instruction::new_unchecked(Opcode::Inc, vec![inc_slot3]));
+                        self.emit_star(idx_reg);
+                    }
+                }
+            }
+
+            self.allocator
+                .release_temporary(idx_reg)
+                .map_err(|e| StatorError::Internal(e.to_string()))?;
         }
 
         // Reload the array into accumulator.
@@ -2974,10 +3098,18 @@ impl FunctionCompiler {
                 crate::parser::ast::ObjectProp::Prop(p) => {
                     self.compile_object_prop(obj_reg, p)?;
                 }
-                crate::parser::ast::ObjectProp::Spread(_) => {
-                    return Err(StatorError::Internal(
-                        "object spread is not yet supported".into(),
+                crate::parser::ast::ObjectProp::Spread(spread) => {
+                    // Object spread: compile source, store in temp, copy all properties.
+                    self.compile_expr(&spread.argument)?;
+                    let src_reg = self.allocator.allocate_temporary();
+                    self.emit_star(src_reg);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::CopyDataProperties,
+                        vec![to_reg_op(obj_reg), to_reg_op(src_reg)],
                     ));
+                    self.allocator
+                        .release_temporary(src_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
             }
         }
@@ -3301,9 +3433,16 @@ impl FunctionCompiler {
                     vec![to_reg_op(recv_reg), slot],
                 ));
             }
-            crate::parser::ast::MemberProp::Private(_) => {
-                return Err(StatorError::Internal(
-                    "private tagged-template method calls are not yet supported".into(),
+            crate::parser::ast::MemberProp::Private(id) => {
+                let name_idx = self.add_string(&format!("#{}", id.name));
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaNamedProperty,
+                    vec![
+                        to_reg_op(recv_reg),
+                        Operand::ConstantPoolIdx(name_idx),
+                        slot,
+                    ],
                 ));
             }
         }
@@ -3569,11 +3708,7 @@ impl FunctionCompiler {
                 if decl.declarators.len() == 1 {
                     match &decl.declarators[0].id {
                         crate::parser::ast::Pat::Ident(id) => Some(self.define_local(&id.name)),
-                        _ => {
-                            return Err(StatorError::Internal(
-                                "destructuring in for-in is not yet supported".into(),
-                            ));
-                        }
+                        _pat => Some(self.allocator.new_local()),
                     }
                 } else if decl.declarators.is_empty() {
                     None
@@ -3657,9 +3792,15 @@ impl FunctionCompiler {
 
         // Bind the loop variable.
         match &stmt.left {
-            ForInOfLeft::VarDecl(_) => {
+            ForInOfLeft::VarDecl(decl) => {
                 if let Some(reg) = loop_var_reg {
                     self.emit_star(reg);
+                    // For destructuring declarations, unpack the key.
+                    if decl.declarators.len() == 1
+                        && !matches!(decl.declarators[0].id, crate::parser::ast::Pat::Ident(_))
+                    {
+                        self.compile_binding_pattern(&decl.declarators[0].id, reg)?;
+                    }
                 }
             }
             ForInOfLeft::Pat(pat) => match pat {
@@ -3669,10 +3810,11 @@ impl FunctionCompiler {
                     })?;
                     self.emit_star(reg);
                 }
-                _ => {
-                    return Err(StatorError::Internal(
-                        "destructuring in for-in is not yet supported".into(),
-                    ));
+                pat => {
+                    // Destructuring: store key in scratch, then unpack.
+                    let scratch = self.allocator.new_local();
+                    self.emit_star(scratch);
+                    self.compile_binding_pattern(pat, scratch)?;
                 }
             },
         }
@@ -3747,11 +3889,7 @@ impl FunctionCompiler {
                 if decl.declarators.len() == 1 {
                     match &decl.declarators[0].id {
                         crate::parser::ast::Pat::Ident(id) => Some(self.define_local(&id.name)),
-                        _ => {
-                            return Err(StatorError::Internal(
-                                "destructuring in for-of is not yet supported".into(),
-                            ));
-                        }
+                        _pat => Some(self.allocator.new_local()),
                     }
                 } else if decl.declarators.is_empty() {
                     None
@@ -3812,11 +3950,17 @@ impl FunctionCompiler {
 
         // Bind loop variable.
         match &stmt.left {
-            ForInOfLeft::VarDecl(_) => {
+            ForInOfLeft::VarDecl(decl) => {
                 // Loop variable was pre-allocated above.
                 if let Some(reg) = loop_var_reg {
                     self.emit_ldar(val_reg);
                     self.emit_star(reg);
+                    // For destructuring declarations, unpack the value.
+                    if decl.declarators.len() == 1
+                        && !matches!(decl.declarators[0].id, crate::parser::ast::Pat::Ident(_))
+                    {
+                        self.compile_binding_pattern(&decl.declarators[0].id, reg)?;
+                    }
                 }
             }
             ForInOfLeft::Pat(pat) => match pat {
@@ -3827,10 +3971,12 @@ impl FunctionCompiler {
                     self.emit_ldar(val_reg);
                     self.emit_star(reg);
                 }
-                _ => {
-                    return Err(StatorError::Internal(
-                        "destructuring in for-of is not yet supported".into(),
-                    ));
+                pat => {
+                    // Destructuring: store value in scratch, then unpack.
+                    let scratch = self.allocator.new_local();
+                    self.emit_ldar(val_reg);
+                    self.emit_star(scratch);
+                    self.compile_binding_pattern(pat, scratch)?;
                 }
             },
         }

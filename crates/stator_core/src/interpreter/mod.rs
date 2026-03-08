@@ -1905,6 +1905,16 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             if let Some(val) = borrow.get(key) {
                 return val.clone();
             }
+            // Check for getter accessor (__get_<key>__).
+            let getter_key = format!("__get_{key}__");
+            if let Some(getter) = borrow.get(&getter_key).cloned() {
+                drop(borrow);
+                // Invoke the getter with `this` = the object being accessed.
+                return match dispatch_getter(&getter, obj) {
+                    Ok(v) => v,
+                    Err(_) => JsValue::Undefined,
+                };
+            }
             if let Some(proto) = borrow.get("__proto__") {
                 let next = proto.clone();
                 drop(borrow);
@@ -1915,6 +1925,39 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         break;
     }
     JsValue::Undefined
+}
+
+/// Invoke a getter accessor function.
+///
+/// The getter may be a `JsValue::Function` (bytecode) or
+/// `JsValue::NativeFunction`.  Returns the getter's return value.
+fn dispatch_getter(getter: &JsValue, this: &JsValue) -> StatorResult<JsValue> {
+    match getter {
+        JsValue::Function(ba) => {
+            let mut frame = InterpreterFrame::new((**ba).clone(), vec![]);
+            frame.context = Some(this.clone());
+            Interpreter::run(&mut frame)
+        }
+        JsValue::NativeFunction(f) => f(vec![]),
+        _ => Ok(JsValue::Undefined),
+    }
+}
+
+/// Invoke a setter accessor function with the given value.
+pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) -> StatorResult<()> {
+    match setter {
+        JsValue::Function(ba) => {
+            let mut frame = InterpreterFrame::new((**ba).clone(), vec![val]);
+            frame.context = Some(this.clone());
+            Interpreter::run(&mut frame)?;
+            Ok(())
+        }
+        JsValue::NativeFunction(f) => {
+            f(vec![val])?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Wire `[[Prototype]]` on a newly constructed object.
