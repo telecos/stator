@@ -477,6 +477,10 @@ pub enum Opcode {
     /// is set to `undefined` and the accumulator is `true`.
     IteratorNext,
 
+    /// Copy all own enumerable properties from source to target.
+    /// `[target_reg, source_reg]`
+    CopyDataProperties,
+
     // ── Control flow ──────────────────────────────────────────────────────
     /// Back-edge jump (loop). `[offset, loop_depth, slot]`
     JumpLoop,
@@ -822,6 +826,7 @@ impl Opcode {
             Opcode::GetIterator => &[Register, FeedbackSlot, FeedbackSlot],
             Opcode::GetAsyncIterator => &[Register, FeedbackSlot, FeedbackSlot],
             Opcode::IteratorNext => &[Register, Register],
+            Opcode::CopyDataProperties => &[Register, Register],
 
             // Jumps
             Opcode::JumpLoop => &[JumpOffset, Immediate, FeedbackSlot],

@@ -62,7 +62,7 @@ pub(super) type OpcodeHandler =
     fn(&mut DispatchContext, &Instruction) -> StatorResult<DispatchAction>;
 
 /// Number of opcode variants (= `Opcode::Illegal as usize + 1`).
-const OPCODE_COUNT: usize = 190;
+const OPCODE_COUNT: usize = 191;
 
 fn handle_lda_zero(
     ctx: &mut DispatchContext,
@@ -2048,6 +2048,35 @@ fn handle_iterator_next(
     };
     ctx.frame.write_reg(value_out_v, value)?;
     ctx.frame.accumulator = JsValue::Boolean(done);
+    Ok(DispatchAction::Continue)
+}
+
+/// `CopyDataProperties <target_reg> <source_reg>`
+///
+/// Copies all own enumerable properties from the source object to the target.
+fn handle_copy_data_properties(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(target_v) = instr.operands[0] else {
+        return Err(err_bad_operand("CopyDataProperties", 0));
+    };
+    let Operand::Register(source_v) = instr.operands[1] else {
+        return Err(err_bad_operand("CopyDataProperties", 1));
+    };
+    let target = ctx.frame.read_reg(target_v)?.clone();
+    let source = ctx.frame.read_reg(source_v)?.clone();
+
+    if let (JsValue::PlainObject(t), JsValue::PlainObject(s)) = (&target, &source) {
+        let entries: Vec<(String, JsValue)> = s
+            .borrow()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (k, v) in entries {
+            t.borrow_mut().insert(k, v);
+        }
+    }
     Ok(DispatchAction::Continue)
 }
 
@@ -4100,6 +4129,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::GetIterator as usize] = handle_get_iterator;
     table[Opcode::GetAsyncIterator as usize] = handle_get_async_iterator;
     table[Opcode::IteratorNext as usize] = handle_iterator_next;
+    table[Opcode::CopyDataProperties as usize] = handle_copy_data_properties;
     table[Opcode::JumpLoop as usize] = handle_jump_loop;
     table[Opcode::Jump as usize] = handle_jump;
     table[Opcode::JumpConstant as usize] = handle_jump_constant;
