@@ -858,6 +858,10 @@ pub struct InterpreterFrame {
     /// The `new.target` value for this frame.  Set to the constructor function
     /// when invoked via `[[Construct]]`, or `undefined` for normal calls.
     pub new_target: JsValue,
+    /// Monomorphic property-load cache: `slot → (map_ptr, cached_value)`.
+    /// When the same PropertyMap is seen again, the cached value is returned
+    /// without a full `proto_lookup` scan.
+    pub mono_load_cache: HashMap<u32, (usize, JsValue)>,
 }
 
 impl InterpreterFrame {
@@ -892,6 +896,7 @@ impl InterpreterFrame {
             pending_message: JsValue::Undefined,
             template_cache: HashMap::new(),
             new_target: JsValue::Undefined,
+            mono_load_cache: HashMap::new(),
         }
     }
 
@@ -1112,6 +1117,7 @@ impl Interpreter {
             pending_message: JsValue::Undefined,
             template_cache: std::collections::HashMap::new(),
             new_target: JsValue::Undefined,
+            mono_load_cache: std::collections::HashMap::new(),
         };
 
         state.borrow_mut().status = GeneratorStatus::Executing;
@@ -1417,6 +1423,24 @@ pub(super) fn number_to_jsvalue(n: f64) -> JsValue {
         JsValue::Smi(n as i32)
     } else {
         JsValue::HeapNumber(n)
+    }
+}
+
+/// Convert a JsValue to boolean (ECMAScript §7.1.2).
+fn to_boolean_val(v: &JsValue) -> bool {
+    v.to_boolean()
+}
+
+/// Convert a JsValue to its string representation.
+fn js_to_string(v: &JsValue) -> String {
+    match v {
+        JsValue::String(s) => s.clone(),
+        JsValue::Smi(n) => n.to_string(),
+        JsValue::HeapNumber(n) => format!("{n}"),
+        JsValue::Boolean(b) => b.to_string(),
+        JsValue::Null => "null".to_string(),
+        JsValue::Undefined => "undefined".to_string(),
+        _ => "[object Object]".to_string(),
     }
 }
 
@@ -1813,6 +1837,46 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 Err(_) => JsValue::Undefined,
             };
         }
+        // Object.prototype methods available on all plain objects.
+        match key {
+            "hasOwnProperty" => {
+                let map = Rc::clone(map);
+                drop(borrow);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let prop = match args.first() {
+                        Some(JsValue::String(s)) => s.clone(),
+                        Some(JsValue::Smi(n)) => n.to_string(),
+                        _ => return Ok(JsValue::Boolean(false)),
+                    };
+                    Ok(JsValue::Boolean(map.borrow().contains_key(&prop)))
+                }));
+            }
+            "propertyIsEnumerable" => {
+                let map = Rc::clone(map);
+                drop(borrow);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let prop = match args.first() {
+                        Some(JsValue::String(s)) => s.clone(),
+                        Some(JsValue::Smi(n)) => n.to_string(),
+                        _ => return Ok(JsValue::Boolean(false)),
+                    };
+                    Ok(JsValue::Boolean(map.borrow().contains_key(&prop)))
+                }));
+            }
+            "isPrototypeOf" => {
+                let map = Rc::clone(map);
+                drop(borrow);
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    let _ = &map;
+                    Ok(JsValue::Boolean(false))
+                }));
+            }
+            "constructor" => {
+                drop(borrow);
+                return JsValue::Undefined;
+            }
+            _ => {}
+        }
         // Walk __proto__ chain.
         if let Some(proto) = borrow.get("__proto__") {
             let next = proto.clone();
@@ -2113,6 +2177,113 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         (end, start)
                     };
                     Ok(JsValue::String(s.chars().skip(s0).take(s1 - s0).collect()))
+                }));
+            }
+            "replaceAll" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let search = match args.first() {
+                        Some(JsValue::String(ss)) => ss.clone(),
+                        _ => return Ok(JsValue::String(s.clone())),
+                    };
+                    let replacement = match args.get(1) {
+                        Some(JsValue::String(ss)) => ss.clone(),
+                        _ => String::new(),
+                    };
+                    Ok(JsValue::String(s.replace(&search, &replacement)))
+                }));
+            }
+            "at" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let idx = match args.first() {
+                        Some(JsValue::Smi(i)) => *i,
+                        Some(JsValue::HeapNumber(n)) => *n as i32,
+                        _ => 0,
+                    };
+                    let len = s.chars().count() as i32;
+                    let actual = if idx < 0 { len + idx } else { idx };
+                    if actual < 0 || actual >= len {
+                        return Ok(JsValue::Undefined);
+                    }
+                    Ok(s.chars()
+                        .nth(actual as usize)
+                        .map_or(JsValue::Undefined, |c| JsValue::String(c.to_string())))
+                }));
+            }
+            "trimStart" | "trimLeft" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(s.trim_start().to_string()))
+                }));
+            }
+            "trimEnd" | "trimRight" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(s.trim_end().to_string()))
+                }));
+            }
+            "concat" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let mut result = s.clone();
+                    for arg in &args {
+                        match arg {
+                            JsValue::String(ss) => result.push_str(ss),
+                            JsValue::Smi(n) => result.push_str(&n.to_string()),
+                            JsValue::HeapNumber(n) => result.push_str(&format!("{n}")),
+                            JsValue::Boolean(b) => {
+                                result.push_str(if *b { "true" } else { "false" })
+                            }
+                            JsValue::Null => result.push_str("null"),
+                            JsValue::Undefined => result.push_str("undefined"),
+                            _ => result.push_str("[object Object]"),
+                        }
+                    }
+                    Ok(JsValue::String(result))
+                }));
+            }
+            "codePointAt" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let idx = match args.first() {
+                        Some(JsValue::Smi(i)) => *i as usize,
+                        Some(JsValue::HeapNumber(n)) => *n as usize,
+                        _ => 0,
+                    };
+                    Ok(s.chars()
+                        .nth(idx)
+                        .map_or(JsValue::Undefined, |c| JsValue::Smi(c as i32)))
+                }));
+            }
+            "normalize" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(s.clone()))
+                }));
+            }
+            "localeCompare" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let other = match args.first() {
+                        Some(JsValue::String(ss)) => ss.clone(),
+                        _ => String::new(),
+                    };
+                    Ok(JsValue::Smi(s.cmp(&other) as i32))
+                }));
+            }
+            "match" => {
+                return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Null)));
+            }
+            "search" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let pattern = match args.first() {
+                        Some(JsValue::String(ss)) => ss.clone(),
+                        _ => return Ok(JsValue::Smi(-1)),
+                    };
+                    Ok(s.find(&pattern)
+                        .map_or(JsValue::Smi(-1), |i| JsValue::Smi(i as i32)))
                 }));
             }
             _ => {}
@@ -2455,6 +2626,126 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Ok(JsValue::Array(Rc::new(entries)))
                     }));
                 }
+                "at" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let idx = match args.first() {
+                            Some(JsValue::Smi(i)) => *i,
+                            Some(JsValue::HeapNumber(n)) => *n as i32,
+                            _ => 0,
+                        };
+                        let len = a.len() as i32;
+                        let actual = if idx < 0 { len + idx } else { idx };
+                        if actual < 0 || actual >= len {
+                            return Ok(JsValue::Undefined);
+                        }
+                        Ok(a[actual as usize].clone())
+                    }));
+                }
+                "sort" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        let mut sorted = (*a).clone();
+                        sorted.sort_by(|a, b| {
+                            let a_str = js_to_string(a);
+                            let b_str = js_to_string(b);
+                            a_str.cmp(&b_str)
+                        });
+                        Ok(JsValue::Array(Rc::new(sorted)))
+                    }));
+                }
+                "splice" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let len = a.len() as i32;
+                        let start_raw = match args.first() {
+                            Some(JsValue::Smi(i)) => *i,
+                            Some(JsValue::HeapNumber(n)) => *n as i32,
+                            _ => 0,
+                        };
+                        let start = if start_raw < 0 {
+                            (len + start_raw).max(0)
+                        } else {
+                            start_raw.min(len)
+                        } as usize;
+                        let delete_count = match args.get(1) {
+                            Some(JsValue::Smi(i)) => (*i).max(0) as usize,
+                            Some(JsValue::HeapNumber(n)) => (*n as i32).max(0) as usize,
+                            _ => (len as usize).saturating_sub(start),
+                        };
+                        let end = (start + delete_count).min(a.len());
+                        let removed: Vec<JsValue> = a[start..end].to_vec();
+                        Ok(JsValue::Array(Rc::new(removed)))
+                    }));
+                }
+                "findLast" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        for (i, v) in a.iter().enumerate().rev() {
+                            let result =
+                                dispatch_call_value(&cb, vec![v.clone(), JsValue::Smi(i as i32)])?;
+                            if to_boolean_val(&result) {
+                                return Ok(v.clone());
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }));
+                }
+                "findLastIndex" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        for (i, v) in a.iter().enumerate().rev() {
+                            let result =
+                                dispatch_call_value(&cb, vec![v.clone(), JsValue::Smi(i as i32)])?;
+                            if to_boolean_val(&result) {
+                                return Ok(JsValue::Smi(i as i32));
+                            }
+                        }
+                        Ok(JsValue::Smi(-1))
+                    }));
+                }
+                "toReversed" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        let mut rev = (*a).clone();
+                        rev.reverse();
+                        Ok(JsValue::Array(Rc::new(rev)))
+                    }));
+                }
+                "toSorted" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        let mut sorted = (*a).clone();
+                        sorted.sort_by(|a, b| {
+                            let a_str = js_to_string(a);
+                            let b_str = js_to_string(b);
+                            a_str.cmp(&b_str)
+                        });
+                        Ok(JsValue::Array(Rc::new(sorted)))
+                    }));
+                }
+                "with" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let idx = match args.first() {
+                            Some(JsValue::Smi(i)) => *i,
+                            Some(JsValue::HeapNumber(n)) => *n as i32,
+                            _ => 0,
+                        };
+                        let val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        let len = a.len() as i32;
+                        let actual = if idx < 0 { len + idx } else { idx };
+                        if actual < 0 || actual >= len {
+                            return Err(StatorError::RangeError("Invalid index".to_string()));
+                        }
+                        let mut new_arr = (*a).clone();
+                        new_arr[actual as usize] = val;
+                        Ok(JsValue::Array(Rc::new(new_arr)))
+                    }));
+                }
+                "constructor" => return JsValue::Undefined,
                 _ => {
                     // Numeric index access: arr[0], arr[1], etc.
                     if let Ok(idx) = key.parse::<usize>()
@@ -2707,29 +2998,39 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
             }
             // Integer index
             if let Some(idx) = to_array_index(key) {
-                Ok(items.get(idx).cloned().unwrap_or(JsValue::Undefined))
-            } else {
-                Ok(JsValue::Undefined)
+                return Ok(items.get(idx).cloned().unwrap_or(JsValue::Undefined));
             }
+            // Named property — delegate to proto_lookup for method access.
+            let prop_name = to_property_key(key)?;
+            Ok(proto_lookup(obj, &prop_name))
         }
-        JsValue::String(s) => {
+        JsValue::String(_) => {
             // "length" property
             if let JsValue::String(k) = key
                 && k == "length"
+                && let JsValue::String(s) = obj
             {
                 return Ok(JsValue::Smi(s.len() as i32));
             }
             // Character-at-index
-            if let Some(idx) = to_array_index(key) {
-                Ok(s.chars()
+            if let Some(idx) = to_array_index(key)
+                && let JsValue::String(s) = obj
+            {
+                return Ok(s
+                    .chars()
                     .nth(idx)
                     .map(|c| JsValue::String(c.to_string()))
-                    .unwrap_or(JsValue::Undefined))
-            } else {
-                Ok(JsValue::Undefined)
+                    .unwrap_or(JsValue::Undefined));
             }
+            // Named property — delegate to proto_lookup for method access.
+            let prop_name = to_property_key(key)?;
+            Ok(proto_lookup(obj, &prop_name))
         }
-        _ => Ok(JsValue::Undefined),
+        _ => {
+            // For any other type, try proto_lookup for method access.
+            let prop_name = to_property_key(key)?;
+            Ok(proto_lookup(obj, &prop_name))
+        }
     }
 }
 

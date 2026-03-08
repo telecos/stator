@@ -484,13 +484,54 @@ impl FunctionCompiler {
                 self.emit_star(iter_reg);
                 let val_reg = self.allocator.new_local();
 
-                for element in &arr_pat.elements {
-                    self.emit(Instruction::new_unchecked(
-                        Opcode::IteratorNext,
-                        vec![to_reg_op(iter_reg), to_reg_op(val_reg)],
-                    ));
-                    if let Some(elem_pat) = element {
-                        self.compile_binding_pattern(elem_pat, val_reg)?;
+                let total = arr_pat.elements.len();
+                for (i, element) in arr_pat.elements.iter().enumerate() {
+                    // Check if this is a rest element at the end: let [a, ...rest] = x;
+                    if let Some(Pat::Rest(rest)) = element
+                        && i == total - 1
+                    {
+                        // Collect remaining iterator values into an array.
+                        let arr_slot = self.alloc_slot(FeedbackSlotKind::Literal);
+                        self.emit(Instruction::new_unchecked(
+                            Opcode::CreateEmptyArrayLiteral,
+                            vec![arr_slot],
+                        ));
+                        let rest_arr_reg = self.allocator.new_local();
+                        self.emit_star(rest_arr_reg);
+                        let idx_reg = self.allocator.new_local();
+                        self.emit(Instruction::new_unchecked(Opcode::LdaZero, vec![]));
+                        self.emit_star(idx_reg);
+
+                        let loop_lbl = self.new_label();
+                        let done_lbl = self.new_label();
+                        self.bind_label(loop_lbl);
+                        self.emit(Instruction::new_unchecked(
+                            Opcode::IteratorNext,
+                            vec![to_reg_op(iter_reg), to_reg_op(val_reg)],
+                        ));
+                        self.emit_jump_if_true_to(done_lbl);
+                        self.emit_ldar(val_reg);
+                        let elem_slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
+                        self.emit(Instruction::new_unchecked(
+                            Opcode::StaInArrayLiteral,
+                            vec![to_reg_op(rest_arr_reg), to_reg_op(idx_reg), elem_slot],
+                        ));
+                        self.emit_ldar(idx_reg);
+                        let inc_slot = self.alloc_slot(FeedbackSlotKind::BinaryOp);
+                        self.emit(Instruction::new_unchecked(Opcode::Inc, vec![inc_slot]));
+                        self.emit_star(idx_reg);
+                        self.emit_jump_loop_to(loop_lbl);
+                        self.bind_label(done_lbl);
+
+                        self.compile_binding_pattern(&rest.argument, rest_arr_reg)?;
+                    } else {
+                        self.emit(Instruction::new_unchecked(
+                            Opcode::IteratorNext,
+                            vec![to_reg_op(iter_reg), to_reg_op(val_reg)],
+                        ));
+                        if let Some(elem_pat) = element {
+                            self.compile_binding_pattern(elem_pat, val_reg)?;
+                        }
                     }
                 }
             }
@@ -2666,26 +2707,46 @@ impl FunctionCompiler {
         // identifier `eval` (ECMAScript §19.2.1.1 step 1).
         let is_direct_eval = matches!(c.callee.as_ref(), Expr::Ident(id) if id.name == "eval");
 
+        let has_spread = c.arguments.iter().any(|a| matches!(a, Expr::Spread(_)));
+
         // General call with undefined receiver.
         self.compile_expr(&c.callee)?;
         let callee_reg = self.allocator.allocate_temporary();
         self.emit_star(callee_reg);
 
-        let arg_regs = self.compile_arguments(&c.arguments)?;
-
-        if is_direct_eval {
-            self.emit_call_direct_eval(callee_reg, &arg_regs)?;
-        } else if is_tail {
-            self.emit_tail_call(callee_reg, &arg_regs)?;
-        } else {
-            self.emit_call_any_receiver(callee_reg, &arg_regs)?;
-        }
-
-        // Release args in reverse order.
-        for r in arg_regs.into_iter().rev() {
+        if has_spread && !is_direct_eval {
+            // Build arguments as a single array, then use CallWithSpread.
+            let arr_reg = self.compile_arguments_as_array(&c.arguments)?;
+            let slot = self.alloc_slot(FeedbackSlotKind::Call);
+            self.emit(Instruction::new_unchecked(
+                Opcode::CallWithSpread,
+                vec![
+                    to_reg_op(callee_reg),
+                    to_reg_op(arr_reg),
+                    Operand::RegisterCount(1),
+                    slot,
+                ],
+            ));
             self.allocator
-                .release_temporary(r)
+                .release_temporary(arr_reg)
                 .map_err(|e| StatorError::Internal(e.to_string()))?;
+        } else {
+            let arg_regs = self.compile_arguments(&c.arguments)?;
+
+            if is_direct_eval {
+                self.emit_call_direct_eval(callee_reg, &arg_regs)?;
+            } else if is_tail {
+                self.emit_tail_call(callee_reg, &arg_regs)?;
+            } else {
+                self.emit_call_any_receiver(callee_reg, &arg_regs)?;
+            }
+
+            // Release args in reverse order.
+            for r in arg_regs.into_iter().rev() {
+                self.allocator
+                    .release_temporary(r)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+            }
         }
         self.allocator
             .release_temporary(callee_reg)
@@ -2823,28 +2884,48 @@ impl FunctionCompiler {
         self.emit_star(callee_reg);
 
         // Evaluate arguments into consecutive registers.
-        let arg_regs = self.compile_arguments(args)?;
+        let has_spread = args.iter().any(|a| matches!(a, Expr::Spread(_)));
 
-        // CallProperty: [callable, receiver, args_start_or_count, slot]
-        // For arbitrary arg count use CallAnyReceiver with receiver as first arg.
-        // Emit: CallProperty [callable, recv_reg, arg_count, slot]
-        // args_start points to recv_reg; args follow immediately after.
-        let arg_count = arg_regs.len() as u32;
-        let slot = self.alloc_slot(FeedbackSlotKind::Call);
-        self.emit(Instruction::new_unchecked(
-            Opcode::CallProperty,
-            vec![
-                to_reg_op(callee_reg),
-                to_reg_op(recv_reg),
-                Operand::RegisterCount(arg_count),
-                slot,
-            ],
-        ));
-
-        for r in arg_regs.into_iter().rev() {
+        if has_spread {
+            // Build arguments as a single array, then use CallWithSpread.
+            let arr_reg = self.compile_arguments_as_array(args)?;
+            let slot = self.alloc_slot(FeedbackSlotKind::Call);
+            self.emit(Instruction::new_unchecked(
+                Opcode::CallWithSpread,
+                vec![
+                    to_reg_op(callee_reg),
+                    to_reg_op(arr_reg),
+                    Operand::RegisterCount(1),
+                    slot,
+                ],
+            ));
             self.allocator
-                .release_temporary(r)
+                .release_temporary(arr_reg)
                 .map_err(|e| StatorError::Internal(e.to_string()))?;
+        } else {
+            let arg_regs = self.compile_arguments(args)?;
+
+            // CallProperty: [callable, receiver, args_start_or_count, slot]
+            // For arbitrary arg count use CallAnyReceiver with receiver as first arg.
+            // Emit: CallProperty [callable, recv_reg, arg_count, slot]
+            // args_start points to recv_reg; args follow immediately after.
+            let arg_count = arg_regs.len() as u32;
+            let slot = self.alloc_slot(FeedbackSlotKind::Call);
+            self.emit(Instruction::new_unchecked(
+                Opcode::CallProperty,
+                vec![
+                    to_reg_op(callee_reg),
+                    to_reg_op(recv_reg),
+                    Operand::RegisterCount(arg_count),
+                    slot,
+                ],
+            ));
+
+            for r in arg_regs.into_iter().rev() {
+                self.allocator
+                    .release_temporary(r)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+            }
         }
         self.allocator
             .release_temporary(callee_reg)
@@ -2866,6 +2947,93 @@ impl FunctionCompiler {
             regs.push(r);
         }
         Ok(regs)
+    }
+
+    /// Build an array from call arguments, flattening spread elements.
+    /// Returns the register holding the resulting array.
+    fn compile_arguments_as_array(&mut self, args: &[Expr]) -> StatorResult<Register> {
+        // Create an empty array to hold all arguments.
+        let arr_slot = self.alloc_slot(FeedbackSlotKind::Literal);
+        self.emit(Instruction::new_unchecked(
+            Opcode::CreateEmptyArrayLiteral,
+            vec![arr_slot],
+        ));
+        let arr_reg = self.allocator.allocate_temporary();
+        self.emit_star(arr_reg);
+
+        // Dynamic index counter for spread support.
+        let idx_reg = self.allocator.allocate_temporary();
+        self.emit(Instruction::new_unchecked(Opcode::LdaZero, vec![]));
+        self.emit_star(idx_reg);
+
+        for arg in args {
+            if let Expr::Spread(s) = arg {
+                // Spread: iterate the argument, pushing each value.
+                self.compile_expr(&s.argument)?;
+                let iterable_reg = self.allocator.allocate_temporary();
+                self.emit_star(iterable_reg);
+                let load_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                let call_slot = self.alloc_slot(FeedbackSlotKind::Call);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::GetIterator,
+                    vec![to_reg_op(iterable_reg), load_slot, call_slot],
+                ));
+                let iter_reg = self.allocator.allocate_temporary();
+                self.emit_star(iter_reg);
+                let val_reg = self.allocator.allocate_temporary();
+
+                let loop_lbl = self.new_label();
+                let done_lbl = self.new_label();
+                self.bind_label(loop_lbl);
+
+                self.emit(Instruction::new_unchecked(
+                    Opcode::IteratorNext,
+                    vec![to_reg_op(iter_reg), to_reg_op(val_reg)],
+                ));
+                self.emit_jump_if_true_to(done_lbl);
+
+                // Store val at arr[idx], then increment idx.
+                self.emit_ldar(val_reg);
+                let elem_slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::StaInArrayLiteral,
+                    vec![to_reg_op(arr_reg), to_reg_op(idx_reg), elem_slot],
+                ));
+                self.emit_ldar(idx_reg);
+                let inc_slot = self.alloc_slot(FeedbackSlotKind::BinaryOp);
+                self.emit(Instruction::new_unchecked(Opcode::Inc, vec![inc_slot]));
+                self.emit_star(idx_reg);
+                self.emit_jump_loop_to(loop_lbl);
+                self.bind_label(done_lbl);
+
+                self.allocator
+                    .release_temporary(val_reg)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+                self.allocator
+                    .release_temporary(iter_reg)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+                self.allocator
+                    .release_temporary(iterable_reg)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+            } else {
+                // Normal argument at dynamic index.
+                self.compile_expr(arg)?;
+                let elem_slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::StaInArrayLiteral,
+                    vec![to_reg_op(arr_reg), to_reg_op(idx_reg), elem_slot],
+                ));
+                self.emit_ldar(idx_reg);
+                let inc_slot = self.alloc_slot(FeedbackSlotKind::BinaryOp);
+                self.emit(Instruction::new_unchecked(Opcode::Inc, vec![inc_slot]));
+                self.emit_star(idx_reg);
+            }
+        }
+
+        self.allocator
+            .release_temporary(idx_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        Ok(arr_reg)
     }
 
     /// Emit a `CallAnyReceiver` instruction.
