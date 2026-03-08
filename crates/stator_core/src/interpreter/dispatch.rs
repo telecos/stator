@@ -1853,6 +1853,22 @@ fn handle_lda_named_property(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
         return Err(err_bad_operand("LdaNamedProperty", 1));
     };
+    let slot = if let Operand::FeedbackSlot(s) = instr.operands[2] {
+        s
+    } else {
+        u32::MAX
+    };
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    // Monomorphic cache: check if the object's PropertyMap identity matches.
+    if let JsValue::PlainObject(ref map) = obj {
+        let map_ptr = Rc::as_ptr(map) as usize;
+        if let Some(&(cached_ptr, ref cached_val)) = ctx.frame.mono_load_cache.get(&slot)
+            && cached_ptr == map_ptr
+        {
+            ctx.frame.accumulator = cached_val.clone();
+            return Ok(DispatchAction::Continue);
+        }
+    }
     let prop_name = match ctx.frame.bytecode_array.get_constant(name_idx) {
         Some(ConstantPoolEntry::String(s)) => s.clone(),
         _ => {
@@ -1861,8 +1877,17 @@ fn handle_lda_named_property(
             ));
         }
     };
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
-    ctx.frame.accumulator = proto_lookup(&obj, &prop_name);
+    let result = proto_lookup(&obj, &prop_name);
+    // Update monomorphic cache for PlainObject accesses.
+    if let JsValue::PlainObject(ref map) = obj
+        && slot != u32::MAX
+    {
+        let map_ptr = Rc::as_ptr(map) as usize;
+        ctx.frame
+            .mono_load_cache
+            .insert(slot, (map_ptr, result.clone()));
+    }
+    ctx.frame.accumulator = result;
     Ok(DispatchAction::Continue)
 }
 
@@ -1905,6 +1930,11 @@ fn handle_sta_named_property(
             }
             drop(pm);
             map.borrow_mut().insert(prop_name, val);
+            // Invalidate monomorphic cache entries for this object.
+            let map_ptr = Rc::as_ptr(map) as usize;
+            ctx.frame
+                .mono_load_cache
+                .retain(|_, (ptr, _)| *ptr != map_ptr);
         }
         JsValue::Function(ref ba) => {
             fn_props_set(ba, prop_name, val);

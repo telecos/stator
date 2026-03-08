@@ -858,6 +858,10 @@ pub struct InterpreterFrame {
     /// The `new.target` value for this frame.  Set to the constructor function
     /// when invoked via `[[Construct]]`, or `undefined` for normal calls.
     pub new_target: JsValue,
+    /// Monomorphic property-load cache: `slot → (map_ptr, cached_value)`.
+    /// When the same PropertyMap is seen again, the cached value is returned
+    /// without a full `proto_lookup` scan.
+    pub mono_load_cache: HashMap<u32, (usize, JsValue)>,
 }
 
 impl InterpreterFrame {
@@ -892,6 +896,7 @@ impl InterpreterFrame {
             pending_message: JsValue::Undefined,
             template_cache: HashMap::new(),
             new_target: JsValue::Undefined,
+            mono_load_cache: HashMap::new(),
         }
     }
 
@@ -1112,6 +1117,7 @@ impl Interpreter {
             pending_message: JsValue::Undefined,
             template_cache: std::collections::HashMap::new(),
             new_target: JsValue::Undefined,
+            mono_load_cache: std::collections::HashMap::new(),
         };
 
         state.borrow_mut().status = GeneratorStatus::Executing;
