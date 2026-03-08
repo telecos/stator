@@ -136,5 +136,6 @@ pub fn program_from_bytes(data: &[u8], max_stmts: usize) -> Program {
         loc: dummy_span(),
         source_type: SourceType::Script,
         body: stmts.into_iter().map(ProgramItem::Stmt).collect(),
+        is_strict: false,
     }
 }
