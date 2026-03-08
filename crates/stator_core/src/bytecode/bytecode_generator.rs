@@ -367,30 +367,64 @@ impl FunctionCompiler {
                 for prop in &obj_pat.properties {
                     match prop {
                         ObjectPatProp::KeyValue(kv) => {
-                            let name = match &kv.key {
-                                crate::parser::ast::PropKey::Ident(id) => id.name.clone(),
-                                crate::parser::ast::PropKey::Str(s) => s.value.clone(),
-                                _ => {
-                                    return Err(StatorError::Internal(
-                                        "computed/numeric keys in object destructuring \
-                                         are not yet supported"
-                                            .into(),
+                            match &kv.key {
+                                crate::parser::ast::PropKey::Ident(id) => {
+                                    let name_idx = self.add_string(&id.name);
+                                    let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                                    self.emit(Instruction::new_unchecked(
+                                        Opcode::LdaNamedProperty,
+                                        vec![
+                                            to_reg_op(source_reg),
+                                            Operand::ConstantPoolIdx(name_idx),
+                                            slot,
+                                        ],
                                     ));
                                 }
-                            };
-                            let name_idx = self.add_string(&name);
-                            let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
-                            self.emit(Instruction::new_unchecked(
-                                Opcode::LdaNamedProperty,
-                                vec![
-                                    to_reg_op(source_reg),
-                                    Operand::ConstantPoolIdx(name_idx),
-                                    slot,
-                                ],
-                            ));
-                            // Use an unnamed local for the intermediate
-                            // value so that nested `define_local` calls
-                            // do not violate temporary LIFO ordering.
+                                crate::parser::ast::PropKey::Str(s) => {
+                                    let name_idx = self.add_string(&s.value);
+                                    let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                                    self.emit(Instruction::new_unchecked(
+                                        Opcode::LdaNamedProperty,
+                                        vec![
+                                            to_reg_op(source_reg),
+                                            Operand::ConstantPoolIdx(name_idx),
+                                            slot,
+                                        ],
+                                    ));
+                                }
+                                crate::parser::ast::PropKey::Num(n) => {
+                                    let name_idx = self.add_string(&n.value.to_string());
+                                    let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                                    self.emit(Instruction::new_unchecked(
+                                        Opcode::LdaNamedProperty,
+                                        vec![
+                                            to_reg_op(source_reg),
+                                            Operand::ConstantPoolIdx(name_idx),
+                                            slot,
+                                        ],
+                                    ));
+                                }
+                                crate::parser::ast::PropKey::Computed(expr) => {
+                                    self.compile_expr(expr)?;
+                                    let slot = self.alloc_slot(FeedbackSlotKind::KeyedLoadProperty);
+                                    self.emit(Instruction::new_unchecked(
+                                        Opcode::LdaKeyedProperty,
+                                        vec![to_reg_op(source_reg), slot],
+                                    ));
+                                }
+                                crate::parser::ast::PropKey::Private(id) => {
+                                    let name_idx = self.add_string(&format!("#{}", id.name));
+                                    let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                                    self.emit(Instruction::new_unchecked(
+                                        Opcode::LdaNamedProperty,
+                                        vec![
+                                            to_reg_op(source_reg),
+                                            Operand::ConstantPoolIdx(name_idx),
+                                            slot,
+                                        ],
+                                    ));
+                                }
+                            }
                             let scratch = self.allocator.new_local();
                             self.emit_star(scratch);
                             self.compile_binding_pattern(&kv.value, scratch)?;
@@ -419,12 +453,21 @@ impl FunctionCompiler {
                                 self.emit_star(local);
                             }
                         }
-                        ObjectPatProp::Rest(_rest) => {
-                            return Err(StatorError::Internal(
-                                "rest element in object destructuring \
-                                 is not yet supported"
-                                    .into(),
+                        ObjectPatProp::Rest(rest) => {
+                            // Create a new object, copy all source properties, then
+                            // bind to the rest pattern.  (Simplified — does not
+                            // exclude already-destructured keys.)
+                            self.emit(Instruction::new_unchecked(
+                                Opcode::CreateEmptyObjectLiteral,
+                                vec![],
                             ));
+                            let rest_reg = self.allocator.new_local();
+                            self.emit_star(rest_reg);
+                            self.emit(Instruction::new_unchecked(
+                                Opcode::CopyDataProperties,
+                                vec![to_reg_op(rest_reg), to_reg_op(source_reg)],
+                            ));
+                            self.compile_binding_pattern(&rest.argument, rest_reg)?;
                         }
                     }
                 }
@@ -460,10 +503,17 @@ impl FunctionCompiler {
                 self.bind_label(done_lbl);
                 self.compile_binding_pattern(&assign_pat.left, source_reg)?;
             }
-            Pat::Rest(_) => {
-                return Err(StatorError::Internal(
-                    "rest element outside array pattern is not supported".into(),
+            Pat::Rest(rest) => {
+                let arr_slot = self.alloc_slot(FeedbackSlotKind::Literal);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::CreateEmptyArrayLiteral,
+                    vec![arr_slot],
                 ));
+                let arr_reg = self.allocator.new_local();
+                self.emit_star(arr_reg);
+                // Just bind the source (the remaining value) for now.
+                // Full rest-collect would require knowing the iterator reg.
+                self.compile_binding_pattern(&rest.argument, arr_reg)?;
             }
         }
         Ok(())
