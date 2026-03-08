@@ -551,6 +551,7 @@ impl JsValue {
     /// | `Symbol` | `true` |
     /// | `Object` | `true` |
     /// | `BigInt` | `false` if `0`, otherwise `true` |
+    #[inline]
     pub fn to_boolean(&self) -> bool {
         match self {
             Self::Undefined | Self::Null => false,

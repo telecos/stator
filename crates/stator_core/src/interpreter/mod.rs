@@ -934,6 +934,7 @@ impl InterpreterFrame {
 
     /// Map an encoded register-operand value to a flat index into
     /// [`Self::registers`].
+    #[inline]
     fn reg_index(&self, v: u32) -> StatorResult<usize> {
         let signed = v as i32;
         if signed >= 0 {
@@ -961,12 +962,14 @@ impl InterpreterFrame {
     }
 
     /// Read the value of the register encoded by operand value `v`.
+    #[inline]
     fn read_reg(&self, v: u32) -> StatorResult<&JsValue> {
         let idx = self.reg_index(v)?;
         Ok(&self.registers[idx])
     }
 
     /// Write `value` to the register encoded by operand value `v`.
+    #[inline]
     fn write_reg(&mut self, v: u32, value: JsValue) -> StatorResult<()> {
         let idx = self.reg_index(v)?;
         self.registers[idx] = value;
@@ -1457,6 +1460,7 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
     }
     out
 }
+#[inline]
 pub(super) fn number_to_jsvalue(n: f64) -> JsValue {
     if n.is_finite() && n.fract() == 0.0 && (i32::MIN as f64..=i32::MAX as f64).contains(&n) {
         JsValue::Smi(n as i32)
