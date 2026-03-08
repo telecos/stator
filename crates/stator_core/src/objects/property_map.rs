@@ -200,6 +200,39 @@ impl PropertyMap {
             .unwrap_or(false)
     }
 
+    /// Set or clear the `WRITABLE` flag for an existing property.
+    pub fn set_writable(&mut self, key: &str, writable: bool) {
+        if let Some(&i) = self.index.get(key) {
+            if writable {
+                self.attrs[i].insert(PropertyAttributes::WRITABLE);
+            } else {
+                self.attrs[i].remove(PropertyAttributes::WRITABLE);
+            }
+        }
+    }
+
+    /// Set or clear the `ENUMERABLE` flag for an existing property.
+    pub fn set_enumerable(&mut self, key: &str, enumerable: bool) {
+        if let Some(&i) = self.index.get(key) {
+            if enumerable {
+                self.attrs[i].insert(PropertyAttributes::ENUMERABLE);
+            } else {
+                self.attrs[i].remove(PropertyAttributes::ENUMERABLE);
+            }
+        }
+    }
+
+    /// Set or clear the `CONFIGURABLE` flag for an existing property.
+    pub fn set_configurable(&mut self, key: &str, configurable: bool) {
+        if let Some(&i) = self.index.get(key) {
+            if configurable {
+                self.attrs[i].insert(PropertyAttributes::CONFIGURABLE);
+            } else {
+                self.attrs[i].remove(PropertyAttributes::CONFIGURABLE);
+            }
+        }
+    }
+
     /// Returns an iterator over only the enumerable property keys.
     pub fn enumerable_keys(&self) -> impl Iterator<Item = &String> {
         self.keys

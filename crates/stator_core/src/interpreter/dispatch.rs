@@ -1075,6 +1075,7 @@ fn handle_tail_call(
                     ctx.frame.context = None;
                     ctx.frame.string_cache.clear();
                     ctx.frame.mono_load_cache.clear();
+                    ctx.frame.poly_load_cache.clear();
                     return Ok(DispatchAction::TailCall);
                 }
             }
@@ -1368,7 +1369,11 @@ fn handle_call_property(
                     args,
                     Rc::clone(&ctx.frame.global_env),
                 );
-                callee_frame.context = Some(this_val);
+                callee_frame.context = Some(this_val.clone());
+                callee_frame
+                    .global_env
+                    .borrow_mut()
+                    .insert("this".to_string(), this_val);
                 push_call_frame("<anonymous>")?;
                 let result = Interpreter::run(&mut callee_frame);
                 pop_call_frame();
@@ -1415,7 +1420,7 @@ fn handle_call_with_spread(
     // expand it into the real argument list.
     let args = if raw_args.len() == 1 {
         if let JsValue::Array(ref items) = raw_args[0] {
-            (**items).clone()
+            items.borrow().clone()
         } else {
             raw_args
         }
@@ -1565,7 +1570,7 @@ fn handle_construct_with_spread(
     let raw_args = collect_args(ctx.frame, args_start_v, arg_count)?;
     let args = if raw_args.len() == 1 {
         if let JsValue::Array(ref items) = raw_args[0] {
-            (**items).clone()
+            items.borrow().clone()
         } else {
             raw_args
         }
@@ -1928,26 +1933,50 @@ fn handle_lda_named_property(
         u32::MAX
     };
     let obj = ctx.frame.read_reg(obj_v)?.clone();
-    // Monomorphic cache: check if the object's PropertyMap identity matches.
-    if let JsValue::PlainObject(ref map) = obj {
-        let map_ptr = Rc::as_ptr(map) as usize;
-        if let Some(&(cached_ptr, ref cached_val)) = ctx.frame.mono_load_cache.get(&slot)
-            && cached_ptr == map_ptr
+    // Polymorphic cache: check if any cached entry matches by pointer identity.
+    if slot != u32::MAX {
+        let obj_ptr = match &obj {
+            JsValue::PlainObject(map) => Some(Rc::as_ptr(map) as usize),
+            JsValue::Array(arr) => Some(Rc::as_ptr(arr) as usize),
+            JsValue::Function(ba) => Some(Rc::as_ptr(ba) as usize),
+            _ => None,
+        };
+        if let Some(ptr) = obj_ptr
+            && let Some(entries) = ctx.frame.poly_load_cache.get(&slot)
         {
-            ctx.frame.accumulator = cached_val.clone();
-            return Ok(DispatchAction::Continue);
+            for &(cached_ptr, ref cached_val) in entries {
+                if cached_ptr == ptr {
+                    ctx.frame.accumulator = cached_val.clone();
+                    return Ok(DispatchAction::Continue);
+                }
+            }
         }
     }
     let prop_name = ctx.frame.get_string_constant(name_idx)?;
     let result = proto_lookup(&obj, &prop_name);
-    // Update monomorphic cache for PlainObject accesses.
-    if let JsValue::PlainObject(ref map) = obj
-        && slot != u32::MAX
-    {
-        let map_ptr = Rc::as_ptr(map) as usize;
-        ctx.frame
-            .mono_load_cache
-            .insert(slot, (map_ptr, result.clone()));
+    // Update polymorphic cache (up to 4 entries per slot).
+    if slot != u32::MAX {
+        let obj_ptr = match &obj {
+            JsValue::PlainObject(map) => Some(Rc::as_ptr(map) as usize),
+            JsValue::Array(arr) => Some(Rc::as_ptr(arr) as usize),
+            JsValue::Function(ba) => Some(Rc::as_ptr(ba) as usize),
+            _ => None,
+        };
+        if let Some(ptr) = obj_ptr {
+            let entries = ctx.frame.poly_load_cache.entry(slot).or_default();
+            // Check if we already have this pointer; update in place.
+            let mut found = false;
+            for entry in entries.iter_mut() {
+                if entry.0 == ptr {
+                    entry.1 = result.clone();
+                    found = true;
+                    break;
+                }
+            }
+            if !found && entries.len() < 4 {
+                entries.push((ptr, result.clone()));
+            }
+        }
     }
     ctx.frame.accumulator = result;
     Ok(DispatchAction::Continue)
@@ -1985,11 +2014,15 @@ fn handle_sta_named_property(
             }
             drop(pm);
             map.borrow_mut().insert(prop_name.to_string(), val);
-            // Invalidate monomorphic cache entries for this object.
+            // Invalidate caches entries for this object.
             let map_ptr = Rc::as_ptr(map) as usize;
             ctx.frame
                 .mono_load_cache
                 .retain(|_, (ptr, _)| *ptr != map_ptr);
+            ctx.frame.poly_load_cache.retain(|_, entries| {
+                entries.retain(|(ptr, _)| *ptr != map_ptr);
+                !entries.is_empty()
+            });
         }
         JsValue::Function(ref ba) => {
             fn_props_set(ba, prop_name.to_string(), val);
@@ -2042,7 +2075,7 @@ fn handle_get_iterator(
     let iterable = ctx.frame.read_reg(iter_v)?.clone();
     ctx.frame.accumulator = match iterable {
         JsValue::Array(items) => {
-            let items_vec: Vec<JsValue> = (*items).clone();
+            let items_vec: Vec<JsValue> = items.borrow().clone();
             JsValue::Iterator(NativeIterator::from_items(items_vec))
         }
         JsValue::String(ref s) => JsValue::Iterator(NativeIterator::from_string(s)),
@@ -2083,7 +2116,7 @@ fn handle_get_async_iterator(
     let iterable = ctx.frame.read_reg(iter_v)?.clone();
     ctx.frame.accumulator = match iterable {
         JsValue::Array(items) => {
-            let items_vec: Vec<JsValue> = (*items).clone();
+            let items_vec: Vec<JsValue> = items.borrow().clone();
             JsValue::Iterator(NativeIterator::from_items(items_vec))
         }
         JsValue::String(ref s) => JsValue::Iterator(NativeIterator::from_string(s)),
@@ -2458,7 +2491,7 @@ fn handle_create_array_from_iterable(
 ) -> StatorResult<DispatchAction> {
     let iterable = ctx.frame.accumulator.clone();
     let items: Vec<JsValue> = match &iterable {
-        JsValue::Array(arr) => (**arr).clone(),
+        JsValue::Array(arr) => arr.borrow().clone(),
         JsValue::Iterator(iter) => {
             let mut out = Vec::new();
             loop {
@@ -2722,7 +2755,7 @@ fn handle_test_in(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
             {
                 true
             } else if let Some(idx) = to_array_index(key) {
-                idx < items.len()
+                idx < items.borrow().len()
             } else {
                 false
             }
@@ -2749,7 +2782,7 @@ fn handle_for_in_enumerate(
             .map(|k| JsValue::String(k.clone()))
             .collect(),
         JsValue::Array(items) => {
-            let mut ks: Vec<JsValue> = (0..items.len())
+            let mut ks: Vec<JsValue> = (0..items.borrow().len())
                 .map(|i| JsValue::String(i.to_string()))
                 .collect();
             ks.push(JsValue::String("length".to_string()));
@@ -2758,7 +2791,7 @@ fn handle_for_in_enumerate(
         JsValue::Null | JsValue::Undefined => vec![],
         _ => vec![],
     };
-    ctx.frame.accumulator = JsValue::Array(Rc::new(keys));
+    ctx.frame.accumulator = JsValue::new_array(keys);
     Ok(DispatchAction::Continue)
 }
 
@@ -2772,7 +2805,7 @@ fn handle_for_in_prepare(
     // operands[1] is a FeedbackSlot, ignored at runtime.
     let keys = ctx.frame.read_reg(keys_v)?.clone();
     let len = match &keys {
-        JsValue::Array(items) => items.len() as i32,
+        JsValue::Array(items) => items.borrow().len() as i32,
         _ => 0,
     };
     ctx.frame.accumulator = JsValue::Smi(len);
@@ -2799,7 +2832,11 @@ fn handle_for_in_next(
     };
     let keys = ctx.frame.read_reg(keys_v)?.clone();
     let key = match &keys {
-        JsValue::Array(items) => items.get(idx).cloned().unwrap_or(JsValue::Undefined),
+        JsValue::Array(items) => items
+            .borrow()
+            .get(idx)
+            .cloned()
+            .unwrap_or(JsValue::Undefined),
         _ => JsValue::Undefined,
     };
     ctx.frame.accumulator = key;
@@ -2915,7 +2952,7 @@ fn handle_create_rest_parameter(
     } else {
         vec![]
     };
-    ctx.frame.accumulator = JsValue::Array(Rc::new(rest));
+    ctx.frame.accumulator = JsValue::new_array(rest);
     Ok(DispatchAction::Continue)
 }
 
@@ -3730,10 +3767,13 @@ fn handle_create_object_from_iterable(
         JsValue::PlainObject(obj) => obj.borrow().clone(),
         JsValue::Array(arr) => {
             let mut m = PropertyMap::new();
-            for (i, v) in arr.iter().enumerate() {
+            for (i, v) in arr.borrow().iter().enumerate() {
                 m.insert(i.to_string(), v.clone());
             }
-            m.insert("length".to_string(), JsValue::Smi(arr.len() as i32));
+            m.insert(
+                "length".to_string(),
+                JsValue::Smi(arr.borrow().len() as i32),
+            );
             m
         }
         JsValue::Iterator(iter) => {

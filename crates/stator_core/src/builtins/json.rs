@@ -1023,8 +1023,8 @@ fn js_value_to_json_inner(
                 ));
             }
             seen.insert(ptr);
-            let mut arr: Vec<JsonValue> = Vec::with_capacity(items.len());
-            for item in items.iter() {
+            let mut arr: Vec<JsonValue> = Vec::with_capacity(items.borrow().len());
+            for item in items.borrow().iter() {
                 let json_item = js_value_to_json_inner(item, seen)?;
                 arr.push(json_item.unwrap_or(JsonValue::Null));
             }
@@ -1695,11 +1695,11 @@ mod tests {
 
     #[test]
     fn test_js_value_stringify_array() {
-        let arr = JsValue::Array(Rc::new(vec![
+        let arr = JsValue::new_array(vec![
             JsValue::Smi(1),
             JsValue::Boolean(false),
             JsValue::Null,
-        ]));
+        ]);
         let result = json_stringify_js_value(&arr, None, None).unwrap().unwrap();
         assert_eq!(result, "[1,false,null]");
     }
@@ -1745,7 +1745,7 @@ mod tests {
     #[test]
     fn test_js_value_stringify_with_space() {
         let s = json_stringify_js_value(
-            &JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::Smi(2)])),
+            &JsValue::new_array(vec![JsValue::Smi(1), JsValue::Smi(2)]),
             None,
             Some(&JsonSpace::Count(2)),
         )

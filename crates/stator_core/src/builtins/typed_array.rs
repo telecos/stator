@@ -981,12 +981,7 @@ pub fn typed_array_keys(ta: &JsTypedArray) -> Vec<JsValue> {
 /// `%TypedArray%.prototype.entries()` — returns `[index, value]` pairs.
 pub fn typed_array_entries(ta: &JsTypedArray) -> Vec<JsValue> {
     (0..ta.length)
-        .map(|i| {
-            JsValue::Array(Rc::new(vec![
-                JsValue::Smi(i as i32),
-                typed_array_get(ta, i),
-            ]))
-        })
+        .map(|i| JsValue::new_array(vec![JsValue::Smi(i as i32), typed_array_get(ta, i)]))
         .collect()
 }
 

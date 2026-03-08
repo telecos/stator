@@ -499,8 +499,8 @@ fn write_jsvalue(buf: &mut Vec<u8>, value: &JsValue, ctx: &mut SerContext) {
                 write_u8(buf, TAG_DEFINE_REF);
                 write_u32(buf, id);
                 write_u8(buf, TAG_ARRAY);
-                write_u32(buf, rc.len() as u32);
-                for item in rc.iter() {
+                write_u32(buf, rc.borrow().len() as u32);
+                for item in rc.borrow().iter() {
                     write_jsvalue(buf, item, ctx);
                 }
             }
@@ -838,7 +838,7 @@ fn read_defined_ref(
             for _ in 0..count {
                 items.push(read_jsvalue(bytes, cursor, ctx)?);
             }
-            let value = JsValue::Array(Rc::new(items));
+            let value = JsValue::new_array(items);
             ctx.register(ref_id, value.clone());
             Ok(value)
         }
@@ -906,7 +906,7 @@ fn read_jsvalue_by_tag(
             for _ in 0..count {
                 items.push(read_jsvalue(bytes, cursor, ctx)?);
             }
-            Ok(JsValue::Array(Rc::new(items)))
+            Ok(JsValue::new_array(items))
         }
         TAG_PLAIN_OBJECT => {
             let count = read_u32(bytes, cursor)? as usize;
@@ -1262,10 +1262,10 @@ mod tests {
             JsValue::Null,
         ];
         let mut g = HashMap::new();
-        g.insert("arr".to_string(), JsValue::Array(Rc::new(items.clone())));
+        g.insert("arr".to_string(), JsValue::new_array(items.clone()));
         let r = round_trip(g);
         if let Some(JsValue::Array(restored)) = r.get("arr") {
-            assert_eq!(restored.as_ref(), &items);
+            assert_eq!(*restored.borrow(), items);
         } else {
             panic!("expected Array");
         }
@@ -1633,7 +1633,7 @@ mod tests {
 
     #[test]
     fn test_round_trip_shared_array() {
-        let shared = Rc::new(vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        let shared = Rc::new(RefCell::new(vec![JsValue::Smi(1), JsValue::Smi(2)]));
         let mut g = HashMap::new();
         g.insert("a".to_string(), JsValue::Array(Rc::clone(&shared)));
         g.insert("b".to_string(), JsValue::Array(Rc::clone(&shared)));
@@ -1641,7 +1641,7 @@ mod tests {
         let r = deserialize_globals(snap.as_bytes()).expect("deser");
         if let (Some(JsValue::Array(a)), Some(JsValue::Array(b))) = (r.get("a"), r.get("b")) {
             assert!(Rc::ptr_eq(a, b), "shared array identity must be preserved");
-            assert_eq!(a.as_ref(), &[JsValue::Smi(1), JsValue::Smi(2)]);
+            assert_eq!(*a.borrow(), vec![JsValue::Smi(1), JsValue::Smi(2)]);
         } else {
             panic!("expected two Arrays");
         }

@@ -210,6 +210,7 @@ pub fn plural_rules_select_js(args: &[JsValue]) -> StatorResult<JsValue> {
 pub fn list_format_js(args: &[JsValue], list_type: &str) -> StatorResult<JsValue> {
     let items: Vec<String> = match args.first() {
         Some(JsValue::Array(arr)) => arr
+            .borrow()
             .iter()
             .map(|v| v.to_js_string())
             .collect::<StatorResult<Vec<_>>>()?,

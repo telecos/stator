@@ -2859,7 +2859,7 @@ fn stator_value_inner_to_jsvalue(inner: &StatorValueInner) -> JsValue {
             // reference the same NativeFn without requiring ownership transfer.
             JsValue::NativeFunction(Rc::clone(native))
         }
-        StatorValueInner::Array => JsValue::Array(Rc::new(vec![])),
+        StatorValueInner::Array => JsValue::new_array(vec![]),
     }
 }
 

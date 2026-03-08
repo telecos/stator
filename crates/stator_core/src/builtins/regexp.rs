@@ -130,7 +130,7 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
                 Some(SymbolMatchResult::Single(m)) => Ok(match_to_js(&m)),
                 Some(SymbolMatchResult::All(v)) => {
                     let arr: Vec<JsValue> = v.into_iter().map(JsValue::String).collect();
-                    Ok(JsValue::Array(Rc::new(arr)))
+                    Ok(JsValue::new_array(arr))
                 }
             }
         })),
@@ -176,7 +176,7 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
             };
             let parts = re_split.symbol_split(&input, limit);
             let arr: Vec<JsValue> = parts.into_iter().map(JsValue::String).collect();
-            Ok(JsValue::Array(Rc::new(arr)))
+            Ok(JsValue::new_array(arr))
         })),
     );
 
@@ -245,10 +245,9 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
         let mut idx_props = PropertyMap::new();
         for (i, pair) in idx.pairs.iter().enumerate() {
             let val = match pair {
-                Some((s, e)) => JsValue::Array(Rc::new(vec![
-                    JsValue::Smi(*s as i32),
-                    JsValue::Smi(*e as i32),
-                ])),
+                Some((s, e)) => {
+                    JsValue::new_array(vec![JsValue::Smi(*s as i32), JsValue::Smi(*e as i32)])
+                }
                 None => JsValue::Undefined,
             };
             idx_props.insert(i.to_string(), val);
@@ -258,10 +257,7 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
             for (k, (s, e)) in &idx.groups {
                 g.insert(
                     k.clone(),
-                    JsValue::Array(Rc::new(vec![
-                        JsValue::Smi(*s as i32),
-                        JsValue::Smi(*e as i32),
-                    ])),
+                    JsValue::new_array(vec![JsValue::Smi(*s as i32), JsValue::Smi(*e as i32)]),
                 );
             }
             idx_props.insert(
@@ -406,8 +402,8 @@ mod tests {
                         // indices[0] = [4, 6]
                         let idx0 = idx.borrow().get("0").cloned();
                         if let Some(JsValue::Array(arr)) = idx0 {
-                            assert_eq!(arr[0], JsValue::Smi(4));
-                            assert_eq!(arr[1], JsValue::Smi(6));
+                            assert_eq!(arr.borrow()[0], JsValue::Smi(4));
+                            assert_eq!(arr.borrow()[1], JsValue::Smi(6));
                         } else {
                             panic!("indices[0] should be an array");
                         }

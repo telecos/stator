@@ -237,11 +237,14 @@ pub enum JsValue {
     /// The [`Rc`] allows function values to be cheaply cloned and shared
     /// without copying the bytecode.
     Function(Rc<BytecodeArray>),
-    /// A lightweight JavaScript array backed by a reference-counted [`Vec`].
+    /// A mutable JavaScript array backed by a reference-counted [`RefCell`]
+    /// wrapping a [`Vec`].
     ///
     /// Used by built-in combinators such as `Promise.all` that need to return
-    /// array values without interacting with the GC heap.
-    Array(Rc<Vec<JsValue>>),
+    /// array values without interacting with the GC heap.  The [`RefCell`]
+    /// layer enables in-place mutation required by `Array.prototype.push`,
+    /// `splice`, `sort`, etc.
+    Array(Rc<RefCell<Vec<JsValue>>>),
     /// A JavaScript generator object holding the suspended execution state of
     /// a generator function.
     ///
@@ -336,7 +339,7 @@ impl std::fmt::Debug for JsValue {
             Self::Object(ptr) => write!(f, "Object({ptr:?})"),
             Self::BigInt(n) => write!(f, "BigInt({n})"),
             Self::Function(ba) => write!(f, "Function({ba:?})"),
-            Self::Array(arr) => write!(f, "Array({arr:?})"),
+            Self::Array(arr) => write!(f, "Array({:?})", arr.borrow()),
             Self::Generator(g) => write!(f, "Generator({g:?})"),
             Self::Iterator(i) => write!(f, "Iterator({i:?})"),
             Self::Error(e) => write!(f, "Error({e:?})"),
@@ -372,7 +375,7 @@ impl PartialEq for JsValue {
             (Self::BigInt(a), Self::BigInt(b)) => a == b,
             // Reference types: compare contents (matching the original derive behaviour).
             (Self::Function(a), Self::Function(b)) => a == b,
-            (Self::Array(a), Self::Array(b)) => a == b,
+            (Self::Array(a), Self::Array(b)) => Rc::ptr_eq(a, b),
             (Self::Generator(a), Self::Generator(b)) => Rc::ptr_eq(a, b),
             (Self::Iterator(a), Self::Iterator(b)) => Rc::ptr_eq(a, b),
             (Self::Error(a), Self::Error(b)) => Rc::ptr_eq(a, b),
@@ -395,6 +398,15 @@ impl PartialEq for JsValue {
 // ──────────────────────────────────────────────────────────────────────────────
 
 impl JsValue {
+    /// Create a new mutable `Array` value from a `Vec<JsValue>`.
+    ///
+    /// This is the preferred constructor—callers should use this instead of
+    /// manually wrapping in `Rc<RefCell<…>>`.
+    #[inline]
+    pub fn new_array(items: Vec<JsValue>) -> Self {
+        Self::Array(Rc::new(RefCell::new(items)))
+    }
+
     /// Returns `true` if this value is `undefined`.
     #[inline]
     pub fn is_undefined(&self) -> bool {
@@ -753,6 +765,7 @@ impl JsValue {
             Self::Array(items) => {
                 // Array.prototype.toString → join with ","
                 let parts: Vec<String> = items
+                    .borrow()
                     .iter()
                     .map(|v| match v {
                         Self::Null | Self::Undefined => String::new(),
@@ -911,7 +924,7 @@ impl Trace for JsValue {
                 unsafe { tracer.mark_raw(*ptr as *mut u8) };
             }
             Self::Array(items) => {
-                for item in items.iter() {
+                for item in items.borrow().iter() {
                     item.trace(tracer);
                 }
             }
@@ -1307,7 +1320,7 @@ mod tests {
         assert!(JsValue::Symbol(0).is_primitive());
         assert!(JsValue::BigInt(0).is_primitive());
         assert!(!JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))).is_primitive());
-        assert!(!JsValue::Array(Rc::new(vec![])).is_primitive());
+        assert!(!JsValue::new_array(vec![]).is_primitive());
     }
 
     #[test]
@@ -1315,7 +1328,7 @@ mod tests {
         assert!(!JsValue::Undefined.is_object_like());
         assert!(!JsValue::Smi(42).is_object_like());
         assert!(JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))).is_object_like());
-        assert!(JsValue::Array(Rc::new(vec![])).is_object_like());
+        assert!(JsValue::new_array(vec![]).is_object_like());
     }
 
     // ── to_boolean ───────────────────────────────────────────────────────────
@@ -1430,7 +1443,7 @@ mod tests {
 
     #[test]
     fn test_to_primitive_array() {
-        let arr = JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::Smi(2)]));
+        let arr = JsValue::new_array(vec![JsValue::Smi(1), JsValue::Smi(2)]);
         let prim = arr.to_primitive(ToPrimitiveHint::String).unwrap();
         assert_eq!(prim, JsValue::String("1,2".to_string()));
     }
@@ -1605,19 +1618,19 @@ mod tests {
 
     #[test]
     fn test_to_number_empty_array_is_zero() {
-        let arr = JsValue::Array(Rc::new(vec![]));
+        let arr = JsValue::new_array(vec![]);
         assert_eq!(arr.to_number().unwrap(), 0.0);
     }
 
     #[test]
     fn test_to_number_single_element_array() {
-        let arr = JsValue::Array(Rc::new(vec![JsValue::Smi(42)]));
+        let arr = JsValue::new_array(vec![JsValue::Smi(42)]);
         assert_eq!(arr.to_number().unwrap(), 42.0);
     }
 
     #[test]
     fn test_to_number_multi_element_array_is_nan() {
-        let arr = JsValue::Array(Rc::new(vec![JsValue::Smi(1), JsValue::Smi(2)]));
+        let arr = JsValue::new_array(vec![JsValue::Smi(1), JsValue::Smi(2)]);
         let n = arr.to_number().unwrap();
         assert!(n.is_nan());
     }
@@ -1714,11 +1727,7 @@ mod tests {
 
     #[test]
     fn test_to_js_string_array() {
-        let arr = JsValue::Array(Rc::new(vec![
-            JsValue::Smi(1),
-            JsValue::Null,
-            JsValue::Smi(3),
-        ]));
+        let arr = JsValue::new_array(vec![JsValue::Smi(1), JsValue::Null, JsValue::Smi(3)]);
         assert_eq!(arr.to_js_string().unwrap(), "1,,3");
     }
 
@@ -2067,12 +2076,12 @@ mod tests {
 
     #[test]
     fn test_is_loosely_equal_object_to_primitive() {
-        let arr = JsValue::Array(Rc::new(vec![]));
+        let arr = JsValue::new_array(vec![]);
         // [] == false → "" == 0 → 0 == 0 → true
         assert!(arr.is_loosely_equal(&JsValue::Boolean(false)).unwrap());
         // [] == 0 → "" == 0 → 0 == 0 → true
         assert!(
-            JsValue::Array(Rc::new(vec![]))
+            JsValue::new_array(vec![])
                 .is_loosely_equal(&JsValue::Smi(0))
                 .unwrap()
         );
