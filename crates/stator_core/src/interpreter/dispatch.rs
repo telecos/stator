@@ -22,7 +22,7 @@ use super::{
     resolve_jump, strict_eq, to_array_index, to_bigint, to_property_key, try_execute_best_jit,
     walk_context_chain, wire_construct_prototype,
 };
-use crate::builtins::error::{pop_call_frame, push_call_frame};
+use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{proxy_delete_property, proxy_has, proxy_set};
 use crate::bytecode::bytecode_array::{
     ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD, TIERING_THRESHOLD,
@@ -2789,6 +2789,58 @@ fn handle_test_instance_of(
         let result = f(vec![ctx.frame.accumulator.clone()])?;
         ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
         return Ok(DispatchAction::Continue);
+    }
+
+    // ── Built-in type checks via constructor identity ──────────────
+    // NativeFunction constructors (Error, Array, Function, etc.) don't have
+    // .prototype properties. Identify them by pointer-comparing with global
+    // scope entries and do direct type checking.
+    if let JsValue::NativeFunction(ref ctor_fn) = constructor {
+        let acc = &ctx.frame.accumulator;
+        let global = ctx.frame.global_env.borrow();
+
+        type BuiltinCheck = (&'static str, fn(&JsValue) -> bool);
+        let builtin_checks: &[BuiltinCheck] = &[
+            ("Array", |v| matches!(v, JsValue::Array(_))),
+            ("Function", |v| {
+                matches!(v, JsValue::Function(_) | JsValue::NativeFunction(_))
+            }),
+            ("Promise", |v| matches!(v, JsValue::Promise(_))),
+            // Error hierarchy: instanceof Error matches ALL error kinds
+            ("Error", |v| matches!(v, JsValue::Error(_))),
+        ];
+        for &(name, predicate) in builtin_checks {
+            if let Some(JsValue::NativeFunction(global_fn)) = global.get(name)
+                && Rc::ptr_eq(ctor_fn, global_fn)
+            {
+                let result = predicate(acc);
+                drop(global);
+                ctx.frame.accumulator = JsValue::Boolean(result);
+                return Ok(DispatchAction::Continue);
+            }
+        }
+        // Specific error sub-types: TypeError, RangeError, etc.
+        // These inherit from Error, so `e instanceof TypeError` should check e.kind
+        let error_kinds: &[(&str, ErrorKind)] = &[
+            ("TypeError", ErrorKind::TypeError),
+            ("RangeError", ErrorKind::RangeError),
+            ("ReferenceError", ErrorKind::ReferenceError),
+            ("SyntaxError", ErrorKind::SyntaxError),
+            ("URIError", ErrorKind::URIError),
+            ("EvalError", ErrorKind::EvalError),
+            ("AggregateError", ErrorKind::AggregateError),
+        ];
+        for &(name, kind) in error_kinds {
+            if let Some(JsValue::NativeFunction(global_fn)) = global.get(name)
+                && Rc::ptr_eq(ctor_fn, global_fn)
+            {
+                let is_match = matches!(acc, JsValue::Error(e) if e.kind == kind);
+                drop(global);
+                ctx.frame.accumulator = JsValue::Boolean(is_match);
+                return Ok(DispatchAction::Continue);
+            }
+        }
+        drop(global);
     }
 
     // Obtain the constructor's "prototype" property.

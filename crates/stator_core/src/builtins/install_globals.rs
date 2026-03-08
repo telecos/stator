@@ -272,6 +272,42 @@ fn arg_f64(args: &[JsValue], idx: usize) -> StatorResult<f64> {
     args.get(idx).unwrap_or(&JsValue::Undefined).to_number()
 }
 
+/// Deep-clone a `JsValue`, recursing into objects and arrays.
+fn structured_clone(val: &JsValue) -> JsValue {
+    match val {
+        // Primitives: value types or immutable — return as-is.
+        JsValue::Undefined
+        | JsValue::Null
+        | JsValue::Boolean(_)
+        | JsValue::Smi(_)
+        | JsValue::HeapNumber(_)
+        | JsValue::String(_)
+        | JsValue::Symbol(_)
+        | JsValue::BigInt(_) => val.clone(),
+
+        // PlainObject: recursively clone every property.
+        JsValue::PlainObject(map) => {
+            let mut cloned = PropertyMap::new();
+            for (k, v) in map.borrow().iter() {
+                cloned.insert(k.clone(), structured_clone(v));
+            }
+            JsValue::PlainObject(Rc::new(RefCell::new(cloned)))
+        }
+
+        // Array: recursively clone every element.
+        JsValue::Array(arr) => {
+            let cloned: Vec<JsValue> = arr.borrow().iter().map(structured_clone).collect();
+            JsValue::new_array(cloned)
+        }
+
+        // Error: clone the error.
+        JsValue::Error(e) => JsValue::Error(Rc::new(JsError::clone(e))),
+
+        // Best-effort shallow clone for remaining types.
+        _ => val.clone(),
+    }
+}
+
 // ── Math ─────────────────────────────────────────────────────────────────────
 
 /// Build the `Math` namespace object with all constants and methods.
@@ -7416,6 +7452,34 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(JsValue::String(global_unescape(&s)))
+        }),
+    );
+
+    // ── structuredClone(value) ──────────────────────────────────────────
+    globals.insert(
+        "structuredClone".into(),
+        native(|args| {
+            let val = args.first().unwrap_or(&JsValue::Undefined);
+            Ok(structured_clone(val))
+        }),
+    );
+
+    // ── queueMicrotask(callback) ────────────────────────────────────────
+    globals.insert(
+        "queueMicrotask".into(),
+        native(|args| {
+            let cb = args.first().unwrap_or(&JsValue::Undefined);
+            match cb {
+                JsValue::NativeFunction(f) => {
+                    f(vec![])?;
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "queueMicrotask: argument must be a function".into(),
+                    ));
+                }
+            }
+            Ok(JsValue::Undefined)
         }),
     );
 
