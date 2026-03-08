@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::gc::heap::{Heap, OldSpace};
+use crate::gc::trace::{Tracer, trace_heap_object};
 use crate::objects::heap_object::HeapObject;
 
 // ── Tri-colour marking ───────────────────────────────────────────────────────
@@ -291,9 +292,17 @@ impl IncrementalGc {
             self.mark_table.remove(&addr);
             self.black_set.insert(addr);
 
-            // TODO: call Trace/Relocate dispatch on `obj` to push child
-            // pointers onto the grey stack once the full object model is
-            // available.  For now the mark terminates at each root.
+            // Trace child pointers and enqueue them as grey.
+            let mut tracer = Tracer::new();
+            // SAFETY: obj is a valid, marked HeapObject pointer.
+            unsafe { trace_heap_object(obj, &mut tracer) };
+            for child_raw in tracer.gray_stack {
+                let child_addr = child_raw as usize;
+                if !self.black_set.contains(&child_addr) && !self.mark_table.contains(&child_addr) {
+                    self.mark_table.insert(child_addr);
+                    self.grey_stack.push(child_raw as *mut HeapObject);
+                }
+            }
 
             budget -= 1;
         }

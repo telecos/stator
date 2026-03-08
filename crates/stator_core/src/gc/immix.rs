@@ -46,6 +46,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::gc::heap::OldSpace;
+use crate::gc::trace::{Tracer, trace_heap_object};
 use crate::objects::heap_object::HeapObject;
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -563,9 +564,31 @@ impl ImmixCollector {
             }
         }
 
-        // BFS drain — child traversal to be added with Trace dispatch.
-        while let Some(_obj) = grey_stack.pop() {
-            // TODO: call Trace::trace on each object's children.
+        // BFS drain — trace each object's children via the Trace dispatch.
+        while let Some(obj) = grey_stack.pop() {
+            let mut tracer = Tracer::new();
+            // SAFETY: obj is a valid, marked HeapObject pointer.
+            unsafe { trace_heap_object(obj, &mut tracer) };
+
+            // Enqueue newly discovered children.
+            for child_raw in tracer.gray_stack {
+                let child = child_raw as *mut HeapObject;
+                if child.is_null() || self.is_marked(child) {
+                    continue;
+                }
+                self.mark_object(child);
+                grey_stack.push(child);
+
+                // Mark lines for the child in its containing block.
+                // SAFETY: child is a valid HeapObject with initialised alloc_size.
+                let child_size = unsafe { (*child).alloc_size() } as usize;
+                for block in blocks.iter_mut() {
+                    if block.contains(child as *const u8) {
+                        block.mark_lines_for_object(child as *const u8, child_size);
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -772,9 +795,23 @@ impl ConcurrentMarker {
             }
         }
 
-        // BFS — child traversal via Trace will be wired in later.
-        while let Some(_obj) = grey_stack.pop() {
-            // TODO: call Trace::trace on each object.
+        // BFS — trace each object's children via the Trace dispatch.
+        while let Some(obj) = grey_stack.pop() {
+            let mut tracer = Tracer::new();
+            // SAFETY: obj is a valid, marked HeapObject pointer.
+            unsafe { trace_heap_object(obj as *mut HeapObject, &mut tracer) };
+
+            for child_raw in tracer.gray_stack {
+                let child = child_raw as *const HeapObject;
+                if child.is_null() {
+                    continue;
+                }
+                let addr = child as usize;
+                if old_space.contains(child as *mut u8) && !live_set.contains(&addr) {
+                    live_set.insert(addr);
+                    grey_stack.push(child);
+                }
+            }
         }
 
         let marked_count = live_set.len();

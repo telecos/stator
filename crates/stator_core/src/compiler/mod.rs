@@ -41,5 +41,7 @@ pub mod background;
 pub mod baseline;
 /// Maglev optimising compiler tier.
 pub mod maglev;
+/// On-Stack Replacement: mid-execution tier-up for hot loops.
+pub mod osr;
 /// Turbofan: Cranelift-backed optimising JIT backend.
 pub mod turbofan;

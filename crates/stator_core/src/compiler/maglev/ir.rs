@@ -1809,6 +1809,10 @@ pub struct MaglevGraph {
 
     /// Graph-wide node counter, incremented by [`MaglevGraph::add_value_node`].
     next_node_id: u32,
+
+    /// Number of call sites identified as inlining candidates by the
+    /// optimizer's inlining analysis pass.
+    inline_candidates: u32,
 }
 
 impl MaglevGraph {
@@ -1819,6 +1823,7 @@ impl MaglevGraph {
             blocks: Vec::new(),
             parameter_count,
             next_node_id: 0,
+            inline_candidates: 0,
         }
     }
 
@@ -1876,6 +1881,17 @@ impl MaglevGraph {
     /// Return the entry block (block 0), if present.
     pub fn entry_block(&self) -> Option<&BasicBlock> {
         self.blocks.first()
+    }
+
+    /// Set the number of inlining candidate call sites identified by the
+    /// optimizer.
+    pub fn set_inline_candidates(&mut self, count: u32) {
+        self.inline_candidates = count;
+    }
+
+    /// Return the number of inlining candidate call sites.
+    pub fn inline_candidates(&self) -> u32 {
+        self.inline_candidates
     }
 }
 

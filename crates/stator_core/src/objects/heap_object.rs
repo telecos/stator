@@ -163,6 +163,16 @@ impl HeapObject {
         // SAFETY: caller guarantees the Map pointer is valid and the Map is live.
         unsafe { (*self.map()).instance_type() }
     }
+
+    /// Returns `true` if the `map_word` is non-null and not a forwarding
+    /// pointer.  This is a *necessary* but not *sufficient* condition for
+    /// [`map`][Self::map] to be safe — the pointer could still be dangling.
+    #[inline]
+    pub fn has_map(&self) -> bool {
+        let raw = self.map_word.0;
+        // Null or forwarding pointer (bit 1 set) → no valid map.
+        raw != 0 && (raw & FORWARDING_TAG) == 0
+    }
 }
 
 #[cfg(test)]
