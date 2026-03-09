@@ -8320,10 +8320,24 @@ mod tests {
                 borrow.get("flags"),
                 Some(&JsValue::String("i".to_string().into()))
             );
-            assert_eq!(
-                borrow.get("toString"),
-                Some(&JsValue::String("/ab+d/i".to_string().into()))
+            // toString is now a NativeFunction
+            assert!(
+                matches!(borrow.get("toString"), Some(JsValue::NativeFunction(_))),
+                "expected toString to be a NativeFunction"
             );
+            // test & exec are NativeFunctions
+            assert!(matches!(
+                borrow.get("test"),
+                Some(JsValue::NativeFunction(_))
+            ));
+            assert!(matches!(
+                borrow.get("exec"),
+                Some(JsValue::NativeFunction(_))
+            ));
+            // boolean flags
+            assert_eq!(borrow.get("ignoreCase"), Some(&JsValue::Boolean(true)));
+            assert_eq!(borrow.get("global"), Some(&JsValue::Boolean(false)));
+            assert_eq!(borrow.get("__is_regexp__"), Some(&JsValue::Boolean(true)));
         } else {
             panic!("expected PlainObject, got {result:?}");
         }
@@ -8360,6 +8374,9 @@ mod tests {
                 borrow.get("flags"),
                 Some(&JsValue::String("gim".to_string().into()))
             );
+            assert_eq!(borrow.get("global"), Some(&JsValue::Boolean(true)));
+            assert_eq!(borrow.get("ignoreCase"), Some(&JsValue::Boolean(true)));
+            assert_eq!(borrow.get("multiline"), Some(&JsValue::Boolean(true)));
         } else {
             panic!("expected PlainObject, got {result:?}");
         }
@@ -8396,10 +8413,20 @@ mod tests {
                 borrow.get("flags"),
                 Some(&JsValue::String(String::new().into()))
             );
-            assert_eq!(
-                borrow.get("toString"),
-                Some(&JsValue::String("/abc/".to_string().into()))
+            assert!(
+                matches!(borrow.get("toString"), Some(JsValue::NativeFunction(_))),
+                "expected toString to be a NativeFunction"
             );
+            assert!(matches!(
+                borrow.get("test"),
+                Some(JsValue::NativeFunction(_))
+            ));
+            assert!(matches!(
+                borrow.get("exec"),
+                Some(JsValue::NativeFunction(_))
+            ));
+            assert_eq!(borrow.get("global"), Some(&JsValue::Boolean(false)));
+            assert_eq!(borrow.get("ignoreCase"), Some(&JsValue::Boolean(false)));
         } else {
             panic!("expected PlainObject, got {result:?}");
         }

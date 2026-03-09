@@ -9126,7 +9126,7 @@ mod tests {
 
     #[test]
     fn test_apply_js_reviver_doubles_numbers() {
-        use crate::builtins::json::{JsonValue, json_parse};
+        use crate::builtins::json::json_parse;
         use std::rc::Rc;
 
         let json_val = json_parse("[1, 2, 3]", None).unwrap();
