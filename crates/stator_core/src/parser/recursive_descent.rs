@@ -2649,6 +2649,15 @@ impl<'src> Parser<'src> {
                 self.bump()?;
                 Ok(Expr::This(crate::parser::ast::ThisExpr { loc: span }))
             }
+            TokenKind::Super => {
+                // `super()` and `super.method()` — treat as identifier "super"
+                // so the bytecode generator emits LdaGlobal("super").
+                self.bump()?;
+                Ok(Expr::Ident(Ident {
+                    loc: span,
+                    name: "super".to_owned(),
+                }))
+            }
             TokenKind::Identifier => {
                 let tok = self.bump()?;
                 let name = match tok.value {

@@ -1185,13 +1185,24 @@ fn handle_call_any_receiver(
             ctx.frame.accumulator = f(args)?;
         }
         JsValue::PlainObject(ref map) => {
-            if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                ctx.frame.accumulator = f(args)?;
-            } else {
-                return Err(StatorError::TypeError(
-                    "CallAnyReceiver: callee is not a function (got PlainObject)".to_string(),
-                ));
+            let call_val = map.borrow().get("__call__").cloned();
+            match call_val {
+                Some(JsValue::NativeFunction(f)) => {
+                    let args = collect_args(ctx.frame, args_start_v, arg_count)?;
+                    ctx.frame.accumulator = f(args)?;
+                }
+                Some(JsValue::Function(ba)) => {
+                    let args = collect_args(ctx.frame, args_start_v, arg_count)?;
+                    call_plain_object_function(ctx, &ba)?;
+                    // `args` are forwarded via shared global_env ("this"
+                    // is already set by the outer Construct handler).
+                    let _ = args;
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "CallAnyReceiver: callee is not a function (got PlainObject)".to_string(),
+                    ));
+                }
             }
         }
         other => {
@@ -1743,6 +1754,106 @@ fn handle_call_with_spread(
     Ok(DispatchAction::Continue)
 }
 
+/// Call a `PlainObject`-wrapped class constructor as a regular function.
+///
+/// Used when `super()` appears in a derived constructor — the parent
+/// constructor is called (not `[[Construct]]`-ed).  The shared global
+/// environment already has `"this"` set by the enclosing `[[Construct]]`
+/// handler, so the parent body can see and mutate the same object.
+fn call_plain_object_function(
+    ctx: &mut DispatchContext,
+    ba: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
+) -> StatorResult<()> {
+    let mut callee_frame = InterpreterFrame::new_with_globals(
+        (**ba).clone(),
+        vec![],
+        Rc::clone(&ctx.frame.global_env),
+    );
+    restore_closure_context(&mut callee_frame, ba);
+    push_call_frame("<anonymous>")?;
+    let result = Interpreter::run(&mut callee_frame);
+    pop_call_frame();
+    ctx.frame.accumulator = result?;
+    Ok(())
+}
+
+/// Shared helper for `[[Construct]]` on a class created by `CreateClass`.
+///
+/// The class constructor is a `PlainObject` whose `__call__` holds the
+/// constructor bytecode (`JsValue::Function`).  This function:
+///   1. Creates a fresh `this` object with `__proto__` = constructor's
+///      `prototype`.
+///   2. Sets `"this"` and (when the class `extends`) `"super"` in the
+///      global environment so the constructor body can access them.
+///   3. Runs the constructor bytecode with `new_target` set.
+///   4. Invokes the hidden `.class_field_initializer` closure, if present.
+///   5. Returns the `this` object (or an explicit object returned by the
+///      constructor).
+fn construct_class_from_plain_object(
+    ctx: &mut DispatchContext,
+    ba: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
+    class_map: &Rc<RefCell<PropertyMap>>,
+    ctor_proto: &JsValue,
+    args: Vec<JsValue>,
+) -> StatorResult<()> {
+    // 1. Create `this`.
+    let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+    if !matches!(ctor_proto, JsValue::Undefined) {
+        this_obj
+            .borrow_mut()
+            .insert("__proto__".to_string(), ctor_proto.clone());
+    }
+    let this_val = JsValue::PlainObject(Rc::clone(&this_obj));
+
+    // 2. Set up callee frame.
+    let mut callee_frame =
+        InterpreterFrame::new_with_globals((**ba).clone(), args, Rc::clone(&ctx.frame.global_env));
+    restore_closure_context(&mut callee_frame, ba);
+    callee_frame.new_target = JsValue::PlainObject(Rc::clone(class_map));
+    callee_frame
+        .global_env
+        .borrow_mut()
+        .insert("this".to_string(), this_val.clone());
+
+    // 3. Expose parent constructor as "super" for `super()` calls.
+    if let Some(parent) = class_map.borrow().get("__proto__").cloned()
+        && !matches!(parent, JsValue::Undefined | JsValue::Null)
+    {
+        callee_frame
+            .global_env
+            .borrow_mut()
+            .insert("super".to_string(), parent);
+    }
+
+    // 4. Run constructor body.
+    push_call_frame("<anonymous>")?;
+    let result = Interpreter::run(&mut callee_frame);
+    pop_call_frame();
+    let val = result?;
+
+    // 5. Run field initializer if present.
+    if let Some(JsValue::Function(init_ba)) =
+        class_map.borrow().get(".class_field_initializer").cloned()
+    {
+        let mut init_frame = InterpreterFrame::new_with_globals(
+            (*init_ba).clone(),
+            vec![this_val.clone()],
+            Rc::clone(&ctx.frame.global_env),
+        );
+        restore_closure_context(&mut init_frame, &init_ba);
+        push_call_frame("<field_init>")?;
+        let _ = Interpreter::run(&mut init_frame);
+        pop_call_frame();
+    }
+
+    // 6. If constructor returns an object, use it; else use `this`.
+    ctx.frame.accumulator = match val {
+        JsValue::PlainObject(_) | JsValue::Object(_) => val,
+        _ => this_val,
+    };
+    Ok(())
+}
+
 fn handle_construct(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -1779,6 +1890,10 @@ fn handle_construct(
             );
             restore_closure_context(&mut callee_frame, &ba);
             callee_frame.new_target = JsValue::Function(Rc::clone(&ba));
+            callee_frame
+                .global_env
+                .borrow_mut()
+                .insert("this".to_string(), this_val.clone());
             push_call_frame("<anonymous>")?;
             let result = Interpreter::run(&mut callee_frame);
             pop_call_frame();
@@ -1795,15 +1910,23 @@ fn handle_construct(
             ctx.frame.accumulator = f(args)?;
         }
         JsValue::PlainObject(ref map) => {
-            if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                let val = f(args)?;
-                ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
-            } else {
-                return Err(StatorError::TypeError(format!(
-                    "Construct: constructor is not a function (got {other:?})",
-                    other = JsValue::PlainObject(Rc::clone(map))
-                )));
+            let call_val = map.borrow().get("__call__").cloned();
+            match call_val {
+                Some(JsValue::NativeFunction(f)) => {
+                    let args = collect_args(ctx.frame, args_start_v, arg_count)?;
+                    let val = f(args)?;
+                    ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
+                }
+                Some(JsValue::Function(ba)) => {
+                    let args = collect_args(ctx.frame, args_start_v, arg_count)?;
+                    construct_class_from_plain_object(ctx, &ba, map, &ctor_proto, args)?;
+                }
+                _ => {
+                    return Err(StatorError::TypeError(format!(
+                        "Construct: constructor is not a function (got {other:?})",
+                        other = JsValue::PlainObject(Rc::clone(map))
+                    )));
+                }
             }
         }
         other => {
@@ -1858,6 +1981,10 @@ fn handle_construct_with_spread(
             );
             restore_closure_context(&mut callee_frame, &ba);
             callee_frame.new_target = JsValue::Function(Rc::clone(&ba));
+            callee_frame
+                .global_env
+                .borrow_mut()
+                .insert("this".to_string(), this_val.clone());
             push_call_frame("<anonymous>")?;
             let result = Interpreter::run(&mut callee_frame);
             pop_call_frame();
@@ -1871,13 +1998,20 @@ fn handle_construct_with_spread(
             ctx.frame.accumulator = f(args)?;
         }
         JsValue::PlainObject(ref map) => {
-            if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                let val = f(args)?;
-                ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
-            } else {
-                return Err(StatorError::TypeError(
-                    "ConstructWithSpread: constructor is not a function".to_string(),
-                ));
+            let call_val = map.borrow().get("__call__").cloned();
+            match call_val {
+                Some(JsValue::NativeFunction(f)) => {
+                    let val = f(args)?;
+                    ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
+                }
+                Some(JsValue::Function(ba)) => {
+                    construct_class_from_plain_object(ctx, &ba, map, &ctor_proto, args)?;
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "ConstructWithSpread: constructor is not a function".to_string(),
+                    ));
+                }
             }
         }
         other => {
@@ -4412,20 +4546,53 @@ fn handle_construct_forward_all_args(
         .to_vec();
     match ctor {
         JsValue::Function(ba) => {
+            let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+            if !matches!(ctor_proto, JsValue::Undefined) {
+                this_obj
+                    .borrow_mut()
+                    .insert("__proto__".to_string(), ctor_proto.clone());
+            }
+            let this_val = JsValue::PlainObject(this_obj);
             let mut callee_frame = InterpreterFrame::new_with_globals(
                 (*ba).clone(),
                 args,
                 Rc::clone(&ctx.frame.global_env),
             );
             restore_closure_context(&mut callee_frame, &ba);
+            callee_frame.new_target = JsValue::Function(Rc::clone(&ba));
+            callee_frame
+                .global_env
+                .borrow_mut()
+                .insert("this".to_string(), this_val.clone());
             push_call_frame("<anonymous>")?;
             let result = Interpreter::run(&mut callee_frame);
             pop_call_frame();
             let val = result?;
-            ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
+            ctx.frame.accumulator = match val {
+                JsValue::PlainObject(_) | JsValue::Object(_) => val,
+                _ => this_val,
+            };
         }
         JsValue::NativeFunction(f) => {
             ctx.frame.accumulator = f(args)?;
+        }
+        JsValue::PlainObject(ref map) => {
+            let call_val = map.borrow().get("__call__").cloned();
+            match call_val {
+                Some(JsValue::NativeFunction(f)) => {
+                    let val = f(args)?;
+                    ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
+                }
+                Some(JsValue::Function(ba)) => {
+                    construct_class_from_plain_object(ctx, &ba, map, &ctor_proto, args)?;
+                }
+                _ => {
+                    return Err(StatorError::TypeError(format!(
+                        "ConstructForwardAllArgs: constructor is not a function (got {other:?})",
+                        other = JsValue::PlainObject(Rc::clone(map))
+                    )));
+                }
+            }
         }
         other => {
             return Err(StatorError::TypeError(format!(
