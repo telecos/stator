@@ -1182,6 +1182,31 @@ fn ordinary_to_primitive_plain_object(
         }
     }
 
+    // Array-like PlainObject: join elements with comma.
+    {
+        let borrow = map.borrow();
+        if matches!(borrow.get("__is_array__"), Some(JsValue::Boolean(true))) {
+            let len = match borrow.get("length") {
+                Some(JsValue::Smi(n)) => *n as usize,
+                _ => 0,
+            };
+            let mut parts = Vec::with_capacity(len);
+            for i in 0..len {
+                match borrow.get(&i.to_string()) {
+                    Some(JsValue::Null | JsValue::Undefined) | None => parts.push(String::new()),
+                    Some(JsValue::Smi(n)) => parts.push(n.to_string()),
+                    Some(JsValue::HeapNumber(n)) => parts.push(number_to_string(*n)),
+                    Some(JsValue::Boolean(b)) => {
+                        parts.push(if *b { "true" } else { "false" }.into());
+                    }
+                    Some(JsValue::String(s)) => parts.push(s.to_string()),
+                    Some(_) => parts.push(String::new()),
+                }
+            }
+            return Ok(JsValue::String(parts.join(",").into()));
+        }
+    }
+
     // No callable method returned a primitive — use default.
     Ok(JsValue::String("[object Object]".to_string().into()))
 }
