@@ -996,6 +996,7 @@ fn js_value_to_json_inner(
 ) -> StatorResult<Option<JsonValue>> {
     match value {
         JsValue::Undefined
+        | JsValue::TheHole
         | JsValue::Symbol(_)
         | JsValue::Function(_)
         | JsValue::Generator(_)

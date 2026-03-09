@@ -62,7 +62,7 @@ pub(super) type OpcodeHandler =
     fn(&mut DispatchContext, &Instruction) -> StatorResult<DispatchAction>;
 
 /// Number of opcode variants (= `Opcode::Illegal as usize + 1`).
-const OPCODE_COUNT: usize = 191;
+const OPCODE_COUNT: usize = 192;
 
 fn handle_lda_zero(
     ctx: &mut DispatchContext,
@@ -85,6 +85,14 @@ fn handle_lda_undefined(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     ctx.frame.accumulator = JsValue::Undefined;
+    Ok(DispatchAction::Continue)
+}
+
+fn handle_lda_the_hole(
+    ctx: &mut DispatchContext,
+    _instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    ctx.frame.accumulator = JsValue::TheHole;
     Ok(DispatchAction::Continue)
 }
 
@@ -2447,7 +2455,7 @@ fn handle_debugger(
 
 fn handle_type_of(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<DispatchAction> {
     let type_str = match &ctx.frame.accumulator {
-        JsValue::Undefined => "undefined",
+        JsValue::Undefined | JsValue::TheHole => "undefined",
         JsValue::Null => "object",
         JsValue::Boolean(_) => "boolean",
         JsValue::Smi(_) | JsValue::HeapNumber(_) => "number",
@@ -2554,7 +2562,7 @@ fn handle_to_object(
         return Err(err_bad_operand("ToObject", 0));
     };
     let wrapped = match &ctx.frame.accumulator {
-        JsValue::Null | JsValue::Undefined => {
+        JsValue::Null | JsValue::Undefined | JsValue::TheHole => {
             return Err(StatorError::TypeError(
                 "Cannot convert undefined or null to object".to_string(),
             ));
@@ -3413,7 +3421,7 @@ fn handle_throw_reference_error_if_hole(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
         return Err(err_bad_operand("ThrowReferenceErrorIfHole", 0));
     };
-    if ctx.frame.accumulator == JsValue::Undefined {
+    if ctx.frame.accumulator == JsValue::TheHole {
         let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
             Some(ConstantPoolEntry::String(s)) => s.clone(),
             _ => "<unknown>".to_string(),
@@ -3429,7 +3437,7 @@ fn handle_throw_super_not_called_if_hole(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    if ctx.frame.accumulator == JsValue::Undefined {
+    if ctx.frame.accumulator == JsValue::TheHole {
         return Err(StatorError::ReferenceError(
             "Must call super constructor in derived class \
          before accessing 'this' or returning from \
@@ -3444,7 +3452,7 @@ fn handle_throw_super_already_called_if_not_hole(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    if ctx.frame.accumulator != JsValue::Undefined {
+    if ctx.frame.accumulator != JsValue::TheHole {
         return Err(StatorError::ReferenceError(
             "Super constructor may only be called once".to_string(),
         ));
@@ -4545,6 +4553,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::LdaZero as usize] = handle_lda_zero;
     table[Opcode::LdaSmi as usize] = handle_lda_smi;
     table[Opcode::LdaUndefined as usize] = handle_lda_undefined;
+    table[Opcode::LdaTheHole as usize] = handle_lda_the_hole;
     table[Opcode::LdaNull as usize] = handle_lda_null;
     table[Opcode::LdaTrue as usize] = handle_lda_true;
     table[Opcode::LdaFalse as usize] = handle_lda_false;

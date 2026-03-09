@@ -218,6 +218,15 @@ pub enum JsValue {
     Undefined,
     /// The ECMAScript `null` primitive.
     Null,
+    /// Internal sentinel for uninitialized `let`/`const`/`class` bindings
+    /// (the Temporal Dead Zone).
+    ///
+    /// This is **not** a user-visible JavaScript value.  It exists only so
+    /// that the interpreter can distinguish "not yet initialised" from an
+    /// explicit `undefined` assignment.  The `ThrowReferenceErrorIfHole`
+    /// family of opcodes checks for this value and throws a
+    /// `ReferenceError` when it is encountered.
+    TheHole,
     /// A JavaScript boolean (`true` or `false`).
     Boolean(bool),
     /// A small (31-bit signed) integer, stored inline without heap allocation.
@@ -331,6 +340,7 @@ impl std::fmt::Debug for JsValue {
         match self {
             Self::Undefined => write!(f, "Undefined"),
             Self::Null => write!(f, "Null"),
+            Self::TheHole => write!(f, "TheHole"),
             Self::Boolean(b) => write!(f, "Boolean({b})"),
             Self::Smi(n) => write!(f, "Smi({n})"),
             Self::HeapNumber(n) => write!(f, "HeapNumber({n})"),
@@ -364,6 +374,7 @@ impl PartialEq for JsValue {
         match (self, other) {
             (Self::Undefined, Self::Undefined) => true,
             (Self::Null, Self::Null) => true,
+            (Self::TheHole, Self::TheHole) => true,
             (Self::Boolean(a), Self::Boolean(b)) => a == b,
             (Self::Smi(a), Self::Smi(b)) => a == b,
             (Self::HeapNumber(a), Self::HeapNumber(b)) => a == b,
@@ -411,6 +422,12 @@ impl JsValue {
     #[inline]
     pub fn is_undefined(&self) -> bool {
         matches!(self, Self::Undefined)
+    }
+
+    /// Returns `true` if this value is the internal hole sentinel.
+    #[inline]
+    pub fn is_the_hole(&self) -> bool {
+        matches!(self, Self::TheHole)
     }
 
     /// Returns `true` if this value is `null`.
@@ -554,7 +571,7 @@ impl JsValue {
     #[inline]
     pub fn to_boolean(&self) -> bool {
         match self {
-            Self::Undefined | Self::Null => false,
+            Self::Undefined | Self::Null | Self::TheHole => false,
             Self::Boolean(b) => *b,
             Self::Smi(n) => *n != 0,
             Self::HeapNumber(n) => !n.is_nan() && *n != 0.0,

@@ -9268,10 +9268,10 @@ mod tests {
     // ── ThrowReferenceErrorIfHole ───────────────────────────────────────
 
     #[test]
-    fn test_throw_reference_error_if_hole_fires_on_undefined() {
+    fn test_throw_reference_error_if_hole_fires_on_the_hole() {
         let ba = make_bytecode_with_pool(
             vec![
-                Instruction::new_unchecked(Opcode::LdaUndefined, vec![]),
+                Instruction::new_unchecked(Opcode::LdaTheHole, vec![]),
                 Instruction::new_unchecked(
                     Opcode::ThrowReferenceErrorIfHole,
                     vec![Operand::ConstantPoolIdx(0)],
@@ -9292,7 +9292,7 @@ mod tests {
     }
 
     #[test]
-    fn test_throw_reference_error_if_hole_noop_when_not_undefined() {
+    fn test_throw_reference_error_if_hole_noop_when_not_hole() {
         let ba = make_bytecode_with_pool(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(7)]),
@@ -9311,13 +9311,35 @@ mod tests {
         assert_eq!(result, JsValue::Smi(7));
     }
 
+    #[test]
+    fn test_throw_reference_error_if_hole_noop_for_undefined() {
+        // `let x = undefined; x` must NOT throw — undefined is a valid
+        // initialised value, distinct from the internal hole sentinel.
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaUndefined, vec![]),
+                Instruction::new_unchecked(
+                    Opcode::ThrowReferenceErrorIfHole,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("x".to_string())],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
     // ── ThrowSuperNotCalledIfHole ───────────────────────────────────────
 
     #[test]
     fn test_throw_super_not_called_if_hole() {
         let result = run_bytecode(
             vec![
-                Instruction::new_unchecked(Opcode::LdaUndefined, vec![]),
+                Instruction::new_unchecked(Opcode::LdaTheHole, vec![]),
                 Instruction::new_unchecked(Opcode::ThrowSuperNotCalledIfHole, vec![]),
                 Instruction::new_unchecked(Opcode::Return, vec![]),
             ],
@@ -9369,14 +9391,14 @@ mod tests {
     fn test_throw_super_already_called_noop_when_hole() {
         let result = run_bytecode(
             vec![
-                Instruction::new_unchecked(Opcode::LdaUndefined, vec![]),
+                Instruction::new_unchecked(Opcode::LdaTheHole, vec![]),
                 Instruction::new_unchecked(Opcode::ThrowSuperAlreadyCalledIfNotHole, vec![]),
                 Instruction::new_unchecked(Opcode::Return, vec![]),
             ],
             0,
         )
         .unwrap();
-        assert_eq!(result, JsValue::Undefined);
+        assert_eq!(result, JsValue::TheHole);
     }
 
     // ── CallRuntime (stub / no-op) ──────────────────────────────────────

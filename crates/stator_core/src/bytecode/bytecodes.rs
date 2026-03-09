@@ -218,6 +218,11 @@ pub enum Opcode {
     LdaSmi,
     /// Load `undefined` into the accumulator.
     LdaUndefined,
+    /// Load the internal hole sentinel into the accumulator.
+    ///
+    /// Used to initialise `let`/`const`/`class` bindings before their
+    /// declaration is reached (Temporal Dead Zone).
+    LdaTheHole,
     /// Load `null` into the accumulator.
     LdaNull,
     /// Load `true` into the accumulator.
@@ -697,6 +702,7 @@ impl Opcode {
             Opcode::LdaZero => &[],
             Opcode::LdaSmi => &[Immediate],
             Opcode::LdaUndefined => &[],
+            Opcode::LdaTheHole => &[],
             Opcode::LdaNull => &[],
             Opcode::LdaTrue => &[],
             Opcode::LdaFalse => &[],

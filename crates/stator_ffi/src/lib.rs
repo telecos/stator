@@ -2866,7 +2866,7 @@ fn stator_value_inner_to_jsvalue(inner: &StatorValueInner) -> JsValue {
 /// Convert a [`JsValue`] to the inner storage type used by [`StatorValue`].
 fn jsvalue_to_stator_value_inner(v: &JsValue) -> StatorValueInner {
     match v {
-        JsValue::Undefined => StatorValueInner::Undefined,
+        JsValue::Undefined | JsValue::TheHole => StatorValueInner::Undefined,
         JsValue::Null => StatorValueInner::Null,
         JsValue::Boolean(b) => StatorValueInner::Boolean(*b),
         JsValue::Smi(n) => StatorValueInner::Number(f64::from(*n)),

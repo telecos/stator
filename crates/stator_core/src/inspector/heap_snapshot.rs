@@ -282,7 +282,9 @@ impl HeapSnapshotBuilder {
     /// Map a `JsValue` to its CDP node-type constant.
     fn value_node_type(value: &JsValue) -> u32 {
         match value {
-            JsValue::Undefined | JsValue::Null | JsValue::Boolean(_) => NODE_TYPE_HIDDEN,
+            JsValue::Undefined | JsValue::Null | JsValue::Boolean(_) | JsValue::TheHole => {
+                NODE_TYPE_HIDDEN
+            }
             JsValue::Smi(_) | JsValue::HeapNumber(_) => NODE_TYPE_NUMBER,
             JsValue::String(_) => NODE_TYPE_STRING,
             JsValue::Symbol(_) => NODE_TYPE_SYMBOL,
@@ -324,6 +326,7 @@ impl HeapSnapshotBuilder {
     fn value_name(value: &JsValue) -> String {
         match value {
             JsValue::Undefined => "undefined".to_string(),
+            JsValue::TheHole => "<the hole>".to_string(),
             JsValue::Null => "null".to_string(),
             JsValue::Boolean(b) => b.to_string(),
             JsValue::Smi(n) => n.to_string(),
