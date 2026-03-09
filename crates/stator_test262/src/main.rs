@@ -17,6 +17,7 @@
 //!   --verbose              Print every individual test outcome
 //! ```
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
@@ -31,6 +32,36 @@ use stator_core::interpreter::{Interpreter, InterpreterFrame};
 use stator_core::objects::property_map::PropertyMap;
 use stator_core::objects::value::JsValue;
 use stator_core::parser;
+
+// ─── Guarded global allocator ────────────────────────────────────────────────
+
+/// A thin wrapper around the system allocator that rejects single allocations
+/// larger than 1 GiB.  This prevents pathological Test262 inputs (e.g. a
+/// `new Array(2**53)`) from requesting petabytes of memory and OOM-killing
+/// the CI runner before any Rust-level bounds check can fire.
+struct GuardedAlloc;
+
+/// Maximum size of a single allocation (1 GiB).
+const MAX_ALLOC_SIZE: usize = 1 << 30;
+
+// SAFETY: All methods delegate to `System` after a size check.  The safety
+// invariants of `GlobalAlloc` (valid layout, matching alloc/dealloc) are
+// upheld by the inner `System` allocator.
+unsafe impl GlobalAlloc for GuardedAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if layout.size() > MAX_ALLOC_SIZE {
+            return std::ptr::null_mut();
+        }
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: GuardedAlloc = GuardedAlloc;
 
 // ─── Frontmatter types ───────────────────────────────────────────────────────
 
