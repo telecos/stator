@@ -11298,6 +11298,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_generator_throw_caught_by_try_catch() {
+        // §27.5.3.3 — .throw(err) resumes at the yield inside a try/catch;
+        // the catch block catches the error and execution continues.
+        //
+        // function* gen() {
+        //     try { yield 1; yield 2; } catch(e) { yield "caught"; }
+        // }
+        // var g = gen(); g.next(); var r = g.throw("err"); r.value
+        let result = compile_source_and_run(
+            r#"
+            function* gen() {
+                try { yield 1; yield 2; } catch(e) { yield "caught"; }
+            }
+            var g = gen();
+            g.next();
+            var r = g.throw("err");
+            r.value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("caught".into()));
+    }
+
+    #[test]
+    fn test_generator_throw_no_try_catch_propagates() {
+        // .throw(err) on a generator without try/catch propagates the error.
+        let ba = gen_bytecode_yield_1_yield_2();
+        let gs = GeneratorState::new(ba);
+
+        // Advance to first yield.
+        Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
+
+        // .throw(err) — no handler, error must propagate.
+        let result = Interpreter::generator_throw(&gs, JsValue::String("boom".into()));
+        assert!(result.is_err(), "generator_throw should propagate error");
+        assert_eq!(gs.borrow().status, GeneratorStatus::Completed);
+    }
+
+    #[test]
+    fn test_generator_throw_on_completed_generator() {
+        // .throw(err) on a completed generator throws the error.
+        let ba = gen_bytecode_yield_1_yield_2();
+        let gs = GeneratorState::new(ba);
+
+        // Drive to completion.
+        Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
+        Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
+        Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
+        assert_eq!(gs.borrow().status, GeneratorStatus::Completed);
+
+        let result = Interpreter::generator_throw(&gs, JsValue::String("err".into()));
+        assert!(result.is_err(), "throw on completed should error");
+    }
+
     // ── Async function (run_async_function) ───────────────────────────────────
 
     #[test]

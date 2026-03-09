@@ -42,6 +42,15 @@ use crate::objects::property_map::PropertyMap;
 // Generator support types
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// How a generator should be resumed on the next step.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GeneratorResumeMode {
+    /// Normal `.next(value)` — continue from the yield point.
+    Normal,
+    /// `.throw(value)` — throw an exception at the yield point.
+    Throw(JsValue),
+}
+
 /// Lifecycle status of a JavaScript generator object.
 ///
 /// Maps to V8's `JSGeneratorObject::ResumeMode` / `GeneratorState` integers:
@@ -103,6 +112,8 @@ pub struct GeneratorState {
     pub resume_pc: usize,
     /// Current lifecycle status.
     pub status: GeneratorStatus,
+    /// How the generator should be resumed on the next step.
+    pub resume_mode: GeneratorResumeMode,
 }
 
 impl GeneratorState {
@@ -115,6 +126,7 @@ impl GeneratorState {
             registers: Vec::new(),
             resume_pc: 0,
             status: GeneratorStatus::SuspendedAtStart,
+            resume_mode: GeneratorResumeMode::Normal,
         }))
     }
 }

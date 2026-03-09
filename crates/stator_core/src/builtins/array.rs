@@ -506,16 +506,18 @@ pub fn array_join(arr: &JsArray, separator: Option<&str>) -> StatorResult<String
         }
         return Ok(out);
     }
-    let mut parts: Vec<String> = Vec::with_capacity(len as usize);
+    let mut out = String::with_capacity(len as usize * 8);
     for i in 0..len {
+        if i > 0 {
+            out.push_str(sep);
+        }
         let v = arr.get(i);
-        let s = match &v {
-            JsValue::Undefined | JsValue::Null => String::new(),
-            other => other.to_js_string()?,
-        };
-        parts.push(s);
+        match &v {
+            JsValue::Undefined | JsValue::Null => {}
+            other => out.push_str(&other.to_js_string()?),
+        }
     }
-    Ok(parts.join(sep))
+    Ok(out)
 }
 
 // ── reverse ───────────────────────────────────────────────────────────────────
