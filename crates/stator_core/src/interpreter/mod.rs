@@ -1710,6 +1710,7 @@ pub(super) fn is_js_receiver(value: &JsValue) -> bool {
 /// Dispatch a function call with the given arguments, writing the result to
 /// the frame's accumulator.  Handles `Function`, `NativeFunction`, and
 /// callable `PlainObject` values (those with a `__call__` property).
+#[allow(dead_code)]
 pub(super) fn dispatch_call(
     frame: &mut InterpreterFrame,
     callee: &JsValue,
@@ -1745,6 +1746,76 @@ pub(super) fn dispatch_call(
                         args,
                         Rc::clone(&frame.global_env),
                     );
+                    push_call_frame("<anonymous>")?;
+                    let result = Interpreter::run(&mut callee_frame);
+                    pop_call_frame();
+                    frame.accumulator = result?;
+                }
+            }
+        }
+        JsValue::NativeFunction(f) => {
+            frame.accumulator = f(args)?;
+        }
+        JsValue::PlainObject(map) => {
+            if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
+                frame.accumulator = f(args)?;
+            } else {
+                return Err(StatorError::TypeError(
+                    "CallProperty: callee is not a function (got PlainObject)".to_string(),
+                ));
+            }
+        }
+        other => {
+            return Err(StatorError::TypeError(format!(
+                "CallProperty: callee is not a function (got {other:?})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Like [`dispatch_call`] but also sets `this` in the callee frame's global
+/// environment.  Used by `CallProperty0/1/2` where the receiver register is
+/// available at the call site.
+pub(super) fn dispatch_call_property(
+    frame: &mut InterpreterFrame,
+    callee: &JsValue,
+    this_val: JsValue,
+    args: Vec<JsValue>,
+) -> StatorResult<()> {
+    match callee {
+        JsValue::Function(ba) => {
+            if ba.is_generator() {
+                frame.accumulator = JsValue::Generator(GeneratorState::new((**ba).clone()));
+            } else if ba.is_async() {
+                frame.accumulator = Interpreter::run_async_function((**ba).clone(), args)?;
+            } else {
+                let count = ba.increment_invocation_count();
+                if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
+                    maybe_compile_baseline(ba);
+                }
+                if count >= MAGLEV_TIERING_THRESHOLD {
+                    maybe_compile_maglev(ba);
+                }
+                if count >= TURBOFAN_TIERING_THRESHOLD {
+                    maybe_compile_turbofan(ba);
+                }
+                let mut tried_jit = false;
+                if let Some(jit_result) = try_execute_best_jit(ba, &args) {
+                    frame.accumulator = jit_result?;
+                    tried_jit = true;
+                }
+                if !tried_jit {
+                    let mut callee_frame = InterpreterFrame::new_with_globals(
+                        (**ba).clone(),
+                        args,
+                        Rc::clone(&frame.global_env),
+                    );
+                    callee_frame.context = Some(this_val.clone());
+                    callee_frame
+                        .global_env
+                        .borrow_mut()
+                        .insert("this".to_string(), this_val);
                     push_call_frame("<anonymous>")?;
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
