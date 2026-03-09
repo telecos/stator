@@ -374,6 +374,199 @@ pub fn set_create_iterator(set: &JsSet, kind: SetIteratorKind) -> JsValue {
     JsValue::Iterator(NativeIterator::from_items(items))
 }
 
+// ── ES2025 Set composition methods ────────────────────────────────────────────
+
+/// ECMAScript §24.2.3.12 `Set.prototype.union(other)`.
+///
+/// Returns a new `JsSet` containing all values from both `self` and `other`,
+/// preserving insertion order (elements of `self` first, then new elements
+/// from `other`).
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_union, set_size, set_has};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut a = set_new();
+/// set_add(&mut a, JsValue::Smi(1));
+/// set_add(&mut a, JsValue::Smi(2));
+/// let mut b = set_new();
+/// set_add(&mut b, JsValue::Smi(2));
+/// set_add(&mut b, JsValue::Smi(3));
+/// let u = set_union(&a, &b);
+/// assert_eq!(set_size(&u), 3);
+/// assert!(set_has(&u, &JsValue::Smi(1)));
+/// assert!(set_has(&u, &JsValue::Smi(3)));
+/// ```
+pub fn set_union(a: &JsSet, b: &JsSet) -> JsSet {
+    let mut result = a.clone();
+    for v in &b.values {
+        if !set_has(&result, v) {
+            result.values.push(v.clone());
+        }
+    }
+    result
+}
+
+/// ECMAScript §24.2.3.7 `Set.prototype.intersection(other)`.
+///
+/// Returns a new `JsSet` containing only values present in both sets.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_intersection, set_size};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut a = set_new();
+/// set_add(&mut a, JsValue::Smi(1));
+/// set_add(&mut a, JsValue::Smi(2));
+/// let mut b = set_new();
+/// set_add(&mut b, JsValue::Smi(2));
+/// set_add(&mut b, JsValue::Smi(3));
+/// let i = set_intersection(&a, &b);
+/// assert_eq!(set_size(&i), 1);
+/// ```
+pub fn set_intersection(a: &JsSet, b: &JsSet) -> JsSet {
+    let mut result = set_new();
+    for v in &a.values {
+        if set_has(b, v) {
+            result.values.push(v.clone());
+        }
+    }
+    result
+}
+
+/// ECMAScript §24.2.3.3 `Set.prototype.difference(other)`.
+///
+/// Returns a new `JsSet` containing values in `a` that are not in `b`.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_difference, set_size, set_has};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut a = set_new();
+/// set_add(&mut a, JsValue::Smi(1));
+/// set_add(&mut a, JsValue::Smi(2));
+/// let mut b = set_new();
+/// set_add(&mut b, JsValue::Smi(2));
+/// let d = set_difference(&a, &b);
+/// assert_eq!(set_size(&d), 1);
+/// assert!(set_has(&d, &JsValue::Smi(1)));
+/// ```
+pub fn set_difference(a: &JsSet, b: &JsSet) -> JsSet {
+    let mut result = set_new();
+    for v in &a.values {
+        if !set_has(b, v) {
+            result.values.push(v.clone());
+        }
+    }
+    result
+}
+
+/// ECMAScript §24.2.3.11 `Set.prototype.symmetricDifference(other)`.
+///
+/// Returns a new `JsSet` containing values in either set but not both.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_symmetric_difference, set_size};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut a = set_new();
+/// set_add(&mut a, JsValue::Smi(1));
+/// set_add(&mut a, JsValue::Smi(2));
+/// let mut b = set_new();
+/// set_add(&mut b, JsValue::Smi(2));
+/// set_add(&mut b, JsValue::Smi(3));
+/// let sd = set_symmetric_difference(&a, &b);
+/// assert_eq!(set_size(&sd), 2);
+/// ```
+pub fn set_symmetric_difference(a: &JsSet, b: &JsSet) -> JsSet {
+    let mut result = set_new();
+    for v in &a.values {
+        if !set_has(b, v) {
+            result.values.push(v.clone());
+        }
+    }
+    for v in &b.values {
+        if !set_has(a, v) {
+            result.values.push(v.clone());
+        }
+    }
+    result
+}
+
+/// ECMAScript §24.2.3.9 `Set.prototype.isSubsetOf(other)`.
+///
+/// Returns `true` if every element of `a` is also in `b`.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_is_subset_of};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut a = set_new();
+/// set_add(&mut a, JsValue::Smi(1));
+/// let mut b = set_new();
+/// set_add(&mut b, JsValue::Smi(1));
+/// set_add(&mut b, JsValue::Smi(2));
+/// assert!(set_is_subset_of(&a, &b));
+/// assert!(!set_is_subset_of(&b, &a));
+/// ```
+pub fn set_is_subset_of(a: &JsSet, b: &JsSet) -> bool {
+    a.values.iter().all(|v| set_has(b, v))
+}
+
+/// ECMAScript §24.2.3.10 `Set.prototype.isSupersetOf(other)`.
+///
+/// Returns `true` if every element of `b` is also in `a`.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_is_superset_of};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut a = set_new();
+/// set_add(&mut a, JsValue::Smi(1));
+/// set_add(&mut a, JsValue::Smi(2));
+/// let mut b = set_new();
+/// set_add(&mut b, JsValue::Smi(1));
+/// assert!(set_is_superset_of(&a, &b));
+/// assert!(!set_is_superset_of(&b, &a));
+/// ```
+pub fn set_is_superset_of(a: &JsSet, b: &JsSet) -> bool {
+    b.values.iter().all(|v| set_has(a, v))
+}
+
+/// ECMAScript §24.2.3.8 `Set.prototype.isDisjointFrom(other)`.
+///
+/// Returns `true` if the two sets have no elements in common.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::set::{set_new, set_add, set_is_disjoint_from};
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut a = set_new();
+/// set_add(&mut a, JsValue::Smi(1));
+/// let mut b = set_new();
+/// set_add(&mut b, JsValue::Smi(2));
+/// assert!(set_is_disjoint_from(&a, &b));
+/// set_add(&mut b, JsValue::Smi(1));
+/// assert!(!set_is_disjoint_from(&a, &b));
+/// ```
+pub fn set_is_disjoint_from(a: &JsSet, b: &JsSet) -> bool {
+    !a.values.iter().any(|v| set_has(b, v))
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

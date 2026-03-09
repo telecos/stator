@@ -2432,6 +2432,37 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         .map_or(JsValue::Smi(-1), |i| JsValue::Smi(i as i32)))
                 }));
             }
+            "matchAll" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let pattern = match args.first() {
+                        Some(JsValue::String(ss)) => ss.clone(),
+                        _ => return Ok(JsValue::Iterator(NativeIterator::from_items(vec![]))),
+                    };
+                    if pattern.is_empty() {
+                        return Ok(JsValue::Iterator(NativeIterator::from_items(vec![])));
+                    }
+                    let mut results = Vec::new();
+                    let mut start = 0;
+                    while let Some(pos) = s[start..].find(&pattern) {
+                        let abs = start + pos;
+                        let mut m = PropertyMap::new();
+                        m.insert("0".to_string(), JsValue::String(pattern.clone()));
+                        m.insert("index".to_string(), JsValue::Smi(abs as i32));
+                        m.insert("input".to_string(), JsValue::String(s.clone()));
+                        m.insert("length".to_string(), JsValue::Smi(1));
+                        results.push(JsValue::PlainObject(Rc::new(RefCell::new(m))));
+                        start = abs + pattern.len();
+                    }
+                    Ok(JsValue::Iterator(NativeIterator::from_items(results)))
+                }));
+            }
+            "@@iterator" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::Iterator(NativeIterator::from_string(&s)))
+                }));
+            }
             _ => {}
         },
         JsValue::Boolean(b) => match key {
@@ -2980,6 +3011,82 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         let mut new_arr = a.borrow().clone();
                         new_arr[actual as usize] = val;
                         Ok(JsValue::new_array(new_arr))
+                    }));
+                }
+                "toSpliced" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let v = a.borrow();
+                        let len = v.len() as i32;
+                        let start_raw = match args.first() {
+                            Some(JsValue::Smi(i)) => *i,
+                            Some(JsValue::HeapNumber(n)) => *n as i32,
+                            _ => 0,
+                        };
+                        let start = if start_raw < 0 {
+                            (len + start_raw).max(0)
+                        } else {
+                            start_raw.min(len)
+                        } as usize;
+                        let delete_count = match args.get(1) {
+                            Some(JsValue::Smi(i)) => (*i).max(0) as usize,
+                            Some(JsValue::HeapNumber(n)) => (*n as i32).max(0) as usize,
+                            _ => (len as usize).saturating_sub(start),
+                        };
+                        let end = (start + delete_count).min(v.len());
+                        let mut new_arr = Vec::with_capacity(
+                            v.len() - (end - start) + args.len().saturating_sub(2),
+                        );
+                        new_arr.extend_from_slice(&v[..start]);
+                        new_arr.extend(args.iter().skip(2).cloned());
+                        new_arr.extend_from_slice(&v[end..]);
+                        Ok(JsValue::new_array(new_arr))
+                    }));
+                }
+                "copyWithin" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let mut v = a.borrow_mut();
+                        let len = v.len() as i32;
+                        let target_raw = match args.first() {
+                            Some(JsValue::Smi(i)) => *i,
+                            Some(JsValue::HeapNumber(n)) => *n as i32,
+                            _ => 0,
+                        };
+                        let target = if target_raw < 0 {
+                            (len + target_raw).max(0)
+                        } else {
+                            target_raw.min(len)
+                        } as usize;
+                        let start_raw = match args.get(1) {
+                            Some(JsValue::Smi(i)) => *i,
+                            Some(JsValue::HeapNumber(n)) => *n as i32,
+                            _ => 0,
+                        };
+                        let start = if start_raw < 0 {
+                            (len + start_raw).max(0)
+                        } else {
+                            start_raw.min(len)
+                        } as usize;
+                        let end_raw = match args.get(2) {
+                            Some(JsValue::Smi(i)) => *i,
+                            Some(JsValue::HeapNumber(n)) => *n as i32,
+                            _ => len,
+                        };
+                        let end = if end_raw < 0 {
+                            (len + end_raw).max(0)
+                        } else {
+                            end_raw.min(len)
+                        } as usize;
+                        let count =
+                            (end.saturating_sub(start)).min((len as usize).saturating_sub(target));
+                        // Copy via temporary buffer to handle overlapping regions
+                        let tmp: Vec<JsValue> = v[start..start + count].to_vec();
+                        for (i, val) in tmp.into_iter().enumerate() {
+                            v[target + i] = val;
+                        }
+                        drop(v);
+                        Ok(JsValue::Array(Rc::clone(&a)))
                     }));
                 }
                 "valueOf" => {
@@ -6380,8 +6487,8 @@ mod tests {
     }
 
     #[test]
-    fn test_to_object_smi_passthrough() {
-        // Primitives remain as-is for now (wrapper objects not implemented).
+    fn test_to_object_smi_wrapper() {
+        // Smi primitives are wrapped in a PlainObject per ECMAScript §7.1.18.
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
@@ -6392,7 +6499,13 @@ mod tests {
             1,
         )
         .unwrap();
-        assert_eq!(result, JsValue::Smi(5));
+        match &result {
+            JsValue::PlainObject(map) => {
+                let m = map.borrow();
+                assert_eq!(m.get("__wrapped__").cloned(), Some(JsValue::Smi(5)));
+            }
+            other => panic!("expected PlainObject wrapper, got {:?}", other),
+        }
     }
 
     // ── ToName ───────────────────────────────────────────────────────────────

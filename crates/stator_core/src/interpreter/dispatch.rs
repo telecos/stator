@@ -3291,9 +3291,37 @@ fn handle_create_mapped_arguments(
         JsValue::Function(Rc::new(ctx.frame.bytecode_array.clone())),
     );
     // @@iterator: array-like iteration support
+    let args_rc = Rc::new(RefCell::new(args.clone()));
+    let idx_rc = Rc::new(RefCell::new(0usize));
+    let iter_args = args_rc.clone();
+    let iter_idx = idx_rc.clone();
     map.insert(
         "@@iterator".to_string(),
-        JsValue::NativeFunction(Rc::new(|_args: Vec<JsValue>| Ok(JsValue::Undefined))),
+        JsValue::NativeFunction(Rc::new(move |_args: Vec<JsValue>| {
+            let a = iter_args.clone();
+            let i = iter_idx.clone();
+            // Reset index for fresh iteration
+            *i.borrow_mut() = 0;
+            let mut iter_map = PropertyMap::new();
+            iter_map.insert(
+                "next".to_string(),
+                JsValue::NativeFunction(Rc::new(move |_| {
+                    let mut idx = i.borrow_mut();
+                    let arr = a.borrow();
+                    let mut result = PropertyMap::new();
+                    if *idx < arr.len() {
+                        result.insert("value".to_string(), arr[*idx].clone());
+                        result.insert("done".to_string(), JsValue::Boolean(false));
+                        *idx += 1;
+                    } else {
+                        result.insert("value".to_string(), JsValue::Undefined);
+                        result.insert("done".to_string(), JsValue::Boolean(true));
+                    }
+                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
+                })),
+            );
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(iter_map))))
+        })),
     );
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
@@ -3325,9 +3353,37 @@ fn handle_create_unmapped_arguments(
         })),
     );
     // @@iterator: array-like iteration support
+    let args_rc = Rc::new(RefCell::new(args.clone()));
+    let idx_rc = Rc::new(RefCell::new(0usize));
+    let iter_args = args_rc.clone();
+    let iter_idx = idx_rc.clone();
     map.insert(
         "@@iterator".to_string(),
-        JsValue::NativeFunction(Rc::new(|_args: Vec<JsValue>| Ok(JsValue::Undefined))),
+        JsValue::NativeFunction(Rc::new(move |_args: Vec<JsValue>| {
+            let a = iter_args.clone();
+            let i = iter_idx.clone();
+            // Reset index for fresh iteration
+            *i.borrow_mut() = 0;
+            let mut iter_map = PropertyMap::new();
+            iter_map.insert(
+                "next".to_string(),
+                JsValue::NativeFunction(Rc::new(move |_| {
+                    let mut idx = i.borrow_mut();
+                    let arr = a.borrow();
+                    let mut result = PropertyMap::new();
+                    if *idx < arr.len() {
+                        result.insert("value".to_string(), arr[*idx].clone());
+                        result.insert("done".to_string(), JsValue::Boolean(false));
+                        *idx += 1;
+                    } else {
+                        result.insert("value".to_string(), JsValue::Undefined);
+                        result.insert("done".to_string(), JsValue::Boolean(true));
+                    }
+                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
+                })),
+            );
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(iter_map))))
+        })),
     );
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)

@@ -84,8 +84,9 @@ use crate::builtins::reflect::{
 };
 use crate::builtins::regexp::regexp_construct;
 use crate::builtins::set::{
-    SetIteratorKind, set_add, set_clear, set_create_iterator, set_delete, set_from_iterable,
-    set_has, set_new, set_size, set_values,
+    SetIteratorKind, set_add, set_clear, set_create_iterator, set_delete, set_difference,
+    set_from_iterable, set_has, set_intersection, set_is_disjoint_from, set_is_subset_of,
+    set_is_superset_of, set_new, set_size, set_symmetric_difference, set_union, set_values,
 };
 use crate::builtins::string::{
     string_anchor, string_at, string_big, string_blink, string_bold, string_char_at,
@@ -134,6 +135,163 @@ use crate::objects::value::JsValue;
 /// Wrap a Rust closure as a `JsValue::NativeFunction`.
 fn native(f: impl Fn(Vec<JsValue>) -> StatorResult<JsValue> + 'static) -> JsValue {
     JsValue::NativeFunction(Rc::new(f))
+}
+
+/// If `value` is a RegExp `PlainObject` (has `__is_regexp__`), invoke the
+/// given `__symbol_*__` method with the supplied arguments and return the
+/// result.  Otherwise return `None` so the caller can fall through to the
+/// plain-string implementation.
+fn try_regexp_symbol(
+    value: &JsValue,
+    symbol_key: &str,
+    args: Vec<JsValue>,
+) -> Option<StatorResult<JsValue>> {
+    if let JsValue::PlainObject(map) = value {
+        let borrow = map.borrow();
+        let is_re = matches!(borrow.get("__is_regexp__"), Some(JsValue::Boolean(true)));
+        if is_re && let Some(JsValue::NativeFunction(f)) = borrow.get(symbol_key).cloned() {
+            drop(borrow);
+            return Some(f(args));
+        }
+    }
+    None
+}
+
+/// Extract a [`JsSet`] from a Set-like `PlainObject` by calling its `values()`
+/// method and collecting the resulting iterator.
+fn extract_set_from_arg(arg: &JsValue) -> StatorResult<crate::builtins::set::JsSet> {
+    use crate::builtins::iterator::iterator_next;
+    if let JsValue::PlainObject(map) = arg {
+        let borrow = map.borrow();
+        if let Some(JsValue::NativeFunction(values_fn)) = borrow.get("values") {
+            let iter = values_fn(vec![])?;
+            drop(borrow);
+            let mut items = Vec::new();
+            loop {
+                let rec = iterator_next(&iter)?;
+                if rec.done {
+                    break;
+                }
+                items.push(rec.value);
+            }
+            return Ok(set_from_iterable(items));
+        }
+    }
+    Err(StatorError::TypeError(
+        "argument is not a Set-like object".into(),
+    ))
+}
+
+/// Build a full `Set` instance (PlainObject with prototype methods) from a
+/// [`JsSet`].  Used by ES2025 Set composition methods that return new sets.
+fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
+    let inner = Rc::new(RefCell::new(s));
+    let mut obj = PropertyMap::new();
+    obj.insert(
+        "size".into(),
+        JsValue::Smi(set_size(&inner.borrow()) as i32),
+    );
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "add".into(),
+            native(move |a| {
+                let val = a.first().cloned().unwrap_or(JsValue::Undefined);
+                set_add(&mut inner.borrow_mut(), val);
+                Ok(JsValue::Undefined)
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "has".into(),
+            native(move |a| {
+                let val = a.first().unwrap_or(&JsValue::Undefined);
+                Ok(JsValue::Boolean(set_has(&inner.borrow(), val)))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "delete".into(),
+            native(move |a| {
+                let val = a.first().unwrap_or(&JsValue::Undefined);
+                Ok(JsValue::Boolean(set_delete(&mut inner.borrow_mut(), val)))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "clear".into(),
+            native(move |_| {
+                set_clear(&mut inner.borrow_mut());
+                Ok(JsValue::Undefined)
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "forEach".into(),
+            native(move |a| {
+                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                let snapshot = set_values(&inner.borrow());
+                for v in snapshot {
+                    if let JsValue::NativeFunction(f) = &cb {
+                        f(vec![v.clone(), v])?;
+                    }
+                }
+                Ok(JsValue::Undefined)
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "keys".into(),
+            native(move |_| Ok(set_create_iterator(&inner.borrow(), SetIteratorKind::Keys))),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "values".into(),
+            native(move |_| {
+                Ok(set_create_iterator(
+                    &inner.borrow(),
+                    SetIteratorKind::Values,
+                ))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "entries".into(),
+            native(move |_| {
+                Ok(set_create_iterator(
+                    &inner.borrow(),
+                    SetIteratorKind::Entries,
+                ))
+            }),
+        );
+    }
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "@@iterator".into(),
+            native(move |_| {
+                Ok(set_create_iterator(
+                    &inner.borrow(),
+                    SetIteratorKind::Values,
+                ))
+            }),
+        );
+    }
+    Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
 }
 
 /// Build a NativeFunction that constructs a `JsValue::Error` of the given `ErrorKind`.
@@ -3599,6 +3757,100 @@ fn make_map_builtin() -> JsValue {
         }),
     );
 
+    // ── Map.groupBy(items, callbackFn) ──────────────────────────────────
+    props.insert(
+        "groupBy".into(),
+        native(|args| {
+            let items = args.first().unwrap_or(&JsValue::Undefined).clone();
+            let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let arr = match &items {
+                JsValue::Array(a) => a.clone(),
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "Map.groupBy: first argument must be iterable".into(),
+                    ));
+                }
+            };
+            let result_map = Rc::new(RefCell::new(map_new()));
+            for (i, item) in arr.borrow().iter().enumerate() {
+                let key = if let JsValue::NativeFunction(f) = &cb {
+                    f(vec![item.clone(), JsValue::Smi(i as i32)])?
+                } else {
+                    JsValue::Undefined
+                };
+                let existing = map_get(&result_map.borrow(), &key);
+                if let JsValue::Array(existing_arr) = existing {
+                    existing_arr.borrow_mut().push(item.clone());
+                } else {
+                    map_set(
+                        &mut result_map.borrow_mut(),
+                        key,
+                        JsValue::new_array(vec![item.clone()]),
+                    );
+                }
+            }
+            // Build a Map instance with prototype methods from the result
+            let inner = result_map;
+            let mut obj = PropertyMap::new();
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "size".into(),
+                    JsValue::Smi(map_size(&inner.borrow()) as i32),
+                );
+            }
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "get".into(),
+                    native(move |a| {
+                        let key = a.first().unwrap_or(&JsValue::Undefined);
+                        Ok(map_get(&inner.borrow(), key))
+                    }),
+                );
+            }
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "has".into(),
+                    native(move |a| {
+                        let key = a.first().unwrap_or(&JsValue::Undefined);
+                        Ok(JsValue::Boolean(map_has(&inner.borrow(), key)))
+                    }),
+                );
+            }
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "entries".into(),
+                    native(move |_| {
+                        Ok(map_create_iterator(
+                            &inner.borrow(),
+                            MapIteratorKind::Entries,
+                        ))
+                    }),
+                );
+            }
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "forEach".into(),
+                    native(move |a| {
+                        let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                        let snapshot = map_entries(&inner.borrow());
+                        for (k, v) in snapshot {
+                            if let JsValue::NativeFunction(f) = &cb {
+                                f(vec![v, k])?;
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+            }
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+        }),
+    );
+
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -3740,6 +3992,104 @@ fn make_set_builtin() -> JsValue {
                             &inner.borrow(),
                             SetIteratorKind::Values,
                         ))
+                    }),
+                );
+            }
+            // ── ES2025 Set composition methods ──────────────────────────
+            // union(other)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "union".into(),
+                    native(move |a| {
+                        let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                        let other_set = extract_set_from_arg(other_val)?;
+                        let result = set_union(&inner.borrow(), &other_set);
+                        build_set_instance(result)
+                    }),
+                );
+            }
+            // intersection(other)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "intersection".into(),
+                    native(move |a| {
+                        let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                        let other_set = extract_set_from_arg(other_val)?;
+                        let result = set_intersection(&inner.borrow(), &other_set);
+                        build_set_instance(result)
+                    }),
+                );
+            }
+            // difference(other)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "difference".into(),
+                    native(move |a| {
+                        let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                        let other_set = extract_set_from_arg(other_val)?;
+                        let result = set_difference(&inner.borrow(), &other_set);
+                        build_set_instance(result)
+                    }),
+                );
+            }
+            // symmetricDifference(other)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "symmetricDifference".into(),
+                    native(move |a| {
+                        let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                        let other_set = extract_set_from_arg(other_val)?;
+                        let result = set_symmetric_difference(&inner.borrow(), &other_set);
+                        build_set_instance(result)
+                    }),
+                );
+            }
+            // isSubsetOf(other)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "isSubsetOf".into(),
+                    native(move |a| {
+                        let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                        let other_set = extract_set_from_arg(other_val)?;
+                        Ok(JsValue::Boolean(set_is_subset_of(
+                            &inner.borrow(),
+                            &other_set,
+                        )))
+                    }),
+                );
+            }
+            // isSupersetOf(other)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "isSupersetOf".into(),
+                    native(move |a| {
+                        let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                        let other_set = extract_set_from_arg(other_val)?;
+                        Ok(JsValue::Boolean(set_is_superset_of(
+                            &inner.borrow(),
+                            &other_set,
+                        )))
+                    }),
+                );
+            }
+            // isDisjointFrom(other)
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "isDisjointFrom".into(),
+                    native(move |a| {
+                        let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                        let other_set = extract_set_from_arg(other_val)?;
+                        Ok(JsValue::Boolean(set_is_disjoint_from(
+                            &inner.borrow(),
+                            &other_set,
+                        )))
                     }),
                 );
             }
@@ -4495,9 +4845,20 @@ fn make_string() -> JsValue {
         "split".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            let sep = match args.get(1) {
-                Some(JsValue::Undefined) | None => None,
-                Some(v) => Some(v.to_js_string()?),
+            let sep_arg = args.get(1).unwrap_or(&JsValue::Undefined);
+            // Delegate to RegExp[@@split] when separator is a regexp.
+            if let Some(result) = try_regexp_symbol(sep_arg, "__symbol_split__", {
+                let mut a = vec![JsValue::String(s.clone())];
+                if let Some(lim) = args.get(2) {
+                    a.push(lim.clone());
+                }
+                a
+            }) {
+                return result;
+            }
+            let sep = match sep_arg {
+                JsValue::Undefined => None,
+                v => Some(v.to_js_string()?),
             };
             let limit = match args.get(2) {
                 Some(JsValue::Undefined) | None => None,
@@ -4514,7 +4875,19 @@ fn make_string() -> JsValue {
         "replace".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let search_arg = args.get(1).unwrap_or(&JsValue::Undefined);
+            // Delegate to RegExp[@@replace] when searchValue is a regexp.
+            if let Some(result) = try_regexp_symbol(
+                search_arg,
+                "__symbol_replace__",
+                vec![
+                    JsValue::String(s.clone()),
+                    args.get(2).unwrap_or(&JsValue::Undefined).clone(),
+                ],
+            ) {
+                return result;
+            }
+            let search = search_arg.to_js_string()?;
             let replacement = args.get(2).unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(JsValue::String(string_replace(&s, &search, &replacement)))
         }),
@@ -4525,7 +4898,31 @@ fn make_string() -> JsValue {
         "replaceAll".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let search_arg = args.get(1).unwrap_or(&JsValue::Undefined);
+            // Delegate to RegExp[@@replace] when searchValue is a regexp.
+            // Per spec, replaceAll with a non-global regexp throws TypeError.
+            if let JsValue::PlainObject(map) = search_arg {
+                let borrow = map.borrow();
+                if matches!(borrow.get("__is_regexp__"), Some(JsValue::Boolean(true))) {
+                    let is_global = matches!(borrow.get("global"), Some(JsValue::Boolean(true)));
+                    if !is_global {
+                        return Err(crate::error::StatorError::TypeError(
+                            "String.prototype.replaceAll called with a non-global RegExp argument"
+                                .to_string(),
+                        ));
+                    }
+                    if let Some(JsValue::NativeFunction(f)) =
+                        borrow.get("__symbol_replace__").cloned()
+                    {
+                        drop(borrow);
+                        return f(vec![
+                            JsValue::String(s),
+                            args.get(2).unwrap_or(&JsValue::Undefined).clone(),
+                        ]);
+                    }
+                }
+            }
+            let search = search_arg.to_js_string()?;
             let replacement = args.get(2).unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(JsValue::String(string_replace_all(
                 &s,
@@ -4540,7 +4937,16 @@ fn make_string() -> JsValue {
         "match".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            let pattern = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let pattern_arg = args.get(1).unwrap_or(&JsValue::Undefined);
+            // Delegate to RegExp[@@match] when argument is a regexp.
+            if let Some(result) = try_regexp_symbol(
+                pattern_arg,
+                "__symbol_match__",
+                vec![JsValue::String(s.clone())],
+            ) {
+                return result;
+            }
+            let pattern = pattern_arg.to_js_string()?;
             match string_match(&s, &pattern) {
                 Some(groups) => {
                     let arr: Vec<JsValue> = groups.into_iter().map(JsValue::String).collect();
@@ -4556,7 +4962,16 @@ fn make_string() -> JsValue {
         "matchAll".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            let pattern = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let pattern_arg = args.get(1).unwrap_or(&JsValue::Undefined);
+            // Delegate to RegExp[@@matchAll] when argument is a regexp.
+            if let Some(result) = try_regexp_symbol(
+                pattern_arg,
+                "__symbol_match_all__",
+                vec![JsValue::String(s.clone())],
+            ) {
+                return result;
+            }
+            let pattern = pattern_arg.to_js_string()?;
             match string_match_all(&s, &pattern) {
                 Some(matches) => {
                     let arr: Vec<JsValue> = matches.into_iter().map(JsValue::String).collect();
@@ -4665,7 +5080,16 @@ fn make_string() -> JsValue {
         "search".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            let pattern = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let pattern_arg = args.get(1).unwrap_or(&JsValue::Undefined);
+            // Delegate to RegExp[@@search] when argument is a regexp.
+            if let Some(result) = try_regexp_symbol(
+                pattern_arg,
+                "__symbol_search__",
+                vec![JsValue::String(s.clone())],
+            ) {
+                return result;
+            }
+            let pattern = pattern_arg.to_js_string()?;
             Ok(num(string_search(&s, &pattern) as f64))
         }),
     );
@@ -11296,5 +11720,141 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    // ── String ↔ RegExp delegation tests ────────────────────────────────────
+
+    /// Helper: build a RegExp `JsValue` via `regexp_construct`.
+    fn make_re(pattern: &str, flags: &str) -> JsValue {
+        regexp_construct(&[
+            JsValue::String(pattern.into()),
+            JsValue::String(flags.into()),
+        ])
+        .unwrap()
+    }
+
+    /// Helper: build a `String` proto object via `install_globals` and extract it.
+    fn string_proto() -> Rc<RefCell<PropertyMap>> {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        if let Some(JsValue::PlainObject(string_ctor)) = globals.get("String") {
+            if let Some(JsValue::PlainObject(proto)) = string_ctor.borrow().get("prototype") {
+                return Rc::clone(proto);
+            }
+        }
+        panic!("String.prototype not found");
+    }
+
+    /// Helper: call a String.prototype method (first arg = this string).
+    fn call_string_method(
+        proto: &Rc<RefCell<PropertyMap>>,
+        method: &str,
+        args: Vec<JsValue>,
+    ) -> StatorResult<JsValue> {
+        if let Some(JsValue::NativeFunction(f)) = proto.borrow().get(method).cloned() {
+            f(args)
+        } else {
+            panic!("String.prototype.{method} not found");
+        }
+    }
+
+    #[test]
+    fn test_string_match_delegates_to_regexp() {
+        let proto = string_proto();
+        let re = make_re(r"(\d+)", "");
+        let result = call_string_method(
+            &proto,
+            "match",
+            vec![JsValue::String("price 42 dollars".into()), re],
+        )
+        .unwrap();
+        // Should delegate to @@match → exec-like result with "0" = "42"
+        if let JsValue::PlainObject(map) = &result {
+            assert_eq!(map.borrow().get("0"), Some(&JsValue::String("42".into())));
+            assert_eq!(map.borrow().get("index"), Some(&JsValue::Smi(6)));
+        } else {
+            panic!("expected PlainObject match result, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_string_search_delegates_to_regexp() {
+        let proto = string_proto();
+        let re = make_re(r"\d+", "");
+        let result =
+            call_string_method(&proto, "search", vec![JsValue::String("abc 42".into()), re])
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_string_replace_delegates_to_regexp() {
+        let proto = string_proto();
+        let re = make_re(r"\d+", "g");
+        let result = call_string_method(
+            &proto,
+            "replace",
+            vec![
+                JsValue::String("a1 b2 c3".into()),
+                re,
+                JsValue::String("X".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("aX bX cX".into()));
+    }
+
+    #[test]
+    fn test_string_split_delegates_to_regexp() {
+        let proto = string_proto();
+        let re = make_re(r"\s+", "");
+        let result =
+            call_string_method(&proto, "split", vec![JsValue::String("a  b  c".into()), re])
+                .unwrap();
+        if let JsValue::Array(arr) = &result {
+            let arr = arr.borrow();
+            assert_eq!(arr.len(), 3);
+            assert_eq!(arr[0], JsValue::String("a".into()));
+            assert_eq!(arr[1], JsValue::String("b".into()));
+            assert_eq!(arr[2], JsValue::String("c".into()));
+        } else {
+            panic!("expected Array, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_string_replace_all_regexp_non_global_throws() {
+        let proto = string_proto();
+        let re = make_re(r"\d+", ""); // no 'g' flag
+        let result = call_string_method(
+            &proto,
+            "replaceAll",
+            vec![
+                JsValue::String("a1 b2".into()),
+                re,
+                JsValue::String("X".into()),
+            ],
+        );
+        assert!(
+            result.is_err(),
+            "replaceAll with non-global regexp should error"
+        );
+    }
+
+    #[test]
+    fn test_string_replace_all_regexp_global_delegates() {
+        let proto = string_proto();
+        let re = make_re(r"\d+", "g");
+        let result = call_string_method(
+            &proto,
+            "replaceAll",
+            vec![
+                JsValue::String("a1 b2 c3".into()),
+                re,
+                JsValue::String("X".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("aX bX cX".into()));
     }
 }
