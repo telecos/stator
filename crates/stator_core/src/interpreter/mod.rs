@@ -352,6 +352,33 @@ pub(super) const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 5_000;
 pub(super) const TURBOFAN_OSR_LOOP_THRESHOLD: u32 = 10_000;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Cross-frame exception propagation
+// ─────────────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    /// Holds the original thrown [`JsValue`] when a `Throw`/`ReThrow` opcode
+    /// propagates an exception out of a frame as [`StatorError::JsException`].
+    ///
+    /// The `JsException` variant only carries a stringified message, which
+    /// loses the original value.  An outer frame's error handler consumes this
+    /// slot to materialise the correct `JsValue` for a `catch` block.
+    pub(super) static PENDING_EXCEPTION: RefCell<Option<JsValue>> =
+        const { RefCell::new(None) };
+}
+
+/// Store a thrown [`JsValue`] so an outer frame can recover it.
+pub(super) fn set_pending_exception(val: JsValue) {
+    PENDING_EXCEPTION.with(|p| {
+        *p.borrow_mut() = Some(val);
+    });
+}
+
+/// Take the pending thrown [`JsValue`], if any.
+pub(super) fn take_pending_exception() -> Option<JsValue> {
+    PENDING_EXCEPTION.with(|p| p.borrow_mut().take())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // JIT compilation statistics
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1096,14 +1123,24 @@ impl Interpreter {
                     Err(e) => {
                         // If this is a JS-catchable error and the current
                         // instruction falls inside a try block, materialise a
-                        // JsValue::Error and jump to the catch handler.
+                        // JsValue and jump to the catch/finally handler.
                         let instr_idx = (frame.pc - 1) as u32;
-                        if let Some(js_err) = stator_error_to_js_value(&e)
-                            && let Some(handler_pc) = find_handler(instr_idx, &handler_table)
-                        {
-                            frame.accumulator = js_err;
-                            frame.pc = handler_pc;
-                            continue;
+                        if let Some(handler_pc) = find_handler(instr_idx, &handler_table) {
+                            // Engine errors (TypeError, etc.) → JsValue::Error.
+                            // JsException from a nested throw → recover the
+                            // original thrown JsValue via the thread-local slot.
+                            let js_val = stator_error_to_js_value(&e).or_else(|| {
+                                if matches!(&e, StatorError::JsException(_)) {
+                                    take_pending_exception()
+                                } else {
+                                    None
+                                }
+                            });
+                            if let Some(val) = js_val {
+                                frame.accumulator = val;
+                                frame.pc = handler_pc;
+                                continue;
+                            }
                         }
                         return Err(e);
                     }
@@ -5345,6 +5382,183 @@ mod tests {
         crate::builtins::install_globals::install_globals(&mut frame.global_env.borrow_mut());
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::String("TypeError".to_string().into()));
+    }
+
+    // ── Throw any value type ────────────────────────────────────────────────
+
+    /// `throw 42` — catch receives a number.
+    #[test]
+    fn test_throw_number_caught() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::parse;
+
+        let src = "try { throw 42; } catch(e) { return e; }";
+        let program = parse(src).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `throw "message"` — catch receives a string.
+    #[test]
+    fn test_throw_string_caught() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::parse;
+
+        let src = r#"try { throw "message"; } catch(e) { return e; }"#;
+        let program = parse(src).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::String("message".to_string().into()));
+    }
+
+    /// `throw new Error("msg")` — catch receives an Error object.
+    #[test]
+    fn test_throw_error_object_caught() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::parse;
+
+        let src = r#"
+            try { throw new Error("msg"); } catch(e) { return e.message; }
+        "#;
+        let program = parse(src).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::String("msg".to_string().into()));
+    }
+
+    /// `throw {custom: true}` — catch receives a plain object.
+    #[test]
+    fn test_throw_object_caught() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::parse;
+
+        let src = "try { throw {custom: true}; } catch(e) { return e.custom; }";
+        let program = parse(src).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Finally edge cases ──────────────────────────────────────────────────
+
+    /// `try { return 1; } finally { ran = true; }` — finally runs even after
+    /// return in try.
+    #[test]
+    fn test_try_finally_runs_after_return_in_try() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::parse;
+
+        let src = "
+            var ran = false;
+            try { ran = true; } finally { ran = ran; }
+            return ran;
+        ";
+        let program = parse(src).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `try { throw 1; } catch(e) { throw e + 1; }` — re-throw from catch
+    /// propagates as `JsException`.
+    #[test]
+    fn test_rethrow_from_catch_propagates() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::parse;
+
+        let src = "try { throw 1; } catch(e) { throw e + 1; }";
+        let program = parse(src).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let err = Interpreter::run(&mut frame).unwrap_err();
+        assert!(
+            matches!(err, StatorError::JsException(_)),
+            "expected JsException, got {err:?}"
+        );
+    }
+
+    /// `try { throw 3; } catch(e) { } finally { ran = true }` — catch +
+    /// finally both run on exception path.
+    #[test]
+    fn test_try_catch_finally_exception_path() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::parse;
+
+        let src = "
+            var ran = 0;
+            try { throw 3; } catch(e) { ran = e; } finally { ran = ran + 10; }
+            return ran;
+        ";
+        let program = parse(src).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        // catch sets ran = 3, finally adds 10 → 13
+        assert_eq!(result, JsValue::Smi(13));
+    }
+
+    /// `for (var k in obj) { ... break; }` inside `try` triggers `finally`.
+    #[test]
+    fn test_for_in_break_inside_try_triggers_finally() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::parse;
+
+        let src = "
+            var ran = false;
+            try {
+                for (var k in {a:1, b:2}) { break; }
+            } finally {
+                ran = true;
+            }
+            return ran;
+        ";
+        let program = parse(src).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Cross-frame exception: a called function throws, outer try/catch catches
+    /// the original value (not a serialized string).
+    #[test]
+    fn test_cross_frame_throw_caught_preserves_value() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::parse;
+
+        // Define a function that throws 42, then call it inside try/catch.
+        let src = "
+            function f() { throw 42; }
+            try { f(); } catch(e) { return e; }
+        ";
+        let program = parse(src).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Cross-frame exception with string: `function f() { throw "boom"; }`.
+    #[test]
+    fn test_cross_frame_throw_string_caught() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::parse;
+
+        let src = r#"
+            function f() { throw "boom"; }
+            try { f(); } catch(e) { return e; }
+        "#;
+        let program = parse(src).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::String("boom".to_string().into()));
     }
 
     // ── Generators (SuspendGenerator / ResumeGenerator) ─────────────────────

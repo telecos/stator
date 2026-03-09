@@ -19,9 +19,9 @@ use super::{
     dispatch_setter, err_bad_operand, error_message_from_value, extract_context, find_handler,
     fn_props_set, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
     maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, number_to_jsvalue,
-    plain_object_to_array_items, proto_lookup, resolve_jump, restore_closure_context, strict_eq,
-    to_array_index, to_bigint, to_property_key, try_execute_best_jit, walk_context_chain,
-    wire_construct_prototype,
+    plain_object_to_array_items, proto_lookup, resolve_jump, restore_closure_context,
+    set_pending_exception, strict_eq, to_array_index, to_bigint, to_property_key,
+    try_execute_best_jit, walk_context_chain, wire_construct_prototype,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{proxy_delete_property, proxy_has, proxy_set};
@@ -2265,8 +2265,10 @@ fn handle_throw(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult
     }) {
         return Err(pause_err);
     }
-    // No handler in this frame — serialise the thrown value and
-    // propagate it as a `StatorError::JsException` to the caller.
+    // No handler in this frame — store the original thrown value so
+    // an outer frame's catch/finally can recover it, then propagate
+    // as `StatorError::JsException`.
+    set_pending_exception(thrown.clone());
     let msg = error_message_from_value(&thrown);
     Err(StatorError::JsException(msg))
 }
