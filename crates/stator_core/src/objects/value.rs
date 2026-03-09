@@ -845,6 +845,45 @@ impl JsValue {
             _ => "undefined".to_string(),
         }
     }
+
+    /// ECMAScript §20.1.3.6 **Object.prototype.toString** tag.
+    ///
+    /// Returns the `[object X]` classification string for any [`JsValue`].
+    /// Used by `Object.prototype.toString.call(value)` to identify types.
+    pub fn obj_to_string_tag(&self) -> String {
+        match self {
+            Self::Undefined => "[object Undefined]".to_string(),
+            Self::Null => "[object Null]".to_string(),
+            Self::Boolean(_) => "[object Boolean]".to_string(),
+            Self::Smi(_) | Self::HeapNumber(_) => "[object Number]".to_string(),
+            Self::String(_) => "[object String]".to_string(),
+            Self::Symbol(_) => "[object Symbol]".to_string(),
+            Self::BigInt(_) => "[object BigInt]".to_string(),
+            Self::Array(_) => "[object Array]".to_string(),
+            Self::Function(_) | Self::NativeFunction(_) => "[object Function]".to_string(),
+            Self::Error(_) => "[object Error]".to_string(),
+            Self::Generator(_) => "[object Generator]".to_string(),
+            Self::Iterator(_) => "[object Iterator]".to_string(),
+            Self::Promise(_) => "[object Promise]".to_string(),
+            Self::ArrayBuffer(_) => "[object ArrayBuffer]".to_string(),
+            Self::TypedArray(ta) => format!("[object {}]", ta.borrow().kind.name()),
+            Self::DataView(_) => "[object DataView]".to_string(),
+            Self::PlainObject(map) => {
+                let borrow = map.borrow();
+                if let Some(Self::String(tag)) = borrow.get("@@toStringTag").cloned() {
+                    return format!("[object {tag}]");
+                }
+                if matches!(borrow.get("__is_array__"), Some(Self::Boolean(true))) {
+                    return "[object Array]".to_string();
+                }
+                if matches!(borrow.get("__is_regexp__"), Some(Self::Boolean(true))) {
+                    return "[object RegExp]".to_string();
+                }
+                "[object Object]".to_string()
+            }
+            _ => "[object Object]".to_string(),
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1534,6 +1573,92 @@ mod tests {
             obj.default_obj_to_string(),
             "[object CustomType]".to_string()
         );
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_undefined() {
+        assert_eq!(JsValue::Undefined.obj_to_string_tag(), "[object Undefined]");
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_null() {
+        assert_eq!(JsValue::Null.obj_to_string_tag(), "[object Null]");
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_boolean() {
+        assert_eq!(
+            JsValue::Boolean(true).obj_to_string_tag(),
+            "[object Boolean]"
+        );
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_number() {
+        assert_eq!(JsValue::Smi(42).obj_to_string_tag(), "[object Number]");
+        assert_eq!(
+            JsValue::HeapNumber(3.14).obj_to_string_tag(),
+            "[object Number]"
+        );
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_string() {
+        assert_eq!(
+            JsValue::String("hi".into()).obj_to_string_tag(),
+            "[object String]"
+        );
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_array() {
+        let arr = JsValue::Array(Rc::new(RefCell::new(vec![])));
+        assert_eq!(arr.obj_to_string_tag(), "[object Array]");
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_function() {
+        let f: Rc<dyn Fn(Vec<JsValue>) -> crate::error::StatorResult<JsValue>> =
+            Rc::new(|_| Ok(JsValue::Undefined));
+        assert_eq!(
+            JsValue::NativeFunction(f).obj_to_string_tag(),
+            "[object Function]"
+        );
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_error() {
+        let e = JsValue::Error(Rc::new(crate::builtins::error::JsError::new(
+            crate::builtins::error::ErrorKind::Error,
+            "test".to_string(),
+        )));
+        assert_eq!(e.obj_to_string_tag(), "[object Error]");
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_plain_object() {
+        let map = PropertyMap::new();
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert_eq!(obj.obj_to_string_tag(), "[object Object]");
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_custom_tag() {
+        let mut map = PropertyMap::new();
+        map.insert(
+            "@@toStringTag".to_string(),
+            JsValue::String("MyClass".into()),
+        );
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert_eq!(obj.obj_to_string_tag(), "[object MyClass]");
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_regexp() {
+        let mut map = PropertyMap::new();
+        map.insert("__is_regexp__".to_string(), JsValue::Boolean(true));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert_eq!(obj.obj_to_string_tag(), "[object RegExp]");
     }
 
     // ── to_number ────────────────────────────────────────────────────────────

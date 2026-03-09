@@ -1008,6 +1008,9 @@ fn make_date_instance(t: f64) -> JsValue {
     let inner = Rc::new(RefCell::new(t));
     let mut obj = PropertyMap::new();
 
+    // §20.1.3.6 — identify as Date for Object.prototype.toString.
+    obj.insert("@@toStringTag".into(), JsValue::String("Date".into()));
+
     // ── getTime / valueOf ────────────────────────────────────────────────
     {
         let inner = Rc::clone(&inner);
@@ -2241,6 +2244,19 @@ fn make_object() -> JsValue {
 
     // Annex B §B.2.2.1 — Object.prototype.__proto__ (terminal null)
     obj_proto.insert("__proto__".into(), JsValue::Null);
+
+    // Object.prototype.toString()
+    // ECMAScript §20.1.3.6 — returns "[object X]" classification.
+    obj_proto.insert(
+        "toString".into(),
+        native(|args| {
+            // When called via .call(value), args[0] is the value.
+            if let Some(value) = args.first() {
+                return Ok(JsValue::String(value.obj_to_string_tag().into()));
+            }
+            Ok(JsValue::String("[object Object]".to_string().into()))
+        }),
+    );
 
     props.insert(
         "prototype".into(),
@@ -9146,6 +9162,85 @@ mod tests {
     fn e2e_typeof_symbol_to_string_tag() {
         let result = global_eval("typeof Symbol.toStringTag").unwrap();
         assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    // ── Object.prototype.toString tests ─────────────────────────────────
+
+    /// `Object.prototype.toString.call(undefined)` → "[object Undefined]"
+    #[test]
+    fn e2e_obj_tostring_call_undefined() {
+        let result = global_eval("Object.prototype.toString.call(undefined)").unwrap();
+        assert_eq!(result, JsValue::String("[object Undefined]".into()));
+    }
+
+    /// `Object.prototype.toString.call(null)` → "[object Null]"
+    #[test]
+    fn e2e_obj_tostring_call_null() {
+        let result = global_eval("Object.prototype.toString.call(null)").unwrap();
+        assert_eq!(result, JsValue::String("[object Null]".into()));
+    }
+
+    /// `Object.prototype.toString.call([])` → "[object Array]"
+    #[test]
+    fn e2e_obj_tostring_call_array() {
+        let result = global_eval("Object.prototype.toString.call([])").unwrap();
+        assert_eq!(result, JsValue::String("[object Array]".into()));
+    }
+
+    /// `Object.prototype.toString.call(true)` → "[object Boolean]"
+    #[test]
+    fn e2e_obj_tostring_call_boolean() {
+        let result = global_eval("Object.prototype.toString.call(true)").unwrap();
+        assert_eq!(result, JsValue::String("[object Boolean]".into()));
+    }
+
+    /// `Object.prototype.toString.call(42)` → "[object Number]"
+    #[test]
+    fn e2e_obj_tostring_call_number() {
+        let result = global_eval("Object.prototype.toString.call(42)").unwrap();
+        assert_eq!(result, JsValue::String("[object Number]".into()));
+    }
+
+    /// `Object.prototype.toString.call("hi")` → "[object String]"
+    #[test]
+    fn e2e_obj_tostring_call_string() {
+        let result = global_eval(r#"Object.prototype.toString.call("hi")"#).unwrap();
+        assert_eq!(result, JsValue::String("[object String]".into()));
+    }
+
+    /// `Object.prototype.toString.call({})` → "[object Object]"
+    #[test]
+    fn e2e_obj_tostring_call_object() {
+        let result = global_eval("Object.prototype.toString.call({})").unwrap();
+        assert_eq!(result, JsValue::String("[object Object]".into()));
+    }
+
+    /// Direct `({}).toString()` → "[object Object]"
+    #[test]
+    fn e2e_plain_object_tostring_direct() {
+        let result = global_eval("({}).toString()").unwrap();
+        assert_eq!(result, JsValue::String("[object Object]".into()));
+    }
+
+    /// `Object.prototype.toString.call(function(){})` → "[object Function]"
+    #[test]
+    fn e2e_obj_tostring_call_function() {
+        let result = global_eval("Object.prototype.toString.call(function(){})").unwrap();
+        assert_eq!(result, JsValue::String("[object Function]".into()));
+    }
+
+    /// `Object.prototype.toString.call(new Error())` → "[object Error]"
+    #[test]
+    fn e2e_obj_tostring_call_error() {
+        let result = global_eval("Object.prototype.toString.call(new Error())").unwrap();
+        assert_eq!(result, JsValue::String("[object Error]".into()));
+    }
+
+    /// `Object.prototype.toString.call(new Date())` → "[object Date]"
+    #[test]
+    fn e2e_obj_tostring_call_date() {
+        let result = global_eval("Object.prototype.toString.call(new Date())").unwrap();
+        assert_eq!(result, JsValue::String("[object Date]".into()));
     }
 
     /// `typeof Symbol.match` → "symbol"

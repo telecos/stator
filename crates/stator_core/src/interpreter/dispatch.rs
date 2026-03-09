@@ -2903,6 +2903,7 @@ fn handle_create_empty_array_literal(
     // operands[0] is a FeedbackSlot, ignored at runtime.
     let mut map = PropertyMap::new();
     map.insert("length".to_string(), JsValue::Smi(0));
+    map.insert("__is_array__".to_string(), JsValue::Boolean(true));
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
 }
@@ -2914,6 +2915,7 @@ fn handle_create_array_literal(
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
     let mut map = PropertyMap::new();
     map.insert("length".to_string(), JsValue::Smi(0));
+    map.insert("__is_array__".to_string(), JsValue::Boolean(true));
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
 }
