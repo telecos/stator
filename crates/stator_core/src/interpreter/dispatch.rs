@@ -15,12 +15,12 @@ use crate::objects::property_map::PropertyMap;
 use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
     TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, constant_pool_jump_delta,
-    constant_to_value, decode_string_constant, dispatch_call, dispatch_call_value, dispatch_setter,
-    err_bad_operand, error_message_from_value, extract_context, find_handler, fn_props_set,
-    is_js_receiver, js_add, js_less_than, keyed_load, keyed_store, maybe_compile_baseline,
-    maybe_compile_maglev, maybe_compile_turbofan, number_to_jsvalue, plain_object_to_array_items,
-    proto_lookup, resolve_jump, strict_eq, to_array_index, to_bigint, to_property_key,
-    try_execute_best_jit, walk_context_chain, wire_construct_prototype,
+    constant_to_value, decode_string_constant, dispatch_call_property, dispatch_call_value,
+    dispatch_setter, err_bad_operand, error_message_from_value, extract_context, find_handler,
+    fn_props_set, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
+    maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, number_to_jsvalue,
+    plain_object_to_array_items, proto_lookup, resolve_jump, strict_eq, to_array_index, to_bigint,
+    to_property_key, try_execute_best_jit, walk_context_chain, wire_construct_prototype,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{proxy_delete_property, proxy_has, proxy_set};
@@ -3267,8 +3267,12 @@ fn handle_call_property0(
     let Operand::Register(callee_v) = instr.operands[0] else {
         return Err(err_bad_operand("CallProperty0", 0));
     };
+    let Operand::Register(recv_v) = instr.operands[1] else {
+        return Err(err_bad_operand("CallProperty0", 1));
+    };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
-    dispatch_call(ctx.frame, &callee, vec![])?;
+    let this_val = ctx.frame.read_reg(recv_v)?.clone();
+    dispatch_call_property(ctx.frame, &callee, this_val, vec![])?;
     Ok(DispatchAction::Continue)
 }
 
@@ -3279,12 +3283,16 @@ fn handle_call_property1(
     let Operand::Register(callee_v) = instr.operands[0] else {
         return Err(err_bad_operand("CallProperty1", 0));
     };
+    let Operand::Register(recv_v) = instr.operands[1] else {
+        return Err(err_bad_operand("CallProperty1", 1));
+    };
     let Operand::Register(arg0_v) = instr.operands[2] else {
         return Err(err_bad_operand("CallProperty1", 2));
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
+    let this_val = ctx.frame.read_reg(recv_v)?.clone();
     let arg0 = ctx.frame.read_reg(arg0_v)?.clone();
-    dispatch_call(ctx.frame, &callee, vec![arg0])?;
+    dispatch_call_property(ctx.frame, &callee, this_val, vec![arg0])?;
     Ok(DispatchAction::Continue)
 }
 
@@ -3295,6 +3303,9 @@ fn handle_call_property2(
     let Operand::Register(callee_v) = instr.operands[0] else {
         return Err(err_bad_operand("CallProperty2", 0));
     };
+    let Operand::Register(recv_v) = instr.operands[1] else {
+        return Err(err_bad_operand("CallProperty2", 1));
+    };
     let Operand::Register(arg0_v) = instr.operands[2] else {
         return Err(err_bad_operand("CallProperty2", 2));
     };
@@ -3302,9 +3313,10 @@ fn handle_call_property2(
         return Err(err_bad_operand("CallProperty2", 3));
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
+    let this_val = ctx.frame.read_reg(recv_v)?.clone();
     let arg0 = ctx.frame.read_reg(arg0_v)?.clone();
     let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
-    dispatch_call(ctx.frame, &callee, vec![arg0, arg1])?;
+    dispatch_call_property(ctx.frame, &callee, this_val, vec![arg0, arg1])?;
     Ok(DispatchAction::Continue)
 }
 
