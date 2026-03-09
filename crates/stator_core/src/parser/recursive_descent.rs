@@ -3472,9 +3472,13 @@ impl<'src> Parser<'src> {
 /// assert!(matches!(prog.body[0], ProgramItem::Stmt(Stmt::VarDecl(_))));
 /// ```
 pub fn parse(source: &str) -> StatorResult<Program> {
-    let mut parser = Parser::new(source)?;
-    let program = parser.parse_program()?;
-    Ok(program)
+    // Parser recursion (expressions, nested functions, arrow bodies) can be
+    // deep for generated / minified code.  Ensure stack headroom.
+    stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, || {
+        let mut parser = Parser::new(source)?;
+        let program = parser.parse_program()?;
+        Ok(program)
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

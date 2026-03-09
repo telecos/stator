@@ -2452,7 +2452,15 @@ fn make_array() -> JsValue {
         "isArray".into(),
         native(|args| {
             let val = args.first().unwrap_or(&JsValue::Undefined);
-            Ok(JsValue::Boolean(matches!(val, JsValue::Array(_))))
+            let is_arr = match val {
+                JsValue::Array(_) => true,
+                JsValue::PlainObject(map) => map
+                    .borrow()
+                    .get("__is_array__")
+                    .is_some_and(|v| matches!(v, JsValue::Boolean(true))),
+                _ => false,
+            };
+            Ok(JsValue::Boolean(is_arr))
         }),
     );
 

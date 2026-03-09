@@ -1103,11 +1103,11 @@ impl Interpreter {
     /// - an unimplemented opcode is encountered, or
     /// - a type error occurs during arithmetic.
     pub fn run(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
-        // Dynamically grow the native stack when headroom drops below 128 KiB.
-        // Allocates a fresh 2 MiB segment via mmap/VirtualAlloc on demand,
+        // Dynamically grow the native stack when headroom drops below 512 KiB.
+        // Allocates a fresh 4 MiB segment via mmap/VirtualAlloc on demand,
         // preventing SIGSEGV/stack-overflow aborts on deeply recursive JS code
-        // (e.g. Test262 JSON.parse nesting tests).
-        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+        // (e.g. Test262 JSON.parse nesting tests, regex compilation).
+        stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
             // Outer loop: re-entered when a TailCall opcode rewrites the frame
             // with a new bytecode array (proper tail-call trampoline).
             'tail_call: loop {
@@ -2257,7 +2257,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Some(JsValue::Smi(n)) => n.to_string(),
                         _ => return Ok(JsValue::Boolean(false)),
                     };
-                    Ok(JsValue::Boolean(map.borrow().contains_key(&prop)))
+                    Ok(JsValue::Boolean(map.borrow().is_enumerable(&prop)))
                 }));
             }
             "isPrototypeOf" => {
@@ -2299,8 +2299,18 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         JsValue::Smi(n) => match key {
             "toString" => {
                 let n = *n;
-                return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(n.to_string().into()))
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let radix = match args.first() {
+                        Some(JsValue::Smi(r)) if *r >= 2 && *r <= 36 => *r as u32,
+                        None => 10,
+                        _ => 10,
+                    };
+                    if radix == 10 {
+                        return Ok(JsValue::String(n.to_string().into()));
+                    }
+                    Ok(JsValue::String(
+                        crate::builtins::util::i64_to_radix_string(n as i64, radix).into(),
+                    ))
                 }));
             }
             "valueOf" => {
@@ -2325,8 +2335,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         JsValue::HeapNumber(n) => match key {
             "toString" => {
                 let n = *n;
-                return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(format!("{n}").into()))
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let radix = match args.first() {
+                        Some(JsValue::Smi(r)) if *r >= 2 && *r <= 36 => *r as u32,
+                        _ => 10,
+                    };
+                    if radix == 10 {
+                        return Ok(JsValue::String(format!("{n}").into()));
+                    }
+                    Ok(JsValue::String(
+                        crate::builtins::util::f64_to_radix_string(n, radix).into(),
+                    ))
                 }));
             }
             "valueOf" => {

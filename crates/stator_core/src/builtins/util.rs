@@ -79,6 +79,57 @@ pub(crate) fn same_value_zero(a: &JsValue, b: &JsValue) -> bool {
     a.same_value_zero(b)
 }
 
+/// Convert an `i64` to a string in the given radix (2..=36).
+pub(crate) fn i64_to_radix_string(value: i64, radix: u32) -> String {
+    if radix == 10 {
+        return value.to_string();
+    }
+    if value == 0 {
+        return "0".to_string();
+    }
+    let negative = value < 0;
+    let mut n = if negative {
+        -(value as i128)
+    } else {
+        value as i128
+    };
+    let digits = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut buf = Vec::new();
+    let r = radix as i128;
+    while n > 0 {
+        buf.push(digits[(n % r) as usize]);
+        n /= r;
+    }
+    if negative {
+        buf.push(b'-');
+    }
+    buf.reverse();
+    String::from_utf8(buf).unwrap_or_default()
+}
+
+/// Convert an `f64` to a string in the given radix (2..=36).
+pub(crate) fn f64_to_radix_string(value: f64, radix: u32) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        };
+    }
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    // For integer values, use the integer path.
+    if value.fract() == 0.0 && value.abs() < (i64::MAX as f64) {
+        return i64_to_radix_string(value as i64, radix);
+    }
+    // Fallback: use decimal string for non-integer values.
+    format!("{value}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

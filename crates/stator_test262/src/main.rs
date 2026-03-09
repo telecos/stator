@@ -654,6 +654,19 @@ fn execute_source(
     harness_prefix: &str,
     template_globals: &HashMap<String, JsValue>,
 ) -> Result<JsValue, StatorError> {
+    // Each test execution gets a generous stack guarantee so that
+    // pathological inputs (deep regex, deep eval chains) cannot
+    // overflow the main thread stack across 53k+ tests.
+    stacker::maybe_grow(256 * 1024, 8 * 1024 * 1024, || {
+        execute_source_inner(source, harness_prefix, template_globals)
+    })
+}
+
+fn execute_source_inner(
+    source: &str,
+    harness_prefix: &str,
+    template_globals: &HashMap<String, JsValue>,
+) -> Result<JsValue, StatorError> {
     let combined = if harness_prefix.is_empty() {
         source.to_string()
     } else {
