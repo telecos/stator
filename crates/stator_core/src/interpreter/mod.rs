@@ -229,6 +229,13 @@ thread_local! {
         RefCell::new(crate::objects::js_string::StringTable::new());
 }
 
+/// Fast-path atomic flag indicating whether a debugger is attached.
+///
+/// Checked on every instruction dispatch before touching the thread-local
+/// `ACTIVE_DEBUGGER` RefCell.  This avoids a TLS+RefCell borrow on every
+/// single instruction when no debugger is present (the common case).
+static DEBUG_ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Attach a [`Debugger`] to the current thread's interpreter.
 ///
 /// While attached, the interpreter checks for breakpoints and step conditions
@@ -236,6 +243,7 @@ thread_local! {
 /// thread; calling this again replaces any previously attached debugger.
 pub fn attach_debugger(dbg: Rc<RefCell<Debugger>>) {
     ACTIVE_DEBUGGER.with(|d| *d.borrow_mut() = Some(dbg));
+    DEBUG_ATTACHED.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Detach the [`Debugger`] from the current thread.
@@ -244,6 +252,7 @@ pub fn attach_debugger(dbg: Rc<RefCell<Debugger>>) {
 /// safe to call this even if no debugger was attached.
 pub fn detach_debugger() {
     ACTIVE_DEBUGGER.with(|d| *d.borrow_mut() = None);
+    DEBUG_ATTACHED.store(false, std::sync::atomic::Ordering::Release);
 }
 
 /// Intern a property key string in the thread-local string table.
@@ -925,6 +934,7 @@ impl InterpreterFrame {
 
     /// Map an encoded register-operand value to a flat index into
     /// [`Self::registers`].
+    #[inline]
     fn reg_index(&self, v: u32) -> StatorResult<usize> {
         let signed = v as i32;
         if signed >= 0 {
@@ -952,12 +962,14 @@ impl InterpreterFrame {
     }
 
     /// Read the value of the register encoded by operand value `v`.
+    #[inline]
     fn read_reg(&self, v: u32) -> StatorResult<&JsValue> {
         let idx = self.reg_index(v)?;
         Ok(&self.registers[idx])
     }
 
     /// Write `value` to the register encoded by operand value `v`.
+    #[inline]
     fn write_reg(&mut self, v: u32, value: JsValue) -> StatorResult<()> {
         let idx = self.reg_index(v)?;
         self.registers[idx] = value;
@@ -1030,13 +1042,15 @@ impl Interpreter {
                 // next instruction so that the paused frame state reflects what is
                 // *about* to execute (the program counter still points at the
                 // instruction that would fire next).
-                let current_offset = byte_offsets[frame.pc] as u32;
-                if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
-                    let opt = d.borrow();
-                    opt.as_ref()
-                        .and_then(|rc| rc.borrow_mut().check_pause_at(current_offset))
-                }) {
-                    return Err(pause_err);
+                if DEBUG_ATTACHED.load(std::sync::atomic::Ordering::Relaxed) {
+                    let current_offset = byte_offsets[frame.pc] as u32;
+                    if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
+                        let opt = d.borrow();
+                        opt.as_ref()
+                            .and_then(|rc| rc.borrow_mut().check_pause_at(current_offset))
+                    }) {
+                        return Err(pause_err);
+                    }
                 }
 
                 // ── Fetch ──────────────────────────────────────────────────────
@@ -1446,6 +1460,7 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
     }
     out
 }
+#[inline]
 pub(super) fn number_to_jsvalue(n: f64) -> JsValue {
     if n.is_finite() && n.fract() == 0.0 && (i32::MIN as f64..=i32::MAX as f64).contains(&n) {
         JsValue::Smi(n as i32)
@@ -1618,6 +1633,26 @@ pub(super) fn abstract_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
         // Object identity — `JsValue::Object` holds a raw `*mut HeapObject`
         // pointer; comparing the pointer values gives reference identity.
         (JsValue::Object(a), JsValue::Object(b)) => std::ptr::eq(*a, *b),
+        // PlainObject, Array, Function identity — Rc pointer comparison.
+        (JsValue::PlainObject(a), JsValue::PlainObject(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Array(a), JsValue::Array(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Function(a), JsValue::Function(b)) => Rc::ptr_eq(a, b),
+        (JsValue::NativeFunction(a), JsValue::NativeFunction(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Error(a), JsValue::Error(b)) => Rc::ptr_eq(a, b),
+        // Object == primitive → ToPrimitive(Object, default) then compare
+        // (ECMAScript §7.2.14 steps 12/13).
+        (lhs_val, rhs_val) if !lhs_val.is_primitive() && rhs_val.is_primitive() => {
+            match lhs_val.to_primitive(crate::objects::value::ToPrimitiveHint::Default) {
+                Ok(prim) => abstract_eq(&prim, rhs_val),
+                Err(_) => false,
+            }
+        }
+        (lhs_val, rhs_val) if lhs_val.is_primitive() && !rhs_val.is_primitive() => {
+            match rhs_val.to_primitive(crate::objects::value::ToPrimitiveHint::Default) {
+                Ok(prim) => abstract_eq(lhs_val, &prim),
+                Err(_) => false,
+            }
+        }
         _ => false,
     }
 }
@@ -1635,9 +1670,15 @@ pub(super) fn strict_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
         (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => a == b,
         (JsValue::Smi(a), JsValue::HeapNumber(b)) => (*a as f64) == *b,
         (JsValue::HeapNumber(a), JsValue::Smi(b)) => *a == (*b as f64),
-        // Object identity — `JsValue::Object` holds a raw `*mut HeapObject`
-        // pointer; comparing the pointer values gives reference identity.
+        // Object identity — pointer comparison for all object-like types.
         (JsValue::Object(a), JsValue::Object(b)) => std::ptr::eq(*a, *b),
+        (JsValue::PlainObject(a), JsValue::PlainObject(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Array(a), JsValue::Array(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Function(a), JsValue::Function(b)) => Rc::ptr_eq(a, b),
+        (JsValue::NativeFunction(a), JsValue::NativeFunction(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Error(a), JsValue::Error(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Promise(a), JsValue::Promise(b)) => a == b,
+        (JsValue::Proxy(a), JsValue::Proxy(b)) => Rc::ptr_eq(a, b),
         _ => false,
     }
 }
@@ -2870,6 +2911,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Ok(JsValue::new_array(new_arr))
                     }));
                 }
+                "valueOf" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        Ok(JsValue::Array(Rc::clone(&a)))
+                    }));
+                }
                 "constructor" => return JsValue::Undefined,
                 _ => {
                     // Numeric index access: arr[0], arr[1], etc.
@@ -2882,6 +2929,19 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             return JsValue::Undefined;
         }
+        JsValue::BigInt(n) => match key {
+            "toString" | "toLocaleString" => {
+                let s = format!("{n}");
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(s.clone()))
+                }));
+            }
+            "valueOf" => {
+                let n = *n;
+                return JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::BigInt(n))));
+            }
+            _ => {}
+        },
         _ => {}
     }
     // Handle JsValue::Proxy — delegate to the proxy get trap.
@@ -2929,6 +2989,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toString" => JsValue::NativeFunction(Rc::new(move |_args| {
                 Ok(JsValue::String(err.to_error_string()))
             })),
+            "valueOf" => {
+                let e2 = Rc::clone(e);
+                JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Error(Rc::clone(&e2)))))
+            }
             _ => JsValue::Undefined,
         };
     }

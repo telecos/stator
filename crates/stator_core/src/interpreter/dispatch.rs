@@ -15,14 +15,14 @@ use crate::objects::property_map::PropertyMap;
 use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
     TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, constant_pool_jump_delta,
-    constant_to_value, decode_string_constant, dispatch_call, dispatch_setter, err_bad_operand,
-    error_message_from_value, extract_context, find_handler, fn_props_set, is_js_receiver, js_add,
-    js_less_than, keyed_load, keyed_store, maybe_compile_baseline, maybe_compile_maglev,
-    maybe_compile_turbofan, number_to_jsvalue, plain_object_to_array_items, proto_lookup,
-    resolve_jump, strict_eq, to_array_index, to_bigint, to_property_key, try_execute_best_jit,
-    walk_context_chain, wire_construct_prototype,
+    constant_to_value, decode_string_constant, dispatch_call, dispatch_call_value, dispatch_setter,
+    err_bad_operand, error_message_from_value, extract_context, find_handler, fn_props_set,
+    is_js_receiver, js_add, js_less_than, keyed_load, keyed_store, maybe_compile_baseline,
+    maybe_compile_maglev, maybe_compile_turbofan, number_to_jsvalue, plain_object_to_array_items,
+    proto_lookup, resolve_jump, strict_eq, to_array_index, to_bigint, to_property_key,
+    try_execute_best_jit, walk_context_chain, wire_construct_prototype,
 };
-use crate::builtins::error::{pop_call_frame, push_call_frame};
+use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{proxy_delete_property, proxy_has, proxy_set};
 use crate::bytecode::bytecode_array::{
     ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD, TIERING_THRESHOLD,
@@ -160,7 +160,18 @@ fn handle_add(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Add", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi + Smi → Smi (no allocation, overflow → HeapNumber)
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = match a.checked_add(*b) {
+            Some(r) => JsValue::Smi(r),
+            None => JsValue::HeapNumber(a as f64 + *b as f64),
+        };
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.clone();
     ctx.frame.accumulator = js_add(&ctx.frame.accumulator, &rhs)?;
     Ok(DispatchAction::Continue)
 }
@@ -169,7 +180,18 @@ fn handle_sub(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Sub", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi - Smi → Smi
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = match a.checked_sub(*b) {
+            Some(r) => JsValue::Smi(r),
+            None => JsValue::HeapNumber(a as f64 - *b as f64),
+        };
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(&rhs)?;
@@ -186,7 +208,18 @@ fn handle_mul(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Mul", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi * Smi → Smi
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = match a.checked_mul(*b) {
+            Some(r) => JsValue::Smi(r),
+            None => JsValue::HeapNumber(a as f64 * *b as f64),
+        };
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(&rhs)?;
@@ -380,6 +413,14 @@ fn handle_add_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("AddSmi", 0));
     };
+    // Fast path: Smi + immediate
+    if let JsValue::Smi(n) = ctx.frame.accumulator {
+        ctx.frame.accumulator = match n.checked_add(imm) {
+            Some(r) => JsValue::Smi(r),
+            None => JsValue::HeapNumber(n as f64 + imm as f64),
+        };
+        return Ok(DispatchAction::Continue);
+    }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n.wrapping_add(i128::from(imm)));
     } else {
@@ -393,6 +434,14 @@ fn handle_sub_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("SubSmi", 0));
     };
+    // Fast path: Smi - immediate
+    if let JsValue::Smi(n) = ctx.frame.accumulator {
+        ctx.frame.accumulator = match n.checked_sub(imm) {
+            Some(r) => JsValue::Smi(r),
+            None => JsValue::HeapNumber(n as f64 - imm as f64),
+        };
+        return Ok(DispatchAction::Continue);
+    }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n.wrapping_sub(i128::from(imm)));
     } else {
@@ -406,6 +455,14 @@ fn handle_mul_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("MulSmi", 0));
     };
+    // Fast path: Smi * immediate
+    if let JsValue::Smi(n) = ctx.frame.accumulator {
+        ctx.frame.accumulator = match n.checked_mul(imm) {
+            Some(r) => JsValue::Smi(r),
+            None => JsValue::HeapNumber(n as f64 * imm as f64),
+        };
+        return Ok(DispatchAction::Continue);
+    }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n.wrapping_mul(i128::from(imm)));
     } else {
@@ -616,7 +673,15 @@ fn handle_test_equal_strict(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("TestEqualStrict", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi === Smi
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = JsValue::Boolean(a == *b);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.clone();
     let result = strict_eq(&ctx.frame.accumulator, &rhs);
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
@@ -629,7 +694,15 @@ fn handle_test_less_than(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("TestLessThan", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi < Smi
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = JsValue::Boolean(a < *b);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.clone();
     let result = js_less_than(&ctx.frame.accumulator, &rhs)?;
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
@@ -642,7 +715,15 @@ fn handle_test_greater_than(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("TestGreaterThan", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi > Smi
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = JsValue::Boolean(a > *b);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.clone();
     // a > b  ≡  b < a
     let result = js_less_than(&rhs, &ctx.frame.accumulator)?;
     ctx.frame.accumulator = JsValue::Boolean(result);
@@ -656,7 +737,15 @@ fn handle_test_less_than_or_equal(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("TestLessThanOrEqual", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi <= Smi
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = JsValue::Boolean(a <= *b);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.clone();
     // a <= b  ≡  !(b < a)
     let result = !js_less_than(&rhs, &ctx.frame.accumulator)?;
     ctx.frame.accumulator = JsValue::Boolean(result);
@@ -670,7 +759,15 @@ fn handle_test_greater_than_or_equal(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("TestGreaterThanOrEqual", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi >= Smi
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = JsValue::Boolean(a >= *b);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.clone();
     // a >= b  ≡  !(a < b)
     let result = !js_less_than(&ctx.frame.accumulator, &rhs)?;
     ctx.frame.accumulator = JsValue::Boolean(result);
@@ -2084,12 +2181,15 @@ fn handle_get_iterator(
         // PlainObject with @@iterator → call it to get the iterator.
         JsValue::PlainObject(ref map) if map.borrow().contains_key("@@iterator") => {
             let iter_fn = map.borrow().get("@@iterator").cloned();
-            if let Some(JsValue::NativeFunction(f)) = iter_fn {
-                f(vec![])?
-            } else {
-                return Err(StatorError::TypeError(
-                    "GetIterator: @@iterator is not a function".into(),
-                ));
+            match iter_fn {
+                Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
+                    dispatch_call_value(f, vec![])?
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "GetIterator: @@iterator is not a function".into(),
+                    ));
+                }
             }
         }
         // PlainObject with a "length" property → array-like.
@@ -2124,12 +2224,15 @@ fn handle_get_async_iterator(
         // PlainObject with @@iterator → call it to get the iterator.
         JsValue::PlainObject(ref map) if map.borrow().contains_key("@@iterator") => {
             let iter_fn = map.borrow().get("@@iterator").cloned();
-            if let Some(JsValue::NativeFunction(f)) = iter_fn {
-                f(vec![])?
-            } else {
-                return Err(StatorError::TypeError(
-                    "GetAsyncIterator: @@iterator is not a function".into(),
-                ));
+            match iter_fn {
+                Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
+                    dispatch_call_value(f, vec![])?
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "GetAsyncIterator: @@iterator is not a function".into(),
+                    ));
+                }
             }
         }
         JsValue::PlainObject(ref map) if map.borrow().contains_key("length") => {
@@ -2165,6 +2268,31 @@ fn handle_iterator_next(
             match Interpreter::run_generator_step(gs, JsValue::Undefined)? {
                 GeneratorStep::Yield(v) => (v, false),
                 GeneratorStep::Return(v) => (v, true),
+            }
+        }
+        JsValue::PlainObject(ref map) if map.borrow().contains_key("next") => {
+            let next_fn = map.borrow().get("next").cloned();
+            match next_fn {
+                Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
+                    let result = dispatch_call_value(f, vec![])?;
+                    match result {
+                        JsValue::PlainObject(ref res_map) => {
+                            let done = res_map.borrow().get("done").is_some_and(|d| d.to_boolean());
+                            let value = res_map
+                                .borrow()
+                                .get("value")
+                                .cloned()
+                                .unwrap_or(JsValue::Undefined);
+                            (value, done)
+                        }
+                        _ => (JsValue::Undefined, true),
+                    }
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "IteratorNext: next is not a function".into(),
+                    ));
+                }
             }
         }
         other => {
@@ -2694,6 +2822,58 @@ fn handle_test_instance_of(
         return Ok(DispatchAction::Continue);
     }
 
+    // ── Built-in type checks via constructor identity ──────────────
+    // NativeFunction constructors (Error, Array, Function, etc.) don't have
+    // .prototype properties. Identify them by pointer-comparing with global
+    // scope entries and do direct type checking.
+    if let JsValue::NativeFunction(ref ctor_fn) = constructor {
+        let acc = &ctx.frame.accumulator;
+        let global = ctx.frame.global_env.borrow();
+
+        type BuiltinCheck = (&'static str, fn(&JsValue) -> bool);
+        let builtin_checks: &[BuiltinCheck] = &[
+            ("Array", |v| matches!(v, JsValue::Array(_))),
+            ("Function", |v| {
+                matches!(v, JsValue::Function(_) | JsValue::NativeFunction(_))
+            }),
+            ("Promise", |v| matches!(v, JsValue::Promise(_))),
+            // Error hierarchy: instanceof Error matches ALL error kinds
+            ("Error", |v| matches!(v, JsValue::Error(_))),
+        ];
+        for &(name, predicate) in builtin_checks {
+            if let Some(JsValue::NativeFunction(global_fn)) = global.get(name)
+                && Rc::ptr_eq(ctor_fn, global_fn)
+            {
+                let result = predicate(acc);
+                drop(global);
+                ctx.frame.accumulator = JsValue::Boolean(result);
+                return Ok(DispatchAction::Continue);
+            }
+        }
+        // Specific error sub-types: TypeError, RangeError, etc.
+        // These inherit from Error, so `e instanceof TypeError` should check e.kind
+        let error_kinds: &[(&str, ErrorKind)] = &[
+            ("TypeError", ErrorKind::TypeError),
+            ("RangeError", ErrorKind::RangeError),
+            ("ReferenceError", ErrorKind::ReferenceError),
+            ("SyntaxError", ErrorKind::SyntaxError),
+            ("URIError", ErrorKind::URIError),
+            ("EvalError", ErrorKind::EvalError),
+            ("AggregateError", ErrorKind::AggregateError),
+        ];
+        for &(name, kind) in error_kinds {
+            if let Some(JsValue::NativeFunction(global_fn)) = global.get(name)
+                && Rc::ptr_eq(ctor_fn, global_fn)
+            {
+                let is_match = matches!(acc, JsValue::Error(e) if e.kind == kind);
+                drop(global);
+                ctx.frame.accumulator = JsValue::Boolean(is_match);
+                return Ok(DispatchAction::Continue);
+            }
+        }
+        drop(global);
+    }
+
     // Obtain the constructor's "prototype" property.
     let ctor_proto = match &constructor {
         JsValue::PlainObject(map) => map.borrow().get("prototype").cloned(),
@@ -2776,18 +2956,32 @@ fn handle_for_in_enumerate(
     };
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     let keys: Vec<JsValue> = match &obj {
-        JsValue::PlainObject(map) => map
-            .borrow()
-            .enumerable_keys()
-            .map(|k| JsValue::String(k.clone()))
-            .collect(),
-        JsValue::Array(items) => {
-            let mut ks: Vec<JsValue> = (0..items.borrow().len())
-                .map(|i| JsValue::String(i.to_string()))
-                .collect();
-            ks.push(JsValue::String("length".to_string()));
-            ks
+        JsValue::PlainObject(map) => {
+            let mut all_keys = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            // Walk the prototype chain collecting enumerable keys.
+            let mut current_map = Some(Rc::clone(map));
+            for _ in 0..256 {
+                let Some(m) = current_map.take() else { break };
+                let borrow = m.borrow();
+                for k in borrow.enumerable_keys() {
+                    if seen.insert(k.clone()) {
+                        all_keys.push(JsValue::String(k.clone()));
+                    }
+                }
+                current_map = borrow.get("__proto__").and_then(|v| {
+                    if let JsValue::PlainObject(proto) = v {
+                        Some(Rc::clone(proto))
+                    } else {
+                        None
+                    }
+                });
+            }
+            all_keys
         }
+        JsValue::Array(items) => (0..items.borrow().len())
+            .map(|i| JsValue::String(i.to_string()))
+            .collect(),
         JsValue::Null | JsValue::Undefined => vec![],
         _ => vec![],
     };
