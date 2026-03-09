@@ -1618,8 +1618,12 @@ pub(super) fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
     if lhs.is_string() || rhs.is_string() {
         let l = lhs.to_js_string()?;
         let r = rhs.to_js_string()?;
+        let total = l.len().saturating_add(r.len());
+        if total > crate::builtins::string::MAX_STRING_LEN {
+            return Err(StatorError::RangeError("Invalid string length".into()));
+        }
         // Pre-allocate exact capacity to avoid reallocation during concat.
-        let mut result = String::with_capacity(l.len() + r.len());
+        let mut result = String::with_capacity(total);
         result.push_str(&l);
         result.push_str(&r);
         Ok(JsValue::String(result.into()))

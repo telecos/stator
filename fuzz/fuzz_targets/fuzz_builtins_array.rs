@@ -18,7 +18,7 @@ fn make_value(sel: u8) -> JsValue {
         2 => JsValue::Boolean(sel & 1 == 0),
         3 => JsValue::Smi(i32::from(sel)),
         4 => JsValue::HeapNumber(f64::from(sel)),
-        _ => JsValue::String(format!("s{sel}")),
+        _ => JsValue::String(format!("s{sel}").into()),
     }
 }
 

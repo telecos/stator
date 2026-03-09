@@ -27,7 +27,7 @@ fuzz_target!(|data: &[u8]| {
             2 => JsValue::Boolean(selector & 1 == 0),
             3 => JsValue::Smi(i32::from(selector)),
             4 => JsValue::HeapNumber(f64::from(selector)),
-            _ => JsValue::String(format!("v{selector}")),
+            _ => JsValue::String(format!("v{selector}").into()),
         }
     }
 
