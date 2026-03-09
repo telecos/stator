@@ -47,6 +47,7 @@ use crate::bytecode::bytecodes::{self, Instruction};
 use crate::bytecode::feedback::FeedbackMetadata;
 use crate::compiler::turbofan::TurbofanCompiledCode;
 use crate::error::StatorResult;
+use crate::objects::value::JsContext;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HandlerTableEntry
@@ -272,6 +273,13 @@ pub struct BytecodeArray {
     /// been scheduled so that only one background thread is spawned per
     /// function.
     turbofan_compile_started: Arc<AtomicBool>,
+    /// Captured closure context set by `CreateClosure`.
+    ///
+    /// When a function is created as a closure, this holds the enclosing
+    /// scope's context so that inner code can walk the context chain to
+    /// reach captured variables.  `None` for top-level scripts and functions
+    /// that do not close over any variables.
+    closure_context: Option<Rc<RefCell<JsContext>>>,
 }
 
 impl PartialEq for BytecodeArray {
@@ -335,6 +343,7 @@ impl BytecodeArray {
             maglev_compile_started: Arc::new(AtomicBool::new(false)),
             turbofan_jit_code: Arc::new(Mutex::new(None)),
             turbofan_compile_started: Arc::new(AtomicBool::new(false)),
+            closure_context: None,
         }
     }
 
@@ -393,6 +402,16 @@ impl BytecodeArray {
     /// Returns `true` if this bytecode was compiled in strict mode.
     pub fn is_strict(&self) -> bool {
         self.is_strict
+    }
+
+    /// Returns the captured closure context, if any.
+    pub fn closure_context(&self) -> Option<&Rc<RefCell<JsContext>>> {
+        self.closure_context.as_ref()
+    }
+
+    /// Attach a captured closure context to this [`BytecodeArray`].
+    pub fn set_closure_context(&mut self, ctx: Rc<RefCell<JsContext>>) {
+        self.closure_context = Some(ctx);
     }
 
     /// The raw encoded bytecode bytes.

@@ -1175,6 +1175,10 @@ impl Interpreter {
             poly_load_cache: std::collections::HashMap::new(),
             string_cache: std::collections::HashMap::new(),
         };
+        // Restore the captured closure context so generators can access outer
+        // scope variables through the context chain.
+        let ba_ref = frame.bytecode_array.clone();
+        restore_closure_context(&mut frame, &ba_ref);
 
         state.borrow_mut().status = GeneratorStatus::Executing;
 
@@ -1637,11 +1641,11 @@ pub(super) fn abstract_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
         (JsValue::String(s), JsValue::BigInt(b)) => s.trim().parse::<i128>() == Ok(*b),
         // String → Number coercion (steps 5/6).
         (JsValue::String(s), _) if rhs.is_number() => {
-            let n: f64 = s.trim().parse().unwrap_or(f64::NAN);
+            let n = crate::objects::value::string_to_number(s);
             abstract_eq(&JsValue::HeapNumber(n), rhs)
         }
         (_, JsValue::String(s)) if lhs.is_number() => {
-            let n: f64 = s.trim().parse().unwrap_or(f64::NAN);
+            let n = crate::objects::value::string_to_number(s);
             abstract_eq(lhs, &JsValue::HeapNumber(n))
         }
         // Object identity — `JsValue::Object` holds a raw `*mut HeapObject`
@@ -1760,6 +1764,7 @@ pub(super) fn dispatch_call(
                         args,
                         Rc::clone(&frame.global_env),
                     );
+                    restore_closure_context(&mut callee_frame, ba);
                     push_call_frame("<anonymous>")?;
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
@@ -1825,7 +1830,7 @@ pub(super) fn dispatch_call_property(
                         args,
                         Rc::clone(&frame.global_env),
                     );
-                    callee_frame.context = Some(this_val.clone());
+                    restore_closure_context(&mut callee_frame, ba);
                     callee_frame
                         .global_env
                         .borrow_mut()
@@ -1896,6 +1901,20 @@ pub(super) fn walk_context_chain(
         current = parent;
     }
     Ok(current)
+}
+
+/// Restore the captured closure context on a callee frame.
+///
+/// If `ba` was created by `CreateClosure` with an enclosing scope, this sets
+/// the callee frame's context so that `CreateFunctionContext` chains to the
+/// captured scope and context-slot opcodes can walk up to outer variables.
+pub(super) fn restore_closure_context(
+    frame: &mut InterpreterFrame,
+    ba: &crate::bytecode::bytecode_array::BytecodeArray,
+) {
+    if let Some(ctx) = ba.closure_context() {
+        frame.context = Some(JsValue::Context(Rc::clone(ctx)));
+    }
 }
 
 /// Convert a thrown JavaScript value to a human-readable error message string.
@@ -10529,7 +10548,12 @@ mod tests {
         let ba = make_bytecode_with_pool(outer_instrs, pool, 1, 2);
         let mut frame = InterpreterFrame::new(ba, vec![JsValue::Smi(3), JsValue::Smi(4)]);
         let result = Interpreter::run(&mut frame).unwrap();
-        assert_eq!(result, JsValue::Smi(7));
+        // [[Construct]] semantics: the inner function returns Smi(7) (a
+        // primitive), so the freshly-created `this` object is returned.
+        assert!(
+            matches!(result, JsValue::PlainObject(_)),
+            "expected PlainObject from [[Construct]], got {result:?}"
+        );
     }
 
     #[test]
@@ -10564,7 +10588,12 @@ mod tests {
         let ba = make_bytecode_with_pool(outer_instrs, pool, 1, 0);
         let mut frame = InterpreterFrame::new(ba, vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
-        assert_eq!(result, JsValue::Smi(42));
+        // [[Construct]] semantics: the inner function returns Smi(42) (a
+        // primitive), so the freshly-created `this` object is returned.
+        assert!(
+            matches!(result, JsValue::PlainObject(_)),
+            "expected PlainObject from [[Construct]], got {result:?}"
+        );
     }
 
     // ── CreateObjectFromIterable ─────────────────────────────────────────
@@ -10996,5 +11025,104 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::String("done".to_string().into()));
+    }
+
+    // ── Class-inheritance conformance ────────────────────────────────────
+
+    /// Basic class construction: `new Foo()` creates an instance with
+    /// `this` bound in the constructor.
+    #[test]
+    fn test_class_construct_this_binding() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo { constructor() { this.x = 42; } } \
+             let f = new Foo(); \
+             f.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Static methods: `class Foo { static bar() { return 1; } }`
+    /// — `Foo.bar()` should work.
+    #[test]
+    fn test_class_static_method() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo { static bar() { return 99; } } \
+             Foo.bar()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    /// Static class fields: `class Foo { static x = 1; }` — `Foo.x`.
+    #[test]
+    fn test_class_static_field() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo { static x = 7; } \
+             Foo.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    /// Instance fields: `class Foo { x = 1; }` — instance properties
+    /// initialized during construction.
+    #[test]
+    fn test_class_instance_field() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo { x = 10; } \
+             let f = new Foo(); \
+             f.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// Class extends prototype chain:
+    /// `Foo.prototype.__proto__ === Bar.prototype` and
+    /// `Foo.__proto__ === Bar` (static inheritance).
+    #[test]
+    fn test_class_extends_prototype_chain() {
+        // Verify that an instance of Child can access Parent prototype methods.
+        let result = crate::builtins::global::global_eval(
+            "class Parent { greet() { return 'hello'; } } \
+             class Child extends Parent { } \
+             let c = new Child(); \
+             c.greet()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("hello".to_string().into()));
+    }
+
+    /// `super()` in constructors: calls the parent constructor, sets up
+    /// the prototype chain, and initialises parent-defined properties.
+    #[test]
+    fn test_class_super_constructor() {
+        let result = crate::builtins::global::global_eval(
+            "class Base { constructor() { this.base = 1; } } \
+             class Derived extends Base { \
+                 constructor() { super(); this.derived = 2; } \
+             } \
+             let d = new Derived(); \
+             d.base + d.derived",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `new.target` — in constructors, references the constructor
+    /// being `new`-ed.
+    #[test]
+    fn test_class_new_target() {
+        // new.target is defined (not undefined) when called with `new`.
+        let result = crate::builtins::global::global_eval(
+            "class Foo { constructor() { \
+                 this.hasNewTarget = new.target !== undefined; \
+             } } \
+             let f = new Foo(); \
+             f.hasNewTarget",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 }
