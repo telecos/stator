@@ -73,7 +73,9 @@ use crate::builtins::math::{
     math_min, math_pow, math_random, math_round, math_sign, math_sin, math_sinh, math_sqrt,
     math_tan, math_tanh, math_trunc,
 };
-use crate::builtins::proxy::{ProxyHandler, proxy_new, proxy_revocable, proxy_revoke};
+use crate::builtins::proxy::{
+    ProxyHandler, proxy_new, proxy_new_callable, proxy_revocable, proxy_revoke,
+};
 use crate::builtins::reflect::{
     reflect_define_property, reflect_delete_property, reflect_get,
     reflect_get_own_property_descriptor, reflect_get_prototype_of, reflect_has,
@@ -5590,15 +5592,16 @@ fn make_proxy() -> JsValue {
         native(|args| {
             let target_val = args.first().cloned().unwrap_or(JsValue::Undefined);
             let handler_val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-            // target must be an object-like value
-            let target = match &target_val {
+            // target must be an object-like value; detect callability
+            let (target, callable) = match &target_val {
                 JsValue::PlainObject(map) => {
                     let mut obj = JsObject::new();
                     for (k, v) in map.borrow().iter() {
                         obj.set_property(k, v.clone()).ok();
                     }
-                    obj
+                    (obj, false)
                 }
+                JsValue::Function(_) | JsValue::NativeFunction(_) => (JsObject::new(), true),
                 _ => {
                     return Err(StatorError::TypeError(
                         "Proxy: target must be an object".to_string(),
@@ -5607,7 +5610,11 @@ fn make_proxy() -> JsValue {
             };
             // Build a ProxyHandler from the handler PlainObject's trap functions
             let handler = build_proxy_handler(&handler_val);
-            let proxy = proxy_new(target, handler);
+            let proxy = if callable {
+                proxy_new_callable(target, handler)
+            } else {
+                proxy_new(target, handler)
+            };
             Ok(JsValue::Proxy(Rc::new(RefCell::new(proxy))))
         }),
     );
@@ -5618,14 +5625,15 @@ fn make_proxy() -> JsValue {
         native(|args| {
             let target_val = args.first().cloned().unwrap_or(JsValue::Undefined);
             let handler_val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-            let target = match &target_val {
+            let (target, callable) = match &target_val {
                 JsValue::PlainObject(map) => {
                     let mut obj = JsObject::new();
                     for (k, v) in map.borrow().iter() {
                         obj.set_property(k, v.clone()).ok();
                     }
-                    obj
+                    (obj, false)
                 }
+                JsValue::Function(_) | JsValue::NativeFunction(_) => (JsObject::new(), true),
                 _ => {
                     return Err(StatorError::TypeError(
                         "Proxy.revocable: target must be an object".to_string(),
@@ -5633,7 +5641,11 @@ fn make_proxy() -> JsValue {
                 }
             };
             let handler = build_proxy_handler(&handler_val);
-            let proxy = proxy_revocable(target, handler);
+            let proxy = if callable {
+                proxy_new_callable(target, handler)
+            } else {
+                proxy_revocable(target, handler)
+            };
             let proxy_rc = Rc::new(RefCell::new(proxy));
             let proxy_val = JsValue::Proxy(Rc::clone(&proxy_rc));
             let revoke_fn = JsValue::NativeFunction(Rc::new(move |_args| {

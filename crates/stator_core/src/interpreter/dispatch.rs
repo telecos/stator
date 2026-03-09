@@ -2445,7 +2445,14 @@ fn handle_type_of(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResu
         JsValue::Iterator(_) => "object",
         JsValue::Promise(_) => "object",
         JsValue::Context(_) => "object",
-        JsValue::Proxy(_) => "object",
+        JsValue::Proxy(p) => {
+            let proxy = p.borrow();
+            if proxy.is_callable() {
+                "function"
+            } else {
+                "object"
+            }
+        }
         JsValue::ArrayBuffer(_) | JsValue::TypedArray(_) | JsValue::DataView(_) => "object",
     };
     ctx.frame.accumulator = JsValue::String(type_str.to_owned());
@@ -2469,22 +2476,23 @@ fn handle_test_type_of(
         3 => matches!(ctx.frame.accumulator, JsValue::Boolean(_)),
         4 => matches!(ctx.frame.accumulator, JsValue::BigInt(_)),
         5 => matches!(ctx.frame.accumulator, JsValue::Undefined),
-        6 => matches!(
-            ctx.frame.accumulator,
-            JsValue::Function(_) | JsValue::NativeFunction(_)
-        ),
-        7 => matches!(
-            ctx.frame.accumulator,
+        6 => match &ctx.frame.accumulator {
+            JsValue::Function(_) | JsValue::NativeFunction(_) => true,
+            JsValue::Proxy(p) => p.borrow().is_callable(),
+            _ => false,
+        },
+        7 => match &ctx.frame.accumulator {
             JsValue::Null
-                | JsValue::Object(_)
-                | JsValue::Array(_)
-                | JsValue::PlainObject(_)
-                | JsValue::Error(_)
-                | JsValue::Generator(_)
-                | JsValue::Iterator(_)
-                | JsValue::Promise(_)
-                | JsValue::Proxy(_)
-        ),
+            | JsValue::Object(_)
+            | JsValue::Array(_)
+            | JsValue::PlainObject(_)
+            | JsValue::Error(_)
+            | JsValue::Generator(_)
+            | JsValue::Iterator(_)
+            | JsValue::Promise(_) => true,
+            JsValue::Proxy(p) => !p.borrow().is_callable(),
+            _ => false,
+        },
         _ => false,
     };
     ctx.frame.accumulator = JsValue::Boolean(matches_type);
@@ -2528,19 +2536,130 @@ fn handle_to_object(
     let Operand::Register(dst) = instr.operands[0] else {
         return Err(err_bad_operand("ToObject", 0));
     };
-    match &ctx.frame.accumulator {
+    let wrapped = match &ctx.frame.accumulator {
         JsValue::Null | JsValue::Undefined => {
             return Err(StatorError::TypeError(
                 "Cannot convert undefined or null to object".to_string(),
             ));
         }
-        _ => {
-            // Objects/arrays stay as-is; primitives would need
-            // wrapper objects (not yet implemented).
-            let val = ctx.frame.accumulator.clone();
-            ctx.frame.write_reg(dst, val)?;
+        // Objects, arrays, and other reference types stay as-is.
+        JsValue::PlainObject(_)
+        | JsValue::Array(_)
+        | JsValue::Function(_)
+        | JsValue::NativeFunction(_)
+        | JsValue::Promise(_)
+        | JsValue::Generator(_)
+        | JsValue::Error(_)
+        | JsValue::Proxy(_)
+        | JsValue::Object(_)
+        | JsValue::Context(_)
+        | JsValue::Iterator(_)
+        | JsValue::ArrayBuffer(_)
+        | JsValue::TypedArray(_)
+        | JsValue::DataView(_) => ctx.frame.accumulator.clone(),
+        // ECMAScript §7.1.18 – Boolean wrapper object.
+        JsValue::Boolean(b) => {
+            let b_val = *b;
+            let mut map = PropertyMap::new();
+            map.insert("__wrapped__".into(), JsValue::Boolean(b_val));
+            map.insert(
+                "valueOf".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::Boolean(b_val)))),
+            );
+            map.insert(
+                "toString".into(),
+                JsValue::NativeFunction(Rc::new(move |_| {
+                    Ok(JsValue::String(if b_val { "true" } else { "false" }.into()))
+                })),
+            );
+            JsValue::PlainObject(Rc::new(RefCell::new(map)))
         }
-    }
+        // ECMAScript §7.1.18 – Number wrapper object (Smi).
+        JsValue::Smi(n) => {
+            let n_val = *n;
+            let mut map = PropertyMap::new();
+            map.insert("__wrapped__".into(), JsValue::Smi(n_val));
+            map.insert(
+                "valueOf".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::Smi(n_val)))),
+            );
+            map.insert(
+                "toString".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::String(n_val.to_string())))),
+            );
+            JsValue::PlainObject(Rc::new(RefCell::new(map)))
+        }
+        // ECMAScript §7.1.18 – Number wrapper object (HeapNumber).
+        JsValue::HeapNumber(n) => {
+            let n_val = *n;
+            let mut map = PropertyMap::new();
+            map.insert("__wrapped__".into(), JsValue::HeapNumber(n_val));
+            map.insert(
+                "valueOf".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::HeapNumber(n_val)))),
+            );
+            map.insert(
+                "toString".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::String(n_val.to_string())))),
+            );
+            JsValue::PlainObject(Rc::new(RefCell::new(map)))
+        }
+        // ECMAScript §7.1.18 – String wrapper object with length and indexed access.
+        JsValue::String(s) => {
+            let s_val = s.clone();
+            let mut map = PropertyMap::new();
+            map.insert("__wrapped__".into(), JsValue::String(s_val.clone()));
+            map.insert("length".into(), JsValue::Smi(s_val.len() as i32));
+            // Indexed character access ("0", "1", …).
+            for (i, ch) in s_val.chars().enumerate() {
+                map.insert(i.to_string(), JsValue::String(ch.to_string()));
+            }
+            let s_vo = s_val.clone();
+            map.insert(
+                "valueOf".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::String(s_vo.clone())))),
+            );
+            let s_ts = s_val;
+            map.insert(
+                "toString".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::String(s_ts.clone())))),
+            );
+            JsValue::PlainObject(Rc::new(RefCell::new(map)))
+        }
+        // ECMAScript §7.1.18 – Symbol wrapper object.
+        JsValue::Symbol(sym) => {
+            let sym_val = *sym;
+            let mut map = PropertyMap::new();
+            map.insert("__wrapped__".into(), JsValue::Symbol(sym_val));
+            map.insert(
+                "valueOf".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::Symbol(sym_val)))),
+            );
+            map.insert(
+                "toString".into(),
+                JsValue::NativeFunction(Rc::new(move |_| {
+                    Ok(JsValue::String(format!("Symbol({})", sym_val)))
+                })),
+            );
+            JsValue::PlainObject(Rc::new(RefCell::new(map)))
+        }
+        // ECMAScript §7.1.18 – BigInt wrapper object.
+        JsValue::BigInt(n) => {
+            let n_val = *n;
+            let mut map = PropertyMap::new();
+            map.insert("__wrapped__".into(), JsValue::BigInt(n_val));
+            map.insert(
+                "valueOf".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::BigInt(n_val)))),
+            );
+            map.insert(
+                "toString".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::String(n_val.to_string())))),
+            );
+            JsValue::PlainObject(Rc::new(RefCell::new(map)))
+        }
+    };
+    ctx.frame.write_reg(dst, wrapped)?;
     Ok(DispatchAction::Continue)
 }
 
