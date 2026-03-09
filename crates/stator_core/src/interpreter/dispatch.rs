@@ -2415,6 +2415,17 @@ fn handle_lda_named_property(
         }
     }
     let prop_name = ctx.frame.get_string_constant(name_idx)?;
+    // TypeError for property access on null or undefined (ES §13.10.3).
+    if matches!(obj, JsValue::Null | JsValue::Undefined) {
+        return Err(StatorError::TypeError(format!(
+            "Cannot read properties of {} (reading '{prop_name}')",
+            if matches!(obj, JsValue::Null) {
+                "null"
+            } else {
+                "undefined"
+            }
+        )));
+    }
     let result = proto_lookup(&obj, &prop_name);
     // ── Populate shape IC for own-property hits on PlainObject ───────────
     if slot != u32::MAX
@@ -2477,6 +2488,17 @@ fn handle_sta_named_property(
     let prop_name = ctx.frame.get_string_constant(name_idx)?;
     let val = ctx.frame.accumulator.clone();
     let obj = ctx.frame.read_reg(obj_v)?.clone();
+    // TypeError for property store on null or undefined.
+    if matches!(obj, JsValue::Null | JsValue::Undefined) {
+        return Err(StatorError::TypeError(format!(
+            "Cannot set properties of {} (setting '{prop_name}')",
+            if matches!(obj, JsValue::Null) {
+                "null"
+            } else {
+                "undefined"
+            }
+        )));
+    }
     match obj {
         JsValue::Proxy(ref p) => {
             let _ = proxy_set(&mut p.borrow_mut(), &prop_name, val)?;
@@ -2565,6 +2587,18 @@ fn handle_lda_keyed_property(
     };
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     let key = ctx.frame.accumulator.clone();
+    // TypeError for property access on null or undefined (ES §13.10.3).
+    if matches!(obj, JsValue::Null | JsValue::Undefined) {
+        let key_str = key.to_js_string().unwrap_or_default();
+        return Err(StatorError::TypeError(format!(
+            "Cannot read properties of {} (reading '{key_str}')",
+            if matches!(obj, JsValue::Null) {
+                "null"
+            } else {
+                "undefined"
+            }
+        )));
+    }
     ctx.frame.accumulator = keyed_load(&obj, &key)?;
     Ok(DispatchAction::Continue)
 }
@@ -2582,6 +2616,18 @@ fn handle_sta_keyed_property(
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     let key = ctx.frame.read_reg(key_v)?.clone();
     let val = ctx.frame.accumulator.clone();
+    // TypeError for property store on null or undefined.
+    if matches!(obj, JsValue::Null | JsValue::Undefined) {
+        let key_str = key.to_js_string().unwrap_or_default();
+        return Err(StatorError::TypeError(format!(
+            "Cannot set properties of {} (setting '{key_str}')",
+            if matches!(obj, JsValue::Null) {
+                "null"
+            } else {
+                "undefined"
+            }
+        )));
+    }
     keyed_store(&obj, &key, val)?;
     // Accumulator stays unchanged.
     Ok(DispatchAction::Continue)
