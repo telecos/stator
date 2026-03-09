@@ -34,7 +34,9 @@ use crate::builtins::date::{
     date_to_locale_date_string, date_to_locale_string, date_to_locale_time_string, date_to_string,
     date_to_time_string, date_to_utc_string, date_utc, date_value_of,
 };
-use crate::builtins::error::{ErrorKind, JsError};
+use crate::builtins::error::{
+    ErrorKind, JsError, error_capture_stack_trace, get_stack_trace_limit,
+};
 use crate::builtins::finalization_registry::{
     finalization_registry_drain, finalization_registry_new, finalization_registry_notify,
     finalization_registry_register, finalization_registry_register_plain,
@@ -402,8 +404,40 @@ fn make_suppressed_error_constructor() -> JsValue {
 }
 
 /// Register all ECMAScript error constructors in the global environment.
+/// Register all ECMAScript error constructors in the global environment.
+///
+/// The `Error` constructor additionally exposes the V8-compatible
+/// `Error.captureStackTrace(target)` and `Error.stackTraceLimit` extensions.
 fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
-    globals.insert("Error".into(), make_error_constructor(ErrorKind::Error));
+    // The `Error` constructor is a PlainObject so it can carry static methods.
+    let mut error_props = PropertyMap::new();
+    error_props.insert("__call__".into(), make_error_constructor(ErrorKind::Error));
+    // V8 extension: Error.captureStackTrace(targetObject [, constructorOpt])
+    error_props.insert(
+        "captureStackTrace".into(),
+        native(|args| {
+            let target = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if let JsValue::Error(e) = target {
+                // Rc::try_unwrap is unlikely to succeed for shared Rcs, so
+                // clone-and-mutate.
+                let mut cloned = (*e).clone();
+                error_capture_stack_trace(&mut cloned, None);
+                Ok(JsValue::Error(Rc::new(cloned)))
+            } else {
+                Ok(JsValue::Undefined)
+            }
+        }),
+    );
+    // V8 extension: Error.stackTraceLimit (getter/setter via property)
+    error_props.insert(
+        "stackTraceLimit".into(),
+        JsValue::Smi(get_stack_trace_limit() as i32),
+    );
+    globals.insert(
+        "Error".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(error_props))),
+    );
+
     globals.insert(
         "TypeError".into(),
         make_error_constructor(ErrorKind::TypeError),
@@ -7409,11 +7443,46 @@ fn make_typed_array_instance(
             }),
         );
     }
+    // toLocaleString()
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "toLocaleString".into(),
+            native(move |_| {
+                Ok(JsValue::String(
+                    typed_array_join(&inner.borrow(), ",")?.into(),
+                ))
+            }),
+        );
+    }
+    // toString()
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "toString".into(),
+            native(move |_| {
+                Ok(JsValue::String(
+                    typed_array_join(&inner.borrow(), ",")?.into(),
+                ))
+            }),
+        );
+    }
     // values()
     {
         let inner = Rc::clone(&inner);
         obj.insert(
             "values".into(),
+            native(move |_| {
+                let items = typed_array_values(&inner.borrow());
+                Ok(JsValue::new_array(items))
+            }),
+        );
+    }
+    // @@iterator — same as values()
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "@@iterator".into(),
             native(move |_| {
                 let items = typed_array_values(&inner.borrow());
                 Ok(JsValue::new_array(items))
@@ -12007,6 +12076,20 @@ mod tests {
     fn e2e_type_error_to_string_empty_message() {
         let result = global_eval(r#"var e = new TypeError(); e.toString()"#).unwrap();
         assert_eq!(result, JsValue::String("TypeError".to_string().into()));
+    }
+
+    /// `Error.captureStackTrace` is accessible as a function.
+    #[test]
+    fn e2e_error_capture_stack_trace_exists() {
+        let result = global_eval("typeof Error.captureStackTrace").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    /// `Error.stackTraceLimit` is a number.
+    #[test]
+    fn e2e_error_stack_trace_limit_exists() {
+        let result = global_eval("typeof Error.stackTraceLimit").unwrap();
+        assert_eq!(result, JsValue::String("number".into()));
     }
 
     /// `new.target` is the constructor when called via `new`.
