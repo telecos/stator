@@ -1103,78 +1103,86 @@ impl Interpreter {
     /// - an unimplemented opcode is encountered, or
     /// - a type error occurs during arithmetic.
     pub fn run(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
-        // Outer loop: re-entered when a TailCall opcode rewrites the frame
-        // with a new bytecode array (proper tail-call trampoline).
-        'tail_call: loop {
-            // Pre-decode the bytecode once and capture byte offsets for jump resolution.
-            let (instructions, byte_offsets) =
-                decode_with_byte_offsets(frame.bytecode_array.bytecodes())?;
-            // Clone the handler table once so the borrow on bytecode_array is released
-            // before we start mutating the frame.
-            let handler_table: Vec<HandlerTableEntry> =
-                frame.bytecode_array.handler_table().to_vec();
+        // Dynamically grow the native stack when headroom drops below 128 KiB.
+        // Allocates a fresh 2 MiB segment via mmap/VirtualAlloc on demand,
+        // preventing SIGSEGV/stack-overflow aborts on deeply recursive JS code
+        // (e.g. Test262 JSON.parse nesting tests).
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+            // Outer loop: re-entered when a TailCall opcode rewrites the frame
+            // with a new bytecode array (proper tail-call trampoline).
+            'tail_call: loop {
+                // Pre-decode the bytecode once and capture byte offsets for jump resolution.
+                let (instructions, byte_offsets) =
+                    decode_with_byte_offsets(frame.bytecode_array.bytecodes())?;
+                // Clone the handler table once so the borrow on bytecode_array is released
+                // before we start mutating the frame.
+                let handler_table: Vec<HandlerTableEntry> =
+                    frame.bytecode_array.handler_table().to_vec();
 
-            loop {
-                // ── CPU profiler checkpoint ────────────────────────────────────
-                crate::inspector::profiler::maybe_record_sample();
+                loop {
+                    // ── CPU profiler checkpoint ────────────────────────────────────
+                    crate::inspector::profiler::maybe_record_sample();
 
-                if frame.pc >= instructions.len() {
-                    return Err(bytecode_end_error());
-                }
-
-                // ── Debug hook (pre-fetch) ─────────────────────────────────────
-                //
-                // Check for breakpoints and step conditions *before* fetching the
-                // next instruction so that the paused frame state reflects what is
-                // *about* to execute (the program counter still points at the
-                // instruction that would fire next).
-                if DEBUG_ATTACHED.with(Cell::get) {
-                    let current_offset = byte_offsets[frame.pc] as u32;
-                    if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
-                        let opt = d.borrow();
-                        opt.as_ref()
-                            .and_then(|rc| rc.borrow_mut().check_pause_at(current_offset))
-                    }) {
-                        return Err(pause_err);
+                    if frame.pc >= instructions.len() {
+                        return Err(bytecode_end_error());
                     }
-                }
 
-                // ── Fetch ──────────────────────────────────────────────────────
-                let instr = &instructions[frame.pc];
-                frame.pc += 1;
-
-                // ── Instruction limit check ────────────────────────────────────
-                if frame.instruction_limit > 0 {
-                    frame.instructions_executed += 1;
-                    if frame.instructions_executed > frame.instruction_limit {
-                        return Err(instruction_limit_error());
-                    }
-                }
-
-                // ── Dispatch (computed-goto table) ─────────────────────────
-                let handler = dispatch::DISPATCH_TABLE[instr.opcode as usize];
-                let mut dctx = dispatch::DispatchContext {
-                    frame,
-                    instructions: &instructions,
-                    byte_offsets: &byte_offsets,
-                    handler_table: &handler_table,
-                };
-                match handler(&mut dctx, instr) {
-                    Ok(action) => match action {
-                        dispatch::DispatchAction::Continue => {}
-                        dispatch::DispatchAction::Return(v) => return Ok(v),
-                        dispatch::DispatchAction::TailCall => continue 'tail_call,
-                    },
-                    Err(e) => {
-                        if let Some(resume_pc) = handle_dispatch_error(&e, frame, &handler_table) {
-                            frame.pc = resume_pc;
-                            continue;
+                    // ── Debug hook (pre-fetch) ─────────────────────────────────────
+                    //
+                    // Check for breakpoints and step conditions *before* fetching the
+                    // next instruction so that the paused frame state reflects what is
+                    // *about* to execute (the program counter still points at the
+                    // instruction that would fire next).
+                    if DEBUG_ATTACHED.with(Cell::get) {
+                        let current_offset = byte_offsets[frame.pc] as u32;
+                        if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
+                            let opt = d.borrow();
+                            opt.as_ref()
+                                .and_then(|rc| rc.borrow_mut().check_pause_at(current_offset))
+                        }) {
+                            return Err(pause_err);
                         }
-                        return Err(e);
+                    }
+
+                    // ── Fetch ──────────────────────────────────────────────────────
+                    let instr = &instructions[frame.pc];
+                    frame.pc += 1;
+
+                    // ── Instruction limit check ────────────────────────────────────
+                    if frame.instruction_limit > 0 {
+                        frame.instructions_executed += 1;
+                        if frame.instructions_executed > frame.instruction_limit {
+                            return Err(instruction_limit_error());
+                        }
+                    }
+
+                    // ── Dispatch (computed-goto table) ─────────────────────────
+                    let handler = dispatch::DISPATCH_TABLE[instr.opcode as usize];
+                    let mut dctx = dispatch::DispatchContext {
+                        frame,
+                        instructions: &instructions,
+                        byte_offsets: &byte_offsets,
+                        handler_table: &handler_table,
+                    };
+                    match handler(&mut dctx, instr) {
+                        Ok(action) => match action {
+                            dispatch::DispatchAction::Continue => {}
+                            dispatch::DispatchAction::Return(v) => return Ok(v),
+                            dispatch::DispatchAction::TailCall => continue 'tail_call,
+                        },
+                        Err(e) => {
+                            if let Some(resume_pc) =
+                                handle_dispatch_error(&e, frame, &handler_table)
+                            {
+                                frame.pc = resume_pc;
+                                continue;
+                            }
+                            return Err(e);
+                        }
                     }
                 }
-            }
-        } // 'tail_call
+            } // 'tail_call
+        }) // stacker::maybe_grow
     }
 
     /// Execute one step of a generator function.
