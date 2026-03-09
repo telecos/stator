@@ -7443,11 +7443,46 @@ fn make_typed_array_instance(
             }),
         );
     }
+    // toLocaleString()
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "toLocaleString".into(),
+            native(move |_| {
+                Ok(JsValue::String(
+                    typed_array_join(&inner.borrow(), ",")?.into(),
+                ))
+            }),
+        );
+    }
+    // toString()
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "toString".into(),
+            native(move |_| {
+                Ok(JsValue::String(
+                    typed_array_join(&inner.borrow(), ",")?.into(),
+                ))
+            }),
+        );
+    }
     // values()
     {
         let inner = Rc::clone(&inner);
         obj.insert(
             "values".into(),
+            native(move |_| {
+                let items = typed_array_values(&inner.borrow());
+                Ok(JsValue::new_array(items))
+            }),
+        );
+    }
+    // @@iterator — same as values()
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "@@iterator".into(),
             native(move |_| {
                 let items = typed_array_values(&inner.borrow());
                 Ok(JsValue::new_array(items))
