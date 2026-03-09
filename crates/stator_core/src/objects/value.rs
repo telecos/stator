@@ -1082,7 +1082,7 @@ fn number_to_string(n: f64) -> String {
 /// octal (`0o`), and binary (`0b`) integer literals, in addition to standard
 /// decimal notation.  Returns `NaN` for strings that are not valid ECMAScript
 /// numeric literals.
-fn string_to_number(s: &str) -> f64 {
+pub(crate) fn string_to_number(s: &str) -> f64 {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return 0.0;

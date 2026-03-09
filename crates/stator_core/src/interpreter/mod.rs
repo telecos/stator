@@ -1637,11 +1637,11 @@ pub(super) fn abstract_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
         (JsValue::String(s), JsValue::BigInt(b)) => s.trim().parse::<i128>() == Ok(*b),
         // String → Number coercion (steps 5/6).
         (JsValue::String(s), _) if rhs.is_number() => {
-            let n: f64 = s.trim().parse().unwrap_or(f64::NAN);
+            let n = crate::objects::value::string_to_number(s);
             abstract_eq(&JsValue::HeapNumber(n), rhs)
         }
         (_, JsValue::String(s)) if lhs.is_number() => {
-            let n: f64 = s.trim().parse().unwrap_or(f64::NAN);
+            let n = crate::objects::value::string_to_number(s);
             abstract_eq(lhs, &JsValue::HeapNumber(n))
         }
         // Object identity — `JsValue::Object` holds a raw `*mut HeapObject`
