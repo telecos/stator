@@ -1067,11 +1067,21 @@ fn ordinary_to_primitive_plain_object(
 
     for name in &method_names {
         let maybe_fn = map.borrow().get(name).cloned();
-        if let Some(JsValue::NativeFunction(f)) = maybe_fn {
-            let result = f(vec![])?;
-            if result.is_primitive() {
-                return Ok(result);
+        match maybe_fn {
+            Some(JsValue::NativeFunction(f)) => {
+                let result = f(vec![])?;
+                if result.is_primitive() {
+                    return Ok(result);
+                }
             }
+            Some(JsValue::Function(ref ba)) => {
+                let mut frame = crate::interpreter::InterpreterFrame::new((**ba).clone(), vec![]);
+                let result = crate::interpreter::Interpreter::run(&mut frame)?;
+                if result.is_primitive() {
+                    return Ok(result);
+                }
+            }
+            _ => {}
         }
     }
 
