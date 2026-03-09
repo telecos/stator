@@ -45,10 +45,12 @@ use crate::objects::value::JsValue;
 
 // ── Type aliases for complex closure signatures ───────────────────────────────
 
-/// A reviver closure: `(key, value) → JsonValue`.
+/// A reviver closure: `(key, value) → Option<JsonValue>`.
 ///
 /// Used by [`json_parse`] to transform each parsed value bottom-up.
-pub type ReviverFn<'a> = &'a dyn Fn(&str, JsonValue) -> StatorResult<JsonValue>;
+/// Returning `None` deletes the property from its parent object; for
+/// array elements, `None` is replaced with [`JsonValue::Null`].
+pub type ReviverFn<'a> = &'a dyn Fn(&str, JsonValue) -> StatorResult<Option<JsonValue>>;
 
 /// A `toJSON` hook closure: `(key, value) → Option<JsonValue>`.
 ///
@@ -236,8 +238,12 @@ pub enum JsonSpace {
 ///
 /// If `reviver` is `Some`, it is called **bottom-up** for every
 /// `(key, value)` pair: the final top-level value is produced by calling
-/// `reviver("", top_level_value)`.  Returning a value from the reviver
-/// replaces the parsed value; this is the standard ECMAScript behaviour.
+/// `reviver("", top_level_value)`.  Returning `Some(value)` from the
+/// reviver replaces the parsed value; returning `None` deletes the
+/// property from its parent object (or replaces the element with
+/// [`JsonValue::Null`] in arrays).  If the root-level reviver returns
+/// `None`, `json_parse` returns [`JsonValue::Null`] (the closest
+/// approximation, since [`JsonValue`] has no `Undefined` variant).
 ///
 /// # Errors
 ///
@@ -273,7 +279,9 @@ pub fn json_parse(text: &str, reviver: Option<ReviverFn<'_>>) -> StatorResult<Js
         )));
     }
     if let Some(rev) = reviver {
-        apply_reviver(value, "", rev)
+        // §25.5.1: if the top-level reviver returns undefined (None),
+        // the closest JSON equivalent is null.
+        Ok(apply_reviver(value, "", rev)?.unwrap_or(JsonValue::Null))
     } else {
         Ok(value)
     }
@@ -714,14 +722,17 @@ impl<'a> Parser<'a> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Recursively applies `reviver` to all nodes in `value`, bottom-up.
+///
+/// Returns `None` when the reviver returns `None` for the current node,
+/// signalling that the caller should delete the property (objects) or
+/// substitute [`JsonValue::Null`] (arrays).
 fn apply_reviver(
     value: JsonValue,
     key: &str,
-    reviver: &dyn Fn(&str, JsonValue) -> StatorResult<JsonValue>,
-) -> StatorResult<JsonValue> {
+    reviver: &dyn Fn(&str, JsonValue) -> StatorResult<Option<JsonValue>>,
+) -> StatorResult<Option<JsonValue>> {
     let transformed = match value {
         JsonValue::Array(ref arr) => {
-            // Replace each element in-place with the reviver result.
             let items: Vec<JsonValue> = {
                 let borrow = arr.borrow();
                 borrow.clone()
@@ -730,7 +741,8 @@ fn apply_reviver(
             for (i, item) in items.into_iter().enumerate() {
                 let idx_str = i.to_string();
                 let revived = apply_reviver(item, &idx_str, reviver)?;
-                new_items.push(revived);
+                // §25.5.1.1: undefined → null for array elements.
+                new_items.push(revived.unwrap_or(JsonValue::Null));
             }
             *arr.borrow_mut() = new_items;
             value
@@ -743,7 +755,10 @@ fn apply_reviver(
             let mut new_pairs = Vec::with_capacity(pairs.len());
             for (k, v) in pairs {
                 let revived = apply_reviver(v, &k, reviver)?;
-                new_pairs.push((k, revived));
+                // §25.5.1.1: undefined → delete the property.
+                if let Some(rv) = revived {
+                    new_pairs.push((k, rv));
+                }
             }
             *obj.borrow_mut() = new_pairs;
             value
@@ -1253,10 +1268,10 @@ mod tests {
         let v = json_parse(
             "[1, 2, 3]",
             Some(&|_key, val| {
-                Ok(match val {
+                Ok(Some(match val {
                     JsonValue::Number(n) => JsonValue::Number(n * 2.0),
                     other => other,
-                })
+                }))
             }),
         )
         .unwrap();
@@ -1265,6 +1280,44 @@ mod tests {
             assert_eq!(b[0], JsonValue::Number(2.0));
             assert_eq!(b[1], JsonValue::Number(4.0));
             assert_eq!(b[2], JsonValue::Number(6.0));
+        } else {
+            panic!("expected array");
+        }
+    }
+
+    #[test]
+    fn test_parse_reviver_deletes_object_property() {
+        let v = json_parse(
+            r#"{"a":1,"b":2,"c":3}"#,
+            Some(&|key, val| {
+                if key == "b" { Ok(None) } else { Ok(Some(val)) }
+            }),
+        )
+        .unwrap();
+        if let JsonValue::Object(obj) = &v {
+            let b = obj.borrow();
+            assert_eq!(b.len(), 2);
+            assert_eq!(b[0], ("a".to_string(), JsonValue::Number(1.0)));
+            assert_eq!(b[1], ("c".to_string(), JsonValue::Number(3.0)));
+        } else {
+            panic!("expected object");
+        }
+    }
+
+    #[test]
+    fn test_parse_reviver_array_undefined_becomes_null() {
+        let v = json_parse(
+            "[1, 2, 3]",
+            Some(&|key, val| {
+                if key == "1" { Ok(None) } else { Ok(Some(val)) }
+            }),
+        )
+        .unwrap();
+        if let JsonValue::Array(arr) = &v {
+            let b = arr.borrow();
+            assert_eq!(b[0], JsonValue::Number(1.0));
+            assert_eq!(b[1], JsonValue::Null);
+            assert_eq!(b[2], JsonValue::Number(3.0));
         } else {
             panic!("expected array");
         }

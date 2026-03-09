@@ -8631,10 +8631,10 @@ mod tests {
         let v = json_parse(
             "[1, 2, 3]",
             Some(&|_key, val| {
-                Ok(match val {
+                Ok(Some(match val {
                     JsonValue::Number(n) => JsonValue::Number(n * 10.0),
                     other => other,
-                })
+                }))
             }),
         )
         .unwrap();
