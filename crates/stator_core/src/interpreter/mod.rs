@@ -961,7 +961,7 @@ impl InterpreterFrame {
 
     /// Map an encoded register-operand value to a flat index into
     /// [`Self::registers`].
-    #[inline]
+    #[inline(always)]
     fn reg_index(&self, v: u32) -> StatorResult<usize> {
         let signed = v as i32;
         if signed >= 0 {
@@ -989,14 +989,14 @@ impl InterpreterFrame {
     }
 
     /// Read the value of the register encoded by operand value `v`.
-    #[inline]
+    #[inline(always)]
     fn read_reg(&self, v: u32) -> StatorResult<&JsValue> {
         let idx = self.reg_index(v)?;
         Ok(&self.registers[idx])
     }
 
     /// Write `value` to the register encoded by operand value `v`.
-    #[inline]
+    #[inline(always)]
     fn write_reg(&mut self, v: u32, value: JsValue) -> StatorResult<()> {
         let idx = self.reg_index(v)?;
         self.registers[idx] = value;
@@ -1006,7 +1006,7 @@ impl InterpreterFrame {
     /// Copy a value from register `src` to register `dst` directly,
     /// avoiding the intermediate borrow that `read_reg` + `write_reg`
     /// would require.
-    #[inline]
+    #[inline(always)]
     fn copy_reg(&mut self, src: u32, dst: u32) -> StatorResult<()> {
         let src_idx = self.reg_index(src)?;
         let dst_idx = self.reg_index(dst)?;
@@ -1072,9 +1072,7 @@ impl Interpreter {
                 crate::inspector::profiler::maybe_record_sample();
 
                 if frame.pc >= instructions.len() {
-                    return Err(StatorError::Internal(
-                        "bytecode ended without a Return instruction".into(),
-                    ));
+                    return Err(bytecode_end_error());
                 }
 
                 // ── Debug hook (pre-fetch) ─────────────────────────────────────
@@ -1102,7 +1100,7 @@ impl Interpreter {
                 if frame.instruction_limit > 0 {
                     frame.instructions_executed += 1;
                     if frame.instructions_executed > frame.instruction_limit {
-                        return Err(StatorError::Internal("instruction limit exceeded".into()));
+                        return Err(instruction_limit_error());
                     }
                 }
 
@@ -1121,26 +1119,9 @@ impl Interpreter {
                         dispatch::DispatchAction::TailCall => continue 'tail_call,
                     },
                     Err(e) => {
-                        // If this is a JS-catchable error and the current
-                        // instruction falls inside a try block, materialise a
-                        // JsValue and jump to the catch/finally handler.
-                        let instr_idx = (frame.pc - 1) as u32;
-                        if let Some(handler_pc) = find_handler(instr_idx, &handler_table) {
-                            // Engine errors (TypeError, etc.) → JsValue::Error.
-                            // JsException from a nested throw → recover the
-                            // original thrown JsValue via the thread-local slot.
-                            let js_val = stator_error_to_js_value(&e).or_else(|| {
-                                if matches!(&e, StatorError::JsException(_)) {
-                                    take_pending_exception()
-                                } else {
-                                    None
-                                }
-                            });
-                            if let Some(val) = js_val {
-                                frame.accumulator = val;
-                                frame.pc = handler_pc;
-                                continue;
-                            }
+                        if let Some(resume_pc) = handle_dispatch_error(&e, frame, &handler_table) {
+                            frame.pc = resume_pc;
+                            continue;
                         }
                         return Err(e);
                     }
@@ -1439,6 +1420,7 @@ pub(super) fn collect_args(
 ///
 /// `instr_count` is `instructions.len()`; only the first `instr_count` entries
 /// of `byte_offsets` are valid instruction starts.
+#[inline]
 pub(super) fn resolve_jump(
     pc_after_jump: usize,
     delta: i32,
@@ -1486,6 +1468,7 @@ pub(super) fn constant_pool_jump_delta(
 /// sequences (`\\`, `\'`, `\"`, `\n`, `\r`, `\t`) are expanded.  Plain
 /// identifier strings (property names, variable names) are stored without
 /// delimiters and are returned as-is.
+#[inline]
 pub(super) fn constant_to_value(entry: &ConstantPoolEntry) -> JsValue {
     match entry {
         ConstantPoolEntry::Number(n) => number_to_jsvalue(*n),
@@ -1575,7 +1558,7 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
     }
     out
 }
-#[inline]
+#[inline(always)]
 pub(super) fn number_to_jsvalue(n: f64) -> JsValue {
     if n.is_finite() && n.fract() == 0.0 && (i32::MIN as f64..=i32::MAX as f64).contains(&n) {
         JsValue::Smi(n as i32)
@@ -1806,6 +1789,46 @@ pub(super) fn err_bad_operand(opcode_name: &'static str, operand_index: usize) -
     ))
 }
 
+/// Error returned when the bytecode stream ends without a `Return`.
+#[cold]
+fn bytecode_end_error() -> StatorError {
+    StatorError::Internal("bytecode ended without a Return instruction".into())
+}
+
+/// Error returned when the per-frame instruction limit is exceeded.
+#[cold]
+fn instruction_limit_error() -> StatorError {
+    StatorError::Internal("instruction limit exceeded".into())
+}
+
+/// Handle a dispatch error on the cold path: look for a JS exception
+/// handler covering the faulting instruction and, if found, store the
+/// error value in the frame accumulator and return the handler PC.
+///
+/// Returns `None` if no handler covers the instruction, meaning the
+/// error should propagate to the caller.
+#[cold]
+fn handle_dispatch_error(
+    e: &StatorError,
+    frame: &mut InterpreterFrame,
+    handler_table: &[HandlerTableEntry],
+) -> Option<usize> {
+    let instr_idx = (frame.pc - 1) as u32;
+    let handler_pc = find_handler(instr_idx, handler_table)?;
+    // Engine errors (TypeError, etc.) → JsValue::Error.
+    // JsException from a nested throw → recover the
+    // original thrown JsValue via the thread-local slot.
+    let js_val = stator_error_to_js_value(e).or_else(|| {
+        if matches!(e, StatorError::JsException(_)) {
+            take_pending_exception()
+        } else {
+            None
+        }
+    })?;
+    frame.accumulator = js_val;
+    Some(handler_pc)
+}
+
 /// Returns `true` if the value is a JS receiver (an object-like type, not a
 /// primitive, null, or undefined).
 pub(super) fn is_js_receiver(value: &JsValue) -> bool {
@@ -2020,6 +2043,7 @@ pub(super) fn restore_closure_context(
 /// message).  All other values are converted via [`JsValue::to_js_string`];
 /// when that conversion itself fails the debug representation is used instead.
 #[allow(dead_code)]
+#[cold]
 pub(super) fn error_message_from_value(value: &JsValue) -> String {
     match value {
         JsValue::Error(e) => e.to_error_string(),
@@ -2037,6 +2061,7 @@ pub(super) fn error_message_from_value(value: &JsValue) -> String {
 /// (e.g. `OutOfMemory`, `Internal`, `JsException`, `DebuggerPaused`), which
 /// should propagate to the caller rather than being caught by a JS `catch`
 /// block.
+#[cold]
 pub(super) fn stator_error_to_js_value(err: &StatorError) -> Option<JsValue> {
     use crate::builtins::error::{ErrorKind, JsError};
 
