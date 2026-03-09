@@ -1633,6 +1633,26 @@ pub(super) fn abstract_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
         // Object identity — `JsValue::Object` holds a raw `*mut HeapObject`
         // pointer; comparing the pointer values gives reference identity.
         (JsValue::Object(a), JsValue::Object(b)) => std::ptr::eq(*a, *b),
+        // PlainObject, Array, Function identity — Rc pointer comparison.
+        (JsValue::PlainObject(a), JsValue::PlainObject(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Array(a), JsValue::Array(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Function(a), JsValue::Function(b)) => Rc::ptr_eq(a, b),
+        (JsValue::NativeFunction(a), JsValue::NativeFunction(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Error(a), JsValue::Error(b)) => Rc::ptr_eq(a, b),
+        // Object == primitive → ToPrimitive(Object, default) then compare
+        // (ECMAScript §7.2.14 steps 12/13).
+        (lhs_val, rhs_val) if !lhs_val.is_primitive() && rhs_val.is_primitive() => {
+            match lhs_val.to_primitive(crate::objects::value::ToPrimitiveHint::Default) {
+                Ok(prim) => abstract_eq(&prim, rhs_val),
+                Err(_) => false,
+            }
+        }
+        (lhs_val, rhs_val) if lhs_val.is_primitive() && !rhs_val.is_primitive() => {
+            match rhs_val.to_primitive(crate::objects::value::ToPrimitiveHint::Default) {
+                Ok(prim) => abstract_eq(lhs_val, &prim),
+                Err(_) => false,
+            }
+        }
         _ => false,
     }
 }
@@ -1650,9 +1670,15 @@ pub(super) fn strict_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
         (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => a == b,
         (JsValue::Smi(a), JsValue::HeapNumber(b)) => (*a as f64) == *b,
         (JsValue::HeapNumber(a), JsValue::Smi(b)) => *a == (*b as f64),
-        // Object identity — `JsValue::Object` holds a raw `*mut HeapObject`
-        // pointer; comparing the pointer values gives reference identity.
+        // Object identity — pointer comparison for all object-like types.
         (JsValue::Object(a), JsValue::Object(b)) => std::ptr::eq(*a, *b),
+        (JsValue::PlainObject(a), JsValue::PlainObject(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Array(a), JsValue::Array(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Function(a), JsValue::Function(b)) => Rc::ptr_eq(a, b),
+        (JsValue::NativeFunction(a), JsValue::NativeFunction(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Error(a), JsValue::Error(b)) => Rc::ptr_eq(a, b),
+        (JsValue::Promise(a), JsValue::Promise(b)) => a == b,
+        (JsValue::Proxy(a), JsValue::Proxy(b)) => Rc::ptr_eq(a, b),
         _ => false,
     }
 }

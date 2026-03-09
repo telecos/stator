@@ -2277,10 +2277,7 @@ fn handle_iterator_next(
                     let result = dispatch_call_value(f, vec![])?;
                     match result {
                         JsValue::PlainObject(ref res_map) => {
-                            let done = res_map
-                                .borrow()
-                                .get("done")
-                                .is_some_and(|d| d.to_boolean());
+                            let done = res_map.borrow().get("done").is_some_and(|d| d.to_boolean());
                             let value = res_map
                                 .borrow()
                                 .get("value")
