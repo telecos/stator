@@ -14,14 +14,14 @@ use crate::objects::property_map::PropertyMap;
 
 use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
-    TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, constant_pool_jump_delta,
-    constant_to_value, decode_string_constant, dispatch_call_property, dispatch_call_with_this,
-    dispatch_setter, err_bad_operand, error_message_from_value, extract_context, find_handler,
-    fn_props_set, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
-    maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, number_to_jsvalue,
-    plain_object_to_array_items, proto_lookup, resolve_jump, restore_closure_context,
-    set_pending_exception, strict_eq, to_array_index, to_bigint, to_property_key,
-    try_execute_best_jit, walk_context_chain, wire_construct_prototype,
+    PropertyIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, concat_rc_strs,
+    constant_pool_jump_delta, constant_to_value, decode_string_constant, dispatch_call_property,
+    dispatch_call_with_this, dispatch_setter, err_bad_operand, error_message_from_value,
+    extract_context, find_handler, fn_props_set, is_js_receiver, js_add, js_less_than, keyed_load,
+    keyed_store, maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan,
+    number_to_jsvalue, plain_object_to_array_items, proto_lookup, resolve_jump,
+    restore_closure_context, set_pending_exception, strict_eq, to_array_index, to_bigint,
+    to_property_key, try_execute_best_jit, walk_context_chain, wire_construct_prototype,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{proxy_delete_property, proxy_has, proxy_set};
@@ -32,7 +32,8 @@ use crate::bytecode::bytecode_array::{
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
 use crate::error::{StatorError, StatorResult};
 use crate::objects::value::{
-    GeneratorState, GeneratorStatus, GeneratorStep, JsContext, JsValue, NativeIterator,
+    GeneratorResumeMode, GeneratorState, GeneratorStatus, GeneratorStep, JsContext, JsValue,
+    NativeIterator,
 };
 
 /// Result of executing a single opcode handler.
@@ -189,6 +190,19 @@ fn handle_add(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
             Some(r) => JsValue::Smi(r),
             None => JsValue::HeapNumber(a as f64 + *b as f64),
         };
+        return Ok(DispatchAction::Continue);
+    }
+    // Fast path: String + String – skip to_js_string conversion.
+    if let JsValue::String(ref a) = ctx.frame.accumulator
+        && let JsValue::String(b) = rhs
+    {
+        let total = a.len().saturating_add(b.len());
+        if total > crate::builtins::string::MAX_STRING_LEN {
+            return Err(crate::error::StatorError::RangeError(
+                "Invalid string length".into(),
+            ));
+        }
+        ctx.frame.accumulator = concat_rc_strs(a, b);
         return Ok(DispatchAction::Continue);
     }
     let rhs = rhs.cheap_clone();
@@ -1299,6 +1313,8 @@ fn handle_tail_call(
                     ctx.frame.string_cache.clear();
                     ctx.frame.mono_load_cache.clear();
                     ctx.frame.poly_load_cache.clear();
+                    ctx.frame.shape_load_ic.clear();
+                    ctx.frame.shape_store_ic.clear();
                     return Ok(DispatchAction::TailCall);
                 }
             }
@@ -2364,6 +2380,21 @@ fn handle_lda_named_property(
         u32::MAX
     };
     let obj = ctx.frame.read_reg(obj_v)?.clone();
+    // ── Shape IC fast path: O(1) own-property access via cached offset ──
+    if slot != u32::MAX
+        && let JsValue::PlainObject(ref map) = obj
+        && let Some(ic) = ctx.frame.shape_load_ic.get(&slot)
+    {
+        let pm = map.borrow();
+        if pm.shape_id() == ic.cached_shape
+            && let Some(val) = pm.get_by_offset(ic.cached_offset)
+        {
+            let v = val.clone();
+            drop(pm);
+            ctx.frame.accumulator = v;
+            return Ok(DispatchAction::Continue);
+        }
+    }
     // Polymorphic cache: check if any cached entry matches by pointer identity.
     if slot != u32::MAX {
         let obj_ptr = match &obj {
@@ -2385,6 +2416,21 @@ fn handle_lda_named_property(
     }
     let prop_name = ctx.frame.get_string_constant(name_idx)?;
     let result = proto_lookup(&obj, &prop_name);
+    // ── Populate shape IC for own-property hits on PlainObject ───────────
+    if slot != u32::MAX
+        && let JsValue::PlainObject(ref map) = obj
+    {
+        let pm = map.borrow();
+        if let Some(offset) = pm.offset_of(&prop_name) {
+            ctx.frame.shape_load_ic.insert(
+                slot,
+                PropertyIc {
+                    cached_shape: pm.shape_id(),
+                    cached_offset: offset,
+                },
+            );
+        }
+    }
     // Update polymorphic cache (up to 4 entries per slot).
     if slot != u32::MAX {
         let obj_ptr = match &obj {
@@ -2423,6 +2469,11 @@ fn handle_sta_named_property(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
         return Err(err_bad_operand("StaNamedProperty", 1));
     };
+    let slot = if let Operand::FeedbackSlot(s) = instr.operands[2] {
+        s
+    } else {
+        u32::MAX
+    };
     let prop_name = ctx.frame.get_string_constant(name_idx)?;
     let val = ctx.frame.accumulator.clone();
     let obj = ctx.frame.read_reg(obj_v)?.clone();
@@ -2431,6 +2482,30 @@ fn handle_sta_named_property(
             let _ = proxy_set(&mut p.borrow_mut(), &prop_name, val)?;
         }
         JsValue::PlainObject(ref map) => {
+            // ── Shape IC fast path for store: existing writable property ─
+            if slot != u32::MAX
+                && let Some(ic) = ctx.frame.shape_store_ic.get(&slot)
+            {
+                let pm = map.borrow();
+                if pm.shape_id() == ic.cached_shape {
+                    if pm.is_writable_by_offset(ic.cached_offset) {
+                        drop(pm);
+                        map.borrow_mut().set_by_offset(ic.cached_offset, val);
+                        // Invalidate value-based caches for this object.
+                        let map_ptr = Rc::as_ptr(map) as usize;
+                        ctx.frame
+                            .mono_load_cache
+                            .retain(|_, (ptr, _)| *ptr != map_ptr);
+                        ctx.frame.poly_load_cache.retain(|_, entries| {
+                            entries.retain(|(ptr, _)| *ptr != map_ptr);
+                            !entries.is_empty()
+                        });
+                        return Ok(DispatchAction::Continue);
+                    }
+                    // Non-writable: silently ignore (sloppy mode).
+                    return Ok(DispatchAction::Continue);
+                }
+            }
             // Check for setter accessor first.
             let setter_key = format!("__set_{prop_name}__");
             let setter = map.borrow().get(&setter_key).cloned();
@@ -2445,7 +2520,20 @@ fn handle_sta_named_property(
             }
             drop(pm);
             map.borrow_mut().insert(prop_name.to_string(), val);
-            // Invalidate caches entries for this object.
+            // Populate shape store IC for future fast-path stores.
+            if slot != u32::MAX {
+                let pm = map.borrow();
+                if let Some(offset) = pm.offset_of(&prop_name) {
+                    ctx.frame.shape_store_ic.insert(
+                        slot,
+                        PropertyIc {
+                            cached_shape: pm.shape_id(),
+                            cached_offset: offset,
+                        },
+                    );
+                }
+            }
+            // Invalidate value-based caches for this object.
             let map_ptr = Rc::as_ptr(map) as usize;
             ctx.frame
                 .mono_load_cache
@@ -2711,6 +2799,7 @@ fn handle_resume_generator(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
+    let mut throw_val: Option<JsValue> = None;
     if let Some(gs_rc) = ctx.frame.generator_state.as_ref() {
         let mut gs = gs_rc.borrow_mut();
         // Restore the saved registers into the ctx.frame.
@@ -2721,6 +2810,20 @@ fn handle_resume_generator(
         let count = gs.registers.len().min(ctx.frame.registers.len());
         ctx.frame.registers[..count].clone_from_slice(&gs.registers[..count]);
         gs.status = GeneratorStatus::Executing;
+        // Check if we need to throw at the yield point.
+        if let GeneratorResumeMode::Throw(val) =
+            std::mem::replace(&mut gs.resume_mode, GeneratorResumeMode::Normal)
+        {
+            throw_val = Some(val);
+        }
+    }
+    if let Some(val) = throw_val {
+        // Trigger exception propagation — the interpreter's error handling
+        // will consult the handler table and jump to any active catch block.
+        ctx.frame.accumulator = val.clone();
+        set_pending_exception(val.clone());
+        let msg = error_message_from_value(&val);
+        return Err(StatorError::JsException(msg));
     }
     // Accumulator keeps the resume value supplied by run_generator_step.
     Ok(DispatchAction::Continue)

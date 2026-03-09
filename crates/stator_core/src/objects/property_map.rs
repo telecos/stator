@@ -26,9 +26,14 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::objects::map::PropertyAttributes;
 use crate::objects::value::JsValue;
+
+/// Global monotonically-increasing counter used to assign unique shape
+/// identifiers to each [`PropertyMap`] structural configuration.
+static NEXT_SHAPE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Default attributes for properties created by ordinary JS assignment:
 /// writable, enumerable, and configurable.
@@ -104,6 +109,9 @@ pub struct PropertyMap {
     cache_len: Cell<u8>,
     /// Circular replacement cursor into the cache arrays.
     cache_cursor: Cell<u8>,
+    /// Shape identifier — a monotonically-increasing stamp that changes on
+    /// every structural mutation (property add/remove or attribute change).
+    shape_id: u64,
 }
 
 impl PartialEq for PropertyMap {
@@ -127,6 +135,7 @@ impl PropertyMap {
             cache_slots: Default::default(),
             cache_len: Cell::new(0),
             cache_cursor: Cell::new(0),
+            shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -141,6 +150,7 @@ impl PropertyMap {
             cache_slots: Default::default(),
             cache_len: Cell::new(0),
             cache_cursor: Cell::new(0),
+            shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -187,6 +197,67 @@ impl PropertyMap {
     fn cache_invalidate(&self) {
         self.cache_len.set(0);
         self.cache_cursor.set(0);
+    }
+
+    /// Assigns a fresh shape identifier, signalling that the structural layout
+    /// (set of property names or their attribute flags) has changed.
+    #[inline]
+    fn bump_shape_id(&mut self) {
+        self.shape_id = NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── Shape / offset API ───────────────────────────────────────────────
+
+    /// Returns the current shape identifier.
+    ///
+    /// The value changes on every structural mutation (property add, remove,
+    /// or attribute change) but is stable across value-only updates.
+    #[inline]
+    pub fn shape_id(&self) -> u64 {
+        self.shape_id
+    }
+
+    /// Returns the slot index (offset) for `key`, or `None` if absent.
+    ///
+    /// The offset is valid as long as `shape_id()` does not change.
+    #[inline]
+    pub fn offset_of(&self, key: &str) -> Option<usize> {
+        self.index.get(key).copied()
+    }
+
+    /// Returns the value at a raw slot offset.
+    ///
+    /// # Safety contract (logical)
+    ///
+    /// The caller must ensure that `offset` was obtained from
+    /// [`offset_of`](Self::offset_of) while `shape_id()` has not changed
+    /// since.
+    #[inline]
+    pub fn get_by_offset(&self, offset: usize) -> Option<&JsValue> {
+        self.values.get(offset)
+    }
+
+    /// Overwrites the value at a raw slot offset, returning `true` on
+    /// success.
+    ///
+    /// The same validity constraint as [`get_by_offset`](Self::get_by_offset)
+    /// applies.
+    #[inline]
+    pub fn set_by_offset(&mut self, offset: usize, value: JsValue) -> bool {
+        if let Some(slot) = self.values.get_mut(offset) {
+            *slot = value;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns `true` if the property at `offset` has the `WRITABLE` flag.
+    #[inline]
+    pub fn is_writable_by_offset(&self, offset: usize) -> bool {
+        self.attrs
+            .get(offset)
+            .is_some_and(|a| a.contains(PropertyAttributes::WRITABLE))
     }
 
     // ── ECMAScript enumeration-order helpers ──────────────────────────────
@@ -275,6 +346,7 @@ impl PropertyMap {
             self.keys.insert(pos, key);
             self.values.insert(pos, value);
             self.attrs.insert(pos, DEFAULT_ATTRS);
+            self.bump_shape_id();
             if pos != self.keys.len() - 1 {
                 self.cache_invalidate();
             }
@@ -297,6 +369,7 @@ impl PropertyMap {
                     *idx -= 1;
                 }
             }
+            self.bump_shape_id();
             self.cache_invalidate();
             Some(val)
         } else {
@@ -352,6 +425,7 @@ impl PropertyMap {
             self.keys.insert(pos, key);
             self.values.insert(pos, value);
             self.attrs.insert(pos, attrs);
+            self.bump_shape_id();
             if pos != self.keys.len() - 1 {
                 self.cache_invalidate();
             }
@@ -363,6 +437,7 @@ impl PropertyMap {
     pub fn set_attrs(&mut self, key: &str, attrs: PropertyAttributes) -> bool {
         if let Some(&i) = self.index.get(key) {
             self.attrs[i] = attrs;
+            self.bump_shape_id();
             true
         } else {
             false
@@ -409,6 +484,7 @@ impl PropertyMap {
             } else {
                 self.attrs[i].remove(PropertyAttributes::WRITABLE);
             }
+            self.bump_shape_id();
         }
     }
 
@@ -420,6 +496,7 @@ impl PropertyMap {
             } else {
                 self.attrs[i].remove(PropertyAttributes::ENUMERABLE);
             }
+            self.bump_shape_id();
         }
     }
 
@@ -431,6 +508,7 @@ impl PropertyMap {
             } else {
                 self.attrs[i].remove(PropertyAttributes::CONFIGURABLE);
             }
+            self.bump_shape_id();
         }
     }
 
@@ -831,5 +909,89 @@ mod tests {
         let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
         assert_eq!(keys, vec!["1", "a"]);
         assert_eq!(pm.get("1"), Some(&JsValue::Smi(99)));
+    }
+
+    // ── Shape ID / offset API tests ──────────────────────────────────────
+
+    #[test]
+    fn test_shape_id_stable_on_value_update() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        let id_after_insert = pm.shape_id();
+        // Updating an existing value does not change the shape.
+        pm.insert("x".to_string(), JsValue::Smi(2));
+        assert_eq!(pm.shape_id(), id_after_insert);
+    }
+
+    #[test]
+    fn test_shape_id_changes_on_new_property() {
+        let mut pm = PropertyMap::new();
+        let id0 = pm.shape_id();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        assert_ne!(pm.shape_id(), id0);
+    }
+
+    #[test]
+    fn test_shape_id_changes_on_remove() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        let id1 = pm.shape_id();
+        pm.remove("x");
+        assert_ne!(pm.shape_id(), id1);
+    }
+
+    #[test]
+    fn test_shape_id_changes_on_attr_change() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        let id1 = pm.shape_id();
+        pm.set_writable("x", false);
+        assert_ne!(pm.shape_id(), id1);
+    }
+
+    #[test]
+    fn test_offset_of_and_get_by_offset() {
+        let mut pm = PropertyMap::new();
+        pm.insert("a".to_string(), JsValue::Smi(10));
+        pm.insert("b".to_string(), JsValue::Smi(20));
+        let off_a = pm.offset_of("a").unwrap();
+        let off_b = pm.offset_of("b").unwrap();
+        assert_eq!(pm.get_by_offset(off_a), Some(&JsValue::Smi(10)));
+        assert_eq!(pm.get_by_offset(off_b), Some(&JsValue::Smi(20)));
+        assert!(pm.offset_of("missing").is_none());
+        assert!(pm.get_by_offset(999).is_none());
+    }
+
+    #[test]
+    fn test_set_by_offset() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        let off = pm.offset_of("x").unwrap();
+        assert!(pm.set_by_offset(off, JsValue::Smi(42)));
+        assert_eq!(pm.get("x"), Some(&JsValue::Smi(42)));
+        assert!(!pm.set_by_offset(999, JsValue::Null));
+    }
+
+    #[test]
+    fn test_is_writable_by_offset() {
+        let mut pm = PropertyMap::new();
+        pm.insert("w".to_string(), JsValue::Smi(1));
+        pm.insert_with_attrs(
+            "ro".to_string(),
+            JsValue::Smi(2),
+            PropertyAttributes::ENUMERABLE,
+        );
+        let off_w = pm.offset_of("w").unwrap();
+        let off_ro = pm.offset_of("ro").unwrap();
+        assert!(pm.is_writable_by_offset(off_w));
+        assert!(!pm.is_writable_by_offset(off_ro));
+        assert!(!pm.is_writable_by_offset(999));
+    }
+
+    #[test]
+    fn test_unique_shape_ids_across_maps() {
+        let pm1 = PropertyMap::new();
+        let pm2 = PropertyMap::new();
+        assert_ne!(pm1.shape_id(), pm2.shape_id());
     }
 }
