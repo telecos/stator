@@ -4896,6 +4896,24 @@ fn make_string() -> JsValue {
         }),
     );
 
+    // trimLeft() — §B.2.3.1 legacy alias for trimStart
+    proto.insert(
+        "trimLeft".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_trim_start(&s).into()))
+        }),
+    );
+
+    // trimRight() — §B.2.3.2 legacy alias for trimEnd
+    proto.insert(
+        "trimRight".into(),
+        native(|args| {
+            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            Ok(JsValue::String(string_trim_end(&s).into()))
+        }),
+    );
+
     // split(separator?, limit?)
     proto.insert(
         "split".into(),
@@ -12032,5 +12050,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::String("aX bX cX".into()));
+    }
+
+    // ── trimLeft / trimRight aliases ─────────────────────────────────────
+
+    /// `trimLeft` is a legacy alias for `trimStart`.
+    #[test]
+    fn test_string_trim_left_alias() {
+        let proto = string_proto();
+        let result = call_string_method(
+            &proto,
+            "trimLeft",
+            vec![JsValue::String("  hello  ".into())],
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("hello  ".into()));
+    }
+
+    /// `trimRight` is a legacy alias for `trimEnd`.
+    #[test]
+    fn test_string_trim_right_alias() {
+        let proto = string_proto();
+        let result = call_string_method(
+            &proto,
+            "trimRight",
+            vec![JsValue::String("  hello  ".into())],
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("  hello".into()));
     }
 }
