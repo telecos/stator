@@ -837,7 +837,7 @@ fn main() {
     // pathological test inputs from overflowing the default 8 MB stack.
     let builder = std::thread::Builder::new()
         .name("test262-main".into())
-        .stack_size(64 * 1024 * 1024); // 64 MB
+        .stack_size(128 * 1024 * 1024); // 128 MiB
     let handler = builder
         .spawn(main_inner)
         .expect("failed to spawn main thread");

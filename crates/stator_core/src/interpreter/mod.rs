@@ -3748,8 +3748,11 @@ pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) ->
 pub(super) fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult<JsValue> {
     match callee {
         JsValue::Function(ba) => {
+            push_call_frame("<anonymous>")?;
             let mut frame = InterpreterFrame::new((**ba).clone(), args);
-            Interpreter::run(&mut frame)
+            let result = Interpreter::run(&mut frame);
+            pop_call_frame();
+            result
         }
         JsValue::NativeFunction(f) => f(args),
         _ => Ok(JsValue::Undefined),
@@ -3767,12 +3770,15 @@ pub(super) fn dispatch_call_with_this(
 ) -> StatorResult<JsValue> {
     match callee {
         JsValue::Function(ba) => {
+            push_call_frame("<anonymous>")?;
             let mut frame = InterpreterFrame::new((**ba).clone(), args);
             frame
                 .global_env
                 .borrow_mut()
                 .insert("this".to_string(), this_val);
-            Interpreter::run(&mut frame)
+            let result = Interpreter::run(&mut frame);
+            pop_call_frame();
+            result
         }
         JsValue::NativeFunction(f) => f(args),
         _ => Ok(JsValue::Undefined),

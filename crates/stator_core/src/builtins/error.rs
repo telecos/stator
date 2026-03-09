@@ -84,10 +84,10 @@ thread_local! {
 /// This value is intentionally conservative.  Each recursive call to the
 /// interpreter's `run` function consumes a significant amount of native stack
 /// space (several kilobytes) due to the large opcode-dispatch match statement.
-/// With a 128 MiB thread stack (as used by the Test262 runner) a limit of 512
+/// With a 128 MiB thread stack (as used by the Test262 runner) a limit of 256
 /// keeps native stack consumption safely under control even if each frame uses
-/// ~64 KiB, leaving ample headroom for unwinding.
-pub const MAX_CALL_STACK_DEPTH: usize = 512;
+/// ~100 KiB, leaving ample headroom for unwinding.
+pub const MAX_CALL_STACK_DEPTH: usize = 256;
 
 /// Push a frame name onto the thread-local call stack.
 ///
