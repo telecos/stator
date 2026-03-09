@@ -1493,8 +1493,8 @@ mod tests {
     #[test]
     fn test_array_join_custom_separator() {
         let arr = array_of(&[
-            JsValue::String("a".to_string()),
-            JsValue::String("b".to_string()),
+            JsValue::String("a".to_string().into()),
+            JsValue::String("b".to_string().into()),
         ]);
         assert_eq!(array_join(&arr, Some("-")).unwrap(), "a-b");
     }

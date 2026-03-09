@@ -62,7 +62,7 @@ pub(super) type OpcodeHandler =
     fn(&mut DispatchContext, &Instruction) -> StatorResult<DispatchAction>;
 
 /// Number of opcode variants (= `Opcode::Illegal as usize + 1`).
-const OPCODE_COUNT: usize = 191;
+const OPCODE_COUNT: usize = 192;
 
 fn handle_lda_zero(
     ctx: &mut DispatchContext,
@@ -85,6 +85,14 @@ fn handle_lda_undefined(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     ctx.frame.accumulator = JsValue::Undefined;
+    Ok(DispatchAction::Continue)
+}
+
+fn handle_lda_the_hole(
+    ctx: &mut DispatchContext,
+    _instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    ctx.frame.accumulator = JsValue::TheHole;
     Ok(DispatchAction::Continue)
 }
 
@@ -2124,6 +2132,9 @@ fn handle_sta_named_property(
         JsValue::Function(ref ba) => {
             fn_props_set(ba, prop_name.to_string(), val);
         }
+        JsValue::Error(ref e) => {
+            e.props.borrow_mut().insert(prop_name.to_string(), val);
+        }
         _ => {}
     }
     // Accumulator stays unchanged: the assignment's completion
@@ -2221,7 +2232,21 @@ fn handle_get_async_iterator(
         }
         JsValue::String(ref s) => JsValue::Iterator(NativeIterator::from_string(s)),
         JsValue::Generator(_) | JsValue::Iterator(_) => iterable,
-        // PlainObject with @@iterator → call it to get the iterator.
+        // PlainObject with @@asyncIterator → call it first (§27.1.4.2).
+        JsValue::PlainObject(ref map) if map.borrow().contains_key("@@asyncIterator") => {
+            let iter_fn = map.borrow().get("@@asyncIterator").cloned();
+            match iter_fn {
+                Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
+                    dispatch_call_value(f, vec![])?
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "GetAsyncIterator: @@asyncIterator is not a function".into(),
+                    ));
+                }
+            }
+        }
+        // Fall back to @@iterator (sync iterator wrapped for async).
         JsValue::PlainObject(ref map) if map.borrow().contains_key("@@iterator") => {
             let iter_fn = map.borrow().get("@@iterator").cloned();
             match iter_fn {
@@ -2430,7 +2455,7 @@ fn handle_debugger(
 
 fn handle_type_of(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<DispatchAction> {
     let type_str = match &ctx.frame.accumulator {
-        JsValue::Undefined => "undefined",
+        JsValue::Undefined | JsValue::TheHole => "undefined",
         JsValue::Null => "object",
         JsValue::Boolean(_) => "boolean",
         JsValue::Smi(_) | JsValue::HeapNumber(_) => "number",
@@ -2445,10 +2470,17 @@ fn handle_type_of(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResu
         JsValue::Iterator(_) => "object",
         JsValue::Promise(_) => "object",
         JsValue::Context(_) => "object",
-        JsValue::Proxy(_) => "object",
+        JsValue::Proxy(p) => {
+            let proxy = p.borrow();
+            if proxy.is_callable() {
+                "function"
+            } else {
+                "object"
+            }
+        }
         JsValue::ArrayBuffer(_) | JsValue::TypedArray(_) | JsValue::DataView(_) => "object",
     };
-    ctx.frame.accumulator = JsValue::String(type_str.to_owned());
+    ctx.frame.accumulator = JsValue::String(type_str.to_owned().into());
     Ok(DispatchAction::Continue)
 }
 
@@ -2469,22 +2501,23 @@ fn handle_test_type_of(
         3 => matches!(ctx.frame.accumulator, JsValue::Boolean(_)),
         4 => matches!(ctx.frame.accumulator, JsValue::BigInt(_)),
         5 => matches!(ctx.frame.accumulator, JsValue::Undefined),
-        6 => matches!(
-            ctx.frame.accumulator,
-            JsValue::Function(_) | JsValue::NativeFunction(_)
-        ),
-        7 => matches!(
-            ctx.frame.accumulator,
+        6 => match &ctx.frame.accumulator {
+            JsValue::Function(_) | JsValue::NativeFunction(_) => true,
+            JsValue::Proxy(p) => p.borrow().is_callable(),
+            _ => false,
+        },
+        7 => match &ctx.frame.accumulator {
             JsValue::Null
-                | JsValue::Object(_)
-                | JsValue::Array(_)
-                | JsValue::PlainObject(_)
-                | JsValue::Error(_)
-                | JsValue::Generator(_)
-                | JsValue::Iterator(_)
-                | JsValue::Promise(_)
-                | JsValue::Proxy(_)
-        ),
+            | JsValue::Object(_)
+            | JsValue::Array(_)
+            | JsValue::PlainObject(_)
+            | JsValue::Error(_)
+            | JsValue::Generator(_)
+            | JsValue::Iterator(_)
+            | JsValue::Promise(_) => true,
+            JsValue::Proxy(p) => !p.borrow().is_callable(),
+            _ => false,
+        },
         _ => false,
     };
     ctx.frame.accumulator = JsValue::Boolean(matches_type);
@@ -2506,7 +2539,7 @@ fn handle_to_string(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     let s = ctx.frame.accumulator.to_js_string()?;
-    ctx.frame.accumulator = JsValue::String(s);
+    ctx.frame.accumulator = JsValue::String(s.into());
     Ok(DispatchAction::Continue)
 }
 
@@ -2528,19 +2561,136 @@ fn handle_to_object(
     let Operand::Register(dst) = instr.operands[0] else {
         return Err(err_bad_operand("ToObject", 0));
     };
-    match &ctx.frame.accumulator {
-        JsValue::Null | JsValue::Undefined => {
+    let wrapped = match &ctx.frame.accumulator {
+        JsValue::Null | JsValue::Undefined | JsValue::TheHole => {
             return Err(StatorError::TypeError(
                 "Cannot convert undefined or null to object".to_string(),
             ));
         }
-        _ => {
-            // Objects/arrays stay as-is; primitives would need
-            // wrapper objects (not yet implemented).
-            let val = ctx.frame.accumulator.clone();
-            ctx.frame.write_reg(dst, val)?;
+        // Objects, arrays, and other reference types stay as-is.
+        JsValue::PlainObject(_)
+        | JsValue::Array(_)
+        | JsValue::Function(_)
+        | JsValue::NativeFunction(_)
+        | JsValue::Promise(_)
+        | JsValue::Generator(_)
+        | JsValue::Error(_)
+        | JsValue::Proxy(_)
+        | JsValue::Object(_)
+        | JsValue::Context(_)
+        | JsValue::Iterator(_)
+        | JsValue::ArrayBuffer(_)
+        | JsValue::TypedArray(_)
+        | JsValue::DataView(_) => ctx.frame.accumulator.clone(),
+        // ECMAScript §7.1.18 – Boolean wrapper object.
+        JsValue::Boolean(b) => {
+            let b_val = *b;
+            let mut map = PropertyMap::new();
+            map.insert("__wrapped__".into(), JsValue::Boolean(b_val));
+            map.insert(
+                "valueOf".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::Boolean(b_val)))),
+            );
+            map.insert(
+                "toString".into(),
+                JsValue::NativeFunction(Rc::new(move |_| {
+                    Ok(JsValue::String(if b_val { "true" } else { "false" }.into()))
+                })),
+            );
+            JsValue::PlainObject(Rc::new(RefCell::new(map)))
         }
-    }
+        // ECMAScript §7.1.18 – Number wrapper object (Smi).
+        JsValue::Smi(n) => {
+            let n_val = *n;
+            let mut map = PropertyMap::new();
+            map.insert("__wrapped__".into(), JsValue::Smi(n_val));
+            map.insert(
+                "valueOf".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::Smi(n_val)))),
+            );
+            map.insert(
+                "toString".into(),
+                JsValue::NativeFunction(Rc::new(move |_| {
+                    Ok(JsValue::String(n_val.to_string().into()))
+                })),
+            );
+            JsValue::PlainObject(Rc::new(RefCell::new(map)))
+        }
+        // ECMAScript §7.1.18 – Number wrapper object (HeapNumber).
+        JsValue::HeapNumber(n) => {
+            let n_val = *n;
+            let mut map = PropertyMap::new();
+            map.insert("__wrapped__".into(), JsValue::HeapNumber(n_val));
+            map.insert(
+                "valueOf".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::HeapNumber(n_val)))),
+            );
+            map.insert(
+                "toString".into(),
+                JsValue::NativeFunction(Rc::new(move |_| {
+                    Ok(JsValue::String(n_val.to_string().into()))
+                })),
+            );
+            JsValue::PlainObject(Rc::new(RefCell::new(map)))
+        }
+        // ECMAScript §7.1.18 – String wrapper object with length and indexed access.
+        JsValue::String(s) => {
+            let s_val = s.clone();
+            let mut map = PropertyMap::new();
+            map.insert("__wrapped__".into(), JsValue::String(s_val.clone()));
+            map.insert("length".into(), JsValue::Smi(s_val.len() as i32));
+            // Indexed character access ("0", "1", …).
+            for (i, ch) in s_val.chars().enumerate() {
+                map.insert(i.to_string(), JsValue::String(ch.to_string().into()));
+            }
+            let s_vo = s_val.clone();
+            map.insert(
+                "valueOf".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::String(s_vo.clone())))),
+            );
+            let s_ts = s_val;
+            map.insert(
+                "toString".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::String(s_ts.clone())))),
+            );
+            JsValue::PlainObject(Rc::new(RefCell::new(map)))
+        }
+        // ECMAScript §7.1.18 – Symbol wrapper object.
+        JsValue::Symbol(sym) => {
+            let sym_val = *sym;
+            let mut map = PropertyMap::new();
+            map.insert("__wrapped__".into(), JsValue::Symbol(sym_val));
+            map.insert(
+                "valueOf".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::Symbol(sym_val)))),
+            );
+            map.insert(
+                "toString".into(),
+                JsValue::NativeFunction(Rc::new(move |_| {
+                    Ok(JsValue::String(format!("Symbol({})", sym_val).into()))
+                })),
+            );
+            JsValue::PlainObject(Rc::new(RefCell::new(map)))
+        }
+        // ECMAScript §7.1.18 – BigInt wrapper object.
+        JsValue::BigInt(n) => {
+            let n_val = *n;
+            let mut map = PropertyMap::new();
+            map.insert("__wrapped__".into(), JsValue::BigInt(n_val));
+            map.insert(
+                "valueOf".into(),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::BigInt(n_val)))),
+            );
+            map.insert(
+                "toString".into(),
+                JsValue::NativeFunction(Rc::new(move |_| {
+                    Ok(JsValue::String(n_val.to_string().into()))
+                })),
+            );
+            JsValue::PlainObject(Rc::new(RefCell::new(map)))
+        }
+    };
+    ctx.frame.write_reg(dst, wrapped)?;
     Ok(DispatchAction::Continue)
 }
 
@@ -2552,7 +2702,7 @@ fn handle_to_name(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     };
     let key = match &ctx.frame.accumulator {
         JsValue::String(_) | JsValue::Symbol(_) => ctx.frame.accumulator.clone(),
-        other => JsValue::String(other.to_js_string()?),
+        other => JsValue::String(other.to_js_string()?.into()),
     };
     ctx.frame.write_reg(dst, key)?;
     Ok(DispatchAction::Continue)
@@ -2687,12 +2837,18 @@ fn handle_create_reg_exp_literal(
         flags_str.push('y');
     }
     let mut map = PropertyMap::new();
-    map.insert("source".to_string(), JsValue::String(pattern.clone()));
-    map.insert("flags".to_string(), JsValue::String(flags_str.clone()));
+    map.insert(
+        "source".to_string(),
+        JsValue::String(pattern.clone().into()),
+    );
+    map.insert(
+        "flags".to_string(),
+        JsValue::String(flags_str.clone().into()),
+    );
     // toString() representation: /pattern/flags
     map.insert(
         "toString".to_string(),
-        JsValue::String(format!("/{pattern}/{flags_str}")),
+        JsValue::String(format!("/{pattern}/{flags_str}").into()),
     );
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
@@ -2931,7 +3087,7 @@ fn handle_test_in(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
         JsValue::Array(items) => {
             // "length" is always present on arrays.
             if let JsValue::String(s) = key
-                && s == "length"
+                && &**s == "length"
             {
                 true
             } else if let Some(idx) = to_array_index(key) {
@@ -2966,7 +3122,7 @@ fn handle_for_in_enumerate(
                 let borrow = m.borrow();
                 for k in borrow.enumerable_keys() {
                     if seen.insert(k.clone()) {
-                        all_keys.push(JsValue::String(k.clone()));
+                        all_keys.push(JsValue::String(k.clone().into()));
                     }
                 }
                 current_map = borrow.get("__proto__").and_then(|v| {
@@ -2980,7 +3136,7 @@ fn handle_for_in_enumerate(
             all_keys
         }
         JsValue::Array(items) => (0..items.borrow().len())
-            .map(|i| JsValue::String(i.to_string()))
+            .map(|i| JsValue::String(i.to_string().into()))
             .collect(),
         JsValue::Null | JsValue::Undefined => vec![],
         _ => vec![],
@@ -3172,9 +3328,37 @@ fn handle_create_mapped_arguments(
         JsValue::Function(Rc::new(ctx.frame.bytecode_array.clone())),
     );
     // @@iterator: array-like iteration support
+    let args_rc = Rc::new(RefCell::new(args.clone()));
+    let idx_rc = Rc::new(RefCell::new(0usize));
+    let iter_args = args_rc.clone();
+    let iter_idx = idx_rc.clone();
     map.insert(
         "@@iterator".to_string(),
-        JsValue::NativeFunction(Rc::new(|_args: Vec<JsValue>| Ok(JsValue::Undefined))),
+        JsValue::NativeFunction(Rc::new(move |_args: Vec<JsValue>| {
+            let a = iter_args.clone();
+            let i = iter_idx.clone();
+            // Reset index for fresh iteration
+            *i.borrow_mut() = 0;
+            let mut iter_map = PropertyMap::new();
+            iter_map.insert(
+                "next".to_string(),
+                JsValue::NativeFunction(Rc::new(move |_| {
+                    let mut idx = i.borrow_mut();
+                    let arr = a.borrow();
+                    let mut result = PropertyMap::new();
+                    if *idx < arr.len() {
+                        result.insert("value".to_string(), arr[*idx].clone());
+                        result.insert("done".to_string(), JsValue::Boolean(false));
+                        *idx += 1;
+                    } else {
+                        result.insert("value".to_string(), JsValue::Undefined);
+                        result.insert("done".to_string(), JsValue::Boolean(true));
+                    }
+                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
+                })),
+            );
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(iter_map))))
+        })),
     );
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
@@ -3206,9 +3390,37 @@ fn handle_create_unmapped_arguments(
         })),
     );
     // @@iterator: array-like iteration support
+    let args_rc = Rc::new(RefCell::new(args.clone()));
+    let idx_rc = Rc::new(RefCell::new(0usize));
+    let iter_args = args_rc.clone();
+    let iter_idx = idx_rc.clone();
     map.insert(
         "@@iterator".to_string(),
-        JsValue::NativeFunction(Rc::new(|_args: Vec<JsValue>| Ok(JsValue::Undefined))),
+        JsValue::NativeFunction(Rc::new(move |_args: Vec<JsValue>| {
+            let a = iter_args.clone();
+            let i = iter_idx.clone();
+            // Reset index for fresh iteration
+            *i.borrow_mut() = 0;
+            let mut iter_map = PropertyMap::new();
+            iter_map.insert(
+                "next".to_string(),
+                JsValue::NativeFunction(Rc::new(move |_| {
+                    let mut idx = i.borrow_mut();
+                    let arr = a.borrow();
+                    let mut result = PropertyMap::new();
+                    if *idx < arr.len() {
+                        result.insert("value".to_string(), arr[*idx].clone());
+                        result.insert("done".to_string(), JsValue::Boolean(false));
+                        *idx += 1;
+                    } else {
+                        result.insert("value".to_string(), JsValue::Undefined);
+                        result.insert("done".to_string(), JsValue::Boolean(true));
+                    }
+                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
+                })),
+            );
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(iter_map))))
+        })),
     );
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
@@ -3221,7 +3433,7 @@ fn handle_throw_reference_error_if_hole(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
         return Err(err_bad_operand("ThrowReferenceErrorIfHole", 0));
     };
-    if ctx.frame.accumulator == JsValue::Undefined {
+    if ctx.frame.accumulator == JsValue::TheHole {
         let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
             Some(ConstantPoolEntry::String(s)) => s.clone(),
             _ => "<unknown>".to_string(),
@@ -3237,7 +3449,7 @@ fn handle_throw_super_not_called_if_hole(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    if ctx.frame.accumulator == JsValue::Undefined {
+    if ctx.frame.accumulator == JsValue::TheHole {
         return Err(StatorError::ReferenceError(
             "Must call super constructor in derived class \
          before accessing 'this' or returning from \
@@ -3252,7 +3464,7 @@ fn handle_throw_super_already_called_if_not_hole(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    if ctx.frame.accumulator != JsValue::Undefined {
+    if ctx.frame.accumulator != JsValue::TheHole {
         return Err(StatorError::ReferenceError(
             "Super constructor may only be called once".to_string(),
         ));
@@ -4353,6 +4565,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::LdaZero as usize] = handle_lda_zero;
     table[Opcode::LdaSmi as usize] = handle_lda_smi;
     table[Opcode::LdaUndefined as usize] = handle_lda_undefined;
+    table[Opcode::LdaTheHole as usize] = handle_lda_the_hole;
     table[Opcode::LdaNull as usize] = handle_lda_null;
     table[Opcode::LdaTrue as usize] = handle_lda_true;
     table[Opcode::LdaFalse as usize] = handle_lda_false;

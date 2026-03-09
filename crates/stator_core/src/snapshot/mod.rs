@@ -96,13 +96,13 @@
 //!
 //! let mut globals: HashMap<String, JsValue> = HashMap::new();
 //! globals.insert("answer".to_string(), JsValue::Smi(42));
-//! globals.insert("greeting".to_string(), JsValue::String("hello".to_string()));
+//! globals.insert("greeting".to_string(), JsValue::String("hello".to_string().into()));
 //!
 //! let snapshot = serialize_globals(&globals);
 //! let restored = deserialize_globals(snapshot.as_bytes()).expect("valid snapshot");
 //!
 //! assert_eq!(restored.get("answer"), Some(&JsValue::Smi(42)));
-//! assert_eq!(restored.get("greeting"), Some(&JsValue::String("hello".to_string())));
+//! assert_eq!(restored.get("greeting"), Some(&JsValue::String("hello".to_string().into())));
 //! ```
 
 use std::cell::RefCell;
@@ -554,7 +554,8 @@ fn write_jsvalue(buf: &mut Vec<u8>, value: &JsValue, ctx: &mut SerContext) {
         | JsValue::Proxy(_)
         | JsValue::ArrayBuffer(_)
         | JsValue::TypedArray(_)
-        | JsValue::DataView(_) => {
+        | JsValue::DataView(_)
+        | JsValue::TheHole => {
             write_u8(buf, TAG_UNDEFINED);
         }
     }
@@ -886,7 +887,7 @@ fn read_jsvalue_by_tag(
         }
         TAG_STRING => {
             let s = read_str32(bytes, cursor)?;
-            Ok(JsValue::String(s))
+            Ok(JsValue::String(s.into()))
         }
         TAG_SYMBOL => {
             let id = read_u64(bytes, cursor)?;
@@ -1222,15 +1223,15 @@ mod tests {
         let mut g = HashMap::new();
         g.insert(
             "s".to_string(),
-            JsValue::String("hello, world 🌍".to_string()),
+            JsValue::String("hello, world 🌍".to_string().into()),
         );
-        g.insert("empty".to_string(), JsValue::String(String::new()));
+        g.insert("empty".to_string(), JsValue::String(String::new().into()));
         let r = round_trip(g);
         assert_eq!(
             r.get("s"),
-            Some(&JsValue::String("hello, world 🌍".to_string()))
+            Some(&JsValue::String("hello, world 🌍".to_string().into()))
         );
-        assert_eq!(r.get("empty"), Some(&JsValue::String(String::new())));
+        assert_eq!(r.get("empty"), Some(&JsValue::String(String::new().into())));
     }
 
     #[test]
@@ -1258,7 +1259,7 @@ mod tests {
     fn test_round_trip_array() {
         let items = vec![
             JsValue::Smi(1),
-            JsValue::String("two".to_string()),
+            JsValue::String("two".to_string().into()),
             JsValue::Null,
         ];
         let mut g = HashMap::new();
@@ -1522,7 +1523,7 @@ mod tests {
 
         let mut g = HashMap::new();
         g.insert("x".to_string(), JsValue::Smi(99));
-        g.insert("s".to_string(), JsValue::String("hello".to_string()));
+        g.insert("s".to_string(), JsValue::String("hello".to_string().into()));
         let snap = serialize_globals(&g);
         snap.write_to_file(&path).expect("write should succeed");
 
@@ -1533,7 +1534,7 @@ mod tests {
         assert_eq!(restored.get("x"), Some(&JsValue::Smi(99)));
         assert_eq!(
             restored.get("s"),
-            Some(&JsValue::String("hello".to_string()))
+            Some(&JsValue::String("hello".to_string().into()))
         );
 
         // Clean up.
@@ -1681,7 +1682,10 @@ mod tests {
     fn test_round_trip_prototype_chain() {
         // Simulate a prototype chain: child.__proto__ = parent
         let mut parent_map = PropertyMap::new();
-        parent_map.insert("greet".to_string(), JsValue::String("hello".to_string()));
+        parent_map.insert(
+            "greet".to_string(),
+            JsValue::String("hello".to_string().into()),
+        );
         let parent = Rc::new(RefCell::new(parent_map));
         let mut child_map = PropertyMap::new();
         child_map.insert("x".to_string(), JsValue::Smi(10));
@@ -1721,7 +1725,7 @@ mod tests {
                 );
                 assert_eq!(
                     p1.borrow().get("greet"),
-                    Some(&JsValue::String("hello".to_string()))
+                    Some(&JsValue::String("hello".to_string().into()))
                 );
             } else {
                 panic!("expected __proto__ to be PlainObject");

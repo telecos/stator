@@ -1104,6 +1104,7 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::Throw
             | Opcode::ReThrow
             | Opcode::SetPendingMessage
+            | Opcode::LdaTheHole
             | Opcode::ThrowReferenceErrorIfHole
             | Opcode::ThrowSuperNotCalledIfHole
             | Opcode::ThrowSuperAlreadyCalledIfNotHole

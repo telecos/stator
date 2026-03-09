@@ -282,7 +282,9 @@ impl HeapSnapshotBuilder {
     /// Map a `JsValue` to its CDP node-type constant.
     fn value_node_type(value: &JsValue) -> u32 {
         match value {
-            JsValue::Undefined | JsValue::Null | JsValue::Boolean(_) => NODE_TYPE_HIDDEN,
+            JsValue::Undefined | JsValue::Null | JsValue::Boolean(_) | JsValue::TheHole => {
+                NODE_TYPE_HIDDEN
+            }
             JsValue::Smi(_) | JsValue::HeapNumber(_) => NODE_TYPE_NUMBER,
             JsValue::String(_) => NODE_TYPE_STRING,
             JsValue::Symbol(_) => NODE_TYPE_SYMBOL,
@@ -324,11 +326,12 @@ impl HeapSnapshotBuilder {
     fn value_name(value: &JsValue) -> String {
         match value {
             JsValue::Undefined => "undefined".to_string(),
+            JsValue::TheHole => "<the hole>".to_string(),
             JsValue::Null => "null".to_string(),
             JsValue::Boolean(b) => b.to_string(),
             JsValue::Smi(n) => n.to_string(),
             JsValue::HeapNumber(f) => f.to_string(),
-            JsValue::String(s) => s.clone(),
+            JsValue::String(s) => s.to_string(),
             JsValue::Symbol(id) => format!("Symbol({id})"),
             JsValue::BigInt(n) => format!("{n}n"),
             JsValue::Function(_) => "(closure)".to_string(),
@@ -533,7 +536,7 @@ mod tests {
     fn test_snapshot_primitive_globals_adds_nodes() {
         let mut globals = HashMap::new();
         globals.insert("x".to_string(), JsValue::Smi(42));
-        globals.insert("s".to_string(), JsValue::String("hello".to_string()));
+        globals.insert("s".to_string(), JsValue::String("hello".to_string().into()));
         let snap = HeapSnapshotBuilder::build(&globals);
         // Root + 2 primitive nodes.
         assert_eq!(snap.snapshot.node_count, 3);

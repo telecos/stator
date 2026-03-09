@@ -546,21 +546,21 @@ impl V8String {
     /// Create a new string value.
     pub fn new(value: &str) -> Self {
         Self {
-            inner: JsValue::String(value.to_string()),
+            inner: JsValue::String(value.to_string().into()),
         }
     }
 
     /// Create from an owned `String`.
     pub fn from_owned(value: String) -> Self {
         Self {
-            inner: JsValue::String(value),
+            inner: JsValue::String(value.into()),
         }
     }
 
     /// Return the string contents.
     pub fn value(&self) -> String {
         match &self.inner {
-            JsValue::String(s) => s.clone(),
+            JsValue::String(s) => s.to_string(),
             _ => String::new(),
         }
     }
@@ -854,7 +854,7 @@ impl V8TryCatch {
     pub fn set_caught(&mut self, exception: JsValue) {
         self.has_caught = true;
         self.message = Some(match &exception {
-            JsValue::String(s) => s.clone(),
+            JsValue::String(s) => s.to_string(),
             JsValue::Smi(n) => n.to_string(),
             JsValue::HeapNumber(n) => n.to_string(),
             JsValue::Boolean(b) => b.to_string(),
@@ -2090,7 +2090,7 @@ mod tests {
 
         match f.call(JsValue::Undefined, &[]) {
             Err(StatorError::TypeError(msg)) => {
-                tc.set_caught(JsValue::String(msg.clone()));
+                tc.set_caught(JsValue::String(msg.clone().into()));
             }
             _ => panic!("expected error"),
         }

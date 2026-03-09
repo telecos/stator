@@ -44,10 +44,13 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
     let mut props = PropertyMap::new();
 
     // ── Read-only accessors ─────────────────────────────────────────────
-    props.insert("source".into(), JsValue::String(re.pattern().to_string()));
+    props.insert(
+        "source".into(),
+        JsValue::String(re.pattern().to_string().into()),
+    );
     props.insert(
         "flags".into(),
-        JsValue::String(re.flags().to_flags_string()),
+        JsValue::String(re.flags().to_flags_string().into()),
     );
     props.insert(
         "global".into(),
@@ -115,7 +118,7 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
     props.insert(
         "toString".into(),
         JsValue::NativeFunction(Rc::new(move |_args: Vec<JsValue>| {
-            Ok(JsValue::String(re_str.to_string()))
+            Ok(JsValue::String(re_str.to_string().into()))
         })),
     );
 
@@ -129,7 +132,8 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
                 None => Ok(JsValue::Null),
                 Some(SymbolMatchResult::Single(m)) => Ok(match_to_js(&m)),
                 Some(SymbolMatchResult::All(v)) => {
-                    let arr: Vec<JsValue> = v.into_iter().map(JsValue::String).collect();
+                    let arr: Vec<JsValue> =
+                        v.into_iter().map(|s| JsValue::String(s.into())).collect();
                     Ok(JsValue::new_array(arr))
                 }
             }
@@ -144,7 +148,7 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
             let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             let replacement = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(JsValue::String(
-                re_replace.symbol_replace(&input, &replacement),
+                re_replace.symbol_replace(&input, &replacement).into(),
             ))
         })),
     );
@@ -175,7 +179,10 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
                 Some(v) => Some(v.to_number()? as usize),
             };
             let parts = re_split.symbol_split(&input, limit);
-            let arr: Vec<JsValue> = parts.into_iter().map(JsValue::String).collect();
+            let arr: Vec<JsValue> = parts
+                .into_iter()
+                .map(|s| JsValue::String(s.into()))
+                .collect();
             Ok(JsValue::new_array(arr))
         })),
     );
@@ -211,20 +218,20 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
     let mut props = PropertyMap::new();
 
     // [0] = full match
-    props.insert("0".into(), JsValue::String(m.matched.clone()));
+    props.insert("0".into(), JsValue::String(m.matched.clone().into()));
     // [1..] = captures
     for (i, cap) in m.captures.iter().enumerate() {
         let key = (i + 1).to_string();
         props.insert(
             key,
             match cap {
-                Some(s) => JsValue::String(s.clone()),
+                Some(s) => JsValue::String(s.clone().into()),
                 None => JsValue::Undefined,
             },
         );
     }
     props.insert("index".into(), JsValue::Smi(m.index as i32));
-    props.insert("input".into(), JsValue::String(m.input.clone()));
+    props.insert("input".into(), JsValue::String(m.input.clone().into()));
 
     // groups
     if m.named_groups.is_empty() {
@@ -232,7 +239,7 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
     } else {
         let mut groups = PropertyMap::new();
         for (k, v) in &m.named_groups {
-            groups.insert(k.clone(), JsValue::String(v.clone()));
+            groups.insert(k.clone(), JsValue::String(v.clone().into()));
         }
         props.insert(
             "groups".into(),
@@ -287,7 +294,7 @@ mod tests {
     fn get_str(obj: &JsValue, key: &str) -> Option<String> {
         if let JsValue::PlainObject(map) = obj {
             match map.borrow().get(key)? {
-                JsValue::String(s) => Some(s.clone()),
+                JsValue::String(s) => Some(s.to_string()),
                 _ => None,
             }
         } else {

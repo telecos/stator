@@ -2839,7 +2839,7 @@ fn stator_value_inner_to_jsvalue(inner: &StatorValueInner) -> JsValue {
                 JsValue::HeapNumber(*n)
             }
         }
-        StatorValueInner::Str(cs) => JsValue::String(cs.to_string_lossy().into_owned()),
+        StatorValueInner::Str(cs) => JsValue::String(cs.to_string_lossy().into_owned().into()),
         StatorValueInner::Undefined => JsValue::Undefined,
         StatorValueInner::Null => JsValue::Null,
         StatorValueInner::Boolean(b) => JsValue::Boolean(*b),
@@ -2866,7 +2866,7 @@ fn stator_value_inner_to_jsvalue(inner: &StatorValueInner) -> JsValue {
 /// Convert a [`JsValue`] to the inner storage type used by [`StatorValue`].
 fn jsvalue_to_stator_value_inner(v: &JsValue) -> StatorValueInner {
     match v {
-        JsValue::Undefined => StatorValueInner::Undefined,
+        JsValue::Undefined | JsValue::TheHole => StatorValueInner::Undefined,
         JsValue::Null => StatorValueInner::Null,
         JsValue::Boolean(b) => StatorValueInner::Boolean(*b),
         JsValue::Smi(n) => StatorValueInner::Number(f64::from(*n)),

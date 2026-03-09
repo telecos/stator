@@ -110,7 +110,7 @@ pub fn make_array_iterator(items: Vec<JsValue>) -> JsValue {
 /// let iter = make_string_iterator("hi");
 /// assert_eq!(
 ///     iterator_next(&iter).unwrap().value,
-///     JsValue::String("h".to_string())
+///     JsValue::String("h".to_string().into())
 /// );
 /// ```
 pub fn make_string_iterator(s: &str) -> JsValue {
@@ -560,7 +560,7 @@ pub fn iterator_from(iterable: &JsValue) -> StatorResult<JsValue> {
 pub fn async_iterator_map(iter: &JsValue, mapper: &JsValue, queue: &MicrotaskQueue) -> JsValue {
     match iterator_map(iter, mapper) {
         Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
-        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string().into()), queue)),
     }
 }
 
@@ -575,7 +575,7 @@ pub fn async_iterator_filter(
 ) -> JsValue {
     match iterator_filter(iter, predicate) {
         Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
-        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string().into()), queue)),
     }
 }
 
@@ -586,7 +586,7 @@ pub fn async_iterator_filter(
 pub fn async_iterator_take(iter: &JsValue, limit: usize, queue: &MicrotaskQueue) -> JsValue {
     match iterator_take(iter, limit) {
         Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
-        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string().into()), queue)),
     }
 }
 
@@ -597,7 +597,7 @@ pub fn async_iterator_take(iter: &JsValue, limit: usize, queue: &MicrotaskQueue)
 pub fn async_iterator_drop(iter: &JsValue, count: usize, queue: &MicrotaskQueue) -> JsValue {
     match iterator_drop(iter, count) {
         Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
-        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string().into()), queue)),
     }
 }
 
@@ -612,7 +612,7 @@ pub fn async_iterator_flat_map(
 ) -> JsValue {
     match iterator_flat_map(iter, mapper) {
         Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
-        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string().into()), queue)),
     }
 }
 
@@ -627,7 +627,7 @@ pub fn async_iterator_reduce(
 ) -> JsValue {
     match iterator_reduce(iter, reducer, initial) {
         Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
-        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string().into()), queue)),
     }
 }
 
@@ -637,7 +637,7 @@ pub fn async_iterator_reduce(
 pub fn async_iterator_to_array(iter: &JsValue, queue: &MicrotaskQueue) -> JsValue {
     match iterator_to_array(iter) {
         Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
-        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string().into()), queue)),
     }
 }
 
@@ -652,7 +652,7 @@ pub fn async_iterator_for_each(
 ) -> JsValue {
     match iterator_for_each(iter, callback) {
         Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
-        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string().into()), queue)),
     }
 }
 
@@ -663,7 +663,7 @@ pub fn async_iterator_for_each(
 pub fn async_iterator_some(iter: &JsValue, predicate: &JsValue, queue: &MicrotaskQueue) -> JsValue {
     match iterator_some(iter, predicate) {
         Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
-        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string().into()), queue)),
     }
 }
 
@@ -678,7 +678,7 @@ pub fn async_iterator_every(
 ) -> JsValue {
     match iterator_every(iter, predicate) {
         Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
-        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string().into()), queue)),
     }
 }
 
@@ -689,7 +689,7 @@ pub fn async_iterator_every(
 pub fn async_iterator_find(iter: &JsValue, predicate: &JsValue, queue: &MicrotaskQueue) -> JsValue {
     match iterator_find(iter, predicate) {
         Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
-        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string().into()), queue)),
     }
 }
 
@@ -700,7 +700,7 @@ pub fn async_iterator_find(iter: &JsValue, predicate: &JsValue, queue: &Microtas
 pub fn async_iterator_from(iterable: &JsValue, queue: &MicrotaskQueue) -> JsValue {
     match iterator_from(iterable) {
         Ok(v) => JsValue::Promise(promise_resolve(v, queue)),
-        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string()), queue)),
+        Err(e) => JsValue::Promise(promise_reject(JsValue::String(e.to_string().into()), queue)),
     }
 }
 
@@ -766,11 +766,11 @@ mod tests {
         let iter = make_string_iterator("ab");
         assert_eq!(
             iterator_next(&iter).unwrap().value,
-            JsValue::String("a".to_string())
+            JsValue::String("a".to_string().into())
         );
         assert_eq!(
             iterator_next(&iter).unwrap().value,
-            JsValue::String("b".to_string())
+            JsValue::String("b".to_string().into())
         );
         assert!(iterator_next(&iter).unwrap().done);
     }

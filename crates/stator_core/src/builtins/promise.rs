@@ -409,9 +409,9 @@ pub fn promise_resolve(value: JsValue, queue: &MicrotaskQueue) -> JsPromise {
 /// use stator_core::objects::value::JsValue;
 ///
 /// let queue = MicrotaskQueue::new();
-/// let p = promise_reject(JsValue::String("oops".to_string()), &queue);
+/// let p = promise_reject(JsValue::String("oops".to_string().into()), &queue);
 /// assert!(p.is_rejected());
-/// assert_eq!(p.reason(), Some(JsValue::String("oops".to_string())));
+/// assert_eq!(p.reason(), Some(JsValue::String("oops".to_string().into())));
 /// ```
 pub fn promise_reject(reason: JsValue, queue: &MicrotaskQueue) -> JsPromise {
     promise_new(|_resolve, reject| reject(reason), queue)
@@ -496,12 +496,12 @@ pub fn promise_then(
 /// use stator_core::objects::value::JsValue;
 ///
 /// let queue = MicrotaskQueue::new();
-/// let p = promise_reject(JsValue::String("err".to_string()), &queue);
+/// let p = promise_reject(JsValue::String("err".to_string().into()), &queue);
 /// let result = std::rc::Rc::new(std::cell::RefCell::new(JsValue::Undefined));
 /// let r2 = std::rc::Rc::clone(&result);
 /// promise_catch(&p, Box::new(move |r| { *r2.borrow_mut() = r.clone(); Ok(JsValue::Undefined) }), &queue);
 /// queue.drain();
-/// assert_eq!(*result.borrow(), JsValue::String("err".to_string()));
+/// assert_eq!(*result.borrow(), JsValue::String("err".to_string().into()));
 /// ```
 pub fn promise_catch(
     promise: &JsPromise,
@@ -666,7 +666,7 @@ pub fn promise_all_settled(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> 
 
         let on_fulfilled = Some(Box::new(move |v: JsValue| {
             results_f.borrow_mut()[i] = Some(JsValue::new_array(vec![
-                JsValue::String("fulfilled".to_string()),
+                JsValue::String("fulfilled".to_string().into()),
                 v,
             ]));
             settle_all_settled(&results_f, &remaining_f, &p_result_f, &q_f);
@@ -675,7 +675,7 @@ pub fn promise_all_settled(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> 
 
         let on_rejected = Some(Box::new(move |r: JsValue| {
             results_r.borrow_mut()[i] = Some(JsValue::new_array(vec![
-                JsValue::String("rejected".to_string()),
+                JsValue::String("rejected".to_string().into()),
                 r.clone(),
             ]));
             settle_all_settled(&results_r, &remaining_r, &p_result_r, &q_r);
@@ -975,11 +975,11 @@ mod tests {
     fn test_promise_new_rejects_synchronously() {
         let queue = MicrotaskQueue::new();
         let p = promise_new(
-            |_, reject| reject(JsValue::String("err".to_string())),
+            |_, reject| reject(JsValue::String("err".to_string().into())),
             &queue,
         );
         assert!(p.is_rejected());
-        assert_eq!(p.reason(), Some(JsValue::String("err".to_string())));
+        assert_eq!(p.reason(), Some(JsValue::String("err".to_string().into())));
     }
 
     #[test]
@@ -1075,13 +1075,18 @@ mod tests {
         let p = promise_resolve(JsValue::Smi(1), &queue);
         let p2 = promise_then(
             &p,
-            Some(Box::new(|_v| Err(JsValue::String("boom".to_string())))),
+            Some(Box::new(|_v| {
+                Err(JsValue::String("boom".to_string().into()))
+            })),
             None,
             &queue,
         );
         queue.drain();
         assert!(p2.is_rejected());
-        assert_eq!(p2.reason(), Some(JsValue::String("boom".to_string())));
+        assert_eq!(
+            p2.reason(),
+            Some(JsValue::String("boom".to_string().into()))
+        );
     }
 
     #[test]
@@ -1143,7 +1148,7 @@ mod tests {
     #[test]
     fn test_promise_catch_handles_rejection() {
         let queue = MicrotaskQueue::new();
-        let p = promise_reject(JsValue::String("fail".to_string()), &queue);
+        let p = promise_reject(JsValue::String("fail".to_string().into()), &queue);
         let caught: Rc<RefCell<JsValue>> = Rc::new(RefCell::new(JsValue::Undefined));
         let c2 = Rc::clone(&caught);
         let p2 = promise_catch(
@@ -1155,7 +1160,7 @@ mod tests {
             &queue,
         );
         queue.drain();
-        assert_eq!(*caught.borrow(), JsValue::String("fail".to_string()));
+        assert_eq!(*caught.borrow(), JsValue::String("fail".to_string().into()));
         assert!(p2.is_fulfilled());
     }
 
@@ -1206,12 +1211,15 @@ mod tests {
         let p = promise_resolve(JsValue::Smi(1), &queue);
         let p2 = promise_finally(
             &p,
-            Box::new(|| Err(JsValue::String("new error".to_string()))),
+            Box::new(|| Err(JsValue::String("new error".to_string().into()))),
             &queue,
         );
         queue.drain();
         assert!(p2.is_rejected());
-        assert_eq!(p2.reason(), Some(JsValue::String("new error".to_string())));
+        assert_eq!(
+            p2.reason(),
+            Some(JsValue::String("new error".to_string().into()))
+        );
     }
 
     // ── promise_all ───────────────────────────────────────────────────────────
@@ -1244,14 +1252,14 @@ mod tests {
         let p = promise_all(
             vec![
                 promise_resolve(JsValue::Smi(1), &queue),
-                promise_reject(JsValue::String("err".to_string()), &queue),
+                promise_reject(JsValue::String("err".to_string().into()), &queue),
                 promise_resolve(JsValue::Smi(3), &queue),
             ],
             &queue,
         );
         queue.drain();
         assert!(p.is_rejected());
-        assert_eq!(p.reason(), Some(JsValue::String("err".to_string())));
+        assert_eq!(p.reason(), Some(JsValue::String("err".to_string().into())));
     }
 
     #[test]
@@ -1274,7 +1282,7 @@ mod tests {
         let p = promise_all_settled(
             vec![
                 promise_resolve(JsValue::Smi(1), &queue),
-                promise_reject(JsValue::String("boom".to_string()), &queue),
+                promise_reject(JsValue::String("boom".to_string().into()), &queue),
             ],
             &queue,
         );
@@ -1285,7 +1293,10 @@ mod tests {
             if let JsValue::Array(inner0) = &arr.borrow()[0] {
                 assert_eq!(
                     *inner0.borrow(),
-                    vec![JsValue::String("fulfilled".to_string()), JsValue::Smi(1)]
+                    vec![
+                        JsValue::String("fulfilled".to_string().into()),
+                        JsValue::Smi(1)
+                    ]
                 );
             } else {
                 panic!("expected inner Array at [0]");
@@ -1294,8 +1305,8 @@ mod tests {
                 assert_eq!(
                     *inner1.borrow(),
                     vec![
-                        JsValue::String("rejected".to_string()),
-                        JsValue::String("boom".to_string()),
+                        JsValue::String("rejected".to_string().into()),
+                        JsValue::String("boom".to_string().into()),
                     ]
                 );
             } else {
@@ -1365,14 +1376,14 @@ mod tests {
         let queue = MicrotaskQueue::new();
         let p = promise_race(
             vec![
-                promise_reject(JsValue::String("no".to_string()), &queue),
+                promise_reject(JsValue::String("no".to_string().into()), &queue),
                 promise_resolve(JsValue::Smi(2), &queue),
             ],
             &queue,
         );
         queue.drain();
         assert!(p.is_rejected());
-        assert_eq!(p.reason(), Some(JsValue::String("no".to_string())));
+        assert_eq!(p.reason(), Some(JsValue::String("no".to_string().into())));
     }
 
     // ── promise_with_resolvers ────────────────────────────────────────────────
@@ -1391,11 +1402,11 @@ mod tests {
     fn test_promise_with_resolvers_reject() {
         let queue = MicrotaskQueue::new();
         let wr = promise_with_resolvers(&queue);
-        (wr.reject)(JsValue::String("fail".to_string()));
+        (wr.reject)(JsValue::String("fail".to_string().into()));
         assert!(wr.promise.is_rejected());
         assert_eq!(
             wr.promise.reason(),
-            Some(JsValue::String("fail".to_string()))
+            Some(JsValue::String("fail".to_string().into()))
         );
     }
 
@@ -1464,10 +1475,10 @@ mod tests {
         let queue = MicrotaskQueue::new();
         let p = promise_resolve(JsValue::Smi(5), &queue);
         assert_eq!(p.state(), PromiseState::Fulfilled(JsValue::Smi(5)));
-        let p2 = promise_reject(JsValue::String("err".to_string()), &queue);
+        let p2 = promise_reject(JsValue::String("err".to_string().into()), &queue);
         assert_eq!(
             p2.state(),
-            PromiseState::Rejected(JsValue::String("err".to_string()))
+            PromiseState::Rejected(JsValue::String("err".to_string().into()))
         );
         let p3 = promise_new(|_, _| {}, &queue);
         assert_eq!(p3.state(), PromiseState::Pending);

@@ -128,7 +128,7 @@ fn make_module_object(module: &WasmModule, bytes: Vec<u8>) -> JsValue {
     // Tag the object type for later detection.
     map.borrow_mut().insert(
         "__wasm_type__".to_string(),
-        JsValue::String("WebAssembly.Module".to_string()),
+        JsValue::String("WebAssembly.Module".to_string().into()),
     );
 
     // Store the original bytes so we can re-compile when instantiating.
@@ -142,8 +142,10 @@ fn make_module_object(module: &WasmModule, bytes: Vec<u8>) -> JsValue {
         .exports()
         .map(|exp| {
             let desc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
-            desc.borrow_mut()
-                .insert("name".to_string(), JsValue::String(exp.name().to_string()));
+            desc.borrow_mut().insert(
+                "name".to_string(),
+                JsValue::String(exp.name().to_string().into()),
+            );
             let kind = match exp.ty() {
                 wasmtime::ExternType::Func(_) => "function",
                 wasmtime::ExternType::Memory(_) => "memory",
@@ -152,7 +154,7 @@ fn make_module_object(module: &WasmModule, bytes: Vec<u8>) -> JsValue {
                 _ => "other",
             };
             desc.borrow_mut()
-                .insert("kind".to_string(), JsValue::String(kind.to_string()));
+                .insert("kind".to_string(), JsValue::String(kind.to_string().into()));
             JsValue::PlainObject(desc)
         })
         .collect();
@@ -180,7 +182,7 @@ fn extract_bytes_from_module(module_obj: &JsValue) -> StatorResult<Vec<u8>> {
 
     let wasm_type = map.borrow().get("__wasm_type__").cloned();
     match &wasm_type {
-        Some(JsValue::String(s)) if s == "WebAssembly.Module" => {}
+        Some(JsValue::String(s)) if &**s == "WebAssembly.Module" => {}
         _ => {
             return Err(StatorError::TypeError(
                 "not a WebAssembly.Module object".to_string(),
@@ -265,7 +267,7 @@ fn make_instance_object(module: &WasmModule, engine: &WasmEngine) -> StatorResul
     let instance_map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
     instance_map.borrow_mut().insert(
         "__wasm_type__".to_string(),
-        JsValue::String("WebAssembly.Instance".to_string()),
+        JsValue::String("WebAssembly.Instance".to_string().into()),
     );
     instance_map
         .borrow_mut()
@@ -327,7 +329,7 @@ pub fn wasm_validate(args: Vec<JsValue>) -> StatorResult<JsValue> {
 /// use stator_core::builtins::wasm::wasm_compile;
 /// use stator_core::objects::value::JsValue;
 ///
-/// let wat = JsValue::String(r#"(module)"#.to_string());
+/// let wat = JsValue::String(r#"(module)"#.to_string().into());
 /// let module = wasm_compile(vec![wat]).unwrap();
 /// assert!(matches!(module, JsValue::PlainObject(_)));
 /// ```
@@ -366,7 +368,7 @@ pub fn wasm_instantiate(args: Vec<JsValue>) -> StatorResult<JsValue> {
     let is_module_obj = if let JsValue::PlainObject(ref m) = source {
         matches!(
             m.borrow().get("__wasm_type__").cloned(),
-            Some(JsValue::String(ref s)) if s == "WebAssembly.Module"
+            Some(JsValue::String(ref s)) if &**s == "WebAssembly.Module"
         )
     } else {
         false
@@ -408,7 +410,7 @@ pub fn wasm_instantiate(args: Vec<JsValue>) -> StatorResult<JsValue> {
 /// use stator_core::builtins::wasm::wasm_module_ctor;
 /// use stator_core::objects::value::JsValue;
 ///
-/// let wat = JsValue::String("(module)".to_string());
+/// let wat = JsValue::String("(module)".to_string().into());
 /// let m = wasm_module_ctor(vec![wat]).unwrap();
 /// assert!(matches!(m, JsValue::PlainObject(_)));
 /// ```
@@ -521,7 +523,7 @@ pub fn wasm_memory_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
     let memory_map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
     memory_map.borrow_mut().insert(
         "__wasm_type__".to_string(),
-        JsValue::String("WebAssembly.Memory".to_string()),
+        JsValue::String("WebAssembly.Memory".to_string().into()),
     );
     memory_map
         .borrow_mut()
@@ -566,7 +568,7 @@ pub fn wasm_table_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
                     )),
                 };
                 let element: String = match map.borrow().get("element").cloned() {
-                    Some(JsValue::String(s)) => s,
+                    Some(JsValue::String(s)) => s.to_string(),
                     _ => return Err(StatorError::TypeError(
                         "WebAssembly.Table: 'element' property is required and must be a string"
                             .to_string(),
@@ -657,7 +659,7 @@ pub fn wasm_table_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
     });
     table_map.borrow_mut().insert(
         "__wasm_type__".to_string(),
-        JsValue::String("WebAssembly.Table".to_string()),
+        JsValue::String("WebAssembly.Table".to_string().into()),
     );
     table_map
         .borrow_mut()
@@ -704,7 +706,7 @@ pub fn wasm_table_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
 /// use stator_core::objects::value::JsValue;
 ///
 /// let desc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
-/// desc.borrow_mut().insert("value".to_string(), JsValue::String("i32".to_string()));
+/// desc.borrow_mut().insert("value".to_string(), JsValue::String("i32".to_string().into()));
 /// desc.borrow_mut().insert("mutable".to_string(), JsValue::Boolean(true));
 /// let global = wasm_global_ctor(vec![JsValue::PlainObject(desc), JsValue::Smi(42)]).unwrap();
 /// assert!(matches!(global, JsValue::PlainObject(_)));
@@ -741,7 +743,7 @@ pub fn wasm_global_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
     let global_map: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
     global_map.borrow_mut().insert(
         "__wasm_type__".to_string(),
-        JsValue::String("WebAssembly.Global".to_string()),
+        JsValue::String("WebAssembly.Global".to_string().into()),
     );
     // Expose the initial value directly; callers should use valueOf() for reads.
     global_map
@@ -868,7 +870,7 @@ mod tests {
 
     /// Helper: convert a WAT string to a `JsValue::String`.
     fn wat_val(wat: &str) -> JsValue {
-        JsValue::String(wat.to_string())
+        JsValue::String(wat.to_string().into())
     }
 
     /// Helper: minimal valid Wasm binary (empty module magic + version).
@@ -907,7 +909,7 @@ mod tests {
 
     #[test]
     fn test_bytes_from_string() {
-        let s = JsValue::String("(module)".to_string());
+        let s = JsValue::String("(module)".to_string().into());
         let bytes = bytes_from_js_value(&s).unwrap();
         assert_eq!(bytes, b"(module)");
     }
@@ -960,7 +962,8 @@ mod tests {
 
     #[test]
     fn test_validate_invalid_wat_returns_false() {
-        let result = wasm_validate(vec![JsValue::String("not wasm at all".to_string())]).unwrap();
+        let result =
+            wasm_validate(vec![JsValue::String("not wasm at all".to_string().into())]).unwrap();
         assert_eq!(result, JsValue::Boolean(false));
     }
 
@@ -989,7 +992,10 @@ mod tests {
         let m = wasm_compile(vec![wat_val(EMPTY_WAT)]).unwrap();
         if let JsValue::PlainObject(map) = m {
             let ty = map.borrow().get("__wasm_type__").cloned();
-            assert_eq!(ty, Some(JsValue::String("WebAssembly.Module".to_string())));
+            assert_eq!(
+                ty,
+                Some(JsValue::String("WebAssembly.Module".to_string().into()))
+            );
         } else {
             panic!("expected PlainObject");
         }
@@ -1016,8 +1022,8 @@ mod tests {
                 if let JsValue::PlainObject(desc) = &arr.borrow()[0] {
                     let name = desc.borrow().get("name").cloned();
                     let kind = desc.borrow().get("kind").cloned();
-                    assert_eq!(name, Some(JsValue::String("add".to_string())));
-                    assert_eq!(kind, Some(JsValue::String("function".to_string())));
+                    assert_eq!(name, Some(JsValue::String("add".to_string().into())));
+                    assert_eq!(kind, Some(JsValue::String("function".to_string().into())));
                 } else {
                     panic!("expected PlainObject descriptor");
                 }
@@ -1031,7 +1037,7 @@ mod tests {
 
     #[test]
     fn test_compile_invalid_wat_returns_error() {
-        let err = wasm_compile(vec![JsValue::String("bad wat".to_string())]).unwrap_err();
+        let err = wasm_compile(vec![JsValue::String("bad wat".to_string().into())]).unwrap_err();
         assert!(matches!(err, StatorError::WasmError(_)));
     }
 
@@ -1090,7 +1096,8 @@ mod tests {
 
     #[test]
     fn test_module_ctor_invalid_returns_error() {
-        let err = wasm_module_ctor(vec![JsValue::String("nonsense".to_string())]).unwrap_err();
+        let err =
+            wasm_module_ctor(vec![JsValue::String("nonsense".to_string().into())]).unwrap_err();
         assert!(matches!(err, StatorError::WasmError(_)));
     }
 
@@ -1203,7 +1210,7 @@ mod tests {
             let ty = map.borrow().get("__wasm_type__").cloned();
             assert_eq!(
                 ty,
-                Some(JsValue::String("WebAssembly.Instance".to_string()))
+                Some(JsValue::String("WebAssembly.Instance".to_string().into()))
             );
         } else {
             panic!("expected instance PlainObject");
@@ -1300,7 +1307,7 @@ mod tests {
     #[test]
     fn test_table_ctor_returns_plain_object() {
         let desc = descriptor(&[
-            ("element", JsValue::String("anyfunc".to_string())),
+            ("element", JsValue::String("anyfunc".to_string().into())),
             ("initial", JsValue::Smi(4)),
         ]);
         let tbl = wasm_table_ctor(vec![desc]).unwrap();
@@ -1310,7 +1317,7 @@ mod tests {
     #[test]
     fn test_table_ctor_has_get_set_grow_length() {
         let desc = descriptor(&[
-            ("element", JsValue::String("anyfunc".to_string())),
+            ("element", JsValue::String("anyfunc".to_string().into())),
             ("initial", JsValue::Smi(4)),
         ]);
         let tbl = wasm_table_ctor(vec![desc]).unwrap();
@@ -1334,7 +1341,7 @@ mod tests {
     #[test]
     fn test_table_get_set_roundtrip() {
         let desc = descriptor(&[
-            ("element", JsValue::String("anyfunc".to_string())),
+            ("element", JsValue::String("anyfunc".to_string().into())),
             ("initial", JsValue::Smi(4)),
         ]);
         let tbl = wasm_table_ctor(vec![desc]).unwrap();
@@ -1358,7 +1365,7 @@ mod tests {
     #[test]
     fn test_table_set_out_of_bounds_error() {
         let desc = descriptor(&[
-            ("element", JsValue::String("anyfunc".to_string())),
+            ("element", JsValue::String("anyfunc".to_string().into())),
             ("initial", JsValue::Smi(2)),
         ]);
         let tbl = wasm_table_ctor(vec![desc]).unwrap();
@@ -1373,7 +1380,7 @@ mod tests {
     #[test]
     fn test_table_grow_extends_length() {
         let desc = descriptor(&[
-            ("element", JsValue::String("anyfunc".to_string())),
+            ("element", JsValue::String("anyfunc".to_string().into())),
             ("initial", JsValue::Smi(2)),
         ]);
         let tbl = wasm_table_ctor(vec![desc]).unwrap();
@@ -1404,7 +1411,7 @@ mod tests {
 
     #[test]
     fn test_table_ctor_missing_initial_returns_error() {
-        let desc = descriptor(&[("element", JsValue::String("anyfunc".to_string()))]);
+        let desc = descriptor(&[("element", JsValue::String("anyfunc".to_string().into()))]);
         let err = wasm_table_ctor(vec![desc]).unwrap_err();
         assert!(matches!(err, StatorError::TypeError(_)));
     }
@@ -1413,14 +1420,14 @@ mod tests {
 
     #[test]
     fn test_global_ctor_returns_plain_object() {
-        let desc = descriptor(&[("value", JsValue::String("i32".to_string()))]);
+        let desc = descriptor(&[("value", JsValue::String("i32".to_string().into()))]);
         let g = wasm_global_ctor(vec![desc, JsValue::Smi(42)]).unwrap();
         assert!(matches!(g, JsValue::PlainObject(_)));
     }
 
     #[test]
     fn test_global_ctor_value_property() {
-        let desc = descriptor(&[("value", JsValue::String("i32".to_string()))]);
+        let desc = descriptor(&[("value", JsValue::String("i32".to_string().into()))]);
         let g = wasm_global_ctor(vec![desc, JsValue::Smi(42)]).unwrap();
         if let JsValue::PlainObject(map) = g {
             assert_eq!(map.borrow().get("value").cloned(), Some(JsValue::Smi(42)));
@@ -1429,7 +1436,7 @@ mod tests {
 
     #[test]
     fn test_global_valueof_returns_init() {
-        let desc = descriptor(&[("value", JsValue::String("f64".to_string()))]);
+        let desc = descriptor(&[("value", JsValue::String("f64".to_string().into()))]);
         let g = wasm_global_ctor(vec![desc, JsValue::HeapNumber(3.14)]).unwrap();
         if let JsValue::PlainObject(map) = g {
             if let Some(JsValue::NativeFunction(valueof)) = map.borrow().get("valueOf").cloned() {
@@ -1441,7 +1448,7 @@ mod tests {
 
     #[test]
     fn test_global_default_init_is_zero() {
-        let desc = descriptor(&[("value", JsValue::String("i32".to_string()))]);
+        let desc = descriptor(&[("value", JsValue::String("i32".to_string().into()))]);
         let g = wasm_global_ctor(vec![desc]).unwrap();
         if let JsValue::PlainObject(map) = g {
             assert_eq!(map.borrow().get("value").cloned(), Some(JsValue::Smi(0)));
@@ -1554,7 +1561,7 @@ mod tests {
         assert_eq!(valid_result, JsValue::Boolean(true));
         assert!(compile_result.is_ok());
 
-        let invalid = JsValue::String("not wasm".to_string());
+        let invalid = JsValue::String("not wasm".to_string().into());
         let invalid_result = wasm_validate(vec![invalid.clone()]).unwrap();
         let compile_err = wasm_compile(vec![invalid]);
         assert_eq!(invalid_result, JsValue::Boolean(false));

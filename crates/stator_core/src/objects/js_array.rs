@@ -253,7 +253,7 @@ mod tests {
     fn test_push_string_transitions_to_packed_elements() {
         let mut arr = JsArray::new();
         arr.push(JsValue::Smi(1));
-        arr.push(JsValue::String("hello".to_string()));
+        arr.push(JsValue::String("hello".to_string().into()));
         assert_eq!(arr.element_kind(), ElementKind::PackedElements);
     }
 
@@ -262,7 +262,7 @@ mod tests {
         let mut arr = JsArray::new();
         arr.push(JsValue::HeapNumber(1.5));
         assert_eq!(arr.element_kind(), ElementKind::PackedDouble);
-        arr.push(JsValue::String("x".to_string()));
+        arr.push(JsValue::String("x".to_string().into()));
         assert_eq!(arr.element_kind(), ElementKind::PackedElements);
     }
 
@@ -286,7 +286,7 @@ mod tests {
     fn test_sparse_set_with_string_transitions_to_hole_elements() {
         let mut arr = JsArray::new();
         arr.push(JsValue::Smi(1));
-        arr.set(5, JsValue::String("z".to_string()));
+        arr.set(5, JsValue::String("z".to_string().into()));
         assert_eq!(arr.element_kind(), ElementKind::HoleElements);
     }
 

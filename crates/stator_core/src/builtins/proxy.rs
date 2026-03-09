@@ -167,6 +167,10 @@ pub struct JsProxy {
     pub(crate) handler: ProxyHandler,
     /// Whether this proxy has been revoked.
     revoked: bool,
+    /// Whether the proxy's target is callable (`[[Call]]` internal method).
+    /// Per ECMAScript §10.5.12, `typeof proxy` returns `"function"` when
+    /// the target is callable.
+    callable: bool,
 }
 
 // ── Constructors ──────────────────────────────────────────────────────────────
@@ -190,6 +194,20 @@ pub fn proxy_new(target: JsObject, handler: ProxyHandler) -> JsProxy {
         target,
         handler,
         revoked: false,
+        callable: false,
+    }
+}
+
+/// Creates a new [`JsProxy`] whose target is callable.
+///
+/// This sets the internal `callable` flag so that `typeof proxy` correctly
+/// returns `"function"` per ECMAScript §10.5.12.
+pub fn proxy_new_callable(target: JsObject, handler: ProxyHandler) -> JsProxy {
+    JsProxy {
+        target,
+        handler,
+        revoked: false,
+        callable: true,
     }
 }
 
@@ -232,6 +250,11 @@ impl JsProxy {
     /// Returns `true` if this proxy has been revoked.
     pub fn is_revoked(&self) -> bool {
         self.revoked
+    }
+
+    /// Returns `true` if the proxy's target is callable.
+    pub fn is_callable(&self) -> bool {
+        self.callable
     }
 
     /// Returns an error if this proxy is revoked.

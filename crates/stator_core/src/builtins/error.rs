@@ -34,6 +34,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::error::{StatorError, StatorResult};
+use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -280,6 +281,12 @@ pub struct JsError {
     /// Set when the constructor receives an options object with a `cause`
     /// property, e.g. `new Error("msg", { cause: originalError })`.
     pub cause: Option<JsValue>,
+    /// User-set property overlay.
+    ///
+    /// Stores values written by JS code (e.g. `err.message = "new"`).
+    /// [`proto_lookup`](crate::interpreter::Interpreter) checks this map
+    /// first, falling back to the built-in fields above when a key is absent.
+    pub props: RefCell<PropertyMap>,
 }
 
 impl JsError {
@@ -306,6 +313,7 @@ impl JsError {
             stack,
             errors: Vec::new(),
             cause: None,
+            props: RefCell::new(PropertyMap::new()),
         }
     }
 
@@ -331,6 +339,7 @@ impl JsError {
             stack,
             errors,
             cause: None,
+            props: RefCell::new(PropertyMap::new()),
         }
     }
 
@@ -364,7 +373,7 @@ impl JsError {
     /// use stator_core::builtins::error::{JsError, ErrorKind};
     /// use stator_core::objects::value::JsValue;
     ///
-    /// let inner = JsValue::String("disk full".to_string());
+    /// let inner = JsValue::String("disk full".to_string().into());
     /// let e = JsError::new(ErrorKind::Error, "write failed".to_string())
     ///     .with_cause(inner.clone());
     /// assert_eq!(e.cause(), Some(&inner));
@@ -374,9 +383,11 @@ impl JsError {
         self
     }
 
-    /// ECMAScript §20.5.8 `Error.prototype.toString()`.
+    /// ECMAScript §20.5.3.4 `Error.prototype.toString()`.
     ///
-    /// Returns `"name: message"`, or just `"name"` when `message` is empty.
+    /// Returns `"name: message"`, or just `"name"` when `message` is empty,
+    /// or just `"message"` when `name` is empty.
+    /// Respects user-set overrides in the property overlay.
     ///
     /// ```
     /// use stator_core::builtins::error::{JsError, ErrorKind};
@@ -388,11 +399,24 @@ impl JsError {
     /// assert_eq!(e2.to_error_string(), "Error");
     /// ```
     pub fn to_error_string(&self) -> String {
-        if self.message.is_empty() {
-            self.kind.as_name().to_string()
-        } else {
-            format!("{}: {}", self.kind.as_name(), self.message)
+        let props = self.props.borrow();
+        let name = match props.get("name") {
+            Some(JsValue::String(s)) => s.to_string(),
+            _ => self.kind.as_name().to_string(),
+        };
+        let msg = match props.get("message") {
+            Some(JsValue::String(s)) => s.to_string(),
+            _ => self.message.clone(),
+        };
+        drop(props);
+
+        if name.is_empty() {
+            return msg;
         }
+        if msg.is_empty() {
+            return name;
+        }
+        format!("{name}: {msg}")
     }
 }
 
@@ -597,6 +621,44 @@ mod tests {
         assert_eq!(e.to_error_string(), "TypeError");
     }
 
+    // ── property overlay (settable name/message) ─────────────────────────────
+
+    #[test]
+    fn test_to_error_string_overridden_message() {
+        let e = JsError::new(ErrorKind::Error, "original".to_string());
+        e.props
+            .borrow_mut()
+            .insert("message".to_string(), JsValue::String("overridden".into()));
+        assert_eq!(e.to_error_string(), "Error: overridden");
+    }
+
+    #[test]
+    fn test_to_error_string_overridden_name() {
+        let e = JsError::new(ErrorKind::Error, "msg".to_string());
+        e.props
+            .borrow_mut()
+            .insert("name".to_string(), JsValue::String("CustomError".into()));
+        assert_eq!(e.to_error_string(), "CustomError: msg");
+    }
+
+    #[test]
+    fn test_to_error_string_overridden_name_empty() {
+        let e = JsError::new(ErrorKind::Error, "msg".to_string());
+        e.props
+            .borrow_mut()
+            .insert("name".to_string(), JsValue::String(String::new().into()));
+        assert_eq!(e.to_error_string(), "msg");
+    }
+
+    #[test]
+    fn test_props_overlay_custom_property() {
+        let e = JsError::new(ErrorKind::Error, "test".to_string());
+        e.props
+            .borrow_mut()
+            .insert("code".to_string(), JsValue::Smi(42));
+        assert_eq!(e.props.borrow().get("code"), Some(&JsValue::Smi(42)));
+    }
+
     // ── stack traces ─────────────────────────────────────────────────────────
 
     #[test]
@@ -709,7 +771,7 @@ mod tests {
 
     #[test]
     fn test_error_with_cause() {
-        let cause = JsValue::String("disk full".to_string());
+        let cause = JsValue::String("disk full".to_string().into());
         let e =
             JsError::new(ErrorKind::Error, "write failed".to_string()).with_cause(cause.clone());
         assert_eq!(e.cause(), Some(&cause));

@@ -335,9 +335,7 @@ fn make_test_globals() -> HashMap<String, JsValue> {
     let t262_proto: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
     t262_proto.borrow_mut().insert(
         "toString".to_string(),
-        JsValue::NativeFunction(Rc::new(|_args| {
-            Ok(JsValue::String("Test262Error".to_string()))
-        })),
+        JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::String("Test262Error".into())))),
     );
     let t262_proto_val = JsValue::PlainObject(t262_proto.clone());
 
@@ -346,10 +344,7 @@ fn make_test_globals() -> HashMap<String, JsValue> {
     t262_ctor.borrow_mut().insert(
         "__call__".to_string(),
         JsValue::NativeFunction(Rc::new(move |args| {
-            let msg = args
-                .first()
-                .cloned()
-                .unwrap_or(JsValue::String(String::new()));
+            let msg = args.first().cloned().unwrap_or(JsValue::String("".into()));
             let obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
             obj.borrow_mut().insert("message".to_string(), msg);
             obj.borrow_mut()
@@ -364,7 +359,7 @@ fn make_test_globals() -> HashMap<String, JsValue> {
         "thrower".to_string(),
         JsValue::NativeFunction(Rc::new(|args| {
             let msg = match args.first() {
-                Some(JsValue::String(s)) => s.clone(),
+                Some(JsValue::String(s)) => s.to_string(),
                 _ => String::new(),
             };
             Err(StatorError::JsException(format!("Test262Error: {msg}")))
@@ -394,7 +389,7 @@ fn make_test_globals() -> HashMap<String, JsValue> {
                 return Ok(JsValue::Undefined);
             }
             let msg = match args.get(1) {
-                Some(JsValue::String(s)) => s.clone(),
+                Some(JsValue::String(s)) => s.to_string(),
                 _ => format!("Expected true but got {val:?}"),
             };
             Err(StatorError::JsException(format!("Test262Error: {msg}")))
@@ -458,7 +453,7 @@ fn make_test_globals() -> HashMap<String, JsValue> {
             let message = args
                 .get(2)
                 .and_then(|v| match v {
-                    JsValue::String(s) => Some(s.clone()),
+                    JsValue::String(s) => Some(s.to_string()),
                     _ => None,
                 })
                 .unwrap_or_else(|| "Expected a throw".to_string());
@@ -486,7 +481,7 @@ fn make_test_globals() -> HashMap<String, JsValue> {
         "_toString".to_string(),
         JsValue::NativeFunction(Rc::new(|args| {
             let v = args.first().cloned().unwrap_or(JsValue::Undefined);
-            Ok(JsValue::String(format!("{v:?}")))
+            Ok(JsValue::String(format!("{v:?}").into()))
         })),
     );
 
