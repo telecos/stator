@@ -2286,6 +2286,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             _ => {}
         }
+        // If this PlainObject is an array literal, delegate to Array.prototype.
+        if borrow
+            .get("__is_array__")
+            .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
+        {
+            drop(borrow);
+            return array_literal_proto_lookup(obj, key);
+        }
         // Walk __proto__ chain.
         if let Some(proto) = borrow.get("__proto__") {
             let next = proto.clone();
@@ -3703,6 +3711,74 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
         }
         break;
+    }
+    JsValue::Undefined
+}
+
+/// Delegate a property lookup on a PlainObject array to the Array prototype.
+///
+/// Extracts the indexed elements from the `PropertyMap`, wraps them in a
+/// `JsValue::Array`, and re-dispatches through `proto_lookup` so that all
+/// `Array.prototype` methods (push, map, filter, etc.) just work.
+fn array_literal_proto_lookup(obj: &JsValue, key: &str) -> JsValue {
+    if let JsValue::PlainObject(map) = obj {
+        let borrow = map.borrow();
+        let len = match borrow.get("length") {
+            Some(JsValue::Smi(n)) => *n as usize,
+            _ => 0,
+        };
+        let mut elements = Vec::with_capacity(len);
+        for i in 0..len {
+            let k = i.to_string();
+            elements.push(borrow.get(&k).cloned().unwrap_or(JsValue::Undefined));
+        }
+        drop(borrow);
+        // Build a real JsValue::Array and lookup on it.
+        let arr = JsValue::Array(Rc::new(RefCell::new(elements)));
+        let result = proto_lookup(&arr, key);
+        // For mutating methods we need to sync changes back.  Wrap the
+        // returned NativeFunction so that after the call, the backing
+        // PlainObject is updated from the Array.
+        if matches!(
+            key,
+            "push"
+                | "pop"
+                | "shift"
+                | "unshift"
+                | "splice"
+                | "reverse"
+                | "sort"
+                | "fill"
+                | "copyWithin"
+        ) && let JsValue::NativeFunction(ref inner_fn) = result
+        {
+            let inner_fn = Rc::clone(inner_fn);
+            let map_rc = Rc::clone(map);
+            if let JsValue::Array(ref arr_ref) = arr {
+                let arr_ref = Rc::clone(arr_ref);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let ret = inner_fn(args)?;
+                    // Sync back from Array to PlainObject.
+                    let elems = arr_ref.borrow();
+                    let mut m = map_rc.borrow_mut();
+                    // Remove old numeric keys.
+                    let old_len = match m.get("length") {
+                        Some(JsValue::Smi(n)) => *n as usize,
+                        _ => 0,
+                    };
+                    for i in 0..old_len {
+                        m.remove(&i.to_string());
+                    }
+                    // Insert new elements.
+                    for (i, v) in elems.iter().enumerate() {
+                        m.insert(i.to_string(), v.clone());
+                    }
+                    m.insert("length".to_string(), JsValue::Smi(elems.len() as i32));
+                    Ok(ret)
+                }));
+            }
+        }
+        return result;
     }
     JsValue::Undefined
 }
