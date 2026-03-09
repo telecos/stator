@@ -2124,6 +2124,9 @@ fn handle_sta_named_property(
         JsValue::Function(ref ba) => {
             fn_props_set(ba, prop_name.to_string(), val);
         }
+        JsValue::Error(ref e) => {
+            e.props.borrow_mut().insert(prop_name.to_string(), val);
+        }
         _ => {}
     }
     // Accumulator stays unchanged: the assignment's completion

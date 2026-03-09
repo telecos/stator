@@ -3146,6 +3146,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
     }
     // Handle JsValue::Error — expose name, message, stack, cause, errors properties.
     if let JsValue::Error(e) = obj {
+        // Check user-set property overlay first.
+        {
+            let props = e.props.borrow();
+            if let Some(val) = props.get(key) {
+                return val.clone();
+            }
+        }
+        // Fall back to built-in Error properties.
         let err = Rc::clone(e);
         return match key {
             "name" => JsValue::String(e.name().to_string()),
@@ -3171,6 +3179,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let e2 = Rc::clone(e);
                 JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Error(Rc::clone(&e2)))))
             }
+            "constructor" => JsValue::Undefined,
             _ => JsValue::Undefined,
         };
     }
@@ -3583,6 +3592,10 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
                 }
                 v[idx] = value;
             }
+        }
+        JsValue::Error(e) => {
+            let prop_name = to_property_key(key)?;
+            e.props.borrow_mut().insert(prop_name, value);
         }
         _ => {}
     }
@@ -9082,6 +9095,35 @@ mod tests {
         } else {
             panic!("expected NativeFunction for toString");
         }
+    }
+
+    /// Test that `proto_lookup` returns user-set overlay property on errors.
+    #[test]
+    fn test_proto_lookup_error_overlay_message() {
+        use crate::builtins::error::{ErrorKind, JsError};
+
+        let je = JsError::new(ErrorKind::Error, "original".to_string());
+        je.props
+            .borrow_mut()
+            .insert("message".to_string(), JsValue::String("overridden".into()));
+        let err = JsValue::Error(Rc::new(je));
+        assert_eq!(
+            proto_lookup(&err, "message"),
+            JsValue::String("overridden".to_string())
+        );
+    }
+
+    /// Test that `proto_lookup` returns user-set custom property on errors.
+    #[test]
+    fn test_proto_lookup_error_overlay_custom_prop() {
+        use crate::builtins::error::{ErrorKind, JsError};
+
+        let je = JsError::new(ErrorKind::Error, "test".to_string());
+        je.props
+            .borrow_mut()
+            .insert("code".to_string(), JsValue::Smi(42));
+        let err = JsValue::Error(Rc::new(je));
+        assert_eq!(proto_lookup(&err, "code"), JsValue::Smi(42));
     }
 
     // ── DeletePropertySloppy / DeletePropertyStrict ──────────────────────
