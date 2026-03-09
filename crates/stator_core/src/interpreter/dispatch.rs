@@ -65,6 +65,7 @@ pub(super) type OpcodeHandler =
 /// Number of opcode variants (= `Opcode::Illegal as usize + 1`).
 const OPCODE_COUNT: usize = 192;
 
+#[inline]
 fn handle_lda_zero(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -73,6 +74,7 @@ fn handle_lda_zero(
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_lda_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Immediate(v) = instr.operands[0] else {
         return Err(err_bad_operand("LdaSmi", 0));
@@ -81,6 +83,7 @@ fn handle_lda_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_lda_undefined(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -89,6 +92,7 @@ fn handle_lda_undefined(
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_lda_the_hole(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -97,6 +101,7 @@ fn handle_lda_the_hole(
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_lda_null(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -105,6 +110,7 @@ fn handle_lda_null(
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_lda_true(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -113,6 +119,7 @@ fn handle_lda_true(
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_lda_false(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -121,6 +128,7 @@ fn handle_lda_false(
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_lda_constant(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -136,6 +144,7 @@ fn handle_lda_constant(
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_ldar(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Ldar", 0));
@@ -144,6 +153,7 @@ fn handle_ldar(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<D
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_star(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Star", 0));
@@ -153,6 +163,7 @@ fn handle_star(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<D
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_mov(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Register(src) = instr.operands[0] else {
         return Err(err_bad_operand("Mov", 0));
@@ -164,6 +175,7 @@ fn handle_mov(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_add(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Add", 0));
@@ -184,6 +196,7 @@ fn handle_add(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_sub(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Sub", 0));
@@ -494,6 +507,7 @@ fn handle_shift_right_logical(
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_add_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("AddSmi", 0));
@@ -515,6 +529,7 @@ fn handle_add_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_sub_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("SubSmi", 0));
@@ -703,6 +718,7 @@ fn handle_shift_right_logical_smi(
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_inc(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<DispatchAction> {
     // operands[0] is a FeedbackSlot, ignored at runtime.
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
@@ -714,6 +730,7 @@ fn handle_inc(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<D
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_dec(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<DispatchAction> {
     // operands[0] is a FeedbackSlot, ignored at runtime.
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
@@ -894,6 +911,7 @@ fn handle_to_boolean_logical_not(
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_jump(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::JumpOffset(delta) = instr.operands[0] else {
         return Err(err_bad_operand("Jump", 0));
@@ -935,6 +953,7 @@ fn handle_jump_loop(
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_jump_if_true(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -953,6 +972,7 @@ fn handle_jump_if_true(
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_jump_if_false(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -971,6 +991,7 @@ fn handle_jump_if_false(
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_jump_if_to_boolean_true(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -989,6 +1010,7 @@ fn handle_jump_if_to_boolean_true(
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_jump_if_to_boolean_false(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -1097,6 +1119,7 @@ fn handle_jump_if_undefined_or_null(
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
 fn handle_return(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<DispatchAction> {
     Ok(DispatchAction::Return(ctx.frame.accumulator.clone()))
 }
@@ -4984,6 +5007,7 @@ fn handle_define_private_brand(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_unimplemented(
     _ctx: &mut DispatchContext,
     instr: &Instruction,
