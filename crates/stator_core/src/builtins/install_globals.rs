@@ -5167,17 +5167,22 @@ fn make_string() -> JsValue {
         "padStart".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            let target_len = args
+            let raw = args
                 .get(1)
                 .unwrap_or(&JsValue::Undefined)
                 .to_number()
-                .unwrap_or(0.0) as usize;
+                .unwrap_or(0.0);
+            let target_len = if raw.is_nan() || raw < 0.0 {
+                0usize
+            } else {
+                raw.min(usize::MAX as f64) as usize
+            };
             let pad = match args.get(2) {
                 Some(JsValue::Undefined) | None => None,
                 Some(v) => Some(v.to_js_string()?),
             };
             Ok(JsValue::String(
-                string_pad_start(&s, target_len, pad.as_deref()).into(),
+                string_pad_start(&s, target_len, pad.as_deref())?.into(),
             ))
         }),
     );
@@ -5187,17 +5192,22 @@ fn make_string() -> JsValue {
         "padEnd".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            let target_len = args
+            let raw = args
                 .get(1)
                 .unwrap_or(&JsValue::Undefined)
                 .to_number()
-                .unwrap_or(0.0) as usize;
+                .unwrap_or(0.0);
+            let target_len = if raw.is_nan() || raw < 0.0 {
+                0usize
+            } else {
+                raw.min(usize::MAX as f64) as usize
+            };
             let pad = match args.get(2) {
                 Some(JsValue::Undefined) | None => None,
                 Some(v) => Some(v.to_js_string()?),
             };
             Ok(JsValue::String(
-                string_pad_end(&s, target_len, pad.as_deref()).into(),
+                string_pad_end(&s, target_len, pad.as_deref())?.into(),
             ))
         }),
     );
