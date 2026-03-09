@@ -2051,12 +2051,7 @@ fn make_object() -> JsValue {
         native(|args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
             if let JsValue::PlainObject(map) = &obj {
-                let keys: Vec<String> = map.borrow().keys().cloned().collect();
-                let mut pm = map.borrow_mut();
-                for key in &keys {
-                    pm.set_writable(key, false);
-                    pm.set_configurable(key, false);
-                }
+                map.borrow_mut().freeze();
             }
             Ok(obj)
         }),
@@ -2068,11 +2063,7 @@ fn make_object() -> JsValue {
         native(|args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
             if let JsValue::PlainObject(map) = &obj {
-                let keys: Vec<String> = map.borrow().keys().cloned().collect();
-                let mut pm = map.borrow_mut();
-                for key in &keys {
-                    pm.set_configurable(key, false);
-                }
+                map.borrow_mut().seal();
             }
             Ok(obj)
         }),
@@ -2084,13 +2075,7 @@ fn make_object() -> JsValue {
         native(|args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined);
             match obj {
-                JsValue::PlainObject(map) => {
-                    let pm = map.borrow();
-                    let frozen = pm
-                        .keys()
-                        .all(|k| !pm.is_writable(k) && !pm.is_configurable(k));
-                    Ok(JsValue::Boolean(frozen))
-                }
+                JsValue::PlainObject(map) => Ok(JsValue::Boolean(map.borrow().is_frozen())),
                 _ => Ok(JsValue::Boolean(true)),
             }
         }),
@@ -2102,29 +2087,50 @@ fn make_object() -> JsValue {
         native(|args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined);
             match obj {
-                JsValue::PlainObject(map) => {
-                    let pm = map.borrow();
-                    let sealed = pm.keys().all(|k| !pm.is_configurable(k));
-                    Ok(JsValue::Boolean(sealed))
-                }
+                JsValue::PlainObject(map) => Ok(JsValue::Boolean(map.borrow().is_sealed())),
                 _ => Ok(JsValue::Boolean(true)),
             }
         }),
     );
 
-    // ── Object.create(proto) ─────────────────────────────────────────────
+    // ── Object.create(proto, [propertiesObject]) ──────────────────────────
     props.insert(
         "create".into(),
         native(|args| {
-            let proto = args.first().unwrap_or(&JsValue::Undefined);
-            let mut obj = PropertyMap::new();
-            match proto {
-                JsValue::Null | JsValue::Undefined => {}
+            let proto = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let mut map = PropertyMap::new();
+            match &proto {
+                JsValue::Null => {
+                    // Object with null prototype — no __proto__
+                }
+                JsValue::PlainObject(_) => {
+                    map.insert("__proto__".to_string(), proto.clone());
+                }
+                JsValue::Undefined => {
+                    return Err(StatorError::TypeError(
+                        "Object prototype may only be an Object or null".to_string(),
+                    ));
+                }
                 _ => {
-                    obj.insert("__proto__".to_string(), proto.clone());
+                    map.insert("__proto__".to_string(), proto.clone());
                 }
             }
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            // Handle second argument (property descriptors)
+            if let Some(JsValue::PlainObject(desc_obj)) = args.get(1) {
+                let borrow = desc_obj.borrow();
+                for key in borrow.keys() {
+                    if key.starts_with("__") {
+                        continue;
+                    }
+                    if let Some(JsValue::PlainObject(desc)) = borrow.get(key) {
+                        let desc_borrow = desc.borrow();
+                        if let Some(value) = desc_borrow.get("value") {
+                            map.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+            }
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(map))))
         }),
     );
 
@@ -2306,7 +2312,9 @@ fn make_object() -> JsValue {
         "preventExtensions".into(),
         native(|args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
-            // Per spec, return the object itself.
+            if let JsValue::PlainObject(map) = &obj {
+                map.borrow_mut().extensible = false;
+            }
             Ok(obj)
         }),
     );
@@ -2317,8 +2325,7 @@ fn make_object() -> JsValue {
         native(|args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined);
             match obj {
-                // Non-objects are not extensible per spec.
-                JsValue::PlainObject(_) => Ok(JsValue::Boolean(true)),
+                JsValue::PlainObject(map) => Ok(JsValue::Boolean(map.borrow().extensible)),
                 _ => Ok(JsValue::Boolean(false)),
             }
         }),

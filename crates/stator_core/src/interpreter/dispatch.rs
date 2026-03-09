@@ -3588,7 +3588,10 @@ fn handle_test_instance_of(
 
         type BuiltinCheck = (&'static str, fn(&JsValue) -> bool);
         let builtin_checks: &[BuiltinCheck] = &[
-            ("Array", |v| matches!(v, JsValue::Array(_))),
+            ("Array", |v| {
+                matches!(v, JsValue::Array(_))
+                    || matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_array__").is_some())
+            }),
             ("Function", |v| {
                 matches!(v, JsValue::Function(_) | JsValue::NativeFunction(_))
             }),

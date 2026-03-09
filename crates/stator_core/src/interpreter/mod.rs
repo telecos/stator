@@ -3495,13 +3495,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         let keys: Vec<JsValue> = (0..a.borrow().len())
                             .map(|i| JsValue::Smi(i as i32))
                             .collect();
-                        Ok(JsValue::new_array(keys))
+                        Ok(JsValue::Iterator(NativeIterator::from_items(keys)))
                     }));
                 }
                 "values" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |_args| {
-                        Ok(JsValue::Array(Rc::clone(&a)))
+                        let items = a.borrow().clone();
+                        Ok(JsValue::Iterator(NativeIterator::from_items(items)))
                     }));
                 }
                 "entries" => {
@@ -3515,7 +3516,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 JsValue::new_array(vec![JsValue::Smi(i as i32), v.clone()])
                             })
                             .collect();
-                        Ok(JsValue::new_array(entries))
+                        Ok(JsValue::Iterator(NativeIterator::from_items(entries)))
+                    }));
+                }
+                "@@iterator" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        let items = a.borrow().clone();
+                        Ok(JsValue::Iterator(NativeIterator::from_items(items)))
                     }));
                 }
                 "at" => {
