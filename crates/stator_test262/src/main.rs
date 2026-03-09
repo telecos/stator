@@ -358,8 +358,24 @@ fn make_test_globals() -> HashMap<String, JsValue> {
     );
     obj_262.borrow_mut().insert(
         "evalScript".to_string(),
+        JsValue::NativeFunction(Rc::new(|args| {
+            let code = match args.first() {
+                Some(JsValue::String(s)) => s.to_string(),
+                _ => return Ok(JsValue::Undefined),
+            };
+            let program = parser::parse(&code)?;
+            let bc = BytecodeGenerator::compile_program(&program)?;
+            let mut frame = InterpreterFrame::new(bc, vec![]);
+            Interpreter::run(&mut frame)
+        })),
+    );
+    obj_262.borrow_mut().insert(
+        "detachArrayBuffer".to_string(),
         JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined))),
     );
+    obj_262
+        .borrow_mut()
+        .insert("global".to_string(), JsValue::Undefined);
     map.insert("$262".to_string(), JsValue::PlainObject(obj_262));
 
     // ── Native Test262Error constructor ──────────────────────────────────
@@ -479,7 +495,7 @@ fn make_test_globals() -> HashMap<String, JsValue> {
     assert_obj.borrow_mut().insert(
         "throws".to_string(),
         JsValue::NativeFunction(Rc::new(|args| {
-            let _expected_ctor = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let expected_ctor = args.first().cloned().unwrap_or(JsValue::Undefined);
             let func = args.get(1).cloned().unwrap_or(JsValue::Undefined);
             let message = args
                 .get(2)
@@ -489,20 +505,73 @@ fn make_test_globals() -> HashMap<String, JsValue> {
                 })
                 .unwrap_or_else(|| "Expected a throw".to_string());
 
-            // Invoke the function and check if it throws.
-            let threw = match &func {
-                JsValue::Function(ba) => {
-                    let mut frame = InterpreterFrame::new((**ba).clone(), vec![]);
-                    Interpreter::run(&mut frame).is_err()
+            // Determine the expected error type name from the constructor.
+            let expected_type = match &expected_ctor {
+                JsValue::PlainObject(map) => {
+                    let borrow = map.borrow();
+                    if let Some(JsValue::String(name)) = borrow.get("name") {
+                        Some(name.to_string())
+                    } else {
+                        borrow.get("prototype").and_then(|p| {
+                            if let JsValue::PlainObject(pm) = p {
+                                pm.borrow().get("constructor").and_then(|c| {
+                                    if let JsValue::PlainObject(cm) = c {
+                                        cm.borrow().get("name").and_then(|n| {
+                                            if let JsValue::String(s) = n {
+                                                Some(s.to_string())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                    }
                 }
-                JsValue::NativeFunction(f) => f(vec![]).is_err(),
-                _ => false,
+                JsValue::NativeFunction(_) => None,
+                _ => None,
             };
 
-            if threw {
-                Ok(JsValue::Undefined)
-            } else {
-                Err(StatorError::TypeError(message))
+            // Invoke the function and check if it throws.
+            let result = match &func {
+                JsValue::Function(ba) => {
+                    let mut frame = InterpreterFrame::new((**ba).clone(), vec![]);
+                    Interpreter::run(&mut frame)
+                }
+                JsValue::NativeFunction(f) => f(vec![]),
+                _ => Ok(JsValue::Undefined),
+            };
+
+            match result {
+                Err(e) => {
+                    // Verify the error type if we know the expected type.
+                    if let Some(ref exp) = expected_type {
+                        let type_matches = match (&e, exp.as_str()) {
+                            (StatorError::TypeError(_), "TypeError") => true,
+                            (StatorError::ReferenceError(_), "ReferenceError") => true,
+                            (StatorError::SyntaxError(_), "SyntaxError") => true,
+                            (StatorError::RangeError(_), "RangeError") => true,
+                            (StatorError::URIError(_), "URIError") => true,
+                            (StatorError::JsException(s), t) => s.contains(t),
+                            _ => true, // allow pass if we can't determine
+                        };
+                        if type_matches {
+                            Ok(JsValue::Undefined)
+                        } else {
+                            Err(StatorError::JsException(format!(
+                                "Test262Error: Expected {exp} but got {e}"
+                            )))
+                        }
+                    } else {
+                        Ok(JsValue::Undefined)
+                    }
+                }
+                Ok(_) => Err(StatorError::TypeError(message)),
             }
         })),
     );

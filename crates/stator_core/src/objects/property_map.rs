@@ -43,6 +43,12 @@ const DEFAULT_ATTRS: PropertyAttributes = PropertyAttributes::from_bits_truncate
         | PropertyAttributes::CONFIGURABLE.bits(),
 );
 
+/// Attributes for built-in methods per ES spec §10.4.7: writable,
+/// non-enumerable, configurable.
+const BUILTIN_ATTRS: PropertyAttributes = PropertyAttributes::from_bits_truncate(
+    PropertyAttributes::WRITABLE.bits() | PropertyAttributes::CONFIGURABLE.bits(),
+);
+
 /// Maximum number of entries in the inline property-name cache.
 ///
 /// Four entries fit comfortably in a single cache line and cover the vast
@@ -350,6 +356,36 @@ impl PropertyMap {
             if pos != self.keys.len() - 1 {
                 self.cache_invalidate();
             }
+        }
+    }
+
+    /// Insert a built-in method or constructor property (writable,
+    /// non-enumerable, configurable — per ES spec).
+    pub fn insert_builtin(&mut self, key: String, value: JsValue) {
+        if let Some(&i) = self.index.get(&key) {
+            self.values[i] = value;
+            self.attrs[i] = BUILTIN_ATTRS;
+        } else {
+            let pos = self.spec_insert_pos(&key);
+            self.index_shift_right(pos);
+            self.index.insert(key.clone(), pos);
+            self.keys.insert(pos, key);
+            self.values.insert(pos, value);
+            self.attrs.insert(pos, BUILTIN_ATTRS);
+            self.bump_shape_id();
+            if pos != self.keys.len() - 1 {
+                self.cache_invalidate();
+            }
+        }
+    }
+
+    /// Set all existing properties to non-enumerable.
+    ///
+    /// Called after populating built-in prototype objects whose methods
+    /// should not appear in `for…in` or `Object.keys()`.
+    pub fn make_all_non_enumerable(&mut self) {
+        for attr in &mut self.attrs {
+            attr.remove(PropertyAttributes::ENUMERABLE);
         }
     }
 

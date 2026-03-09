@@ -715,6 +715,7 @@ fn make_math() -> JsValue {
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -757,6 +758,7 @@ fn make_console() -> JsValue {
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -881,6 +883,7 @@ fn make_json() -> JsValue {
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -1031,6 +1034,7 @@ fn make_date() -> JsValue {
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -1663,6 +1667,7 @@ fn make_number() -> JsValue {
     );
     props.insert("NaN".into(), JsValue::HeapNumber(f64::NAN));
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -1679,8 +1684,20 @@ fn make_object() -> JsValue {
             if let JsValue::PlainObject(map) = val {
                 let keys: Vec<JsValue> = map
                     .borrow()
-                    .keys()
+                    .enumerable_keys()
+                    .filter(|k| !k.starts_with("__"))
                     .map(|k| JsValue::String(k.clone().into()))
+                    .collect();
+                Ok(JsValue::new_array(keys))
+            } else if let JsValue::Array(items) = val {
+                let len = items.borrow().len();
+                let keys: Vec<JsValue> = (0..len)
+                    .map(|i| JsValue::String(i.to_string().into()))
+                    .collect();
+                Ok(JsValue::new_array(keys))
+            } else if let JsValue::String(s) = val {
+                let keys: Vec<JsValue> = (0..s.len())
+                    .map(|i| JsValue::String(i.to_string().into()))
                     .collect();
                 Ok(JsValue::new_array(keys))
             } else {
@@ -1693,7 +1710,15 @@ fn make_object() -> JsValue {
         native(|args| {
             let val = args.first().unwrap_or(&JsValue::Undefined);
             if let JsValue::PlainObject(map) = val {
-                let values: Vec<JsValue> = map.borrow().iter().map(|(_, v)| v.clone()).collect();
+                let borrow = map.borrow();
+                let values: Vec<JsValue> = borrow
+                    .enumerable_keys()
+                    .filter(|k| !k.starts_with("__"))
+                    .filter_map(|k| borrow.get(k).cloned())
+                    .collect();
+                Ok(JsValue::new_array(values))
+            } else if let JsValue::Array(items) = val {
+                let values = items.borrow().clone();
                 Ok(JsValue::new_array(values))
             } else {
                 Ok(JsValue::new_array(vec![]))
@@ -1705,11 +1730,25 @@ fn make_object() -> JsValue {
         native(|args| {
             let val = args.first().unwrap_or(&JsValue::Undefined);
             if let JsValue::PlainObject(map) = val {
-                let entries: Vec<JsValue> = map
+                let borrow = map.borrow();
+                let entries: Vec<JsValue> = borrow
+                    .enumerable_keys()
+                    .filter(|k| !k.starts_with("__"))
+                    .filter_map(|k| {
+                        borrow
+                            .get(k)
+                            .cloned()
+                            .map(|v| JsValue::new_array(vec![JsValue::String(k.clone().into()), v]))
+                    })
+                    .collect();
+                Ok(JsValue::new_array(entries))
+            } else if let JsValue::Array(items) = val {
+                let entries: Vec<JsValue> = items
                     .borrow()
                     .iter()
-                    .map(|(k, v)| {
-                        JsValue::new_array(vec![JsValue::String(k.clone().into()), v.clone()])
+                    .enumerate()
+                    .map(|(i, v)| {
+                        JsValue::new_array(vec![JsValue::String(i.to_string().into()), v.clone()])
                     })
                     .collect();
                 Ok(JsValue::new_array(entries))
@@ -1794,53 +1833,117 @@ fn make_object() -> JsValue {
 
             let key = prop.to_js_string()?;
 
-            if let JsValue::PlainObject(map) = obj {
-                let borrowed = map.borrow();
-                // Check for accessor property first
-                let getter_key = format!("__get_{key}__");
-                let setter_key = format!("__set_{key}__");
-                let has_getter = borrowed.contains_key(&getter_key);
-                let has_setter = borrowed.contains_key(&setter_key);
-                if has_getter || has_setter {
-                    let mut desc = PropertyMap::new();
-                    desc.insert(
-                        "get".into(),
-                        borrowed
-                            .get(&getter_key)
-                            .cloned()
-                            .unwrap_or(JsValue::Undefined),
-                    );
-                    desc.insert(
-                        "set".into(),
-                        borrowed
-                            .get(&setter_key)
-                            .cloned()
-                            .unwrap_or(JsValue::Undefined),
-                    );
-                    desc.insert("enumerable".into(), JsValue::Boolean(true));
-                    desc.insert("configurable".into(), JsValue::Boolean(true));
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(desc))))
-                } else if let Some(value) = borrowed.get(&key) {
-                    let mut desc = PropertyMap::new();
-                    desc.insert("value".into(), value.clone());
-                    desc.insert(
-                        "writable".into(),
-                        JsValue::Boolean(borrowed.is_writable(&key)),
-                    );
-                    desc.insert(
-                        "enumerable".into(),
-                        JsValue::Boolean(borrowed.is_enumerable(&key)),
-                    );
-                    desc.insert(
-                        "configurable".into(),
-                        JsValue::Boolean(borrowed.is_configurable(&key)),
-                    );
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(desc))))
-                } else {
-                    Ok(JsValue::Undefined)
+            // Helper to build a data descriptor.
+            fn data_desc(
+                value: JsValue,
+                writable: bool,
+                enumerable: bool,
+                configurable: bool,
+            ) -> JsValue {
+                let mut desc = PropertyMap::new();
+                desc.insert("value".into(), value);
+                desc.insert("writable".into(), JsValue::Boolean(writable));
+                desc.insert("enumerable".into(), JsValue::Boolean(enumerable));
+                desc.insert("configurable".into(), JsValue::Boolean(configurable));
+                JsValue::PlainObject(Rc::new(RefCell::new(desc)))
+            }
+
+            match obj {
+                JsValue::PlainObject(map) => {
+                    let borrowed = map.borrow();
+                    // Check for accessor property first
+                    let getter_key = format!("__get_{key}__");
+                    let setter_key = format!("__set_{key}__");
+                    let has_getter = borrowed.contains_key(&getter_key);
+                    let has_setter = borrowed.contains_key(&setter_key);
+                    if has_getter || has_setter {
+                        let mut desc = PropertyMap::new();
+                        desc.insert(
+                            "get".into(),
+                            borrowed
+                                .get(&getter_key)
+                                .cloned()
+                                .unwrap_or(JsValue::Undefined),
+                        );
+                        desc.insert(
+                            "set".into(),
+                            borrowed
+                                .get(&setter_key)
+                                .cloned()
+                                .unwrap_or(JsValue::Undefined),
+                        );
+                        desc.insert(
+                            "enumerable".into(),
+                            JsValue::Boolean(borrowed.is_enumerable(&key)),
+                        );
+                        desc.insert(
+                            "configurable".into(),
+                            JsValue::Boolean(borrowed.is_configurable(&key)),
+                        );
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(desc))))
+                    } else if let Some(value) = borrowed.get(&key) {
+                        Ok(data_desc(
+                            value.clone(),
+                            borrowed.is_writable(&key),
+                            borrowed.is_enumerable(&key),
+                            borrowed.is_configurable(&key),
+                        ))
+                    } else {
+                        Ok(JsValue::Undefined)
+                    }
                 }
-            } else {
-                Ok(JsValue::Undefined)
+                JsValue::Array(items) => {
+                    if key == "length" {
+                        Ok(data_desc(
+                            JsValue::Smi(items.borrow().len() as i32),
+                            true,
+                            false,
+                            false,
+                        ))
+                    } else if let Ok(idx) = key.parse::<usize>() {
+                        let borrow = items.borrow();
+                        if idx < borrow.len() {
+                            Ok(data_desc(borrow[idx].clone(), true, true, true))
+                        } else {
+                            Ok(JsValue::Undefined)
+                        }
+                    } else {
+                        Ok(JsValue::Undefined)
+                    }
+                }
+                JsValue::Function(ba) => {
+                    if key == "length" {
+                        Ok(data_desc(
+                            JsValue::Smi(ba.parameter_count() as i32),
+                            false,
+                            false,
+                            true,
+                        ))
+                    } else if key == "name" {
+                        Ok(data_desc(JsValue::String("".into()), false, false, true))
+                    } else {
+                        Ok(JsValue::Undefined)
+                    }
+                }
+                JsValue::String(s) => {
+                    if key == "length" {
+                        Ok(data_desc(JsValue::Smi(s.len() as i32), false, false, false))
+                    } else if let Ok(idx) = key.parse::<usize>() {
+                        if idx < s.len() {
+                            let ch: String = s
+                                .chars()
+                                .nth(idx)
+                                .map(|c| c.to_string())
+                                .unwrap_or_default();
+                            Ok(data_desc(JsValue::String(ch.into()), false, true, false))
+                        } else {
+                            Ok(JsValue::Undefined)
+                        }
+                    } else {
+                        Ok(JsValue::Undefined)
+                    }
+                }
+                _ => Ok(JsValue::Undefined),
             }
         }),
     );
@@ -1881,8 +1984,16 @@ fn make_object() -> JsValue {
                 let keys: Vec<JsValue> = map
                     .borrow()
                     .keys()
+                    .filter(|k| !k.starts_with("__"))
                     .map(|k| JsValue::String(k.clone().into()))
                     .collect();
+                Ok(JsValue::new_array(keys))
+            } else if let JsValue::Array(items) = obj {
+                let len = items.borrow().len();
+                let mut keys: Vec<JsValue> = (0..len)
+                    .map(|i| JsValue::String(i.to_string().into()))
+                    .collect();
+                keys.push(JsValue::String("length".into()));
                 Ok(JsValue::new_array(keys))
             } else {
                 Ok(JsValue::new_array(vec![]))
@@ -1898,11 +2009,31 @@ fn make_object() -> JsValue {
 
             if let JsValue::PlainObject(target_map) = &target {
                 for source in args.iter().skip(1) {
-                    if let JsValue::PlainObject(src_map) = source {
-                        let src = src_map.borrow();
-                        for (k, v) in src.iter() {
-                            target_map.borrow_mut().insert(k.clone(), v.clone());
+                    match source {
+                        JsValue::PlainObject(src_map) => {
+                            let src = src_map.borrow();
+                            for k in src.enumerable_keys() {
+                                if !k.starts_with("__")
+                                    && let Some(v) = src.get(k)
+                                {
+                                    target_map.borrow_mut().insert(k.clone(), v.clone());
+                                }
+                            }
                         }
+                        JsValue::Array(items) => {
+                            let borrow = items.borrow();
+                            for (i, v) in borrow.iter().enumerate() {
+                                target_map.borrow_mut().insert(i.to_string(), v.clone());
+                            }
+                        }
+                        JsValue::String(s) => {
+                            for (i, ch) in s.chars().enumerate() {
+                                target_map
+                                    .borrow_mut()
+                                    .insert(i.to_string(), JsValue::String(ch.to_string().into()));
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Ok(target)
@@ -2292,11 +2423,13 @@ fn make_object() -> JsValue {
         }),
     );
 
+    obj_proto.make_all_non_enumerable();
     props.insert(
         "prototype".into(),
         JsValue::PlainObject(Rc::new(RefCell::new(obj_proto))),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -3258,11 +3391,13 @@ fn make_array() -> JsValue {
         }),
     );
 
+    proto.make_all_non_enumerable();
     props.insert(
         "prototype".into(),
         JsValue::PlainObject(Rc::new(RefCell::new(proto))),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 // ── Symbol constructor ────────────────────────────────────────────────────────────
@@ -3393,6 +3528,7 @@ fn make_symbol() -> JsValue {
         // Symbol.prototype[@@toStringTag] = "Symbol"
         proto.insert("@@toStringTag".into(), JsValue::String("Symbol".into()));
 
+        proto.make_all_non_enumerable();
         props.insert(
             "prototype".into(),
             JsValue::PlainObject(Rc::new(RefCell::new(proto))),
@@ -3415,6 +3551,7 @@ fn make_symbol() -> JsValue {
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -3871,6 +4008,7 @@ fn make_map_builtin() -> JsValue {
                     }),
                 );
             }
+            obj.make_all_non_enumerable();
             Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
         }),
     );
@@ -3969,6 +4107,7 @@ fn make_map_builtin() -> JsValue {
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -4211,10 +4350,12 @@ fn make_set_builtin() -> JsValue {
                     }),
                 );
             }
+            obj.make_all_non_enumerable();
             Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -4303,10 +4444,12 @@ fn make_weak_map_builtin() -> JsValue {
                 );
             }
 
+            obj.make_all_non_enumerable();
             Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -4378,10 +4521,12 @@ fn make_weak_set_builtin() -> JsValue {
                 );
             }
 
+            obj.make_all_non_enumerable();
             Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -4420,10 +4565,12 @@ fn make_weak_ref_builtin() -> JsValue {
                 );
             }
 
+            obj.make_all_non_enumerable();
             Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -4565,10 +4712,12 @@ fn make_finalization_registry_builtin() -> JsValue {
                 );
             }
 
+            obj.make_all_non_enumerable();
             Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -4687,11 +4836,13 @@ fn make_function() -> JsValue {
     // Function.name = "Function"
     props.insert("name".into(), JsValue::String("Function".into()));
 
+    proto.make_all_non_enumerable();
     props.insert(
         "prototype".into(),
         JsValue::PlainObject(Rc::new(RefCell::new(proto))),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -5491,11 +5642,13 @@ fn make_string() -> JsValue {
         }),
     );
 
+    proto.make_all_non_enumerable();
     props.insert(
         "prototype".into(),
         JsValue::PlainObject(Rc::new(RefCell::new(proto))),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -5758,6 +5911,7 @@ fn make_promise() -> JsValue {
         );
     }
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -5780,6 +5934,7 @@ fn make_regexp() -> JsValue {
     props.insert("leftContext".into(), JsValue::String(String::new().into()));
     props.insert("rightContext".into(), JsValue::String(String::new().into()));
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -5895,6 +6050,7 @@ fn make_bigint() -> JsValue {
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -6841,6 +6997,7 @@ fn make_reflect() -> JsValue {
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -7186,6 +7343,7 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -7776,6 +7934,7 @@ fn make_typed_array_instance(
     // Store the TypedArray value for identity purposes.
     obj.insert("__typed_array__".into(), typed_array_val);
 
+    obj.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(obj)))
 }
 
