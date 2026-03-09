@@ -14,9 +14,12 @@
 //! This initial implementation uses Rust standard library formatting and
 //! returns reasonable en-US results.  Full ICU (icu4x) support is deferred.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::rc::Rc;
 
 use crate::error::StatorResult;
+use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 
 // ── NumberFormat ──────────────────────────────────────────────────────────────
@@ -177,6 +180,29 @@ pub fn locale_base_name(tag: &str) -> String {
     tag.to_string()
 }
 
+// ── formatToParts helpers ────────────────────────────────────────────────────
+
+/// Create a `{type, value}` part as a `JsValue::PlainObject`.
+fn make_part(part_type: &str, value: &str) -> JsValue {
+    let mut part = PropertyMap::new();
+    part.insert("type".into(), JsValue::String(part_type.to_string().into()));
+    part.insert("value".into(), JsValue::String(value.to_string().into()));
+    JsValue::PlainObject(Rc::new(RefCell::new(part)))
+}
+
+/// Split an already-formatted number string into integer/decimal/fraction parts.
+fn integer_fraction_parts(formatted: &str) -> Vec<JsValue> {
+    if let Some(dot_pos) = formatted.find('.') {
+        vec![
+            make_part("integer", &formatted[..dot_pos]),
+            make_part("decimal", "."),
+            make_part("fraction", &formatted[dot_pos + 1..]),
+        ]
+    } else {
+        vec![make_part("integer", formatted)]
+    }
+}
+
 // ── JsValue helpers ──────────────────────────────────────────────────────────
 
 /// Convert a numeric `JsValue` to the formatted string produced by
@@ -224,6 +250,54 @@ pub fn relative_time_format_js(args: &[JsValue]) -> StatorResult<JsValue> {
     let value = args.first().unwrap_or(&JsValue::Undefined).to_number()?;
     let unit = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
     Ok(JsValue::String(relative_time_format(value, &unit).into()))
+}
+
+/// `Intl.NumberFormat.prototype.formatToParts` — returns an array of `{type, value}` parts.
+pub fn number_format_to_parts_js(args: &[JsValue]) -> StatorResult<JsValue> {
+    let n = args.first().unwrap_or(&JsValue::Undefined).to_number()?;
+    let parts = if n.is_nan() {
+        vec![make_part("nan", "NaN")]
+    } else if n.is_infinite() {
+        if n.is_sign_positive() {
+            vec![make_part("infinity", "∞")]
+        } else {
+            vec![make_part("minusSign", "-"), make_part("infinity", "∞")]
+        }
+    } else if n < 0.0 {
+        let abs = number_format(n.abs());
+        let mut p = vec![make_part("minusSign", "-")];
+        p.extend(integer_fraction_parts(&abs));
+        p
+    } else {
+        integer_fraction_parts(&number_format(n))
+    };
+    Ok(JsValue::new_array(parts))
+}
+
+/// `Intl.DateTimeFormat.prototype.formatToParts` — returns an array of `{type, value}` parts.
+pub fn date_time_format_to_parts_js(args: &[JsValue]) -> StatorResult<JsValue> {
+    let ms = args.first().unwrap_or(&JsValue::Undefined).to_number()?;
+    if ms.is_nan() || ms.is_infinite() {
+        return Ok(JsValue::new_array(vec![]));
+    }
+    let secs = (ms / 1000.0).trunc() as i64;
+    let (year, month, day, hour, min, sec) = epoch_to_components(secs);
+    let parts = vec![
+        make_part("month", &format!("{month}")),
+        make_part("literal", "/"),
+        make_part("day", &format!("{day}")),
+        make_part("literal", "/"),
+        make_part("year", &format!("{year}")),
+        make_part("literal", ", "),
+        make_part("hour", &format!("{hour}")),
+        make_part("literal", ":"),
+        make_part("minute", &format!("{min:02}")),
+        make_part("literal", ":"),
+        make_part("second", &format!("{sec:02}")),
+        make_part("literal", " "),
+        make_part("dayPeriod", "AM"),
+    ];
+    Ok(JsValue::new_array(parts))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
