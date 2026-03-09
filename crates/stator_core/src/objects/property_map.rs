@@ -11,7 +11,12 @@
 //! cache-friendly iteration and O(1) slot-based access.  A secondary
 //! `HashMap<String, usize>` maps property names to slot indices for
 //! efficient lookup.
+//!
+//! An [`INLINE_CACHE_CAP`]-entry inline cache of recently accessed property
+//! names sits in front of the `HashMap` to avoid hash-table probing on
+//! repeated lookups of the same hot property names.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use crate::objects::map::PropertyAttributes;
@@ -25,12 +30,38 @@ const DEFAULT_ATTRS: PropertyAttributes = PropertyAttributes::from_bits_truncate
         | PropertyAttributes::CONFIGURABLE.bits(),
 );
 
+/// Maximum number of entries in the inline property-name cache.
+///
+/// Four entries fit comfortably in a single cache line and cover the vast
+/// majority of tight property-access loops in typical JavaScript code.
+const INLINE_CACHE_CAP: usize = 4;
+
+/// Cheap 64-bit FNV-1a hash for inline-cache probing.
+///
+/// This is intentionally *not* `SipHash`: it trades collision resistance for
+/// raw speed on the short property names typical of JavaScript.
+#[inline]
+fn name_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
 /// A map of named properties with ECMAScript attribute flags.
 ///
 /// Property values are stored in a flat `Vec` for cache-friendly iteration
 /// and O(1) slot-based access.  The `index` HashMap provides O(1) name
 /// lookups into the flat storage.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// An [`INLINE_CACHE_CAP`]-entry inline cache of recently accessed property
+/// name hashes sits in front of the `HashMap` to avoid hash-table probing
+/// on repeated lookups of the same hot property names.  The cache uses
+/// [`Cell`]-based interior mutability so that read-only (`&self`) lookups
+/// can still populate the cache.
+#[derive(Debug, Clone)]
 pub struct PropertyMap {
     /// Property names in insertion order.
     keys: Vec<String>,
@@ -40,6 +71,23 @@ pub struct PropertyMap {
     attrs: Vec<PropertyAttributes>,
     /// Name → slot-index mapping for O(1) lookup.
     index: HashMap<String, usize>,
+    /// Inline cache: FNV-1a hashes of recently accessed property names.
+    cache_hashes: [Cell<u64>; INLINE_CACHE_CAP],
+    /// Inline cache: corresponding slot indices for `cache_hashes`.
+    cache_slots: [Cell<u32>; INLINE_CACHE_CAP],
+    /// Number of valid entries in the inline cache (0..=INLINE_CACHE_CAP).
+    cache_len: Cell<u8>,
+    /// Circular replacement cursor into the cache arrays.
+    cache_cursor: Cell<u8>,
+}
+
+impl PartialEq for PropertyMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.keys == other.keys
+            && self.values == other.values
+            && self.attrs == other.attrs
+            && self.index == other.index
+    }
 }
 
 impl PropertyMap {
@@ -50,6 +98,10 @@ impl PropertyMap {
             values: Vec::new(),
             attrs: Vec::new(),
             index: HashMap::new(),
+            cache_hashes: Default::default(),
+            cache_slots: Default::default(),
+            cache_len: Cell::new(0),
+            cache_cursor: Cell::new(0),
         }
     }
 
@@ -60,23 +112,87 @@ impl PropertyMap {
             values: Vec::with_capacity(capacity),
             attrs: Vec::with_capacity(capacity),
             index: HashMap::with_capacity(capacity),
+            cache_hashes: Default::default(),
+            cache_slots: Default::default(),
+            cache_len: Cell::new(0),
+            cache_cursor: Cell::new(0),
         }
+    }
+
+    // ── Inline cache helpers ──────────────────────────────────────────────
+
+    /// Probes the inline cache for `key`, returning its slot index on hit.
+    #[inline]
+    fn cache_probe(&self, key: &str) -> Option<usize> {
+        let h = name_hash(key);
+        let len = self.cache_len.get() as usize;
+        for i in 0..len {
+            if self.cache_hashes[i].get() == h {
+                let slot = self.cache_slots[i].get() as usize;
+                // Verify against the canonical key to guard against hash
+                // collisions (extremely rare but must be handled).
+                if slot < self.keys.len() && self.keys[slot] == key {
+                    return Some(slot);
+                }
+            }
+        }
+        None
+    }
+
+    /// Records a `(key, slot)` pair in the inline cache.
+    #[inline]
+    fn cache_record(&self, key: &str, slot: usize) {
+        let h = name_hash(key);
+        let len = self.cache_len.get() as usize;
+        if len < INLINE_CACHE_CAP {
+            self.cache_hashes[len].set(h);
+            self.cache_slots[len].set(slot as u32);
+            self.cache_len.set((len + 1) as u8);
+        } else {
+            let cursor = self.cache_cursor.get() as usize;
+            self.cache_hashes[cursor].set(h);
+            self.cache_slots[cursor].set(slot as u32);
+            self.cache_cursor
+                .set(((cursor + 1) % INLINE_CACHE_CAP) as u8);
+        }
+    }
+
+    /// Invalidates all inline cache entries.
+    #[inline]
+    fn cache_invalidate(&self) {
+        self.cache_len.set(0);
+        self.cache_cursor.set(0);
     }
 
     // ── HashMap-compatible API ────────────────────────────────────────────
 
     /// Returns the value for `key`, ignoring attributes.
     pub fn get(&self, key: &str) -> Option<&JsValue> {
-        self.index.get(key).map(|&i| &self.values[i])
+        if let Some(slot) = self.cache_probe(key) {
+            return Some(&self.values[slot]);
+        }
+        self.index.get(key).map(|&i| {
+            self.cache_record(key, i);
+            &self.values[i]
+        })
     }
 
     /// Returns a clone of the value for `key`, ignoring attributes.
     pub fn get_cloned(&self, key: &str) -> Option<JsValue> {
-        self.index.get(key).map(|&i| self.values[i].clone())
+        if let Some(slot) = self.cache_probe(key) {
+            return Some(self.values[slot].clone());
+        }
+        self.index.get(key).map(|&i| {
+            self.cache_record(key, i);
+            self.values[i].clone()
+        })
     }
 
     /// Returns `true` if the map contains an entry for `key`.
     pub fn contains_key(&self, key: &str) -> bool {
+        if self.cache_probe(key).is_some() {
+            return true;
+        }
         self.index.contains_key(key)
     }
 
@@ -111,6 +227,8 @@ impl PropertyMap {
             self.keys.pop();
             self.values.pop();
             self.attrs.pop();
+            // Invalidate cache: swap-remove may have changed slot indices.
+            self.cache_invalidate();
             Some(val)
         } else {
             None
@@ -141,9 +259,13 @@ impl PropertyMap {
 
     /// Returns the value and attribute flags for `key`.
     pub fn get_with_attrs(&self, key: &str) -> Option<(&JsValue, PropertyAttributes)> {
-        self.index
-            .get(key)
-            .map(|&i| (&self.values[i], self.attrs[i]))
+        if let Some(slot) = self.cache_probe(key) {
+            return Some((&self.values[slot], self.attrs[slot]));
+        }
+        self.index.get(key).map(|&i| {
+            self.cache_record(key, i);
+            (&self.values[i], self.attrs[i])
+        })
     }
 
     /// Inserts a property with explicit attribute flags.
@@ -173,6 +295,9 @@ impl PropertyMap {
 
     /// Returns the attribute flags for `key`, or `None` if absent.
     pub fn attrs(&self, key: &str) -> Option<PropertyAttributes> {
+        if let Some(slot) = self.cache_probe(key) {
+            return Some(self.attrs[slot]);
+        }
         self.index.get(key).map(|&i| self.attrs[i])
     }
 
@@ -389,5 +514,101 @@ mod tests {
     fn test_with_capacity() {
         let pm = PropertyMap::with_capacity(16);
         assert!(pm.is_empty());
+    }
+
+    // ── Inline cache tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_cache_populated_on_get() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        pm.insert("y".to_string(), JsValue::Smi(2));
+
+        // First access populates the cache.
+        assert_eq!(pm.get("x"), Some(&JsValue::Smi(1)));
+        assert_eq!(pm.cache_len.get(), 1);
+
+        // Second access of same key hits the cache.
+        assert_eq!(pm.get("x"), Some(&JsValue::Smi(1)));
+        assert_eq!(pm.cache_len.get(), 1); // no new entry
+
+        // Different key adds another cache entry.
+        assert_eq!(pm.get("y"), Some(&JsValue::Smi(2)));
+        assert_eq!(pm.cache_len.get(), 2);
+    }
+
+    #[test]
+    fn test_cache_invalidated_on_remove() {
+        let mut pm = PropertyMap::new();
+        pm.insert("a".to_string(), JsValue::Smi(1));
+        pm.insert("b".to_string(), JsValue::Smi(2));
+
+        // Populate cache.
+        assert_eq!(pm.get("a"), Some(&JsValue::Smi(1)));
+        assert_eq!(pm.cache_len.get(), 1);
+
+        // Remove invalidates cache.
+        pm.remove("a");
+        assert_eq!(pm.cache_len.get(), 0);
+    }
+
+    #[test]
+    fn test_cache_wraps_around() {
+        let mut pm = PropertyMap::new();
+        for i in 0..6 {
+            pm.insert(format!("k{i}"), JsValue::Smi(i));
+        }
+        // Access 6 keys: first 4 fill the cache, next 2 replace via cursor.
+        for i in 0..6 {
+            assert_eq!(pm.get(&format!("k{i}")), Some(&JsValue::Smi(i)));
+        }
+        assert_eq!(pm.cache_len.get(), INLINE_CACHE_CAP as u8);
+        // All lookups should still work (cache or HashMap fallback).
+        for i in 0..6 {
+            assert_eq!(pm.get(&format!("k{i}")), Some(&JsValue::Smi(i)));
+        }
+    }
+
+    #[test]
+    fn test_cache_contains_key_fast_path() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        // Populate cache via get.
+        let _ = pm.get("x");
+        // contains_key should hit the cache.
+        assert!(pm.contains_key("x"));
+        assert!(!pm.contains_key("missing"));
+    }
+
+    #[test]
+    fn test_cache_get_with_attrs_fast_path() {
+        let mut pm = PropertyMap::new();
+        pm.insert_with_attrs(
+            "p".to_string(),
+            JsValue::Smi(42),
+            PropertyAttributes::WRITABLE | PropertyAttributes::ENUMERABLE,
+        );
+        // First call: populates cache.
+        let (val, attrs) = pm.get_with_attrs("p").unwrap();
+        assert_eq!(val, &JsValue::Smi(42));
+        assert!(attrs.contains(PropertyAttributes::WRITABLE));
+        // Second call: should hit cache.
+        let (val2, attrs2) = pm.get_with_attrs("p").unwrap();
+        assert_eq!(val2, &JsValue::Smi(42));
+        assert_eq!(attrs, attrs2);
+    }
+
+    #[test]
+    fn test_cache_equality_ignores_cache_state() {
+        let mut pm1 = PropertyMap::new();
+        let mut pm2 = PropertyMap::new();
+        pm1.insert("x".to_string(), JsValue::Smi(1));
+        pm2.insert("x".to_string(), JsValue::Smi(1));
+        // pm1 has a populated cache, pm2 does not.
+        let _ = pm1.get("x");
+        assert_eq!(pm1.cache_len.get(), 1);
+        assert_eq!(pm2.cache_len.get(), 0);
+        // They should still be equal.
+        assert_eq!(pm1, pm2);
     }
 }
