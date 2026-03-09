@@ -2224,7 +2224,21 @@ fn handle_get_async_iterator(
         }
         JsValue::String(ref s) => JsValue::Iterator(NativeIterator::from_string(s)),
         JsValue::Generator(_) | JsValue::Iterator(_) => iterable,
-        // PlainObject with @@iterator → call it to get the iterator.
+        // PlainObject with @@asyncIterator → call it first (§27.1.4.2).
+        JsValue::PlainObject(ref map) if map.borrow().contains_key("@@asyncIterator") => {
+            let iter_fn = map.borrow().get("@@asyncIterator").cloned();
+            match iter_fn {
+                Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
+                    dispatch_call_value(f, vec![])?
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "GetAsyncIterator: @@asyncIterator is not a function".into(),
+                    ));
+                }
+            }
+        }
+        // Fall back to @@iterator (sync iterator wrapped for async).
         JsValue::PlainObject(ref map) if map.borrow().contains_key("@@iterator") => {
             let iter_fn = map.borrow().get("@@iterator").cloned();
             match iter_fn {

@@ -137,6 +137,29 @@ fn native(f: impl Fn(Vec<JsValue>) -> StatorResult<JsValue> + 'static) -> JsValu
     JsValue::NativeFunction(Rc::new(f))
 }
 
+/// ECMAScript §23.1.3.1 step 5.b — check `@@isConcatSpreadable`.
+///
+/// Returns `true` when the value should be spread by `Array.prototype.concat`:
+/// arrays are spreadable by default unless `@@isConcatSpreadable` is `false`;
+/// other objects are spreadable only when `@@isConcatSpreadable` is `true`.
+fn is_concat_spreadable(value: &JsValue) -> bool {
+    match value {
+        JsValue::PlainObject(map) => match map.borrow().get("@@isConcatSpreadable").cloned() {
+            Some(v) => v.to_boolean(),
+            None => false,
+        },
+        JsValue::Array(items) => {
+            // If the array was wrapped in an object with @@isConcatSpreadable,
+            // we can't see it here.  Bare arrays are always spreadable unless
+            // they carry an internal property override — our representation
+            // does not support per-value internal slots, so default to `true`.
+            let _ = items;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// If `value` is a RegExp `PlainObject` (has `__is_regexp__`), invoke the
 /// given `__symbol_*__` method with the supplied arguments and return the
 /// result.  Otherwise return `None` so the caller can fall through to the
@@ -2425,7 +2448,7 @@ fn make_array() -> JsValue {
         }),
     );
 
-    // concat(...arrays)
+    // concat(...arrays) — §23.1.3.1, respects @@isConcatSpreadable
     proto.insert(
         "concat".into(),
         native(|args| {
@@ -2436,8 +2459,27 @@ fn make_array() -> JsValue {
                 Vec::new()
             };
             for other in args.iter().skip(1) {
-                if let JsValue::Array(items) = other {
-                    result.extend(items.borrow().iter().cloned());
+                if is_concat_spreadable(other) {
+                    match other {
+                        JsValue::Array(items) => {
+                            result.extend(items.borrow().iter().cloned());
+                        }
+                        JsValue::PlainObject(map) => {
+                            let borrow = map.borrow();
+                            let len = borrow
+                                .get("length")
+                                .and_then(|v| v.to_number().ok())
+                                .unwrap_or(0.0) as usize;
+                            for i in 0..len {
+                                if let Some(v) = borrow.get(&i.to_string()) {
+                                    result.push(v.clone());
+                                } else {
+                                    result.push(JsValue::Undefined);
+                                }
+                            }
+                        }
+                        _ => result.push(other.clone()),
+                    }
                 } else {
                     result.push(other.clone());
                 }
@@ -3270,10 +3312,7 @@ fn make_symbol() -> JsValue {
         );
 
         // Symbol.prototype[@@toStringTag] = "Symbol"
-        proto.insert(
-            format!("Symbol({})", SYMBOL_TO_STRING_TAG),
-            JsValue::String("Symbol".into()),
-        );
+        proto.insert("@@toStringTag".into(), JsValue::String("Symbol".into()));
 
         props.insert(
             "prototype".into(),
