@@ -37,7 +37,9 @@ use crate::builtins::date::{
 use crate::builtins::error::{ErrorKind, JsError};
 use crate::builtins::finalization_registry::{
     finalization_registry_drain, finalization_registry_new, finalization_registry_notify,
-    finalization_registry_register, finalization_registry_unregister,
+    finalization_registry_register, finalization_registry_register_plain,
+    finalization_registry_sweep_plain, finalization_registry_unregister,
+    finalization_registry_unregister_plain,
 };
 use crate::builtins::function::{
     function_apply, function_bind, function_call, function_constructor, function_has_instance,
@@ -122,7 +124,7 @@ use crate::builtins::typed_array::{
 use crate::builtins::weak_map::{
     weak_map_delete, weak_map_get, weak_map_has, weak_map_new, weak_map_set,
 };
-use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new};
+use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new, weak_ref_new_plain};
 use crate::builtins::weak_set::{weak_set_add, weak_set_delete, weak_set_has, weak_set_new};
 use crate::error::{StatorError, StatorResult};
 use crate::objects::js_object::JsObject;
@@ -4337,25 +4339,28 @@ fn make_weak_ref_builtin() -> JsValue {
         "__call__".into(),
         native(|args| {
             let target = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Object(ptr) = target {
-                let inner = Rc::new(RefCell::new(weak_ref_new(*ptr)?));
-                let mut obj = PropertyMap::new();
-
-                // deref()
-                {
-                    let inner = Rc::clone(&inner);
-                    obj.insert(
-                        "deref".into(),
-                        native(move |_a| Ok(weak_ref_deref(&inner.borrow()))),
-                    );
+            let wr = match target {
+                JsValue::Object(ptr) => weak_ref_new(*ptr)?,
+                JsValue::PlainObject(rc) => weak_ref_new_plain(rc),
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "WeakRef target must be an object".into(),
+                    ));
                 }
+            };
+            let inner = Rc::new(RefCell::new(wr));
+            let mut obj = PropertyMap::new();
 
-                Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
-            } else {
-                Err(StatorError::TypeError(
-                    "WeakRef target must be an object".into(),
-                ))
+            // deref()
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "deref".into(),
+                    native(move |_a| Ok(weak_ref_deref(&inner.borrow()))),
+                );
             }
+
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
         }),
     );
 
@@ -4397,27 +4402,48 @@ fn make_finalization_registry_builtin() -> JsValue {
                         let held_value = a.get(1).cloned().unwrap_or(JsValue::Undefined);
                         let token = a.get(2).unwrap_or(&JsValue::Undefined);
 
-                        if let JsValue::Object(ptr) = target {
-                            let unregister_token = match token {
-                                JsValue::Object(tok_ptr) => Some(*tok_ptr),
-                                JsValue::Undefined => None,
-                                _ => {
-                                    return Err(StatorError::TypeError(
-                                        "unregister token must be an object or undefined".into(),
-                                    ));
-                                }
-                            };
-                            finalization_registry_register(
-                                &mut inner.borrow_mut(),
-                                *ptr,
-                                held_value,
-                                unregister_token,
-                            )?;
-                            Ok(JsValue::Undefined)
-                        } else {
-                            Err(StatorError::TypeError(
+                        match target {
+                            JsValue::Object(ptr) => {
+                                let unregister_token = match token {
+                                    JsValue::Object(tok_ptr) => Some(*tok_ptr),
+                                    JsValue::Undefined => None,
+                                    _ => {
+                                        return Err(StatorError::TypeError(
+                                            "unregister token must be an object or undefined"
+                                                .into(),
+                                        ));
+                                    }
+                                };
+                                finalization_registry_register(
+                                    &mut inner.borrow_mut(),
+                                    *ptr,
+                                    held_value,
+                                    unregister_token,
+                                )?;
+                                Ok(JsValue::Undefined)
+                            }
+                            JsValue::PlainObject(rc) => {
+                                let unregister_token = match token {
+                                    JsValue::PlainObject(tok_rc) => Some(tok_rc),
+                                    JsValue::Undefined => None,
+                                    _ => {
+                                        return Err(StatorError::TypeError(
+                                            "unregister token must be an object or undefined"
+                                                .into(),
+                                        ));
+                                    }
+                                };
+                                finalization_registry_register_plain(
+                                    &mut inner.borrow_mut(),
+                                    rc,
+                                    held_value,
+                                    unregister_token,
+                                );
+                                Ok(JsValue::Undefined)
+                            }
+                            _ => Err(StatorError::TypeError(
                                 "FinalizationRegistry target must be an object".into(),
-                            ))
+                            )),
                         }
                     }),
                 );
@@ -4430,27 +4456,29 @@ fn make_finalization_registry_builtin() -> JsValue {
                     "unregister".into(),
                     native(move |a| {
                         let token = a.first().unwrap_or(&JsValue::Undefined);
-                        if let JsValue::Object(ptr) = token {
-                            Ok(JsValue::Boolean(finalization_registry_unregister(
-                                &mut inner.borrow_mut(),
-                                *ptr,
-                            )?))
-                        } else {
-                            Err(StatorError::TypeError(
+                        match token {
+                            JsValue::Object(ptr) => Ok(JsValue::Boolean(
+                                finalization_registry_unregister(&mut inner.borrow_mut(), *ptr)?,
+                            )),
+                            JsValue::PlainObject(rc) => Ok(JsValue::Boolean(
+                                finalization_registry_unregister_plain(&mut inner.borrow_mut(), rc),
+                            )),
+                            _ => Err(StatorError::TypeError(
                                 "unregister token must be an object".into(),
-                            ))
+                            )),
                         }
                     }),
                 );
             }
 
-            // cleanupSome() — drain the queue and invoke callback
+            // cleanupSome() — sweep plain targets, then drain the queue
             {
                 let inner = Rc::clone(&inner);
                 let cb = Rc::clone(&callback);
                 obj.insert(
                     "cleanupSome".into(),
                     native(move |_a| {
+                        finalization_registry_sweep_plain(&mut inner.borrow_mut());
                         let held_values = finalization_registry_drain(&mut inner.borrow_mut());
                         if let JsValue::NativeFunction(ref f) = *cb {
                             for held in held_values {
