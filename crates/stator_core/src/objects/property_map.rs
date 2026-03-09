@@ -7,6 +7,14 @@
 //! to `WRITABLE | ENUMERABLE | CONFIGURABLE` (the ECMAScript default for
 //! ordinary user-created data properties).
 //!
+//! ## ECMAScript enumeration order (§10.1.11)
+//!
+//! Properties are stored in **ECMAScript enumeration order**: integer-indexed
+//! keys (array indices `0 ..= 2^32 − 2`) occupy the front of the storage in
+//! ascending numeric order, followed by non-index string keys in the order
+//! they were first inserted.  All iteration methods (`keys`, `iter`,
+//! `enumerable_keys`, `iter_with_attrs`) naturally produce this order.
+//!
 //! Internally, property values are stored in a flat `Vec<JsValue>` for
 //! cache-friendly iteration and O(1) slot-based access.  A secondary
 //! `HashMap<String, usize>` maps property names to slot indices for
@@ -36,6 +44,22 @@ const DEFAULT_ATTRS: PropertyAttributes = PropertyAttributes::from_bits_truncate
 /// majority of tight property-access loops in typical JavaScript code.
 const INLINE_CACHE_CAP: usize = 4;
 
+/// Returns `Some(n)` if `key` is a valid ECMAScript array index — a canonical
+/// decimal string representing an integer in `0 ..= 2^32 − 2`.
+///
+/// Per ECMA-262 §6.1.7, an integer index is a String value that is a canonical
+/// numeric string (no leading zeros except `"0"` itself) whose numeric value
+/// *i* satisfies `0 ≤ i < 2^32 − 1`.
+#[inline]
+fn parse_integer_index(key: &str) -> Option<u32> {
+    if key.is_empty() || (key.len() > 1 && key.as_bytes()[0] == b'0') {
+        return None;
+    }
+    let n: u32 = key.parse().ok()?;
+    // Array indices are 0 ..= 2^32 − 2 (u32::MAX is *not* an index).
+    if n < u32::MAX { Some(n) } else { None }
+}
+
 /// Cheap 64-bit FNV-1a hash for inline-cache probing.
 ///
 /// This is intentionally *not* `SipHash`: it trades collision resistance for
@@ -52,9 +76,10 @@ fn name_hash(s: &str) -> u64 {
 
 /// A map of named properties with ECMAScript attribute flags.
 ///
-/// Property values are stored in a flat `Vec` for cache-friendly iteration
-/// and O(1) slot-based access.  The `index` HashMap provides O(1) name
-/// lookups into the flat storage.
+/// Property values are stored in a flat `Vec` in ECMAScript enumeration
+/// order (integer indices ascending, then string keys in insertion order)
+/// for cache-friendly, spec-compliant iteration.  The `index` HashMap
+/// provides O(1) name lookups into the flat storage.
 ///
 /// An [`INLINE_CACHE_CAP`]-entry inline cache of recently accessed property
 /// name hashes sits in front of the `HashMap` to avoid hash-table probing
@@ -164,6 +189,43 @@ impl PropertyMap {
         self.cache_cursor.set(0);
     }
 
+    // ── ECMAScript enumeration-order helpers ──────────────────────────────
+
+    /// Returns the position at which `key` should be inserted to maintain
+    /// ECMAScript §10.1.11 enumeration order: integer indices (ascending)
+    /// first, then string keys in insertion order.
+    fn spec_insert_pos(&self, key: &str) -> usize {
+        if let Some(n) = parse_integer_index(key) {
+            // Integer index: find the correct sorted position among the
+            // existing integer-indexed keys that occupy the front of `keys`.
+            let mut pos = 0;
+            while pos < self.keys.len() {
+                if let Some(existing) = parse_integer_index(&self.keys[pos]) {
+                    if existing > n {
+                        return pos;
+                    }
+                    pos += 1;
+                } else {
+                    return pos;
+                }
+            }
+            pos
+        } else {
+            // String property: append after all existing entries.
+            self.keys.len()
+        }
+    }
+
+    /// Increments all HashMap index values `>= pos` by one, preparing for
+    /// an element insertion at `pos`.
+    fn index_shift_right(&mut self, pos: usize) {
+        for idx in self.index.values_mut() {
+            if *idx >= pos {
+                *idx += 1;
+            }
+        }
+    }
+
     // ── HashMap-compatible API ────────────────────────────────────────────
 
     /// Returns the value for `key`, ignoring attributes.
@@ -199,35 +261,42 @@ impl PropertyMap {
     /// Inserts a property with default attributes (writable, enumerable,
     /// configurable).  If the key already exists the value is replaced but
     /// the existing attributes are preserved.
+    ///
+    /// New properties are placed according to ECMAScript enumeration order:
+    /// integer-indexed keys occupy the front of the storage (sorted
+    /// numerically), followed by string keys in insertion order.
     pub fn insert(&mut self, key: String, value: JsValue) {
         if let Some(&i) = self.index.get(&key) {
             self.values[i] = value;
         } else {
-            let i = self.keys.len();
-            self.index.insert(key.clone(), i);
-            self.keys.push(key);
-            self.values.push(value);
-            self.attrs.push(DEFAULT_ATTRS);
+            let pos = self.spec_insert_pos(&key);
+            self.index_shift_right(pos);
+            self.index.insert(key.clone(), pos);
+            self.keys.insert(pos, key);
+            self.values.insert(pos, value);
+            self.attrs.insert(pos, DEFAULT_ATTRS);
+            if pos != self.keys.len() - 1 {
+                self.cache_invalidate();
+            }
         }
     }
 
     /// Removes the entry for `key`, returning the old value (if any).
+    ///
+    /// Uses an order-preserving shift-remove so that the ECMAScript
+    /// enumeration order of the remaining properties is maintained.
     pub fn remove(&mut self, key: &str) -> Option<JsValue> {
         if let Some(i) = self.index.remove(key) {
             let val = self.values[i].clone();
-            // Swap-remove to keep storage compact.
-            let last = self.keys.len() - 1;
-            if i != last {
-                self.keys.swap(i, last);
-                self.values.swap(i, last);
-                self.attrs.swap(i, last);
-                // Update the index for the swapped-in key.
-                self.index.insert(self.keys[i].clone(), i);
+            self.keys.remove(i);
+            self.values.remove(i);
+            self.attrs.remove(i);
+            // Decrement indices for every slot that shifted left.
+            for idx in self.index.values_mut() {
+                if *idx > i {
+                    *idx -= 1;
+                }
             }
-            self.keys.pop();
-            self.values.pop();
-            self.attrs.pop();
-            // Invalidate cache: swap-remove may have changed slot indices.
             self.cache_invalidate();
             Some(val)
         } else {
@@ -269,16 +338,23 @@ impl PropertyMap {
     }
 
     /// Inserts a property with explicit attribute flags.
+    ///
+    /// New properties are placed according to ECMAScript enumeration order
+    /// (see [`insert`][Self::insert]).
     pub fn insert_with_attrs(&mut self, key: String, value: JsValue, attrs: PropertyAttributes) {
         if let Some(&i) = self.index.get(&key) {
             self.values[i] = value;
             self.attrs[i] = attrs;
         } else {
-            let i = self.keys.len();
-            self.index.insert(key.clone(), i);
-            self.keys.push(key);
-            self.values.push(value);
-            self.attrs.push(attrs);
+            let pos = self.spec_insert_pos(&key);
+            self.index_shift_right(pos);
+            self.index.insert(key.clone(), pos);
+            self.keys.insert(pos, key);
+            self.values.insert(pos, value);
+            self.attrs.insert(pos, attrs);
+            if pos != self.keys.len() - 1 {
+                self.cache_invalidate();
+            }
         }
     }
 
@@ -610,5 +686,150 @@ mod tests {
         assert_eq!(pm2.cache_len.get(), 0);
         // They should still be equal.
         assert_eq!(pm1, pm2);
+    }
+
+    // ── ECMAScript enumeration-order tests ───────────────────────────────
+
+    #[test]
+    fn test_parse_integer_index() {
+        assert_eq!(parse_integer_index("0"), Some(0));
+        assert_eq!(parse_integer_index("1"), Some(1));
+        assert_eq!(parse_integer_index("42"), Some(42));
+        assert_eq!(parse_integer_index("4294967294"), Some(u32::MAX - 1));
+        // u32::MAX is NOT a valid array index.
+        assert_eq!(parse_integer_index("4294967295"), None);
+        // Leading zeros are not canonical.
+        assert_eq!(parse_integer_index("01"), None);
+        assert_eq!(parse_integer_index("007"), None);
+        // Non-numeric strings.
+        assert_eq!(parse_integer_index(""), None);
+        assert_eq!(parse_integer_index("abc"), None);
+        assert_eq!(parse_integer_index("-1"), None);
+        assert_eq!(parse_integer_index("1.5"), None);
+    }
+
+    #[test]
+    fn test_integer_indices_sorted_before_strings() {
+        let mut pm = PropertyMap::new();
+        // Insert in non-spec order: strings first, then integers.
+        pm.insert("b".to_string(), JsValue::Smi(1));
+        pm.insert("2".to_string(), JsValue::Smi(2));
+        pm.insert("a".to_string(), JsValue::Smi(3));
+        pm.insert("0".to_string(), JsValue::Smi(4));
+        // Expected spec order: 0, 2, b, a
+        let keys: Vec<&String> = pm.keys().collect();
+        assert_eq!(
+            keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            vec!["0", "2", "b", "a"]
+        );
+    }
+
+    #[test]
+    fn test_integer_indices_ascending_numeric_order() {
+        let mut pm = PropertyMap::new();
+        pm.insert("10".to_string(), JsValue::Smi(10));
+        pm.insert("2".to_string(), JsValue::Smi(2));
+        pm.insert("1".to_string(), JsValue::Smi(1));
+        pm.insert("20".to_string(), JsValue::Smi(20));
+        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["1", "2", "10", "20"]);
+    }
+
+    #[test]
+    fn test_string_keys_preserve_insertion_order() {
+        let mut pm = PropertyMap::new();
+        pm.insert("z".to_string(), JsValue::Smi(1));
+        pm.insert("a".to_string(), JsValue::Smi(2));
+        pm.insert("m".to_string(), JsValue::Smi(3));
+        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["z", "a", "m"]);
+    }
+
+    #[test]
+    fn test_mixed_integer_and_string_order() {
+        let mut pm = PropertyMap::new();
+        // Simulate: obj.z = 1; obj[5] = 2; obj.a = 3; obj[1] = 4; obj.m = 5; obj[3] = 6;
+        pm.insert("z".to_string(), JsValue::Smi(1));
+        pm.insert("5".to_string(), JsValue::Smi(2));
+        pm.insert("a".to_string(), JsValue::Smi(3));
+        pm.insert("1".to_string(), JsValue::Smi(4));
+        pm.insert("m".to_string(), JsValue::Smi(5));
+        pm.insert("3".to_string(), JsValue::Smi(6));
+        // Spec: integer indices ascending, then strings in insertion order.
+        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["1", "3", "5", "z", "a", "m"]);
+    }
+
+    #[test]
+    fn test_remove_preserves_order() {
+        let mut pm = PropertyMap::new();
+        pm.insert("a".to_string(), JsValue::Smi(1));
+        pm.insert("b".to_string(), JsValue::Smi(2));
+        pm.insert("c".to_string(), JsValue::Smi(3));
+        pm.remove("b");
+        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["a", "c"]);
+        // Remaining entries still accessible.
+        assert_eq!(pm.get("a"), Some(&JsValue::Smi(1)));
+        assert_eq!(pm.get("c"), Some(&JsValue::Smi(3)));
+    }
+
+    #[test]
+    fn test_remove_preserves_spec_order() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        pm.insert("3".to_string(), JsValue::Smi(2));
+        pm.insert("y".to_string(), JsValue::Smi(3));
+        pm.insert("1".to_string(), JsValue::Smi(4));
+        // Before remove: 1, 3, x, y
+        pm.remove("3");
+        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["1", "x", "y"]);
+    }
+
+    #[test]
+    fn test_enumerable_keys_spec_order() {
+        let mut pm = PropertyMap::new();
+        pm.insert("b".to_string(), JsValue::Smi(1));
+        pm.insert("2".to_string(), JsValue::Smi(2));
+        pm.insert_with_attrs(
+            "hidden".to_string(),
+            JsValue::Smi(99),
+            PropertyAttributes::WRITABLE, // not enumerable
+        );
+        pm.insert("0".to_string(), JsValue::Smi(3));
+        // Enumerable keys should follow spec order, excluding "hidden".
+        let keys: Vec<&str> = pm.enumerable_keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["0", "2", "b"]);
+    }
+
+    #[test]
+    fn test_iter_values_match_spec_ordered_keys() {
+        let mut pm = PropertyMap::new();
+        pm.insert("b".to_string(), JsValue::Smi(10));
+        pm.insert("1".to_string(), JsValue::Smi(20));
+        pm.insert("0".to_string(), JsValue::Smi(30));
+        // Spec order: 0, 1, b — values should follow.
+        let pairs: Vec<(&str, &JsValue)> = pm.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("0", &JsValue::Smi(30)),
+                ("1", &JsValue::Smi(20)),
+                ("b", &JsValue::Smi(10)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_insert_existing_integer_key_no_reorder() {
+        let mut pm = PropertyMap::new();
+        pm.insert("1".to_string(), JsValue::Smi(10));
+        pm.insert("a".to_string(), JsValue::Smi(20));
+        // Re-insert "1" — should update value, not move it.
+        pm.insert("1".to_string(), JsValue::Smi(99));
+        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["1", "a"]);
+        assert_eq!(pm.get("1"), Some(&JsValue::Smi(99)));
     }
 }

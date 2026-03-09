@@ -53,9 +53,9 @@ use crate::builtins::global::{
     global_parse_float, global_parse_int, global_unescape,
 };
 use crate::builtins::intl::{
-    collator_compare_js, date_time_format_js, display_names_of, list_format_js, locale_base_name,
-    locale_language, number_format_js, plural_rules_select_js, relative_time_format_js,
-    segmenter_segment,
+    collator_compare_js, date_time_format_js, date_time_format_to_parts_js, display_names_of,
+    list_format_js, locale_base_name, locale_language, number_format_js, number_format_to_parts_js,
+    plural_rules_select_js, relative_time_format_js, segmenter_segment,
 };
 use crate::builtins::iterator::{
     async_iterator_drop, async_iterator_every, async_iterator_filter, async_iterator_find,
@@ -5912,6 +5912,20 @@ fn extract_handler(val: &JsValue) -> Option<crate::builtins::promise::PromiseHan
 
 // ── Intl ─────────────────────────────────────────────────────────────────────
 
+/// Create a `supportedLocalesOf` native function shared by all Intl constructors.
+///
+/// Stub: returns all requested locales (we fall back to en-US for everything).
+fn make_supported_locales_of() -> JsValue {
+    native(|args| {
+        let locales: Vec<JsValue> = match args.first() {
+            Some(JsValue::Array(arr)) => arr.borrow().iter().cloned().collect(),
+            Some(JsValue::String(s)) => vec![JsValue::String(s.clone())],
+            _ => Vec::new(),
+        };
+        Ok(JsValue::new_array(locales))
+    })
+}
+
 /// Build the `Intl` namespace object (ECMA-402).
 ///
 /// Each property is a constructor-like `PlainObject` with a `__call__` method
@@ -5929,6 +5943,10 @@ fn make_intl() -> JsValue {
                 let mut obj = PropertyMap::new();
                 obj.insert("format".into(), native(|a| number_format_js(&a)));
                 obj.insert(
+                    "formatToParts".into(),
+                    native(|a| number_format_to_parts_js(&a)),
+                );
+                obj.insert(
                     "resolvedOptions".into(),
                     native(|_| {
                         let mut opts = PropertyMap::new();
@@ -5939,6 +5957,26 @@ fn make_intl() -> JsValue {
                 );
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
+        );
+        ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
+        let mut proto = PropertyMap::new();
+        proto.insert("format".into(), native(|a| number_format_js(&a)));
+        proto.insert(
+            "formatToParts".into(),
+            native(|a| number_format_to_parts_js(&a)),
+        );
+        proto.insert(
+            "resolvedOptions".into(),
+            native(|_| {
+                let mut opts = PropertyMap::new();
+                opts.insert("locale".into(), JsValue::String("en-US".into()));
+                opts.insert("numberingSystem".into(), JsValue::String("latn".into()));
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+            }),
+        );
+        ctor.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
         );
         JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
     });
@@ -5952,6 +5990,10 @@ fn make_intl() -> JsValue {
                 let mut obj = PropertyMap::new();
                 obj.insert("format".into(), native(|a| date_time_format_js(&a)));
                 obj.insert(
+                    "formatToParts".into(),
+                    native(|a| date_time_format_to_parts_js(&a)),
+                );
+                obj.insert(
                     "resolvedOptions".into(),
                     native(|_| {
                         let mut opts = PropertyMap::new();
@@ -5963,6 +6005,27 @@ fn make_intl() -> JsValue {
                 );
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
+        );
+        ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
+        let mut proto = PropertyMap::new();
+        proto.insert("format".into(), native(|a| date_time_format_js(&a)));
+        proto.insert(
+            "formatToParts".into(),
+            native(|a| date_time_format_to_parts_js(&a)),
+        );
+        proto.insert(
+            "resolvedOptions".into(),
+            native(|_| {
+                let mut opts = PropertyMap::new();
+                opts.insert("locale".into(), JsValue::String("en-US".into()));
+                opts.insert("calendar".into(), JsValue::String("gregory".into()));
+                opts.insert("timeZone".into(), JsValue::String("UTC".into()));
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+            }),
+        );
+        ctor.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
         );
         JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
     });
@@ -5987,6 +6050,22 @@ fn make_intl() -> JsValue {
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
         );
+        ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
+        let mut proto = PropertyMap::new();
+        proto.insert("compare".into(), native(|a| collator_compare_js(&a)));
+        proto.insert(
+            "resolvedOptions".into(),
+            native(|_| {
+                let mut opts = PropertyMap::new();
+                opts.insert("locale".into(), JsValue::String("en-US".into()));
+                opts.insert("sensitivity".into(), JsValue::String("variant".into()));
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+            }),
+        );
+        ctor.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        );
         JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
     });
 
@@ -6009,6 +6088,22 @@ fn make_intl() -> JsValue {
                 );
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
+        );
+        ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
+        let mut proto = PropertyMap::new();
+        proto.insert("select".into(), native(|a| plural_rules_select_js(&a)));
+        proto.insert(
+            "resolvedOptions".into(),
+            native(|_| {
+                let mut opts = PropertyMap::new();
+                opts.insert("locale".into(), JsValue::String("en-US".into()));
+                opts.insert("type".into(), JsValue::String("cardinal".into()));
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+            }),
+        );
+        ctor.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
         );
         JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
     });
@@ -6033,13 +6128,52 @@ fn make_intl() -> JsValue {
                 } else {
                     "conjunction".to_string()
                 };
+                let lt = list_type.clone();
                 let mut obj = PropertyMap::new();
                 obj.insert(
                     "format".into(),
                     native(move |a| list_format_js(&a, &list_type)),
                 );
+                obj.insert(
+                    "formatToParts".into(),
+                    native(move |a| list_format_js(&a, &lt)),
+                );
+                obj.insert(
+                    "resolvedOptions".into(),
+                    native(|_| {
+                        let mut opts = PropertyMap::new();
+                        opts.insert("locale".into(), JsValue::String("en-US".into()));
+                        opts.insert("type".into(), JsValue::String("conjunction".into()));
+                        opts.insert("style".into(), JsValue::String("long".into()));
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+                    }),
+                );
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
+        );
+        ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
+        let mut proto = PropertyMap::new();
+        proto.insert(
+            "format".into(),
+            native(|a| list_format_js(&a, "conjunction")),
+        );
+        proto.insert(
+            "formatToParts".into(),
+            native(|a| list_format_js(&a, "conjunction")),
+        );
+        proto.insert(
+            "resolvedOptions".into(),
+            native(|_| {
+                let mut opts = PropertyMap::new();
+                opts.insert("locale".into(), JsValue::String("en-US".into()));
+                opts.insert("type".into(), JsValue::String("conjunction".into()));
+                opts.insert("style".into(), JsValue::String("long".into()));
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+            }),
+        );
+        ctor.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
         );
         JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
     });
@@ -6052,8 +6186,43 @@ fn make_intl() -> JsValue {
             native(|_args| {
                 let mut obj = PropertyMap::new();
                 obj.insert("format".into(), native(|a| relative_time_format_js(&a)));
+                obj.insert(
+                    "formatToParts".into(),
+                    native(|a| relative_time_format_js(&a)),
+                );
+                obj.insert(
+                    "resolvedOptions".into(),
+                    native(|_| {
+                        let mut opts = PropertyMap::new();
+                        opts.insert("locale".into(), JsValue::String("en-US".into()));
+                        opts.insert("style".into(), JsValue::String("long".into()));
+                        opts.insert("numeric".into(), JsValue::String("always".into()));
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+                    }),
+                );
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
+        );
+        ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
+        let mut proto = PropertyMap::new();
+        proto.insert("format".into(), native(|a| relative_time_format_js(&a)));
+        proto.insert(
+            "formatToParts".into(),
+            native(|a| relative_time_format_js(&a)),
+        );
+        proto.insert(
+            "resolvedOptions".into(),
+            native(|_| {
+                let mut opts = PropertyMap::new();
+                opts.insert("locale".into(), JsValue::String("en-US".into()));
+                opts.insert("style".into(), JsValue::String("long".into()));
+                opts.insert("numeric".into(), JsValue::String("always".into()));
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+            }),
+        );
+        ctor.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
         );
         JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
     });
@@ -6076,8 +6245,43 @@ fn make_intl() -> JsValue {
                         Ok(JsValue::new_array(segs))
                     }),
                 );
+                obj.insert(
+                    "resolvedOptions".into(),
+                    native(|_| {
+                        let mut opts = PropertyMap::new();
+                        opts.insert("locale".into(), JsValue::String("en-US".into()));
+                        opts.insert("granularity".into(), JsValue::String("grapheme".into()));
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+                    }),
+                );
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
+        );
+        ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
+        let mut proto = PropertyMap::new();
+        proto.insert(
+            "segment".into(),
+            native(|a| {
+                let s = a.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+                let segs: Vec<JsValue> = segmenter_segment(&s)
+                    .into_iter()
+                    .map(|s| JsValue::String(s.into()))
+                    .collect();
+                Ok(JsValue::new_array(segs))
+            }),
+        );
+        proto.insert(
+            "resolvedOptions".into(),
+            native(|_| {
+                let mut opts = PropertyMap::new();
+                opts.insert("locale".into(), JsValue::String("en-US".into()));
+                opts.insert("granularity".into(), JsValue::String("grapheme".into()));
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+            }),
+        );
+        ctor.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
         );
         JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
     });
@@ -6096,8 +6300,41 @@ fn make_intl() -> JsValue {
                         Ok(JsValue::String(display_names_of(&code).into()))
                     }),
                 );
+                obj.insert(
+                    "resolvedOptions".into(),
+                    native(|_| {
+                        let mut opts = PropertyMap::new();
+                        opts.insert("locale".into(), JsValue::String("en-US".into()));
+                        opts.insert("type".into(), JsValue::String("language".into()));
+                        opts.insert("style".into(), JsValue::String("long".into()));
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+                    }),
+                );
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
+        );
+        ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
+        let mut proto = PropertyMap::new();
+        proto.insert(
+            "of".into(),
+            native(|a| {
+                let code = a.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+                Ok(JsValue::String(display_names_of(&code).into()))
+            }),
+        );
+        proto.insert(
+            "resolvedOptions".into(),
+            native(|_| {
+                let mut opts = PropertyMap::new();
+                opts.insert("locale".into(), JsValue::String("en-US".into()));
+                opts.insert("type".into(), JsValue::String("language".into()));
+                opts.insert("style".into(), JsValue::String("long".into()));
+                Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
+            }),
+        );
+        ctor.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
         );
         JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
     });
@@ -6125,6 +6362,7 @@ fn make_intl() -> JsValue {
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
         );
+        ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
         JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
     });
 
