@@ -2938,8 +2938,13 @@ fn handle_type_of(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResu
         JsValue::Symbol(_) => "symbol",
         JsValue::BigInt(_) => "bigint",
         JsValue::Function(_) | JsValue::NativeFunction(_) => "function",
-        JsValue::Object(_) | JsValue::Array(_) | JsValue::PlainObject(_) | JsValue::Error(_) => {
-            "object"
+        JsValue::Object(_) | JsValue::Array(_) | JsValue::Error(_) => "object",
+        JsValue::PlainObject(map) => {
+            if map.borrow().get("__call__").is_some() {
+                "function"
+            } else {
+                "object"
+            }
         }
         JsValue::Generator(_) => "object",
         JsValue::Iterator(_) => "object",
