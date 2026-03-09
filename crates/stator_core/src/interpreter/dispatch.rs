@@ -2956,18 +2956,32 @@ fn handle_for_in_enumerate(
     };
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     let keys: Vec<JsValue> = match &obj {
-        JsValue::PlainObject(map) => map
-            .borrow()
-            .enumerable_keys()
-            .map(|k| JsValue::String(k.clone()))
-            .collect(),
-        JsValue::Array(items) => {
-            let mut ks: Vec<JsValue> = (0..items.borrow().len())
-                .map(|i| JsValue::String(i.to_string()))
-                .collect();
-            ks.push(JsValue::String("length".to_string()));
-            ks
+        JsValue::PlainObject(map) => {
+            let mut all_keys = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            // Walk the prototype chain collecting enumerable keys.
+            let mut current_map = Some(Rc::clone(map));
+            for _ in 0..256 {
+                let Some(m) = current_map.take() else { break };
+                let borrow = m.borrow();
+                for k in borrow.enumerable_keys() {
+                    if seen.insert(k.clone()) {
+                        all_keys.push(JsValue::String(k.clone()));
+                    }
+                }
+                current_map = borrow.get("__proto__").and_then(|v| {
+                    if let JsValue::PlainObject(proto) = v {
+                        Some(Rc::clone(proto))
+                    } else {
+                        None
+                    }
+                });
+            }
+            all_keys
         }
+        JsValue::Array(items) => (0..items.borrow().len())
+            .map(|i| JsValue::String(i.to_string()))
+            .collect(),
         JsValue::Null | JsValue::Undefined => vec![],
         _ => vec![],
     };
