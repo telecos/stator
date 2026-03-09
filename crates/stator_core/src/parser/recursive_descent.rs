@@ -886,6 +886,11 @@ impl<'src> Parser<'src> {
         let (body, fn_strict) = self.parse_function_body()?;
         self.strict_mode = outer_strict;
 
+        // Duplicate parameter names are a SyntaxError in strict mode.
+        if fn_strict {
+            self.check_strict_duplicate_params(&params)?;
+        }
+
         let end = body.loc;
         Ok(Stmt::FnDecl(Box::new(FnDecl {
             loc: Self::merge_spans(fn_span, end),
@@ -1652,6 +1657,22 @@ impl<'src> Parser<'src> {
         }
         self.expect(TokenKind::RightParen)?;
         Ok(params)
+    }
+
+    /// In strict mode, duplicate simple parameter names are a `SyntaxError`.
+    fn check_strict_duplicate_params(&self, params: &[Param]) -> StatorResult<()> {
+        let mut seen = std::collections::HashSet::new();
+        for param in params {
+            if let Pat::Ident(id) = &param.pat
+                && !seen.insert(&id.name)
+            {
+                return Err(self.error(&format!(
+                    "duplicate parameter name '{}' not allowed in strict mode",
+                    id.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn parse_binding_pat(&mut self) -> StatorResult<Pat> {
@@ -2552,6 +2573,17 @@ impl<'src> Parser<'src> {
         match self.peek_kind() {
             TokenKind::NumericLiteral => {
                 let tok = self.bump()?;
+                // Strict mode: legacy octal literals (e.g. `0123`) are not allowed.
+                if self.strict_mode {
+                    let raw = &self.scanner.source()[tok.span.start.offset..tok.span.end.offset];
+                    if raw.len() >= 2 && raw.starts_with('0') && raw.as_bytes()[1].is_ascii_digit()
+                    {
+                        return Err(Self::error_at(
+                            tok.span,
+                            "octal literals are not allowed in strict mode",
+                        ));
+                    }
+                }
                 match tok.value {
                     TokenValue::Number(n) => Ok(Expr::Num(NumLit {
                         loc: tok.span,
@@ -3201,6 +3233,11 @@ impl<'src> Parser<'src> {
         let outer_strict = self.strict_mode;
         let (body, fn_strict) = self.parse_function_body()?;
         self.strict_mode = outer_strict;
+
+        // Duplicate parameter names are a SyntaxError in strict mode.
+        if fn_strict {
+            self.check_strict_duplicate_params(&params)?;
+        }
 
         let end = body.loc;
         Ok(Expr::Fn(Box::new(crate::parser::ast::FnExpr {

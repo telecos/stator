@@ -518,6 +518,11 @@ impl<'src> Scanner<'src> {
         }
     }
 
+    /// Returns the full source string being scanned.
+    pub fn source(&self) -> &'src str {
+        self.source
+    }
+
     /// Returns `true` when all input has been consumed.
     pub fn is_eof(&self) -> bool {
         self.pos >= self.source.len()

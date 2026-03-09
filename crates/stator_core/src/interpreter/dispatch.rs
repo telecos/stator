@@ -1316,6 +1316,17 @@ fn handle_call_undefined_receiver0(
                     tried_jit = true;
                 }
                 if !tried_jit {
+                    // Strict mode: `this` is undefined for free function calls.
+                    let saved_this = if ba.is_strict() {
+                        let old = ctx.frame.global_env.borrow().get("this").cloned();
+                        ctx.frame
+                            .global_env
+                            .borrow_mut()
+                            .insert("this".to_string(), JsValue::Undefined);
+                        old
+                    } else {
+                        None
+                    };
                     let mut callee_frame = InterpreterFrame::new_with_globals(
                         (*ba).clone(),
                         args,
@@ -1324,6 +1335,19 @@ fn handle_call_undefined_receiver0(
                     push_call_frame("<anonymous>")?;
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
+                    if ba.is_strict() {
+                        match saved_this {
+                            Some(v) => {
+                                ctx.frame
+                                    .global_env
+                                    .borrow_mut()
+                                    .insert("this".to_string(), v);
+                            }
+                            None => {
+                                ctx.frame.global_env.borrow_mut().remove("this");
+                            }
+                        }
+                    }
                     ctx.frame.accumulator = result?;
                 }
             }
@@ -1387,6 +1411,17 @@ fn handle_call_undefined_receiver1(
                     tried_jit = true;
                 }
                 if !tried_jit {
+                    // Strict mode: `this` is undefined for free function calls.
+                    let saved_this = if ba.is_strict() {
+                        let old = ctx.frame.global_env.borrow().get("this").cloned();
+                        ctx.frame
+                            .global_env
+                            .borrow_mut()
+                            .insert("this".to_string(), JsValue::Undefined);
+                        old
+                    } else {
+                        None
+                    };
                     let mut callee_frame = InterpreterFrame::new_with_globals(
                         (*ba).clone(),
                         args,
@@ -1395,6 +1430,19 @@ fn handle_call_undefined_receiver1(
                     push_call_frame("<anonymous>")?;
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
+                    if ba.is_strict() {
+                        match saved_this {
+                            Some(v) => {
+                                ctx.frame
+                                    .global_env
+                                    .borrow_mut()
+                                    .insert("this".to_string(), v);
+                            }
+                            None => {
+                                ctx.frame.global_env.borrow_mut().remove("this");
+                            }
+                        }
+                    }
                     ctx.frame.accumulator = result?;
                 }
             }
@@ -1467,6 +1515,17 @@ fn handle_call_undefined_receiver2(
                     tried_jit = true;
                 }
                 if !tried_jit {
+                    // Strict mode: `this` is undefined for free function calls.
+                    let saved_this = if ba.is_strict() {
+                        let old = ctx.frame.global_env.borrow().get("this").cloned();
+                        ctx.frame
+                            .global_env
+                            .borrow_mut()
+                            .insert("this".to_string(), JsValue::Undefined);
+                        old
+                    } else {
+                        None
+                    };
                     let mut callee_frame = InterpreterFrame::new_with_globals(
                         (*ba).clone(),
                         args,
@@ -1475,6 +1534,19 @@ fn handle_call_undefined_receiver2(
                     push_call_frame("<anonymous>")?;
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
+                    if ba.is_strict() {
+                        match saved_this {
+                            Some(v) => {
+                                ctx.frame
+                                    .global_env
+                                    .borrow_mut()
+                                    .insert("this".to_string(), v);
+                            }
+                            None => {
+                                ctx.frame.global_env.borrow_mut().remove("this");
+                            }
+                        }
+                    }
                     ctx.frame.accumulator = result?;
                 }
             }
@@ -2094,7 +2166,14 @@ fn handle_sta_global(
         }
     };
     let val = ctx.frame.accumulator.clone();
-    ctx.frame.global_env.borrow_mut().insert(name, val);
+    let mut env = ctx.frame.global_env.borrow_mut();
+    // Strict mode: assigning to an undeclared variable is a ReferenceError.
+    if ctx.frame.bytecode_array.is_strict() && !env.contains_key(&name) {
+        return Err(StatorError::ReferenceError(format!(
+            "{name} is not defined"
+        )));
+    }
+    env.insert(name, val);
     Ok(DispatchAction::Continue)
 }
 
@@ -2824,6 +2903,7 @@ fn handle_create_empty_array_literal(
     // operands[0] is a FeedbackSlot, ignored at runtime.
     let mut map = PropertyMap::new();
     map.insert("length".to_string(), JsValue::Smi(0));
+    map.insert("__is_array__".to_string(), JsValue::Boolean(true));
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
 }
@@ -2835,6 +2915,7 @@ fn handle_create_array_literal(
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
     let mut map = PropertyMap::new();
     map.insert("length".to_string(), JsValue::Smi(0));
+    map.insert("__is_array__".to_string(), JsValue::Boolean(true));
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
 }
@@ -3737,7 +3818,14 @@ fn handle_sta_lookup_slot(
         }
     };
     let val = ctx.frame.accumulator.clone();
-    ctx.frame.global_env.borrow_mut().insert(name, val);
+    let mut env = ctx.frame.global_env.borrow_mut();
+    // Strict mode: assigning to an undeclared variable is a ReferenceError.
+    if ctx.frame.bytecode_array.is_strict() && !env.contains_key(&name) {
+        return Err(StatorError::ReferenceError(format!(
+            "{name} is not defined"
+        )));
+    }
+    env.insert(name, val);
     Ok(DispatchAction::Continue)
 }
 

@@ -3,19 +3,16 @@
 //! Provides [`JsWeakRef`], a weak reference to an object that does **not**
 //! prevent garbage collection of the target.
 //!
-//! # Current limitations
+//! # Weak semantics
 //!
-//! True GC-weak semantics require integration with the garbage collector
-//! (issue #267).  For now the reference is held strongly; the API surface is
-//! correct so that downstream code can rely on the interface while the GC
-//! integration is completed separately.
+//! For `PlainObject` targets (backed by `Rc<RefCell<PropertyMap>>`), this
+//! module uses [`std::rc::Weak`] to hold a true weak reference.  When all
+//! strong `Rc` handles are dropped, [`weak_ref_deref`] automatically returns
+//! [`JsValue::Undefined`] — no external GC hook is required.
 //!
-//! # GC integration
-//!
-//! When the GC determines that the target object is no longer strongly
-//! reachable, it should call [`weak_ref_clear`] to set the internal slot to
-//! `None`, after which [`weak_ref_deref`] will return
-//! [`JsValue::Undefined`].
+//! For raw `*mut HeapObject` targets managed by the GC heap, the reference
+//! is stored as a raw pointer.  The GC sweep phase should call
+//! [`weak_ref_clear`] when the target becomes unreachable.
 //!
 //! # Safety
 //!
@@ -27,16 +24,32 @@
 //!
 //! * ECMAScript 2025 Language Specification §26.1 — *WeakRef Objects*
 
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+
 use crate::error::{StatorError, StatorResult};
 use crate::objects::heap_object::HeapObject;
+use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
+
+// ── WeakTarget ───────────────────────────────────────────────────────────────
+
+/// The internal representation of a weak reference target.
+#[derive(Debug, Clone)]
+pub(crate) enum WeakTarget {
+    /// An Rc-managed `PlainObject`: uses `Weak<RefCell<PropertyMap>>` so that
+    /// `deref()` returns `Undefined` once all strong references are dropped.
+    Plain(Weak<RefCell<PropertyMap>>),
+    /// A GC-managed `HeapObject`: raw pointer cleared by the GC sweep phase.
+    Heap(Option<*mut HeapObject>),
+}
 
 // ── JsWeakRef ────────────────────────────────────────────────────────────────
 
 /// A JavaScript `WeakRef` object per ECMAScript §26.1.
 ///
-/// Holds an optional raw `*mut HeapObject` pointer.  When the target is
-/// collected by the GC, the internal slot is cleared to `None`.
+/// Supports both Rc-managed `PlainObject` targets (true weak semantics via
+/// [`std::rc::Weak`]) and GC-managed `HeapObject` targets (manual clearing).
 ///
 /// # Examples
 ///
@@ -49,17 +62,17 @@ use crate::objects::value::JsValue;
 /// let wr = weak_ref_new(&raw mut obj).unwrap();
 /// assert_ne!(weak_ref_deref(&wr), JsValue::Undefined);
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct JsWeakRef {
-    /// The weak target stored as a raw address, or `None` if collected.
-    target: Option<*mut HeapObject>,
+    /// The weak target, supporting both Rc-managed and GC-managed objects.
+    target: WeakTarget,
 }
 
 // ── Constructors ─────────────────────────────────────────────────────────────
 
-/// ECMAScript §26.1.1.1 `new WeakRef(target)`.
+/// ECMAScript §26.1.1.1 `new WeakRef(target)` for GC-managed heap objects.
 ///
-/// Creates a new [`JsWeakRef`] holding a reference to `target`.
+/// Creates a new [`JsWeakRef`] holding a raw pointer to `target`.
 ///
 /// Returns [`StatorError::TypeError`] if `target` is null (only objects may
 /// be weak-referenced).
@@ -80,16 +93,49 @@ pub fn weak_ref_new(target: *mut HeapObject) -> StatorResult<JsWeakRef> {
         ));
     }
     Ok(JsWeakRef {
-        target: Some(target),
+        target: WeakTarget::Heap(Some(target)),
     })
+}
+
+/// ECMAScript §26.1.1.1 `new WeakRef(target)` for Rc-managed plain objects.
+///
+/// Creates a new [`JsWeakRef`] using [`Rc::downgrade`] so that the weak
+/// reference does **not** prevent the target from being dropped.  Once all
+/// strong `Rc` handles are released, [`weak_ref_deref`] returns
+/// [`JsValue::Undefined`].
+///
+/// # Examples
+///
+/// ```
+/// use std::cell::RefCell;
+/// use std::rc::Rc;
+/// use stator_core::builtins::weak_ref::{weak_ref_new_plain, weak_ref_deref};
+/// use stator_core::objects::property_map::PropertyMap;
+/// use stator_core::objects::value::JsValue;
+///
+/// let obj = Rc::new(RefCell::new(PropertyMap::new()));
+/// let wr = weak_ref_new_plain(&obj);
+/// assert_ne!(weak_ref_deref(&wr), JsValue::Undefined);
+///
+/// drop(obj);
+/// assert_eq!(weak_ref_deref(&wr), JsValue::Undefined);
+/// ```
+pub fn weak_ref_new_plain(rc: &Rc<RefCell<PropertyMap>>) -> JsWeakRef {
+    JsWeakRef {
+        target: WeakTarget::Plain(Rc::downgrade(rc)),
+    }
 }
 
 // ── weak_ref_deref ───────────────────────────────────────────────────────────
 
 /// ECMAScript §26.1.3.2 `WeakRef.prototype.deref()`.
 ///
-/// Returns a [`JsValue::Object`] containing the target pointer if the target
-/// has not been collected, or [`JsValue::Undefined`] if it has.
+/// Returns the target as a [`JsValue`] if it is still alive, or
+/// [`JsValue::Undefined`] if the target has been collected.
+///
+/// For `PlainObject` targets this checks `Weak::upgrade()`.  For
+/// `HeapObject` targets this returns the stored raw pointer (or `Undefined`
+/// if the GC has cleared it via [`weak_ref_clear`]).
 ///
 /// # Examples
 ///
@@ -103,9 +149,13 @@ pub fn weak_ref_new(target: *mut HeapObject) -> StatorResult<JsWeakRef> {
 /// assert_ne!(weak_ref_deref(&wr), JsValue::Undefined);
 /// ```
 pub fn weak_ref_deref(wr: &JsWeakRef) -> JsValue {
-    match wr.target {
-        Some(ptr) => JsValue::Object(ptr),
-        None => JsValue::Undefined,
+    match &wr.target {
+        WeakTarget::Plain(weak) => match weak.upgrade() {
+            Some(rc) => JsValue::PlainObject(rc),
+            None => JsValue::Undefined,
+        },
+        WeakTarget::Heap(Some(ptr)) => JsValue::Object(*ptr),
+        WeakTarget::Heap(None) => JsValue::Undefined,
     }
 }
 
@@ -114,8 +164,8 @@ pub fn weak_ref_deref(wr: &JsWeakRef) -> JsValue {
 /// GC hook: clear the weak reference when the target is collected.
 ///
 /// After this call, [`weak_ref_deref`] will return [`JsValue::Undefined`].
-/// This function is called by the garbage collector sweep phase when the
-/// target object is determined to be unreachable.
+/// For `PlainObject` targets this is a no-op (clearing is automatic).
+/// For `HeapObject` targets this sets the internal slot to `None`.
 ///
 /// # Examples
 ///
@@ -130,7 +180,16 @@ pub fn weak_ref_deref(wr: &JsWeakRef) -> JsValue {
 /// assert_eq!(weak_ref_deref(&wr), JsValue::Undefined);
 /// ```
 pub fn weak_ref_clear(wr: &mut JsWeakRef) {
-    wr.target = None;
+    match &mut wr.target {
+        WeakTarget::Plain(_) => {
+            // Rc-managed targets are cleared automatically when all strong
+            // references are dropped; replace with an already-expired Weak.
+            wr.target = WeakTarget::Plain(Weak::new());
+        }
+        WeakTarget::Heap(opt) => {
+            *opt = None;
+        }
+    }
 }
 
 // ── weak_ref_has_target ──────────────────────────────────────────────────────
@@ -150,7 +209,10 @@ pub fn weak_ref_clear(wr: &mut JsWeakRef) {
 /// assert!(!weak_ref_has_target(&wr));
 /// ```
 pub fn weak_ref_has_target(wr: &JsWeakRef) -> bool {
-    wr.target.is_some()
+    match &wr.target {
+        WeakTarget::Plain(weak) => weak.strong_count() > 0,
+        WeakTarget::Heap(opt) => opt.is_some(),
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -159,7 +221,7 @@ pub fn weak_ref_has_target(wr: &JsWeakRef) -> bool {
 mod tests {
     use super::*;
 
-    // ── Construction ─────────────────────────────────────────────────────────
+    // ── Heap target: Construction ────────────────────────────────────────────
 
     #[test]
     fn test_weak_ref_new_with_valid_target() {
@@ -180,7 +242,7 @@ mod tests {
         assert!(matches!(err, StatorError::TypeError(_)));
     }
 
-    // ── Deref ────────────────────────────────────────────────────────────────
+    // ── Heap target: Deref ───────────────────────────────────────────────────
 
     #[test]
     fn test_weak_ref_deref_returns_object() {
@@ -211,7 +273,7 @@ mod tests {
         }
     }
 
-    // ── Clear (GC hook) ──────────────────────────────────────────────────────
+    // ── Heap target: Clear (GC hook) ─────────────────────────────────────────
 
     #[test]
     fn test_weak_ref_clear_makes_deref_undefined() {
@@ -230,7 +292,7 @@ mod tests {
         assert_eq!(weak_ref_deref(&wr), JsValue::Undefined);
     }
 
-    // ── has_target ───────────────────────────────────────────────────────────
+    // ── Heap target: has_target ──────────────────────────────────────────────
 
     #[test]
     fn test_weak_ref_has_target_true_initially() {
@@ -247,7 +309,7 @@ mod tests {
         assert!(!weak_ref_has_target(&wr));
     }
 
-    // ── Distinct targets ─────────────────────────────────────────────────────
+    // ── Heap target: Distinct targets ────────────────────────────────────────
 
     #[test]
     fn test_weak_ref_distinct_targets() {
@@ -279,7 +341,7 @@ mod tests {
         assert!(weak_ref_has_target(&wr_b));
     }
 
-    // ── Multiple derefs ──────────────────────────────────────────────────────
+    // ── Heap target: Multiple derefs ─────────────────────────────────────────
 
     #[test]
     fn test_weak_ref_deref_is_repeatable() {
@@ -290,5 +352,83 @@ mod tests {
         let v2 = weak_ref_deref(&wr);
         assert!(matches!(v1, JsValue::Object(p) if p == ptr));
         assert!(matches!(v2, JsValue::Object(p) if p == ptr));
+    }
+
+    // ── PlainObject target: Construction ─────────────────────────────────────
+
+    #[test]
+    fn test_weak_ref_new_plain_creates_weak_ref() {
+        let obj = Rc::new(RefCell::new(PropertyMap::new()));
+        let wr = weak_ref_new_plain(&obj);
+        assert!(weak_ref_has_target(&wr));
+    }
+
+    // ── PlainObject target: Deref returns PlainObject ────────────────────────
+
+    #[test]
+    fn test_weak_ref_plain_deref_returns_plain_object() {
+        let obj = Rc::new(RefCell::new(PropertyMap::new()));
+        let wr = weak_ref_new_plain(&obj);
+        assert!(matches!(weak_ref_deref(&wr), JsValue::PlainObject(_)));
+    }
+
+    // ── PlainObject target: Deref returns Undefined after drop ───────────────
+
+    #[test]
+    fn test_weak_ref_plain_deref_undefined_after_drop() {
+        let obj = Rc::new(RefCell::new(PropertyMap::new()));
+        let wr = weak_ref_new_plain(&obj);
+        drop(obj);
+        assert_eq!(weak_ref_deref(&wr), JsValue::Undefined);
+    }
+
+    // ── PlainObject target: has_target false after drop ──────────────────────
+
+    #[test]
+    fn test_weak_ref_plain_has_target_false_after_drop() {
+        let obj = Rc::new(RefCell::new(PropertyMap::new()));
+        let wr = weak_ref_new_plain(&obj);
+        drop(obj);
+        assert!(!weak_ref_has_target(&wr));
+    }
+
+    // ── PlainObject target: Clear ────────────────────────────────────────────
+
+    #[test]
+    fn test_weak_ref_plain_clear() {
+        let obj = Rc::new(RefCell::new(PropertyMap::new()));
+        let mut wr = weak_ref_new_plain(&obj);
+        weak_ref_clear(&mut wr);
+        assert!(!weak_ref_has_target(&wr));
+        assert_eq!(weak_ref_deref(&wr), JsValue::Undefined);
+    }
+
+    // ── PlainObject target: Multiple clones keep alive ───────────────────────
+
+    #[test]
+    fn test_weak_ref_plain_alive_while_rc_exists() {
+        let obj = Rc::new(RefCell::new(PropertyMap::new()));
+        let obj2 = Rc::clone(&obj);
+        let wr = weak_ref_new_plain(&obj);
+        drop(obj);
+        // obj2 still holds a strong reference
+        assert!(weak_ref_has_target(&wr));
+        assert!(matches!(weak_ref_deref(&wr), JsValue::PlainObject(_)));
+        drop(obj2);
+        // now all strong refs are gone
+        assert!(!weak_ref_has_target(&wr));
+        assert_eq!(weak_ref_deref(&wr), JsValue::Undefined);
+    }
+
+    // ── PlainObject target: Deref is repeatable ──────────────────────────────
+
+    #[test]
+    fn test_weak_ref_plain_deref_is_repeatable() {
+        let obj = Rc::new(RefCell::new(PropertyMap::new()));
+        let wr = weak_ref_new_plain(&obj);
+        let v1 = weak_ref_deref(&wr);
+        let v2 = weak_ref_deref(&wr);
+        assert!(matches!(v1, JsValue::PlainObject(_)));
+        assert!(matches!(v2, JsValue::PlainObject(_)));
     }
 }

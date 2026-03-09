@@ -2030,9 +2030,15 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 return JsValue::Undefined;
             }
             "toString" => {
+                let obj_clone = obj.clone();
                 drop(borrow);
-                return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String("[object Object]".to_string().into()))
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    // When called via .call(value), classify that value.
+                    if let Some(value) = args.first() {
+                        return Ok(JsValue::String(value.obj_to_string_tag().into()));
+                    }
+                    // Direct call: classify the captured receiver.
+                    Ok(JsValue::String(obj_clone.obj_to_string_tag().into()))
                 }));
             }
             _ => {}
@@ -3336,27 +3342,28 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "call" => {
                 let f = Rc::clone(f);
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let call_args = if args.len() > 1 {
-                        args[1..].to_vec()
-                    } else {
-                        vec![]
-                    };
-                    f(call_args)
+                    // Pass thisArg (args[0]) through so that
+                    // Object.prototype.toString.call(value) works.
+                    f(args)
                 }));
             }
             "apply" => {
                 let f = Rc::clone(f);
                 return JsValue::NativeFunction(Rc::new(move |args| {
+                    let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
                     let call_args = match args.get(1) {
                         Some(JsValue::Array(arr)) => arr.borrow().clone(),
                         _ => vec![],
                     };
-                    f(call_args)
+                    let mut full_args = vec![this_arg];
+                    full_args.extend(call_args);
+                    f(full_args)
                 }));
             }
             "bind" => {
                 let f = Rc::clone(f);
                 return JsValue::NativeFunction(Rc::new(move |args| {
+                    let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
                     let bound_args: Vec<JsValue> = if args.len() > 1 {
                         args[1..].to_vec()
                     } else {
@@ -3364,7 +3371,8 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     };
                     let f2 = Rc::clone(&f);
                     Ok(JsValue::NativeFunction(Rc::new(move |call_args| {
-                        let mut all_args = bound_args.clone();
+                        let mut all_args = vec![this_arg.clone()];
+                        all_args.extend(bound_args.clone());
                         all_args.extend(call_args);
                         f2(all_args)
                     })))
@@ -7454,7 +7462,7 @@ mod tests {
         if let JsValue::PlainObject(map) = &result {
             let borrow = map.borrow();
             assert_eq!(borrow.get("length"), Some(&JsValue::Smi(0)));
-            assert_eq!(borrow.len(), 1); // only "length"
+            assert_eq!(borrow.len(), 2); // "length" + "__is_array__"
         } else {
             panic!("expected PlainObject, got {result:?}");
         }
