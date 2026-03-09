@@ -1205,30 +1205,90 @@ impl Interpreter {
         bytecode_array: BytecodeArray,
         _args: Vec<JsValue>,
     ) -> StatorResult<JsValue> {
-        use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
+        use crate::builtins::promise::{MicrotaskQueue, promise_reject, promise_resolve};
 
         let queue = MicrotaskQueue::new();
         let state = GeneratorState::new(bytecode_array);
         let mut input = JsValue::Undefined;
 
         loop {
-            match Interpreter::run_generator_step(&state, input)? {
-                GeneratorStep::Yield(awaited) => {
+            match Interpreter::run_generator_step(&state, input) {
+                Ok(GeneratorStep::Yield(awaited)) => {
                     // The awaited value is the result of evaluating the
                     // expression after `await`.  If it is already a resolved
-                    // promise we extract its value; otherwise we treat it as
-                    // a plain value (auto-wrap semantics).
-                    input = match awaited {
-                        JsValue::Promise(ref p) => p.value().unwrap_or(awaited),
-                        other => other,
-                    };
+                    // promise we extract its value; a rejected promise
+                    // propagates the rejection to the outer promise per
+                    // §27.7.5.3; otherwise we treat it as a plain value
+                    // (auto-wrap semantics).
+                    match &awaited {
+                        JsValue::Promise(p) => {
+                            if let Some(v) = p.value() {
+                                input = v;
+                            } else if let Some(r) = p.reason() {
+                                // Awaited promise was rejected — reject the
+                                // outer async-function promise.
+                                state.borrow_mut().status = GeneratorStatus::Completed;
+                                let rp = promise_reject(r, &queue);
+                                queue.drain();
+                                return Ok(JsValue::Promise(rp));
+                            } else {
+                                // Pending — no event loop yet, treat as undefined.
+                                input = JsValue::Undefined;
+                            }
+                        }
+                        _ => input = awaited,
+                    }
                 }
-                GeneratorStep::Return(v) => {
+                Ok(GeneratorStep::Return(v)) => {
                     let p = promise_resolve(v, &queue);
                     queue.drain();
                     return Ok(JsValue::Promise(p));
                 }
+                Err(e) => {
+                    // JavaScript exceptions inside the async body become
+                    // rejected promises per §27.7.5.2.  Engine-level errors
+                    // (OOM, sandbox violations, debugger) still propagate.
+                    if let Some(reason) = Self::js_error_to_rejection_reason(&e) {
+                        state.borrow_mut().status = GeneratorStatus::Completed;
+                        let rp = promise_reject(reason, &queue);
+                        queue.drain();
+                        return Ok(JsValue::Promise(rp));
+                    }
+                    return Err(e);
+                }
             }
+        }
+    }
+
+    /// Convert a [`StatorError`] that represents a JavaScript exception into a
+    /// [`JsValue`] suitable as a promise rejection reason.
+    ///
+    /// Returns `None` for engine-level errors that should not be silently
+    /// swallowed (OOM, internal, debugger, sandbox).
+    fn js_error_to_rejection_reason(e: &StatorError) -> Option<JsValue> {
+        match e {
+            StatorError::JsException(msg) => Some(JsValue::String(msg.clone().into())),
+            StatorError::TypeError(msg) => {
+                Some(JsValue::String(format!("TypeError: {msg}").into()))
+            }
+            StatorError::SyntaxError(msg) => {
+                Some(JsValue::String(format!("SyntaxError: {msg}").into()))
+            }
+            StatorError::ReferenceError(msg) => {
+                Some(JsValue::String(format!("ReferenceError: {msg}").into()))
+            }
+            StatorError::RangeError(msg) => {
+                Some(JsValue::String(format!("RangeError: {msg}").into()))
+            }
+            StatorError::URIError(msg) => Some(JsValue::String(format!("URIError: {msg}").into())),
+            StatorError::WasmError(msg) => {
+                Some(JsValue::String(format!("WasmError: {msg}").into()))
+            }
+            // Engine-level errors must propagate as Rust errors.
+            StatorError::OutOfMemory
+            | StatorError::Internal(_)
+            | StatorError::DebuggerPaused { .. }
+            | StatorError::SandboxViolation { .. } => None,
         }
     }
 
@@ -10961,6 +11021,64 @@ mod tests {
         } else {
             panic!("expected Promise, got {result:?}");
         }
+    }
+
+    #[test]
+    fn test_run_async_function_throw_returns_rejected_promise() {
+        // Simulate `async function f() { throw "boom"; }` — the thrown
+        // exception should be caught and surfaced as a rejected promise.
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::SwitchOnGeneratorState, vec![GEN_REG]),
+            Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(0)]),
+            Instruction::new_unchecked(Opcode::Throw, vec![]),
+        ];
+        let ba = make_bytecode_with_pool(
+            instrs,
+            vec![ConstantPoolEntry::String("boom".to_string())],
+            1,
+            0,
+        )
+        .with_async_flag(true);
+        let result = Interpreter::run_async_function(ba, vec![]).unwrap();
+        if let JsValue::Promise(p) = &result {
+            assert!(
+                p.is_rejected(),
+                "async throw should produce a rejected promise"
+            );
+            assert!(
+                p.reason().is_some(),
+                "rejected promise should have a reason"
+            );
+        } else {
+            panic!("expected Promise, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_js_error_to_rejection_reason_js_exceptions() {
+        // All JS exception types should convert to a JsValue.
+        assert!(
+            Interpreter::js_error_to_rejection_reason(&StatorError::TypeError("bad".into()))
+                .is_some()
+        );
+        assert!(
+            Interpreter::js_error_to_rejection_reason(&StatorError::ReferenceError("undef".into()))
+                .is_some()
+        );
+        assert!(
+            Interpreter::js_error_to_rejection_reason(&StatorError::JsException("oops".into()))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_js_error_to_rejection_reason_engine_errors() {
+        // Engine-level errors should NOT be converted — they propagate.
+        assert!(Interpreter::js_error_to_rejection_reason(&StatorError::OutOfMemory).is_none());
+        assert!(
+            Interpreter::js_error_to_rejection_reason(&StatorError::Internal("bug".into()))
+                .is_none()
+        );
     }
 
     // ── Tail call optimisation ────────────────────────────────────────────────
