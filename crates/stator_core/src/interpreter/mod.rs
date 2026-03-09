@@ -976,6 +976,20 @@ impl InterpreterFrame {
         Ok(())
     }
 
+    /// Copy a value from register `src` to register `dst` directly,
+    /// avoiding the intermediate borrow that `read_reg` + `write_reg`
+    /// would require.
+    #[inline]
+    fn copy_reg(&mut self, src: u32, dst: u32) -> StatorResult<()> {
+        let src_idx = self.reg_index(src)?;
+        let dst_idx = self.reg_index(dst)?;
+        if src_idx != dst_idx {
+            let val = self.registers[src_idx].cheap_clone();
+            self.registers[dst_idx] = val;
+        }
+        Ok(())
+    }
+
     /// Get a string constant from the constant pool, caching the result.
     pub fn get_string_constant(&mut self, idx: u32) -> StatorResult<Rc<str>> {
         if let Some(cached) = self.string_cache.get(&idx) {

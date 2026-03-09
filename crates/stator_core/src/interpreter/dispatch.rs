@@ -139,7 +139,7 @@ fn handle_ldar(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<D
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Ldar", 0));
     };
-    ctx.frame.accumulator = ctx.frame.read_reg(v)?.clone();
+    ctx.frame.accumulator = ctx.frame.read_reg(v)?.cheap_clone();
     Ok(DispatchAction::Continue)
 }
 
@@ -147,7 +147,7 @@ fn handle_star(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<D
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Star", 0));
     };
-    let val = ctx.frame.accumulator.clone();
+    let val = ctx.frame.accumulator.cheap_clone();
     ctx.frame.write_reg(v, val)?;
     Ok(DispatchAction::Continue)
 }
@@ -159,8 +159,7 @@ fn handle_mov(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     let Operand::Register(dst) = instr.operands[1] else {
         return Err(err_bad_operand("Mov", 1));
     };
-    let val = ctx.frame.read_reg(src)?.clone();
-    ctx.frame.write_reg(dst, val)?;
+    ctx.frame.copy_reg(src, dst)?;
     Ok(DispatchAction::Continue)
 }
 
@@ -179,7 +178,7 @@ fn handle_add(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         };
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.clone();
+    let rhs = rhs.cheap_clone();
     ctx.frame.accumulator = js_add(&ctx.frame.accumulator, &rhs)?;
     Ok(DispatchAction::Continue)
 }
@@ -199,7 +198,7 @@ fn handle_sub(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         };
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.clone();
+    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(&rhs)?;
@@ -227,7 +226,7 @@ fn handle_mul(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         };
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.clone();
+    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(&rhs)?;
@@ -244,7 +243,15 @@ fn handle_div(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Div", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi / Smi → HeapNumber (JS division always yields float)
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = number_to_jsvalue(a as f64 / *b as f64);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(&rhs)?;
@@ -264,7 +271,15 @@ fn handle_mod(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Mod", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi % Smi
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = number_to_jsvalue(a as f64 % *b as f64);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(&rhs)?;
@@ -284,7 +299,15 @@ fn handle_exp(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Exp", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi ** Smi
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = number_to_jsvalue((a as f64).powf(*b as f64));
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(&rhs)?;
@@ -309,7 +332,15 @@ fn handle_bitwise_or(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("BitwiseOr", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi | Smi (no clone needed)
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = JsValue::Smi(a | *b);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(&rhs)?;
@@ -329,7 +360,15 @@ fn handle_bitwise_xor(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("BitwiseXor", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi ^ Smi (no clone needed)
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = JsValue::Smi(a ^ *b);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(&rhs)?;
@@ -349,7 +388,15 @@ fn handle_bitwise_and(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("BitwiseAnd", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi & Smi (no clone needed)
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        ctx.frame.accumulator = JsValue::Smi(a & *b);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(&rhs)?;
@@ -369,7 +416,16 @@ fn handle_shift_left(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("ShiftLeft", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi << Smi (no clone needed)
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        let shift = (*b as u32) & 0x1f;
+        ctx.frame.accumulator = JsValue::Smi(a << shift);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(&rhs)?;
@@ -389,7 +445,16 @@ fn handle_shift_right(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("ShiftRight", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi >> Smi (no clone needed)
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        let shift = (*b as u32) & 0x1f;
+        ctx.frame.accumulator = JsValue::Smi(a >> shift);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(&rhs)?;
@@ -409,7 +474,18 @@ fn handle_shift_right_logical(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("ShiftRightLogical", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?;
+    // Fast path: Smi >>> Smi (no clone needed)
+    if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        let lhs = a as u32;
+        let shift = (*b as u32) & 0x1f;
+        let result = lhs >> shift;
+        ctx.frame.accumulator = number_to_jsvalue(result as f64);
+        return Ok(DispatchAction::Continue);
+    }
+    let rhs = rhs.cheap_clone();
     let lhs = ctx.frame.accumulator.to_number()? as i32 as u32;
     let shift = (rhs.to_number()? as u32) & 0x1f;
     let result = lhs >> shift;
@@ -655,7 +731,7 @@ fn handle_test_equal(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("TestEqual", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?.cheap_clone();
     let result = abstract_eq(&ctx.frame.accumulator, &rhs);
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
@@ -668,7 +744,7 @@ fn handle_test_not_equal(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("TestNotEqual", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?.cheap_clone();
     let result = !abstract_eq(&ctx.frame.accumulator, &rhs);
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)

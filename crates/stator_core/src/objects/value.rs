@@ -554,6 +554,28 @@ impl JsValue {
     pub fn is_object_like(&self) -> bool {
         !self.is_primitive()
     }
+
+    /// Clone this value with minimal overhead.
+    ///
+    /// Scalar variants (`Undefined`, `Null`, `TheHole`, `Boolean`, `Smi`,
+    /// `HeapNumber`, `Symbol`, `Object`, `BigInt`) are plain bitwise copies
+    /// with no reference-count traffic.  Reference-counted variants fall
+    /// back to the derived [`Clone`] implementation.
+    #[inline(always)]
+    pub fn cheap_clone(&self) -> Self {
+        match self {
+            Self::Undefined => Self::Undefined,
+            Self::Null => Self::Null,
+            Self::TheHole => Self::TheHole,
+            Self::Boolean(b) => Self::Boolean(*b),
+            Self::Smi(n) => Self::Smi(*n),
+            Self::HeapNumber(n) => Self::HeapNumber(*n),
+            Self::Symbol(s) => Self::Symbol(*s),
+            Self::Object(p) => Self::Object(*p),
+            Self::BigInt(n) => Self::BigInt(*n),
+            other => other.clone(),
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -659,6 +681,7 @@ impl JsValue {
     ///
     /// String parsing handles hex (`0x`), octal (`0o`), and binary (`0b`)
     /// integer literals as well as `"Infinity"` / `"-Infinity"`.
+    #[inline]
     pub fn to_number(&self) -> StatorResult<f64> {
         match self {
             Self::Undefined => Ok(f64::NAN),
