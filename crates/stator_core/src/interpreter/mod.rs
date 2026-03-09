@@ -1618,8 +1618,12 @@ pub(super) fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
     if lhs.is_string() || rhs.is_string() {
         let l = lhs.to_js_string()?;
         let r = rhs.to_js_string()?;
+        let total = l.len().saturating_add(r.len());
+        if total > crate::builtins::string::MAX_STRING_LEN {
+            return Err(StatorError::RangeError("Invalid string length".into()));
+        }
         // Pre-allocate exact capacity to avoid reallocation during concat.
-        let mut result = String::with_capacity(l.len() + r.len());
+        let mut result = String::with_capacity(total);
         result.push_str(&l);
         result.push_str(&r);
         Ok(JsValue::String(result.into()))
@@ -2410,53 +2414,66 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let count = match args.first() {
-                        Some(JsValue::Smi(n)) => *n as usize,
-                        Some(JsValue::HeapNumber(n)) => *n as usize,
+                        Some(JsValue::Smi(n)) => i64::from(*n),
+                        Some(JsValue::HeapNumber(n)) => {
+                            let f = *n;
+                            if f.is_nan() || f.is_infinite() || f < 0.0 {
+                                return Err(crate::error::StatorError::RangeError(
+                                    "Invalid count value".to_string(),
+                                ));
+                            }
+                            f as i64
+                        }
                         _ => 0,
                     };
-                    Ok(JsValue::String(s.repeat(count).into()))
+                    crate::builtins::string::string_repeat(&s, count)
+                        .map(|r| JsValue::String(r.into()))
                 }));
             }
             "padStart" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let target_len = match args.first() {
-                        Some(JsValue::Smi(n)) => *n as usize,
-                        Some(JsValue::HeapNumber(n)) => *n as usize,
+                        Some(JsValue::Smi(n)) => (*n).max(0) as usize,
+                        Some(JsValue::HeapNumber(n)) => {
+                            let f = *n;
+                            if f.is_nan() || f < 0.0 {
+                                0usize
+                            } else {
+                                f as usize
+                            }
+                        }
                         _ => 0,
                     };
                     let pad_str = match args.get(1) {
                         Some(JsValue::String(ss)) => ss.to_string(),
                         _ => " ".to_string(),
                     };
-                    if s.len() >= target_len {
-                        Ok(JsValue::String(s.clone()))
-                    } else {
-                        let pad_needed = target_len - s.len();
-                        let padding: String = pad_str.chars().cycle().take(pad_needed).collect();
-                        Ok(JsValue::String(format!("{padding}{s}").into()))
-                    }
+                    crate::builtins::string::string_pad_start(&s, target_len, Some(&pad_str))
+                        .map(|r| JsValue::String(r.into()))
                 }));
             }
             "padEnd" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let target_len = match args.first() {
-                        Some(JsValue::Smi(n)) => *n as usize,
-                        Some(JsValue::HeapNumber(n)) => *n as usize,
+                        Some(JsValue::Smi(n)) => (*n).max(0) as usize,
+                        Some(JsValue::HeapNumber(n)) => {
+                            let f = *n;
+                            if f.is_nan() || f < 0.0 {
+                                0usize
+                            } else {
+                                f as usize
+                            }
+                        }
                         _ => 0,
                     };
                     let pad_str = match args.get(1) {
                         Some(JsValue::String(ss)) => ss.to_string(),
                         _ => " ".to_string(),
                     };
-                    if s.len() >= target_len {
-                        Ok(JsValue::String(s.clone()))
-                    } else {
-                        let pad_needed = target_len - s.len();
-                        let padding: String = pad_str.chars().cycle().take(pad_needed).collect();
-                        Ok(JsValue::String(format!("{s}{padding}").into()))
-                    }
+                    crate::builtins::string::string_pad_end(&s, target_len, Some(&pad_str))
+                        .map(|r| JsValue::String(r.into()))
                 }));
             }
             "replace" => {

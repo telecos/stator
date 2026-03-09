@@ -25,6 +25,9 @@
 
 use crate::error::{StatorError, StatorResult};
 
+/// Maximum string length in UTF-16 code units (~256 MiB), matching V8's limit.
+pub const MAX_STRING_LEN: usize = 1 << 28;
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Encodes a UTF-8 string slice into a `Vec` of UTF-16 code units.
@@ -723,9 +726,6 @@ pub fn string_repeat(s: &str, count: i64) -> StatorResult<String> {
         ));
     }
     let n = count as usize;
-    // Guard against allocation failure: cap result size at ~256 MiB
-    // (similar to V8's string length limit).
-    const MAX_STRING_LEN: usize = 1 << 28;
     let total = n.saturating_mul(s.len());
     if total > MAX_STRING_LEN {
         return Err(StatorError::RangeError(
@@ -743,25 +743,34 @@ pub fn string_repeat(s: &str, count: i64) -> StatorResult<String> {
 /// string reaches `target_length` UTF-16 code units.  If `s` is already at
 /// least `target_length` units long, it is returned unchanged.
 ///
+/// Returns a `RangeError` if `target_length` exceeds [`MAX_STRING_LEN`].
+///
 /// # Examples
 ///
 /// ```
 /// use stator_core::builtins::string::string_pad_start;
 ///
-/// assert_eq!(string_pad_start("5", 3, None), "  5");
-/// assert_eq!(string_pad_start("5", 3, Some("0")), "005");
-/// assert_eq!(string_pad_start("hello", 3, None), "hello"); // already long enough
+/// assert_eq!(string_pad_start("5", 3, None).unwrap(), "  5");
+/// assert_eq!(string_pad_start("5", 3, Some("0")).unwrap(), "005");
+/// assert_eq!(string_pad_start("hello", 3, None).unwrap(), "hello"); // already long enough
 /// ```
-pub fn string_pad_start(s: &str, target_length: usize, pad_string: Option<&str>) -> String {
+pub fn string_pad_start(
+    s: &str,
+    target_length: usize,
+    pad_string: Option<&str>,
+) -> StatorResult<String> {
     let units = encode_utf16(s);
     let len = units.len();
     if len >= target_length {
-        return s.to_string();
+        return Ok(s.to_string());
+    }
+    if target_length > MAX_STRING_LEN {
+        return Err(StatorError::RangeError("Invalid string length".to_string()));
     }
     let pad = pad_string.unwrap_or(" ");
     let pad_units = encode_utf16(pad);
     if pad_units.is_empty() {
-        return s.to_string();
+        return Ok(s.to_string());
     }
     let pad_count = target_length - len;
     let mut prefix: Vec<u16> = Vec::with_capacity(pad_count);
@@ -774,7 +783,7 @@ pub fn string_pad_start(s: &str, target_length: usize, pad_string: Option<&str>)
     }
     let mut result = decode_utf16(&prefix);
     result.push_str(s);
-    result
+    Ok(result)
 }
 
 /// ECMAScript §22.1.3.13 `String.prototype.padEnd(targetLength, padString?)`.
@@ -782,25 +791,34 @@ pub fn string_pad_start(s: &str, target_length: usize, pad_string: Option<&str>)
 /// Pads the **end** of `s` with `pad_string` (default `" "`) until the string
 /// reaches `target_length` UTF-16 code units.
 ///
+/// Returns a `RangeError` if `target_length` exceeds [`MAX_STRING_LEN`].
+///
 /// # Examples
 ///
 /// ```
 /// use stator_core::builtins::string::string_pad_end;
 ///
-/// assert_eq!(string_pad_end("5", 3, None), "5  ");
-/// assert_eq!(string_pad_end("5", 3, Some("0")), "500");
-/// assert_eq!(string_pad_end("hello", 3, None), "hello");
+/// assert_eq!(string_pad_end("5", 3, None).unwrap(), "5  ");
+/// assert_eq!(string_pad_end("5", 3, Some("0")).unwrap(), "500");
+/// assert_eq!(string_pad_end("hello", 3, None).unwrap(), "hello");
 /// ```
-pub fn string_pad_end(s: &str, target_length: usize, pad_string: Option<&str>) -> String {
+pub fn string_pad_end(
+    s: &str,
+    target_length: usize,
+    pad_string: Option<&str>,
+) -> StatorResult<String> {
     let units = encode_utf16(s);
     let len = units.len();
     if len >= target_length {
-        return s.to_string();
+        return Ok(s.to_string());
+    }
+    if target_length > MAX_STRING_LEN {
+        return Err(StatorError::RangeError("Invalid string length".to_string()));
     }
     let pad = pad_string.unwrap_or(" ");
     let pad_units = encode_utf16(pad);
     if pad_units.is_empty() {
-        return s.to_string();
+        return Ok(s.to_string());
     }
     let pad_count = target_length - len;
     let mut suffix: Vec<u16> = Vec::with_capacity(pad_count);
@@ -813,7 +831,7 @@ pub fn string_pad_end(s: &str, target_length: usize, pad_string: Option<&str>) -
     }
     let mut result = s.to_string();
     result.push_str(&decode_utf16(&suffix));
-    result
+    Ok(result)
 }
 
 // ── at ────────────────────────────────────────────────────────────────────────
@@ -1766,48 +1784,72 @@ mod tests {
         assert_eq!(string_repeat("😀", 2).unwrap(), "😀😀");
     }
 
+    #[test]
+    fn test_repeat_exceeds_max_len() {
+        assert!(matches!(
+            string_repeat("a", (MAX_STRING_LEN as i64) + 1),
+            Err(StatorError::RangeError(_))
+        ));
+    }
+
     // ── string_pad_start / pad_end ───────────────────────────────────────────
 
     #[test]
     fn test_pad_start_default_pad() {
-        assert_eq!(string_pad_start("5", 3, None), "  5");
+        assert_eq!(string_pad_start("5", 3, None).unwrap(), "  5");
     }
 
     #[test]
     fn test_pad_start_custom_pad() {
-        assert_eq!(string_pad_start("5", 3, Some("0")), "005");
+        assert_eq!(string_pad_start("5", 3, Some("0")).unwrap(), "005");
     }
 
     #[test]
     fn test_pad_start_already_long_enough() {
-        assert_eq!(string_pad_start("hello", 3, None), "hello");
+        assert_eq!(string_pad_start("hello", 3, None).unwrap(), "hello");
     }
 
     #[test]
     fn test_pad_start_multi_char_pad() {
         // "abc" padded to length 8 with "xy" → "xyxyxabc" (pad cycles)
         // Wait: "abc" length 3, need 5 more, "xyxyx" → "xyxyxabc"
-        assert_eq!(string_pad_start("abc", 8, Some("xy")), "xyxyxabc");
+        assert_eq!(string_pad_start("abc", 8, Some("xy")).unwrap(), "xyxyxabc");
     }
 
     #[test]
     fn test_pad_end_default_pad() {
-        assert_eq!(string_pad_end("5", 3, None), "5  ");
+        assert_eq!(string_pad_end("5", 3, None).unwrap(), "5  ");
     }
 
     #[test]
     fn test_pad_end_custom_pad() {
-        assert_eq!(string_pad_end("5", 3, Some("0")), "500");
+        assert_eq!(string_pad_end("5", 3, Some("0")).unwrap(), "500");
     }
 
     #[test]
     fn test_pad_end_already_long_enough() {
-        assert_eq!(string_pad_end("hello", 3, None), "hello");
+        assert_eq!(string_pad_end("hello", 3, None).unwrap(), "hello");
     }
 
     #[test]
     fn test_pad_end_multi_char_pad() {
-        assert_eq!(string_pad_end("abc", 8, Some("xy")), "abcxyxyx");
+        assert_eq!(string_pad_end("abc", 8, Some("xy")).unwrap(), "abcxyxyx");
+    }
+
+    #[test]
+    fn test_pad_start_exceeds_max_len() {
+        assert!(matches!(
+            string_pad_start("a", MAX_STRING_LEN + 1, None),
+            Err(StatorError::RangeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_pad_end_exceeds_max_len() {
+        assert!(matches!(
+            string_pad_end("a", MAX_STRING_LEN + 1, None),
+            Err(StatorError::RangeError(_))
+        ));
     }
 
     // ── string_at ────────────────────────────────────────────────────────────
@@ -1913,7 +1955,7 @@ mod tests {
     fn test_pad_start_unicode_pad_string() {
         // Pad "a" to length 3 with "é" (1 UTF-16 unit each).
         // "a" has length 1, need 2 more: "éé" then "a".
-        let result = string_pad_start("a", 3, Some("é"));
+        let result = string_pad_start("a", 3, Some("é")).unwrap();
         assert_eq!(result, "ééa");
     }
 
