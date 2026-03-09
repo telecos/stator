@@ -189,7 +189,9 @@ use crate::objects::value::{JsContext, JsValue};
 
 // Re-export generator types and bring them into scope so external code can
 // import them from `stator_core::interpreter` (backwards-compatible path).
-pub use crate::objects::value::{GeneratorState, GeneratorStatus, GeneratorStep, NativeIterator};
+pub use crate::objects::value::{
+    GeneratorResumeMode, GeneratorState, GeneratorStatus, GeneratorStep, NativeIterator,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Debugger integration
@@ -839,6 +841,20 @@ pub(super) fn try_execute_best_jit(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PropertyIc – shape-based inline cache entry
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A monomorphic inline-cache entry that maps a [`PropertyMap::shape_id`] to a
+/// direct slot offset, enabling O(1) property access when the shape is stable.
+#[derive(Debug, Clone)]
+pub struct PropertyIc {
+    /// The [`PropertyMap::shape_id`] observed when the cache was populated.
+    pub cached_shape: u64,
+    /// The Vec offset of the cached property inside the `PropertyMap`.
+    pub cached_offset: usize,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // InterpreterFrame
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -902,6 +918,13 @@ pub struct InterpreterFrame {
     /// Polymorphic property-load cache: `slot → [(ptr, cached_value)]`.
     /// Holds up to 4 entries per feedback slot, supporting polymorphic sites.
     pub poly_load_cache: HashMap<u32, Vec<(usize, JsValue)>>,
+    /// Shape-based inline cache for named property loads.
+    /// Maps a feedback slot to a [`PropertyIc`] recording the last observed
+    /// `(shape_id, offset)` pair so that a repeat access on the same shape
+    /// can skip HashMap lookup entirely.
+    pub shape_load_ic: HashMap<u32, PropertyIc>,
+    /// Shape-based inline cache for named property stores.
+    pub shape_store_ic: HashMap<u32, PropertyIc>,
     /// Pre-decoded string constants from the constant pool, keyed by index.
     /// Avoids repeated `String::clone()` from the constant pool.
     pub string_cache: HashMap<u32, Rc<str>>,
@@ -941,6 +964,8 @@ impl InterpreterFrame {
             new_target: JsValue::Undefined,
             mono_load_cache: HashMap::new(),
             poly_load_cache: HashMap::new(),
+            shape_load_ic: HashMap::new(),
+            shape_store_ic: HashMap::new(),
             string_cache: HashMap::new(),
         }
     }
@@ -949,11 +974,26 @@ impl InterpreterFrame {
     ///
     /// Used by the interpreter when calling a function so that the callee can
     /// access the same globals as the top-level script.
+    ///
+    /// Engine builtins (`eval`, `Math`, `JSON`, etc.) are merged into the
+    /// provided environment when they are not already present, so callers
+    /// that supply only application-specific globals (e.g. `print`) still
+    /// get a fully functional JavaScript environment.
     pub fn new_with_globals(
         bytecode_array: BytecodeArray,
         args: Vec<JsValue>,
         global_env: Rc<RefCell<HashMap<String, JsValue>>>,
     ) -> Self {
+        // Ensure engine builtins are present.  The `eval` key is used as a
+        // sentinel — if it exists the full set has already been installed.
+        if !global_env.borrow().contains_key("eval") {
+            let mut defaults = HashMap::new();
+            crate::builtins::install_globals::install_globals(&mut defaults);
+            let mut env = global_env.borrow_mut();
+            for (k, v) in defaults {
+                env.entry(k).or_insert(v);
+            }
+        }
         let mut frame = Self::new(bytecode_array, args);
         frame.global_env = global_env;
         frame
@@ -1191,6 +1231,8 @@ impl Interpreter {
             new_target: JsValue::Undefined,
             mono_load_cache: std::collections::HashMap::new(),
             poly_load_cache: std::collections::HashMap::new(),
+            shape_load_ic: std::collections::HashMap::new(),
+            shape_store_ic: std::collections::HashMap::new(),
             string_cache: std::collections::HashMap::new(),
         };
         // Restore the captured closure context so generators can access outer
@@ -1343,17 +1385,31 @@ impl Interpreter {
         value: JsValue,
     ) -> StatorResult<JsValue> {
         let status = state.borrow().status;
-        let err_str = format!("{value:?}");
         match status {
             GeneratorStatus::SuspendedAtYield => {
-                state.borrow_mut().status = GeneratorStatus::Completed;
-                Err(StatorError::JsException(err_str))
+                // Set resume mode so handle_resume_generator will throw at
+                // the yield point; the handler table catches it if there is
+                // an active try/catch.
+                state.borrow_mut().resume_mode = GeneratorResumeMode::Throw(value.clone());
+                match Self::run_generator_step(state, JsValue::Undefined) {
+                    Ok(GeneratorStep::Yield(v)) => Ok(make_iterator_result(v, false)),
+                    Ok(GeneratorStep::Return(v)) => Ok(make_iterator_result(v, true)),
+                    Err(e) => {
+                        // Uncaught — mark the generator as completed.
+                        state.borrow_mut().status = GeneratorStatus::Completed;
+                        Err(e)
+                    }
+                }
             }
             GeneratorStatus::SuspendedAtStart => {
                 state.borrow_mut().status = GeneratorStatus::Completed;
+                let err_str = format!("{value:?}");
                 Err(StatorError::JsException(err_str))
             }
-            GeneratorStatus::Completed => Err(StatorError::JsException(err_str)),
+            GeneratorStatus::Completed => {
+                let err_str = format!("{value:?}");
+                Err(StatorError::JsException(err_str))
+            }
             GeneratorStatus::Executing => Err(StatorError::TypeError(
                 "Generator is already running".into(),
             )),
@@ -1609,11 +1665,42 @@ pub(super) fn bigint_pow(base: i128, exp: u32) -> i128 {
     result
 }
 
+thread_local! {
+    /// Reusable buffer for string concatenation.  Avoids a fresh allocation on
+    /// every `+` when building strings in a loop (e.g. `a + b + c + d`).  The
+    /// buffer is cleared before each use but retains its heap allocation across
+    /// calls within the same thread.
+    static STRING_BUILDER: RefCell<String> = RefCell::new(String::with_capacity(4096));
+}
+
+/// Concatenate two string slices, reusing a thread-local buffer.
+///
+/// The caller must already have validated `MAX_STRING_LEN`.
+#[inline]
+pub(super) fn concat_rc_strs(l: &str, r: &str) -> JsValue {
+    STRING_BUILDER.with(|sb| {
+        let mut buf = sb.borrow_mut();
+        buf.clear();
+        let total = l.len() + r.len();
+        let cap = buf.capacity();
+        if total > cap {
+            buf.reserve(total - cap);
+        }
+        buf.push_str(l);
+        buf.push_str(r);
+        JsValue::String(Rc::from(buf.as_str()))
+    })
+}
+
 /// ECMAScript `+` operator: string concatenation or numeric addition.
 ///
 /// If either operand is already a string, both are converted to strings and
 /// concatenated.  Otherwise both are converted to numbers and added.
 /// BigInt operands are added together; mixing BigInt and Number is a TypeError.
+///
+/// String concatenation reuses a thread-local buffer so that chains like
+/// `a + b + c + d` avoid allocating a fresh `String` for every intermediate
+/// result.
 pub(super) fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
     if lhs.is_string() || rhs.is_string() {
         let l = lhs.to_js_string()?;
@@ -1622,11 +1709,7 @@ pub(super) fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
         if total > crate::builtins::string::MAX_STRING_LEN {
             return Err(StatorError::RangeError("Invalid string length".into()));
         }
-        // Pre-allocate exact capacity to avoid reallocation during concat.
-        let mut result = String::with_capacity(total);
-        result.push_str(&l);
-        result.push_str(&r);
-        Ok(JsValue::String(result.into()))
+        Ok(concat_rc_strs(&l, &r))
     } else if lhs.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(lhs)?;
         let r = to_bigint(rhs)?;
