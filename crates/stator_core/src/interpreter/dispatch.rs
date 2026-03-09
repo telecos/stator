@@ -15,7 +15,7 @@ use crate::objects::property_map::PropertyMap;
 use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
     TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, constant_pool_jump_delta,
-    constant_to_value, decode_string_constant, dispatch_call_property, dispatch_call_value,
+    constant_to_value, decode_string_constant, dispatch_call_property, dispatch_call_with_this,
     dispatch_setter, err_bad_operand, error_message_from_value, extract_context, find_handler,
     fn_props_set, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
     maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, number_to_jsvalue,
@@ -2194,7 +2194,7 @@ fn handle_get_iterator(
             let iter_fn = map.borrow().get("@@iterator").cloned();
             match iter_fn {
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
-                    dispatch_call_value(f, vec![])?
+                    dispatch_call_with_this(f, iterable.clone(), vec![])?
                 }
                 _ => {
                     return Err(StatorError::TypeError(
@@ -2237,7 +2237,7 @@ fn handle_get_async_iterator(
             let iter_fn = map.borrow().get("@@asyncIterator").cloned();
             match iter_fn {
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
-                    dispatch_call_value(f, vec![])?
+                    dispatch_call_with_this(f, iterable.clone(), vec![])?
                 }
                 _ => {
                     return Err(StatorError::TypeError(
@@ -2251,7 +2251,7 @@ fn handle_get_async_iterator(
             let iter_fn = map.borrow().get("@@iterator").cloned();
             match iter_fn {
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
-                    dispatch_call_value(f, vec![])?
+                    dispatch_call_with_this(f, iterable.clone(), vec![])?
                 }
                 _ => {
                     return Err(StatorError::TypeError(
@@ -2299,7 +2299,7 @@ fn handle_iterator_next(
             let next_fn = map.borrow().get("next").cloned();
             match next_fn {
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
-                    let result = dispatch_call_value(f, vec![])?;
+                    let result = dispatch_call_with_this(f, iter.clone(), vec![])?;
                     match result {
                         JsValue::PlainObject(ref res_map) => {
                             let done = res_map.borrow().get("done").is_some_and(|d| d.to_boolean());
@@ -2777,6 +2777,54 @@ fn handle_create_array_from_iterable(
                 match it.next_item() {
                     Some(v) => out.push(v),
                     None => break,
+                }
+            }
+            out
+        }
+        JsValue::String(s) => s
+            .chars()
+            .map(|c| JsValue::String(c.to_string().into()))
+            .collect(),
+        JsValue::Generator(gs) => {
+            let mut out = Vec::new();
+            loop {
+                match Interpreter::run_generator_step(gs, JsValue::Undefined)? {
+                    GeneratorStep::Yield(v) => out.push(v),
+                    GeneratorStep::Return(v) => {
+                        if !matches!(v, JsValue::Undefined) {
+                            out.push(v);
+                        }
+                        break;
+                    }
+                }
+            }
+            out
+        }
+        JsValue::PlainObject(map) if map.borrow().contains_key("next") => {
+            let mut out = Vec::new();
+            loop {
+                let next_fn = map.borrow().get("next").cloned();
+                match next_fn {
+                    Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
+                        let result = dispatch_call_with_this(f, iterable.clone(), vec![])?;
+                        match result {
+                            JsValue::PlainObject(ref res_map) => {
+                                let done =
+                                    res_map.borrow().get("done").is_some_and(|d| d.to_boolean());
+                                if done {
+                                    break;
+                                }
+                                let value = res_map
+                                    .borrow()
+                                    .get("value")
+                                    .cloned()
+                                    .unwrap_or(JsValue::Undefined);
+                                out.push(value);
+                            }
+                            _ => break,
+                        }
+                    }
+                    _ => break,
                 }
             }
             out
