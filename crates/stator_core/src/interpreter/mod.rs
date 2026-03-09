@@ -231,12 +231,19 @@ thread_local! {
         RefCell::new(crate::objects::js_string::StringTable::new());
 }
 
-/// Fast-path atomic flag indicating whether a debugger is attached.
-///
-/// Checked on every instruction dispatch before touching the thread-local
-/// `ACTIVE_DEBUGGER` RefCell.  This avoids a TLS+RefCell borrow on every
-/// single instruction when no debugger is present (the common case).
-static DEBUG_ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    /// Fast-path flag indicating whether a debugger is attached on this thread.
+    ///
+    /// Checked on every instruction dispatch before touching the thread-local
+    /// `ACTIVE_DEBUGGER` RefCell.  This avoids a TLS+RefCell borrow on every
+    /// single instruction when no debugger is present (the common case).
+    ///
+    /// Must be thread-local (not a global `AtomicBool`) because
+    /// `ACTIVE_DEBUGGER` is thread-local: a global flag would let one thread's
+    /// `detach_debugger` hide another thread's attached debugger, causing
+    /// flaky breakpoint misses in parallel tests.
+    static DEBUG_ATTACHED: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Attach a [`Debugger`] to the current thread's interpreter.
 ///
@@ -245,7 +252,7 @@ static DEBUG_ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// thread; calling this again replaces any previously attached debugger.
 pub fn attach_debugger(dbg: Rc<RefCell<Debugger>>) {
     ACTIVE_DEBUGGER.with(|d| *d.borrow_mut() = Some(dbg));
-    DEBUG_ATTACHED.store(true, std::sync::atomic::Ordering::Release);
+    DEBUG_ATTACHED.with(|f| f.set(true));
 }
 
 /// Detach the [`Debugger`] from the current thread.
@@ -254,7 +261,7 @@ pub fn attach_debugger(dbg: Rc<RefCell<Debugger>>) {
 /// safe to call this even if no debugger was attached.
 pub fn detach_debugger() {
     ACTIVE_DEBUGGER.with(|d| *d.borrow_mut() = None);
-    DEBUG_ATTACHED.store(false, std::sync::atomic::Ordering::Release);
+    DEBUG_ATTACHED.with(|f| f.set(false));
 }
 
 /// Intern a property key string in the thread-local string table.
@@ -1121,7 +1128,7 @@ impl Interpreter {
                 // next instruction so that the paused frame state reflects what is
                 // *about* to execute (the program counter still points at the
                 // instruction that would fire next).
-                if DEBUG_ATTACHED.load(std::sync::atomic::Ordering::Relaxed) {
+                if DEBUG_ATTACHED.with(Cell::get) {
                     let current_offset = byte_offsets[frame.pc] as u32;
                     if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
                         let opt = d.borrow();
