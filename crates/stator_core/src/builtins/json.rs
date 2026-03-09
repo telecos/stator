@@ -268,6 +268,7 @@ pub fn json_parse(text: &str, reviver: Option<ReviverFn<'_>>) -> StatorResult<Js
     let mut parser = Parser {
         src: &chars,
         pos: 0,
+        depth: 0,
     };
     parser.skip_ws();
     let value = parser.parse_value()?;
@@ -376,9 +377,13 @@ pub fn json_stringify_js_value(
 // Internal: RFC 8259 parser
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Maximum nesting depth for JSON values (arrays/objects).
+const JSON_MAX_DEPTH: usize = 512;
+
 struct Parser<'a> {
     src: &'a [char],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -443,8 +448,21 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         match self.peek() {
             Some('"') => self.parse_string().map(JsonValue::Str),
-            Some('{') => self.parse_object(),
-            Some('[') => self.parse_array(),
+            Some('{') | Some('[') => {
+                self.depth += 1;
+                if self.depth > JSON_MAX_DEPTH {
+                    return Err(StatorError::SyntaxError(
+                        "JSON nesting depth exceeded".to_string(),
+                    ));
+                }
+                let result = if self.peek() == Some('{') {
+                    self.parse_object()
+                } else {
+                    self.parse_array()
+                };
+                self.depth -= 1;
+                result
+            }
             Some('t') => {
                 self.expect_literal("true")?;
                 Ok(JsonValue::Bool(true))

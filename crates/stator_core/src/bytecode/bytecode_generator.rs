@@ -764,47 +764,49 @@ impl FunctionCompiler {
 
     /// Compile a single statement, emitting bytecode into `self.instructions`.
     fn compile_stmt(&mut self, stmt: &Stmt) -> StatorResult<()> {
-        // Record the source position of each non-empty statement so that the
-        // debugger can map bytecode offsets back to line/column numbers.
-        let loc = stmt.loc();
-        if loc.start.line > 0 {
-            let instr_idx = self.instructions.len();
-            self.pending_positions
-                .push((instr_idx, loc.start.line, loc.start.column));
-        }
-        match stmt {
-            Stmt::Block(s) => self.compile_block(s),
-            Stmt::VarDecl(s) => self.compile_var_decl(s),
-            Stmt::FnDecl(s) => self.compile_fn_decl(s),
-            Stmt::Expr(s) => {
-                self.compile_expr(&s.expr)?;
-                Ok(())
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+            // Record the source position of each non-empty statement so that the
+            // debugger can map bytecode offsets back to line/column numbers.
+            let loc = stmt.loc();
+            if loc.start.line > 0 {
+                let instr_idx = self.instructions.len();
+                self.pending_positions
+                    .push((instr_idx, loc.start.line, loc.start.column));
             }
-            Stmt::If(s) => self.compile_if(s),
-            Stmt::While(s) => self.compile_while(s),
-            Stmt::DoWhile(s) => self.compile_do_while(s),
-            Stmt::For(s) => self.compile_for(s),
-            Stmt::Return(s) => self.compile_return(s),
-            Stmt::Throw(s) => {
-                self.compile_expr(&s.argument)?;
-                self.emit(Instruction::new_unchecked(Opcode::Throw, vec![]));
-                Ok(())
+            match stmt {
+                Stmt::Block(s) => self.compile_block(s),
+                Stmt::VarDecl(s) => self.compile_var_decl(s),
+                Stmt::FnDecl(s) => self.compile_fn_decl(s),
+                Stmt::Expr(s) => {
+                    self.compile_expr(&s.expr)?;
+                    Ok(())
+                }
+                Stmt::If(s) => self.compile_if(s),
+                Stmt::While(s) => self.compile_while(s),
+                Stmt::DoWhile(s) => self.compile_do_while(s),
+                Stmt::For(s) => self.compile_for(s),
+                Stmt::Return(s) => self.compile_return(s),
+                Stmt::Throw(s) => {
+                    self.compile_expr(&s.argument)?;
+                    self.emit(Instruction::new_unchecked(Opcode::Throw, vec![]));
+                    Ok(())
+                }
+                Stmt::Try(s) => self.compile_try(s),
+                Stmt::Break(s) => self.compile_break(s),
+                Stmt::Continue(s) => self.compile_continue(s),
+                Stmt::Labeled(s) => self.compile_labeled(s),
+                Stmt::Debugger(_) => {
+                    self.emit(Instruction::new_unchecked(Opcode::Debugger, vec![]));
+                    Ok(())
+                }
+                Stmt::Empty(_) => Ok(()),
+                Stmt::Switch(s) => self.compile_switch(s),
+                Stmt::ForIn(s) => self.compile_for_in(s),
+                Stmt::With(s) => self.compile_with(s),
+                Stmt::ClassDecl(c) => self.compile_class_decl(c),
+                Stmt::ForOf(s) => self.compile_for_of(s),
             }
-            Stmt::Try(s) => self.compile_try(s),
-            Stmt::Break(s) => self.compile_break(s),
-            Stmt::Continue(s) => self.compile_continue(s),
-            Stmt::Labeled(s) => self.compile_labeled(s),
-            Stmt::Debugger(_) => {
-                self.emit(Instruction::new_unchecked(Opcode::Debugger, vec![]));
-                Ok(())
-            }
-            Stmt::Empty(_) => Ok(()),
-            Stmt::Switch(s) => self.compile_switch(s),
-            Stmt::ForIn(s) => self.compile_for_in(s),
-            Stmt::With(s) => self.compile_with(s),
-            Stmt::ClassDecl(c) => self.compile_class_decl(c),
-            Stmt::ForOf(s) => self.compile_for_of(s),
-        }
+        }) // stacker::maybe_grow
     }
 
     /// Compile a `{ … }` block, pushing/popping a scope.
@@ -1885,186 +1887,190 @@ impl FunctionCompiler {
 
     /// Compile an expression, leaving the result in the accumulator.
     fn compile_expr(&mut self, expr: &Expr) -> StatorResult<()> {
-        // Only Call, Conditional, Logical, and Sequence expressions can
-        // propagate tail position to sub-expressions.  All other expression
-        // types clear the flag so that nested calls are not incorrectly
-        // marked as tail calls (e.g. `return n + f(n-1)` — the call f() is
-        // NOT in tail position because its result feeds into `+`).
-        match expr {
-            Expr::Call(_) | Expr::Conditional(_) | Expr::Logical(_) | Expr::Sequence(_) => {}
-            _ => {
-                self.in_tail_position = false;
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+            // Only Call, Conditional, Logical, and Sequence expressions can
+            // propagate tail position to sub-expressions.  All other expression
+            // types clear the flag so that nested calls are not incorrectly
+            // marked as tail calls (e.g. `return n + f(n-1)` — the call f() is
+            // NOT in tail position because its result feeds into `+`).
+            match expr {
+                Expr::Call(_) | Expr::Conditional(_) | Expr::Logical(_) | Expr::Sequence(_) => {}
+                _ => {
+                    self.in_tail_position = false;
+                }
             }
-        }
 
-        match expr {
-            // ── Literals ──────────────────────────────────────────────────
-            Expr::Null(_) => {
-                self.emit(Instruction::new_unchecked(Opcode::LdaNull, vec![]));
-                Ok(())
-            }
-            Expr::Bool(b) => {
-                let op = if b.value {
-                    Opcode::LdaTrue
-                } else {
-                    Opcode::LdaFalse
-                };
-                self.emit(Instruction::new_unchecked(op, vec![]));
-                Ok(())
-            }
-            Expr::Num(n) => {
-                self.compile_number(n.value);
-                Ok(())
-            }
-            Expr::Str(s) => {
-                let idx = self.add_string(&s.value);
-                self.emit(Instruction::new_unchecked(
-                    Opcode::LdaConstant,
-                    vec![Operand::ConstantPoolIdx(idx)],
-                ));
-                Ok(())
-            }
-            Expr::BigInt(b) => {
-                let raw = b.value.replace('_', "");
-                let n: i128 = if let Some(hex) =
-                    raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X"))
-                {
-                    i128::from_str_radix(hex, 16).map_err(|e| {
-                        StatorError::Internal(format!("invalid BigInt hex literal: {e}"))
-                    })?
-                } else if let Some(oct) = raw.strip_prefix("0o").or_else(|| raw.strip_prefix("0O"))
-                {
-                    i128::from_str_radix(oct, 8).map_err(|e| {
-                        StatorError::Internal(format!("invalid BigInt octal literal: {e}"))
-                    })?
-                } else if let Some(bin) = raw.strip_prefix("0b").or_else(|| raw.strip_prefix("0B"))
-                {
-                    i128::from_str_radix(bin, 2).map_err(|e| {
-                        StatorError::Internal(format!("invalid BigInt binary literal: {e}"))
-                    })?
-                } else {
-                    raw.parse::<i128>().map_err(|e| {
-                        StatorError::Internal(format!("invalid BigInt literal: {e}"))
-                    })?
-                };
-                let idx = self.add_bigint(n);
-                self.emit(Instruction::new_unchecked(
-                    Opcode::LdaConstant,
-                    vec![Operand::ConstantPoolIdx(idx)],
-                ));
-                Ok(())
-            }
-            Expr::Regexp(r) => {
-                let pattern_idx = self.add_string(&r.pattern);
-                // Encode flags as a bitfield: g=1, i=2, m=4, s=8, u=16, y=32
-                let flags_val: u8 = r.flags.bytes().fold(0u8, |acc, b| {
-                    let bit = match b {
-                        b'g' => 0x01,
-                        b'i' => 0x02,
-                        b'm' => 0x04,
-                        b's' => 0x08,
-                        b'u' => 0x10,
-                        b'y' => 0x20,
-                        _ => 0,
+            match expr {
+                // ── Literals ──────────────────────────────────────────────────
+                Expr::Null(_) => {
+                    self.emit(Instruction::new_unchecked(Opcode::LdaNull, vec![]));
+                    Ok(())
+                }
+                Expr::Bool(b) => {
+                    let op = if b.value {
+                        Opcode::LdaTrue
+                    } else {
+                        Opcode::LdaFalse
                     };
-                    acc | bit
-                });
-                let slot = self.alloc_slot(FeedbackSlotKind::Literal);
-                self.emit(Instruction::new_unchecked(
-                    Opcode::CreateRegExpLiteral,
-                    vec![
-                        Operand::ConstantPoolIdx(pattern_idx),
-                        slot,
-                        Operand::Flag(flags_val),
-                    ],
-                ));
-                Ok(())
-            }
-            Expr::Template(t) => self.compile_template(t),
-
-            // ── Identifier ────────────────────────────────────────────────
-            Expr::Ident(id) => {
-                self.compile_ident_load(&id.name);
-                Ok(())
-            }
-            Expr::This(_) => {
-                // `this` is implicitly the receiver; load from a special slot.
-                // We represent it as a named global lookup for now.
-                let name_idx = self.add_string("this");
-                let slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
-                self.emit(Instruction::new_unchecked(
-                    Opcode::LdaGlobal,
-                    vec![Operand::ConstantPoolIdx(name_idx), slot],
-                ));
-                Ok(())
-            }
-
-            // ── Objects / Arrays ──────────────────────────────────────────
-            Expr::Array(a) => self.compile_array(a),
-            Expr::Object(o) => self.compile_object(o),
-
-            // ── Function-like ─────────────────────────────────────────────
-            Expr::Fn(f) => self.compile_fn_expr(f),
-            Expr::Arrow(a) => self.compile_arrow_expr(a),
-            Expr::Class(c) => self.compile_class_expr(c),
-
-            // ── Operators ─────────────────────────────────────────────────
-            Expr::Unary(u) => self.compile_unary(u),
-            Expr::Update(u) => self.compile_update(u),
-            Expr::Binary(b) => self.compile_binary(b),
-            Expr::Logical(l) => self.compile_logical(l),
-            Expr::Conditional(c) => self.compile_conditional(c),
-            Expr::Assign(a) => self.compile_assign(a),
-            Expr::Sequence(s) => {
-                let saved_tail = self.in_tail_position;
-                let len = s.expressions.len();
-                for (i, expr) in s.expressions.iter().enumerate() {
-                    // Only the last expression in a comma sequence inherits
-                    // tail position; all preceding ones are for side effects.
-                    self.in_tail_position = saved_tail && i == len - 1;
-                    self.compile_expr(expr)?;
+                    self.emit(Instruction::new_unchecked(op, vec![]));
+                    Ok(())
                 }
-                self.in_tail_position = false;
-                Ok(())
-            }
-
-            // ── Member / call ─────────────────────────────────────────────
-            Expr::Member(m) => self.compile_member(m),
-            Expr::OptionalMember(m) => self.compile_optional_member(m),
-            Expr::Call(c) => self.compile_call(c),
-            Expr::OptionalCall(c) => self.compile_optional_call(c),
-            Expr::New(n) => self.compile_new(n),
-
-            // ── Async / generators ────────────────────────────────────────
-            Expr::Yield(y) => {
-                if !self.is_generator {
-                    return Err(StatorError::Internal(
-                        "yield expression outside of a generator function".into(),
+                Expr::Num(n) => {
+                    self.compile_number(n.value);
+                    Ok(())
+                }
+                Expr::Str(s) => {
+                    let idx = self.add_string(&s.value);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::LdaConstant,
+                        vec![Operand::ConstantPoolIdx(idx)],
                     ));
+                    Ok(())
                 }
-                self.compile_yield(y)
-            }
-            Expr::Await(a) => {
-                if !self.is_async {
-                    return Err(StatorError::Internal(
-                        "await expression outside of an async function".into(),
+                Expr::BigInt(b) => {
+                    let raw = b.value.replace('_', "");
+                    let n: i128 = if let Some(hex) =
+                        raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X"))
+                    {
+                        i128::from_str_radix(hex, 16).map_err(|e| {
+                            StatorError::Internal(format!("invalid BigInt hex literal: {e}"))
+                        })?
+                    } else if let Some(oct) =
+                        raw.strip_prefix("0o").or_else(|| raw.strip_prefix("0O"))
+                    {
+                        i128::from_str_radix(oct, 8).map_err(|e| {
+                            StatorError::Internal(format!("invalid BigInt octal literal: {e}"))
+                        })?
+                    } else if let Some(bin) =
+                        raw.strip_prefix("0b").or_else(|| raw.strip_prefix("0B"))
+                    {
+                        i128::from_str_radix(bin, 2).map_err(|e| {
+                            StatorError::Internal(format!("invalid BigInt binary literal: {e}"))
+                        })?
+                    } else {
+                        raw.parse::<i128>().map_err(|e| {
+                            StatorError::Internal(format!("invalid BigInt literal: {e}"))
+                        })?
+                    };
+                    let idx = self.add_bigint(n);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::LdaConstant,
+                        vec![Operand::ConstantPoolIdx(idx)],
                     ));
+                    Ok(())
                 }
-                self.compile_await(a)
-            }
+                Expr::Regexp(r) => {
+                    let pattern_idx = self.add_string(&r.pattern);
+                    // Encode flags as a bitfield: g=1, i=2, m=4, s=8, u=16, y=32
+                    let flags_val: u8 = r.flags.bytes().fold(0u8, |acc, b| {
+                        let bit = match b {
+                            b'g' => 0x01,
+                            b'i' => 0x02,
+                            b'm' => 0x04,
+                            b's' => 0x08,
+                            b'u' => 0x10,
+                            b'y' => 0x20,
+                            _ => 0,
+                        };
+                        acc | bit
+                    });
+                    let slot = self.alloc_slot(FeedbackSlotKind::Literal);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::CreateRegExpLiteral,
+                        vec![
+                            Operand::ConstantPoolIdx(pattern_idx),
+                            slot,
+                            Operand::Flag(flags_val),
+                        ],
+                    ));
+                    Ok(())
+                }
+                Expr::Template(t) => self.compile_template(t),
 
-            Expr::TaggedTemplate(t) => self.compile_tagged_template(t),
-            Expr::Spread(s) => {
-                // Spread in expression position: compile the argument.
-                // The parent context (array literal, function call) handles iteration.
-                self.compile_expr(&s.argument)
+                // ── Identifier ────────────────────────────────────────────────
+                Expr::Ident(id) => {
+                    self.compile_ident_load(&id.name);
+                    Ok(())
+                }
+                Expr::This(_) => {
+                    // `this` is implicitly the receiver; load from a special slot.
+                    // We represent it as a named global lookup for now.
+                    let name_idx = self.add_string("this");
+                    let slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::LdaGlobal,
+                        vec![Operand::ConstantPoolIdx(name_idx), slot],
+                    ));
+                    Ok(())
+                }
+
+                // ── Objects / Arrays ──────────────────────────────────────────
+                Expr::Array(a) => self.compile_array(a),
+                Expr::Object(o) => self.compile_object(o),
+
+                // ── Function-like ─────────────────────────────────────────────
+                Expr::Fn(f) => self.compile_fn_expr(f),
+                Expr::Arrow(a) => self.compile_arrow_expr(a),
+                Expr::Class(c) => self.compile_class_expr(c),
+
+                // ── Operators ─────────────────────────────────────────────────
+                Expr::Unary(u) => self.compile_unary(u),
+                Expr::Update(u) => self.compile_update(u),
+                Expr::Binary(b) => self.compile_binary(b),
+                Expr::Logical(l) => self.compile_logical(l),
+                Expr::Conditional(c) => self.compile_conditional(c),
+                Expr::Assign(a) => self.compile_assign(a),
+                Expr::Sequence(s) => {
+                    let saved_tail = self.in_tail_position;
+                    let len = s.expressions.len();
+                    for (i, expr) in s.expressions.iter().enumerate() {
+                        // Only the last expression in a comma sequence inherits
+                        // tail position; all preceding ones are for side effects.
+                        self.in_tail_position = saved_tail && i == len - 1;
+                        self.compile_expr(expr)?;
+                    }
+                    self.in_tail_position = false;
+                    Ok(())
+                }
+
+                // ── Member / call ─────────────────────────────────────────────
+                Expr::Member(m) => self.compile_member(m),
+                Expr::OptionalMember(m) => self.compile_optional_member(m),
+                Expr::Call(c) => self.compile_call(c),
+                Expr::OptionalCall(c) => self.compile_optional_call(c),
+                Expr::New(n) => self.compile_new(n),
+
+                // ── Async / generators ────────────────────────────────────────
+                Expr::Yield(y) => {
+                    if !self.is_generator {
+                        return Err(StatorError::Internal(
+                            "yield expression outside of a generator function".into(),
+                        ));
+                    }
+                    self.compile_yield(y)
+                }
+                Expr::Await(a) => {
+                    if !self.is_async {
+                        return Err(StatorError::Internal(
+                            "await expression outside of an async function".into(),
+                        ));
+                    }
+                    self.compile_await(a)
+                }
+
+                Expr::TaggedTemplate(t) => self.compile_tagged_template(t),
+                Expr::Spread(s) => {
+                    // Spread in expression position: compile the argument.
+                    // The parent context (array literal, function call) handles iteration.
+                    self.compile_expr(&s.argument)
+                }
+                Expr::Import(imp) => self.compile_import_call(imp),
+                Expr::MetaProp(m) => self.compile_meta_prop(m),
+                Expr::PrivateName(_) => Err(StatorError::Internal(
+                    "bare private name expression should only appear as LHS of 'in'".into(),
+                )),
             }
-            Expr::Import(imp) => self.compile_import_call(imp),
-            Expr::MetaProp(m) => self.compile_meta_prop(m),
-            Expr::PrivateName(_) => Err(StatorError::Internal(
-                "bare private name expression should only appear as LHS of 'in'".into(),
-            )),
-        }
+        }) // stacker::maybe_grow
     }
 
     /// Emit the optimal load for a numeric constant.
