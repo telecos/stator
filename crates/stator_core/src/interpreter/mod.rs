@@ -1175,6 +1175,10 @@ impl Interpreter {
             poly_load_cache: std::collections::HashMap::new(),
             string_cache: std::collections::HashMap::new(),
         };
+        // Restore the captured closure context so generators can access outer
+        // scope variables through the context chain.
+        let ba_ref = frame.bytecode_array.clone();
+        restore_closure_context(&mut frame, &ba_ref);
 
         state.borrow_mut().status = GeneratorStatus::Executing;
 
@@ -1760,6 +1764,7 @@ pub(super) fn dispatch_call(
                         args,
                         Rc::clone(&frame.global_env),
                     );
+                    restore_closure_context(&mut callee_frame, ba);
                     push_call_frame("<anonymous>")?;
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
@@ -1825,7 +1830,7 @@ pub(super) fn dispatch_call_property(
                         args,
                         Rc::clone(&frame.global_env),
                     );
-                    callee_frame.context = Some(this_val.clone());
+                    restore_closure_context(&mut callee_frame, ba);
                     callee_frame
                         .global_env
                         .borrow_mut()
@@ -1896,6 +1901,20 @@ pub(super) fn walk_context_chain(
         current = parent;
     }
     Ok(current)
+}
+
+/// Restore the captured closure context on a callee frame.
+///
+/// If `ba` was created by `CreateClosure` with an enclosing scope, this sets
+/// the callee frame's context so that `CreateFunctionContext` chains to the
+/// captured scope and context-slot opcodes can walk up to outer variables.
+pub(super) fn restore_closure_context(
+    frame: &mut InterpreterFrame,
+    ba: &crate::bytecode::bytecode_array::BytecodeArray,
+) {
+    if let Some(ctx) = ba.closure_context() {
+        frame.context = Some(JsValue::Context(Rc::clone(ctx)));
+    }
 }
 
 /// Convert a thrown JavaScript value to a human-readable error message string.

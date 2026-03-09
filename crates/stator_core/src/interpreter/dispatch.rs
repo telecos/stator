@@ -19,8 +19,9 @@ use super::{
     dispatch_setter, err_bad_operand, error_message_from_value, extract_context, find_handler,
     fn_props_set, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
     maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, number_to_jsvalue,
-    plain_object_to_array_items, proto_lookup, resolve_jump, strict_eq, to_array_index, to_bigint,
-    to_property_key, try_execute_best_jit, walk_context_chain, wire_construct_prototype,
+    plain_object_to_array_items, proto_lookup, resolve_jump, restore_closure_context, strict_eq,
+    to_array_index, to_bigint, to_property_key, try_execute_best_jit, walk_context_chain,
+    wire_construct_prototype,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{proxy_delete_property, proxy_has, proxy_set};
@@ -1117,7 +1118,12 @@ fn handle_create_closure(
             "CreateClosure: constant pool entry is not a Function".into(),
         ));
     };
-    ctx.frame.accumulator = JsValue::Function(Rc::new((**ba).clone()));
+    let mut closure_ba = (**ba).clone();
+    // Capture the enclosing context so the closure can walk the scope chain.
+    if let Some(JsValue::Context(c)) = &ctx.frame.context {
+        closure_ba.set_closure_context(Rc::clone(c));
+    }
+    ctx.frame.accumulator = JsValue::Function(Rc::new(closure_ba));
     Ok(DispatchAction::Continue)
 }
 
@@ -1166,6 +1172,7 @@ fn handle_call_any_receiver(
                         args,
                         Rc::clone(&ctx.frame.global_env),
                     );
+                    restore_closure_context(&mut callee_frame, &ba);
                     push_call_frame("<anonymous>")?;
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
@@ -1253,7 +1260,8 @@ fn handle_tail_call(
                     }
                     ctx.frame.accumulator = JsValue::Undefined;
                     ctx.frame.pc = 0;
-                    ctx.frame.context = None;
+                    ctx.frame.context =
+                        ba.closure_context().map(|c| JsValue::Context(Rc::clone(c)));
                     ctx.frame.string_cache.clear();
                     ctx.frame.mono_load_cache.clear();
                     ctx.frame.poly_load_cache.clear();
@@ -1332,6 +1340,7 @@ fn handle_call_undefined_receiver0(
                         args,
                         Rc::clone(&ctx.frame.global_env),
                     );
+                    restore_closure_context(&mut callee_frame, &ba);
                     push_call_frame("<anonymous>")?;
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
@@ -1427,6 +1436,7 @@ fn handle_call_undefined_receiver1(
                         args,
                         Rc::clone(&ctx.frame.global_env),
                     );
+                    restore_closure_context(&mut callee_frame, &ba);
                     push_call_frame("<anonymous>")?;
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
@@ -1531,6 +1541,7 @@ fn handle_call_undefined_receiver2(
                         args,
                         Rc::clone(&ctx.frame.global_env),
                     );
+                    restore_closure_context(&mut callee_frame, &ba);
                     push_call_frame("<anonymous>")?;
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
@@ -1622,7 +1633,7 @@ fn handle_call_property(
                     args,
                     Rc::clone(&ctx.frame.global_env),
                 );
-                callee_frame.context = Some(this_val.clone());
+                restore_closure_context(&mut callee_frame, &ba);
                 callee_frame
                     .global_env
                     .borrow_mut()
@@ -1704,6 +1715,7 @@ fn handle_call_with_spread(
                     args,
                     Rc::clone(&ctx.frame.global_env),
                 );
+                restore_closure_context(&mut callee_frame, &ba);
                 push_call_frame("<anonymous>")?;
                 let result = Interpreter::run(&mut callee_frame);
                 pop_call_frame();
@@ -1765,7 +1777,7 @@ fn handle_construct(
                 args,
                 Rc::clone(&ctx.frame.global_env),
             );
-            callee_frame.context = Some(this_val.clone());
+            restore_closure_context(&mut callee_frame, &ba);
             callee_frame.new_target = JsValue::Function(Rc::clone(&ba));
             push_call_frame("<anonymous>")?;
             let result = Interpreter::run(&mut callee_frame);
@@ -1844,7 +1856,7 @@ fn handle_construct_with_spread(
                 args,
                 Rc::clone(&ctx.frame.global_env),
             );
-            callee_frame.context = Some(this_val.clone());
+            restore_closure_context(&mut callee_frame, &ba);
             callee_frame.new_target = JsValue::Function(Rc::clone(&ba));
             push_call_frame("<anonymous>")?;
             let result = Interpreter::run(&mut callee_frame);
@@ -3887,6 +3899,27 @@ fn handle_lda_lookup_context_slot(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
         return Err(err_bad_operand("LdaLookupContextSlot", 0));
     };
+    let Operand::ConstantPoolIdx(slot_idx) = instr.operands[1] else {
+        return Err(err_bad_operand("LdaLookupContextSlot", 1));
+    };
+    let Operand::Immediate(depth) = instr.operands[2] else {
+        return Err(err_bad_operand("LdaLookupContextSlot", 2));
+    };
+
+    // Fast path: read from the context chain at the statically known slot/depth.
+    if let Some(ctx_val) = &ctx.frame.context
+        && let Ok(js_ctx) = extract_context(ctx_val, "LdaLookupContextSlot")
+        && let Ok(target) = walk_context_chain(&js_ctx, depth as u32, "LdaLookupContextSlot")
+    {
+        let borrowed = target.borrow();
+        let slot = slot_idx as usize;
+        if let Some(val) = borrowed.slots.get(slot) {
+            ctx.frame.accumulator = val.clone();
+            return Ok(DispatchAction::Continue);
+        }
+    }
+
+    // Slow path: fall back to global name-based lookup.
     let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
         Some(ConstantPoolEntry::String(s)) => s.clone(),
         _ => {
@@ -3913,6 +3946,28 @@ fn handle_lda_lookup_context_slot_inside_typeof(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
         return Err(err_bad_operand("LdaLookupContextSlotInsideTypeof", 0));
     };
+    let Operand::ConstantPoolIdx(slot_idx) = instr.operands[1] else {
+        return Err(err_bad_operand("LdaLookupContextSlotInsideTypeof", 1));
+    };
+    let Operand::Immediate(depth) = instr.operands[2] else {
+        return Err(err_bad_operand("LdaLookupContextSlotInsideTypeof", 2));
+    };
+
+    // Fast path: read from the context chain at the statically known slot/depth.
+    if let Some(ctx_val) = &ctx.frame.context
+        && let Ok(js_ctx) = extract_context(ctx_val, "LdaLookupContextSlotInsideTypeof")
+        && let Ok(target) =
+            walk_context_chain(&js_ctx, depth as u32, "LdaLookupContextSlotInsideTypeof")
+    {
+        let borrowed = target.borrow();
+        let slot = slot_idx as usize;
+        if let Some(val) = borrowed.slots.get(slot) {
+            ctx.frame.accumulator = val.clone();
+            return Ok(DispatchAction::Continue);
+        }
+    }
+
+    // Slow path: fall back to global name-based lookup (undefined if missing).
     let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
         Some(ConstantPoolEntry::String(s)) => s.clone(),
         _ => {
@@ -4362,6 +4417,7 @@ fn handle_construct_forward_all_args(
                 args,
                 Rc::clone(&ctx.frame.global_env),
             );
+            restore_closure_context(&mut callee_frame, &ba);
             push_call_frame("<anonymous>")?;
             let result = Interpreter::run(&mut callee_frame);
             pop_call_frame();
@@ -4487,6 +4543,7 @@ fn handle_call_direct_eval(
                         args,
                         Rc::clone(&ctx.frame.global_env),
                     );
+                    restore_closure_context(&mut callee_frame, &ba);
                     let _ = push_call_frame("<eval-fallback>");
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
