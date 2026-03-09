@@ -2296,8 +2296,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let n = *n as f64;
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let digits = match args.first() {
-                        Some(JsValue::Smi(d)) => *d as usize,
-                        Some(JsValue::HeapNumber(d)) => *d as usize,
+                        Some(JsValue::Smi(d)) => (*d).max(0) as usize,
+                        Some(JsValue::HeapNumber(d)) => {
+                            crate::builtins::util::clamped_f64_to_usize(*d)
+                        }
                         _ => 0,
                     };
                     Ok(JsValue::String(format!("{n:.digits$}").into()))
@@ -2320,8 +2322,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let n = *n;
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let digits = match args.first() {
-                        Some(JsValue::Smi(d)) => *d as usize,
-                        Some(JsValue::HeapNumber(d)) => *d as usize,
+                        Some(JsValue::Smi(d)) => (*d).max(0) as usize,
+                        Some(JsValue::HeapNumber(d)) => {
+                            crate::builtins::util::clamped_f64_to_usize(*d)
+                        }
                         _ => 0,
                     };
                     Ok(JsValue::String(format!("{n:.digits$}").into()))
@@ -2341,8 +2345,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let idx = match args.first() {
-                        Some(JsValue::Smi(i)) => *i as usize,
-                        Some(JsValue::HeapNumber(n)) => *n as usize,
+                        Some(JsValue::Smi(i)) => (*i).max(0) as usize,
+                        Some(JsValue::HeapNumber(n)) => {
+                            crate::builtins::util::clamped_f64_to_usize(*n)
+                        }
                         _ => 0,
                     };
                     Ok(JsValue::String(
@@ -2357,8 +2363,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let idx = match args.first() {
-                        Some(JsValue::Smi(i)) => *i as usize,
-                        Some(JsValue::HeapNumber(n)) => *n as usize,
+                        Some(JsValue::Smi(i)) => (*i).max(0) as usize,
+                        Some(JsValue::HeapNumber(n)) => {
+                            crate::builtins::util::clamped_f64_to_usize(*n)
+                        }
                         _ => 0,
                     };
                     Ok(s.chars()
@@ -2578,13 +2586,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let len = s.len();
                     let start = match args.first() {
-                        Some(JsValue::Smi(i)) => (*i as usize).min(len),
-                        Some(JsValue::HeapNumber(n)) => (*n as usize).min(len),
+                        Some(JsValue::Smi(i)) => ((*i).max(0) as usize).min(len),
+                        Some(JsValue::HeapNumber(n)) => {
+                            crate::builtins::util::clamped_f64_to_usize(*n).min(len)
+                        }
                         _ => 0,
                     };
                     let end = match args.get(1) {
-                        Some(JsValue::Smi(i)) => (*i as usize).min(len),
-                        Some(JsValue::HeapNumber(n)) => (*n as usize).min(len),
+                        Some(JsValue::Smi(i)) => ((*i).max(0) as usize).min(len),
+                        Some(JsValue::HeapNumber(n)) => {
+                            crate::builtins::util::clamped_f64_to_usize(*n).min(len)
+                        }
                         _ => len,
                     };
                     let (s0, s1) = if start <= end {
@@ -2667,8 +2679,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let idx = match args.first() {
-                        Some(JsValue::Smi(i)) => *i as usize,
-                        Some(JsValue::HeapNumber(n)) => *n as usize,
+                        Some(JsValue::Smi(i)) => (*i).max(0) as usize,
+                        Some(JsValue::HeapNumber(n)) => {
+                            crate::builtins::util::clamped_f64_to_usize(*n)
+                        }
                         _ => 0,
                     };
                     Ok(s.chars()
@@ -3895,8 +3909,8 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
 pub(super) fn plain_object_to_array_items(map: &Rc<RefCell<PropertyMap>>) -> Vec<JsValue> {
     let borrow = map.borrow();
     let len = match borrow.get("length") {
-        Some(JsValue::Smi(n)) => *n as usize,
-        Some(JsValue::HeapNumber(n)) => *n as usize,
+        Some(JsValue::Smi(n)) => (*n).max(0) as usize,
+        Some(JsValue::HeapNumber(n)) => crate::builtins::util::clamped_f64_to_usize(*n),
         _ => 0,
     };
     (0..len)

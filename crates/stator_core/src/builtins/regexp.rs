@@ -176,7 +176,7 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
             let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             let limit = match args.get(1) {
                 Some(JsValue::Undefined) | None => None,
-                Some(v) => Some(v.to_number()? as usize),
+                Some(v) => Some(crate::builtins::util::clamped_f64_to_usize(v.to_number()?)),
             };
             let parts = re_split.symbol_split(&input, limit);
             let arr: Vec<JsValue> = parts

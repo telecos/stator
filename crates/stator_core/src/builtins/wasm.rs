@@ -596,8 +596,8 @@ pub fn wasm_table_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
 
     let get_fn: NativeFn = Rc::new(move |args: Vec<JsValue>| {
         let idx: usize = match args.first() {
-            Some(JsValue::Smi(n)) => *n as usize,
-            Some(JsValue::HeapNumber(f)) => *f as usize,
+            Some(JsValue::Smi(n)) => (*n).max(0) as usize,
+            Some(JsValue::HeapNumber(f)) => crate::builtins::util::clamped_f64_to_usize(*f),
             _ => {
                 return Err(StatorError::TypeError(
                     "Table.get: expected a numeric index".to_string(),
@@ -614,8 +614,8 @@ pub fn wasm_table_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
     let set_fn: NativeFn = Rc::new(move |args: Vec<JsValue>| {
         let mut it = args.into_iter();
         let idx: usize = match it.next() {
-            Some(JsValue::Smi(n)) => n as usize,
-            Some(JsValue::HeapNumber(f)) => f as usize,
+            Some(JsValue::Smi(n)) => n.max(0) as usize,
+            Some(JsValue::HeapNumber(f)) => crate::builtins::util::clamped_f64_to_usize(f),
             _ => {
                 return Err(StatorError::TypeError(
                     "Table.set: expected a numeric index".to_string(),
@@ -638,8 +638,8 @@ pub fn wasm_table_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
     let grow_fn: NativeFn = Rc::new(move |args: Vec<JsValue>| {
         let mut it = args.into_iter();
         let delta: usize = match it.next() {
-            Some(JsValue::Smi(n)) => n as usize,
-            Some(JsValue::HeapNumber(f)) => f as usize,
+            Some(JsValue::Smi(n)) => n.max(0) as usize,
+            Some(JsValue::HeapNumber(f)) => crate::builtins::util::clamped_f64_to_usize(f),
             _ => {
                 return Err(StatorError::TypeError(
                     "Table.grow: expected a numeric delta".to_string(),

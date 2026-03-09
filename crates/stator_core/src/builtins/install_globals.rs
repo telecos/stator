@@ -2826,7 +2826,12 @@ fn make_array() -> JsValue {
                 let max_del = (len - s as i64).max(0) as usize;
                 let del = args
                     .get(2)
-                    .map(|v| (v.to_number().unwrap_or(max_del as f64) as usize).min(max_del))
+                    .map(|v| {
+                        crate::builtins::util::clamped_f64_to_usize(
+                            v.to_number().unwrap_or(max_del as f64),
+                        )
+                        .min(max_del)
+                    })
                     .unwrap_or(max_del);
                 let new_items = if args.len() > 3 { &args[3..] } else { &[] };
                 let deleted: Vec<JsValue> = items.borrow()[s..s + del].to_vec();
@@ -3207,7 +3212,12 @@ fn make_array() -> JsValue {
                 let max_del = (len - s as i64).max(0) as usize;
                 let del = args
                     .get(2)
-                    .map(|v| (v.to_number().unwrap_or(max_del as f64) as usize).min(max_del))
+                    .map(|v| {
+                        crate::builtins::util::clamped_f64_to_usize(
+                            v.to_number().unwrap_or(max_del as f64),
+                        )
+                        .min(max_del)
+                    })
                     .unwrap_or(max_del);
                 let new_items = if args.len() > 3 { &args[3..] } else { &[] };
                 let mut v: Vec<JsValue> = items.borrow()[..s].to_vec();
@@ -5175,7 +5185,7 @@ fn make_string() -> JsValue {
             let target_len = if raw.is_nan() || raw < 0.0 {
                 0usize
             } else {
-                raw.min(usize::MAX as f64) as usize
+                crate::builtins::util::clamped_f64_to_usize(raw)
             };
             let pad = match args.get(2) {
                 Some(JsValue::Undefined) | None => None,
@@ -5200,7 +5210,7 @@ fn make_string() -> JsValue {
             let target_len = if raw.is_nan() || raw < 0.0 {
                 0usize
             } else {
-                raw.min(usize::MAX as f64) as usize
+                crate::builtins::util::clamped_f64_to_usize(raw)
             };
             let pad = match args.get(2) {
                 Some(JsValue::Undefined) | None => None,
@@ -6862,7 +6872,7 @@ fn make_arraybuffer() -> JsValue {
         "__call__".into(),
         native(|args| {
             let len = match args.first() {
-                Some(v) => v.to_number()?.floor() as usize,
+                Some(v) => crate::builtins::util::checked_f64_to_length(v.to_number()?)?,
                 None => 0,
             };
             let buf = arraybuffer_new(len);
@@ -6898,11 +6908,15 @@ fn make_dataview() -> JsValue {
                 }
             };
             let offset = match args.get(1) {
-                Some(v) if !v.is_undefined() => v.to_number()?.floor() as usize,
+                Some(v) if !v.is_undefined() => {
+                    crate::builtins::util::checked_f64_to_length(v.to_number()?)?
+                }
                 _ => 0,
             };
             let length = match args.get(2) {
-                Some(v) if !v.is_undefined() => Some(v.to_number()?.floor() as usize),
+                Some(v) if !v.is_undefined() => Some(crate::builtins::util::checked_f64_to_length(
+                    v.to_number()?,
+                )?),
                 _ => None,
             };
             let dv = dataview_new(buf_rc, offset, length)?;
@@ -6943,7 +6957,11 @@ fn make_dataview() -> JsValue {
                         native(move |a| {
                             let off = a
                                 .first()
-                                .map(|v| v.to_number().unwrap_or(0.0) as usize)
+                                .map(|v| {
+                                    crate::builtins::util::clamped_f64_to_usize(
+                                        v.to_number().unwrap_or(0.0),
+                                    )
+                                })
                                 .unwrap_or(0);
                             let le = a.get(1).map(|v| v.to_boolean()).unwrap_or(false);
                             let dv_ref = inner.borrow();
@@ -6962,7 +6980,11 @@ fn make_dataview() -> JsValue {
                         native(move |a| {
                             let off = a
                                 .first()
-                                .map(|v| v.to_number().unwrap_or(0.0) as usize)
+                                .map(|v| {
+                                    crate::builtins::util::clamped_f64_to_usize(
+                                        v.to_number().unwrap_or(0.0),
+                                    )
+                                })
                                 .unwrap_or(0);
                             let raw_val = a.get(1).unwrap_or(&JsValue::Undefined);
                             let le = a.get(2).map(|v| v.to_boolean()).unwrap_or(false);
@@ -6991,7 +7013,11 @@ fn make_dataview() -> JsValue {
                     native(move |a| {
                         let off = a
                             .first()
-                            .map(|v| v.to_number().unwrap_or(0.0) as usize)
+                            .map(|v| {
+                                crate::builtins::util::clamped_f64_to_usize(
+                                    v.to_number().unwrap_or(0.0),
+                                )
+                            })
                             .unwrap_or(0);
                         let le = a.get(1).map(|v| v.to_boolean()).unwrap_or(false);
                         let val = dataview_get_bigint64(&inner.borrow(), off, le)?;
@@ -7006,7 +7032,11 @@ fn make_dataview() -> JsValue {
                     native(move |a| {
                         let off = a
                             .first()
-                            .map(|v| v.to_number().unwrap_or(0.0) as usize)
+                            .map(|v| {
+                                crate::builtins::util::clamped_f64_to_usize(
+                                    v.to_number().unwrap_or(0.0),
+                                )
+                            })
                             .unwrap_or(0);
                         let le = a.get(1).map(|v| v.to_boolean()).unwrap_or(false);
                         let val = dataview_get_biguint64(&inner.borrow(), off, le)?;
@@ -7098,11 +7128,15 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
                 // From ArrayBuffer
                 Some(JsValue::ArrayBuffer(buf)) => {
                     let offset = match args.get(1) {
-                        Some(v) if !v.is_undefined() => v.to_number()?.floor() as usize,
+                        Some(v) if !v.is_undefined() => {
+                            crate::builtins::util::checked_f64_to_length(v.to_number()?)?
+                        }
                         _ => 0,
                     };
                     let length = match args.get(2) {
-                        Some(v) if !v.is_undefined() => Some(v.to_number()?.floor() as usize),
+                        Some(v) if !v.is_undefined() => Some(
+                            crate::builtins::util::checked_f64_to_length(v.to_number()?)?,
+                        ),
                         _ => None,
                     };
                     typed_array_new_from_buffer(kind, Rc::clone(buf), offset, length)?
@@ -7118,7 +7152,7 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
                 Some(JsValue::Array(arr)) => typed_array_from_values(kind, &arr.borrow())?,
                 // From length (number)
                 Some(v) => {
-                    let len = v.to_number()?.floor() as usize;
+                    let len = crate::builtins::util::checked_f64_to_length(v.to_number()?)?;
                     typed_array_new_from_length(kind, len)
                 }
                 None => typed_array_new_from_length(kind, 0),
@@ -7611,7 +7645,9 @@ fn make_typed_array_instance(
                 };
                 let offset = a
                     .get(1)
-                    .map(|v| v.to_number().unwrap_or(0.0) as usize)
+                    .map(|v| {
+                        crate::builtins::util::clamped_f64_to_usize(v.to_number().unwrap_or(0.0))
+                    })
                     .unwrap_or(0);
                 typed_array_set_from(&inner.borrow(), &source, offset)?;
                 Ok(JsValue::Undefined)
@@ -7807,7 +7843,7 @@ fn make_shadow_realm() -> JsValue {
 fn make_shared_arraybuffer() -> JsValue {
     native(|args| {
         let byte_length = match args.first() {
-            Some(v) => v.to_number()? as usize,
+            Some(v) => crate::builtins::util::checked_f64_to_length(v.to_number()?)?,
             None => 0,
         };
         let buf = arraybuffer_new(byte_length);
@@ -7929,7 +7965,7 @@ fn atomics_extract_ta(
     };
     let idx = args
         .get(1)
-        .map(|v| v.to_number().unwrap_or(0.0) as usize)
+        .map(|v| crate::builtins::util::clamped_f64_to_usize(v.to_number().unwrap_or(0.0)))
         .unwrap_or(0);
     let byte_offset = idx * kind.bytes_per_element();
     Ok((buf, kind, byte_offset))
@@ -8103,7 +8139,7 @@ fn make_atomics() -> JsValue {
         native(|args| {
             let size = args
                 .first()
-                .map(|v| v.to_number().unwrap_or(0.0) as usize)
+                .map(|v| crate::builtins::util::clamped_f64_to_usize(v.to_number().unwrap_or(0.0)))
                 .unwrap_or(0);
             Ok(JsValue::Boolean(matches!(size, 1 | 2 | 4 | 8)))
         }),

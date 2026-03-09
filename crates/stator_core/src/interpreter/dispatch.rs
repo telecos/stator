@@ -3656,7 +3656,7 @@ fn handle_for_in_next(
     };
     // operands[3] is a FeedbackSlot, ignored at runtime.
     let idx = match ctx.frame.read_reg(idx_v)? {
-        JsValue::Smi(n) => *n as usize,
+        JsValue::Smi(n) => (*n).max(0) as usize,
         _ => 0,
     };
     let keys = ctx.frame.read_reg(keys_v)?.clone();
