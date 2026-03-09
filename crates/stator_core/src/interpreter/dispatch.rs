@@ -15,12 +15,12 @@ use crate::objects::property_map::PropertyMap;
 use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
     TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, constant_pool_jump_delta,
-    constant_to_value, decode_string_constant, dispatch_call, dispatch_setter, err_bad_operand,
-    error_message_from_value, extract_context, find_handler, fn_props_set, is_js_receiver, js_add,
-    js_less_than, keyed_load, keyed_store, maybe_compile_baseline, maybe_compile_maglev,
-    maybe_compile_turbofan, number_to_jsvalue, plain_object_to_array_items, proto_lookup,
-    resolve_jump, strict_eq, to_array_index, to_bigint, to_property_key, try_execute_best_jit,
-    walk_context_chain, wire_construct_prototype,
+    constant_to_value, decode_string_constant, dispatch_call, dispatch_call_value, dispatch_setter,
+    err_bad_operand, error_message_from_value, extract_context, find_handler, fn_props_set,
+    is_js_receiver, js_add, js_less_than, keyed_load, keyed_store, maybe_compile_baseline,
+    maybe_compile_maglev, maybe_compile_turbofan, number_to_jsvalue, plain_object_to_array_items,
+    proto_lookup, resolve_jump, strict_eq, to_array_index, to_bigint, to_property_key,
+    try_execute_best_jit, walk_context_chain, wire_construct_prototype,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{proxy_delete_property, proxy_has, proxy_set};
@@ -2181,12 +2181,15 @@ fn handle_get_iterator(
         // PlainObject with @@iterator → call it to get the iterator.
         JsValue::PlainObject(ref map) if map.borrow().contains_key("@@iterator") => {
             let iter_fn = map.borrow().get("@@iterator").cloned();
-            if let Some(JsValue::NativeFunction(f)) = iter_fn {
-                f(vec![])?
-            } else {
-                return Err(StatorError::TypeError(
-                    "GetIterator: @@iterator is not a function".into(),
-                ));
+            match iter_fn {
+                Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
+                    dispatch_call_value(f, vec![])?
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "GetIterator: @@iterator is not a function".into(),
+                    ));
+                }
             }
         }
         // PlainObject with a "length" property → array-like.
@@ -2221,12 +2224,15 @@ fn handle_get_async_iterator(
         // PlainObject with @@iterator → call it to get the iterator.
         JsValue::PlainObject(ref map) if map.borrow().contains_key("@@iterator") => {
             let iter_fn = map.borrow().get("@@iterator").cloned();
-            if let Some(JsValue::NativeFunction(f)) = iter_fn {
-                f(vec![])?
-            } else {
-                return Err(StatorError::TypeError(
-                    "GetAsyncIterator: @@iterator is not a function".into(),
-                ));
+            match iter_fn {
+                Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
+                    dispatch_call_value(f, vec![])?
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "GetAsyncIterator: @@iterator is not a function".into(),
+                    ));
+                }
             }
         }
         JsValue::PlainObject(ref map) if map.borrow().contains_key("length") => {
@@ -2262,6 +2268,34 @@ fn handle_iterator_next(
             match Interpreter::run_generator_step(gs, JsValue::Undefined)? {
                 GeneratorStep::Yield(v) => (v, false),
                 GeneratorStep::Return(v) => (v, true),
+            }
+        }
+        JsValue::PlainObject(ref map) if map.borrow().contains_key("next") => {
+            let next_fn = map.borrow().get("next").cloned();
+            match next_fn {
+                Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
+                    let result = dispatch_call_value(f, vec![])?;
+                    match result {
+                        JsValue::PlainObject(ref res_map) => {
+                            let done = res_map
+                                .borrow()
+                                .get("done")
+                                .is_some_and(|d| d.to_boolean());
+                            let value = res_map
+                                .borrow()
+                                .get("value")
+                                .cloned()
+                                .unwrap_or(JsValue::Undefined);
+                            (value, done)
+                        }
+                        _ => (JsValue::Undefined, true),
+                    }
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "IteratorNext: next is not a function".into(),
+                    ));
+                }
             }
         }
         other => {
