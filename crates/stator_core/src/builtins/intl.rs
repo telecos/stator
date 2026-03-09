@@ -183,14 +183,14 @@ pub fn locale_base_name(tag: &str) -> String {
 /// `Intl.NumberFormat.prototype.format`.
 pub fn number_format_js(args: &[JsValue]) -> StatorResult<JsValue> {
     let n = args.first().unwrap_or(&JsValue::Undefined).to_number()?;
-    Ok(JsValue::String(number_format(n)))
+    Ok(JsValue::String(number_format(n).into()))
 }
 
 /// Convert a timestamp `JsValue` to the formatted string produced by
 /// `Intl.DateTimeFormat.prototype.format`.
 pub fn date_time_format_js(args: &[JsValue]) -> StatorResult<JsValue> {
     let ms = args.first().unwrap_or(&JsValue::Undefined).to_number()?;
-    Ok(JsValue::String(date_time_format(ms)))
+    Ok(JsValue::String(date_time_format(ms).into()))
 }
 
 /// Compare two string `JsValue`s using `Intl.Collator`.
@@ -203,7 +203,7 @@ pub fn collator_compare_js(args: &[JsValue]) -> StatorResult<JsValue> {
 /// Select the plural category for a number.
 pub fn plural_rules_select_js(args: &[JsValue]) -> StatorResult<JsValue> {
     let n = args.first().unwrap_or(&JsValue::Undefined).to_number()?;
-    Ok(JsValue::String(plural_rules_select(n).to_string()))
+    Ok(JsValue::String(plural_rules_select(n).to_string().into()))
 }
 
 /// Format a JS array of strings using `Intl.ListFormat`.
@@ -216,14 +216,14 @@ pub fn list_format_js(args: &[JsValue], list_type: &str) -> StatorResult<JsValue
             .collect::<StatorResult<Vec<_>>>()?,
         _ => Vec::new(),
     };
-    Ok(JsValue::String(list_format(&items, list_type)))
+    Ok(JsValue::String(list_format(&items, list_type).into()))
 }
 
 /// Format a relative time.
 pub fn relative_time_format_js(args: &[JsValue]) -> StatorResult<JsValue> {
     let value = args.first().unwrap_or(&JsValue::Undefined).to_number()?;
     let unit = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
-    Ok(JsValue::String(relative_time_format(value, &unit)))
+    Ok(JsValue::String(relative_time_format(value, &unit).into()))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

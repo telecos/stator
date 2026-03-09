@@ -517,7 +517,7 @@ fn js_value_to_remote_object(value: &JsValue) -> Value {
             json!({"type": "number", "value": f, "description": description})
         }
         JsValue::String(s) => {
-            json!({"type": "string", "value": s})
+            json!({"type": "string", "value": &**s})
         }
         _ => {
             // Complex objects / functions: return a generic description.

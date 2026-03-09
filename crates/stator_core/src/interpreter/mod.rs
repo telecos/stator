@@ -1374,7 +1374,7 @@ pub(super) fn constant_pool_jump_delta(
 pub(super) fn constant_to_value(entry: &ConstantPoolEntry) -> JsValue {
     match entry {
         ConstantPoolEntry::Number(n) => number_to_jsvalue(*n),
-        ConstantPoolEntry::String(s) => JsValue::String(decode_string_constant(s)),
+        ConstantPoolEntry::String(s) => JsValue::String(decode_string_constant(s).into()),
         ConstantPoolEntry::Boolean(b) => JsValue::Boolean(*b),
         ConstantPoolEntry::Null => JsValue::Null,
         ConstantPoolEntry::Undefined => JsValue::Undefined,
@@ -1394,7 +1394,7 @@ fn build_template_object(cooked: &[Option<String>], raw: &[String]) -> JsValue {
     let mut map = PropertyMap::new();
     for (i, c) in cooked.iter().enumerate() {
         let val = match c {
-            Some(s) => JsValue::String(s.clone()),
+            Some(s) => JsValue::String(s.clone().into()),
             None => JsValue::Undefined,
         };
         map.insert(i.to_string(), val);
@@ -1403,7 +1403,7 @@ fn build_template_object(cooked: &[Option<String>], raw: &[String]) -> JsValue {
 
     let mut raw_map = PropertyMap::new();
     for (i, r) in raw.iter().enumerate() {
-        raw_map.insert(i.to_string(), JsValue::String(r.clone()));
+        raw_map.insert(i.to_string(), JsValue::String(r.clone().into()));
     }
     raw_map.insert("length".to_string(), JsValue::Smi(raw.len() as i32));
 
@@ -1477,7 +1477,7 @@ fn to_boolean_val(v: &JsValue) -> bool {
 /// Convert a JsValue to its string representation.
 fn js_to_string(v: &JsValue) -> String {
     match v {
-        JsValue::String(s) => s.clone(),
+        JsValue::String(s) => s.to_string(),
         JsValue::Smi(n) => n.to_string(),
         JsValue::HeapNumber(n) => format!("{n}"),
         JsValue::Boolean(b) => b.to_string(),
@@ -1524,7 +1524,7 @@ pub(super) fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
         let mut result = String::with_capacity(l.len() + r.len());
         result.push_str(&l);
         result.push_str(&r);
-        Ok(JsValue::String(result))
+        Ok(JsValue::String(result.into()))
     } else if lhs.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(lhs)?;
         let r = to_bigint(rhs)?;
@@ -1984,7 +1984,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 drop(borrow);
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let prop = match args.first() {
-                        Some(JsValue::String(s)) => s.clone(),
+                        Some(JsValue::String(s)) => s.to_string(),
                         Some(JsValue::Smi(n)) => n.to_string(),
                         _ => return Ok(JsValue::Boolean(false)),
                     };
@@ -1996,7 +1996,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 drop(borrow);
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let prop = match args.first() {
-                        Some(JsValue::String(s)) => s.clone(),
+                        Some(JsValue::String(s)) => s.to_string(),
                         Some(JsValue::Smi(n)) => n.to_string(),
                         _ => return Ok(JsValue::Boolean(false)),
                     };
@@ -2018,7 +2018,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toString" => {
                 drop(borrow);
                 return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String("[object Object]".to_string()))
+                    Ok(JsValue::String("[object Object]".to_string().into()))
                 }));
             }
             _ => {}
@@ -2037,7 +2037,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toString" => {
                 let n = *n;
                 return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(n.to_string()))
+                    Ok(JsValue::String(n.to_string().into()))
                 }));
             }
             "valueOf" => {
@@ -2052,7 +2052,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Some(JsValue::HeapNumber(d)) => *d as usize,
                         _ => 0,
                     };
-                    Ok(JsValue::String(format!("{n:.digits$}")))
+                    Ok(JsValue::String(format!("{n:.digits$}").into()))
                 }));
             }
             _ => {}
@@ -2061,7 +2061,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toString" => {
                 let n = *n;
                 return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(format!("{n}")))
+                    Ok(JsValue::String(format!("{n}").into()))
                 }));
             }
             "valueOf" => {
@@ -2076,7 +2076,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Some(JsValue::HeapNumber(d)) => *d as usize,
                         _ => 0,
                     };
-                    Ok(JsValue::String(format!("{n:.digits$}")))
+                    Ok(JsValue::String(format!("{n:.digits$}").into()))
                 }));
             }
             _ => {}
@@ -2098,7 +2098,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         _ => 0,
                     };
                     Ok(JsValue::String(
-                        s.chars().nth(idx).map_or(String::new(), |c| c.to_string()),
+                        s.chars()
+                            .nth(idx)
+                            .map_or(String::new(), |c| c.to_string())
+                            .into(),
                     ))
                 }));
             }
@@ -2156,10 +2159,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         _ => len as usize,
                     };
                     if start >= end {
-                        Ok(JsValue::String(String::new()))
+                        Ok(JsValue::String(String::new().into()))
                     } else {
                         Ok(JsValue::String(
-                            s.chars().skip(start).take(end - start).collect(),
+                            s.chars()
+                                .skip(start)
+                                .take(end - start)
+                                .collect::<String>()
+                                .into(),
                         ))
                     }
                 }));
@@ -2168,7 +2175,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let search = match args.first() {
-                        Some(JsValue::String(ss)) => ss.clone(),
+                        Some(JsValue::String(ss)) => ss.to_string(),
                         _ => String::new(),
                     };
                     Ok(JsValue::Boolean(s.contains(&search)))
@@ -2178,7 +2185,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let search = match args.first() {
-                        Some(JsValue::String(ss)) => ss.clone(),
+                        Some(JsValue::String(ss)) => ss.to_string(),
                         _ => String::new(),
                     };
                     Ok(JsValue::Smi(s.find(&search).map_or(-1, |i| i as i32)))
@@ -2187,31 +2194,33 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toUpperCase" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(s.to_uppercase()))
+                    Ok(JsValue::String(s.to_uppercase().into()))
                 }));
             }
             "toLowerCase" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(s.to_lowercase()))
+                    Ok(JsValue::String(s.to_lowercase().into()))
                 }));
             }
             "trim" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(s.trim().to_string()))
+                    Ok(JsValue::String(s.trim().to_string().into()))
                 }));
             }
             "split" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let sep = match args.first() {
-                        Some(JsValue::String(ss)) => ss.clone(),
-                        _ => return Ok(JsValue::new_array(vec![JsValue::String(s.clone())])),
+                        Some(JsValue::String(ss)) => ss.to_string(),
+                        _ => {
+                            return Ok(JsValue::new_array(vec![JsValue::String(s.clone())]));
+                        }
                     };
                     let parts: Vec<JsValue> = s
                         .split(&sep)
-                        .map(|p| JsValue::String(p.to_string()))
+                        .map(|p| JsValue::String(p.to_string().into()))
                         .collect();
                     Ok(JsValue::new_array(parts))
                 }));
@@ -2220,7 +2229,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let prefix = match args.first() {
-                        Some(JsValue::String(ss)) => ss.clone(),
+                        Some(JsValue::String(ss)) => ss.to_string(),
                         _ => String::new(),
                     };
                     Ok(JsValue::Boolean(s.starts_with(&prefix)))
@@ -2230,7 +2239,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let suffix = match args.first() {
-                        Some(JsValue::String(ss)) => ss.clone(),
+                        Some(JsValue::String(ss)) => ss.to_string(),
                         _ => String::new(),
                     };
                     Ok(JsValue::Boolean(s.ends_with(&suffix)))
@@ -2244,7 +2253,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Some(JsValue::HeapNumber(n)) => *n as usize,
                         _ => 0,
                     };
-                    Ok(JsValue::String(s.repeat(count)))
+                    Ok(JsValue::String(s.repeat(count).into()))
                 }));
             }
             "padStart" => {
@@ -2256,7 +2265,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         _ => 0,
                     };
                     let pad_str = match args.get(1) {
-                        Some(JsValue::String(ss)) => ss.clone(),
+                        Some(JsValue::String(ss)) => ss.to_string(),
                         _ => " ".to_string(),
                     };
                     if s.len() >= target_len {
@@ -2264,7 +2273,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     } else {
                         let pad_needed = target_len - s.len();
                         let padding: String = pad_str.chars().cycle().take(pad_needed).collect();
-                        Ok(JsValue::String(format!("{padding}{s}")))
+                        Ok(JsValue::String(format!("{padding}{s}").into()))
                     }
                 }));
             }
@@ -2277,7 +2286,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         _ => 0,
                     };
                     let pad_str = match args.get(1) {
-                        Some(JsValue::String(ss)) => ss.clone(),
+                        Some(JsValue::String(ss)) => ss.to_string(),
                         _ => " ".to_string(),
                     };
                     if s.len() >= target_len {
@@ -2285,7 +2294,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     } else {
                         let pad_needed = target_len - s.len();
                         let padding: String = pad_str.chars().cycle().take(pad_needed).collect();
-                        Ok(JsValue::String(format!("{s}{padding}")))
+                        Ok(JsValue::String(format!("{s}{padding}").into()))
                     }
                 }));
             }
@@ -2293,14 +2302,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let search = match args.first() {
-                        Some(JsValue::String(ss)) => ss.clone(),
+                        Some(JsValue::String(ss)) => ss.to_string(),
                         _ => return Ok(JsValue::String(s.clone())),
                     };
                     let replacement = match args.get(1) {
-                        Some(JsValue::String(ss)) => ss.clone(),
+                        Some(JsValue::String(ss)) => ss.to_string(),
                         _ => String::new(),
                     };
-                    Ok(JsValue::String(s.replacen(&search, &replacement, 1)))
+                    Ok(JsValue::String(s.replacen(&search, &replacement, 1).into()))
                 }));
             }
             "substring" => {
@@ -2322,21 +2331,23 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     } else {
                         (end, start)
                     };
-                    Ok(JsValue::String(s.chars().skip(s0).take(s1 - s0).collect()))
+                    Ok(JsValue::String(
+                        s.chars().skip(s0).take(s1 - s0).collect::<String>().into(),
+                    ))
                 }));
             }
             "replaceAll" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let search = match args.first() {
-                        Some(JsValue::String(ss)) => ss.clone(),
+                        Some(JsValue::String(ss)) => ss.to_string(),
                         _ => return Ok(JsValue::String(s.clone())),
                     };
                     let replacement = match args.get(1) {
-                        Some(JsValue::String(ss)) => ss.clone(),
+                        Some(JsValue::String(ss)) => ss.to_string(),
                         _ => String::new(),
                     };
-                    Ok(JsValue::String(s.replace(&search, &replacement)))
+                    Ok(JsValue::String(s.replace(&search, &replacement).into()))
                 }));
             }
             "at" => {
@@ -2354,25 +2365,27 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     }
                     Ok(s.chars()
                         .nth(actual as usize)
-                        .map_or(JsValue::Undefined, |c| JsValue::String(c.to_string())))
+                        .map_or(JsValue::Undefined, |c| {
+                            JsValue::String(c.to_string().into())
+                        }))
                 }));
             }
             "trimStart" | "trimLeft" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(s.trim_start().to_string()))
+                    Ok(JsValue::String(s.trim_start().to_string().into()))
                 }));
             }
             "trimEnd" | "trimRight" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(s.trim_end().to_string()))
+                    Ok(JsValue::String(s.trim_end().to_string().into()))
                 }));
             }
             "concat" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let mut result = s.clone();
+                    let mut result = s.to_string();
                     for arg in &args {
                         match arg {
                             JsValue::String(ss) => result.push_str(ss),
@@ -2386,7 +2399,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             _ => result.push_str("[object Object]"),
                         }
                     }
-                    Ok(JsValue::String(result))
+                    Ok(JsValue::String(result.into()))
                 }));
             }
             "codePointAt" => {
@@ -2412,10 +2425,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let other = match args.first() {
-                        Some(JsValue::String(ss)) => ss.clone(),
+                        Some(JsValue::String(ss)) => ss.to_string(),
                         _ => String::new(),
                     };
-                    Ok(JsValue::Smi(s.cmp(&other) as i32))
+                    Ok(JsValue::Smi((*s).cmp(other.as_str()) as i32))
                 }));
             }
             "match" => {
@@ -2425,7 +2438,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let pattern = match args.first() {
-                        Some(JsValue::String(ss)) => ss.clone(),
+                        Some(JsValue::String(ss)) => ss.to_string(),
                         _ => return Ok(JsValue::Smi(-1)),
                     };
                     Ok(s.find(&pattern)
@@ -2436,7 +2449,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let pattern = match args.first() {
-                        Some(JsValue::String(ss)) => ss.clone(),
+                        Some(JsValue::String(ss)) => ss.to_string(),
                         _ => return Ok(JsValue::Iterator(NativeIterator::from_items(vec![]))),
                     };
                     if pattern.is_empty() {
@@ -2444,10 +2457,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     }
                     let mut results = Vec::new();
                     let mut start = 0;
-                    while let Some(pos) = s[start..].find(&pattern) {
+                    while let Some(pos) = s[start..].find(pattern.as_str()) {
                         let abs = start + pos;
                         let mut m = PropertyMap::new();
-                        m.insert("0".to_string(), JsValue::String(pattern.clone()));
+                        m.insert("0".to_string(), JsValue::String(Rc::from(pattern.as_str())));
                         m.insert("index".to_string(), JsValue::Smi(abs as i32));
                         m.insert("input".to_string(), JsValue::String(s.clone()));
                         m.insert("length".to_string(), JsValue::Smi(1));
@@ -2469,11 +2482,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toString" => {
                 let b = *b;
                 return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(if b {
-                        "true".to_string()
-                    } else {
-                        "false".to_string()
-                    }))
+                    Ok(JsValue::String(
+                        if b {
+                            "true".to_string()
+                        } else {
+                            "false".to_string()
+                        }
+                        .into(),
+                    ))
                 }));
             }
             "valueOf" => {
@@ -2526,14 +2542,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let sep = match args.first() {
-                            Some(JsValue::String(s)) => s.clone(),
+                            Some(JsValue::String(s)) => s.to_string(),
                             _ => ",".to_string(),
                         };
                         let parts: Vec<String> = a
                             .borrow()
                             .iter()
                             .map(|v| match v {
-                                JsValue::String(s) => s.clone(),
+                                JsValue::String(s) => s.to_string(),
                                 JsValue::Smi(n) => n.to_string(),
                                 JsValue::HeapNumber(n) => format!("{n}"),
                                 JsValue::Boolean(b) => b.to_string(),
@@ -2542,7 +2558,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 _ => String::new(),
                             })
                             .collect();
-                        Ok(JsValue::String(parts.join(&sep)))
+                        Ok(JsValue::String(parts.join(&sep).into()))
                     }));
                 }
                 "toString" => {
@@ -2552,7 +2568,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             .borrow()
                             .iter()
                             .map(|v| match v {
-                                JsValue::String(s) => s.clone(),
+                                JsValue::String(s) => s.to_string(),
                                 JsValue::Smi(n) => n.to_string(),
                                 JsValue::HeapNumber(n) => format!("{n}"),
                                 JsValue::Boolean(b) => b.to_string(),
@@ -2561,7 +2577,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 _ => String::new(),
                             })
                             .collect();
-                        Ok(JsValue::String(parts.join(",")))
+                        Ok(JsValue::String(parts.join(",").into()))
                     }));
                 }
                 "indexOf" => {
@@ -3111,7 +3127,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toString" | "toLocaleString" => {
                 let s = format!("{n}");
                 return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(s.clone()))
+                    Ok(JsValue::String(s.clone().into()))
                 }));
             }
             "valueOf" => {
@@ -3131,13 +3147,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         let id = *id;
         return match key {
             "description" => match symbol_description(id) {
-                Some(desc) => JsValue::String(desc),
+                Some(desc) => JsValue::String(desc.into()),
                 None => JsValue::Undefined,
             },
             "toString" => {
                 JsValue::NativeFunction(Rc::new(move |_args| match symbol_description(id) {
-                    Some(desc) => Ok(JsValue::String(format!("Symbol({desc})"))),
-                    None => Ok(JsValue::String("Symbol()".to_string())),
+                    Some(desc) => Ok(JsValue::String(format!("Symbol({desc})").into())),
+                    None => Ok(JsValue::String("Symbol()".to_string().into())),
                 }))
             }
             "valueOf" => JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Symbol(id)))),
@@ -3156,9 +3172,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         // Fall back to built-in Error properties.
         let err = Rc::clone(e);
         return match key {
-            "name" => JsValue::String(e.name().to_string()),
-            "message" => JsValue::String(e.message().to_string()),
-            "stack" => JsValue::String(e.stack().to_string()),
+            "name" => JsValue::String(e.name().to_string().into()),
+            "message" => JsValue::String(e.message().to_string().into()),
+            "stack" => JsValue::String(e.stack().to_string().into()),
             "cause" => e.cause().cloned().unwrap_or(JsValue::Undefined),
             "errors" => {
                 if e.kind == crate::builtins::error::ErrorKind::AggregateError {
@@ -3173,7 +3189,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }
             }
             "toString" => JsValue::NativeFunction(Rc::new(move |_args| {
-                Ok(JsValue::String(err.to_error_string()))
+                Ok(JsValue::String(err.to_error_string().into()))
             })),
             "valueOf" => {
                 let e2 = Rc::clone(e);
@@ -3279,14 +3295,16 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             "name" => {
-                return JsValue::String(String::new());
+                return JsValue::String(String::new().into());
             }
             "length" => {
                 return JsValue::Smi(ba.parameter_count() as i32);
             }
             "toString" => {
                 return JsValue::NativeFunction(Rc::new(|_args| {
-                    Ok(JsValue::String("function () { [native code] }".to_string()))
+                    Ok(JsValue::String(
+                        "function () { [native code] }".to_string().into(),
+                    ))
                 }));
             }
             "constructor" => return JsValue::Undefined,
@@ -3333,11 +3351,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     })))
                 }));
             }
-            "name" => return JsValue::String(String::new()),
+            "name" => return JsValue::String(String::new().into()),
             "length" => return JsValue::Smi(0),
             "toString" => {
                 return JsValue::NativeFunction(Rc::new(|_args| {
-                    Ok(JsValue::String("function () { [native code] }".to_string()))
+                    Ok(JsValue::String(
+                        "function () { [native code] }".to_string().into(),
+                    ))
                 }));
             }
             "constructor" => return JsValue::Undefined,
@@ -3500,7 +3520,7 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
         JsValue::Array(items) => {
             // "length" property
             if let JsValue::String(s) = key
-                && s == "length"
+                && &**s == "length"
             {
                 return Ok(JsValue::Smi(items.borrow().len() as i32));
             }
@@ -3519,7 +3539,7 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
         JsValue::String(_) => {
             // "length" property
             if let JsValue::String(k) = key
-                && k == "length"
+                && &**k == "length"
                 && let JsValue::String(s) = obj
             {
                 return Ok(JsValue::Smi(s.len() as i32));
@@ -3531,7 +3551,7 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
                 return Ok(s
                     .chars()
                     .nth(idx)
-                    .map(|c| JsValue::String(c.to_string()))
+                    .map(|c| JsValue::String(c.to_string().into()))
                     .unwrap_or(JsValue::Undefined));
             }
             // Named property — delegate to proto_lookup for method access.
@@ -5218,7 +5238,7 @@ mod tests {
         let mut frame = InterpreterFrame::new(ba, vec![]);
         crate::builtins::install_globals::install_globals(&mut frame.global_env.borrow_mut());
         let result = Interpreter::run(&mut frame).unwrap();
-        assert_eq!(result, JsValue::String("TypeError".to_string()));
+        assert_eq!(result, JsValue::String("TypeError".to_string().into()));
     }
 
     // ── Generators (SuspendGenerator / ResumeGenerator) ─────────────────────
@@ -6188,7 +6208,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert_eq!(result, JsValue::String("undefined".to_owned()));
+        assert_eq!(result, JsValue::String("undefined".to_owned().into()));
     }
 
     #[test]
@@ -6203,7 +6223,7 @@ mod tests {
         )
         .unwrap();
         // typeof null === "object" per the ECMAScript specification.
-        assert_eq!(result, JsValue::String("object".to_owned()));
+        assert_eq!(result, JsValue::String("object".to_owned().into()));
     }
 
     #[test]
@@ -6217,7 +6237,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert_eq!(result, JsValue::String("boolean".to_owned()));
+        assert_eq!(result, JsValue::String("boolean".to_owned().into()));
     }
 
     #[test]
@@ -6231,7 +6251,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert_eq!(result, JsValue::String("number".to_owned()));
+        assert_eq!(result, JsValue::String("number".to_owned().into()));
     }
 
     #[test]
@@ -6247,7 +6267,7 @@ mod tests {
         let ba = BytecodeArray::new(bytes, pool, 0, 0, vec![], FeedbackMetadata::empty(), vec![]);
         let mut frame = InterpreterFrame::new(ba, vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
-        assert_eq!(result, JsValue::String("string".to_owned()));
+        assert_eq!(result, JsValue::String("string".to_owned().into()));
     }
 
     // ── TestTypeOf ───────────────────────────────────────────────────────────
@@ -6396,7 +6416,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert_eq!(result, JsValue::String("123".to_string()));
+        assert_eq!(result, JsValue::String("123".to_string().into()));
     }
 
     #[test]
@@ -6410,7 +6430,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert_eq!(result, JsValue::String("false".to_string()));
+        assert_eq!(result, JsValue::String("false".to_string().into()));
     }
 
     #[test]
@@ -6424,7 +6444,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert_eq!(result, JsValue::String("null".to_string()));
+        assert_eq!(result, JsValue::String("null".to_string().into()));
     }
 
     // ── ToBoolean ────────────────────────────────────────────────────────────
@@ -6536,7 +6556,7 @@ mod tests {
             1,
         )
         .unwrap();
-        assert_eq!(result, JsValue::String("10".to_string()));
+        assert_eq!(result, JsValue::String("10".to_string().into()));
     }
 
     #[test]
@@ -6559,7 +6579,7 @@ mod tests {
         );
         let mut frame = InterpreterFrame::new(ba, vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
-        assert_eq!(result, JsValue::String("hello".to_string()));
+        assert_eq!(result, JsValue::String("hello".to_string().into()));
     }
 
     // ── Negate ───────────────────────────────────────────────────────────────
@@ -6883,16 +6903,16 @@ mod tests {
     fn test_lda_keyed_property_string_key() {
         let obj = make_plain_object(vec![
             ("x", JsValue::Smi(42)),
-            ("name", JsValue::String("hello".to_string())),
+            ("name", JsValue::String("hello".to_string().into())),
         ]);
-        let val = keyed_load(&obj, &JsValue::String("x".to_string())).unwrap();
+        let val = keyed_load(&obj, &JsValue::String("x".to_string().into())).unwrap();
         assert_eq!(val, JsValue::Smi(42));
 
-        let val = keyed_load(&obj, &JsValue::String("name".to_string())).unwrap();
-        assert_eq!(val, JsValue::String("hello".to_string()));
+        let val = keyed_load(&obj, &JsValue::String("name".to_string().into())).unwrap();
+        assert_eq!(val, JsValue::String("hello".to_string().into()));
 
         // Missing key returns undefined
-        let val = keyed_load(&obj, &JsValue::String("missing".to_string())).unwrap();
+        let val = keyed_load(&obj, &JsValue::String("missing".to_string().into())).unwrap();
         assert_eq!(val, JsValue::Undefined);
     }
 
@@ -6915,12 +6935,12 @@ mod tests {
         );
         // "length" property
         assert_eq!(
-            keyed_load(&arr, &JsValue::String("length".to_string())).unwrap(),
+            keyed_load(&arr, &JsValue::String("length".to_string().into())).unwrap(),
             JsValue::Smi(3)
         );
         // String index "1" works
         assert_eq!(
-            keyed_load(&arr, &JsValue::String("1".to_string())).unwrap(),
+            keyed_load(&arr, &JsValue::String("1".to_string().into())).unwrap(),
             JsValue::Smi(20)
         );
     }
@@ -6986,14 +7006,14 @@ mod tests {
 
     #[test]
     fn test_lda_keyed_property_string_char_at() {
-        let s = JsValue::String("hello".to_string());
+        let s = JsValue::String("hello".to_string().into());
         assert_eq!(
             keyed_load(&s, &JsValue::Smi(0)).unwrap(),
-            JsValue::String("h".to_string())
+            JsValue::String("h".to_string().into())
         );
         assert_eq!(
             keyed_load(&s, &JsValue::Smi(4)).unwrap(),
-            JsValue::String("o".to_string())
+            JsValue::String("o".to_string().into())
         );
         // Out-of-bounds → undefined
         assert_eq!(
@@ -7002,7 +7022,7 @@ mod tests {
         );
         // "length" property
         assert_eq!(
-            keyed_load(&s, &JsValue::String("length".to_string())).unwrap(),
+            keyed_load(&s, &JsValue::String("length".to_string().into())).unwrap(),
             JsValue::Smi(5)
         );
     }
@@ -7011,22 +7031,37 @@ mod tests {
     fn test_keyed_store_plain_object() {
         let obj = make_plain_object(vec![("x", JsValue::Smi(1))]);
         // Store new property
-        keyed_store(&obj, &JsValue::String("y".to_string()), JsValue::Smi(99)).unwrap();
+        keyed_store(
+            &obj,
+            &JsValue::String("y".to_string().into()),
+            JsValue::Smi(99),
+        )
+        .unwrap();
         assert_eq!(
-            keyed_load(&obj, &JsValue::String("y".to_string())).unwrap(),
+            keyed_load(&obj, &JsValue::String("y".to_string().into())).unwrap(),
             JsValue::Smi(99)
         );
         // Overwrite existing property
-        keyed_store(&obj, &JsValue::String("x".to_string()), JsValue::Smi(7)).unwrap();
+        keyed_store(
+            &obj,
+            &JsValue::String("x".to_string().into()),
+            JsValue::Smi(7),
+        )
+        .unwrap();
         assert_eq!(
-            keyed_load(&obj, &JsValue::String("x".to_string())).unwrap(),
+            keyed_load(&obj, &JsValue::String("x".to_string().into())).unwrap(),
             JsValue::Smi(7)
         );
         // Numeric string key
-        keyed_store(&obj, &JsValue::Smi(0), JsValue::String("zero".to_string())).unwrap();
+        keyed_store(
+            &obj,
+            &JsValue::Smi(0),
+            JsValue::String("zero".to_string().into()),
+        )
+        .unwrap();
         assert_eq!(
-            keyed_load(&obj, &JsValue::String("0".to_string())).unwrap(),
-            JsValue::String("zero".to_string())
+            keyed_load(&obj, &JsValue::String("0".to_string().into())).unwrap(),
+            JsValue::String("zero".to_string().into())
         );
     }
 
@@ -7035,13 +7070,13 @@ mod tests {
         // Storing to non-objects should not error
         keyed_store(
             &JsValue::Smi(42),
-            &JsValue::String("x".to_string()),
+            &JsValue::String("x".to_string().into()),
             JsValue::Smi(1),
         )
         .unwrap();
         keyed_store(
             &JsValue::Undefined,
-            &JsValue::String("x".to_string()),
+            &JsValue::String("x".to_string().into()),
             JsValue::Smi(1),
         )
         .unwrap();
@@ -7135,13 +7170,13 @@ mod tests {
     #[test]
     fn test_lda_keyed_property_heap_number_key() {
         let arr = JsValue::new_array(vec![
-            JsValue::String("first".to_string()),
-            JsValue::String("second".to_string()),
+            JsValue::String("first".to_string().into()),
+            JsValue::String("second".to_string().into()),
         ]);
         // HeapNumber 1.0 should work as index 1
         assert_eq!(
             keyed_load(&arr, &JsValue::HeapNumber(1.0)).unwrap(),
-            JsValue::String("second".to_string())
+            JsValue::String("second".to_string().into())
         );
         // HeapNumber 1.5 is not a valid index
         assert_eq!(
@@ -7162,8 +7197,14 @@ mod tests {
         assert_eq!(to_array_index(&JsValue::Smi(-1)), None);
         assert_eq!(to_array_index(&JsValue::HeapNumber(3.0)), Some(3));
         assert_eq!(to_array_index(&JsValue::HeapNumber(3.5)), None);
-        assert_eq!(to_array_index(&JsValue::String("7".to_string())), Some(7));
-        assert_eq!(to_array_index(&JsValue::String("abc".to_string())), None);
+        assert_eq!(
+            to_array_index(&JsValue::String("7".to_string().into())),
+            Some(7)
+        );
+        assert_eq!(
+            to_array_index(&JsValue::String("abc".to_string().into())),
+            None
+        );
         assert_eq!(to_array_index(&JsValue::Undefined), None);
     }
 
@@ -7212,9 +7253,10 @@ mod tests {
         //        instance.__proto__   = proto_obj
         // TestInstanceOf should find the match.
         let proto = Rc::new(RefCell::new(PropertyMap::new()));
-        proto
-            .borrow_mut()
-            .insert("kind".to_string(), JsValue::String("proto".to_string()));
+        proto.borrow_mut().insert(
+            "kind".to_string(),
+            JsValue::String("proto".to_string().into()),
+        );
 
         let mut ctor_map = PropertyMap::new();
         ctor_map.insert("prototype".to_string(), JsValue::PlainObject(proto.clone()));
@@ -7273,7 +7315,7 @@ mod tests {
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
 
         let result = run_with_acc_and_regs(
-            JsValue::String("x".to_string()),
+            JsValue::String("x".to_string().into()),
             &[obj],
             vec![Instruction::new_unchecked(
                 Opcode::TestIn,
@@ -7292,7 +7334,7 @@ mod tests {
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
 
         let result = run_with_acc_and_regs(
-            JsValue::String("y".to_string()),
+            JsValue::String("y".to_string().into()),
             &[obj],
             vec![Instruction::new_unchecked(
                 Opcode::TestIn,
@@ -7343,7 +7385,7 @@ mod tests {
         let arr = JsValue::new_array(vec![JsValue::Smi(10), JsValue::Smi(20)]);
 
         let result = run_with_acc_and_regs(
-            JsValue::String("length".to_string()),
+            JsValue::String("length".to_string().into()),
             &[arr],
             vec![Instruction::new_unchecked(
                 Opcode::TestIn,
@@ -7358,7 +7400,7 @@ mod tests {
     fn test_test_in_non_object() {
         // "x" in 42 → false (non-object target)
         let result = run_with_acc_and_regs(
-            JsValue::String("x".to_string()),
+            JsValue::String("x".to_string().into()),
             &[JsValue::Smi(42)],
             vec![Instruction::new_unchecked(
                 Opcode::TestIn,
@@ -7697,12 +7739,15 @@ mod tests {
             let borrow = map.borrow();
             assert_eq!(
                 borrow.get("source"),
-                Some(&JsValue::String("ab+d".to_string()))
+                Some(&JsValue::String("ab+d".to_string().into()))
             );
-            assert_eq!(borrow.get("flags"), Some(&JsValue::String("i".to_string())));
+            assert_eq!(
+                borrow.get("flags"),
+                Some(&JsValue::String("i".to_string().into()))
+            );
             assert_eq!(
                 borrow.get("toString"),
-                Some(&JsValue::String("/ab+d/i".to_string()))
+                Some(&JsValue::String("/ab+d/i".to_string().into()))
             );
         } else {
             panic!("expected PlainObject, got {result:?}");
@@ -7734,11 +7779,11 @@ mod tests {
             let borrow = map.borrow();
             assert_eq!(
                 borrow.get("source"),
-                Some(&JsValue::String("test".to_string()))
+                Some(&JsValue::String("test".to_string().into()))
             );
             assert_eq!(
                 borrow.get("flags"),
-                Some(&JsValue::String("gim".to_string()))
+                Some(&JsValue::String("gim".to_string().into()))
             );
         } else {
             panic!("expected PlainObject, got {result:?}");
@@ -7770,12 +7815,15 @@ mod tests {
             let borrow = map.borrow();
             assert_eq!(
                 borrow.get("source"),
-                Some(&JsValue::String("abc".to_string()))
+                Some(&JsValue::String("abc".to_string().into()))
             );
-            assert_eq!(borrow.get("flags"), Some(&JsValue::String(String::new())));
+            assert_eq!(
+                borrow.get("flags"),
+                Some(&JsValue::String(String::new().into()))
+            );
             assert_eq!(
                 borrow.get("toString"),
-                Some(&JsValue::String("/abc/".to_string()))
+                Some(&JsValue::String("/abc/".to_string().into()))
             );
         } else {
             panic!("expected PlainObject, got {result:?}");
@@ -7973,14 +8021,14 @@ mod tests {
         {
             let mut borrow = map.borrow_mut();
             borrow.insert("0".to_string(), JsValue::Smi(10));
-            borrow.insert("1".to_string(), JsValue::String("hello".to_string()));
+            borrow.insert("1".to_string(), JsValue::String("hello".to_string().into()));
             borrow.insert("2".to_string(), JsValue::Boolean(true));
             borrow.insert("length".to_string(), JsValue::Smi(3));
         }
         let items = super::plain_object_to_array_items(&map);
         assert_eq!(items.len(), 3);
         assert_eq!(items[0], JsValue::Smi(10));
-        assert_eq!(items[1], JsValue::String("hello".to_string()));
+        assert_eq!(items[1], JsValue::String("hello".to_string().into()));
         assert_eq!(items[2], JsValue::Boolean(true));
     }
 
@@ -8884,14 +8932,17 @@ mod tests {
     #[test]
     fn test_new_error_name_property() {
         let result = error_construct_and_read_property("Error", "something broke", "name").unwrap();
-        assert_eq!(result, JsValue::String("Error".to_string()));
+        assert_eq!(result, JsValue::String("Error".to_string().into()));
     }
 
     #[test]
     fn test_new_error_message_property() {
         let result =
             error_construct_and_read_property("Error", "something broke", "message").unwrap();
-        assert_eq!(result, JsValue::String("something broke".to_string()));
+        assert_eq!(
+            result,
+            JsValue::String("something broke".to_string().into())
+        );
     }
 
     #[test]
@@ -8911,26 +8962,26 @@ mod tests {
     #[test]
     fn test_new_type_error_name() {
         let result = error_construct_and_read_property("TypeError", "bad type", "name").unwrap();
-        assert_eq!(result, JsValue::String("TypeError".to_string()));
+        assert_eq!(result, JsValue::String("TypeError".to_string().into()));
     }
 
     #[test]
     fn test_new_type_error_message() {
         let result = error_construct_and_read_property("TypeError", "bad type", "message").unwrap();
-        assert_eq!(result, JsValue::String("bad type".to_string()));
+        assert_eq!(result, JsValue::String("bad type".to_string().into()));
     }
 
     #[test]
     fn test_new_range_error() {
         let result =
             error_construct_and_read_property("RangeError", "out of range", "name").unwrap();
-        assert_eq!(result, JsValue::String("RangeError".to_string()));
+        assert_eq!(result, JsValue::String("RangeError".to_string().into()));
     }
 
     #[test]
     fn test_new_syntax_error() {
         let result = error_construct_and_read_property("SyntaxError", "bad token", "name").unwrap();
-        assert_eq!(result, JsValue::String("SyntaxError".to_string()));
+        assert_eq!(result, JsValue::String("SyntaxError".to_string().into()));
     }
 
     #[test]
@@ -8938,19 +8989,19 @@ mod tests {
         let result =
             error_construct_and_read_property("ReferenceError", "x is not defined", "name")
                 .unwrap();
-        assert_eq!(result, JsValue::String("ReferenceError".to_string()));
+        assert_eq!(result, JsValue::String("ReferenceError".to_string().into()));
     }
 
     #[test]
     fn test_new_uri_error() {
         let result = error_construct_and_read_property("URIError", "bad URI", "name").unwrap();
-        assert_eq!(result, JsValue::String("URIError".to_string()));
+        assert_eq!(result, JsValue::String("URIError".to_string().into()));
     }
 
     #[test]
     fn test_new_eval_error() {
         let result = error_construct_and_read_property("EvalError", "bad eval", "name").unwrap();
-        assert_eq!(result, JsValue::String("EvalError".to_string()));
+        assert_eq!(result, JsValue::String("EvalError".to_string().into()));
     }
 
     #[test]
@@ -8995,7 +9046,7 @@ mod tests {
         let mut frame = InterpreterFrame::new(ba, vec![]);
         crate::builtins::install_globals::install_globals(&mut frame.global_env.borrow_mut());
         let result = Interpreter::run(&mut frame).unwrap();
-        assert_eq!(result, JsValue::String(String::new()));
+        assert_eq!(result, JsValue::String(String::new().into()));
     }
 
     /// Test that `proto_lookup` resolves name/message/stack on JsValue::Error.
@@ -9009,11 +9060,11 @@ mod tests {
         )));
         assert_eq!(
             proto_lookup(&err, "name"),
-            JsValue::String("TypeError".to_string())
+            JsValue::String("TypeError".to_string().into())
         );
         assert_eq!(
             proto_lookup(&err, "message"),
-            JsValue::String("not a function".to_string())
+            JsValue::String("not a function".to_string().into())
         );
         if let JsValue::String(s) = proto_lookup(&err, "stack") {
             assert!(s.starts_with("TypeError: not a function"));
@@ -9037,7 +9088,7 @@ mod tests {
         assert_eq!(proto_lookup(&err, "cause"), JsValue::Undefined);
 
         // Error with cause returns the cause value.
-        let cause = JsValue::String("original problem".to_string());
+        let cause = JsValue::String("original problem".to_string().into());
         let err_with_cause = JsValue::Error(Rc::new(
             JsError::new(ErrorKind::Error, "wrapper".to_string()).with_cause(cause.clone()),
         ));
@@ -9091,7 +9142,10 @@ mod tests {
         )));
         if let JsValue::NativeFunction(f) = proto_lookup(&err, "toString") {
             let result = f(vec![]).unwrap();
-            assert_eq!(result, JsValue::String("TypeError: bad value".to_string()));
+            assert_eq!(
+                result,
+                JsValue::String("TypeError: bad value".to_string().into())
+            );
         } else {
             panic!("expected NativeFunction for toString");
         }
@@ -9109,7 +9163,7 @@ mod tests {
         let err = JsValue::Error(Rc::new(je));
         assert_eq!(
             proto_lookup(&err, "message"),
-            JsValue::String("overridden".to_string())
+            JsValue::String("overridden".to_string().into())
         );
     }
 
@@ -9845,7 +9899,7 @@ mod tests {
         );
         let mut frame = InterpreterFrame::new(ba, vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
-        assert_eq!(result, JsValue::String("hello".to_string()));
+        assert_eq!(result, JsValue::String("hello".to_string().into()));
     }
 
     #[test]
@@ -9865,7 +9919,7 @@ mod tests {
         );
         let mut frame = InterpreterFrame::new(ba, vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
-        assert_eq!(result, JsValue::String("tpl".to_string()));
+        assert_eq!(result, JsValue::String("tpl".to_string().into()));
         assert_eq!(frame.template_cache.len(), 1);
     }
 
@@ -10555,7 +10609,7 @@ mod tests {
         let result =
             compile_source_and_run("function tag(strings) { return strings[0]; } tag`hello`")
                 .unwrap();
-        assert_eq!(result, JsValue::String("hello".to_string()));
+        assert_eq!(result, JsValue::String("hello".to_string().into()));
     }
 
     #[test]
@@ -10563,7 +10617,7 @@ mod tests {
         let result =
             compile_source_and_run("function tag(strings) { return strings.raw[0]; } tag`hello`")
                 .unwrap();
-        assert_eq!(result, JsValue::String("hello".to_string()));
+        assert_eq!(result, JsValue::String("hello".to_string().into()));
     }
 
     #[test]
@@ -10843,6 +10897,6 @@ mod tests {
              countdown(50000)",
         )
         .unwrap();
-        assert_eq!(result, JsValue::String("done".to_string()));
+        assert_eq!(result, JsValue::String("done".to_string().into()));
     }
 }

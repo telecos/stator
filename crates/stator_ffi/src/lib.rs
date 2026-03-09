@@ -2839,7 +2839,7 @@ fn stator_value_inner_to_jsvalue(inner: &StatorValueInner) -> JsValue {
                 JsValue::HeapNumber(*n)
             }
         }
-        StatorValueInner::Str(cs) => JsValue::String(cs.to_string_lossy().into_owned()),
+        StatorValueInner::Str(cs) => JsValue::String(cs.to_string_lossy().into_owned().into()),
         StatorValueInner::Undefined => JsValue::Undefined,
         StatorValueInner::Null => JsValue::Null,
         StatorValueInner::Boolean(b) => JsValue::Boolean(*b),

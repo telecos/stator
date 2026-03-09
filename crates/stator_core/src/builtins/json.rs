@@ -1012,7 +1012,7 @@ fn js_value_to_json_inner(
         JsValue::Boolean(b) => Ok(Some(JsonValue::Bool(*b))),
         JsValue::Smi(n) => Ok(Some(JsonValue::Number(f64::from(*n)))),
         JsValue::HeapNumber(n) => Ok(Some(JsonValue::Number(*n))),
-        JsValue::String(s) => Ok(Some(JsonValue::Str(s.clone()))),
+        JsValue::String(s) => Ok(Some(JsonValue::Str(s.to_string()))),
         JsValue::BigInt(_) => Err(StatorError::TypeError(
             "Do not know how to serialize a BigInt".to_string(),
         )),
@@ -1048,7 +1048,7 @@ fn js_value_to_json_inner(
                 }
             });
             if let Some(f) = to_json_fn {
-                let result = f(vec![JsValue::String(String::new())])?;
+                let result = f(vec![JsValue::String(String::new().into())])?;
                 return js_value_to_json_inner(&result, seen);
             }
 

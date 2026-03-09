@@ -820,13 +820,13 @@ mod tests {
         let mut obj = JsObject::new();
         obj.set_property("a", JsValue::Smi(1)).unwrap();
         obj.set_property("b", JsValue::Boolean(true)).unwrap();
-        obj.set_property("c", JsValue::String("hi".to_string()))
+        obj.set_property("c", JsValue::String("hi".to_string().into()))
             .unwrap();
         assert_eq!(obj.get_own_property("a"), Some(JsValue::Smi(1)));
         assert_eq!(obj.get_own_property("b"), Some(JsValue::Boolean(true)));
         assert_eq!(
             obj.get_own_property("c"),
-            Some(JsValue::String("hi".to_string()))
+            Some(JsValue::String("hi".to_string().into()))
         );
     }
 

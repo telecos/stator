@@ -373,7 +373,7 @@ impl JsError {
     /// use stator_core::builtins::error::{JsError, ErrorKind};
     /// use stator_core::objects::value::JsValue;
     ///
-    /// let inner = JsValue::String("disk full".to_string());
+    /// let inner = JsValue::String("disk full".to_string().into());
     /// let e = JsError::new(ErrorKind::Error, "write failed".to_string())
     ///     .with_cause(inner.clone());
     /// assert_eq!(e.cause(), Some(&inner));
@@ -401,11 +401,11 @@ impl JsError {
     pub fn to_error_string(&self) -> String {
         let props = self.props.borrow();
         let name = match props.get("name") {
-            Some(JsValue::String(s)) => s.clone(),
+            Some(JsValue::String(s)) => s.to_string(),
             _ => self.kind.as_name().to_string(),
         };
         let msg = match props.get("message") {
-            Some(JsValue::String(s)) => s.clone(),
+            Some(JsValue::String(s)) => s.to_string(),
             _ => self.message.clone(),
         };
         drop(props);
@@ -646,7 +646,7 @@ mod tests {
         let e = JsError::new(ErrorKind::Error, "msg".to_string());
         e.props
             .borrow_mut()
-            .insert("name".to_string(), JsValue::String(String::new()));
+            .insert("name".to_string(), JsValue::String(String::new().into()));
         assert_eq!(e.to_error_string(), "msg");
     }
 
@@ -771,7 +771,7 @@ mod tests {
 
     #[test]
     fn test_error_with_cause() {
-        let cause = JsValue::String("disk full".to_string());
+        let cause = JsValue::String("disk full".to_string().into());
         let e =
             JsError::new(ErrorKind::Error, "write failed".to_string()).with_cause(cause.clone());
         assert_eq!(e.cause(), Some(&cause));

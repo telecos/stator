@@ -157,7 +157,10 @@ impl NativeIterator {
     /// Create a `NativeIterator` that yields the individual Unicode scalar
     /// values of `s` as single-character strings.
     pub fn from_string(s: &str) -> Rc<RefCell<Self>> {
-        let items = s.chars().map(|c| JsValue::String(c.to_string())).collect();
+        let items = s
+            .chars()
+            .map(|c| JsValue::String(c.to_string().into()))
+            .collect();
         Rc::new(RefCell::new(Self { items, index: 0 }))
     }
 
@@ -234,7 +237,10 @@ pub enum JsValue {
     /// A double-precision floating-point number stored inline.
     HeapNumber(f64),
     /// A JavaScript string value.
-    String(String),
+    ///
+    /// Stored as `Rc<str>` so that cloning a string value is O(1) (reference
+    /// count bump) instead of O(n) (full heap copy).
+    String(Rc<str>),
     /// A unique JavaScript symbol, identified by an opaque 64-bit descriptor.
     Symbol(u64),
     /// A pointer to a GC-managed heap object.
@@ -641,7 +647,7 @@ impl JsValue {
             }
 
             // All other object-like types: default string representation.
-            _ => Ok(JsValue::String(self.default_obj_to_string())),
+            _ => Ok(JsValue::String(self.default_obj_to_string().into())),
         }
     }
 
@@ -689,7 +695,7 @@ impl JsValue {
             Self::Boolean(b) => Ok(if *b { "true" } else { "false" }.to_string()),
             Self::Smi(n) => Ok(n.to_string()),
             Self::HeapNumber(n) => Ok(number_to_string(*n)),
-            Self::String(s) => Ok(s.clone()),
+            Self::String(s) => Ok(s.to_string()),
             Self::Symbol(_) => Err(StatorError::TypeError(
                 "Cannot convert a Symbol value to a string".to_string(),
             )),
@@ -1103,7 +1109,7 @@ fn ordinary_to_primitive_plain_object(
     }
 
     // No callable method returned a primitive — use default.
-    Ok(JsValue::String("[object Object]".to_string()))
+    Ok(JsValue::String("[object Object]".to_string().into()))
 }
 
 /// ECMAScript §7.1.6 helper: truncate an `f64` to a signed 32-bit integer.
@@ -1313,14 +1319,14 @@ mod tests {
 
     #[test]
     fn test_is_string() {
-        assert!(JsValue::String("hello".to_string()).is_string());
+        assert!(JsValue::String("hello".to_string().into()).is_string());
         assert!(!JsValue::Smi(0).is_string());
     }
 
     #[test]
     fn test_is_symbol() {
         assert!(JsValue::Symbol(1).is_symbol());
-        assert!(!JsValue::String("sym".to_string()).is_symbol());
+        assert!(!JsValue::String("sym".to_string().into()).is_symbol());
     }
 
     #[test]
@@ -1344,7 +1350,7 @@ mod tests {
         assert!(JsValue::Boolean(true).is_primitive());
         assert!(JsValue::Smi(0).is_primitive());
         assert!(JsValue::HeapNumber(0.0).is_primitive());
-        assert!(JsValue::String("".to_string()).is_primitive());
+        assert!(JsValue::String("".to_string().into()).is_primitive());
         assert!(JsValue::Symbol(0).is_primitive());
         assert!(JsValue::BigInt(0).is_primitive());
         assert!(!JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))).is_primitive());
@@ -1396,9 +1402,9 @@ mod tests {
 
     #[test]
     fn test_to_boolean_string() {
-        assert!(!JsValue::String(String::new()).to_boolean());
-        assert!(JsValue::String("x".to_string()).to_boolean());
-        assert!(JsValue::String("false".to_string()).to_boolean());
+        assert!(!JsValue::String(String::new().into()).to_boolean());
+        assert!(JsValue::String("x".to_string().into()).to_boolean());
+        assert!(JsValue::String("false".to_string().into()).to_boolean());
     }
 
     #[test]
@@ -1431,7 +1437,7 @@ mod tests {
             JsValue::Boolean(true),
             JsValue::Smi(42),
             JsValue::HeapNumber(3.14),
-            JsValue::String("hi".to_string()),
+            JsValue::String("hi".to_string().into()),
             JsValue::Symbol(7),
             JsValue::BigInt(99),
         ];
@@ -1444,7 +1450,7 @@ mod tests {
     fn test_to_primitive_plain_object_default() {
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
         let prim = obj.to_primitive(ToPrimitiveHint::Default).unwrap();
-        assert_eq!(prim, JsValue::String("[object Object]".to_string()));
+        assert_eq!(prim, JsValue::String("[object Object]".to_string().into()));
     }
 
     #[test]
@@ -1461,19 +1467,19 @@ mod tests {
     #[test]
     fn test_to_primitive_plain_object_with_tostring() {
         let mut map = PropertyMap::new();
-        let f: NativeFn = Rc::new(|_| Ok(JsValue::String("custom".to_string())));
+        let f: NativeFn = Rc::new(|_| Ok(JsValue::String("custom".to_string().into())));
         map.insert("toString".to_string(), JsValue::NativeFunction(f));
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
         // String hint: toString is tried first.
         let prim = obj.to_primitive(ToPrimitiveHint::String).unwrap();
-        assert_eq!(prim, JsValue::String("custom".to_string()));
+        assert_eq!(prim, JsValue::String("custom".to_string().into()));
     }
 
     #[test]
     fn test_to_primitive_array() {
         let arr = JsValue::new_array(vec![JsValue::Smi(1), JsValue::Smi(2)]);
         let prim = arr.to_primitive(ToPrimitiveHint::String).unwrap();
-        assert_eq!(prim, JsValue::String("1,2".to_string()));
+        assert_eq!(prim, JsValue::String("1,2".to_string().into()));
     }
 
     #[test]
@@ -1482,7 +1488,7 @@ mod tests {
         let f: NativeFn = Rc::new(|args| {
             let hint = args.get(1).unwrap_or(&JsValue::Undefined).clone();
             if let JsValue::String(h) = hint {
-                Ok(JsValue::String(format!("hint:{h}")))
+                Ok(JsValue::String(format!("hint:{h}").into()))
             } else {
                 Ok(JsValue::Smi(0))
             }
@@ -1490,7 +1496,7 @@ mod tests {
         map.insert("@@toPrimitive".to_string(), JsValue::NativeFunction(f));
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
         let prim = obj.to_primitive(ToPrimitiveHint::Number).unwrap();
-        assert_eq!(prim, JsValue::String("hint:number".to_string()));
+        assert_eq!(prim, JsValue::String("hint:number".to_string().into()));
     }
 
     #[test]
@@ -1498,7 +1504,7 @@ mod tests {
         let mut map = PropertyMap::new();
         map.insert(
             "@@toStringTag".to_string(),
-            JsValue::String("CustomType".to_string()),
+            JsValue::String("CustomType".to_string().into()),
         );
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
         assert_eq!(
@@ -1542,33 +1548,56 @@ mod tests {
 
     #[test]
     fn test_to_number_string_numeric() {
-        assert_eq!(JsValue::String("42".to_string()).to_number().unwrap(), 42.0);
         assert_eq!(
-            JsValue::String("  3.14  ".to_string()).to_number().unwrap(),
+            JsValue::String("42".to_string().into())
+                .to_number()
+                .unwrap(),
+            42.0
+        );
+        assert_eq!(
+            JsValue::String("  3.14  ".to_string().into())
+                .to_number()
+                .unwrap(),
             3.14
         );
-        assert_eq!(JsValue::String("".to_string()).to_number().unwrap(), 0.0);
-        assert_eq!(JsValue::String("   ".to_string()).to_number().unwrap(), 0.0);
+        assert_eq!(
+            JsValue::String("".to_string().into()).to_number().unwrap(),
+            0.0
+        );
+        assert_eq!(
+            JsValue::String("   ".to_string().into())
+                .to_number()
+                .unwrap(),
+            0.0
+        );
     }
 
     #[test]
     fn test_to_number_string_non_numeric_gives_nan() {
-        let n = JsValue::String("abc".to_string()).to_number().unwrap();
+        let n = JsValue::String("abc".to_string().into())
+            .to_number()
+            .unwrap();
         assert!(n.is_nan());
     }
 
     #[test]
     fn test_to_number_string_hex() {
         assert_eq!(
-            JsValue::String("0xFF".to_string()).to_number().unwrap(),
+            JsValue::String("0xFF".to_string().into())
+                .to_number()
+                .unwrap(),
             255.0
         );
         assert_eq!(
-            JsValue::String("0x1A".to_string()).to_number().unwrap(),
+            JsValue::String("0x1A".to_string().into())
+                .to_number()
+                .unwrap(),
             26.0
         );
         assert_eq!(
-            JsValue::String("0X10".to_string()).to_number().unwrap(),
+            JsValue::String("0X10".to_string().into())
+                .to_number()
+                .unwrap(),
             16.0
         );
     }
@@ -1576,11 +1605,15 @@ mod tests {
     #[test]
     fn test_to_number_string_octal() {
         assert_eq!(
-            JsValue::String("0o17".to_string()).to_number().unwrap(),
+            JsValue::String("0o17".to_string().into())
+                .to_number()
+                .unwrap(),
             15.0
         );
         assert_eq!(
-            JsValue::String("0O10".to_string()).to_number().unwrap(),
+            JsValue::String("0O10".to_string().into())
+                .to_number()
+                .unwrap(),
             8.0
         );
     }
@@ -1588,11 +1621,15 @@ mod tests {
     #[test]
     fn test_to_number_string_binary() {
         assert_eq!(
-            JsValue::String("0b1010".to_string()).to_number().unwrap(),
+            JsValue::String("0b1010".to_string().into())
+                .to_number()
+                .unwrap(),
             10.0
         );
         assert_eq!(
-            JsValue::String("0B11".to_string()).to_number().unwrap(),
+            JsValue::String("0B11".to_string().into())
+                .to_number()
+                .unwrap(),
             3.0
         );
     }
@@ -1600,23 +1637,27 @@ mod tests {
     #[test]
     fn test_to_number_string_infinity() {
         assert_eq!(
-            JsValue::String("Infinity".to_string()).to_number().unwrap(),
-            f64::INFINITY
-        );
-        assert_eq!(
-            JsValue::String("+Infinity".to_string())
+            JsValue::String("Infinity".to_string().into())
                 .to_number()
                 .unwrap(),
             f64::INFINITY
         );
         assert_eq!(
-            JsValue::String("-Infinity".to_string())
+            JsValue::String("+Infinity".to_string().into())
+                .to_number()
+                .unwrap(),
+            f64::INFINITY
+        );
+        assert_eq!(
+            JsValue::String("-Infinity".to_string().into())
                 .to_number()
                 .unwrap(),
             f64::NEG_INFINITY
         );
         // "inf" is not valid ECMAScript.
-        let n = JsValue::String("inf".to_string()).to_number().unwrap();
+        let n = JsValue::String("inf".to_string().into())
+            .to_number()
+            .unwrap();
         assert!(n.is_nan());
     }
 
@@ -1722,10 +1763,17 @@ mod tests {
     #[test]
     fn test_to_js_string_string_passthrough() {
         assert_eq!(
-            JsValue::String("hello".to_string()).to_js_string().unwrap(),
+            JsValue::String("hello".to_string().into())
+                .to_js_string()
+                .unwrap(),
             "hello"
         );
-        assert_eq!(JsValue::String(String::new()).to_js_string().unwrap(), "");
+        assert_eq!(
+            JsValue::String(String::new().into())
+                .to_js_string()
+                .unwrap(),
+            ""
+        );
     }
 
     #[test]
@@ -1903,7 +1951,7 @@ mod tests {
     #[test]
     fn test_to_property_key_string() {
         assert_eq!(
-            JsValue::String("foo".to_string())
+            JsValue::String("foo".to_string().into())
                 .to_property_key()
                 .unwrap(),
             "foo"
@@ -2003,7 +2051,8 @@ mod tests {
         assert!(JsValue::Smi(1).is_strictly_equal(&JsValue::Smi(1)));
         assert!(!JsValue::Smi(1).is_strictly_equal(&JsValue::Smi(2)));
         assert!(
-            JsValue::String("a".to_string()).is_strictly_equal(&JsValue::String("a".to_string()))
+            JsValue::String("a".to_string().into())
+                .is_strictly_equal(&JsValue::String("a".to_string().into()))
         );
     }
 
@@ -2021,7 +2070,7 @@ mod tests {
     #[test]
     fn test_is_strictly_equal_cross_type() {
         // Different types → false.
-        assert!(!JsValue::Smi(1).is_strictly_equal(&JsValue::String("1".to_string())));
+        assert!(!JsValue::Smi(1).is_strictly_equal(&JsValue::String("1".to_string().into())));
         assert!(!JsValue::Null.is_strictly_equal(&JsValue::Undefined));
     }
 
@@ -2050,7 +2099,7 @@ mod tests {
         assert!(!JsValue::Null.is_loosely_equal(&JsValue::Smi(0)).unwrap());
         assert!(
             !JsValue::Null
-                .is_loosely_equal(&JsValue::String("".to_string()))
+                .is_loosely_equal(&JsValue::String("".to_string().into()))
                 .unwrap()
         );
     }
@@ -2059,17 +2108,17 @@ mod tests {
     fn test_is_loosely_equal_number_string() {
         assert!(
             JsValue::Smi(1)
-                .is_loosely_equal(&JsValue::String("1".to_string()))
+                .is_loosely_equal(&JsValue::String("1".to_string().into()))
                 .unwrap()
         );
         assert!(
-            JsValue::String("42".to_string())
+            JsValue::String("42".to_string().into())
                 .is_loosely_equal(&JsValue::Smi(42))
                 .unwrap()
         );
         assert!(
             !JsValue::Smi(1)
-                .is_loosely_equal(&JsValue::String("2".to_string()))
+                .is_loosely_equal(&JsValue::String("2".to_string().into()))
                 .unwrap()
         );
     }
@@ -2091,13 +2140,13 @@ mod tests {
         // true == "1"
         assert!(
             JsValue::Boolean(true)
-                .is_loosely_equal(&JsValue::String("1".to_string()))
+                .is_loosely_equal(&JsValue::String("1".to_string().into()))
                 .unwrap()
         );
         // false != "false"
         assert!(
             !JsValue::Boolean(false)
-                .is_loosely_equal(&JsValue::String("false".to_string()))
+                .is_loosely_equal(&JsValue::String("false".to_string().into()))
                 .unwrap()
         );
     }
@@ -2139,12 +2188,12 @@ mod tests {
     fn test_is_loosely_equal_bigint_string() {
         assert!(
             JsValue::BigInt(42)
-                .is_loosely_equal(&JsValue::String("42".to_string()))
+                .is_loosely_equal(&JsValue::String("42".to_string().into()))
                 .unwrap()
         );
         assert!(
             !JsValue::BigInt(42)
-                .is_loosely_equal(&JsValue::String("abc".to_string()))
+                .is_loosely_equal(&JsValue::String("abc".to_string().into()))
                 .unwrap()
         );
     }

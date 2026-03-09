@@ -392,7 +392,7 @@ fn make_suppressed_error_constructor() -> JsValue {
         };
         let mut props = PropertyMap::new();
         props.insert("name".into(), JsValue::String("SuppressedError".into()));
-        props.insert("message".into(), JsValue::String(message));
+        props.insert("message".into(), JsValue::String(message.into()));
         props.insert("error".into(), error_val);
         props.insert("suppressed".into(), suppressed_val);
         Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
@@ -733,7 +733,7 @@ fn json_value_to_js_value(jv: &crate::builtins::json::JsonValue) -> JsValue {
         JsonValue::Null => JsValue::Null,
         JsonValue::Bool(b) => JsValue::Boolean(*b),
         JsonValue::Number(n) => num(*n),
-        JsonValue::Str(s) => JsValue::String(s.clone()),
+        JsonValue::Str(s) => JsValue::String(s.clone().into()),
         JsonValue::Array(arr) => {
             let items: Vec<JsValue> = arr.borrow().iter().map(json_value_to_js_value).collect();
             JsValue::new_array(items)
@@ -789,7 +789,7 @@ fn make_json() -> JsValue {
                     let f = f.clone();
                     Some(Box::new(
                         move |key: &str, val: &JsonValue| -> StatorResult<Option<JsonValue>> {
-                            let js_key = JsValue::String(key.to_string());
+                            let js_key = JsValue::String(key.to_string().into());
                             let js_val = json_value_to_js_value(val);
                             let result = f(vec![js_key, js_val])?;
                             match result {
@@ -812,7 +812,7 @@ fn make_json() -> JsValue {
                     .iter()
                     .filter_map(|v| {
                         if let JsValue::String(s) = v {
-                            Some(s.clone())
+                            Some(s.to_string())
                         } else {
                             None
                         }
@@ -834,12 +834,12 @@ fn make_json() -> JsValue {
             let space: Option<JsonSpace> = match args.get(2) {
                 Some(JsValue::Smi(n)) => Some(JsonSpace::Count((*n).max(0) as u32)),
                 Some(JsValue::HeapNumber(n)) => Some(JsonSpace::Count(n.clamp(0.0, 10.0) as u32)),
-                Some(JsValue::String(s)) => Some(JsonSpace::Str(s.clone())),
+                Some(JsValue::String(s)) => Some(JsonSpace::Str(s.to_string())),
                 _ => None,
             };
 
             match json_stringify_js_value(val, replacer.as_ref(), space.as_ref())? {
-                Some(s) => Ok(JsValue::String(s)),
+                Some(s) => Ok(JsValue::String(s.into())),
                 None => Ok(JsValue::Undefined),
             }
         }),
@@ -879,7 +879,7 @@ fn apply_js_reviver(
         }
         other => other,
     };
-    reviver(vec![JsValue::String(key.to_string()), value])
+    reviver(vec![JsValue::String(key.to_string().into()), value])
 }
 
 // ── Date constructor ─────────────────────────────────────────────────────────
@@ -1424,42 +1424,42 @@ fn make_date_instance(t: f64) -> JsValue {
         let inner = Rc::clone(&inner);
         obj.insert(
             "toString".into(),
-            native(move |_| Ok(JsValue::String(date_to_string(*inner.borrow())))),
+            native(move |_| Ok(JsValue::String(date_to_string(*inner.borrow()).into()))),
         );
     }
     {
         let inner = Rc::clone(&inner);
         obj.insert(
             "toDateString".into(),
-            native(move |_| Ok(JsValue::String(date_to_date_string(*inner.borrow())))),
+            native(move |_| Ok(JsValue::String(date_to_date_string(*inner.borrow()).into()))),
         );
     }
     {
         let inner = Rc::clone(&inner);
         obj.insert(
             "toTimeString".into(),
-            native(move |_| Ok(JsValue::String(date_to_time_string(*inner.borrow())))),
+            native(move |_| Ok(JsValue::String(date_to_time_string(*inner.borrow()).into()))),
         );
     }
     {
         let inner = Rc::clone(&inner);
         obj.insert(
             "toISOString".into(),
-            native(move |_| Ok(JsValue::String(date_to_iso_string(*inner.borrow())?))),
+            native(move |_| Ok(JsValue::String(date_to_iso_string(*inner.borrow())?.into()))),
         );
     }
     {
         let inner = Rc::clone(&inner);
         obj.insert(
             "toUTCString".into(),
-            native(move |_| Ok(JsValue::String(date_to_utc_string(*inner.borrow())))),
+            native(move |_| Ok(JsValue::String(date_to_utc_string(*inner.borrow()).into()))),
         );
     }
     {
         let inner = Rc::clone(&inner);
         obj.insert(
             "toGMTString".into(),
-            native(move |_| Ok(JsValue::String(date_to_utc_string(*inner.borrow())))),
+            native(move |_| Ok(JsValue::String(date_to_utc_string(*inner.borrow()).into()))),
         );
     }
     {
@@ -1467,7 +1467,7 @@ fn make_date_instance(t: f64) -> JsValue {
         obj.insert(
             "toJSON".into(),
             native(move |_| match date_to_json(*inner.borrow()) {
-                Some(s) => Ok(JsValue::String(s)),
+                Some(s) => Ok(JsValue::String(s.into())),
                 None => Ok(JsValue::Null),
             }),
         );
@@ -1476,21 +1476,33 @@ fn make_date_instance(t: f64) -> JsValue {
         let inner = Rc::clone(&inner);
         obj.insert(
             "toLocaleDateString".into(),
-            native(move |_| Ok(JsValue::String(date_to_locale_date_string(*inner.borrow())))),
+            native(move |_| {
+                Ok(JsValue::String(
+                    date_to_locale_date_string(*inner.borrow()).into(),
+                ))
+            }),
         );
     }
     {
         let inner = Rc::clone(&inner);
         obj.insert(
             "toLocaleString".into(),
-            native(move |_| Ok(JsValue::String(date_to_locale_string(*inner.borrow())))),
+            native(move |_| {
+                Ok(JsValue::String(
+                    date_to_locale_string(*inner.borrow()).into(),
+                ))
+            }),
         );
     }
     {
         let inner = Rc::clone(&inner);
         obj.insert(
             "toLocaleTimeString".into(),
-            native(move |_| Ok(JsValue::String(date_to_locale_time_string(*inner.borrow())))),
+            native(move |_| {
+                Ok(JsValue::String(
+                    date_to_locale_time_string(*inner.borrow()).into(),
+                ))
+            }),
         );
     }
 
@@ -1629,7 +1641,7 @@ fn make_object() -> JsValue {
                 let keys: Vec<JsValue> = map
                     .borrow()
                     .keys()
-                    .map(|k| JsValue::String(k.clone()))
+                    .map(|k| JsValue::String(k.clone().into()))
                     .collect();
                 Ok(JsValue::new_array(keys))
             } else {
@@ -1657,7 +1669,9 @@ fn make_object() -> JsValue {
                 let entries: Vec<JsValue> = map
                     .borrow()
                     .iter()
-                    .map(|(k, v)| JsValue::new_array(vec![JsValue::String(k.clone()), v.clone()]))
+                    .map(|(k, v)| {
+                        JsValue::new_array(vec![JsValue::String(k.clone().into()), v.clone()])
+                    })
                     .collect();
                 Ok(JsValue::new_array(entries))
             } else {
@@ -1828,7 +1842,7 @@ fn make_object() -> JsValue {
                 let keys: Vec<JsValue> = map
                     .borrow()
                     .keys()
-                    .map(|k| JsValue::String(k.clone()))
+                    .map(|k| JsValue::String(k.clone().into()))
                     .collect();
                 Ok(JsValue::new_array(keys))
             } else {
@@ -2264,7 +2278,10 @@ fn make_array() -> JsValue {
             let iterable = args.first().unwrap_or(&JsValue::Undefined);
             let items: Vec<JsValue> = match iterable {
                 JsValue::Array(arr) => arr.borrow().clone(),
-                JsValue::String(s) => s.chars().map(|c| JsValue::String(c.to_string())).collect(),
+                JsValue::String(s) => s
+                    .chars()
+                    .map(|c| JsValue::String(c.to_string().into()))
+                    .collect(),
                 _ => Vec::new(),
             };
             Ok(JsValue::new_array(items))
@@ -2441,9 +2458,9 @@ fn make_array() -> JsValue {
                         other => other.to_js_string(),
                     })
                     .collect::<StatorResult<_>>()?;
-                Ok(JsValue::String(parts.join(&sep)))
+                Ok(JsValue::String(parts.join(&sep).into()))
             } else {
-                Ok(JsValue::String(String::new()))
+                Ok(JsValue::String(String::new().into()))
             }
         }),
     );
@@ -3221,7 +3238,7 @@ fn make_symbol() -> JsValue {
             let sym = args.first().unwrap_or(&JsValue::Undefined);
             if let JsValue::Symbol(id) = sym {
                 match symbol_key_for(*id) {
-                    Some(key) => Ok(JsValue::String(key)),
+                    Some(key) => Ok(JsValue::String(key.into())),
                     None => Ok(JsValue::Undefined),
                 }
             } else {
@@ -3267,7 +3284,7 @@ fn make_symbol() -> JsValue {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 if let JsValue::Symbol(id) = this {
                     match symbol_description(*id) {
-                        Some(desc) => Ok(JsValue::String(desc)),
+                        Some(desc) => Ok(JsValue::String(desc.into())),
                         None => Ok(JsValue::Undefined),
                     }
                 } else {
@@ -3285,8 +3302,8 @@ fn make_symbol() -> JsValue {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 if let JsValue::Symbol(id) = this {
                     match symbol_description(*id) {
-                        Some(desc) => Ok(JsValue::String(format!("Symbol({desc})"))),
-                        None => Ok(JsValue::String("Symbol()".to_string())),
+                        Some(desc) => Ok(JsValue::String(format!("Symbol({desc})").into())),
+                        None => Ok(JsValue::String("Symbol()".to_string().into())),
                     }
                 } else {
                     Err(crate::error::StatorError::TypeError(
@@ -4553,7 +4570,7 @@ fn make_function() -> JsValue {
         "toString".into(),
         native(|args| {
             let _func = args.first().cloned().unwrap_or(JsValue::Undefined);
-            Ok(JsValue::String(function_to_string("")))
+            Ok(JsValue::String(function_to_string("").into()))
         }),
     );
 
@@ -4571,7 +4588,7 @@ fn make_function() -> JsValue {
     );
 
     // Function.prototype.name (empty string for the prototype itself)
-    proto.insert("name".into(), JsValue::String(String::new()));
+    proto.insert("name".into(), JsValue::String(String::new().into()));
 
     // Function.prototype.length (0 for the prototype itself)
     proto.insert("length".into(), JsValue::Smi(0));
@@ -4605,7 +4622,7 @@ fn make_string() -> JsValue {
         "__call__".into(),
         native(|args| {
             let val = args.first().unwrap_or(&JsValue::Undefined);
-            Ok(JsValue::String(val.to_js_string()?))
+            Ok(JsValue::String(val.to_js_string()?.into()))
         }),
     );
 
@@ -4619,7 +4636,7 @@ fn make_string() -> JsValue {
                 .iter()
                 .map(|a| a.to_number().unwrap_or(0.0) as u32)
                 .collect();
-            Ok(JsValue::String(string_from_char_code(&codes)))
+            Ok(JsValue::String(string_from_char_code(&codes).into()))
         }),
     );
 
@@ -4631,7 +4648,7 @@ fn make_string() -> JsValue {
                 .iter()
                 .map(|a| a.to_number().unwrap_or(0.0) as u32)
                 .collect();
-            Ok(JsValue::String(string_from_code_point(&codes)?))
+            Ok(JsValue::String(string_from_code_point(&codes)?.into()))
         }),
     );
 
@@ -4663,7 +4680,7 @@ fn make_string() -> JsValue {
                 .collect();
             let raw_refs: Vec<&str> = raw_strings.iter().map(String::as_str).collect();
             let sub_refs: Vec<&str> = subs.iter().map(String::as_str).collect();
-            Ok(JsValue::String(string_raw(&raw_refs, &sub_refs)))
+            Ok(JsValue::String(string_raw(&raw_refs, &sub_refs).into()))
         }),
     );
 
@@ -4680,7 +4697,7 @@ fn make_string() -> JsValue {
                 .unwrap_or(&JsValue::Undefined)
                 .to_number()
                 .unwrap_or(0.0) as i64;
-            Ok(JsValue::String(string_char_at(&s, pos)))
+            Ok(JsValue::String(string_char_at(&s, pos).into()))
         }),
     );
 
@@ -4724,7 +4741,7 @@ fn make_string() -> JsValue {
                 args.iter().skip(1).map(|a| a.to_js_string()).collect();
             let parts = parts?;
             let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
-            Ok(JsValue::String(string_concat(&s, &refs)))
+            Ok(JsValue::String(string_concat(&s, &refs).into()))
         }),
     );
 
@@ -4742,7 +4759,7 @@ fn make_string() -> JsValue {
                 Some(JsValue::Undefined) | None => None,
                 Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
             };
-            Ok(JsValue::String(string_slice(&s, start, end)))
+            Ok(JsValue::String(string_slice(&s, start, end).into()))
         }),
     );
 
@@ -4760,7 +4777,7 @@ fn make_string() -> JsValue {
                 Some(JsValue::Undefined) | None => None,
                 Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
             };
-            Ok(JsValue::String(string_substring(&s, start, end)))
+            Ok(JsValue::String(string_substring(&s, start, end).into()))
         }),
     );
 
@@ -4839,7 +4856,7 @@ fn make_string() -> JsValue {
         "toUpperCase".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_to_upper_case(&s)))
+            Ok(JsValue::String(string_to_upper_case(&s).into()))
         }),
     );
 
@@ -4848,7 +4865,7 @@ fn make_string() -> JsValue {
         "toLowerCase".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_to_lower_case(&s)))
+            Ok(JsValue::String(string_to_lower_case(&s).into()))
         }),
     );
 
@@ -4857,7 +4874,7 @@ fn make_string() -> JsValue {
         "trim".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_trim(&s)))
+            Ok(JsValue::String(string_trim(&s).into()))
         }),
     );
 
@@ -4866,7 +4883,7 @@ fn make_string() -> JsValue {
         "trimStart".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_trim_start(&s)))
+            Ok(JsValue::String(string_trim_start(&s).into()))
         }),
     );
 
@@ -4875,7 +4892,7 @@ fn make_string() -> JsValue {
         "trimEnd".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_trim_end(&s)))
+            Ok(JsValue::String(string_trim_end(&s).into()))
         }),
     );
 
@@ -4887,7 +4904,7 @@ fn make_string() -> JsValue {
             let sep_arg = args.get(1).unwrap_or(&JsValue::Undefined);
             // Delegate to RegExp[@@split] when separator is a regexp.
             if let Some(result) = try_regexp_symbol(sep_arg, "__symbol_split__", {
-                let mut a = vec![JsValue::String(s.clone())];
+                let mut a = vec![JsValue::String(s.clone().into())];
                 if let Some(lim) = args.get(2) {
                     a.push(lim.clone());
                 }
@@ -4904,7 +4921,10 @@ fn make_string() -> JsValue {
                 Some(v) => Some(v.to_number().unwrap_or(0.0) as u32),
             };
             let parts = string_split(&s, sep.as_deref(), limit);
-            let arr: Vec<JsValue> = parts.into_iter().map(JsValue::String).collect();
+            let arr: Vec<JsValue> = parts
+                .into_iter()
+                .map(|s| JsValue::String(s.into()))
+                .collect();
             Ok(JsValue::new_array(arr))
         }),
     );
@@ -4920,7 +4940,7 @@ fn make_string() -> JsValue {
                 search_arg,
                 "__symbol_replace__",
                 vec![
-                    JsValue::String(s.clone()),
+                    JsValue::String(s.clone().into()),
                     args.get(2).unwrap_or(&JsValue::Undefined).clone(),
                 ],
             ) {
@@ -4928,7 +4948,9 @@ fn make_string() -> JsValue {
             }
             let search = search_arg.to_js_string()?;
             let replacement = args.get(2).unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_replace(&s, &search, &replacement)))
+            Ok(JsValue::String(
+                string_replace(&s, &search, &replacement).into(),
+            ))
         }),
     );
 
@@ -4955,7 +4977,7 @@ fn make_string() -> JsValue {
                     {
                         drop(borrow);
                         return f(vec![
-                            JsValue::String(s),
+                            JsValue::String(s.into()),
                             args.get(2).unwrap_or(&JsValue::Undefined).clone(),
                         ]);
                     }
@@ -4963,11 +4985,9 @@ fn make_string() -> JsValue {
             }
             let search = search_arg.to_js_string()?;
             let replacement = args.get(2).unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_replace_all(
-                &s,
-                &search,
-                &replacement,
-            )))
+            Ok(JsValue::String(
+                string_replace_all(&s, &search, &replacement).into(),
+            ))
         }),
     );
 
@@ -4981,14 +5001,17 @@ fn make_string() -> JsValue {
             if let Some(result) = try_regexp_symbol(
                 pattern_arg,
                 "__symbol_match__",
-                vec![JsValue::String(s.clone())],
+                vec![JsValue::String(s.clone().into())],
             ) {
                 return result;
             }
             let pattern = pattern_arg.to_js_string()?;
             match string_match(&s, &pattern) {
                 Some(groups) => {
-                    let arr: Vec<JsValue> = groups.into_iter().map(JsValue::String).collect();
+                    let arr: Vec<JsValue> = groups
+                        .into_iter()
+                        .map(|s| JsValue::String(s.into()))
+                        .collect();
                     Ok(JsValue::new_array(arr))
                 }
                 None => Ok(JsValue::Null),
@@ -5006,14 +5029,17 @@ fn make_string() -> JsValue {
             if let Some(result) = try_regexp_symbol(
                 pattern_arg,
                 "__symbol_match_all__",
-                vec![JsValue::String(s.clone())],
+                vec![JsValue::String(s.clone().into())],
             ) {
                 return result;
             }
             let pattern = pattern_arg.to_js_string()?;
             match string_match_all(&s, &pattern) {
                 Some(matches) => {
-                    let arr: Vec<JsValue> = matches.into_iter().map(JsValue::String).collect();
+                    let arr: Vec<JsValue> = matches
+                        .into_iter()
+                        .map(|s| JsValue::String(s.into()))
+                        .collect();
                     Ok(JsValue::new_array(arr))
                 }
                 None => Ok(JsValue::new_array(Vec::new())),
@@ -5036,7 +5062,7 @@ fn make_string() -> JsValue {
                     "Invalid count value".to_string(),
                 ));
             }
-            Ok(JsValue::String(string_repeat(&s, n as i64)?))
+            Ok(JsValue::String(string_repeat(&s, n as i64)?.into()))
         }),
     );
 
@@ -5054,11 +5080,9 @@ fn make_string() -> JsValue {
                 Some(JsValue::Undefined) | None => None,
                 Some(v) => Some(v.to_js_string()?),
             };
-            Ok(JsValue::String(string_pad_start(
-                &s,
-                target_len,
-                pad.as_deref(),
-            )))
+            Ok(JsValue::String(
+                string_pad_start(&s, target_len, pad.as_deref()).into(),
+            ))
         }),
     );
 
@@ -5076,11 +5100,9 @@ fn make_string() -> JsValue {
                 Some(JsValue::Undefined) | None => None,
                 Some(v) => Some(v.to_js_string()?),
             };
-            Ok(JsValue::String(string_pad_end(
-                &s,
-                target_len,
-                pad.as_deref(),
-            )))
+            Ok(JsValue::String(
+                string_pad_end(&s, target_len, pad.as_deref()).into(),
+            ))
         }),
     );
 
@@ -5095,7 +5117,7 @@ fn make_string() -> JsValue {
                 .to_number()
                 .unwrap_or(0.0) as i64;
             match string_at(&s, idx) {
-                Some(ch) => Ok(JsValue::String(ch)),
+                Some(ch) => Ok(JsValue::String(ch.into())),
                 None => Ok(JsValue::Undefined),
             }
         }),
@@ -5110,7 +5132,9 @@ fn make_string() -> JsValue {
                 Some(JsValue::Undefined) | None => None,
                 Some(v) => Some(v.to_js_string()?),
             };
-            Ok(JsValue::String(string_normalize(&s, form.as_deref())?))
+            Ok(JsValue::String(
+                string_normalize(&s, form.as_deref())?.into(),
+            ))
         }),
     );
 
@@ -5124,7 +5148,7 @@ fn make_string() -> JsValue {
             if let Some(result) = try_regexp_symbol(
                 pattern_arg,
                 "__symbol_search__",
-                vec![JsValue::String(s.clone())],
+                vec![JsValue::String(s.clone().into())],
             ) {
                 return result;
             }
@@ -5147,7 +5171,7 @@ fn make_string() -> JsValue {
         "toWellFormed".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_to_well_formed(&s)))
+            Ok(JsValue::String(string_to_well_formed(&s).into()))
         }),
     );
 
@@ -5166,7 +5190,7 @@ fn make_string() -> JsValue {
         "toLocaleLowerCase".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_to_locale_lower_case(&s)))
+            Ok(JsValue::String(string_to_locale_lower_case(&s).into()))
         }),
     );
 
@@ -5175,7 +5199,7 @@ fn make_string() -> JsValue {
         "toLocaleUpperCase".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_to_locale_upper_case(&s)))
+            Ok(JsValue::String(string_to_locale_upper_case(&s).into()))
         }),
     );
 
@@ -5184,7 +5208,7 @@ fn make_string() -> JsValue {
         "toString".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(s))
+            Ok(JsValue::String(s.into()))
         }),
     );
 
@@ -5193,7 +5217,7 @@ fn make_string() -> JsValue {
         "valueOf".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(s))
+            Ok(JsValue::String(s.into()))
         }),
     );
 
@@ -5202,7 +5226,10 @@ fn make_string() -> JsValue {
         "@@iterator".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            let chars: Vec<JsValue> = string_iter(&s).into_iter().map(JsValue::String).collect();
+            let chars: Vec<JsValue> = string_iter(&s)
+                .into_iter()
+                .map(|s| JsValue::String(s.into()))
+                .collect();
             Ok(JsValue::new_array(chars))
         }),
     );
@@ -5223,7 +5250,7 @@ fn make_string() -> JsValue {
                 Some(JsValue::Undefined) | None => None,
                 Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
             };
-            Ok(JsValue::String(string_substr(&s, start, length)))
+            Ok(JsValue::String(string_substr(&s, start, length).into()))
         }),
     );
 
@@ -5233,7 +5260,7 @@ fn make_string() -> JsValue {
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             let name = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_anchor(&s, &name)))
+            Ok(JsValue::String(string_anchor(&s, &name).into()))
         }),
     );
 
@@ -5242,7 +5269,7 @@ fn make_string() -> JsValue {
         "big".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_big(&s)))
+            Ok(JsValue::String(string_big(&s).into()))
         }),
     );
 
@@ -5251,7 +5278,7 @@ fn make_string() -> JsValue {
         "blink".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_blink(&s)))
+            Ok(JsValue::String(string_blink(&s).into()))
         }),
     );
 
@@ -5260,7 +5287,7 @@ fn make_string() -> JsValue {
         "bold".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_bold(&s)))
+            Ok(JsValue::String(string_bold(&s).into()))
         }),
     );
 
@@ -5269,7 +5296,7 @@ fn make_string() -> JsValue {
         "fixed".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_fixed(&s)))
+            Ok(JsValue::String(string_fixed(&s).into()))
         }),
     );
 
@@ -5279,7 +5306,7 @@ fn make_string() -> JsValue {
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             let color = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_fontcolor(&s, &color)))
+            Ok(JsValue::String(string_fontcolor(&s, &color).into()))
         }),
     );
 
@@ -5289,7 +5316,7 @@ fn make_string() -> JsValue {
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             let size = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_fontsize(&s, &size)))
+            Ok(JsValue::String(string_fontsize(&s, &size).into()))
         }),
     );
 
@@ -5298,7 +5325,7 @@ fn make_string() -> JsValue {
         "italics".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_italics(&s)))
+            Ok(JsValue::String(string_italics(&s).into()))
         }),
     );
 
@@ -5308,7 +5335,7 @@ fn make_string() -> JsValue {
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             let url = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_link(&s, &url)))
+            Ok(JsValue::String(string_link(&s, &url).into()))
         }),
     );
 
@@ -5317,7 +5344,7 @@ fn make_string() -> JsValue {
         "small".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_small(&s)))
+            Ok(JsValue::String(string_small(&s).into()))
         }),
     );
 
@@ -5326,7 +5353,7 @@ fn make_string() -> JsValue {
         "strike".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_strike(&s)))
+            Ok(JsValue::String(string_strike(&s).into()))
         }),
     );
 
@@ -5335,7 +5362,7 @@ fn make_string() -> JsValue {
         "sub".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_sub(&s)))
+            Ok(JsValue::String(string_sub(&s).into()))
         }),
     );
 
@@ -5344,7 +5371,7 @@ fn make_string() -> JsValue {
         "sup".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(string_sup(&s)))
+            Ok(JsValue::String(string_sup(&s).into()))
         }),
     );
 
@@ -5605,7 +5632,7 @@ fn make_promise() -> JsValue {
                         let f = Rc::clone(f);
                         Box::new(move || match f(vec![]) {
                             Ok(_) => Ok(()),
-                            Err(e) => Err(JsValue::String(e.to_string())),
+                            Err(e) => Err(JsValue::String(e.to_string().into())),
                         }) as Box<dyn Fn() -> Result<(), JsValue>>
                     }
                     _ => Box::new(|| Ok(())) as Box<dyn Fn() -> Result<(), JsValue>>,
@@ -5629,13 +5656,13 @@ fn make_regexp() -> JsValue {
 
     // Annex B legacy static properties (stubs)
     for i in 1..=9 {
-        props.insert(format!("${i}"), JsValue::String(String::new()));
+        props.insert(format!("${i}"), JsValue::String(String::new().into()));
     }
-    props.insert("input".into(), JsValue::String(String::new()));
-    props.insert("lastMatch".into(), JsValue::String(String::new()));
-    props.insert("lastParen".into(), JsValue::String(String::new()));
-    props.insert("leftContext".into(), JsValue::String(String::new()));
-    props.insert("rightContext".into(), JsValue::String(String::new()));
+    props.insert("input".into(), JsValue::String(String::new().into()));
+    props.insert("lastMatch".into(), JsValue::String(String::new().into()));
+    props.insert("lastParen".into(), JsValue::String(String::new().into()));
+    props.insert("leftContext".into(), JsValue::String(String::new().into()));
+    props.insert("rightContext".into(), JsValue::String(String::new().into()));
 
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
@@ -5780,7 +5807,7 @@ fn extract_handler(val: &JsValue) -> Option<crate::builtins::promise::PromiseHan
         let f = Rc::clone(f);
         Some(Box::new(move |v: JsValue| match f(vec![v.clone()]) {
             Ok(result) => Ok(result),
-            Err(e) => Err(JsValue::String(e.to_string())),
+            Err(e) => Err(JsValue::String(e.to_string().into())),
         }))
     } else {
         None
@@ -5901,7 +5928,7 @@ fn make_intl() -> JsValue {
                         .get("type")
                         .and_then(|v| {
                             if let JsValue::String(s) = v {
-                                Some(s.clone())
+                                Some(s.to_string())
                             } else {
                                 None
                             }
@@ -5948,7 +5975,7 @@ fn make_intl() -> JsValue {
                         let s = a.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                         let segs: Vec<JsValue> = segmenter_segment(&s)
                             .into_iter()
-                            .map(JsValue::String)
+                            .map(|s| JsValue::String(s.into()))
                             .collect();
                         Ok(JsValue::new_array(segs))
                     }),
@@ -5970,7 +5997,7 @@ fn make_intl() -> JsValue {
                     "of".into(),
                     native(|a| {
                         let code = a.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                        Ok(JsValue::String(display_names_of(&code)))
+                        Ok(JsValue::String(display_names_of(&code).into()))
                     }),
                 );
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
@@ -5987,11 +6014,17 @@ fn make_intl() -> JsValue {
             native(|args| {
                 let tag = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                 let mut obj = PropertyMap::new();
-                obj.insert("language".into(), JsValue::String(locale_language(&tag)));
-                obj.insert("baseName".into(), JsValue::String(locale_base_name(&tag)));
+                obj.insert(
+                    "language".into(),
+                    JsValue::String(locale_language(&tag).into()),
+                );
+                obj.insert(
+                    "baseName".into(),
+                    JsValue::String(locale_base_name(&tag).into()),
+                );
                 obj.insert(
                     "toString".into(),
-                    native(move |_| Ok(JsValue::String(tag.clone()))),
+                    native(move |_| Ok(JsValue::String(tag.clone().into()))),
                 );
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
@@ -6009,7 +6042,7 @@ fn make_intl() -> JsValue {
                     .iter()
                     .map(|v| match v {
                         JsValue::String(s) => Ok(JsValue::String(s.clone())),
-                        other => Ok(JsValue::String(other.to_js_string()?)),
+                        other => Ok(JsValue::String(other.to_js_string()?.into())),
                     })
                     .collect::<StatorResult<Vec<_>>>()?,
                 Some(JsValue::String(s)) => vec![JsValue::String(s.clone())],
@@ -6133,14 +6166,17 @@ fn build_proxy_handler(handler_val: &JsValue) -> ProxyHandler {
 
         if let Some(JsValue::NativeFunction(f)) = borrow.get("get").cloned() {
             handler.get = Some(Box::new(move |_target, key| {
-                f(vec![JsValue::Undefined, JsValue::String(key.to_string())])
+                f(vec![
+                    JsValue::Undefined,
+                    JsValue::String(key.to_string().into()),
+                ])
             }));
         }
         if let Some(JsValue::NativeFunction(f)) = borrow.get("set").cloned() {
             handler.set = Some(Box::new(move |_target, key, value| {
                 let result = f(vec![
                     JsValue::Undefined,
-                    JsValue::String(key.to_string()),
+                    JsValue::String(key.to_string().into()),
                     value,
                 ])?;
                 Ok(result.to_boolean())
@@ -6148,13 +6184,19 @@ fn build_proxy_handler(handler_val: &JsValue) -> ProxyHandler {
         }
         if let Some(JsValue::NativeFunction(f)) = borrow.get("has").cloned() {
             handler.has = Some(Box::new(move |_target, key| {
-                let result = f(vec![JsValue::Undefined, JsValue::String(key.to_string())])?;
+                let result = f(vec![
+                    JsValue::Undefined,
+                    JsValue::String(key.to_string().into()),
+                ])?;
                 Ok(result.to_boolean())
             }));
         }
         if let Some(JsValue::NativeFunction(f)) = borrow.get("deleteProperty").cloned() {
             handler.delete_property = Some(Box::new(move |_target, key| {
-                let result = f(vec![JsValue::Undefined, JsValue::String(key.to_string())])?;
+                let result = f(vec![
+                    JsValue::Undefined,
+                    JsValue::String(key.to_string().into()),
+                ])?;
                 Ok(result.to_boolean())
             }));
         }
@@ -6311,7 +6353,7 @@ fn make_reflect() -> JsValue {
             let target = require_object_arg(&args, 0, "Reflect.ownKeys")?;
             let keys: Vec<JsValue> = reflect_own_keys(&target)
                 .into_iter()
-                .map(JsValue::String)
+                .map(|s| JsValue::String(s.into()))
                 .collect();
             Ok(JsValue::new_array(keys))
         }),
@@ -6984,7 +7026,9 @@ fn make_typed_array_instance(
                     Some(v) if !v.is_undefined() => v.to_js_string()?,
                     _ => ",".to_string(),
                 };
-                Ok(JsValue::String(typed_array_join(&inner.borrow(), &sep)?))
+                Ok(JsValue::String(
+                    typed_array_join(&inner.borrow(), &sep)?.into(),
+                ))
             }),
         );
     }
@@ -7877,28 +7921,28 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         "encodeURI".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(global_encode_uri(&s)))
+            Ok(JsValue::String(global_encode_uri(&s).into()))
         }),
     );
     globals.insert(
         "decodeURI".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(global_decode_uri(&s)?))
+            Ok(JsValue::String(global_decode_uri(&s)?.into()))
         }),
     );
     globals.insert(
         "encodeURIComponent".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(global_encode_uri_component(&s)))
+            Ok(JsValue::String(global_encode_uri_component(&s).into()))
         }),
     );
     globals.insert(
         "decodeURIComponent".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(global_decode_uri_component(&s)?))
+            Ok(JsValue::String(global_decode_uri_component(&s)?.into()))
         }),
     );
     globals.insert(
@@ -7919,14 +7963,14 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         "escape".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(global_escape(&s)))
+            Ok(JsValue::String(global_escape(&s).into()))
         }),
     );
     globals.insert(
         "unescape".into(),
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-            Ok(JsValue::String(global_unescape(&s)))
+            Ok(JsValue::String(global_unescape(&s).into()))
         }),
     );
 
@@ -11630,56 +11674,56 @@ mod tests {
     #[test]
     fn e2e_error_name_property() {
         let result = global_eval(r#"var e = new Error("msg"); e.name"#).unwrap();
-        assert_eq!(result, JsValue::String("Error".to_string()));
+        assert_eq!(result, JsValue::String("Error".to_string().into()));
     }
 
     /// `new TypeError("msg").name` → "TypeError"
     #[test]
     fn e2e_type_error_name() {
         let result = global_eval(r#"var e = new TypeError("msg"); e.name"#).unwrap();
-        assert_eq!(result, JsValue::String("TypeError".to_string()));
+        assert_eq!(result, JsValue::String("TypeError".to_string().into()));
     }
 
     /// `new RangeError("msg").name` → "RangeError"
     #[test]
     fn e2e_range_error_name() {
         let result = global_eval(r#"var e = new RangeError("msg"); e.name"#).unwrap();
-        assert_eq!(result, JsValue::String("RangeError".to_string()));
+        assert_eq!(result, JsValue::String("RangeError".to_string().into()));
     }
 
     /// `new ReferenceError("msg").name` → "ReferenceError"
     #[test]
     fn e2e_reference_error_name() {
         let result = global_eval(r#"var e = new ReferenceError("msg"); e.name"#).unwrap();
-        assert_eq!(result, JsValue::String("ReferenceError".to_string()));
+        assert_eq!(result, JsValue::String("ReferenceError".to_string().into()));
     }
 
     /// `new SyntaxError("msg").name` → "SyntaxError"
     #[test]
     fn e2e_syntax_error_name() {
         let result = global_eval(r#"var e = new SyntaxError("msg"); e.name"#).unwrap();
-        assert_eq!(result, JsValue::String("SyntaxError".to_string()));
+        assert_eq!(result, JsValue::String("SyntaxError".to_string().into()));
     }
 
     /// `new URIError("msg").name` → "URIError"
     #[test]
     fn e2e_uri_error_name() {
         let result = global_eval(r#"var e = new URIError("msg"); e.name"#).unwrap();
-        assert_eq!(result, JsValue::String("URIError".to_string()));
+        assert_eq!(result, JsValue::String("URIError".to_string().into()));
     }
 
     /// `new EvalError("msg").name` → "EvalError"
     #[test]
     fn e2e_eval_error_name() {
         let result = global_eval(r#"var e = new EvalError("msg"); e.name"#).unwrap();
-        assert_eq!(result, JsValue::String("EvalError".to_string()));
+        assert_eq!(result, JsValue::String("EvalError".to_string().into()));
     }
 
     /// `new Error("msg").message` → "msg"
     #[test]
     fn e2e_error_message_property() {
         let result = global_eval(r#"var e = new Error("hello"); e.message"#).unwrap();
-        assert_eq!(result, JsValue::String("hello".to_string()));
+        assert_eq!(result, JsValue::String("hello".to_string().into()));
     }
 
     /// `new Error("msg").stack` starts with "Error: msg"
@@ -11707,28 +11751,28 @@ mod tests {
     #[test]
     fn e2e_aggregate_error_name() {
         let result = global_eval(r#"var e = new AggregateError([], "msg"); e.name"#).unwrap();
-        assert_eq!(result, JsValue::String("AggregateError".to_string()));
+        assert_eq!(result, JsValue::String("AggregateError".to_string().into()));
     }
 
     /// AggregateError constructor: `.message` → "msg"
     #[test]
     fn e2e_aggregate_error_message() {
         let result = global_eval(r#"var e = new AggregateError([], "msg"); e.message"#).unwrap();
-        assert_eq!(result, JsValue::String("msg".to_string()));
+        assert_eq!(result, JsValue::String("msg".to_string().into()));
     }
 
     /// `new Error("msg").toString()` → "Error: msg"
     #[test]
     fn e2e_error_to_string() {
         let result = global_eval(r#"var e = new Error("msg"); e.toString()"#).unwrap();
-        assert_eq!(result, JsValue::String("Error: msg".to_string()));
+        assert_eq!(result, JsValue::String("Error: msg".to_string().into()));
     }
 
     /// `new TypeError("").toString()` → "TypeError"
     #[test]
     fn e2e_type_error_to_string_empty_message() {
         let result = global_eval(r#"var e = new TypeError(); e.toString()"#).unwrap();
-        assert_eq!(result, JsValue::String("TypeError".to_string()));
+        assert_eq!(result, JsValue::String("TypeError".to_string().into()));
     }
 
     /// `new.target` is the constructor when called via `new`.

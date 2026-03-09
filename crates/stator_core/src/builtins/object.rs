@@ -832,12 +832,12 @@ mod tests {
     #[test]
     fn test_object_is_same_string() {
         assert!(object_is(
-            &JsValue::String("hello".to_string()),
-            &JsValue::String("hello".to_string())
+            &JsValue::String("hello".to_string().into()),
+            &JsValue::String("hello".to_string().into())
         ));
         assert!(!object_is(
-            &JsValue::String("a".to_string()),
-            &JsValue::String("b".to_string())
+            &JsValue::String("a".to_string().into()),
+            &JsValue::String("b".to_string().into())
         ));
     }
 

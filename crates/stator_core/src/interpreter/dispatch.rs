@@ -2480,7 +2480,7 @@ fn handle_type_of(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResu
         }
         JsValue::ArrayBuffer(_) | JsValue::TypedArray(_) | JsValue::DataView(_) => "object",
     };
-    ctx.frame.accumulator = JsValue::String(type_str.to_owned());
+    ctx.frame.accumulator = JsValue::String(type_str.to_owned().into());
     Ok(DispatchAction::Continue)
 }
 
@@ -2539,7 +2539,7 @@ fn handle_to_string(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     let s = ctx.frame.accumulator.to_js_string()?;
-    ctx.frame.accumulator = JsValue::String(s);
+    ctx.frame.accumulator = JsValue::String(s.into());
     Ok(DispatchAction::Continue)
 }
 
@@ -2610,7 +2610,9 @@ fn handle_to_object(
             );
             map.insert(
                 "toString".into(),
-                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::String(n_val.to_string())))),
+                JsValue::NativeFunction(Rc::new(move |_| {
+                    Ok(JsValue::String(n_val.to_string().into()))
+                })),
             );
             JsValue::PlainObject(Rc::new(RefCell::new(map)))
         }
@@ -2625,7 +2627,9 @@ fn handle_to_object(
             );
             map.insert(
                 "toString".into(),
-                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::String(n_val.to_string())))),
+                JsValue::NativeFunction(Rc::new(move |_| {
+                    Ok(JsValue::String(n_val.to_string().into()))
+                })),
             );
             JsValue::PlainObject(Rc::new(RefCell::new(map)))
         }
@@ -2637,7 +2641,7 @@ fn handle_to_object(
             map.insert("length".into(), JsValue::Smi(s_val.len() as i32));
             // Indexed character access ("0", "1", …).
             for (i, ch) in s_val.chars().enumerate() {
-                map.insert(i.to_string(), JsValue::String(ch.to_string()));
+                map.insert(i.to_string(), JsValue::String(ch.to_string().into()));
             }
             let s_vo = s_val.clone();
             map.insert(
@@ -2663,7 +2667,7 @@ fn handle_to_object(
             map.insert(
                 "toString".into(),
                 JsValue::NativeFunction(Rc::new(move |_| {
-                    Ok(JsValue::String(format!("Symbol({})", sym_val)))
+                    Ok(JsValue::String(format!("Symbol({})", sym_val).into()))
                 })),
             );
             JsValue::PlainObject(Rc::new(RefCell::new(map)))
@@ -2679,7 +2683,9 @@ fn handle_to_object(
             );
             map.insert(
                 "toString".into(),
-                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::String(n_val.to_string())))),
+                JsValue::NativeFunction(Rc::new(move |_| {
+                    Ok(JsValue::String(n_val.to_string().into()))
+                })),
             );
             JsValue::PlainObject(Rc::new(RefCell::new(map)))
         }
@@ -2696,7 +2702,7 @@ fn handle_to_name(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     };
     let key = match &ctx.frame.accumulator {
         JsValue::String(_) | JsValue::Symbol(_) => ctx.frame.accumulator.clone(),
-        other => JsValue::String(other.to_js_string()?),
+        other => JsValue::String(other.to_js_string()?.into()),
     };
     ctx.frame.write_reg(dst, key)?;
     Ok(DispatchAction::Continue)
@@ -2831,12 +2837,18 @@ fn handle_create_reg_exp_literal(
         flags_str.push('y');
     }
     let mut map = PropertyMap::new();
-    map.insert("source".to_string(), JsValue::String(pattern.clone()));
-    map.insert("flags".to_string(), JsValue::String(flags_str.clone()));
+    map.insert(
+        "source".to_string(),
+        JsValue::String(pattern.clone().into()),
+    );
+    map.insert(
+        "flags".to_string(),
+        JsValue::String(flags_str.clone().into()),
+    );
     // toString() representation: /pattern/flags
     map.insert(
         "toString".to_string(),
-        JsValue::String(format!("/{pattern}/{flags_str}")),
+        JsValue::String(format!("/{pattern}/{flags_str}").into()),
     );
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
@@ -3075,7 +3087,7 @@ fn handle_test_in(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
         JsValue::Array(items) => {
             // "length" is always present on arrays.
             if let JsValue::String(s) = key
-                && s == "length"
+                && &**s == "length"
             {
                 true
             } else if let Some(idx) = to_array_index(key) {
@@ -3110,7 +3122,7 @@ fn handle_for_in_enumerate(
                 let borrow = m.borrow();
                 for k in borrow.enumerable_keys() {
                     if seen.insert(k.clone()) {
-                        all_keys.push(JsValue::String(k.clone()));
+                        all_keys.push(JsValue::String(k.clone().into()));
                     }
                 }
                 current_map = borrow.get("__proto__").and_then(|v| {
@@ -3124,7 +3136,7 @@ fn handle_for_in_enumerate(
             all_keys
         }
         JsValue::Array(items) => (0..items.borrow().len())
-            .map(|i| JsValue::String(i.to_string()))
+            .map(|i| JsValue::String(i.to_string().into()))
             .collect(),
         JsValue::Null | JsValue::Undefined => vec![],
         _ => vec![],

@@ -305,7 +305,7 @@ mod tests {
             JsValue::Null,
             JsValue::Boolean(true),
             JsValue::HeapNumber(3.14),
-            JsValue::String("hello".to_string()),
+            JsValue::String("hello".to_string().into()),
         ] {
             // SAFETY: old_obj is a valid live heap object.
             unsafe {

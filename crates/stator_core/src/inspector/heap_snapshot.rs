@@ -331,7 +331,7 @@ impl HeapSnapshotBuilder {
             JsValue::Boolean(b) => b.to_string(),
             JsValue::Smi(n) => n.to_string(),
             JsValue::HeapNumber(f) => f.to_string(),
-            JsValue::String(s) => s.clone(),
+            JsValue::String(s) => s.to_string(),
             JsValue::Symbol(id) => format!("Symbol({id})"),
             JsValue::BigInt(n) => format!("{n}n"),
             JsValue::Function(_) => "(closure)".to_string(),
@@ -536,7 +536,7 @@ mod tests {
     fn test_snapshot_primitive_globals_adds_nodes() {
         let mut globals = HashMap::new();
         globals.insert("x".to_string(), JsValue::Smi(42));
-        globals.insert("s".to_string(), JsValue::String("hello".to_string()));
+        globals.insert("s".to_string(), JsValue::String("hello".to_string().into()));
         let snap = HeapSnapshotBuilder::build(&globals);
         // Root + 2 primitive nodes.
         assert_eq!(snap.snapshot.node_count, 3);
