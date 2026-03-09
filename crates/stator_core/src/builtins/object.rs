@@ -1226,4 +1226,46 @@ mod tests {
         let deleted = obj.delete_own_property("sticky").unwrap();
         assert!(!deleted);
     }
+
+    // ── Non-writable + non-configurable value change rejection ──────────
+
+    #[test]
+    fn test_define_own_property_rejects_value_change_on_non_writable_non_configurable() {
+        let mut obj = JsObject::new();
+        // Create a non-writable, non-configurable property.
+        obj.define_own_property("x", JsValue::Smi(1), PropertyAttributes::empty())
+            .unwrap();
+        // Attempting to change the value should fail.
+        let err = obj.define_own_property("x", JsValue::Smi(2), PropertyAttributes::empty());
+        assert!(matches!(err, Err(StatorError::TypeError(_))));
+        // Value should remain unchanged.
+        assert_eq!(obj.get_own_property("x"), Some(JsValue::Smi(1)));
+    }
+
+    #[test]
+    fn test_define_own_property_allows_same_value_on_non_writable_non_configurable() {
+        let mut obj = JsObject::new();
+        obj.define_own_property("x", JsValue::Smi(1), PropertyAttributes::empty())
+            .unwrap();
+        // Setting the same value is allowed per spec.
+        obj.define_own_property("x", JsValue::Smi(1), PropertyAttributes::empty())
+            .unwrap();
+        assert_eq!(obj.get_own_property("x"), Some(JsValue::Smi(1)));
+    }
+
+    #[test]
+    fn test_define_property_from_descriptor_rejects_value_change_non_writable() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+        // Define non-writable, non-configurable property.
+        obj.define_own_property("p", JsValue::Smi(10), PropertyAttributes::empty())
+            .unwrap();
+        // Try to change value via descriptor.
+        let mut desc_map = PropertyMap::new();
+        desc_map.insert("value".to_string(), JsValue::Smi(20));
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+
+        let err = object_define_property_from_descriptor(&mut obj, "p", &desc);
+        assert!(matches!(err, Err(StatorError::TypeError(_))));
+    }
 }

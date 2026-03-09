@@ -508,6 +508,17 @@ impl JsObject {
                          [[Writable]] cannot change from false to true"
                     )));
                 }
+                // §10.1.6.3 step 9.a.i: non-writable → value must not change.
+                if !existing_attrs.contains(PropertyAttributes::WRITABLE)
+                    && let Some(current_value) = self.get_own_property(key)
+                    && !value.same_value(&current_value)
+                {
+                    return Err(StatorError::TypeError(format!(
+                        "Cannot redefine property '{key}': \
+                         value of a non-writable, non-configurable property \
+                         cannot be changed"
+                    )));
+                }
             }
             // Validation passed: update in slow mode (normalise if currently fast).
             if self.is_fast_mode() {
