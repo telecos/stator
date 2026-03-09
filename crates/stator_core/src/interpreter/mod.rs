@@ -1217,8 +1217,8 @@ impl Interpreter {
     /// Execute a `.return(value)` call on a generator.
     ///
     /// If the generator is suspended, marks it as completed and returns
-    /// `{ value, done: true }`.  If already completed, returns
-    /// `{ value: undefined, done: true }`.
+    /// `{ value, done: true }`.  If already completed, also returns
+    /// `{ value, done: true }` per §27.5.3.4 step 2a.
     pub fn generator_return(
         state: &Rc<RefCell<GeneratorState>>,
         value: JsValue,
@@ -1229,7 +1229,7 @@ impl Interpreter {
                 state.borrow_mut().status = GeneratorStatus::Completed;
                 Ok(make_iterator_result(value, true))
             }
-            GeneratorStatus::Completed => Ok(make_iterator_result(JsValue::Undefined, true)),
+            GeneratorStatus::Completed => Ok(make_iterator_result(value, true)),
             GeneratorStatus::Executing => Err(StatorError::TypeError(
                 "Generator is already running".into(),
             )),
@@ -3199,7 +3199,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             _ => JsValue::Undefined,
         };
     }
-    // Handle JsValue::Generator — expose next/return/throw methods.
+    // Handle JsValue::Generator — expose next/return/throw/@@iterator methods.
     if let JsValue::Generator(gs) = obj {
         let gs = Rc::clone(gs);
         return match key {
@@ -3226,6 +3226,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let value = args.into_iter().next().unwrap_or(JsValue::Undefined);
                     Interpreter::generator_throw(&gs, value)
                 }))
+            }
+            // §27.5.1.2 — Generator.prototype[@@iterator]() returns `this`.
+            "@@iterator" => {
+                let generator = obj.clone();
+                JsValue::NativeFunction(Rc::new(move |_args| Ok(generator.clone())))
             }
             _ => JsValue::Undefined,
         };
@@ -3456,7 +3461,7 @@ pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) ->
 
 /// Invoke a callable JsValue (Function or NativeFunction) with the given
 /// arguments and return the result.
-fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult<JsValue> {
+pub(super) fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult<JsValue> {
     match callee {
         JsValue::Function(ba) => {
             let mut frame = InterpreterFrame::new((**ba).clone(), args);
@@ -3471,7 +3476,7 @@ fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult<JsV
 ///
 /// Sets `"this"` in the global environment so that `Expr::This` (which compiles
 /// to `LdaGlobal("this")`) resolves to the given receiver.
-fn dispatch_call_with_this(
+pub(super) fn dispatch_call_with_this(
     callee: &JsValue,
     this_val: JsValue,
     args: Vec<JsValue>,
@@ -10752,7 +10757,8 @@ mod tests {
 
     #[test]
     fn test_generator_return_on_completed() {
-        // .return() on a completed generator returns { value: undefined, done: true }.
+        // .return(val) on a completed generator returns { value: val, done: true }
+        // per §27.5.3.4 GeneratorResumeAbrupt step 2a.
         let ba = gen_bytecode_yield_1_yield_2();
         let gs = GeneratorState::new(ba);
 
@@ -10765,10 +10771,80 @@ mod tests {
         let result = Interpreter::generator_return(&gs, JsValue::Smi(5)).unwrap();
         if let JsValue::PlainObject(map) = &result {
             let borrow = map.borrow();
+            assert_eq!(borrow.get("value"), Some(&JsValue::Smi(5)));
+            assert_eq!(borrow.get("done"), Some(&JsValue::Boolean(true)));
+        } else {
+            panic!("expected PlainObject, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_generator_return_on_completed_no_arg() {
+        // .return() with no argument on a completed generator returns
+        // { value: undefined, done: true }.
+        let ba = gen_bytecode_yield_1_yield_2();
+        let gs = GeneratorState::new(ba);
+        // Drive to completion.
+        Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
+        Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
+        Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
+        assert_eq!(gs.borrow().status, GeneratorStatus::Completed);
+
+        let result = Interpreter::generator_return(&gs, JsValue::Undefined).unwrap();
+        if let JsValue::PlainObject(map) = &result {
+            let borrow = map.borrow();
             assert_eq!(borrow.get("value"), Some(&JsValue::Undefined));
             assert_eq!(borrow.get("done"), Some(&JsValue::Boolean(true)));
         } else {
             panic!("expected PlainObject, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_generator_not_resumable_after_return() {
+        // After .return(), .next() should return { value: undefined, done: true }.
+        let ba = gen_bytecode_yield_1_yield_2();
+        let gs = GeneratorState::new(ba);
+        // Advance once.
+        Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
+        // .return(42)
+        Interpreter::generator_return(&gs, JsValue::Smi(42)).unwrap();
+        assert_eq!(gs.borrow().status, GeneratorStatus::Completed);
+        // .next() should return done.
+        let step = Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
+        assert_eq!(step, GeneratorStep::Return(JsValue::Undefined));
+    }
+
+    #[test]
+    fn test_generator_not_resumable_after_throw() {
+        // After .throw(), .next() should return { value: undefined, done: true }.
+        let ba = gen_bytecode_yield_1_yield_2();
+        let gs = GeneratorState::new(ba);
+        // Advance once.
+        Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
+        // .throw(err)
+        let _ = Interpreter::generator_throw(&gs, JsValue::String("err".into()));
+        assert_eq!(gs.borrow().status, GeneratorStatus::Completed);
+        // .next() should return done.
+        let step = Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
+        assert_eq!(step, GeneratorStep::Return(JsValue::Undefined));
+    }
+
+    #[test]
+    fn test_generator_symbol_iterator_returns_self() {
+        // gen[@@iterator]() must return the generator itself (§27.5.1.2).
+        let ba = gen_bytecode_yield_1_yield_2();
+        let gs = GeneratorState::new(ba);
+        let generator = JsValue::Generator(gs);
+        let iter_fn = proto_lookup(&generator, "@@iterator");
+        if let JsValue::NativeFunction(f) = iter_fn {
+            let result = f(vec![]).unwrap();
+            assert_eq!(
+                result, generator,
+                "@@iterator() should return the generator itself"
+            );
+        } else {
+            panic!("expected NativeFunction for @@iterator, got {iter_fn:?}");
         }
     }
 
