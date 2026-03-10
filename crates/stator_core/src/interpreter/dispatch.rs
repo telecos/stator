@@ -1230,10 +1230,7 @@ fn handle_call_any_receiver(
                 }
                 Some(JsValue::Function(ba)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                    call_plain_object_function(ctx, &ba)?;
-                    // `args` are forwarded via shared global_env ("this"
-                    // is already set by the outer Construct handler).
-                    let _ = args;
+                    call_plain_object_function(ctx, &ba, args)?;
                 }
                 _ => {
                     return Err(StatorError::TypeError(
@@ -1698,12 +1695,19 @@ fn handle_call_property(
             ctx.frame.accumulator = f(args)?;
         }
         JsValue::PlainObject(ref map) => {
-            if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                ctx.frame.accumulator = f(args)?;
-            } else {
-                return Err(StatorError::TypeError(
-                    "CallProperty: callee is not a function (got PlainObject)".to_string(),
-                ));
+            let call_val = map.borrow().get("__call__").cloned();
+            match call_val {
+                Some(JsValue::NativeFunction(f)) => {
+                    ctx.frame.accumulator = f(args)?;
+                }
+                Some(JsValue::Function(ba)) => {
+                    call_plain_object_function(ctx, &ba, args)?;
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "CallProperty: callee is not a function (got PlainObject)".to_string(),
+                    ));
+                }
             }
         }
         other => {
@@ -1802,12 +1806,10 @@ fn handle_call_with_spread(
 fn call_plain_object_function(
     ctx: &mut DispatchContext,
     ba: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
+    args: Vec<JsValue>,
 ) -> StatorResult<()> {
-    let mut callee_frame = InterpreterFrame::new_with_globals(
-        (**ba).clone(),
-        vec![],
-        Rc::clone(&ctx.frame.global_env),
-    );
+    let mut callee_frame =
+        InterpreterFrame::new_with_globals((**ba).clone(), args, Rc::clone(&ctx.frame.global_env));
     restore_closure_context(&mut callee_frame, ba);
     push_call_frame("<anonymous>")?;
     let result = Interpreter::run(&mut callee_frame);
@@ -2659,24 +2661,45 @@ fn handle_get_iterator(
         JsValue::String(ref s) => JsValue::Iterator(NativeIterator::from_string(s)),
         // Generators and existing iterators pass through unchanged.
         JsValue::Generator(_) | JsValue::Iterator(_) => iterable,
-        // PlainObject with @@iterator → call it to get the iterator.
-        JsValue::PlainObject(ref map) if map.borrow().contains_key("@@iterator") => {
-            let iter_fn = map.borrow().get("@@iterator").cloned();
+        // PlainObject with @@iterator or Symbol.iterator → call it.
+        JsValue::PlainObject(ref map) => {
+            let borrow = map.borrow();
+            // Check for both internal @@iterator and user-visible Symbol(SYMBOL_ITERATOR)
+            let iter_fn = borrow.get("@@iterator").cloned().or_else(|| {
+                let sym_key = format!("Symbol({})", crate::builtins::symbol::SYMBOL_ITERATOR);
+                borrow.get(&sym_key).cloned()
+            });
+            drop(borrow);
             match iter_fn {
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
                     dispatch_call_with_this(f, iterable.clone(), vec![])?
                 }
-                _ => {
+                Some(JsValue::PlainObject(ref call_obj))
+                    if call_obj.borrow().contains_key("__call__") =>
+                {
+                    dispatch_call_with_this(
+                        &JsValue::PlainObject(call_obj.clone()),
+                        iterable.clone(),
+                        vec![],
+                    )?
+                }
+                Some(_) => {
                     return Err(StatorError::TypeError(
                         "GetIterator: @@iterator is not a function".into(),
                     ));
                 }
+                None => {
+                    // Fallback: PlainObject with "length" → array-like
+                    if map.borrow().contains_key("length") {
+                        let items = plain_object_to_array_items(map);
+                        JsValue::Iterator(NativeIterator::from_items(items))
+                    } else {
+                        return Err(StatorError::TypeError(format!(
+                            "GetIterator: value is not iterable (got {iterable:?})"
+                        )));
+                    }
+                }
             }
-        }
-        // PlainObject with a "length" property → array-like.
-        JsValue::PlainObject(ref map) if map.borrow().contains_key("length") => {
-            let items = plain_object_to_array_items(map);
-            JsValue::Iterator(NativeIterator::from_items(items))
         }
         other => {
             return Err(StatorError::TypeError(format!(
