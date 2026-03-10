@@ -18,7 +18,7 @@
 //! ```
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -80,12 +80,10 @@ impl TestMeta {
         self.flags.iter().any(|f| f == flag)
     }
 
-    #[allow(dead_code)]
     fn is_async(&self) -> bool {
         self.has_flag("async")
     }
 
-    #[allow(dead_code)]
     fn is_module(&self) -> bool {
         self.has_flag("module")
     }
@@ -444,6 +442,9 @@ fn make_test_globals() -> HashMap<String, JsValue> {
     t262_ctor
         .borrow_mut()
         .insert("prototype".to_string(), t262_proto_val.clone());
+    t262_ctor
+        .borrow_mut()
+        .insert("name".to_string(), JsValue::String("Test262Error".into()));
     t262_ctor.borrow_mut().insert(
         "thrower".to_string(),
         JsValue::NativeFunction(Rc::new(|args| {
@@ -474,7 +475,7 @@ fn make_test_globals() -> HashMap<String, JsValue> {
         "__call__".to_string(),
         JsValue::NativeFunction(Rc::new(|args| {
             let val = args.first().cloned().unwrap_or(JsValue::Undefined);
-            if matches!(val, JsValue::Boolean(true)) {
+            if val.to_boolean() {
                 return Ok(JsValue::Undefined);
             }
             let msg = match args.get(1) {
@@ -633,42 +634,46 @@ fn make_test_globals() -> HashMap<String, JsValue> {
 }
 
 /// SameValue comparison (ES2015 §7.2.10).
+///
+/// Unlike strict equality (`===`), SameValue treats `NaN` as equal to `NaN`
+/// and distinguishes `+0` from `-0`.  Cross-type comparisons always return
+/// `false` (e.g. `SameValue(true, 1)` is `false`).
 fn js_same_value(a: &JsValue, b: &JsValue) -> bool {
     match (a, b) {
         (JsValue::Undefined, JsValue::Undefined) | (JsValue::Null, JsValue::Null) => true,
         (JsValue::Boolean(x), JsValue::Boolean(y)) => x == y,
         (JsValue::String(x), JsValue::String(y)) => x == y,
-        (JsValue::Smi(x), JsValue::Smi(y)) => x == y,
-        // Handle +0 / -0 and NaN.
-        _ => {
-            let af = js_to_f64(a);
-            let bf = js_to_f64(b);
-            if let (Some(af), Some(bf)) = (af, bf) {
-                if af.is_nan() && bf.is_nan() {
-                    return true;
-                }
-                if af == 0.0 && bf == 0.0 {
-                    return af.is_sign_positive() == bf.is_sign_positive();
-                }
-                af == bf
-            } else {
-                // Reference identity for objects.
-                std::ptr::eq(a as *const _, b as *const _)
-            }
-        }
-    }
-}
+        (JsValue::Symbol(x), JsValue::Symbol(y)) => x == y,
+        (JsValue::BigInt(x), JsValue::BigInt(y)) => x == y,
 
-/// Attempt to coerce a JsValue to f64 for numeric comparison.
-fn js_to_f64(v: &JsValue) -> Option<f64> {
-    match v {
-        JsValue::Smi(n) => Some(*n as f64),
-        JsValue::HeapNumber(n) => Some(*n),
-        JsValue::Boolean(true) => Some(1.0),
-        JsValue::Boolean(false) => Some(0.0),
-        JsValue::Null => Some(0.0),
-        JsValue::Undefined => Some(f64::NAN),
-        _ => None,
+        // Number type: Smi and HeapNumber are both JS "Number".
+        (JsValue::Smi(x), JsValue::Smi(y)) => x == y,
+        (JsValue::HeapNumber(x), JsValue::HeapNumber(y)) => {
+            if x.is_nan() && y.is_nan() {
+                return true;
+            }
+            if *x == 0.0 && *y == 0.0 {
+                return x.is_sign_positive() == y.is_sign_positive();
+            }
+            x == y
+        }
+        (JsValue::Smi(s), JsValue::HeapNumber(h)) | (JsValue::HeapNumber(h), JsValue::Smi(s)) => {
+            let sf = *s as f64;
+            // Smi is always a signed integer, so Smi(0) is positive zero.
+            if sf == 0.0 && *h == 0.0 {
+                return sf.is_sign_positive() == h.is_sign_positive();
+            }
+            sf == *h
+        }
+
+        // Object identity — same reference means SameValue.
+        (JsValue::PlainObject(x), JsValue::PlainObject(y)) => Rc::ptr_eq(x, y),
+        (JsValue::Array(x), JsValue::Array(y)) => Rc::ptr_eq(x, y),
+        (JsValue::Function(x), JsValue::Function(y)) => Rc::ptr_eq(x, y),
+        (JsValue::Error(x), JsValue::Error(y)) => Rc::ptr_eq(x, y),
+
+        // Different types → never SameValue.
+        _ => false,
     }
 }
 
@@ -795,10 +800,46 @@ fn run_test(
     meta: &TestMeta,
     template_globals: &HashMap<String, JsValue>,
 ) -> TestOutcome {
+    // ── Flag handling: strict mode ────────────────────────────────────────
+    // `onlyStrict` and `module` tests run in strict mode.
+    let effective_prefix = if meta.has_flag("onlyStrict") || meta.is_module() {
+        format!("\"use strict\";\n{harness_prefix}")
+    } else {
+        harness_prefix.to_string()
+    };
+
+    // ── Flag handling: async $DONE callback ───────────────────────────────
+    let is_async = meta.is_async();
+    let done_called = Rc::new(Cell::new(false));
+
+    let async_globals = if is_async {
+        let mut g = template_globals.clone();
+        let dc = done_called.clone();
+        g.insert(
+            "$DONE".to_string(),
+            JsValue::NativeFunction(Rc::new(move |args| {
+                dc.set(true);
+                let error = args.first().cloned().unwrap_or(JsValue::Undefined);
+                if error.to_boolean() {
+                    Err(StatorError::JsException(format!(
+                        "Test262Error: $DONE called with error: {error:?}"
+                    )))
+                } else {
+                    Ok(JsValue::Undefined)
+                }
+            })),
+        );
+        Some(g)
+    } else {
+        None
+    };
+    let effective_globals = async_globals.as_ref().unwrap_or(template_globals);
+
+    // ── Execute ───────────────────────────────────────────────────────────
     // Wrap execution in catch_unwind to gracefully handle panics from
     // pathological test inputs.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        execute_source(source, harness_prefix, template_globals)
+        execute_source(source, &effective_prefix, effective_globals)
     }));
 
     // A panic inside the interpreter may leave frames on the thread-local
@@ -810,20 +851,36 @@ fn run_test(
         Err(_) => ExecResult::OtherError("panicked (likely stack overflow)".into()),
     };
 
+    // ── Async: verify $DONE was invoked ───────────────────────────────────
+    if is_async
+        && meta.negative.is_none()
+        && let ExecResult::Ok = &exec
+        && !done_called.get()
+    {
+        return TestOutcome::Fail("async test completed without calling $DONE".into());
+    }
+
+    // ── Evaluate outcome ──────────────────────────────────────────────────
     if let Some(neg) = &meta.negative {
         match neg.phase.as_str() {
-            "parse" | "early" => match exec {
-                ExecResult::SyntaxError(_) => TestOutcome::Pass,
-                ExecResult::Ok => TestOutcome::Fail(format!(
-                    "expected {} SyntaxError but test succeeded",
-                    neg.phase
-                )),
-                _ => TestOutcome::Fail(format!(
-                    "expected {} SyntaxError, got: {}",
-                    neg.phase,
-                    exec.error_message()
-                )),
-            },
+            "parse" | "early" => {
+                if exec.matches_type(&neg.type_) {
+                    TestOutcome::Pass
+                } else {
+                    match exec {
+                        ExecResult::Ok => TestOutcome::Fail(format!(
+                            "expected {} {} but test succeeded",
+                            neg.phase, neg.type_
+                        )),
+                        _ => TestOutcome::Fail(format!(
+                            "expected {} {}, got: {}",
+                            neg.phase,
+                            neg.type_,
+                            exec.error_message()
+                        )),
+                    }
+                }
+            }
             "runtime" => {
                 if exec.matches_type(&neg.type_) {
                     TestOutcome::Pass
@@ -835,6 +892,24 @@ fn run_test(
                         )),
                         _ => TestOutcome::Fail(format!(
                             "expected runtime {}, got: {}",
+                            neg.type_,
+                            exec.error_message()
+                        )),
+                    }
+                }
+            }
+            "resolution" => {
+                // Module resolution errors are treated like parse-phase errors.
+                if exec.matches_type(&neg.type_) {
+                    TestOutcome::Pass
+                } else {
+                    match exec {
+                        ExecResult::Ok => TestOutcome::Fail(format!(
+                            "expected resolution {} but test succeeded",
+                            neg.type_
+                        )),
+                        _ => TestOutcome::Fail(format!(
+                            "expected resolution {}, got: {}",
                             neg.type_,
                             exec.error_message()
                         )),
