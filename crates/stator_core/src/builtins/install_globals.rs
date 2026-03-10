@@ -2210,9 +2210,7 @@ fn make_object() -> JsValue {
                         JsValue::PlainObject(src_map) => {
                             let src = src_map.borrow();
                             for k in src.enumerable_keys() {
-                                if !k.starts_with("__")
-                                    && let Some(v) = src.get(k)
-                                {
+                                if let Some(v) = src.get(k) {
                                     target_map.borrow_mut().insert(k.clone(), v.clone());
                                 }
                             }

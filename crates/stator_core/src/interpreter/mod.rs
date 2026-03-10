@@ -3755,11 +3755,22 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }
                 "toSorted" => {
                     let a = Rc::clone(&arr_rc);
-                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let cmp_fn = args.first().cloned();
                         let mut sorted = a.borrow().clone();
-                        sorted.sort_by(|a, b| {
-                            let a_str = js_to_string(a);
-                            let b_str = js_to_string(b);
+                        sorted.sort_by(|x, y| {
+                            if let Some(ref cb) = cmp_fn
+                                && let Ok(r) = dispatch_call_value(cb, vec![x.clone(), y.clone()])
+                            {
+                                let n = match &r {
+                                    JsValue::Smi(i) => *i as f64,
+                                    JsValue::HeapNumber(f) => *f,
+                                    _ => 0.0,
+                                };
+                                return n.partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal);
+                            }
+                            let a_str = js_to_string(x);
+                            let b_str = js_to_string(y);
                             a_str.cmp(&b_str)
                         });
                         Ok(JsValue::new_array(sorted))
@@ -4318,7 +4329,15 @@ pub(super) fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> Stato
             result
         }
         JsValue::NativeFunction(f) => f(args),
-        _ => Ok(JsValue::Undefined),
+        JsValue::PlainObject(map) => {
+            let call_fn = map.borrow().get("__call__").cloned();
+            if let Some(f) = call_fn {
+                dispatch_call_value(&f, args)
+            } else {
+                Err(StatorError::TypeError("object is not a function".into()))
+            }
+        }
+        _ => Err(StatorError::TypeError("value is not a function".into())),
     }
 }
 
@@ -4344,7 +4363,15 @@ pub(super) fn dispatch_call_with_this(
             result
         }
         JsValue::NativeFunction(f) => f(args),
-        _ => Ok(JsValue::Undefined),
+        JsValue::PlainObject(map) => {
+            let call_fn = map.borrow().get("__call__").cloned();
+            if let Some(f) = call_fn {
+                dispatch_call_with_this(&f, this_val, args)
+            } else {
+                Err(StatorError::TypeError("object is not a function".into()))
+            }
+        }
+        _ => Err(StatorError::TypeError("value is not a function".into())),
     }
 }
 
