@@ -1854,32 +1854,150 @@ fn make_object() -> JsValue {
                     // Check for accessor descriptor (get/set)
                     let has_get = desc.contains_key("get");
                     let has_set = desc.contains_key("set");
+
+                    // Validate non-configurable invariants.
+                    {
+                        let borrow = map.borrow();
+                        if borrow.contains_key(&key) {
+                            let currently_configurable = borrow.is_configurable(&key);
+                            if !currently_configurable {
+                                // Cannot switch between data and accessor for
+                                // non-configurable property.
+                                let getter_key = format!("__get_{key}__");
+                                let setter_key = format!("__set_{key}__");
+                                let is_accessor = borrow.contains_key(&getter_key)
+                                    || borrow.contains_key(&setter_key);
+                                if (has_get || has_set) && !is_accessor {
+                                    return Err(crate::error::StatorError::TypeError(format!(
+                                        "Cannot redefine property: {key}"
+                                    )));
+                                }
+                                if !has_get
+                                    && !has_set
+                                    && is_accessor
+                                    && (desc.contains_key("value") || desc.contains_key("writable"))
+                                {
+                                    return Err(crate::error::StatorError::TypeError(format!(
+                                        "Cannot redefine property: {key}"
+                                    )));
+                                }
+                                // Cannot change writable from false to true for
+                                // non-configurable data property.
+                                if !is_accessor
+                                    && !borrow.is_writable(&key)
+                                    && matches!(desc.get("writable"), Some(JsValue::Boolean(true)))
+                                {
+                                    return Err(crate::error::StatorError::TypeError(format!(
+                                        "Cannot redefine property: {key}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+
                     if has_get || has_set {
                         // Accessor property: store getter/setter using __get/__set convention.
+                        let getter_key = format!("__get_{key}__");
+                        let setter_key = format!("__set_{key}__");
+
+                        // Determine enumerable/configurable from descriptor
+                        // (default false per spec for defineProperty).
+                        let enumerable =
+                            matches!(desc.get("enumerable"), Some(JsValue::Boolean(true)));
+                        let configurable =
+                            matches!(desc.get("configurable"), Some(JsValue::Boolean(true)));
+                        let mut accessor_attrs = PropertyAttributes::empty();
+                        if enumerable {
+                            accessor_attrs |= PropertyAttributes::ENUMERABLE;
+                        }
+                        if configurable {
+                            accessor_attrs |= PropertyAttributes::CONFIGURABLE;
+                        }
+
                         if let Some(getter) = desc.get("get").cloned() {
-                            let getter_key = format!("__get_{key}__");
-                            map.borrow_mut().insert(getter_key, getter);
+                            map.borrow_mut()
+                                .insert_with_attrs(getter_key, getter, accessor_attrs);
                         }
                         if let Some(setter) = desc.get("set").cloned() {
-                            let setter_key = format!("__set_{key}__");
-                            map.borrow_mut().insert(setter_key, setter);
+                            map.borrow_mut()
+                                .insert_with_attrs(setter_key, setter, accessor_attrs);
                         }
+                        // Remove any existing data property with this key.
+                        map.borrow_mut().remove(&key);
                     } else {
-                        // Data descriptor: extract value.
-                        let value = desc.get("value").cloned().unwrap_or(JsValue::Undefined);
-                        map.borrow_mut().insert(key.clone(), value);
-                    }
-                    // Apply writable attribute
-                    if let Some(JsValue::Boolean(w)) = desc.get("writable") {
-                        map.borrow_mut().set_writable(&key, *w);
-                    }
-                    // Apply enumerable attribute
-                    if let Some(JsValue::Boolean(e)) = desc.get("enumerable") {
-                        map.borrow_mut().set_enumerable(&key, *e);
-                    }
-                    // Apply configurable attribute
-                    if let Some(JsValue::Boolean(c)) = desc.get("configurable") {
-                        map.borrow_mut().set_configurable(&key, *c);
+                        // Data descriptor.
+                        let has_value = desc.contains_key("value");
+                        let has_writable = desc.contains_key("writable");
+
+                        if has_value {
+                            let value = desc.get("value").cloned().unwrap_or(JsValue::Undefined);
+                            // Remove any existing accessor for this key.
+                            let getter_key = format!("__get_{key}__");
+                            let setter_key = format!("__set_{key}__");
+                            map.borrow_mut().remove(&getter_key);
+                            map.borrow_mut().remove(&setter_key);
+
+                            if !map.borrow().contains_key(&key) {
+                                // New property: default attrs per spec (all false
+                                // for defineProperty, unlike ordinary assignment).
+                                let mut attrs = PropertyAttributes::empty();
+                                if matches!(desc.get("writable"), Some(JsValue::Boolean(true))) {
+                                    attrs |= PropertyAttributes::WRITABLE;
+                                }
+                                if matches!(desc.get("enumerable"), Some(JsValue::Boolean(true))) {
+                                    attrs |= PropertyAttributes::ENUMERABLE;
+                                }
+                                if matches!(desc.get("configurable"), Some(JsValue::Boolean(true)))
+                                {
+                                    attrs |= PropertyAttributes::CONFIGURABLE;
+                                }
+                                map.borrow_mut()
+                                    .insert_with_attrs(key.clone(), value, attrs);
+                            } else {
+                                map.borrow_mut().insert(key.clone(), value);
+                                // Apply individual attribute flags if provided.
+                                if let Some(JsValue::Boolean(w)) = desc.get("writable") {
+                                    map.borrow_mut().set_writable(&key, *w);
+                                }
+                                if let Some(JsValue::Boolean(e)) = desc.get("enumerable") {
+                                    map.borrow_mut().set_enumerable(&key, *e);
+                                }
+                                if let Some(JsValue::Boolean(c)) = desc.get("configurable") {
+                                    map.borrow_mut().set_configurable(&key, *c);
+                                }
+                            }
+                        } else {
+                            // Partial descriptor — no value key.  Ensure the
+                            // property exists so attribute setters can act on it.
+                            if !map.borrow().contains_key(&key) && has_writable {
+                                let mut attrs = PropertyAttributes::empty();
+                                if matches!(desc.get("writable"), Some(JsValue::Boolean(true))) {
+                                    attrs |= PropertyAttributes::WRITABLE;
+                                }
+                                if matches!(desc.get("enumerable"), Some(JsValue::Boolean(true))) {
+                                    attrs |= PropertyAttributes::ENUMERABLE;
+                                }
+                                if matches!(desc.get("configurable"), Some(JsValue::Boolean(true)))
+                                {
+                                    attrs |= PropertyAttributes::CONFIGURABLE;
+                                }
+                                map.borrow_mut().insert_with_attrs(
+                                    key.clone(),
+                                    JsValue::Undefined,
+                                    attrs,
+                                );
+                            } else {
+                                if let Some(JsValue::Boolean(w)) = desc.get("writable") {
+                                    map.borrow_mut().set_writable(&key, *w);
+                                }
+                                if let Some(JsValue::Boolean(e)) = desc.get("enumerable") {
+                                    map.borrow_mut().set_enumerable(&key, *e);
+                                }
+                                if let Some(JsValue::Boolean(c)) = desc.get("configurable") {
+                                    map.borrow_mut().set_configurable(&key, *c);
+                                }
+                            }
+                        }
                     }
                 } else {
                     // If descriptor is not an object, just set undefined
@@ -1942,13 +2060,16 @@ fn make_object() -> JsValue {
                                 .cloned()
                                 .unwrap_or(JsValue::Undefined),
                         );
+                        // Read attributes from the getter key (or setter
+                        // key as fallback) where defineProperty stores them.
+                        let attr_key = if has_getter { &getter_key } else { &setter_key };
                         desc.insert(
                             "enumerable".into(),
-                            JsValue::Boolean(borrowed.is_enumerable(&key)),
+                            JsValue::Boolean(borrowed.is_enumerable(attr_key)),
                         );
                         desc.insert(
                             "configurable".into(),
-                            JsValue::Boolean(borrowed.is_configurable(&key)),
+                            JsValue::Boolean(borrowed.is_configurable(attr_key)),
                         );
                         Ok(JsValue::PlainObject(Rc::new(RefCell::new(desc))))
                     } else if let Some(value) = borrowed.get(&key) {
@@ -2061,6 +2182,12 @@ fn make_object() -> JsValue {
             } else if let JsValue::Array(items) = obj {
                 let len = items.borrow().len();
                 let mut keys: Vec<JsValue> = (0..len)
+                    .map(|i| JsValue::String(i.to_string().into()))
+                    .collect();
+                keys.push(JsValue::String("length".into()));
+                Ok(JsValue::new_array(keys))
+            } else if let JsValue::String(s) = obj {
+                let mut keys: Vec<JsValue> = (0..s.len())
                     .map(|i| JsValue::String(i.to_string().into()))
                     .collect();
                 keys.push(JsValue::String("length".into()));
@@ -2435,14 +2562,84 @@ fn make_object() -> JsValue {
             let obj = args.first().unwrap_or(&JsValue::Undefined);
             if let JsValue::PlainObject(map) = obj {
                 let mut result = PropertyMap::new();
-                for (key, value) in map.borrow().iter() {
+                let borrow = map.borrow();
+                // Collect visible property names first (skip dunder internals).
+                let visible_keys: Vec<String> = borrow
+                    .keys()
+                    .filter(|k| !k.starts_with("__"))
+                    .cloned()
+                    .collect();
+                // Also collect accessor property names from __get_*__ / __set_*__
+                let mut accessor_names: Vec<String> = Vec::new();
+                for k in borrow.keys() {
+                    if let Some(name) = k.strip_prefix("__get_")
+                        && let Some(name) = name.strip_suffix("__")
+                        && !accessor_names.contains(&name.to_string())
+                    {
+                        accessor_names.push(name.to_string());
+                    } else if let Some(name) = k.strip_prefix("__set_")
+                        && let Some(name) = name.strip_suffix("__")
+                        && !accessor_names.contains(&name.to_string())
+                    {
+                        accessor_names.push(name.to_string());
+                    }
+                }
+                for key in &visible_keys {
+                    // Skip keys that are accessor properties (handled below).
+                    if accessor_names.contains(key) {
+                        continue;
+                    }
                     let mut desc = PropertyMap::new();
-                    desc.insert("value".into(), value.clone());
-                    desc.insert("writable".into(), JsValue::Boolean(true));
-                    desc.insert("enumerable".into(), JsValue::Boolean(true));
-                    desc.insert("configurable".into(), JsValue::Boolean(true));
+                    if let Some(val) = borrow.get(key) {
+                        desc.insert("value".into(), val.clone());
+                    }
+                    desc.insert("writable".into(), JsValue::Boolean(borrow.is_writable(key)));
+                    desc.insert(
+                        "enumerable".into(),
+                        JsValue::Boolean(borrow.is_enumerable(key)),
+                    );
+                    desc.insert(
+                        "configurable".into(),
+                        JsValue::Boolean(borrow.is_configurable(key)),
+                    );
                     result.insert(
                         key.clone(),
+                        JsValue::PlainObject(Rc::new(RefCell::new(desc))),
+                    );
+                }
+                for name in &accessor_names {
+                    let getter_key = format!("__get_{name}__");
+                    let setter_key = format!("__set_{name}__");
+                    let mut desc = PropertyMap::new();
+                    desc.insert(
+                        "get".into(),
+                        borrow
+                            .get(&getter_key)
+                            .cloned()
+                            .unwrap_or(JsValue::Undefined),
+                    );
+                    desc.insert(
+                        "set".into(),
+                        borrow
+                            .get(&setter_key)
+                            .cloned()
+                            .unwrap_or(JsValue::Undefined),
+                    );
+                    let attr_key = if borrow.contains_key(&getter_key) {
+                        &getter_key
+                    } else {
+                        &setter_key
+                    };
+                    desc.insert(
+                        "enumerable".into(),
+                        JsValue::Boolean(borrow.is_enumerable(attr_key)),
+                    );
+                    desc.insert(
+                        "configurable".into(),
+                        JsValue::Boolean(borrow.is_configurable(attr_key)),
+                    );
+                    result.insert(
+                        name.clone(),
                         JsValue::PlainObject(Rc::new(RefCell::new(desc))),
                     );
                 }

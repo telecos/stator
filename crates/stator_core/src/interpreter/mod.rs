@@ -2650,6 +2650,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         }
                         _ => None,
                     };
+                    // A limit of 0 always returns an empty array.
+                    if limit == Some(0) {
+                        return Ok(JsValue::new_array(vec![]));
+                    }
                     match args.first() {
                         Some(JsValue::PlainObject(re_obj)) => {
                             let borrow = re_obj.borrow();
@@ -2676,16 +2680,22 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         }
                         Some(JsValue::String(sep)) => {
                             let sep = sep.to_string();
-                            let parts: Vec<JsValue> = if let Some(limit) = limit {
-                                s.splitn(limit, &sep)
-                                    .map(|p| JsValue::String(p.to_string().into()))
-                                    .collect()
+                            if sep.is_empty() {
+                                // Empty separator: split into individual characters.
+                                let chars: Vec<JsValue> = s
+                                    .chars()
+                                    .take(limit.unwrap_or(usize::MAX))
+                                    .map(|c| JsValue::String(c.to_string().into()))
+                                    .collect();
+                                Ok(JsValue::new_array(chars))
                             } else {
-                                s.split(&sep)
+                                let parts: Vec<JsValue> = s
+                                    .split(&sep)
+                                    .take(limit.unwrap_or(usize::MAX))
                                     .map(|p| JsValue::String(p.to_string().into()))
-                                    .collect()
-                            };
-                            Ok(JsValue::new_array(parts))
+                                    .collect();
+                                Ok(JsValue::new_array(parts))
+                            }
                         }
                         Some(JsValue::Undefined) | None => {
                             Ok(JsValue::new_array(vec![JsValue::String(s.clone())]))
@@ -3997,6 +4007,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
                     let call_args = match args.get(1) {
                         Some(JsValue::Array(arr)) => arr.borrow().clone(),
+                        Some(JsValue::PlainObject(map)) => {
+                            let borrow = map.borrow();
+                            let len = match borrow.get("length") {
+                                Some(JsValue::Smi(n)) => *n as usize,
+                                Some(JsValue::HeapNumber(n)) => *n as usize,
+                                _ => 0,
+                            };
+                            (0..len)
+                                .filter_map(|i| borrow.get(&i.to_string()).cloned())
+                                .collect()
+                        }
                         _ => vec![],
                     };
                     dispatch_call_with_this(&JsValue::Function(Rc::clone(&ba)), this_arg, call_args)
@@ -4057,6 +4078,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
                     let call_args = match args.get(1) {
                         Some(JsValue::Array(arr)) => arr.borrow().clone(),
+                        Some(JsValue::PlainObject(map)) => {
+                            let borrow = map.borrow();
+                            let len = match borrow.get("length") {
+                                Some(JsValue::Smi(n)) => *n as usize,
+                                Some(JsValue::HeapNumber(n)) => *n as usize,
+                                _ => 0,
+                            };
+                            (0..len)
+                                .filter_map(|i| borrow.get(&i.to_string()).cloned())
+                                .collect()
+                        }
                         _ => vec![],
                     };
                     let mut full_args = vec![this_arg];
