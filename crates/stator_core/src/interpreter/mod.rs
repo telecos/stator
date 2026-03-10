@@ -3147,7 +3147,20 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     Ok(JsValue::String(s.clone()))
                 }));
             }
-            _ => {}
+            _ => {
+                // Numeric string indexing: "0", "1", … → character at index.
+                if let Ok(idx) = key.parse::<usize>() {
+                    if idx < s.chars().count() {
+                        return JsValue::String(
+                            s.chars()
+                                .nth(idx)
+                                .map_or(String::new(), |c| c.to_string())
+                                .into(),
+                        );
+                    }
+                    return JsValue::Undefined;
+                }
+            }
         },
         JsValue::Boolean(b) => match key {
             "toString" => {

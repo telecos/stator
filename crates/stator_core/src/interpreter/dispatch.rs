@@ -3711,7 +3711,9 @@ fn handle_test_in(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
             } else if let Some(idx) = to_array_index(key) {
                 idx < items.borrow().len()
             } else {
-                false
+                // Check Array.prototype / Object.prototype methods.
+                let prop = to_property_key(key)?;
+                !matches!(proto_lookup(&object, &prop), JsValue::Undefined)
             }
         }
         _ => false,

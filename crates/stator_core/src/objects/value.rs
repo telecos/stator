@@ -1173,6 +1173,7 @@ fn ordinary_to_primitive_plain_object(
             }
             Some(JsValue::Function(ref ba)) => {
                 let mut frame = crate::interpreter::InterpreterFrame::new((**ba).clone(), vec![]);
+                frame.context = Some(JsValue::PlainObject(Rc::clone(map)));
                 let result = crate::interpreter::Interpreter::run(&mut frame)?;
                 if result.is_primitive() {
                     return Ok(result);
