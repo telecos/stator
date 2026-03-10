@@ -1884,6 +1884,154 @@ fn make_object() -> JsValue {
         }),
     );
 
+    /// Helper: apply a single property descriptor to a PlainObject.
+    fn define_own_property(
+        map: &Rc<RefCell<PropertyMap>>,
+        key: &str,
+        desc: &PropertyMap,
+    ) -> StatorResult<()> {
+        let has_get = desc.contains_key("get");
+        let has_set = desc.contains_key("set");
+
+        // Validate non-configurable invariants.
+        {
+            let borrow = map.borrow();
+            if borrow.contains_key(key) {
+                let currently_configurable = borrow.is_configurable(key);
+                if !currently_configurable {
+                    let getter_key = format!("__get_{key}__");
+                    let setter_key = format!("__set_{key}__");
+                    let is_accessor =
+                        borrow.contains_key(&getter_key) || borrow.contains_key(&setter_key);
+                    if (has_get || has_set) && !is_accessor {
+                        return Err(crate::error::StatorError::TypeError(format!(
+                            "Cannot redefine property: {key}"
+                        )));
+                    }
+                    if !has_get
+                        && !has_set
+                        && is_accessor
+                        && (desc.contains_key("value") || desc.contains_key("writable"))
+                    {
+                        return Err(crate::error::StatorError::TypeError(format!(
+                            "Cannot redefine property: {key}"
+                        )));
+                    }
+                    if !is_accessor
+                        && !borrow.is_writable(key)
+                        && desc.get("writable").is_some_and(|v| v.to_boolean())
+                    {
+                        return Err(crate::error::StatorError::TypeError(format!(
+                            "Cannot redefine property: {key}"
+                        )));
+                    }
+                    // Cannot change value of non-writable, non-configurable property.
+                    if !is_accessor
+                        && !borrow.is_writable(key)
+                        && desc
+                            .get("value")
+                            .and_then(|new_val| {
+                                borrow
+                                    .get(key)
+                                    .map(|old_val| !new_val.same_value(old_val))
+                            })
+                            .unwrap_or(false)
+                    {
+                        return Err(crate::error::StatorError::TypeError(format!(
+                            "Cannot redefine property: {key}"
+                        )));
+                    }
+                    // Cannot change enumerable of non-configurable property.
+                    if desc.contains_key("enumerable") {
+                        let new_e = desc.get("enumerable").is_some_and(|v| v.to_boolean());
+                        if new_e != borrow.is_enumerable(key) {
+                            return Err(crate::error::StatorError::TypeError(format!(
+                                "Cannot redefine property: {key}"
+                            )));
+                        }
+                    }
+                    // Cannot change configurable from false to true.
+                    if desc.get("configurable").is_some_and(|v| v.to_boolean()) {
+                        return Err(crate::error::StatorError::TypeError(format!(
+                            "Cannot redefine property: {key}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        if has_get || has_set {
+            let getter_key = format!("__get_{key}__");
+            let setter_key = format!("__set_{key}__");
+            let enumerable = desc.get("enumerable").is_some_and(|v| v.to_boolean());
+            let configurable = desc.get("configurable").is_some_and(|v| v.to_boolean());
+            let mut accessor_attrs = PropertyAttributes::empty();
+            if enumerable {
+                accessor_attrs |= PropertyAttributes::ENUMERABLE;
+            }
+            if configurable {
+                accessor_attrs |= PropertyAttributes::CONFIGURABLE;
+            }
+            if let Some(getter) = desc.get("get").cloned() {
+                map.borrow_mut()
+                    .insert_with_attrs(getter_key, getter, accessor_attrs);
+            }
+            if let Some(setter) = desc.get("set").cloned() {
+                map.borrow_mut()
+                    .insert_with_attrs(setter_key, setter, accessor_attrs);
+            }
+            map.borrow_mut().remove(key);
+        } else {
+            let has_value = desc.contains_key("value");
+            let writable_val = desc.get("writable").map(|v| v.to_boolean());
+            let enumerable_val = desc.get("enumerable").map(|v| v.to_boolean());
+            let configurable_val = desc.get("configurable").map(|v| v.to_boolean());
+
+            if !map.borrow().contains_key(key) {
+                let value = if has_value {
+                    desc.get("value").cloned().unwrap_or(JsValue::Undefined)
+                } else {
+                    JsValue::Undefined
+                };
+                let getter_key = format!("__get_{key}__");
+                let setter_key = format!("__set_{key}__");
+                map.borrow_mut().remove(&getter_key);
+                map.borrow_mut().remove(&setter_key);
+                let mut attrs = PropertyAttributes::empty();
+                if writable_val.unwrap_or(false) {
+                    attrs |= PropertyAttributes::WRITABLE;
+                }
+                if enumerable_val.unwrap_or(false) {
+                    attrs |= PropertyAttributes::ENUMERABLE;
+                }
+                if configurable_val.unwrap_or(false) {
+                    attrs |= PropertyAttributes::CONFIGURABLE;
+                }
+                map.borrow_mut()
+                    .insert_with_attrs(key.to_string(), value, attrs);
+            } else {
+                if has_value {
+                    let value = desc.get("value").cloned().unwrap_or(JsValue::Undefined);
+                    let getter_key = format!("__get_{key}__");
+                    let setter_key = format!("__set_{key}__");
+                    map.borrow_mut().remove(&getter_key);
+                    map.borrow_mut().remove(&setter_key);
+                    map.borrow_mut().insert(key.to_string(), value);
+                }
+                if let Some(w) = writable_val {
+                    map.borrow_mut().set_writable(key, w);
+                }
+                if let Some(e) = enumerable_val {
+                    map.borrow_mut().set_enumerable(key, e);
+                }
+                if let Some(c) = configurable_val {
+                    map.borrow_mut().set_configurable(key, c);
+                }
+            }
+        }
+        Ok(())
+    }
+
     // ── Object.defineProperty(obj, prop, descriptor) ─────────────────────
     props.insert(
         "defineProperty".into(),
@@ -1897,134 +2045,7 @@ fn make_object() -> JsValue {
             if let JsValue::PlainObject(map) = &obj {
                 if let JsValue::PlainObject(desc_map) = descriptor {
                     let desc = desc_map.borrow();
-                    // Check for accessor descriptor (get/set)
-                    let has_get = desc.contains_key("get");
-                    let has_set = desc.contains_key("set");
-
-                    // Validate non-configurable invariants.
-                    {
-                        let borrow = map.borrow();
-                        if borrow.contains_key(&key) {
-                            let currently_configurable = borrow.is_configurable(&key);
-                            if !currently_configurable {
-                                // Cannot switch between data and accessor for
-                                // non-configurable property.
-                                let getter_key = format!("__get_{key}__");
-                                let setter_key = format!("__set_{key}__");
-                                let is_accessor = borrow.contains_key(&getter_key)
-                                    || borrow.contains_key(&setter_key);
-                                if (has_get || has_set) && !is_accessor {
-                                    return Err(crate::error::StatorError::TypeError(format!(
-                                        "Cannot redefine property: {key}"
-                                    )));
-                                }
-                                if !has_get
-                                    && !has_set
-                                    && is_accessor
-                                    && (desc.contains_key("value") || desc.contains_key("writable"))
-                                {
-                                    return Err(crate::error::StatorError::TypeError(format!(
-                                        "Cannot redefine property: {key}"
-                                    )));
-                                }
-                                // Cannot change writable from false to true for
-                                // non-configurable data property.
-                                if !is_accessor
-                                    && !borrow.is_writable(&key)
-                                    && matches!(desc.get("writable"), Some(JsValue::Boolean(true)))
-                                {
-                                    return Err(crate::error::StatorError::TypeError(format!(
-                                        "Cannot redefine property: {key}"
-                                    )));
-                                }
-                            }
-                        }
-                    }
-
-                    if has_get || has_set {
-                        // Accessor property: store getter/setter using __get/__set convention.
-                        let getter_key = format!("__get_{key}__");
-                        let setter_key = format!("__set_{key}__");
-
-                        // Determine enumerable/configurable from descriptor
-                        // (default false per spec for defineProperty).
-                        let enumerable = desc.get("enumerable").is_some_and(|v| v.to_boolean());
-                        let configurable = desc.get("configurable").is_some_and(|v| v.to_boolean());
-                        let mut accessor_attrs = PropertyAttributes::empty();
-                        if enumerable {
-                            accessor_attrs |= PropertyAttributes::ENUMERABLE;
-                        }
-                        if configurable {
-                            accessor_attrs |= PropertyAttributes::CONFIGURABLE;
-                        }
-
-                        if let Some(getter) = desc.get("get").cloned() {
-                            map.borrow_mut()
-                                .insert_with_attrs(getter_key, getter, accessor_attrs);
-                        }
-                        if let Some(setter) = desc.get("set").cloned() {
-                            map.borrow_mut()
-                                .insert_with_attrs(setter_key, setter, accessor_attrs);
-                        }
-                        // Remove any existing data property with this key.
-                        map.borrow_mut().remove(&key);
-                    } else {
-                        // Data descriptor.
-                        let has_value = desc.contains_key("value");
-
-                        // Coerce attribute values to boolean per ECMAScript spec.
-                        let writable_val = desc.get("writable").map(|v| v.to_boolean());
-                        let enumerable_val = desc.get("enumerable").map(|v| v.to_boolean());
-                        let configurable_val = desc.get("configurable").map(|v| v.to_boolean());
-
-                        if !map.borrow().contains_key(&key) {
-                            // New property: default attrs are all false per spec.
-                            let value = if has_value {
-                                desc.get("value").cloned().unwrap_or(JsValue::Undefined)
-                            } else {
-                                JsValue::Undefined
-                            };
-                            // Remove any existing accessor for this key.
-                            let getter_key = format!("__get_{key}__");
-                            let setter_key = format!("__set_{key}__");
-                            map.borrow_mut().remove(&getter_key);
-                            map.borrow_mut().remove(&setter_key);
-
-                            let mut attrs = PropertyAttributes::empty();
-                            if writable_val.unwrap_or(false) {
-                                attrs |= PropertyAttributes::WRITABLE;
-                            }
-                            if enumerable_val.unwrap_or(false) {
-                                attrs |= PropertyAttributes::ENUMERABLE;
-                            }
-                            if configurable_val.unwrap_or(false) {
-                                attrs |= PropertyAttributes::CONFIGURABLE;
-                            }
-                            map.borrow_mut()
-                                .insert_with_attrs(key.clone(), value, attrs);
-                        } else {
-                            // Existing property: update only supplied fields.
-                            if has_value {
-                                let value =
-                                    desc.get("value").cloned().unwrap_or(JsValue::Undefined);
-                                // Remove any existing accessor for this key.
-                                let getter_key = format!("__get_{key}__");
-                                let setter_key = format!("__set_{key}__");
-                                map.borrow_mut().remove(&getter_key);
-                                map.borrow_mut().remove(&setter_key);
-                                map.borrow_mut().insert(key.clone(), value);
-                            }
-                            if let Some(w) = writable_val {
-                                map.borrow_mut().set_writable(&key, w);
-                            }
-                            if let Some(e) = enumerable_val {
-                                map.borrow_mut().set_enumerable(&key, e);
-                            }
-                            if let Some(c) = configurable_val {
-                                map.borrow_mut().set_configurable(&key, c);
-                            }
-                        }
-                    }
+                    define_own_property(map, &key, &desc)?;
                 } else {
                     // If descriptor is not an object, just set undefined
                     map.borrow_mut().insert(key, JsValue::Undefined);
@@ -2174,12 +2195,17 @@ fn make_object() -> JsValue {
 
             if let JsValue::PlainObject(map) = &obj {
                 if let JsValue::PlainObject(desc_map) = descriptors {
-                    let descs = desc_map.borrow();
-                    for (key, desc_val) in descs.iter() {
+                    // Collect keys first to avoid borrow conflicts.
+                    let entries: Vec<(String, JsValue)> = desc_map
+                        .borrow()
+                        .iter()
+                        .filter(|(k, _)| !k.starts_with("__"))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    for (key, desc_val) in &entries {
                         if let JsValue::PlainObject(single_desc) = desc_val {
                             let sd = single_desc.borrow();
-                            let value = sd.get("value").cloned().unwrap_or(JsValue::Undefined);
-                            map.borrow_mut().insert(key.clone(), value);
+                            define_own_property(map, key, &sd)?;
                         }
                     }
                 }
