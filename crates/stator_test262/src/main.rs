@@ -459,6 +459,66 @@ fn is_skipped_path(rel_path: &str) -> bool {
 /// Builds the global environment used when running Test262 tests.
 ///
 /// Installs all standard builtins and adds:
+/// Deep-clone a `JsValue`, creating independent copies of any
+/// `PlainObject` or `Array` it contains so that mutations in one test
+/// cannot leak into another via shared `Rc` references.
+///
+/// `visited` tracks already-cloned `PlainObject` / `Array` `Rc` pointers
+/// so that prototype cycles (e.g. `Object → prototype → constructor →
+/// Object`) are broken instead of recursed into infinitely.
+fn deep_clone_value(v: &JsValue, visited: &mut HashMap<usize, JsValue>) -> JsValue {
+    match v {
+        JsValue::PlainObject(rc) => {
+            let ptr = Rc::as_ptr(rc) as usize;
+            if let Some(existing) = visited.get(&ptr) {
+                return existing.clone();
+            }
+            // Insert a placeholder to break cycles.
+            let new_rc = Rc::new(RefCell::new(PropertyMap::new()));
+            let placeholder = JsValue::PlainObject(Rc::clone(&new_rc));
+            visited.insert(ptr, placeholder.clone());
+
+            let borrow = rc.borrow();
+            let mut new_map = PropertyMap::new();
+            for (k, child) in borrow.iter() {
+                new_map.insert(k.clone(), deep_clone_value(child, visited));
+            }
+            drop(borrow);
+            *new_rc.borrow_mut() = new_map;
+            placeholder
+        }
+        JsValue::Array(rc) => {
+            let ptr = Rc::as_ptr(rc) as usize;
+            if let Some(existing) = visited.get(&ptr) {
+                return existing.clone();
+            }
+            let new_rc = Rc::new(RefCell::new(Vec::new()));
+            let placeholder = JsValue::Array(Rc::clone(&new_rc));
+            visited.insert(ptr, placeholder.clone());
+
+            let borrow = rc.borrow();
+            let new_vec: Vec<JsValue> = borrow
+                .iter()
+                .map(|c| deep_clone_value(c, visited))
+                .collect();
+            drop(borrow);
+            *new_rc.borrow_mut() = new_vec;
+            placeholder
+        }
+        other => other.clone(),
+    }
+}
+
+/// Deep-clone a globals `HashMap` so that every `PlainObject` / `Array`
+/// inside it gets a fresh `Rc`, preventing cross-test mutation leakage.
+fn deep_clone_globals(template: &HashMap<String, JsValue>) -> HashMap<String, JsValue> {
+    let mut visited = HashMap::new();
+    template
+        .iter()
+        .map(|(k, v)| (k.clone(), deep_clone_value(v, &mut visited)))
+        .collect()
+}
+
 /// - `print` (silent stub)
 /// - `$262` host object (gc, evalScript stubs)
 /// - `assert` harness (native implementations of assert, assert.sameValue, etc.)
@@ -854,8 +914,10 @@ fn execute_source_inner(
         format!("{harness_prefix}\n{source}")
     };
 
-    // Clone the template globals so each test starts with a clean copy.
-    let globals = Rc::new(RefCell::new(template_globals.clone()));
+    // Deep-clone the template globals so each test starts with fully
+    // independent PlainObject/Array instances that cannot be mutated by
+    // other tests through shared `Rc` references.
+    let globals = Rc::new(RefCell::new(deep_clone_globals(template_globals)));
 
     let program = parser::parse(&combined)?;
     let bc = BytecodeGenerator::compile_program(&program)?;
@@ -949,7 +1011,7 @@ fn run_test(
     let done_called = Rc::new(Cell::new(false));
 
     let async_globals = if is_async {
-        let mut g = template_globals.clone();
+        let mut g = deep_clone_globals(template_globals);
         let dc = done_called.clone();
         g.insert(
             "$DONE".to_string(),
@@ -1588,49 +1650,85 @@ mod tests {
     }
 
     // ── Integration: run simple tests through the engine ─────────────────────
+    //
+    // These tests call `install_globals` → `run_test` which needs a very
+    // large stack (install_globals is deeply nested in debug builds).
+    // We spawn each on a dedicated thread with 64 MiB of stack.
+
+    const TEST_STACK: usize = 64 * 1024 * 1024;
 
     #[test]
     fn test_run_positive_pass() {
-        let src = "/*---\ndescription: 1+1\n---*/\n1 + 1;";
-        let meta = parse_frontmatter(src);
-        let globals = make_test_globals();
-        assert!(matches!(
-            run_test(src, "", &meta, &globals),
-            TestOutcome::Pass
-        ));
+        std::thread::Builder::new()
+            .stack_size(TEST_STACK)
+            .spawn(|| {
+                let src = "/*---\ndescription: 1+1\n---*/\n1 + 1;";
+                let meta = parse_frontmatter(src);
+                let globals = make_test_globals();
+                assert!(matches!(
+                    run_test(src, "", &meta, &globals),
+                    TestOutcome::Pass
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
     fn test_run_positive_fail_on_syntax_error() {
-        let src = "/*---\ndescription: bad\n---*/\n!@# invalid";
-        let meta = parse_frontmatter(src);
-        let globals = make_test_globals();
-        assert!(matches!(
-            run_test(src, "", &meta, &globals),
-            TestOutcome::Fail(_)
-        ));
+        std::thread::Builder::new()
+            .stack_size(TEST_STACK)
+            .spawn(|| {
+                let src = "/*---\ndescription: bad\n---*/\n!@# invalid";
+                let meta = parse_frontmatter(src);
+                let globals = make_test_globals();
+                assert!(matches!(
+                    run_test(src, "", &meta, &globals),
+                    TestOutcome::Fail(_)
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
     fn test_run_negative_parse_passes_when_error_thrown() {
-        let src = "/*---\nnegative:\n  phase: parse\n  type: SyntaxError\n---*/\n!@# bad syntax";
-        let meta = parse_frontmatter(src);
-        let globals = make_test_globals();
-        assert!(matches!(
-            run_test(src, "", &meta, &globals),
-            TestOutcome::Pass
-        ));
+        std::thread::Builder::new()
+            .stack_size(TEST_STACK)
+            .spawn(|| {
+                let src =
+                    "/*---\nnegative:\n  phase: parse\n  type: SyntaxError\n---*/\n!@# bad syntax";
+                let meta = parse_frontmatter(src);
+                let globals = make_test_globals();
+                assert!(matches!(
+                    run_test(src, "", &meta, &globals),
+                    TestOutcome::Pass
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
     fn test_run_negative_parse_fails_when_no_error() {
-        let src = "/*---\nnegative:\n  phase: parse\n  type: SyntaxError\n---*/\nvar x = 1;";
-        let meta = parse_frontmatter(src);
-        let globals = make_test_globals();
-        assert!(matches!(
-            run_test(src, "", &meta, &globals),
-            TestOutcome::Fail(_)
-        ));
+        std::thread::Builder::new()
+            .stack_size(TEST_STACK)
+            .spawn(|| {
+                let src =
+                    "/*---\nnegative:\n  phase: parse\n  type: SyntaxError\n---*/\nvar x = 1;";
+                let meta = parse_frontmatter(src);
+                let globals = make_test_globals();
+                assert!(matches!(
+                    run_test(src, "", &meta, &globals),
+                    TestOutcome::Fail(_)
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
