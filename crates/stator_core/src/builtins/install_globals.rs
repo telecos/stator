@@ -2184,15 +2184,42 @@ fn make_object() -> JsValue {
             let iterable = args.first().unwrap_or(&JsValue::Undefined);
             let mut result = PropertyMap::new();
 
-            if let JsValue::Array(arr) = iterable {
-                for entry in arr.borrow().iter() {
-                    if let JsValue::Array(pair) = entry
-                        && pair.borrow().len() >= 2
-                    {
-                        let key = pair.borrow()[0].to_js_string()?;
-                        result.insert(key, pair.borrow()[1].clone());
+            let entries_to_process: Vec<JsValue> = match iterable {
+                JsValue::Array(arr) => arr.borrow().clone(),
+                JsValue::PlainObject(map) => {
+                    let borrow = map.borrow();
+                    if borrow.get("__is_array__").is_some() {
+                        let len = match borrow.get("length") {
+                            Some(JsValue::Smi(n)) => *n as usize,
+                            _ => 0,
+                        };
+                        (0..len)
+                            .filter_map(|i| borrow.get(&i.to_string()).cloned())
+                            .collect()
+                    } else {
+                        vec![]
                     }
                 }
+                _ => vec![],
+            };
+            for entry in &entries_to_process {
+                let (key, val) = match entry {
+                    JsValue::Array(pair) if pair.borrow().len() >= 2 => {
+                        (pair.borrow()[0].to_js_string()?, pair.borrow()[1].clone())
+                    }
+                    JsValue::PlainObject(obj) => {
+                        let borrow = obj.borrow();
+                        let k = borrow
+                            .get("0")
+                            .cloned()
+                            .unwrap_or(JsValue::Undefined)
+                            .to_js_string()?;
+                        let v = borrow.get("1").cloned().unwrap_or(JsValue::Undefined);
+                        (k, v)
+                    }
+                    _ => continue,
+                };
+                result.insert(key, val);
             }
             Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
         }),
@@ -2482,6 +2509,31 @@ fn make_array() -> JsValue {
                     .chars()
                     .map(|c| JsValue::String(c.to_string().into()))
                     .collect(),
+                JsValue::PlainObject(map) => {
+                    let borrow = map.borrow();
+                    if borrow.get("__is_array__").is_some() {
+                        let len = match borrow.get("length") {
+                            Some(JsValue::Smi(n)) => *n as usize,
+                            _ => 0,
+                        };
+                        (0..len)
+                            .filter_map(|i| borrow.get(&i.to_string()).cloned())
+                            .collect()
+                    } else {
+                        vec![]
+                    }
+                }
+                JsValue::Iterator(iter) => {
+                    let mut items = Vec::new();
+                    loop {
+                        let next = iter.borrow_mut().next_item();
+                        match next {
+                            Some(v) => items.push(v),
+                            None => break,
+                        }
+                    }
+                    items
+                }
                 _ => Vec::new(),
             };
             Ok(JsValue::new_array(items))

@@ -2524,7 +2524,12 @@ fn handle_sta_named_property(
                         });
                         return Ok(DispatchAction::Continue);
                     }
-                    // Non-writable: silently ignore (sloppy mode).
+                    // Non-writable: TypeError in strict mode, silently ignore in sloppy.
+                    if ctx.frame.bytecode_array.is_strict() {
+                        return Err(StatorError::TypeError(format!(
+                            "Cannot assign to read only property '{prop_name}'"
+                        )));
+                    }
                     return Ok(DispatchAction::Continue);
                 }
             }
@@ -2536,8 +2541,13 @@ fn handle_sta_named_property(
                 return Ok(DispatchAction::Continue);
             }
             let pm = map.borrow();
-            // Existing non-writable property: silently ignore (sloppy mode).
+            // Existing non-writable property: TypeError in strict mode, silently ignore in sloppy.
             if pm.contains_key(prop_name.as_ref()) && !pm.is_writable(prop_name.as_ref()) {
+                if ctx.frame.bytecode_array.is_strict() {
+                    return Err(StatorError::TypeError(format!(
+                        "Cannot assign to read only property '{prop_name}'"
+                    )));
+                }
                 return Ok(DispatchAction::Continue);
             }
             drop(pm);

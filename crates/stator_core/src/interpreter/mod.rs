@@ -2243,6 +2243,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let prop = match args.first() {
                         Some(JsValue::String(s)) => s.to_string(),
                         Some(JsValue::Smi(n)) => n.to_string(),
+                        Some(JsValue::HeapNumber(n)) => {
+                            let s = format!("{n}");
+                            s
+                        }
+                        Some(JsValue::Boolean(b)) => b.to_string(),
+                        Some(JsValue::Null) => "null".to_string(),
+                        Some(JsValue::Undefined) => "undefined".to_string(),
                         _ => return Ok(JsValue::Boolean(false)),
                     };
                     Ok(JsValue::Boolean(map.borrow().contains_key(&prop)))
@@ -2372,6 +2379,19 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     }
                 }));
             }
+            "constructor" => {
+                return JsValue::NativeFunction(Rc::new(|args| match args.first() {
+                    Some(v) => {
+                        let n = v.to_number()?;
+                        Ok(if n.fract() == 0.0 && n.abs() < i32::MAX as f64 {
+                            JsValue::Smi(n as i32)
+                        } else {
+                            JsValue::HeapNumber(n)
+                        })
+                    }
+                    None => Ok(JsValue::Smi(0)),
+                }));
+            }
             _ => {}
         },
         JsValue::HeapNumber(n) => match key {
@@ -2439,6 +2459,19 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             format!("{n:.prec$}", prec = p.saturating_sub(1)).into(),
                         ))
                     }
+                }));
+            }
+            "constructor" => {
+                return JsValue::NativeFunction(Rc::new(|args| match args.first() {
+                    Some(v) => {
+                        let n = v.to_number()?;
+                        Ok(if n.fract() == 0.0 && n.abs() < i32::MAX as f64 {
+                            JsValue::Smi(n as i32)
+                        } else {
+                            JsValue::HeapNumber(n)
+                        })
+                    }
+                    None => Ok(JsValue::Smi(0)),
                 }));
             }
             _ => {}
@@ -3076,6 +3109,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     Ok(JsValue::Iterator(NativeIterator::from_string(&s)))
                 }));
             }
+            "constructor" => {
+                return JsValue::NativeFunction(Rc::new(|args| match args.first() {
+                    Some(v) => Ok(JsValue::String(v.to_js_string()?.into())),
+                    None => Ok(JsValue::String("".into())),
+                }));
+            }
             _ => {}
         },
         JsValue::Boolean(b) => match key {
@@ -3095,6 +3134,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "valueOf" => {
                 let b = *b;
                 return JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Boolean(b))));
+            }
+            "constructor" => {
+                return JsValue::NativeFunction(Rc::new(|args| {
+                    let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    Ok(JsValue::Boolean(val.to_boolean()))
+                }));
             }
             _ => {}
         },
@@ -3328,6 +3373,33 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             acc = dispatch_call_value(
                                 &callback,
                                 vec![acc, item.clone(), JsValue::Smi(i as i32)],
+                            )?;
+                        }
+                        Ok(acc)
+                    }));
+                }
+                "reduceRight" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let items = a.borrow().clone();
+                        if items.is_empty() && args.len() < 2 {
+                            return Err(StatorError::TypeError(
+                                "Reduce of empty array with no initial value".into(),
+                            ));
+                        }
+                        let (mut acc, start_idx) = if args.len() > 1 {
+                            (args[1].clone(), items.len())
+                        } else {
+                            (
+                                items.last().cloned().unwrap_or(JsValue::Undefined),
+                                items.len().saturating_sub(1),
+                            )
+                        };
+                        for i in (0..start_idx).rev() {
+                            acc = dispatch_call_value(
+                                &callback,
+                                vec![acc, items[i].clone(), JsValue::Smi(i as i32)],
                             )?;
                         }
                         Ok(acc)
