@@ -4369,7 +4369,13 @@ pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) ->
 
 /// Invoke a callable JsValue (Function or NativeFunction) with the given
 /// arguments and return the result.
-pub(super) fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult<JsValue> {
+///
+/// This is the engine's primary mechanism for calling any JS-callable value
+/// from native Rust code.  It handles:
+/// - `JsValue::Function` (bytecode) — creates a new interpreter frame
+/// - `JsValue::NativeFunction` — calls the Rust closure directly
+/// - `JsValue::PlainObject` with `__call__` — delegates to the callable slot
+pub fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult<JsValue> {
     match callee {
         JsValue::Function(ba) => {
             push_call_frame("<anonymous>")?;

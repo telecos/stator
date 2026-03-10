@@ -129,6 +129,7 @@ use crate::builtins::weak_map::{
 use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new, weak_ref_new_plain};
 use crate::builtins::weak_set::{weak_set_add, weak_set_delete, weak_set_has, weak_set_new};
 use crate::error::{StatorError, StatorResult};
+use crate::interpreter::dispatch_call_value;
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
@@ -139,6 +140,51 @@ use crate::objects::value::JsValue;
 /// Wrap a Rust closure as a `JsValue::NativeFunction`.
 fn native(f: impl Fn(Vec<JsValue>) -> StatorResult<JsValue> + 'static) -> JsValue {
     JsValue::NativeFunction(Rc::new(f))
+}
+
+/// Extract elements from an array-like value.
+///
+/// Handles `JsValue::Array` (native vector), PlainObject arrays (with
+/// `__is_array__` and `length`), and generic array-like objects (objects with
+/// a numeric `length` property and integer-indexed elements).
+///
+/// Returns `(elements, length)`.  For non-array-like values, returns an empty
+/// vector with length 0.
+fn to_array_like_elements(val: &JsValue) -> (Vec<JsValue>, usize) {
+    match val {
+        JsValue::Array(items) => {
+            let borrowed = items.borrow();
+            (borrowed.clone(), borrowed.len())
+        }
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            let len = match borrow.get("length") {
+                Some(v) => {
+                    let n = v.to_number().unwrap_or(0.0);
+                    if n.is_nan() || n < 0.0 {
+                        0
+                    } else {
+                        (n as u64).min(u32::MAX as u64) as usize
+                    }
+                }
+                None => 0,
+            };
+            let mut elements = Vec::with_capacity(len);
+            for i in 0..len {
+                let key = i.to_string();
+                elements.push(borrow.get(&key).cloned().unwrap_or(JsValue::Undefined));
+            }
+            (elements, len)
+        }
+        _ => (Vec::new(), 0),
+    }
+}
+
+/// Invoke a JS callback (NativeFunction, bytecode Function, or PlainObject
+/// with `__call__`) with the given arguments.  This is the bridge between
+/// native built-in implementations and user-defined JS callbacks.
+fn call_callback(cb: &JsValue, args: Vec<JsValue>) -> StatorResult<JsValue> {
+    dispatch_call_value(cb, args)
 }
 
 /// ECMAScript §23.1.3.1 step 5.b — check `@@isConcatSpreadable`.
@@ -2949,24 +2995,21 @@ fn make_array() -> JsValue {
         "indexOf".into(),
         native(|args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Array(items) = arr {
-                let search = args.get(1).unwrap_or(&JsValue::Undefined);
-                let from = args
-                    .get(2)
-                    .unwrap_or(&JsValue::Smi(0))
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
-                let len = items.borrow().len() as i64;
-                let start = if from < 0 { (len + from).max(0) } else { from } as usize;
-                for (i, v) in items.borrow().iter().enumerate().skip(start) {
-                    if v == search {
-                        return Ok(JsValue::Smi(i as i32));
-                    }
+            let search = args.get(1).unwrap_or(&JsValue::Undefined);
+            let (elements, _) = to_array_like_elements(arr);
+            let len = elements.len() as i64;
+            let from = args
+                .get(2)
+                .unwrap_or(&JsValue::Smi(0))
+                .to_number()
+                .unwrap_or(0.0) as i64;
+            let start = if from < 0 { (len + from).max(0) } else { from } as usize;
+            for (i, v) in elements.iter().enumerate().skip(start) {
+                if v == search {
+                    return Ok(JsValue::Smi(i as i32));
                 }
-                Ok(JsValue::Smi(-1))
-            } else {
-                Ok(JsValue::Smi(-1))
             }
+            Ok(JsValue::Smi(-1))
         }),
     );
 
@@ -2975,27 +3018,27 @@ fn make_array() -> JsValue {
         "lastIndexOf".into(),
         native(|args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Array(items) = arr {
-                let search = args.get(1).unwrap_or(&JsValue::Undefined);
-                let len = items.borrow().len() as i64;
-                let from = args
-                    .get(2)
-                    .map(|v| v.to_number().unwrap_or((len - 1) as f64) as i64)
-                    .unwrap_or(len - 1);
-                let start = if from < 0 {
-                    (len + from).max(0) as usize
-                } else {
-                    from.min(len - 1) as usize
-                };
-                for i in (0..=start).rev() {
-                    if items.borrow().get(i) == Some(search) {
-                        return Ok(JsValue::Smi(i as i32));
-                    }
-                }
-                Ok(JsValue::Smi(-1))
-            } else {
-                Ok(JsValue::Smi(-1))
+            let search = args.get(1).unwrap_or(&JsValue::Undefined);
+            let (elements, _) = to_array_like_elements(arr);
+            let len = elements.len() as i64;
+            if len == 0 {
+                return Ok(JsValue::Smi(-1));
             }
+            let from = args
+                .get(2)
+                .map(|v| v.to_number().unwrap_or((len - 1) as f64) as i64)
+                .unwrap_or(len - 1);
+            let start = if from < 0 {
+                (len + from).max(0) as usize
+            } else {
+                from.min(len - 1) as usize
+            };
+            for i in (0..=start).rev() {
+                if elements.get(i) == Some(search) {
+                    return Ok(JsValue::Smi(i as i32));
+                }
+            }
+            Ok(JsValue::Smi(-1))
         }),
     );
 
@@ -3004,24 +3047,21 @@ fn make_array() -> JsValue {
         "includes".into(),
         native(|args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Array(items) = arr {
-                let search = args.get(1).unwrap_or(&JsValue::Undefined);
-                let from = args
-                    .get(2)
-                    .unwrap_or(&JsValue::Smi(0))
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
-                let len = items.borrow().len() as i64;
-                let start = if from < 0 { (len + from).max(0) } else { from } as usize;
-                for v in items.borrow().iter().skip(start) {
-                    if v == search {
-                        return Ok(JsValue::Boolean(true));
-                    }
+            let search = args.get(1).unwrap_or(&JsValue::Undefined);
+            let (elements, _) = to_array_like_elements(arr);
+            let len = elements.len() as i64;
+            let from = args
+                .get(2)
+                .unwrap_or(&JsValue::Smi(0))
+                .to_number()
+                .unwrap_or(0.0) as i64;
+            let start = if from < 0 { (len + from).max(0) } else { from } as usize;
+            for v in elements.iter().skip(start) {
+                if v == search {
+                    return Ok(JsValue::Boolean(true));
                 }
-                Ok(JsValue::Boolean(false))
-            } else {
-                Ok(JsValue::Boolean(false))
             }
+            Ok(JsValue::Boolean(false))
         }),
     );
 
@@ -3384,21 +3424,15 @@ fn make_array() -> JsValue {
         "map".into(),
         native(|args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Array(items) = arr {
-                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let mut result = Vec::with_capacity(items.borrow().len());
-                for (i, item) in items.borrow().iter().enumerate() {
-                    let mapped = if let JsValue::NativeFunction(f) = &cb {
-                        f(vec![item.clone(), JsValue::Smi(i as i32)])?
-                    } else {
-                        item.clone()
-                    };
-                    result.push(mapped);
-                }
-                Ok(JsValue::new_array(result))
-            } else {
-                Ok(JsValue::new_array(Vec::new()))
+            let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let (elements, _) = to_array_like_elements(arr);
+            let arr_val = arr.clone();
+            let mut result = Vec::with_capacity(elements.len());
+            for (i, item) in elements.iter().enumerate() {
+                let mapped = call_callback(&cb, vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                result.push(mapped);
             }
+            Ok(JsValue::new_array(result))
         }),
     );
 
@@ -3407,24 +3441,18 @@ fn make_array() -> JsValue {
         "filter".into(),
         native(|args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Array(items) = arr {
-                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let mut result = Vec::new();
-                for (i, item) in items.borrow().iter().enumerate() {
-                    let keep = if let JsValue::NativeFunction(f) = &cb {
-                        let v = f(vec![item.clone(), JsValue::Smi(i as i32)])?;
-                        v.to_boolean()
-                    } else {
-                        false
-                    };
-                    if keep {
-                        result.push(item.clone());
-                    }
+            let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let (elements, _) = to_array_like_elements(arr);
+            let arr_val = arr.clone();
+            let mut result = Vec::new();
+            for (i, item) in elements.iter().enumerate() {
+                let keep =
+                    call_callback(&cb, vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                if keep.to_boolean() {
+                    result.push(item.clone());
                 }
-                Ok(JsValue::new_array(result))
-            } else {
-                Ok(JsValue::new_array(Vec::new()))
             }
+            Ok(JsValue::new_array(result))
         }),
     );
 
@@ -3433,29 +3461,22 @@ fn make_array() -> JsValue {
         "reduce".into(),
         native(|args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Array(items) = arr {
-                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (mut acc, start) = if let Some(init) = args.get(2) {
-                    (init.clone(), 0usize)
-                } else {
-                    if items.borrow().is_empty() {
-                        return Err(StatorError::TypeError(
-                            "Reduce of empty array with no initial value".into(),
-                        ));
-                    }
-                    (items.borrow()[0].clone(), 1)
-                };
-                for (i, item) in items.borrow().iter().enumerate().skip(start) {
-                    if let JsValue::NativeFunction(f) = &cb {
-                        acc = f(vec![acc, item.clone(), JsValue::Smi(i as i32)])?;
-                    }
-                }
-                Ok(acc)
+            let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let (elements, _) = to_array_like_elements(arr);
+            let (mut acc, start) = if let Some(init) = args.get(2) {
+                (init.clone(), 0usize)
             } else {
-                Err(StatorError::TypeError(
-                    "Reduce of empty array with no initial value".into(),
-                ))
+                if elements.is_empty() {
+                    return Err(StatorError::TypeError(
+                        "Reduce of empty array with no initial value".into(),
+                    ));
+                }
+                (elements[0].clone(), 1)
+            };
+            for (i, item) in elements.iter().enumerate().skip(start) {
+                acc = call_callback(&cb, vec![acc, item.clone(), JsValue::Smi(i as i32), arr.clone()])?;
             }
+            Ok(acc)
         }),
     );
 
@@ -3464,32 +3485,22 @@ fn make_array() -> JsValue {
         "reduceRight".into(),
         native(|args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Array(items) = arr {
-                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (mut acc, end_exclusive) = if let Some(init) = args.get(2) {
-                    (init.clone(), items.borrow().len())
-                } else {
-                    if items.borrow().is_empty() {
-                        return Err(StatorError::TypeError(
-                            "Reduce of empty array with no initial value".into(),
-                        ));
-                    }
-                    (
-                        items.borrow()[items.borrow().len() - 1].clone(),
-                        items.borrow().len() - 1,
-                    )
-                };
-                for i in (0..end_exclusive).rev() {
-                    if let JsValue::NativeFunction(f) = &cb {
-                        acc = f(vec![acc, items.borrow()[i].clone(), JsValue::Smi(i as i32)])?;
-                    }
-                }
-                Ok(acc)
+            let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let (elements, _) = to_array_like_elements(arr);
+            let (mut acc, end_exclusive) = if let Some(init) = args.get(2) {
+                (init.clone(), elements.len())
             } else {
-                Err(StatorError::TypeError(
-                    "Reduce of empty array with no initial value".into(),
-                ))
+                if elements.is_empty() {
+                    return Err(StatorError::TypeError(
+                        "Reduce of empty array with no initial value".into(),
+                    ));
+                }
+                (elements[elements.len() - 1].clone(), elements.len() - 1)
+            };
+            for i in (0..end_exclusive).rev() {
+                acc = call_callback(&cb, vec![acc, elements[i].clone(), JsValue::Smi(i as i32), arr.clone()])?;
             }
+            Ok(acc)
         }),
     );
 
@@ -3498,13 +3509,11 @@ fn make_array() -> JsValue {
         "forEach".into(),
         native(|args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Array(items) = arr {
-                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                for (i, item) in items.borrow().iter().enumerate() {
-                    if let JsValue::NativeFunction(f) = &cb {
-                        f(vec![item.clone(), JsValue::Smi(i as i32)])?;
-                    }
-                }
+            let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let (elements, _) = to_array_like_elements(arr);
+            let arr_val = arr.clone();
+            for (i, item) in elements.iter().enumerate() {
+                call_callback(&cb, vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
             }
             Ok(JsValue::Undefined)
         }),
@@ -3515,15 +3524,13 @@ fn make_array() -> JsValue {
         "find".into(),
         native(|args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Array(items) = arr {
-                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                for (i, item) in items.borrow().iter().enumerate() {
-                    if let JsValue::NativeFunction(f) = &cb {
-                        let v = f(vec![item.clone(), JsValue::Smi(i as i32)])?;
-                        if v.to_boolean() {
-                            return Ok(item.clone());
-                        }
-                    }
+            let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let (elements, _) = to_array_like_elements(arr);
+            let arr_val = arr.clone();
+            for (i, item) in elements.iter().enumerate() {
+                let v = call_callback(&cb, vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                if v.to_boolean() {
+                    return Ok(item.clone());
                 }
             }
             Ok(JsValue::Undefined)
@@ -3535,15 +3542,13 @@ fn make_array() -> JsValue {
         "findIndex".into(),
         native(|args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Array(items) = arr {
-                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                for (i, item) in items.borrow().iter().enumerate() {
-                    if let JsValue::NativeFunction(f) = &cb {
-                        let v = f(vec![item.clone(), JsValue::Smi(i as i32)])?;
-                        if v.to_boolean() {
-                            return Ok(JsValue::Smi(i as i32));
-                        }
-                    }
+            let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let (elements, _) = to_array_like_elements(arr);
+            let arr_val = arr.clone();
+            for (i, item) in elements.iter().enumerate() {
+                let v = call_callback(&cb, vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                if v.to_boolean() {
+                    return Ok(JsValue::Smi(i as i32));
                 }
             }
             Ok(JsValue::Smi(-1))
@@ -3555,15 +3560,13 @@ fn make_array() -> JsValue {
         "findLast".into(),
         native(|args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Array(items) = arr {
-                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                for i in (0..items.borrow().len()).rev() {
-                    if let JsValue::NativeFunction(f) = &cb {
-                        let v = f(vec![items.borrow()[i].clone(), JsValue::Smi(i as i32)])?;
-                        if v.to_boolean() {
-                            return Ok(items.borrow()[i].clone());
-                        }
-                    }
+            let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let (elements, _) = to_array_like_elements(arr);
+            let arr_val = arr.clone();
+            for i in (0..elements.len()).rev() {
+                let v = call_callback(&cb, vec![elements[i].clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                if v.to_boolean() {
+                    return Ok(elements[i].clone());
                 }
             }
             Ok(JsValue::Undefined)
@@ -3575,15 +3578,13 @@ fn make_array() -> JsValue {
         "findLastIndex".into(),
         native(|args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Array(items) = arr {
-                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                for i in (0..items.borrow().len()).rev() {
-                    if let JsValue::NativeFunction(f) = &cb {
-                        let v = f(vec![items.borrow()[i].clone(), JsValue::Smi(i as i32)])?;
-                        if v.to_boolean() {
-                            return Ok(JsValue::Smi(i as i32));
-                        }
-                    }
+            let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let (elements, _) = to_array_like_elements(arr);
+            let arr_val = arr.clone();
+            for i in (0..elements.len()).rev() {
+                let v = call_callback(&cb, vec![elements[i].clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                if v.to_boolean() {
+                    return Ok(JsValue::Smi(i as i32));
                 }
             }
             Ok(JsValue::Smi(-1))
@@ -3595,15 +3596,13 @@ fn make_array() -> JsValue {
         "some".into(),
         native(|args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Array(items) = arr {
-                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                for (i, item) in items.borrow().iter().enumerate() {
-                    if let JsValue::NativeFunction(f) = &cb {
-                        let v = f(vec![item.clone(), JsValue::Smi(i as i32)])?;
-                        if v.to_boolean() {
-                            return Ok(JsValue::Boolean(true));
-                        }
-                    }
+            let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let (elements, _) = to_array_like_elements(arr);
+            let arr_val = arr.clone();
+            for (i, item) in elements.iter().enumerate() {
+                let v = call_callback(&cb, vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                if v.to_boolean() {
+                    return Ok(JsValue::Boolean(true));
                 }
             }
             Ok(JsValue::Boolean(false))
@@ -3615,15 +3614,13 @@ fn make_array() -> JsValue {
         "every".into(),
         native(|args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Array(items) = arr {
-                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                for (i, item) in items.borrow().iter().enumerate() {
-                    if let JsValue::NativeFunction(f) = &cb {
-                        let v = f(vec![item.clone(), JsValue::Smi(i as i32)])?;
-                        if !v.to_boolean() {
-                            return Ok(JsValue::Boolean(false));
-                        }
-                    }
+            let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let (elements, _) = to_array_like_elements(arr);
+            let arr_val = arr.clone();
+            for (i, item) in elements.iter().enumerate() {
+                let v = call_callback(&cb, vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                if !v.to_boolean() {
+                    return Ok(JsValue::Boolean(false));
                 }
             }
             Ok(JsValue::Boolean(true))
