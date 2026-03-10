@@ -337,6 +337,31 @@ fn make_error_constructor(kind: ErrorKind) -> JsValue {
     })
 }
 
+/// Build a PlainObject error constructor with `__call__`, `name`, and
+/// `@@hasInstance` for a specific `ErrorKind`.
+///
+/// This allows `instanceof` checks (via `@@hasInstance`) and name-based
+/// detection in the Test262 harness (via the `name` property).
+fn make_error_constructor_object(kind: ErrorKind) -> JsValue {
+    let mut props = PropertyMap::new();
+    props.insert("__call__".into(), make_error_constructor(kind));
+    props.insert(
+        "name".into(),
+        JsValue::String(kind.as_name().to_string().into()),
+    );
+    props.insert(
+        "@@hasInstance".into(),
+        native(move |args| {
+            let val = args.first().unwrap_or(&JsValue::Undefined);
+            match val {
+                JsValue::Error(e) => Ok(JsValue::Boolean(e.kind == kind)),
+                _ => Ok(JsValue::Boolean(false)),
+            }
+        }),
+    );
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 /// Extract the `cause` value from an options argument, if present.
 fn extract_cause(options: Option<&JsValue>) -> Option<JsValue> {
     if let Some(JsValue::PlainObject(map)) = options {
@@ -412,6 +437,15 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
     // The `Error` constructor is a PlainObject so it can carry static methods.
     let mut error_props = PropertyMap::new();
     error_props.insert("__call__".into(), make_error_constructor(ErrorKind::Error));
+    error_props.insert("name".into(), JsValue::String("Error".into()));
+    // @@hasInstance: `x instanceof Error` returns true for all error kinds.
+    error_props.insert(
+        "@@hasInstance".into(),
+        native(|args| {
+            let val = args.first().unwrap_or(&JsValue::Undefined);
+            Ok(JsValue::Boolean(matches!(val, JsValue::Error(_))))
+        }),
+    );
     // V8 extension: Error.captureStackTrace(targetObject [, constructorOpt])
     error_props.insert(
         "captureStackTrace".into(),
@@ -440,27 +474,27 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
 
     globals.insert(
         "TypeError".into(),
-        make_error_constructor(ErrorKind::TypeError),
+        make_error_constructor_object(ErrorKind::TypeError),
     );
     globals.insert(
         "RangeError".into(),
-        make_error_constructor(ErrorKind::RangeError),
+        make_error_constructor_object(ErrorKind::RangeError),
     );
     globals.insert(
         "ReferenceError".into(),
-        make_error_constructor(ErrorKind::ReferenceError),
+        make_error_constructor_object(ErrorKind::ReferenceError),
     );
     globals.insert(
         "SyntaxError".into(),
-        make_error_constructor(ErrorKind::SyntaxError),
+        make_error_constructor_object(ErrorKind::SyntaxError),
     );
     globals.insert(
         "URIError".into(),
-        make_error_constructor(ErrorKind::URIError),
+        make_error_constructor_object(ErrorKind::URIError),
     );
     globals.insert(
         "EvalError".into(),
-        make_error_constructor(ErrorKind::EvalError),
+        make_error_constructor_object(ErrorKind::EvalError),
     );
     globals.insert("AggregateError".into(), make_aggregate_error_constructor());
     globals.insert(
@@ -1682,13 +1716,24 @@ fn make_object() -> JsValue {
         native(|args| {
             let val = args.first().unwrap_or(&JsValue::Undefined);
             if let JsValue::PlainObject(map) = val {
-                let keys: Vec<JsValue> = map
-                    .borrow()
-                    .enumerable_keys()
-                    .filter(|k| !k.starts_with("__"))
-                    .map(|k| JsValue::String(k.clone().into()))
-                    .collect();
-                Ok(JsValue::new_array(keys))
+                let borrow = map.borrow();
+                if borrow.get("__is_array__").is_some() {
+                    let len = match borrow.get("length") {
+                        Some(JsValue::Smi(n)) => *n as usize,
+                        _ => 0,
+                    };
+                    let keys: Vec<JsValue> = (0..len)
+                        .map(|i| JsValue::String(i.to_string().into()))
+                        .collect();
+                    Ok(JsValue::new_array(keys))
+                } else {
+                    let keys: Vec<JsValue> = borrow
+                        .enumerable_keys()
+                        .filter(|k| !k.starts_with("__"))
+                        .map(|k| JsValue::String(k.clone().into()))
+                        .collect();
+                    Ok(JsValue::new_array(keys))
+                }
             } else if let JsValue::Array(items) = val {
                 let len = items.borrow().len();
                 let keys: Vec<JsValue> = (0..len)
@@ -1711,12 +1756,23 @@ fn make_object() -> JsValue {
             let val = args.first().unwrap_or(&JsValue::Undefined);
             if let JsValue::PlainObject(map) = val {
                 let borrow = map.borrow();
-                let values: Vec<JsValue> = borrow
-                    .enumerable_keys()
-                    .filter(|k| !k.starts_with("__"))
-                    .filter_map(|k| borrow.get(k).cloned())
-                    .collect();
-                Ok(JsValue::new_array(values))
+                if borrow.get("__is_array__").is_some() {
+                    let len = match borrow.get("length") {
+                        Some(JsValue::Smi(n)) => *n as usize,
+                        _ => 0,
+                    };
+                    let values: Vec<JsValue> = (0..len)
+                        .filter_map(|i| borrow.get(&i.to_string()).cloned())
+                        .collect();
+                    Ok(JsValue::new_array(values))
+                } else {
+                    let values: Vec<JsValue> = borrow
+                        .enumerable_keys()
+                        .filter(|k| !k.starts_with("__"))
+                        .filter_map(|k| borrow.get(k).cloned())
+                        .collect();
+                    Ok(JsValue::new_array(values))
+                }
             } else if let JsValue::Array(items) = val {
                 let values = items.borrow().clone();
                 Ok(JsValue::new_array(values))
@@ -1731,17 +1787,31 @@ fn make_object() -> JsValue {
             let val = args.first().unwrap_or(&JsValue::Undefined);
             if let JsValue::PlainObject(map) = val {
                 let borrow = map.borrow();
-                let entries: Vec<JsValue> = borrow
-                    .enumerable_keys()
-                    .filter(|k| !k.starts_with("__"))
-                    .filter_map(|k| {
-                        borrow
-                            .get(k)
-                            .cloned()
-                            .map(|v| JsValue::new_array(vec![JsValue::String(k.clone().into()), v]))
-                    })
-                    .collect();
-                Ok(JsValue::new_array(entries))
+                if borrow.get("__is_array__").is_some() {
+                    let len = match borrow.get("length") {
+                        Some(JsValue::Smi(n)) => *n as usize,
+                        _ => 0,
+                    };
+                    let entries: Vec<JsValue> = (0..len)
+                        .filter_map(|i| {
+                            borrow.get(&i.to_string()).cloned().map(|v| {
+                                JsValue::new_array(vec![JsValue::String(i.to_string().into()), v])
+                            })
+                        })
+                        .collect();
+                    Ok(JsValue::new_array(entries))
+                } else {
+                    let entries: Vec<JsValue> = borrow
+                        .enumerable_keys()
+                        .filter(|k| !k.starts_with("__"))
+                        .filter_map(|k| {
+                            borrow.get(k).cloned().map(|v| {
+                                JsValue::new_array(vec![JsValue::String(k.clone().into()), v])
+                            })
+                        })
+                        .collect();
+                    Ok(JsValue::new_array(entries))
+                }
             } else if let JsValue::Array(items) = val {
                 let entries: Vec<JsValue> = items
                     .borrow()
@@ -1800,16 +1870,16 @@ fn make_object() -> JsValue {
                         map.borrow_mut().insert(key.clone(), value);
                     }
                     // Apply writable attribute
-                    if let Some(JsValue::Boolean(false)) = desc.get("writable") {
-                        map.borrow_mut().set_writable(&key, false);
+                    if let Some(JsValue::Boolean(w)) = desc.get("writable") {
+                        map.borrow_mut().set_writable(&key, *w);
                     }
                     // Apply enumerable attribute
-                    if let Some(JsValue::Boolean(false)) = desc.get("enumerable") {
-                        map.borrow_mut().set_enumerable(&key, false);
+                    if let Some(JsValue::Boolean(e)) = desc.get("enumerable") {
+                        map.borrow_mut().set_enumerable(&key, *e);
                     }
                     // Apply configurable attribute
-                    if let Some(JsValue::Boolean(false)) = desc.get("configurable") {
-                        map.borrow_mut().set_configurable(&key, false);
+                    if let Some(JsValue::Boolean(c)) = desc.get("configurable") {
+                        map.borrow_mut().set_configurable(&key, *c);
                     }
                 } else {
                     // If descriptor is not an object, just set undefined

@@ -2392,6 +2392,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     None => Ok(JsValue::Smi(0)),
                 }));
             }
+            "@@toPrimitive" => {
+                let n = *n;
+                return JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Smi(n))));
+            }
             _ => {}
         },
         JsValue::HeapNumber(n) => match key {
@@ -2473,6 +2477,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     }
                     None => Ok(JsValue::Smi(0)),
                 }));
+            }
+            "@@toPrimitive" => {
+                let n = *n;
+                return JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::HeapNumber(n))));
             }
             _ => {}
         },
@@ -3115,6 +3123,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     None => Ok(JsValue::String("".into())),
                 }));
             }
+            "@@toPrimitive" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(s.clone()))
+                }));
+            }
             _ => {}
         },
         JsValue::Boolean(b) => match key {
@@ -3140,6 +3154,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let val = args.first().cloned().unwrap_or(JsValue::Undefined);
                     Ok(JsValue::Boolean(val.to_boolean()))
                 }));
+            }
+            "@@toPrimitive" => {
+                let b = *b;
+                return JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Boolean(b))));
             }
             _ => {}
         },

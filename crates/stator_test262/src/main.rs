@@ -373,6 +373,48 @@ fn make_test_globals() -> HashMap<String, JsValue> {
         "detachArrayBuffer".to_string(),
         JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined))),
     );
+    // $262.createRealm() — returns an object with `global` and `evalScript`.
+    obj_262.borrow_mut().insert(
+        "createRealm".to_string(),
+        JsValue::NativeFunction(Rc::new(|_args| {
+            let mut realm_globals = HashMap::new();
+            install_globals(&mut realm_globals);
+            let global_obj = {
+                let mut gm = PropertyMap::new();
+                for (k, v) in &realm_globals {
+                    gm.insert(k.clone(), v.clone());
+                }
+                Rc::new(RefCell::new(gm))
+            };
+            let global_val = JsValue::PlainObject(global_obj);
+
+            let realm_globals_rc = Rc::new(RefCell::new(realm_globals));
+            let mut realm = PropertyMap::new();
+            realm.insert("global".to_string(), global_val);
+            let rg = Rc::clone(&realm_globals_rc);
+            realm.insert(
+                "evalScript".to_string(),
+                JsValue::NativeFunction(Rc::new(move |args| {
+                    let code = match args.first() {
+                        Some(JsValue::String(s)) => s.to_string(),
+                        _ => return Ok(JsValue::Undefined),
+                    };
+                    let program = parser::parse(&code)?;
+                    let bc = BytecodeGenerator::compile_program(&program)?;
+                    let mut frame = InterpreterFrame::new(bc, vec![]);
+                    // Populate the frame's global env with the realm's globals.
+                    {
+                        let mut env = frame.global_env.borrow_mut();
+                        for (k, v) in rg.borrow().iter() {
+                            env.insert(k.clone(), v.clone());
+                        }
+                    }
+                    Interpreter::run(&mut frame)
+                })),
+            );
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(realm))))
+        })),
+    );
     obj_262
         .borrow_mut()
         .insert("global".to_string(), JsValue::Undefined);
