@@ -3439,15 +3439,37 @@ fn handle_create_reg_exp_literal(
                 };
                 match r.borrow().exec(&input) {
                     Some(m) => {
-                        let mut parts: Vec<JsValue> =
-                            vec![JsValue::String(m.matched.clone().into())];
-                        for g in &m.captures {
-                            parts.push(match g {
-                                Some(s) => JsValue::String(s.clone().into()),
-                                None => JsValue::Undefined,
-                            });
+                        let mut props = PropertyMap::new();
+                        props.insert("0".to_string(), JsValue::String(m.matched.clone().into()));
+                        for (i, g) in m.captures.iter().enumerate() {
+                            props.insert(
+                                (i + 1).to_string(),
+                                match g {
+                                    Some(s) => JsValue::String(s.clone().into()),
+                                    None => JsValue::Undefined,
+                                },
+                            );
                         }
-                        Ok(JsValue::new_array(parts))
+                        props.insert(
+                            "length".to_string(),
+                            JsValue::Smi((1 + m.captures.len()) as i32),
+                        );
+                        props.insert("index".to_string(), JsValue::Smi(m.index as i32));
+                        props.insert("input".to_string(), JsValue::String(m.input.clone().into()));
+                        if m.named_groups.is_empty() {
+                            props.insert("groups".to_string(), JsValue::Undefined);
+                        } else {
+                            let mut groups = PropertyMap::new();
+                            for (k, v) in &m.named_groups {
+                                groups.insert(k.clone(), JsValue::String(v.clone().into()));
+                            }
+                            props.insert(
+                                "groups".to_string(),
+                                JsValue::PlainObject(Rc::new(RefCell::new(groups))),
+                            );
+                        }
+                        props.insert("__is_array__".to_string(), JsValue::Boolean(true));
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
                     }
                     None => Ok(JsValue::Null),
                 }

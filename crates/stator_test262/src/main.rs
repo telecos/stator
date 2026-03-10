@@ -713,6 +713,13 @@ fn make_test_globals() -> HashMap<String, JsValue> {
                     Interpreter::run(&mut frame)
                 }
                 JsValue::NativeFunction(f) => f(vec![]),
+                JsValue::PlainObject(map) => {
+                    if let Some(call_fn) = map.borrow().get("__call__").cloned() {
+                        stator_core::interpreter::dispatch_call_value(&call_fn, vec![])
+                    } else {
+                        Ok(JsValue::Undefined)
+                    }
+                }
                 _ => Ok(JsValue::Undefined),
             };
 
@@ -796,6 +803,7 @@ fn js_same_value(a: &JsValue, b: &JsValue) -> bool {
         (JsValue::PlainObject(x), JsValue::PlainObject(y)) => Rc::ptr_eq(x, y),
         (JsValue::Array(x), JsValue::Array(y)) => Rc::ptr_eq(x, y),
         (JsValue::Function(x), JsValue::Function(y)) => Rc::ptr_eq(x, y),
+        (JsValue::NativeFunction(x), JsValue::NativeFunction(y)) => Rc::ptr_eq(x, y),
         (JsValue::Error(x), JsValue::Error(y)) => Rc::ptr_eq(x, y),
 
         // Different types → never SameValue.

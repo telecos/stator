@@ -4424,7 +4424,7 @@ pub fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult
 ///
 /// Sets `"this"` in the global environment so that `Expr::This` (which compiles
 /// to `LdaGlobal("this")`) resolves to the given receiver.
-pub(super) fn dispatch_call_with_this(
+pub fn dispatch_call_with_this(
     callee: &JsValue,
     this_val: JsValue,
     args: Vec<JsValue>,

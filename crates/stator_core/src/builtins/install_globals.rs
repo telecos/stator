@@ -129,7 +129,7 @@ use crate::builtins::weak_map::{
 use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new, weak_ref_new_plain};
 use crate::builtins::weak_set::{weak_set_add, weak_set_delete, weak_set_has, weak_set_new};
 use crate::error::{StatorError, StatorResult};
-use crate::interpreter::dispatch_call_value;
+use crate::interpreter::{dispatch_call_value, dispatch_call_with_this};
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
@@ -5184,8 +5184,11 @@ fn make_function() -> JsValue {
             let func = args.first().cloned().unwrap_or(JsValue::Undefined);
             let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
             let call_args: Vec<JsValue> = args.get(2..).unwrap_or(&[]).to_vec();
-            match func {
-                JsValue::NativeFunction(f) => function_call(&f, &this_arg, &call_args),
+            match &func {
+                JsValue::NativeFunction(f) => function_call(f, &this_arg, &call_args),
+                JsValue::Function(_) | JsValue::PlainObject(_) => {
+                    dispatch_call_with_this(&func, this_arg, call_args)
+                }
                 _ => Err(StatorError::TypeError(
                     "Function.prototype.call requires a callable".into(),
                 )),
@@ -5201,6 +5204,24 @@ fn make_function() -> JsValue {
             let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
             let args_array = match args.get(2) {
                 Some(JsValue::Array(arr)) => Some(arr.borrow().clone()),
+                Some(JsValue::PlainObject(map)) => {
+                    let borrow = map.borrow();
+                    let len = match borrow.get("length") {
+                        Some(JsValue::Smi(n)) => *n as usize,
+                        Some(JsValue::HeapNumber(n)) => *n as usize,
+                        _ => 0,
+                    };
+                    Some(
+                        (0..len)
+                            .map(|i| {
+                                borrow
+                                    .get(&i.to_string())
+                                    .cloned()
+                                    .unwrap_or(JsValue::Undefined)
+                            })
+                            .collect(),
+                    )
+                }
                 Some(JsValue::Null) | Some(JsValue::Undefined) | None => None,
                 _ => {
                     return Err(StatorError::TypeError(
@@ -5208,8 +5229,12 @@ fn make_function() -> JsValue {
                     ));
                 }
             };
-            match func {
-                JsValue::NativeFunction(f) => function_apply(&f, &this_arg, &args_array),
+            match &func {
+                JsValue::NativeFunction(f) => function_apply(f, &this_arg, &args_array),
+                JsValue::Function(_) | JsValue::PlainObject(_) => {
+                    let spread = args_array.unwrap_or_default();
+                    dispatch_call_with_this(&func, this_arg, spread)
+                }
                 _ => Err(StatorError::TypeError(
                     "Function.prototype.apply requires a callable".into(),
                 )),
@@ -5224,10 +5249,17 @@ fn make_function() -> JsValue {
             let func = args.first().cloned().unwrap_or(JsValue::Undefined);
             let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
             let bound_args: Vec<JsValue> = args.get(2..).unwrap_or(&[]).to_vec();
-            match func {
-                JsValue::NativeFunction(ref f) => {
+            match &func {
+                JsValue::NativeFunction(f) => {
                     let bound = function_bind(f, &this_arg, &bound_args);
                     Ok(JsValue::NativeFunction(bound))
+                }
+                JsValue::Function(_) | JsValue::PlainObject(_) => {
+                    Ok(JsValue::NativeFunction(Rc::new(move |call_args| {
+                        let mut all_args = bound_args.clone();
+                        all_args.extend(call_args);
+                        dispatch_call_with_this(&func, this_arg.clone(), all_args)
+                    })))
                 }
                 _ => Err(StatorError::TypeError(
                     "Function.prototype.bind requires a callable".into(),
