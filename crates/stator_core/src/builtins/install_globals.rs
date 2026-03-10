@@ -3429,7 +3429,10 @@ fn make_array() -> JsValue {
             let arr_val = arr.clone();
             let mut result = Vec::with_capacity(elements.len());
             for (i, item) in elements.iter().enumerate() {
-                let mapped = call_callback(&cb, vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                let mapped = call_callback(
+                    &cb,
+                    vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                )?;
                 result.push(mapped);
             }
             Ok(JsValue::new_array(result))
@@ -3446,8 +3449,10 @@ fn make_array() -> JsValue {
             let arr_val = arr.clone();
             let mut result = Vec::new();
             for (i, item) in elements.iter().enumerate() {
-                let keep =
-                    call_callback(&cb, vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                let keep = call_callback(
+                    &cb,
+                    vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                )?;
                 if keep.to_boolean() {
                     result.push(item.clone());
                 }
@@ -3474,7 +3479,10 @@ fn make_array() -> JsValue {
                 (elements[0].clone(), 1)
             };
             for (i, item) in elements.iter().enumerate().skip(start) {
-                acc = call_callback(&cb, vec![acc, item.clone(), JsValue::Smi(i as i32), arr.clone()])?;
+                acc = call_callback(
+                    &cb,
+                    vec![acc, item.clone(), JsValue::Smi(i as i32), arr.clone()],
+                )?;
             }
             Ok(acc)
         }),
@@ -3498,7 +3506,15 @@ fn make_array() -> JsValue {
                 (elements[elements.len() - 1].clone(), elements.len() - 1)
             };
             for i in (0..end_exclusive).rev() {
-                acc = call_callback(&cb, vec![acc, elements[i].clone(), JsValue::Smi(i as i32), arr.clone()])?;
+                acc = call_callback(
+                    &cb,
+                    vec![
+                        acc,
+                        elements[i].clone(),
+                        JsValue::Smi(i as i32),
+                        arr.clone(),
+                    ],
+                )?;
             }
             Ok(acc)
         }),
@@ -3513,7 +3529,10 @@ fn make_array() -> JsValue {
             let (elements, _) = to_array_like_elements(arr);
             let arr_val = arr.clone();
             for (i, item) in elements.iter().enumerate() {
-                call_callback(&cb, vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                call_callback(
+                    &cb,
+                    vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                )?;
             }
             Ok(JsValue::Undefined)
         }),
@@ -3528,7 +3547,10 @@ fn make_array() -> JsValue {
             let (elements, _) = to_array_like_elements(arr);
             let arr_val = arr.clone();
             for (i, item) in elements.iter().enumerate() {
-                let v = call_callback(&cb, vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                let v = call_callback(
+                    &cb,
+                    vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                )?;
                 if v.to_boolean() {
                     return Ok(item.clone());
                 }
@@ -3546,7 +3568,10 @@ fn make_array() -> JsValue {
             let (elements, _) = to_array_like_elements(arr);
             let arr_val = arr.clone();
             for (i, item) in elements.iter().enumerate() {
-                let v = call_callback(&cb, vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                let v = call_callback(
+                    &cb,
+                    vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                )?;
                 if v.to_boolean() {
                     return Ok(JsValue::Smi(i as i32));
                 }
@@ -3564,7 +3589,10 @@ fn make_array() -> JsValue {
             let (elements, _) = to_array_like_elements(arr);
             let arr_val = arr.clone();
             for i in (0..elements.len()).rev() {
-                let v = call_callback(&cb, vec![elements[i].clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                let v = call_callback(
+                    &cb,
+                    vec![elements[i].clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                )?;
                 if v.to_boolean() {
                     return Ok(elements[i].clone());
                 }
@@ -3582,7 +3610,10 @@ fn make_array() -> JsValue {
             let (elements, _) = to_array_like_elements(arr);
             let arr_val = arr.clone();
             for i in (0..elements.len()).rev() {
-                let v = call_callback(&cb, vec![elements[i].clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                let v = call_callback(
+                    &cb,
+                    vec![elements[i].clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                )?;
                 if v.to_boolean() {
                     return Ok(JsValue::Smi(i as i32));
                 }
@@ -3600,7 +3631,10 @@ fn make_array() -> JsValue {
             let (elements, _) = to_array_like_elements(arr);
             let arr_val = arr.clone();
             for (i, item) in elements.iter().enumerate() {
-                let v = call_callback(&cb, vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                let v = call_callback(
+                    &cb,
+                    vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                )?;
                 if v.to_boolean() {
                     return Ok(JsValue::Boolean(true));
                 }
@@ -3618,7 +3652,10 @@ fn make_array() -> JsValue {
             let (elements, _) = to_array_like_elements(arr);
             let arr_val = arr.clone();
             for (i, item) in elements.iter().enumerate() {
-                let v = call_callback(&cb, vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()])?;
+                let v = call_callback(
+                    &cb,
+                    vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                )?;
                 if !v.to_boolean() {
                     return Ok(JsValue::Boolean(false));
                 }

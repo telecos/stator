@@ -2207,6 +2207,29 @@ pub(super) fn restore_closure_context(
 pub(super) fn error_message_from_value(value: &JsValue) -> String {
     match value {
         JsValue::Error(e) => e.to_error_string(),
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            // Build "Name: message" for error-like objects so that the
+            // test runner's `matches_type` can identify the error kind
+            // (e.g. "TypeError: foo" matches expected type "TypeError").
+            let name = borrow
+                .get("name")
+                .and_then(|v| v.to_js_string().ok())
+                .unwrap_or_default();
+            let msg = borrow
+                .get("message")
+                .and_then(|v| v.to_js_string().ok())
+                .unwrap_or_default();
+            if !name.is_empty() && !msg.is_empty() {
+                format!("{name}: {msg}")
+            } else if !name.is_empty() {
+                name
+            } else if !msg.is_empty() {
+                msg
+            } else {
+                "[object Object]".to_string()
+            }
+        }
         other => other
             .to_js_string()
             .unwrap_or_else(|_| format!("{other:?}")),
