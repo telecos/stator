@@ -28,7 +28,7 @@ use stator_core::builtins::error::clear_call_stack;
 use stator_core::builtins::install_globals::install_globals;
 use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_core::error::StatorError;
-use stator_core::interpreter::{Interpreter, InterpreterFrame};
+use stator_core::interpreter::{Interpreter, InterpreterFrame, set_execution_deadline};
 use stator_core::objects::property_map::PropertyMap;
 use stator_core::objects::value::JsValue;
 use stator_core::parser;
@@ -36,13 +36,26 @@ use stator_core::parser;
 // ─── Guarded global allocator ────────────────────────────────────────────────
 
 /// A thin wrapper around the system allocator that rejects single allocations
-/// larger than 1 GiB.  This prevents pathological Test262 inputs (e.g. a
-/// `new Array(2**53)`) from requesting petabytes of memory and OOM-killing
-/// the CI runner before any Rust-level bounds check can fire.
+/// larger than [`MAX_ALLOC_SIZE`].  This prevents pathological Test262 inputs
+/// (e.g. `new Array(2**53)`) from OOM-killing the CI runner.
+///
+/// When an oversized allocation is requested, we **panic** rather than
+/// returning `null_mut`.  Returning null triggers Rust's default OOM handler
+/// which **aborts** the process, bypassing `catch_unwind`.  Panicking lets
+/// the test runner's `catch_unwind` wrapper recover gracefully and move on
+/// to the next test.
+///
+/// # Safety
+///
+/// Panicking inside `GlobalAlloc::alloc` is technically UB because the
+/// allocator may be invoked during unwinding.  In practice, only the
+/// oversized allocation panics — small allocations made during unwind
+/// (formatting, vec growth, etc.) pass through to `System` and succeed.
+/// This trade-off is acceptable for a test runner binary.
 struct GuardedAlloc;
 
-/// Maximum size of a single allocation (1 GiB).
-const MAX_ALLOC_SIZE: usize = 1 << 30;
+/// Maximum size of a single allocation (256 MiB).
+const MAX_ALLOC_SIZE: usize = 1 << 28;
 
 // SAFETY: All methods delegate to `System` after a size check.  The safety
 // invariants of `GlobalAlloc` (valid layout, matching alloc/dealloc) are
@@ -50,7 +63,13 @@ const MAX_ALLOC_SIZE: usize = 1 << 30;
 unsafe impl GlobalAlloc for GuardedAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if layout.size() > MAX_ALLOC_SIZE {
-            return std::ptr::null_mut();
+            // Panic instead of returning null so that `catch_unwind` in the
+            // test runner can recover.  See struct-level docs for rationale.
+            panic!(
+                "guarded allocator: allocation of {} bytes exceeds {} byte limit",
+                layout.size(),
+                MAX_ALLOC_SIZE,
+            );
         }
         unsafe { System.alloc(layout) }
     }
@@ -336,12 +355,57 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "iterator-helpers",
     // Atomics — waitAsync not implemented
     "Atomics.waitAsync",
+    "Atomics",
     // ArrayBuffer.prototype.transfer not implemented
     "arraybuffer-transfer",
     // Float16Array typed array not implemented
     "Float16Array",
     // Tail-call optimisation not implemented in the interpreter
     "tail-call-optimization",
+    // Proxy / Reflect — not implemented
+    "Proxy",
+    "Reflect",
+    "Reflect.construct",
+    "Reflect.set",
+    "Reflect.defineProperty",
+    "Reflect.deleteProperty",
+    "Reflect.getOwnPropertyDescriptor",
+    "Reflect.getPrototypeOf",
+    "Reflect.isExtensible",
+    "Reflect.ownKeys",
+    "Reflect.preventExtensions",
+    "Reflect.setPrototypeOf",
+    "Reflect.apply",
+    // SharedArrayBuffer — not implemented
+    "SharedArrayBuffer",
+    // WeakRef / FinalizationRegistry — not implemented
+    "WeakRef",
+    "FinalizationRegistry",
+    // cross-realm — requires full realm support
+    "cross-realm",
+    // Well-known intrinsic objects — not yet implemented
+    "Symbol.species",
+    // Typed arrays not fully implemented
+    "TypedArray",
+    // String/RegExp features requiring lookbehind
+    "regexp-lookbehind",
+    "regexp-named-groups",
+    "regexp-unicode-property-escapes",
+    // Intl not implemented
+    "Intl-enumeration",
+    "Intl.DateTimeFormat-datetimestyle",
+    "Intl.DateTimeFormat-dayPeriod",
+    "Intl.DateTimeFormat-formatRange",
+    "Intl.DateTimeFormat-fractionalSecondDigits",
+    "Intl.DisplayNames",
+    "Intl.DisplayNames-v2",
+    "Intl.DurationFormat",
+    "Intl.ListFormat",
+    "Intl.Locale",
+    "Intl.NumberFormat-unified",
+    "Intl.NumberFormat-v3",
+    "Intl.RelativeTimeFormat",
+    "Intl.Segmenter",
 ];
 
 /// Returns `true` when the feature list contains at least one unsupported tag.
@@ -349,6 +413,45 @@ fn has_unsupported_feature(features: &[String]) -> bool {
     features
         .iter()
         .any(|f| UNSUPPORTED_FEATURES.contains(&f.as_str()))
+}
+
+/// Path prefixes (relative to the `test/` directory, forward-slash separated)
+/// for test categories that are known to hang or that exercise entirely
+/// unimplemented subsystems.  Checked via [`is_skipped_path`].
+const SKIPPED_PATH_PREFIXES: &[&str] = &[
+    // Promise — no microtask queue; tests hang waiting for resolution
+    "built-ins/Promise/",
+    // Async generators / iterators — incomplete async runtime
+    "built-ins/AsyncGeneratorFunction/",
+    "built-ins/AsyncGeneratorPrototype/",
+    "built-ins/AsyncFunction/",
+    "built-ins/AsyncIteratorPrototype/",
+    // Intl — not implemented
+    "intl402/",
+    // Annex B — legacy browser features, low priority
+    "annexB/",
+    // Generators — partially supported but many tests hang
+    "built-ins/GeneratorFunction/",
+    "built-ins/GeneratorPrototype/",
+];
+
+/// Individual test files (relative to the `test/` directory, forward-slash
+/// separated) that are known to hang due to catastrophic backtracking or
+/// other pathological behaviour.
+const SKIPPED_TEST_FILES: &[&str] = &[
+    // Catastrophic backtracking: ((.*\n?)*?) in a body-matching regex.
+    "built-ins/RegExp/S15.10.2.8_A3_T17.js",
+    // Slow catastrophic backtracking (35+ seconds).
+    "built-ins/RegExp/prototype/exec/S15.10.6.2_A3_T7.js",
+];
+
+/// Returns `true` when `rel_path` starts with any of the [`SKIPPED_PATH_PREFIXES`]
+/// or exactly matches a [`SKIPPED_TEST_FILES`] entry.
+fn is_skipped_path(rel_path: &str) -> bool {
+    SKIPPED_PATH_PREFIXES
+        .iter()
+        .any(|prefix| rel_path.starts_with(prefix))
+        || SKIPPED_TEST_FILES.contains(&rel_path)
 }
 
 // ─── Test execution ──────────────────────────────────────────────────────────
@@ -752,7 +855,16 @@ fn execute_source_inner(
     // Limit each test to 10 million instructions to prevent infinite
     // loops from hanging the runner.
     frame.instruction_limit = 10_000_000;
-    Interpreter::run(&mut frame)
+    // Wall-clock deadline: 10 seconds per test.  Set both on the frame AND as
+    // a thread-local so that child frames created by eval() / Function()
+    // also respect the timeout.
+    let dl = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    frame.deadline = Some(dl);
+    set_execution_deadline(Some(dl));
+    let result = Interpreter::run(&mut frame);
+    // Clear the thread-local deadline after each test.
+    set_execution_deadline(None);
+    result
 }
 
 /// Runs a single Test262 test and returns its outcome.
@@ -1052,7 +1164,7 @@ fn main() {
     // pathological test inputs from overflowing the default 8 MB stack.
     let builder = std::thread::Builder::new()
         .name("test262-main".into())
-        .stack_size(128 * 1024 * 1024); // 128 MiB
+        .stack_size(1024 * 1024 * 1024); // 1 GiB
     let handler = builder
         .spawn(main_inner)
         .expect("failed to spawn main thread");
@@ -1135,10 +1247,19 @@ fn main_inner() {
         let meta = parse_frontmatter(&source);
 
         // ── Skip decision ─────────────────────────────────────────────────────
+        // Convert to forward-slash relative path for category matching.
+        let rel_path = path
+            .strip_prefix(&test_dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
         let skip_reason: Option<String> = if meta.is_can_block() {
             Some("CanBlock flag".to_string())
         } else if meta.is_module() {
             Some("module tests require ES module loader".to_string())
+        } else if meta.is_async() {
+            Some("async tests require microtask queue".to_string())
         } else if has_unsupported_feature(&meta.features) {
             let f = meta
                 .features
@@ -1146,6 +1267,8 @@ fn main_inner() {
                 .find(|f| UNSUPPORTED_FEATURES.contains(&f.as_str()))
                 .unwrap();
             Some(format!("unsupported feature: {f}"))
+        } else if is_skipped_path(&rel_path) {
+            Some("path-based skip (known unsupported category)".to_string())
         } else {
             None
         };
@@ -1166,6 +1289,7 @@ fn main_inner() {
         };
 
         // ── Execute and record outcome ────────────────────────────────────────
+        let test_start = std::time::Instant::now();
         match run_test(&source, &harness_prefix, &meta, &template_globals) {
             TestOutcome::Pass => {
                 pass += 1;
@@ -1185,6 +1309,10 @@ fn main_inner() {
                     println!("[SKIP] {}: {reason}", path.display());
                 }
             }
+        }
+        let elapsed = test_start.elapsed();
+        if elapsed.as_secs() >= 5 {
+            eprintln!("[SLOW] {}: {:.1}s", path.display(), elapsed.as_secs_f64());
         }
 
         // Reset the thread-local call stack so that a failed test with

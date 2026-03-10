@@ -8,9 +8,10 @@ use crate::objects::value::JsValue;
 /// Maximum number of elements we allow in a single allocation originating from
 /// a JS-visible length/size value.  This is deliberately much smaller than
 /// `usize::MAX` so that a corrupt or adversarial `f64` can never cause a
-/// multi-TiB allocation attempt.  2^32 − 1 matches the ECMAScript maximum
-/// array length and is already more than enough for any single allocation.
-pub(crate) const MAX_ALLOCATION_LENGTH: usize = u32::MAX as usize; // 4 294 967 295
+/// multi-GiB allocation attempt that aborts the process.  256 MiB matches
+/// `MAX_STRING_LEN` (builtins::string) and is well under the 1 GiB guard in
+/// the Test262 runner.
+pub(crate) const MAX_ALLOCATION_LENGTH: usize = 1 << 28; // 268 435 456 (~256 MiB)
 
 /// Safely convert an `f64` to a `usize` suitable for memory allocation sizes
 /// (array lengths, buffer sizes, repeat counts, etc.).

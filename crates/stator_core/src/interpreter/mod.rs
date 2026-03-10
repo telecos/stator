@@ -170,6 +170,7 @@ mod dispatch;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Instant;
 
 use crate::builtins::error::{pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{proxy_get, proxy_set};
@@ -396,6 +397,26 @@ thread_local! {
     static JIT_COMPILATION_COUNT: Cell<u32> = const { Cell::new(0) };
     /// Total machine-code bytes produced by all successful JIT compilations.
     static JIT_CODE_BYTES: Cell<usize> = const { Cell::new(0) };
+
+    /// Thread-local execution deadline shared by **all** interpreter frames on
+    /// this thread.  Unlike the per-frame `deadline` field, this is inherited
+    /// automatically by child frames created via `eval()`, `Function()`, etc.
+    ///
+    /// The interpreter checks this every 100 000 instructions (even when the
+    /// per-frame `instruction_limit` is zero) and aborts with a `RangeError`
+    /// when the wall-clock time exceeds the deadline.
+    static EXECUTION_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Set a wall-clock deadline for all interpreter execution on the current
+/// thread.  Passing `None` clears any existing deadline.
+pub fn set_execution_deadline(deadline: Option<Instant>) {
+    EXECUTION_DEADLINE.with(|d| d.set(deadline));
+}
+
+/// Return the current thread-local execution deadline, if any.
+pub fn get_execution_deadline() -> Option<Instant> {
+    EXECUTION_DEADLINE.with(|d| d.get())
 }
 
 /// Process-wide count of successful Maglev compilations.
@@ -909,6 +930,11 @@ pub struct InterpreterFrame {
     pub instruction_limit: u64,
     /// Number of instructions executed so far in this frame.
     pub instructions_executed: u64,
+    /// Optional wall-clock deadline.  When set, the interpreter periodically
+    /// checks `Instant::now()` and aborts with a `RangeError` once past the
+    /// deadline.  This catches native-code hangs that the instruction limit
+    /// cannot detect (e.g. pathological regex, string operations).
+    pub deadline: Option<Instant>,
     /// Saved pending-exception message for `SetPendingMessage` (swap pattern
     /// used by `finally` blocks).
     pub pending_message: JsValue,
@@ -966,6 +992,7 @@ impl InterpreterFrame {
             osr_loop_count: 0,
             instruction_limit: 0,
             instructions_executed: 0,
+            deadline: None,
             pending_message: JsValue::Undefined,
             template_cache: HashMap::new(),
             new_target: JsValue::Undefined,
@@ -1148,11 +1175,33 @@ impl Interpreter {
                     let instr = &instructions[frame.pc];
                     frame.pc += 1;
 
-                    // ── Instruction limit check ────────────────────────────────────
-                    if frame.instruction_limit > 0 {
-                        frame.instructions_executed += 1;
-                        if frame.instructions_executed > frame.instruction_limit {
-                            return Err(instruction_limit_error());
+                    // ── Instruction limit & deadline checks ─────────────────────────
+                    frame.instructions_executed += 1;
+                    if frame.instruction_limit > 0
+                        && frame.instructions_executed > frame.instruction_limit
+                    {
+                        return Err(instruction_limit_error());
+                    }
+                    // Every 100 000 instructions, check both the per-frame
+                    // deadline and the thread-local execution deadline.  The
+                    // thread-local deadline is set by the test runner and is
+                    // inherited by child frames (eval, Function constructor)
+                    // that would otherwise have no timeout.
+                    if frame.instructions_executed.is_multiple_of(100_000) {
+                        let now = Instant::now();
+                        if let Some(dl) = frame.deadline
+                            && now > dl
+                        {
+                            return Err(StatorError::RangeError(
+                                "execution timeout exceeded".to_string(),
+                            ));
+                        }
+                        if let Some(dl) = EXECUTION_DEADLINE.with(|d| d.get())
+                            && now > dl
+                        {
+                            return Err(StatorError::RangeError(
+                                "execution timeout exceeded".to_string(),
+                            ));
                         }
                     }
 
@@ -1241,6 +1290,7 @@ impl Interpreter {
             osr_loop_count: 0,
             instruction_limit: 0,
             instructions_executed: 0,
+            deadline: None,
             pending_message: JsValue::Undefined,
             template_cache: std::collections::HashMap::new(),
             new_target: JsValue::Undefined,
