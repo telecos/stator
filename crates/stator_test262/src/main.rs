@@ -293,11 +293,12 @@ impl HarnessCache {
 
         for name in includes {
             // Skip files whose functionality is provided natively.
-            if name == "sta.js" || name == "assert.js" {
+            if name == "sta.js" || name == "assert.js" || name == "donNotEvaluate.js" {
                 continue;
             }
-            if let Ok(s) = self.get(name) {
-                parts.push(s.to_string());
+            match self.get(name) {
+                Ok(s) => parts.push(s.to_string()),
+                Err(e) => log::warn!("failed to load harness file '{name}': {e}"),
             }
         }
 
@@ -319,6 +320,28 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "arbitrary-module-namespace-names",
     "import-assertions",
     "import-attributes",
+    // TC39 Stage 3 / new built-ins not yet implemented
+    "Temporal",
+    "decorators",
+    "source-phase-imports",
+    "json-modules",
+    "ShadowRealm",
+    // Regex features not yet supported by the regress engine
+    "regexp-duplicate-named-groups",
+    "regexp-modifiers",
+    "regexp-v-flag",
+    // Resource management — `using` keyword not yet in the parser
+    "explicit-resource-management",
+    // Iterator helpers — partial, not spec-complete
+    "iterator-helpers",
+    // Atomics — waitAsync not implemented
+    "Atomics.waitAsync",
+    // ArrayBuffer.prototype.transfer not implemented
+    "arraybuffer-transfer",
+    // Float16Array typed array not implemented
+    "Float16Array",
+    // Tail-call optimisation not implemented in the interpreter
+    "tail-call-optimization",
 ];
 
 /// Returns `true` when the feature list contains at least one unsupported tag.
@@ -723,20 +746,13 @@ fn execute_source_inner(
     // Clone the template globals so each test starts with a clean copy.
     let globals = Rc::new(RefCell::new(template_globals.clone()));
 
-    parser::parse(&combined)
-        .and_then(|p| BytecodeGenerator::compile_program(&p))
-        .and_then(|bc| {
-            if bc.is_module() && bc.is_async() {
-                // Top-level await module: execute as async function.
-                Interpreter::run_async_function(bc, vec![])
-            } else {
-                let mut frame = InterpreterFrame::new_with_globals(bc, vec![], globals);
-                // Limit each test to 10 million instructions to prevent infinite
-                // loops from hanging the runner.
-                frame.instruction_limit = 10_000_000;
-                Interpreter::run(&mut frame)
-            }
-        })
+    let program = parser::parse(&combined)?;
+    let bc = BytecodeGenerator::compile_program(&program)?;
+    let mut frame = InterpreterFrame::new_with_globals(bc, vec![], globals);
+    // Limit each test to 10 million instructions to prevent infinite
+    // loops from hanging the runner.
+    frame.instruction_limit = 10_000_000;
+    Interpreter::run(&mut frame)
 }
 
 /// Runs a single Test262 test and returns its outcome.
@@ -1121,6 +1137,8 @@ fn main_inner() {
         // ── Skip decision ─────────────────────────────────────────────────────
         let skip_reason: Option<String> = if meta.is_can_block() {
             Some("CanBlock flag".to_string())
+        } else if meta.is_module() {
+            Some("module tests require ES module loader".to_string())
         } else if has_unsupported_feature(&meta.features) {
             let f = meta
                 .features

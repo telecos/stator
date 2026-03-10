@@ -2319,8 +2319,59 @@ fn make_object() -> JsValue {
                     }
                     if let Some(JsValue::PlainObject(desc)) = borrow.get(key) {
                         let desc_borrow = desc.borrow();
+                        // Extract descriptor attributes
+                        let writable = desc_borrow
+                            .get("writable")
+                            .and_then(|v| {
+                                if let JsValue::Boolean(b) = v {
+                                    Some(*b)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(false);
+                        let enumerable = desc_borrow
+                            .get("enumerable")
+                            .and_then(|v| {
+                                if let JsValue::Boolean(b) = v {
+                                    Some(*b)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(false);
+                        let configurable = desc_borrow
+                            .get("configurable")
+                            .and_then(|v| {
+                                if let JsValue::Boolean(b) = v {
+                                    Some(*b)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(false);
+                        let mut attrs = PropertyAttributes::empty();
+                        if writable {
+                            attrs |= PropertyAttributes::WRITABLE;
+                        }
+                        if enumerable {
+                            attrs |= PropertyAttributes::ENUMERABLE;
+                        }
+                        if configurable {
+                            attrs |= PropertyAttributes::CONFIGURABLE;
+                        }
+                        // Handle accessor descriptors
+                        if let Some(getter) = desc_borrow.get("get") {
+                            let getter_key = format!("__get_{key}__");
+                            map.insert(getter_key, getter.clone());
+                        }
+                        if let Some(setter) = desc_borrow.get("set") {
+                            let setter_key = format!("__set_{key}__");
+                            map.insert(setter_key, setter.clone());
+                        }
+                        // Handle data descriptor
                         if let Some(value) = desc_borrow.get("value") {
-                            map.insert(key.clone(), value.clone());
+                            map.insert_with_attrs(key.clone(), value.clone(), attrs);
                         }
                     }
                 }
