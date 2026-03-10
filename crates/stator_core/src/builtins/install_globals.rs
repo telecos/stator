@@ -1948,10 +1948,8 @@ fn make_object() -> JsValue {
 
                         // Determine enumerable/configurable from descriptor
                         // (default false per spec for defineProperty).
-                        let enumerable =
-                            matches!(desc.get("enumerable"), Some(JsValue::Boolean(true)));
-                        let configurable =
-                            matches!(desc.get("configurable"), Some(JsValue::Boolean(true)));
+                        let enumerable = desc.get("enumerable").is_some_and(|v| v.to_boolean());
+                        let configurable = desc.get("configurable").is_some_and(|v| v.to_boolean());
                         let mut accessor_attrs = PropertyAttributes::empty();
                         if enumerable {
                             accessor_attrs |= PropertyAttributes::ENUMERABLE;
@@ -1973,75 +1971,57 @@ fn make_object() -> JsValue {
                     } else {
                         // Data descriptor.
                         let has_value = desc.contains_key("value");
-                        let has_writable = desc.contains_key("writable");
 
-                        if has_value {
-                            let value = desc.get("value").cloned().unwrap_or(JsValue::Undefined);
+                        // Coerce attribute values to boolean per ECMAScript spec.
+                        let writable_val = desc.get("writable").map(|v| v.to_boolean());
+                        let enumerable_val = desc.get("enumerable").map(|v| v.to_boolean());
+                        let configurable_val = desc.get("configurable").map(|v| v.to_boolean());
+
+                        if !map.borrow().contains_key(&key) {
+                            // New property: default attrs are all false per spec.
+                            let value = if has_value {
+                                desc.get("value").cloned().unwrap_or(JsValue::Undefined)
+                            } else {
+                                JsValue::Undefined
+                            };
                             // Remove any existing accessor for this key.
                             let getter_key = format!("__get_{key}__");
                             let setter_key = format!("__set_{key}__");
                             map.borrow_mut().remove(&getter_key);
                             map.borrow_mut().remove(&setter_key);
 
-                            if !map.borrow().contains_key(&key) {
-                                // New property: default attrs per spec (all false
-                                // for defineProperty, unlike ordinary assignment).
-                                let mut attrs = PropertyAttributes::empty();
-                                if matches!(desc.get("writable"), Some(JsValue::Boolean(true))) {
-                                    attrs |= PropertyAttributes::WRITABLE;
-                                }
-                                if matches!(desc.get("enumerable"), Some(JsValue::Boolean(true))) {
-                                    attrs |= PropertyAttributes::ENUMERABLE;
-                                }
-                                if matches!(desc.get("configurable"), Some(JsValue::Boolean(true)))
-                                {
-                                    attrs |= PropertyAttributes::CONFIGURABLE;
-                                }
-                                map.borrow_mut()
-                                    .insert_with_attrs(key.clone(), value, attrs);
-                            } else {
-                                map.borrow_mut().insert(key.clone(), value);
-                                // Apply individual attribute flags if provided.
-                                if let Some(JsValue::Boolean(w)) = desc.get("writable") {
-                                    map.borrow_mut().set_writable(&key, *w);
-                                }
-                                if let Some(JsValue::Boolean(e)) = desc.get("enumerable") {
-                                    map.borrow_mut().set_enumerable(&key, *e);
-                                }
-                                if let Some(JsValue::Boolean(c)) = desc.get("configurable") {
-                                    map.borrow_mut().set_configurable(&key, *c);
-                                }
+                            let mut attrs = PropertyAttributes::empty();
+                            if writable_val.unwrap_or(false) {
+                                attrs |= PropertyAttributes::WRITABLE;
                             }
+                            if enumerable_val.unwrap_or(false) {
+                                attrs |= PropertyAttributes::ENUMERABLE;
+                            }
+                            if configurable_val.unwrap_or(false) {
+                                attrs |= PropertyAttributes::CONFIGURABLE;
+                            }
+                            map.borrow_mut()
+                                .insert_with_attrs(key.clone(), value, attrs);
                         } else {
-                            // Partial descriptor — no value key.  Ensure the
-                            // property exists so attribute setters can act on it.
-                            if !map.borrow().contains_key(&key) && has_writable {
-                                let mut attrs = PropertyAttributes::empty();
-                                if matches!(desc.get("writable"), Some(JsValue::Boolean(true))) {
-                                    attrs |= PropertyAttributes::WRITABLE;
-                                }
-                                if matches!(desc.get("enumerable"), Some(JsValue::Boolean(true))) {
-                                    attrs |= PropertyAttributes::ENUMERABLE;
-                                }
-                                if matches!(desc.get("configurable"), Some(JsValue::Boolean(true)))
-                                {
-                                    attrs |= PropertyAttributes::CONFIGURABLE;
-                                }
-                                map.borrow_mut().insert_with_attrs(
-                                    key.clone(),
-                                    JsValue::Undefined,
-                                    attrs,
-                                );
-                            } else {
-                                if let Some(JsValue::Boolean(w)) = desc.get("writable") {
-                                    map.borrow_mut().set_writable(&key, *w);
-                                }
-                                if let Some(JsValue::Boolean(e)) = desc.get("enumerable") {
-                                    map.borrow_mut().set_enumerable(&key, *e);
-                                }
-                                if let Some(JsValue::Boolean(c)) = desc.get("configurable") {
-                                    map.borrow_mut().set_configurable(&key, *c);
-                                }
+                            // Existing property: update only supplied fields.
+                            if has_value {
+                                let value =
+                                    desc.get("value").cloned().unwrap_or(JsValue::Undefined);
+                                // Remove any existing accessor for this key.
+                                let getter_key = format!("__get_{key}__");
+                                let setter_key = format!("__set_{key}__");
+                                map.borrow_mut().remove(&getter_key);
+                                map.borrow_mut().remove(&setter_key);
+                                map.borrow_mut().insert(key.clone(), value);
+                            }
+                            if let Some(w) = writable_val {
+                                map.borrow_mut().set_writable(&key, w);
+                            }
+                            if let Some(e) = enumerable_val {
+                                map.borrow_mut().set_enumerable(&key, e);
+                            }
+                            if let Some(c) = configurable_val {
+                                map.borrow_mut().set_configurable(&key, c);
                             }
                         }
                     }
@@ -2803,6 +2783,25 @@ fn make_object() -> JsValue {
         }),
     );
 
+    // Object.prototype.propertyIsEnumerable(key)
+    obj_proto.insert(
+        "propertyIsEnumerable".into(),
+        native(|args| {
+            let this = args.first().unwrap_or(&JsValue::Undefined);
+            let key = args.get(1).unwrap_or(&JsValue::Undefined);
+            let prop = key.to_js_string()?;
+            match this {
+                JsValue::PlainObject(map) => {
+                    let borrow = map.borrow();
+                    let exists = borrow.contains_key(&prop) && prop != "__proto__";
+                    let enumerable = exists && borrow.is_enumerable(&prop);
+                    Ok(JsValue::Boolean(enumerable))
+                }
+                _ => Ok(JsValue::Boolean(false)),
+            }
+        }),
+    );
+
     // Annex B §B.2.2.1 — Object.prototype.__proto__ (terminal null)
     obj_proto.insert("__proto__".into(), JsValue::Null);
 
@@ -2936,12 +2935,27 @@ fn make_array() -> JsValue {
         "push".into(),
         native(|args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Array(items) = arr {
-                let mut vec = items.borrow().clone();
-                vec.extend_from_slice(&args[1..]);
-                Ok(JsValue::Smi(vec.len() as i32))
-            } else {
-                Ok(JsValue::Undefined)
+            match arr {
+                JsValue::Array(items) => {
+                    let mut vec = items.borrow_mut();
+                    vec.extend_from_slice(&args[1..]);
+                    Ok(JsValue::Smi(vec.len() as i32))
+                }
+                JsValue::PlainObject(map) => {
+                    let mut borrow = map.borrow_mut();
+                    let len = match borrow.get("length") {
+                        Some(JsValue::Smi(n)) => *n as usize,
+                        Some(JsValue::HeapNumber(n)) => *n as usize,
+                        _ => 0,
+                    };
+                    for (i, item) in args.iter().skip(1).enumerate() {
+                        borrow.insert((len + i).to_string(), item.clone());
+                    }
+                    let new_len = len + args.len() - 1;
+                    borrow.insert("length".to_string(), JsValue::Smi(new_len as i32));
+                    Ok(JsValue::Smi(new_len as i32))
+                }
+                _ => Ok(JsValue::Undefined),
             }
         }),
     );
@@ -3070,23 +3084,19 @@ fn make_array() -> JsValue {
         "join".into(),
         native(|args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
-            if let JsValue::Array(items) = arr {
-                let sep = match args.get(1) {
-                    Some(JsValue::Undefined) | None => ",".to_string(),
-                    Some(v) => v.to_js_string()?,
-                };
-                let parts: Vec<String> = items
-                    .borrow()
-                    .iter()
-                    .map(|v| match v {
-                        JsValue::Undefined | JsValue::Null => Ok(String::new()),
-                        other => other.to_js_string(),
-                    })
-                    .collect::<StatorResult<_>>()?;
-                Ok(JsValue::String(parts.join(&sep).into()))
-            } else {
-                Ok(JsValue::String(String::new().into()))
-            }
+            let sep = match args.get(1) {
+                Some(JsValue::Undefined) | None => ",".to_string(),
+                Some(v) => v.to_js_string()?,
+            };
+            let (elements, _len) = to_array_like_elements(arr);
+            let parts: Vec<String> = elements
+                .iter()
+                .map(|v| match v {
+                    JsValue::Undefined | JsValue::Null => Ok(String::new()),
+                    other => other.to_js_string(),
+                })
+                .collect::<StatorResult<_>>()?;
+            Ok(JsValue::String(parts.join(&sep).into()))
         }),
     );
 
