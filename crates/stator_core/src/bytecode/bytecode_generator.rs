@@ -900,6 +900,19 @@ impl FunctionCompiler {
                         self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
                     }
                     self.emit_star(reg);
+                    // Top-level var declarations must also be stored as
+                    // globals so that nested functions (which use
+                    // LdaGlobal) can see them — same as function
+                    // declarations (compile_fn_decl).
+                    if self.is_program {
+                        let name_idx = self.add_string(&ident.name);
+                        let sta_slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
+                        self.emit_ldar(reg);
+                        self.emit(Instruction::new_unchecked(
+                            Opcode::StaGlobal,
+                            vec![Operand::ConstantPoolIdx(name_idx), sta_slot],
+                        ));
+                    }
                     Ok(Some(reg))
                 }
             }
