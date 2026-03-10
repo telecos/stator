@@ -2765,11 +2765,12 @@ fn make_array() -> JsValue {
         }),
     );
 
-    // Array.from(iterable)
+    // Array.from(iterable, mapFn?, thisArg?)
     props.insert(
         "from".into(),
         native(|args| {
             let iterable = args.first().unwrap_or(&JsValue::Undefined);
+            let map_fn = args.get(1).cloned();
             let items: Vec<JsValue> = match iterable {
                 JsValue::Array(arr) => arr.borrow().clone(),
                 JsValue::String(s) => s
@@ -2778,13 +2779,19 @@ fn make_array() -> JsValue {
                     .collect(),
                 JsValue::PlainObject(map) => {
                     let borrow = map.borrow();
-                    if borrow.get("__is_array__").is_some() {
-                        let len = match borrow.get("length") {
-                            Some(JsValue::Smi(n)) => *n as usize,
+                    if let Some(len_val) = borrow.get("length") {
+                        let len = match len_val {
+                            JsValue::Smi(n) => *n as usize,
+                            JsValue::HeapNumber(n) => n.trunc() as usize,
                             _ => 0,
                         };
                         (0..len)
-                            .filter_map(|i| borrow.get(&i.to_string()).cloned())
+                            .map(|i| {
+                                borrow
+                                    .get(&i.to_string())
+                                    .cloned()
+                                    .unwrap_or(JsValue::Undefined)
+                            })
                             .collect()
                     } else {
                         vec![]
@@ -2803,7 +2810,17 @@ fn make_array() -> JsValue {
                 }
                 _ => Vec::new(),
             };
-            Ok(JsValue::new_array(items))
+            // Apply mapFn if provided.
+            let mapped = if let Some(JsValue::NativeFunction(f)) = map_fn {
+                items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| f(vec![v, JsValue::Smi(i as i32)]))
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                items
+            };
+            Ok(JsValue::new_array(mapped))
         }),
     );
 

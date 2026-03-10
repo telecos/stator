@@ -1707,31 +1707,39 @@ pub(super) fn concat_rc_strs(l: &str, r: &str) -> JsValue {
     })
 }
 
-/// ECMAScript `+` operator: string concatenation or numeric addition.
+/// ECMAScript §13.15.3 **ApplyStringOrNumericBinaryOperator** for `+`.
 ///
-/// If either operand is already a string, both are converted to strings and
-/// concatenated.  Otherwise both are converted to numbers and added.
+/// 1. Call `ToPrimitive` on both operands (with no hint, i.e. `Default`).
+/// 2. If *either* resulting primitive is a string, convert both to strings and
+///    concatenate.
+/// 3. Otherwise, convert both to numbers and add.
+///
 /// BigInt operands are added together; mixing BigInt and Number is a TypeError.
 ///
 /// String concatenation reuses a thread-local buffer so that chains like
 /// `a + b + c + d` avoid allocating a fresh `String` for every intermediate
 /// result.
 pub(super) fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
-    if lhs.is_string() || rhs.is_string() {
-        let l = lhs.to_js_string()?;
-        let r = rhs.to_js_string()?;
+    // §12.8.3 step 1-2: ToPrimitive on both operands.
+    let lprim = lhs.to_primitive(crate::objects::value::ToPrimitiveHint::Default)?;
+    let rprim = rhs.to_primitive(crate::objects::value::ToPrimitiveHint::Default)?;
+
+    // §12.8.3 step 3: if either primitive is a string, concatenate.
+    if lprim.is_string() || rprim.is_string() {
+        let l = lprim.to_js_string()?;
+        let r = rprim.to_js_string()?;
         let total = l.len().saturating_add(r.len());
         if total > crate::builtins::string::MAX_STRING_LEN {
             return Err(StatorError::RangeError("Invalid string length".into()));
         }
         Ok(concat_rc_strs(&l, &r))
-    } else if lhs.is_bigint() || rhs.is_bigint() {
-        let l = to_bigint(lhs)?;
-        let r = to_bigint(rhs)?;
+    } else if lprim.is_bigint() || rprim.is_bigint() {
+        let l = to_bigint(&lprim)?;
+        let r = to_bigint(&rprim)?;
         Ok(JsValue::BigInt(l.wrapping_add(r)))
     } else {
-        let l = lhs.to_number()?;
-        let r = rhs.to_number()?;
+        let l = lprim.to_number()?;
+        let r = rprim.to_number()?;
         Ok(number_to_jsvalue(l + r))
     }
 }
