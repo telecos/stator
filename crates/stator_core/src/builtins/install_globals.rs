@@ -133,7 +133,7 @@ use crate::interpreter::{dispatch_call_value, dispatch_call_with_this};
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
-use crate::objects::value::JsValue;
+use crate::objects::value::{JsValue, NativeIterator};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -884,32 +884,32 @@ fn make_console() -> JsValue {
     props.insert(
         "log".into(),
         native(|args: Vec<JsValue>| {
-            let parts: StatorResult<Vec<String>> = args.iter().map(|a| a.to_js_string()).collect();
-            println!("{}", parts?.join(" "));
+            let parts: Vec<String> = args.iter().map(|a| a.to_display_string()).collect();
+            println!("{}", parts.join(" "));
             Ok(JsValue::Undefined)
         }),
     );
     props.insert(
         "warn".into(),
         native(|args: Vec<JsValue>| {
-            let parts: StatorResult<Vec<String>> = args.iter().map(|a| a.to_js_string()).collect();
-            eprintln!("{}", parts?.join(" "));
+            let parts: Vec<String> = args.iter().map(|a| a.to_display_string()).collect();
+            eprintln!("{}", parts.join(" "));
             Ok(JsValue::Undefined)
         }),
     );
     props.insert(
         "error".into(),
         native(|args: Vec<JsValue>| {
-            let parts: StatorResult<Vec<String>> = args.iter().map(|a| a.to_js_string()).collect();
-            eprintln!("{}", parts?.join(" "));
+            let parts: Vec<String> = args.iter().map(|a| a.to_display_string()).collect();
+            eprintln!("{}", parts.join(" "));
             Ok(JsValue::Undefined)
         }),
     );
     props.insert(
         "info".into(),
         native(|args: Vec<JsValue>| {
-            let parts: StatorResult<Vec<String>> = args.iter().map(|a| a.to_js_string()).collect();
-            println!("{}", parts?.join(" "));
+            let parts: Vec<String> = args.iter().map(|a| a.to_display_string()).collect();
+            println!("{}", parts.join(" "));
             Ok(JsValue::Undefined)
         }),
     );
@@ -3836,9 +3836,9 @@ fn make_array() -> JsValue {
                 let keys: Vec<JsValue> = (0..items.borrow().len())
                     .map(|i| JsValue::Smi(i as i32))
                     .collect();
-                Ok(JsValue::new_array(keys))
+                Ok(JsValue::Iterator(NativeIterator::from_items(keys)))
             } else {
-                Ok(JsValue::new_array(Vec::new()))
+                Ok(JsValue::Iterator(NativeIterator::from_items(Vec::new())))
             }
         }),
     );
@@ -3850,9 +3850,11 @@ fn make_array() -> JsValue {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
-                Ok(JsValue::new_array(items.borrow().clone()))
+                Ok(JsValue::Iterator(NativeIterator::from_items(
+                    items.borrow().clone(),
+                )))
             } else {
-                Ok(JsValue::new_array(Vec::new()))
+                Ok(JsValue::Iterator(NativeIterator::from_items(Vec::new())))
             }
         }),
     );
@@ -3870,9 +3872,25 @@ fn make_array() -> JsValue {
                     .enumerate()
                     .map(|(i, v)| JsValue::new_array(vec![JsValue::Smi(i as i32), v.clone()]))
                     .collect();
-                Ok(JsValue::new_array(entries))
+                Ok(JsValue::Iterator(NativeIterator::from_items(entries)))
             } else {
-                Ok(JsValue::new_array(Vec::new()))
+                Ok(JsValue::Iterator(NativeIterator::from_items(Vec::new())))
+            }
+        }),
+    );
+
+    // [Symbol.iterator]() — same as values() per §23.1.3.34
+    proto.insert(
+        "@@iterator".into(),
+        builtin_fn("values", 0, |args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            require_object_coercible(arr)?;
+            if let JsValue::Array(items) = arr {
+                Ok(JsValue::Iterator(NativeIterator::from_items(
+                    items.borrow().clone(),
+                )))
+            } else {
+                Ok(JsValue::Iterator(NativeIterator::from_items(Vec::new())))
             }
         }),
     );
@@ -4305,6 +4323,15 @@ fn make_iterator() -> JsValue {
             let iter = args.first().unwrap_or(&JsValue::Undefined);
             let predicate = args.get(1).unwrap_or(&JsValue::Undefined);
             iterator_find(iter, predicate)
+        }),
+    );
+
+    // §27.1.2 %IteratorPrototype%[@@iterator]() — returns `this`.
+    proto.insert(
+        "@@iterator".into(),
+        native(|args| {
+            let iter = args.first().unwrap_or(&JsValue::Undefined).clone();
+            Ok(iter)
         }),
     );
 
@@ -5558,6 +5585,10 @@ fn make_string() -> JsValue {
         "__call__".into(),
         native(|args| {
             let val = args.first().unwrap_or(&JsValue::Undefined);
+            // §22.1.1.1: If value is a Symbol, return SymbolDescriptiveString.
+            if let JsValue::Symbol(id) = val {
+                return Ok(JsValue::String(format!("Symbol({id})").into()));
+            }
             Ok(JsValue::String(val.to_js_string()?.into()))
         }),
     );
@@ -6185,7 +6216,7 @@ fn make_string() -> JsValue {
         }),
     );
 
-    // [Symbol.iterator]() — returns the code-point iteration as an array.
+    // [Symbol.iterator]() — returns an iterator over Unicode code points.
     proto.insert(
         "@@iterator".into(),
         native(|args| {
@@ -6194,7 +6225,7 @@ fn make_string() -> JsValue {
                 .into_iter()
                 .map(|s| JsValue::String(s.into()))
                 .collect();
-            Ok(JsValue::new_array(chars))
+            Ok(JsValue::Iterator(NativeIterator::from_items(chars)))
         }),
     );
 
@@ -6830,6 +6861,7 @@ fn make_intl() -> JsValue {
                         Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                     }),
                 );
+                obj.make_all_non_enumerable();
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
         );
@@ -6878,6 +6910,7 @@ fn make_intl() -> JsValue {
                         Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                     }),
                 );
+                obj.make_all_non_enumerable();
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
         );
@@ -6922,6 +6955,7 @@ fn make_intl() -> JsValue {
                         Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                     }),
                 );
+                obj.make_all_non_enumerable();
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
         );
@@ -6961,6 +6995,7 @@ fn make_intl() -> JsValue {
                         Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                     }),
                 );
+                obj.make_all_non_enumerable();
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
         );
@@ -7023,6 +7058,7 @@ fn make_intl() -> JsValue {
                         Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                     }),
                 );
+                obj.make_all_non_enumerable();
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
         );
@@ -7075,6 +7111,7 @@ fn make_intl() -> JsValue {
                         Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                     }),
                 );
+                obj.make_all_non_enumerable();
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
         );
@@ -7129,6 +7166,7 @@ fn make_intl() -> JsValue {
                         Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                     }),
                 );
+                obj.make_all_non_enumerable();
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
         );
@@ -7185,6 +7223,7 @@ fn make_intl() -> JsValue {
                         Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                     }),
                 );
+                obj.make_all_non_enumerable();
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
         );
@@ -7234,6 +7273,7 @@ fn make_intl() -> JsValue {
                     "toString".into(),
                     native(move |_| Ok(JsValue::String(tag.clone().into()))),
                 );
+                obj.make_all_non_enumerable();
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
             }),
         );
@@ -8141,7 +8181,7 @@ fn make_typed_array_instance(
             "entries".into(),
             native(move |_| {
                 let items = typed_array_entries(&inner.borrow());
-                Ok(JsValue::new_array(items))
+                Ok(JsValue::Iterator(NativeIterator::from_items(items)))
             }),
         );
     }
@@ -8371,7 +8411,7 @@ fn make_typed_array_instance(
             "keys".into(),
             native(move |_| {
                 let items = typed_array_keys(&inner.borrow());
-                Ok(JsValue::new_array(items))
+                Ok(JsValue::Iterator(NativeIterator::from_items(items)))
             }),
         );
     }
@@ -8619,7 +8659,7 @@ fn make_typed_array_instance(
             "values".into(),
             native(move |_| {
                 let items = typed_array_values(&inner.borrow());
-                Ok(JsValue::new_array(items))
+                Ok(JsValue::Iterator(NativeIterator::from_items(items)))
             }),
         );
     }
@@ -8630,7 +8670,7 @@ fn make_typed_array_instance(
             "@@iterator".into(),
             native(move |_| {
                 let items = typed_array_values(&inner.borrow());
-                Ok(JsValue::new_array(items))
+                Ok(JsValue::Iterator(NativeIterator::from_items(items)))
             }),
         );
     }
@@ -8697,6 +8737,7 @@ fn make_shadow_realm() -> JsValue {
         // importValue(specifier, exportName) — stub returning undefined
         props.insert("importValue".into(), native(|_args| Ok(JsValue::Undefined)));
 
+        props.make_all_non_enumerable();
         Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
     })
 }
@@ -8742,6 +8783,7 @@ fn make_shared_arraybuffer() -> JsValue {
             }),
         );
         props.insert("__buffer__".into(), JsValue::ArrayBuffer(Rc::clone(&inner)));
+        props.make_all_non_enumerable();
         Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
     })
 }

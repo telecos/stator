@@ -743,6 +743,18 @@ impl JsValue {
         }
     }
 
+    /// Console-safe string conversion that never throws.
+    ///
+    /// Unlike [`to_js_string`](Self::to_js_string), this handles `Symbol`
+    /// values by formatting them as `"Symbol(<id>)"` rather than returning
+    /// a `TypeError`.  Used by `console.log` and similar debugging output.
+    pub fn to_display_string(&self) -> String {
+        match self {
+            Self::Symbol(id) => format!("Symbol({id})"),
+            _ => self.to_js_string().unwrap_or_else(|_| format!("{self}")),
+        }
+    }
+
     /// ECMAScript §7.1.6 **ToInt32**.
     ///
     /// Converts the value to a number via [`to_number`][Self::to_number], then
