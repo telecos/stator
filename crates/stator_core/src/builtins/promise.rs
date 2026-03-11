@@ -43,6 +43,55 @@ type MicrotaskQueueInner = Rc<RefCell<VecDeque<Box<dyn FnOnce()>>>>;
 /// reject it.
 pub type PromiseHandler = Box<dyn Fn(JsValue) -> Result<JsValue, JsValue>>;
 
+// ── Thread-local active microtask queue ───────────────────────────────────────
+
+thread_local! {
+    /// The active microtask queue for the current thread, set by
+    /// [`install_active_microtask_queue`] during globals installation.
+    static ACTIVE_MTQ: RefCell<Option<MicrotaskQueue>> = const { RefCell::new(None) };
+}
+
+/// Install a [`MicrotaskQueue`] as the thread-local active queue.
+///
+/// Called by `make_promise()` during globals installation so that external
+/// code (e.g. the Test262 runner) can drain microtasks after executing JS.
+pub fn install_active_microtask_queue(q: &MicrotaskQueue) {
+    ACTIVE_MTQ.with(|cell| *cell.borrow_mut() = Some(q.clone()));
+}
+
+/// Drain the thread-local active microtask queue (if any).
+///
+/// This should be called after executing JS code that may have enqueued
+/// promise reactions (e.g. `Promise.resolve(x).then(cb)`).  Returns the
+/// number of microtasks that were drained, or 0 if no queue is installed.
+pub fn drain_active_microtask_queue() -> usize {
+    ACTIVE_MTQ.with(|cell| {
+        if let Some(q) = cell.borrow().as_ref() {
+            let mut count = 0usize;
+            loop {
+                let task = q.0.borrow_mut().pop_front();
+                match task {
+                    Some(t) => {
+                        t();
+                        count += 1;
+                    }
+                    None => break,
+                }
+            }
+            count
+        } else {
+            0
+        }
+    })
+}
+
+/// Clear the thread-local active microtask queue reference.
+///
+/// Call this when tearing down globals to avoid stale references.
+pub fn clear_active_microtask_queue() {
+    ACTIVE_MTQ.with(|cell| *cell.borrow_mut() = None);
+}
+
 // ── MicrotaskQueue ─────────────────────────────────────────────────────────────
 
 /// FIFO microtask queue.

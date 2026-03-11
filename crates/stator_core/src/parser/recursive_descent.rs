@@ -31,13 +31,14 @@ use crate::parser::ast::{
     EmptyStmt, ExportAllDecl, ExportDefaultDecl, ExportDefaultExpr, ExportNamedDecl,
     ExportSpecifier, Expr, ExprStmt, FnDecl, FnExpr, ForInOfLeft, ForInStmt, ForInit, ForOfStmt,
     ForStmt, Ident, IfStmt, ImportDecl, ImportDefaultSpecifier, ImportExpr, ImportNamedSpecifier,
-    ImportNamespaceSpecifier, ImportSpecifier, KeyValuePatProp, LogicalExpr, LogicalOp, MemberProp,
-    MetaPropExpr, MethodDef, MethodKind, ModuleDecl, ModuleExportName, NewExpr, NullLit, NumLit,
-    ObjectExpr, ObjectPat, ObjectPatProp, ObjectProp, Param, Pat, PrivateIdent, Program,
-    ProgramItem, Prop, PropKey, PropValue, PropertyDef, RegExpLit, RestElement, ReturnStmt,
-    SequenceExpr, SourceLocation, SourceType, SpreadElement, StaticBlock, Stmt, StringLit,
-    SwitchCase, SwitchStmt, TemplateElement, TemplateLit, ThrowStmt, TryStmt, UnaryExpr, UnaryOp,
-    UpdateExpr, UpdateOp, VarDecl, VarDeclarator, VarKind, WhileStmt, WithStmt, YieldExpr,
+    ImportNamespaceSpecifier, ImportSpecifier, KeyValuePatProp, LabeledStmt, LogicalExpr,
+    LogicalOp, MemberProp, MetaPropExpr, MethodDef, MethodKind, ModuleDecl, ModuleExportName,
+    NewExpr, NullLit, NumLit, ObjectExpr, ObjectPat, ObjectPatProp, ObjectProp, Param, Pat,
+    PrivateIdent, Program, ProgramItem, Prop, PropKey, PropValue, PropertyDef, RegExpLit,
+    RestElement, ReturnStmt, SequenceExpr, SourceLocation, SourceType, SpreadElement, StaticBlock,
+    Stmt, StringLit, SwitchCase, SwitchStmt, TemplateElement, TemplateLit, ThrowStmt, TryStmt,
+    UnaryExpr, UnaryOp, UpdateExpr, UpdateOp, VarDecl, VarDeclarator, VarKind, WhileStmt, WithStmt,
+    YieldExpr,
 };
 use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue};
 
@@ -382,6 +383,34 @@ impl<'src> Parser<'src> {
                 self.bump()?; // consume `await`
                 let tok = self.bump()?; // consume `using`
                 self.parse_var_decl(VarKind::AwaitUsing, Self::merge_spans(start, tok.span))
+            }
+            // Labeled statement: `identifier : stmt`
+            TokenKind::Identifier => {
+                let saved_scanner = self.scanner.clone();
+                let saved_current = self.current.clone();
+                let id_tok = self.bump()?; // consume identifier
+                if self.peek_kind() == TokenKind::Colon {
+                    self.bump()?; // consume ':'
+                    let label = self.ident_from_token(&id_tok)?;
+                    let body = self.parse_stmt()?;
+                    // Strict mode: labelled function declarations are a SyntaxError.
+                    if self.strict_mode && matches!(body, Stmt::FnDecl(_)) {
+                        return Err(Self::error_at(
+                            label.loc,
+                            "labelled function declarations are not allowed in strict mode",
+                        ));
+                    }
+                    let end = body.loc();
+                    return Ok(Stmt::Labeled(LabeledStmt {
+                        loc: Self::merge_spans(id_tok.span, end),
+                        label,
+                        body: Box::new(body),
+                    }));
+                }
+                // Not a label — restore and parse as expression statement.
+                self.scanner = saved_scanner;
+                self.current = saved_current;
+                self.parse_expr_stmt()
             }
             _ => self.parse_expr_stmt(),
         }
@@ -1672,6 +1701,58 @@ impl<'src> Parser<'src> {
         Ok(())
     }
 
+    /// Strict mode: octal escape sequences in strings (e.g. `"\012"`,
+    /// `"\1"`) and non-octal decimal escapes (`"\8"`, `"\9"`) are a
+    /// SyntaxError.  `"\0"` alone (not followed by another digit) is
+    /// permitted (it's a `<NUL>` escape, not octal).
+    fn check_octal_escape(raw: &str, span: Span) -> StatorResult<()> {
+        let bytes = raw.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+        while i < len {
+            if bytes[i] == b'\\' {
+                i += 1;
+                if i >= len {
+                    break;
+                }
+                let ch = bytes[i];
+                // `\1`–`\7` are legacy octal; `\8` and `\9` are non-octal
+                // decimal escapes — all forbidden in strict mode.
+                if (b'1'..=b'9').contains(&ch) {
+                    return Err(Self::error_at(
+                        span,
+                        "octal escape sequences are not allowed in strict mode",
+                    ));
+                }
+                // `\0` followed by another digit is legacy octal.
+                if ch == b'0' && i + 1 < len && bytes[i + 1].is_ascii_digit() {
+                    return Err(Self::error_at(
+                        span,
+                        "octal escape sequences are not allowed in strict mode",
+                    ));
+                }
+                // Skip multi-character escapes to avoid false positives on
+                // their hex digits.
+                if ch == b'u' {
+                    i += 1;
+                    if i < len && bytes[i] == b'{' {
+                        while i < len && bytes[i] != b'}' {
+                            i += 1;
+                        }
+                    } else {
+                        // \uHHHH — skip 4 hex digits
+                        i += 4;
+                    }
+                } else if ch == b'x' {
+                    // \xHH — skip 2 hex digits
+                    i += 2;
+                }
+            }
+            i += 1;
+        }
+        Ok(())
+    }
+
     fn parse_binding_pat(&mut self) -> StatorResult<Pat> {
         match self.peek_kind() {
             TokenKind::Identifier => {
@@ -2437,6 +2518,14 @@ impl<'src> Parser<'src> {
                 ));
             }
 
+            // Strict mode: `delete identifier` (unqualified) is a SyntaxError.
+            if op == UnaryOp::Delete && self.strict_mode && matches!(arg, Expr::Ident(_)) {
+                return Err(Self::error_at(
+                    Self::merge_spans(start, end),
+                    "deleting an unqualified identifier in strict mode is not allowed",
+                ));
+            }
+
             return Ok(Expr::Unary(Box::new(UnaryExpr {
                 loc: Self::merge_spans(start, end),
                 op,
@@ -2630,6 +2719,12 @@ impl<'src> Parser<'src> {
                     TokenValue::Str(s) => s,
                     _ => return Err(Self::error_at(tok.span, "invalid string token")),
                 };
+                // Strict mode: octal escape sequences (e.g. "\012", "\1") are
+                // not allowed.  "\0" alone (not followed by another digit) is
+                // permitted.
+                if self.strict_mode {
+                    Self::check_octal_escape(&value, tok.span)?;
+                }
                 Ok(Expr::Str(StringLit {
                     loc: tok.span,
                     value,

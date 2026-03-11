@@ -264,14 +264,25 @@ fn try_regexp_symbol(
     None
 }
 
-/// Extract a [`JsSet`] from a Set-like `PlainObject` by calling its `values()`
-/// method and collecting the resulting iterator.
+/// Extract a [`JsSet`] from a Set-like `PlainObject` by calling its `keys()`
+/// or `values()` method and collecting the resulting iterator.
+///
+/// Per ES2025 §7.3.45 `GetSetRecord`, the spec uses `.keys()` to iterate the
+/// other set.  We also fall back to `.values()` and `@@iterator` for
+/// compatibility with Map-like and other iterable objects.
 fn extract_set_from_arg(arg: &JsValue) -> StatorResult<crate::builtins::set::JsSet> {
     use crate::builtins::iterator::iterator_next;
     if let JsValue::PlainObject(map) = arg {
         let borrow = map.borrow();
-        if let Some(JsValue::NativeFunction(values_fn)) = borrow.get("values") {
-            let iter = values_fn(vec![])?;
+        // Try keys() first (spec-compliant for Set composition methods),
+        // then values(), then @@iterator as fallbacks.
+        let iter_fn = borrow
+            .get("keys")
+            .or_else(|| borrow.get("values"))
+            .or_else(|| borrow.get("@@iterator"))
+            .cloned();
+        if let Some(JsValue::NativeFunction(f)) = iter_fn {
+            let iter = f(vec![])?;
             drop(borrow);
             let mut items = Vec::new();
             loop {
@@ -398,6 +409,110 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
             }),
         );
     }
+    // ── ES2025 Set composition methods on returned instances ─────────
+    // union(other)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "union".into(),
+            native(move |a| {
+                let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                let other_set = extract_set_from_arg(other_val)?;
+                let result = set_union(&inner.borrow(), &other_set);
+                build_set_instance(result)
+            }),
+        );
+    }
+    // intersection(other)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "intersection".into(),
+            native(move |a| {
+                let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                let other_set = extract_set_from_arg(other_val)?;
+                let result = set_intersection(&inner.borrow(), &other_set);
+                build_set_instance(result)
+            }),
+        );
+    }
+    // difference(other)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "difference".into(),
+            native(move |a| {
+                let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                let other_set = extract_set_from_arg(other_val)?;
+                let result = set_difference(&inner.borrow(), &other_set);
+                build_set_instance(result)
+            }),
+        );
+    }
+    // symmetricDifference(other)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "symmetricDifference".into(),
+            native(move |a| {
+                let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                let other_set = extract_set_from_arg(other_val)?;
+                let result = set_symmetric_difference(&inner.borrow(), &other_set);
+                build_set_instance(result)
+            }),
+        );
+    }
+    // isSubsetOf(other)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "isSubsetOf".into(),
+            native(move |a| {
+                let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                let other_set = extract_set_from_arg(other_val)?;
+                Ok(JsValue::Boolean(set_is_subset_of(
+                    &inner.borrow(),
+                    &other_set,
+                )))
+            }),
+        );
+    }
+    // isSupersetOf(other)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "isSupersetOf".into(),
+            native(move |a| {
+                let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                let other_set = extract_set_from_arg(other_val)?;
+                Ok(JsValue::Boolean(set_is_superset_of(
+                    &inner.borrow(),
+                    &other_set,
+                )))
+            }),
+        );
+    }
+    // isDisjointFrom(other)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "isDisjointFrom".into(),
+            native(move |a| {
+                let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                let other_set = extract_set_from_arg(other_val)?;
+                Ok(JsValue::Boolean(set_is_disjoint_from(
+                    &inner.borrow(),
+                    &other_set,
+                )))
+            }),
+        );
+    }
+    // §24.2.3.12 Set.prototype[@@toStringTag] = "Set"
+    obj.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("Set".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
     obj.make_all_non_enumerable();
     Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
 }
@@ -6901,13 +7016,14 @@ fn make_string() -> JsValue {
 /// `allSettled`, `any`, `race`, `withResolvers`) are available as properties.
 fn make_promise() -> JsValue {
     use crate::builtins::promise::{
-        MicrotaskQueue, promise_all, promise_all_settled, promise_any, promise_catch,
-        promise_finally, promise_new, promise_race, promise_reject, promise_resolve, promise_then,
-        promise_with_resolvers,
+        MicrotaskQueue, install_active_microtask_queue, promise_all, promise_all_settled,
+        promise_any, promise_catch, promise_finally, promise_new, promise_race, promise_reject,
+        promise_resolve, promise_then, promise_with_resolvers,
     };
 
     let mut props = PropertyMap::new();
     let queue = MicrotaskQueue::new();
+    install_active_microtask_queue(&queue);
 
     // ── Constructor: new Promise(executor) ─────────────────────────────────
     //
