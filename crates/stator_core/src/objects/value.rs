@@ -659,6 +659,9 @@ impl JsValue {
             | Self::Symbol(_)
             | Self::BigInt(_) => Ok(self.clone()),
 
+            // TheHole is an internal sentinel — treat as undefined.
+            Self::TheHole => Ok(JsValue::Undefined),
+
             // PlainObject — check @@toPrimitive, then OrdinaryToPrimitive.
             Self::PlainObject(map) => {
                 // §7.1.1 step 2: check for @@toPrimitive method
@@ -696,7 +699,7 @@ impl JsValue {
     #[inline]
     pub fn to_number(&self) -> StatorResult<f64> {
         match self {
-            Self::Undefined => Ok(f64::NAN),
+            Self::Undefined | Self::TheHole => Ok(f64::NAN),
             Self::Null => Ok(0.0),
             Self::Boolean(b) => Ok(if *b { 1.0 } else { 0.0 }),
             Self::Smi(n) => Ok(f64::from(*n)),
@@ -725,7 +728,7 @@ impl JsValue {
     /// `String` hint, then the resulting primitive is converted to a string.
     pub fn to_js_string(&self) -> StatorResult<String> {
         match self {
-            Self::Undefined => Ok("undefined".to_string()),
+            Self::Undefined | Self::TheHole => Ok("undefined".to_string()),
             Self::Null => Ok("null".to_string()),
             Self::Boolean(b) => Ok(if *b { "true" } else { "false" }.to_string()),
             Self::Smi(n) => Ok(n.to_string()),
@@ -1539,6 +1542,28 @@ mod tests {
         assert!(JsValue::BigInt(-1).to_boolean());
     }
 
+    #[test]
+    fn test_to_boolean_thehole_is_false() {
+        assert!(!JsValue::TheHole.to_boolean());
+    }
+
+    #[test]
+    fn test_to_boolean_function_is_true() {
+        let f: NativeFn = Rc::new(|_| Ok(JsValue::Undefined));
+        assert!(JsValue::NativeFunction(f).to_boolean());
+    }
+
+    #[test]
+    fn test_to_boolean_array_is_true() {
+        assert!(JsValue::new_array(vec![]).to_boolean());
+    }
+
+    #[test]
+    fn test_to_boolean_plain_object_is_true() {
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+        assert!(obj.to_boolean());
+    }
+
     // ── to_primitive ─────────────────────────────────────────────────────────
 
     #[test]
@@ -1563,6 +1588,14 @@ mod tests {
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
         let prim = obj.to_primitive(ToPrimitiveHint::Default).unwrap();
         assert_eq!(prim, JsValue::String("[object Object]".to_string().into()));
+    }
+
+    #[test]
+    fn test_to_primitive_thehole_becomes_undefined() {
+        let prim = JsValue::TheHole
+            .to_primitive(ToPrimitiveHint::Default)
+            .unwrap();
+        assert_eq!(prim, JsValue::Undefined);
     }
 
     #[test]
@@ -1910,6 +1943,34 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_to_number_bigint_error_message() {
+        let err = JsValue::BigInt(0).to_number().unwrap_err();
+        match err {
+            StatorError::TypeError(msg) => {
+                assert_eq!(msg, "Cannot convert a BigInt value to a number");
+            }
+            other => panic!("Expected TypeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_to_number_symbol_error_message() {
+        let err = JsValue::Symbol(0).to_number().unwrap_err();
+        match err {
+            StatorError::TypeError(msg) => {
+                assert_eq!(msg, "Cannot convert a Symbol value to a number");
+            }
+            other => panic!("Expected TypeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_to_number_thehole_is_nan() {
+        let n = JsValue::TheHole.to_number().unwrap();
+        assert!(n.is_nan());
+    }
+
     // ── to_js_string ─────────────────────────────────────────────────────────
 
     #[test]
@@ -1980,6 +2041,11 @@ mod tests {
             JsValue::Symbol(1).to_js_string(),
             Err(StatorError::TypeError(_))
         ));
+    }
+
+    #[test]
+    fn test_to_js_string_thehole_is_undefined() {
+        assert_eq!(JsValue::TheHole.to_js_string().unwrap(), "undefined");
     }
 
     #[test]
