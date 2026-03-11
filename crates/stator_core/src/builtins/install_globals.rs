@@ -4810,8 +4810,7 @@ fn make_map_builtin() -> JsValue {
                     let receiver = args.first().unwrap_or(&JsValue::Undefined);
                     let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
                     if let JsValue::PlainObject(map) = receiver
-                        && let Some(JsValue::NativeFunction(f)) =
-                            map.borrow().get(&name).cloned()
+                        && let Some(JsValue::NativeFunction(f)) = map.borrow().get(&name).cloned()
                     {
                         return f(rest);
                     }
@@ -5113,8 +5112,7 @@ fn make_set_builtin() -> JsValue {
                     let receiver = args.first().unwrap_or(&JsValue::Undefined);
                     let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
                     if let JsValue::PlainObject(map) = receiver
-                        && let Some(JsValue::NativeFunction(f)) =
-                            map.borrow().get(&name).cloned()
+                        && let Some(JsValue::NativeFunction(f)) = map.borrow().get(&name).cloned()
                     {
                         return f(rest);
                     }
@@ -5246,8 +5244,7 @@ fn make_weak_map_builtin() -> JsValue {
                     let receiver = args.first().unwrap_or(&JsValue::Undefined);
                     let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
                     if let JsValue::PlainObject(map) = receiver
-                        && let Some(JsValue::NativeFunction(f)) =
-                            map.borrow().get(&name).cloned()
+                        && let Some(JsValue::NativeFunction(f)) = map.borrow().get(&name).cloned()
                     {
                         return f(rest);
                     }
@@ -5362,8 +5359,7 @@ fn make_weak_set_builtin() -> JsValue {
                     let receiver = args.first().unwrap_or(&JsValue::Undefined);
                     let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
                     if let JsValue::PlainObject(map) = receiver
-                        && let Some(JsValue::NativeFunction(f)) =
-                            map.borrow().get(&name).cloned()
+                        && let Some(JsValue::NativeFunction(f)) = map.borrow().get(&name).cloned()
                     {
                         return f(rest);
                     }
