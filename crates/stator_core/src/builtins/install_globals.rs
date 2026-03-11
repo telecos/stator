@@ -184,7 +184,7 @@ fn to_array_like_elements(val: &JsValue) -> (Vec<JsValue>, usize) {
                     if n.is_nan() || n < 0.0 {
                         0
                     } else {
-                        (n as u64).min(u32::MAX as u64) as usize
+                        crate::builtins::util::clamped_f64_to_usize(n)
                     }
                 }
                 None => 0,
@@ -4048,15 +4048,19 @@ fn make_array() -> JsValue {
                 return Ok(JsValue::Array(Rc::new(RefCell::new(Vec::new()))));
             }
             if args.len() == 1 {
-                if let Some(len) = match &args[0] {
-                    JsValue::Smi(n) if *n >= 0 => Some(*n as usize),
+                let numeric_len: Option<Result<usize, _>> = match &args[0] {
+                    JsValue::Smi(n) if *n >= 0 => {
+                        Some(crate::builtins::util::checked_f64_to_length(*n as f64))
+                    }
                     JsValue::HeapNumber(n)
                         if n.fract() == 0.0 && *n >= 0.0 && *n <= (u32::MAX as f64) =>
                     {
-                        Some(*n as usize)
+                        Some(crate::builtins::util::checked_f64_to_length(*n))
                     }
                     _ => None,
-                } {
+                };
+                if let Some(result) = numeric_len {
+                    let len = result?;
                     let v: Vec<JsValue> = vec![JsValue::Undefined; len];
                     return Ok(JsValue::Array(Rc::new(RefCell::new(v))));
                 }
