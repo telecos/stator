@@ -751,7 +751,7 @@ impl JsValue {
     pub fn to_display_string(&self) -> String {
         match self {
             Self::Symbol(id) => format!("Symbol({id})"),
-            _ => self.to_js_string().unwrap_or_else(|_| format!("{self}")),
+            _ => self.to_js_string().unwrap_or_else(|_| format!("{self:?}")),
         }
     }
 

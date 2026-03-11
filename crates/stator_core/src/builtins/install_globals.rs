@@ -4354,8 +4354,8 @@ fn make_iterator() -> JsValue {
         }),
     );
 
-    props.insert(
     proto.make_all_non_enumerable();
+    props.insert(
         "prototype".into(),
         JsValue::PlainObject(Rc::new(RefCell::new(proto))),
     );
