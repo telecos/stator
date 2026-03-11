@@ -142,6 +142,26 @@ fn native(f: impl Fn(Vec<JsValue>) -> StatorResult<JsValue> + 'static) -> JsValu
     JsValue::NativeFunction(Rc::new(f))
 }
 
+/// Create a built-in function object with `.name` and `.length` properties.
+///
+/// Per the ES spec, every built-in function should expose a non-enumerable,
+/// configurable `.name` (string) and `.length` (expected argument count).
+/// The returned `PlainObject` carries a `__call__` slot so the dispatch
+/// layer invokes the closure, plus the two metadata properties.
+fn builtin_fn(
+    name: &str,
+    length: i32,
+    f: impl Fn(Vec<JsValue>) -> StatorResult<JsValue> + 'static,
+) -> JsValue {
+    let mut props = PropertyMap::new();
+    let attrs = PropertyAttributes::CONFIGURABLE;
+    props.insert_with_attrs("name".into(), JsValue::String(name.into()), attrs);
+    props.insert_with_attrs("length".into(), JsValue::Smi(length), attrs);
+    props.insert("__call__".into(), JsValue::NativeFunction(Rc::new(f)));
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 /// Extract elements from an array-like value.
 ///
 /// Handles `JsValue::Array` (native vector), PlainObject arrays (with
@@ -418,6 +438,7 @@ fn make_error_constructor_object(kind: ErrorKind) -> JsValue {
             }
         }),
     );
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -526,6 +547,7 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
         "stackTraceLimit".into(),
         JsValue::Smi(get_stack_trace_limit() as i32),
     );
+    error_props.make_all_non_enumerable();
     globals.insert(
         "Error".into(),
         JsValue::PlainObject(Rc::new(RefCell::new(error_props))),
@@ -626,130 +648,171 @@ fn structured_clone(val: &JsValue) -> JsValue {
 fn make_math() -> JsValue {
     let mut props = PropertyMap::new();
 
-    // ── Constants ────────────────────────────────────────────────────────
-    props.insert("E".into(), JsValue::HeapNumber(MATH_E));
-    props.insert("LN2".into(), JsValue::HeapNumber(MATH_LN2));
-    props.insert("LN10".into(), JsValue::HeapNumber(MATH_LN10));
-    props.insert("LOG2E".into(), JsValue::HeapNumber(MATH_LOG2E));
-    props.insert("LOG10E".into(), JsValue::HeapNumber(MATH_LOG10E));
-    props.insert("PI".into(), JsValue::HeapNumber(MATH_PI));
-    props.insert("SQRT1_2".into(), JsValue::HeapNumber(MATH_SQRT1_2));
-    props.insert("SQRT2".into(), JsValue::HeapNumber(MATH_SQRT2));
+    // ── Constants (non-writable, non-enumerable, non-configurable) ─────
+    props.insert_with_attrs(
+        "E".into(),
+        JsValue::HeapNumber(MATH_E),
+        PropertyAttributes::empty(),
+    );
+    props.insert_with_attrs(
+        "LN2".into(),
+        JsValue::HeapNumber(MATH_LN2),
+        PropertyAttributes::empty(),
+    );
+    props.insert_with_attrs(
+        "LN10".into(),
+        JsValue::HeapNumber(MATH_LN10),
+        PropertyAttributes::empty(),
+    );
+    props.insert_with_attrs(
+        "LOG2E".into(),
+        JsValue::HeapNumber(MATH_LOG2E),
+        PropertyAttributes::empty(),
+    );
+    props.insert_with_attrs(
+        "LOG10E".into(),
+        JsValue::HeapNumber(MATH_LOG10E),
+        PropertyAttributes::empty(),
+    );
+    props.insert_with_attrs(
+        "PI".into(),
+        JsValue::HeapNumber(MATH_PI),
+        PropertyAttributes::empty(),
+    );
+    props.insert_with_attrs(
+        "SQRT1_2".into(),
+        JsValue::HeapNumber(MATH_SQRT1_2),
+        PropertyAttributes::empty(),
+    );
+    props.insert_with_attrs(
+        "SQRT2".into(),
+        JsValue::HeapNumber(MATH_SQRT2),
+        PropertyAttributes::empty(),
+    );
+
+    // ── @@toStringTag ────────────────────────────────────────────────────
+    props.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("Math".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
 
     // ── Single-argument methods ──────────────────────────────────────────
     props.insert(
         "abs".into(),
-        native(|args| Ok(num(math_abs(arg_f64(&args, 0)?)))),
+        builtin_fn("abs", 1, |args| Ok(num(math_abs(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "ceil".into(),
-        native(|args| Ok(num(math_ceil(arg_f64(&args, 0)?)))),
+        builtin_fn("ceil", 1, |args| Ok(num(math_ceil(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "floor".into(),
-        native(|args| Ok(num(math_floor(arg_f64(&args, 0)?)))),
+        builtin_fn("floor", 1, |args| Ok(num(math_floor(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "round".into(),
-        native(|args| Ok(num(math_round(arg_f64(&args, 0)?)))),
+        builtin_fn("round", 1, |args| Ok(num(math_round(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "trunc".into(),
-        native(|args| Ok(num(math_trunc(arg_f64(&args, 0)?)))),
+        builtin_fn("trunc", 1, |args| Ok(num(math_trunc(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "sign".into(),
-        native(|args| Ok(num(math_sign(arg_f64(&args, 0)?)))),
+        builtin_fn("sign", 1, |args| Ok(num(math_sign(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "sqrt".into(),
-        native(|args| Ok(num(math_sqrt(arg_f64(&args, 0)?)))),
+        builtin_fn("sqrt", 1, |args| Ok(num(math_sqrt(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "cbrt".into(),
-        native(|args| Ok(num(math_cbrt(arg_f64(&args, 0)?)))),
+        builtin_fn("cbrt", 1, |args| Ok(num(math_cbrt(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "log".into(),
-        native(|args| Ok(num(math_log(arg_f64(&args, 0)?)))),
+        builtin_fn("log", 1, |args| Ok(num(math_log(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "log2".into(),
-        native(|args| Ok(num(math_log2(arg_f64(&args, 0)?)))),
+        builtin_fn("log2", 1, |args| Ok(num(math_log2(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "log10".into(),
-        native(|args| Ok(num(math_log10(arg_f64(&args, 0)?)))),
+        builtin_fn("log10", 1, |args| Ok(num(math_log10(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "sin".into(),
-        native(|args| Ok(num(math_sin(arg_f64(&args, 0)?)))),
+        builtin_fn("sin", 1, |args| Ok(num(math_sin(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "cos".into(),
-        native(|args| Ok(num(math_cos(arg_f64(&args, 0)?)))),
+        builtin_fn("cos", 1, |args| Ok(num(math_cos(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "tan".into(),
-        native(|args| Ok(num(math_tan(arg_f64(&args, 0)?)))),
+        builtin_fn("tan", 1, |args| Ok(num(math_tan(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "asin".into(),
-        native(|args| Ok(num(math_asin(arg_f64(&args, 0)?)))),
+        builtin_fn("asin", 1, |args| Ok(num(math_asin(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "acos".into(),
-        native(|args| Ok(num(math_acos(arg_f64(&args, 0)?)))),
+        builtin_fn("acos", 1, |args| Ok(num(math_acos(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "atan".into(),
-        native(|args| Ok(num(math_atan(arg_f64(&args, 0)?)))),
+        builtin_fn("atan", 1, |args| Ok(num(math_atan(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "sinh".into(),
-        native(|args| Ok(num(math_sinh(arg_f64(&args, 0)?)))),
+        builtin_fn("sinh", 1, |args| Ok(num(math_sinh(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "cosh".into(),
-        native(|args| Ok(num(math_cosh(arg_f64(&args, 0)?)))),
+        builtin_fn("cosh", 1, |args| Ok(num(math_cosh(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "tanh".into(),
-        native(|args| Ok(num(math_tanh(arg_f64(&args, 0)?)))),
+        builtin_fn("tanh", 1, |args| Ok(num(math_tanh(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "asinh".into(),
-        native(|args| Ok(num(math_asinh(arg_f64(&args, 0)?)))),
+        builtin_fn("asinh", 1, |args| Ok(num(math_asinh(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "acosh".into(),
-        native(|args| Ok(num(math_acosh(arg_f64(&args, 0)?)))),
+        builtin_fn("acosh", 1, |args| Ok(num(math_acosh(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "atanh".into(),
-        native(|args| Ok(num(math_atanh(arg_f64(&args, 0)?)))),
+        builtin_fn("atanh", 1, |args| Ok(num(math_atanh(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "exp".into(),
-        native(|args| Ok(num(math_exp(arg_f64(&args, 0)?)))),
+        builtin_fn("exp", 1, |args| Ok(num(math_exp(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "expm1".into(),
-        native(|args| Ok(num(math_expm1(arg_f64(&args, 0)?)))),
+        builtin_fn("expm1", 1, |args| Ok(num(math_expm1(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "log1p".into(),
-        native(|args| Ok(num(math_log1p(arg_f64(&args, 0)?)))),
+        builtin_fn("log1p", 1, |args| Ok(num(math_log1p(arg_f64(&args, 0)?)))),
     );
     props.insert(
         "fround".into(),
-        native(|args| Ok(JsValue::HeapNumber(math_fround(arg_f64(&args, 0)?)))),
+        builtin_fn("fround", 1, |args| {
+            Ok(JsValue::HeapNumber(math_fround(arg_f64(&args, 0)?)))
+        }),
     );
 
     // ── Two-argument methods ─────────────────────────────────────────────
     props.insert(
         "atan2".into(),
-        native(|args| {
+        builtin_fn("atan2", 2, |args| {
             let y = arg_f64(&args, 0)?;
             let x = arg_f64(&args, 1)?;
             Ok(num(math_atan2(y, x)))
@@ -757,7 +820,7 @@ fn make_math() -> JsValue {
     );
     props.insert(
         "pow".into(),
-        native(|args| {
+        builtin_fn("pow", 2, |args| {
             let base = arg_f64(&args, 0)?;
             let exp = arg_f64(&args, 1)?;
             Ok(num(math_pow(base, exp)))
@@ -765,7 +828,7 @@ fn make_math() -> JsValue {
     );
     props.insert(
         "imul".into(),
-        native(|args| {
+        builtin_fn("imul", 2, |args| {
             let a = arg_f64(&args, 0)?;
             let b = arg_f64(&args, 1)?;
             Ok(JsValue::Smi(math_imul(a, b)))
@@ -775,21 +838,21 @@ fn make_math() -> JsValue {
     // ── Variadic methods ─────────────────────────────────────────────────
     props.insert(
         "max".into(),
-        native(|args| {
+        builtin_fn("max", 2, |args| {
             let nums: StatorResult<Vec<f64>> = args.iter().map(|a| a.to_number()).collect();
             Ok(num(math_max(&nums?)))
         }),
     );
     props.insert(
         "min".into(),
-        native(|args| {
+        builtin_fn("min", 2, |args| {
             let nums: StatorResult<Vec<f64>> = args.iter().map(|a| a.to_number()).collect();
             Ok(num(math_min(&nums?)))
         }),
     );
     props.insert(
         "hypot".into(),
-        native(|args| {
+        builtin_fn("hypot", 2, |args| {
             let nums: StatorResult<Vec<f64>> = args.iter().map(|a| a.to_number()).collect();
             Ok(num(math_hypot(&nums?)))
         }),
@@ -798,11 +861,11 @@ fn make_math() -> JsValue {
     // ── Zero-argument / special ──────────────────────────────────────────
     props.insert(
         "random".into(),
-        native(|_args| Ok(JsValue::HeapNumber(math_random()))),
+        builtin_fn("random", 0, |_args| Ok(JsValue::HeapNumber(math_random()))),
     );
     props.insert(
         "clz32".into(),
-        native(|args| {
+        builtin_fn("clz32", 1, |args| {
             let x = arg_f64(&args, 0)?;
             Ok(JsValue::Smi(math_clz32(x) as i32))
         }),
@@ -4305,11 +4368,13 @@ fn make_async_iterator() -> JsValue {
         );
     }
 
+    proto.make_all_non_enumerable();
     props.insert(
         "prototype".into(),
         JsValue::PlainObject(Rc::new(RefCell::new(proto))),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -7079,6 +7144,7 @@ fn make_intl() -> JsValue {
         }),
     );
 
+    ns.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(ns)))
 }
 
@@ -7164,6 +7230,7 @@ fn make_proxy() -> JsValue {
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -7545,6 +7612,7 @@ fn make_arraybuffer() -> JsValue {
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -7753,6 +7821,7 @@ fn make_dataview() -> JsValue {
         }),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -8839,6 +8908,7 @@ fn make_atomics() -> JsValue {
     // @@toStringTag
     props.insert("@@toStringTag".into(), JsValue::String("Atomics".into()));
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -9290,7 +9360,7 @@ mod tests {
         }
     }
 
-    /// Call Math.floor via the native function wrapper.
+    /// Call Math.floor via the built-in function object wrapper.
     #[test]
     fn test_math_floor_native() {
         let mut globals = HashMap::new();
@@ -9298,11 +9368,22 @@ mod tests {
         let math = globals.get("Math").unwrap();
         if let JsValue::PlainObject(map) = math {
             let floor = map.borrow().get("floor").cloned().unwrap();
-            if let JsValue::NativeFunction(f) = floor {
-                let result = f(vec![JsValue::HeapNumber(1.7)]).unwrap();
-                assert_eq!(result, JsValue::Smi(1));
+            // Math.floor is now a PlainObject with __call__, .name, .length
+            if let JsValue::PlainObject(fn_obj) = &floor {
+                let call_fn = fn_obj.borrow().get("__call__").cloned().unwrap();
+                if let JsValue::NativeFunction(f) = call_fn {
+                    let result = f(vec![JsValue::HeapNumber(1.7)]).unwrap();
+                    assert_eq!(result, JsValue::Smi(1));
+                } else {
+                    panic!("__call__ should be a NativeFunction");
+                }
+                // Verify .name and .length
+                let name = fn_obj.borrow().get("name").cloned().unwrap();
+                assert_eq!(name, JsValue::String("floor".into()));
+                let length = fn_obj.borrow().get("length").cloned().unwrap();
+                assert_eq!(length, JsValue::Smi(1));
             } else {
-                panic!("floor should be a NativeFunction");
+                panic!("floor should be a PlainObject (builtin_fn)");
             }
         }
     }
