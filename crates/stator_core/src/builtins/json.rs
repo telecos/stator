@@ -1093,7 +1093,8 @@ fn js_value_to_json_inner(
             }
             seen.insert(ptr);
             let mut entries: Vec<(String, JsonValue)> = Vec::new();
-            for (k, v) in map.borrow().iter() {
+            // §25.5.2 step 6: only enumerable own properties are serialised.
+            for (k, v) in map.borrow().enumerable_iter() {
                 if let Some(jv) = js_value_to_json_inner(v, seen)? {
                     entries.push((k.clone(), jv));
                 }

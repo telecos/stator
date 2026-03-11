@@ -355,12 +355,18 @@ impl PropertyMap {
             if !self.extensible && !key.starts_with("__") {
                 return;
             }
+            // __proto__ is an internal link and must never be enumerable (ES §B.2.2.1).
+            let attrs = if key == "__proto__" {
+                BUILTIN_ATTRS
+            } else {
+                DEFAULT_ATTRS
+            };
             let pos = self.spec_insert_pos(&key);
             self.index_shift_right(pos);
             self.index.insert(key.clone(), pos);
             self.keys.insert(pos, key);
             self.values.insert(pos, value);
-            self.attrs.insert(pos, DEFAULT_ATTRS);
+            self.attrs.insert(pos, attrs);
             self.bump_shape_id();
             if pos != self.keys.len() - 1 {
                 self.cache_invalidate();
@@ -564,6 +570,17 @@ impl PropertyMap {
             .zip(self.attrs.iter())
             .filter(|(_, a)| a.contains(PropertyAttributes::ENUMERABLE))
             .map(|(k, _)| k)
+    }
+
+    /// Returns an iterator over `(key, value)` pairs for only enumerable
+    /// properties — the set that ES `EnumerableOwnProperties` would return.
+    pub fn enumerable_iter(&self) -> impl Iterator<Item = (&String, &JsValue)> {
+        self.keys
+            .iter()
+            .zip(self.values.iter())
+            .zip(self.attrs.iter())
+            .filter(|((_, _), a)| a.contains(PropertyAttributes::ENUMERABLE))
+            .map(|((k, v), _)| (k, v))
     }
 
     /// Returns an iterator over `(key, value, attrs)` triples.
