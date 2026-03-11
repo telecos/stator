@@ -1230,10 +1230,7 @@ fn handle_call_any_receiver(
                 }
                 Some(JsValue::Function(ba)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                    call_plain_object_function(ctx, &ba)?;
-                    // `args` are forwarded via shared global_env ("this"
-                    // is already set by the outer Construct handler).
-                    let _ = args;
+                    call_plain_object_function(ctx, &ba, args)?;
                 }
                 _ => {
                     return Err(StatorError::TypeError(
@@ -1698,12 +1695,19 @@ fn handle_call_property(
             ctx.frame.accumulator = f(args)?;
         }
         JsValue::PlainObject(ref map) => {
-            if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                ctx.frame.accumulator = f(args)?;
-            } else {
-                return Err(StatorError::TypeError(
-                    "CallProperty: callee is not a function (got PlainObject)".to_string(),
-                ));
+            let call_val = map.borrow().get("__call__").cloned();
+            match call_val {
+                Some(JsValue::NativeFunction(f)) => {
+                    ctx.frame.accumulator = f(args)?;
+                }
+                Some(JsValue::Function(ba)) => {
+                    call_plain_object_function(ctx, &ba, args)?;
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "CallProperty: callee is not a function (got PlainObject)".to_string(),
+                    ));
+                }
             }
         }
         other => {
@@ -1802,12 +1806,10 @@ fn handle_call_with_spread(
 fn call_plain_object_function(
     ctx: &mut DispatchContext,
     ba: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
+    args: Vec<JsValue>,
 ) -> StatorResult<()> {
-    let mut callee_frame = InterpreterFrame::new_with_globals(
-        (**ba).clone(),
-        vec![],
-        Rc::clone(&ctx.frame.global_env),
-    );
+    let mut callee_frame =
+        InterpreterFrame::new_with_globals((**ba).clone(), args, Rc::clone(&ctx.frame.global_env));
     restore_closure_context(&mut callee_frame, ba);
     push_call_frame("<anonymous>")?;
     let result = Interpreter::run(&mut callee_frame);
@@ -2415,6 +2417,17 @@ fn handle_lda_named_property(
         }
     }
     let prop_name = ctx.frame.get_string_constant(name_idx)?;
+    // TypeError for property access on null or undefined (ES §13.10.3).
+    if matches!(obj, JsValue::Null | JsValue::Undefined) {
+        return Err(StatorError::TypeError(format!(
+            "Cannot read properties of {} (reading '{prop_name}')",
+            if matches!(obj, JsValue::Null) {
+                "null"
+            } else {
+                "undefined"
+            }
+        )));
+    }
     let result = proto_lookup(&obj, &prop_name);
     // ── Populate shape IC for own-property hits on PlainObject ───────────
     if slot != u32::MAX
@@ -2477,6 +2490,17 @@ fn handle_sta_named_property(
     let prop_name = ctx.frame.get_string_constant(name_idx)?;
     let val = ctx.frame.accumulator.clone();
     let obj = ctx.frame.read_reg(obj_v)?.clone();
+    // TypeError for property store on null or undefined.
+    if matches!(obj, JsValue::Null | JsValue::Undefined) {
+        return Err(StatorError::TypeError(format!(
+            "Cannot set properties of {} (setting '{prop_name}')",
+            if matches!(obj, JsValue::Null) {
+                "null"
+            } else {
+                "undefined"
+            }
+        )));
+    }
     match obj {
         JsValue::Proxy(ref p) => {
             let _ = proxy_set(&mut p.borrow_mut(), &prop_name, val)?;
@@ -2502,7 +2526,12 @@ fn handle_sta_named_property(
                         });
                         return Ok(DispatchAction::Continue);
                     }
-                    // Non-writable: silently ignore (sloppy mode).
+                    // Non-writable: TypeError in strict mode, silently ignore in sloppy.
+                    if ctx.frame.bytecode_array.is_strict() {
+                        return Err(StatorError::TypeError(format!(
+                            "Cannot assign to read only property '{prop_name}'"
+                        )));
+                    }
                     return Ok(DispatchAction::Continue);
                 }
             }
@@ -2514,8 +2543,13 @@ fn handle_sta_named_property(
                 return Ok(DispatchAction::Continue);
             }
             let pm = map.borrow();
-            // Existing non-writable property: silently ignore (sloppy mode).
+            // Existing non-writable property: TypeError in strict mode, silently ignore in sloppy.
             if pm.contains_key(prop_name.as_ref()) && !pm.is_writable(prop_name.as_ref()) {
+                if ctx.frame.bytecode_array.is_strict() {
+                    return Err(StatorError::TypeError(format!(
+                        "Cannot assign to read only property '{prop_name}'"
+                    )));
+                }
                 return Ok(DispatchAction::Continue);
             }
             drop(pm);
@@ -2565,6 +2599,18 @@ fn handle_lda_keyed_property(
     };
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     let key = ctx.frame.accumulator.clone();
+    // TypeError for property access on null or undefined (ES §13.10.3).
+    if matches!(obj, JsValue::Null | JsValue::Undefined) {
+        let key_str = key.to_js_string().unwrap_or_default();
+        return Err(StatorError::TypeError(format!(
+            "Cannot read properties of {} (reading '{key_str}')",
+            if matches!(obj, JsValue::Null) {
+                "null"
+            } else {
+                "undefined"
+            }
+        )));
+    }
     ctx.frame.accumulator = keyed_load(&obj, &key)?;
     Ok(DispatchAction::Continue)
 }
@@ -2582,6 +2628,18 @@ fn handle_sta_keyed_property(
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     let key = ctx.frame.read_reg(key_v)?.clone();
     let val = ctx.frame.accumulator.clone();
+    // TypeError for property store on null or undefined.
+    if matches!(obj, JsValue::Null | JsValue::Undefined) {
+        let key_str = key.to_js_string().unwrap_or_default();
+        return Err(StatorError::TypeError(format!(
+            "Cannot set properties of {} (setting '{key_str}')",
+            if matches!(obj, JsValue::Null) {
+                "null"
+            } else {
+                "undefined"
+            }
+        )));
+    }
     keyed_store(&obj, &key, val)?;
     // Accumulator stays unchanged.
     Ok(DispatchAction::Continue)
@@ -2603,24 +2661,45 @@ fn handle_get_iterator(
         JsValue::String(ref s) => JsValue::Iterator(NativeIterator::from_string(s)),
         // Generators and existing iterators pass through unchanged.
         JsValue::Generator(_) | JsValue::Iterator(_) => iterable,
-        // PlainObject with @@iterator → call it to get the iterator.
-        JsValue::PlainObject(ref map) if map.borrow().contains_key("@@iterator") => {
-            let iter_fn = map.borrow().get("@@iterator").cloned();
+        // PlainObject with @@iterator or Symbol.iterator → call it.
+        JsValue::PlainObject(ref map) => {
+            let borrow = map.borrow();
+            // Check for both internal @@iterator and user-visible Symbol(SYMBOL_ITERATOR)
+            let iter_fn = borrow.get("@@iterator").cloned().or_else(|| {
+                let sym_key = format!("Symbol({})", crate::builtins::symbol::SYMBOL_ITERATOR);
+                borrow.get(&sym_key).cloned()
+            });
+            drop(borrow);
             match iter_fn {
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
                     dispatch_call_with_this(f, iterable.clone(), vec![])?
                 }
-                _ => {
+                Some(JsValue::PlainObject(ref call_obj))
+                    if call_obj.borrow().contains_key("__call__") =>
+                {
+                    dispatch_call_with_this(
+                        &JsValue::PlainObject(call_obj.clone()),
+                        iterable.clone(),
+                        vec![],
+                    )?
+                }
+                Some(_) => {
                     return Err(StatorError::TypeError(
                         "GetIterator: @@iterator is not a function".into(),
                     ));
                 }
+                None => {
+                    // Fallback: PlainObject with "length" → array-like
+                    if map.borrow().contains_key("length") {
+                        let items = plain_object_to_array_items(map);
+                        JsValue::Iterator(NativeIterator::from_items(items))
+                    } else {
+                        return Err(StatorError::TypeError(format!(
+                            "GetIterator: value is not iterable (got {iterable:?})"
+                        )));
+                    }
+                }
             }
-        }
-        // PlainObject with a "length" property → array-like.
-        JsValue::PlainObject(ref map) if map.borrow().contains_key("length") => {
-            let items = plain_object_to_array_items(map);
-            JsValue::Iterator(NativeIterator::from_items(items))
         }
         other => {
             return Err(StatorError::TypeError(format!(
@@ -2892,8 +2971,13 @@ fn handle_type_of(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResu
         JsValue::Symbol(_) => "symbol",
         JsValue::BigInt(_) => "bigint",
         JsValue::Function(_) | JsValue::NativeFunction(_) => "function",
-        JsValue::Object(_) | JsValue::Array(_) | JsValue::PlainObject(_) | JsValue::Error(_) => {
-            "object"
+        JsValue::Object(_) | JsValue::Array(_) | JsValue::Error(_) => "object",
+        JsValue::PlainObject(map) => {
+            if map.borrow().get("__call__").is_some() {
+                "function"
+            } else {
+                "object"
+            }
         }
         JsValue::Generator(_) => "object",
         JsValue::Iterator(_) => "object",
@@ -3315,7 +3399,11 @@ fn handle_create_reg_exp_literal(
     if flags_val & 0x20 != 0 {
         flags_str.push('y');
     }
+    // Build a proper RegExp object backed by JsRegExp.
+    let re = crate::objects::regexp::JsRegExp::new(&pattern, &flags_str)?;
+    let re_rc = Rc::new(RefCell::new(re));
     let mut map = PropertyMap::new();
+    map.insert("__is_regexp__".to_string(), JsValue::Boolean(true));
     map.insert(
         "source".to_string(),
         JsValue::String(pattern.clone().into()),
@@ -3324,11 +3412,104 @@ fn handle_create_reg_exp_literal(
         "flags".to_string(),
         JsValue::String(flags_str.clone().into()),
     );
-    // toString() representation: /pattern/flags
     map.insert(
-        "toString".to_string(),
-        JsValue::String(format!("/{pattern}/{flags_str}").into()),
+        "global".to_string(),
+        JsValue::Boolean(flags_str.contains('g')),
     );
+    map.insert(
+        "ignoreCase".to_string(),
+        JsValue::Boolean(flags_str.contains('i')),
+    );
+    map.insert(
+        "multiline".to_string(),
+        JsValue::Boolean(flags_str.contains('m')),
+    );
+    map.insert(
+        "dotAll".to_string(),
+        JsValue::Boolean(flags_str.contains('s')),
+    );
+    map.insert(
+        "unicode".to_string(),
+        JsValue::Boolean(flags_str.contains('u')),
+    );
+    map.insert(
+        "sticky".to_string(),
+        JsValue::Boolean(flags_str.contains('y')),
+    );
+    // test(str)
+    {
+        let r = Rc::clone(&re_rc);
+        map.insert(
+            "test".to_string(),
+            JsValue::NativeFunction(Rc::new(move |args| {
+                let input = match args.first() {
+                    Some(v) => v.to_js_string()?,
+                    None => String::new(),
+                };
+                Ok(JsValue::Boolean(r.borrow().test(&input)))
+            })),
+        );
+    }
+    // exec(str)
+    {
+        let r = Rc::clone(&re_rc);
+        map.insert(
+            "exec".to_string(),
+            JsValue::NativeFunction(Rc::new(move |args| {
+                let input = match args.first() {
+                    Some(v) => v.to_js_string()?,
+                    None => String::new(),
+                };
+                match r.borrow().exec(&input) {
+                    Some(m) => {
+                        let mut props = PropertyMap::new();
+                        props.insert("0".to_string(), JsValue::String(m.matched.clone().into()));
+                        for (i, g) in m.captures.iter().enumerate() {
+                            props.insert(
+                                (i + 1).to_string(),
+                                match g {
+                                    Some(s) => JsValue::String(s.clone().into()),
+                                    None => JsValue::Undefined,
+                                },
+                            );
+                        }
+                        props.insert(
+                            "length".to_string(),
+                            JsValue::Smi((1 + m.captures.len()) as i32),
+                        );
+                        props.insert("index".to_string(), JsValue::Smi(m.index as i32));
+                        props.insert("input".to_string(), JsValue::String(m.input.clone().into()));
+                        if m.named_groups.is_empty() {
+                            props.insert("groups".to_string(), JsValue::Undefined);
+                        } else {
+                            let mut groups = PropertyMap::new();
+                            for (k, v) in &m.named_groups {
+                                groups.insert(k.clone(), JsValue::String(v.clone().into()));
+                            }
+                            props.insert(
+                                "groups".to_string(),
+                                JsValue::PlainObject(Rc::new(RefCell::new(groups))),
+                            );
+                        }
+                        props.insert("__is_array__".to_string(), JsValue::Boolean(true));
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
+                    }
+                    None => Ok(JsValue::Null),
+                }
+            })),
+        );
+    }
+    // toString()
+    {
+        let p = pattern.clone();
+        let f = flags_str.clone();
+        map.insert(
+            "toString".to_string(),
+            JsValue::NativeFunction(Rc::new(move |_args| {
+                Ok(JsValue::String(format!("/{p}/{f}").into()))
+            })),
+        );
+    }
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
 }
@@ -3467,7 +3648,10 @@ fn handle_test_instance_of(
 
         type BuiltinCheck = (&'static str, fn(&JsValue) -> bool);
         let builtin_checks: &[BuiltinCheck] = &[
-            ("Array", |v| matches!(v, JsValue::Array(_))),
+            ("Array", |v| {
+                matches!(v, JsValue::Array(_))
+                    || matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_array__").is_some())
+            }),
             ("Function", |v| {
                 matches!(v, JsValue::Function(_) | JsValue::NativeFunction(_))
             }),
@@ -3572,7 +3756,9 @@ fn handle_test_in(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
             } else if let Some(idx) = to_array_index(key) {
                 idx < items.borrow().len()
             } else {
-                false
+                // Check Array.prototype / Object.prototype methods.
+                let prop = to_property_key(key)?;
+                !matches!(proto_lookup(&object, &prop), JsValue::Undefined)
             }
         }
         _ => false,
@@ -3806,37 +3992,14 @@ fn handle_create_mapped_arguments(
         "callee".to_string(),
         JsValue::Function(Rc::new(ctx.frame.bytecode_array.clone())),
     );
-    // @@iterator: array-like iteration support
-    let args_rc = Rc::new(RefCell::new(args.clone()));
-    let idx_rc = Rc::new(RefCell::new(0usize));
-    let iter_args = args_rc.clone();
-    let iter_idx = idx_rc.clone();
+    // @@iterator: array-like iteration support via NativeIterator
+    let args_for_iter = args.clone();
     map.insert(
         "@@iterator".to_string(),
         JsValue::NativeFunction(Rc::new(move |_args: Vec<JsValue>| {
-            let a = iter_args.clone();
-            let i = iter_idx.clone();
-            // Reset index for fresh iteration
-            *i.borrow_mut() = 0;
-            let mut iter_map = PropertyMap::new();
-            iter_map.insert(
-                "next".to_string(),
-                JsValue::NativeFunction(Rc::new(move |_| {
-                    let mut idx = i.borrow_mut();
-                    let arr = a.borrow();
-                    let mut result = PropertyMap::new();
-                    if *idx < arr.len() {
-                        result.insert("value".to_string(), arr[*idx].clone());
-                        result.insert("done".to_string(), JsValue::Boolean(false));
-                        *idx += 1;
-                    } else {
-                        result.insert("value".to_string(), JsValue::Undefined);
-                        result.insert("done".to_string(), JsValue::Boolean(true));
-                    }
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
-                })),
-            );
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(iter_map))))
+            Ok(JsValue::Iterator(NativeIterator::from_items(
+                args_for_iter.clone(),
+            )))
         })),
     );
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
@@ -3868,37 +4031,14 @@ fn handle_create_unmapped_arguments(
             ))
         })),
     );
-    // @@iterator: array-like iteration support
-    let args_rc = Rc::new(RefCell::new(args.clone()));
-    let idx_rc = Rc::new(RefCell::new(0usize));
-    let iter_args = args_rc.clone();
-    let iter_idx = idx_rc.clone();
+    // @@iterator: array-like iteration support via NativeIterator
+    let args_for_iter = args.clone();
     map.insert(
         "@@iterator".to_string(),
         JsValue::NativeFunction(Rc::new(move |_args: Vec<JsValue>| {
-            let a = iter_args.clone();
-            let i = iter_idx.clone();
-            // Reset index for fresh iteration
-            *i.borrow_mut() = 0;
-            let mut iter_map = PropertyMap::new();
-            iter_map.insert(
-                "next".to_string(),
-                JsValue::NativeFunction(Rc::new(move |_| {
-                    let mut idx = i.borrow_mut();
-                    let arr = a.borrow();
-                    let mut result = PropertyMap::new();
-                    if *idx < arr.len() {
-                        result.insert("value".to_string(), arr[*idx].clone());
-                        result.insert("done".to_string(), JsValue::Boolean(false));
-                        *idx += 1;
-                    } else {
-                        result.insert("value".to_string(), JsValue::Undefined);
-                        result.insert("done".to_string(), JsValue::Boolean(true));
-                    }
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
-                })),
-            );
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(iter_map))))
+            Ok(JsValue::Iterator(NativeIterator::from_items(
+                args_for_iter.clone(),
+            )))
         })),
     );
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));

@@ -160,7 +160,7 @@ jobs:
           # ── Phase 2: JavaScript parsing + bytecode compilation ──────────
           check_contains '[tab] --- Phase 2: JavaScript parsing demo ---'
           check_contains '[tab] compiling: var x = 1 + 2;'
-          check_contains '[tab] OK -- 6 bytecode(s) generated'
+          check_contains '[tab] OK -- 8 bytecode(s) generated'
           check_contains '  LdaSmi 2'
           check_contains '  Star r1'
           check_contains '  LdaSmi 1'

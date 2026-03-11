@@ -26,3 +26,9 @@ _codeql_detected_source_root
 
 # CMake out-of-source build directories
 **/build/
+
+# Test262 checkout (not a submodule)
+/test262/
+
+# Runner log files
+*.log

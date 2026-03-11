@@ -118,6 +118,8 @@ pub struct PropertyMap {
     /// Shape identifier — a monotonically-increasing stamp that changes on
     /// every structural mutation (property add/remove or attribute change).
     shape_id: u64,
+    /// Whether new properties may be added to this object (§10.1 `[[Extensible]]`).
+    pub extensible: bool,
 }
 
 impl PartialEq for PropertyMap {
@@ -126,6 +128,7 @@ impl PartialEq for PropertyMap {
             && self.values == other.values
             && self.attrs == other.attrs
             && self.index == other.index
+            && self.extensible == other.extensible
     }
 }
 
@@ -142,6 +145,7 @@ impl PropertyMap {
             cache_len: Cell::new(0),
             cache_cursor: Cell::new(0),
             shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
+            extensible: true,
         }
     }
 
@@ -157,6 +161,7 @@ impl PropertyMap {
             cache_len: Cell::new(0),
             cache_cursor: Cell::new(0),
             shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
+            extensible: true,
         }
     }
 
@@ -346,6 +351,10 @@ impl PropertyMap {
         if let Some(&i) = self.index.get(&key) {
             self.values[i] = value;
         } else {
+            // Non-extensible objects reject new properties (except internal __dunder__ keys).
+            if !self.extensible && !key.starts_with("__") {
+                return;
+            }
             let pos = self.spec_insert_pos(&key);
             self.index_shift_right(pos);
             self.index.insert(key.clone(), pos);
@@ -564,6 +573,50 @@ impl PropertyMap {
             .zip(self.values.iter())
             .zip(self.attrs.iter())
             .map(|((k, v), a)| (k, v, *a))
+    }
+
+    /// Mark all properties as non-writable and non-configurable, and prevent
+    /// new properties from being added (ES §20.1.2.6).
+    pub fn freeze(&mut self) {
+        for a in &mut self.attrs {
+            a.remove(PropertyAttributes::WRITABLE);
+            a.remove(PropertyAttributes::CONFIGURABLE);
+        }
+        self.extensible = false;
+        self.bump_shape_id();
+    }
+
+    /// Returns `true` if the object is frozen: non-extensible with all
+    /// properties non-writable and non-configurable (ES §20.1.2.15).
+    pub fn is_frozen(&self) -> bool {
+        if self.extensible {
+            return false;
+        }
+        self.attrs.iter().all(|a| {
+            !a.contains(PropertyAttributes::WRITABLE)
+                && !a.contains(PropertyAttributes::CONFIGURABLE)
+        })
+    }
+
+    /// Mark all properties as non-configurable and prevent new properties
+    /// from being added (ES §20.1.2.20).
+    pub fn seal(&mut self) {
+        for a in &mut self.attrs {
+            a.remove(PropertyAttributes::CONFIGURABLE);
+        }
+        self.extensible = false;
+        self.bump_shape_id();
+    }
+
+    /// Returns `true` if the object is sealed: non-extensible with all
+    /// properties non-configurable (ES §20.1.2.16).
+    pub fn is_sealed(&self) -> bool {
+        if self.extensible {
+            return false;
+        }
+        self.attrs
+            .iter()
+            .all(|a| !a.contains(PropertyAttributes::CONFIGURABLE))
     }
 }
 

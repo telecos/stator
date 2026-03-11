@@ -663,7 +663,8 @@ pub fn string_replace_all(s: &str, search: &str, replacement: &str) -> String {
 /// assert!(string_match("hello", r"\d+").is_none());
 /// ```
 pub fn string_match(s: &str, pattern: &str) -> Option<Vec<String>> {
-    let re = regress::Regex::new(pattern).ok()?;
+    let re =
+        stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, || regress::Regex::new(pattern)).ok()?;
     let m = re.find(s)?;
     let mut groups = vec![s[m.range()].to_string()];
     for cap in &m.captures {
@@ -691,7 +692,8 @@ pub fn string_match(s: &str, pattern: &str) -> Option<Vec<String>> {
 /// assert_eq!(matches, vec!["1", "2", "3"]);
 /// ```
 pub fn string_match_all(s: &str, pattern: &str) -> Option<Vec<String>> {
-    let re = regress::Regex::new(pattern).ok()?;
+    let re =
+        stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, || regress::Regex::new(pattern)).ok()?;
     let matches: Vec<String> = re.find_iter(s).map(|m| s[m.range()].to_string()).collect();
     if matches.is_empty() {
         None
@@ -1071,7 +1073,8 @@ pub fn string_to_well_formed(s: &str) -> String {
 /// assert_eq!(string_search("abc123", r"\d+"), 3);
 /// ```
 pub fn string_search(s: &str, pattern: &str) -> i64 {
-    let re = match regress::Regex::new(pattern) {
+    let re = match stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, || regress::Regex::new(pattern))
+    {
         Ok(r) => r,
         Err(_) => return -1,
     };

@@ -255,7 +255,12 @@ impl JsRegExp {
     pub fn new(pattern: &str, flags: &str) -> StatorResult<Self> {
         let flags = RegExpFlags::parse(flags)?;
         let regress_flags = build_regress_flags(flags);
-        let compiled = Regex::with_flags(pattern, regress_flags).map_err(|e| {
+        // Regex compilation in `regress` can recurse deeply for complex
+        // alternation / back-reference patterns.
+        let compiled = stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, || {
+            Regex::with_flags(pattern, regress_flags)
+        })
+        .map_err(|e| {
             StatorError::SyntaxError(format!("Invalid regular expression: /{pattern}/: {e}"))
         })?;
         Ok(Self {
@@ -315,6 +320,12 @@ impl JsRegExp {
     /// byte position immediately after the match.  After a failed match
     /// `lastIndex` is reset to `0`.
     pub fn exec(&self, input: &str) -> Option<RegExpMatch> {
+        // Regex matching in the `regress` crate can recurse deeply for
+        // pathological patterns.  Ensure we have ample stack.
+        stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, || self.exec_inner(input))
+    }
+
+    fn exec_inner(&self, input: &str) -> Option<RegExpMatch> {
         let is_stateful = self
             .flags
             .intersects(RegExpFlags::GLOBAL | RegExpFlags::STICKY);

@@ -743,6 +743,18 @@ impl JsValue {
         }
     }
 
+    /// Console-safe string conversion that never throws.
+    ///
+    /// Unlike [`to_js_string`](Self::to_js_string), this handles `Symbol`
+    /// values by formatting them as `"Symbol(<id>)"` rather than returning
+    /// a `TypeError`.  Used by `console.log` and similar debugging output.
+    pub fn to_display_string(&self) -> String {
+        match self {
+            Self::Symbol(id) => format!("Symbol({id})"),
+            _ => self.to_js_string().unwrap_or_else(|_| format!("{self:?}")),
+        }
+    }
+
     /// ECMAScript §7.1.6 **ToInt32**.
     ///
     /// Converts the value to a number via [`to_number`][Self::to_number], then
@@ -1173,12 +1185,38 @@ fn ordinary_to_primitive_plain_object(
             }
             Some(JsValue::Function(ref ba)) => {
                 let mut frame = crate::interpreter::InterpreterFrame::new((**ba).clone(), vec![]);
+                frame.context = Some(JsValue::PlainObject(Rc::clone(map)));
                 let result = crate::interpreter::Interpreter::run(&mut frame)?;
                 if result.is_primitive() {
                     return Ok(result);
                 }
             }
             _ => {}
+        }
+    }
+
+    // Array-like PlainObject: join elements with comma.
+    {
+        let borrow = map.borrow();
+        if matches!(borrow.get("__is_array__"), Some(JsValue::Boolean(true))) {
+            let len = match borrow.get("length") {
+                Some(JsValue::Smi(n)) => *n as usize,
+                _ => 0,
+            };
+            let mut parts = Vec::with_capacity(len);
+            for i in 0..len {
+                match borrow.get(&i.to_string()) {
+                    Some(JsValue::Null | JsValue::Undefined) | None => parts.push(String::new()),
+                    Some(JsValue::Smi(n)) => parts.push(n.to_string()),
+                    Some(JsValue::HeapNumber(n)) => parts.push(number_to_string(*n)),
+                    Some(JsValue::Boolean(b)) => {
+                        parts.push(if *b { "true" } else { "false" }.into());
+                    }
+                    Some(JsValue::String(s)) => parts.push(s.to_string()),
+                    Some(_) => parts.push(String::new()),
+                }
+            }
+            return Ok(JsValue::String(parts.join(",").into()));
         }
     }
 

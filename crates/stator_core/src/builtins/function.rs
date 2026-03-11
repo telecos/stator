@@ -24,9 +24,8 @@ use crate::objects::value::{JsValue, NativeFn};
 
 /// ECMAScript §20.2.3.3 `Function.prototype.call(thisArg, ...args)`.
 ///
-/// Invokes the target callable with the supplied arguments.  `this_arg` is
-/// accepted for API compatibility but is currently unused because our
-/// `NativeFn` signature does not carry a receiver.
+/// Invokes the target callable with `this_arg` prepended to the arguments
+/// (stator's NativeFunctions expect `this` as `args[0]`).
 ///
 /// # Examples
 ///
@@ -35,9 +34,10 @@ use crate::objects::value::{JsValue, NativeFn};
 /// use stator_core::builtins::function::function_call;
 /// use stator_core::objects::value::JsValue;
 ///
+/// // args[0] = thisArg (prepended by function_call), args[1..] = call args
 /// let add = Rc::new(|args: Vec<JsValue>| {
-///     let a = args.first().unwrap_or(&JsValue::Smi(0)).to_number().unwrap();
-///     let b = args.get(1).unwrap_or(&JsValue::Smi(0)).to_number().unwrap();
+///     let a = args.get(1).unwrap_or(&JsValue::Smi(0)).to_number().unwrap();
+///     let b = args.get(2).unwrap_or(&JsValue::Smi(0)).to_number().unwrap();
 ///     Ok(JsValue::Smi((a + b) as i32))
 /// }) as Rc<dyn Fn(Vec<JsValue>) -> stator_core::error::StatorResult<JsValue>>;
 /// let result = function_call(&add, &JsValue::Undefined, &[JsValue::Smi(1), JsValue::Smi(2)]).unwrap();
@@ -45,10 +45,13 @@ use crate::objects::value::{JsValue, NativeFn};
 /// ```
 pub fn function_call(
     func: &NativeFn,
-    _this_arg: &JsValue,
+    this_arg: &JsValue,
     args: &[JsValue],
 ) -> StatorResult<JsValue> {
-    func(args.to_vec())
+    // NativeFunctions in stator expect `this` as args[0], so prepend it.
+    let mut all_args = vec![this_arg.clone()];
+    all_args.extend_from_slice(args);
+    func(all_args)
 }
 
 // ── Function.prototype.apply ─────────────────────────────────────────────────
@@ -67,8 +70,9 @@ pub fn function_call(
 /// use stator_core::objects::value::JsValue;
 ///
 /// let sum = Rc::new(|args: Vec<JsValue>| {
+///     // args[0] is this_arg, args[1..] are the actual values
 ///     let mut total = 0i32;
-///     for a in &args { total += a.to_number().unwrap() as i32; }
+///     for a in args.iter().skip(1) { total += a.to_number().unwrap() as i32; }
 ///     Ok(JsValue::Smi(total))
 /// }) as Rc<dyn Fn(Vec<JsValue>) -> stator_core::error::StatorResult<JsValue>>;
 /// let arr = vec![JsValue::Smi(10), JsValue::Smi(20)];
@@ -77,14 +81,17 @@ pub fn function_call(
 /// ```
 pub fn function_apply(
     func: &NativeFn,
-    _this_arg: &JsValue,
+    this_arg: &JsValue,
     args_array: &Option<Vec<JsValue>>,
 ) -> StatorResult<JsValue> {
-    let args = match args_array {
+    let spread = match args_array {
         Some(arr) => arr.clone(),
         None => Vec::new(),
     };
-    func(args)
+    // NativeFunctions in stator expect `this` as args[0], so prepend it.
+    let mut all_args = vec![this_arg.clone()];
+    all_args.extend(spread);
+    func(all_args)
 }
 
 // ── Function.prototype.bind ──────────────────────────────────────────────────
@@ -93,6 +100,11 @@ pub fn function_apply(
 ///
 /// Returns a new `NativeFn` that, when called, invokes the original function
 /// with the bound arguments prepended to the call-time arguments.
+///
+/// Note: `this_arg` is intentionally unused here because stator's
+/// NativeFunctions receive `this` as `args[0]` through the runtime calling
+/// convention. The proto_lookup `bind` handler prepends the bound `this` into
+/// the argument list before calling the target.
 ///
 /// # Examples
 ///
@@ -285,7 +297,39 @@ pub fn function_constructor(args: &[JsValue]) -> StatorResult<JsValue> {
 mod tests {
     use super::*;
 
+    // Helpers for call/apply tests skip args[0] (this_arg) since
+    // function_call/apply now prepend it.
     fn make_adder() -> NativeFn {
+        Rc::new(|args: Vec<JsValue>| {
+            let a = args.get(1).unwrap_or(&JsValue::Smi(0)).to_number()?;
+            let b = args.get(2).unwrap_or(&JsValue::Smi(0)).to_number()?;
+            let sum = a + b;
+            if sum.fract() == 0.0 && sum >= f64::from(i32::MIN) && sum <= f64::from(i32::MAX) {
+                Ok(JsValue::Smi(sum as i32))
+            } else {
+                Ok(JsValue::HeapNumber(sum))
+            }
+        })
+    }
+
+    fn make_summer() -> NativeFn {
+        Rc::new(|args: Vec<JsValue>| {
+            let mut total = 0.0_f64;
+            for a in args.iter().skip(1) {
+                total += a.to_number()?;
+            }
+            if total.fract() == 0.0 && total >= f64::from(i32::MIN) && total <= f64::from(i32::MAX)
+            {
+                Ok(JsValue::Smi(total as i32))
+            } else {
+                Ok(JsValue::HeapNumber(total))
+            }
+        })
+    }
+
+    // Helpers for bind tests — bind does NOT prepend this_arg, so args
+    // start at index 0.
+    fn make_adder_raw() -> NativeFn {
         Rc::new(|args: Vec<JsValue>| {
             let a = args.first().unwrap_or(&JsValue::Smi(0)).to_number()?;
             let b = args.get(1).unwrap_or(&JsValue::Smi(0)).to_number()?;
@@ -298,7 +342,7 @@ mod tests {
         })
     }
 
-    fn make_summer() -> NativeFn {
+    fn make_summer_raw() -> NativeFn {
         Rc::new(|args: Vec<JsValue>| {
             let mut total = 0.0_f64;
             for a in &args {
@@ -331,15 +375,19 @@ mod tests {
     }
 
     #[test]
-    fn test_call_with_this_arg_ignored() {
-        let f = make_adder();
+    fn test_call_with_this_arg_passed() {
+        // this_arg is now prepended to the args, so the function sees it at args[0].
+        let f: NativeFn = Rc::new(|args: Vec<JsValue>| {
+            let this = args.first().cloned().unwrap_or(JsValue::Undefined);
+            Ok(this)
+        });
         let result = function_call(
             &f,
-            &JsValue::String("this".into()),
+            &JsValue::String("hello".into()),
             &[JsValue::Smi(10), JsValue::Smi(20)],
         )
         .unwrap();
-        assert_eq!(result, JsValue::Smi(30));
+        assert_eq!(result, JsValue::String("hello".into()));
     }
 
     #[test]
@@ -397,7 +445,7 @@ mod tests {
 
     #[test]
     fn test_bind_partial_application() {
-        let f = make_adder();
+        let f = make_adder_raw();
         let bound = function_bind(&f, &JsValue::Undefined, &[JsValue::Smi(10)]);
         let result = bound(vec![JsValue::Smi(5)]).unwrap();
         assert_eq!(result, JsValue::Smi(15));
@@ -405,7 +453,7 @@ mod tests {
 
     #[test]
     fn test_bind_all_args() {
-        let f = make_adder();
+        let f = make_adder_raw();
         let bound = function_bind(&f, &JsValue::Undefined, &[JsValue::Smi(3), JsValue::Smi(7)]);
         let result = bound(vec![]).unwrap();
         assert_eq!(result, JsValue::Smi(10));
@@ -413,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_bind_no_args() {
-        let f = make_adder();
+        let f = make_adder_raw();
         let bound = function_bind(&f, &JsValue::Undefined, &[]);
         let result = bound(vec![JsValue::Smi(1), JsValue::Smi(2)]).unwrap();
         assert_eq!(result, JsValue::Smi(3));
@@ -421,7 +469,7 @@ mod tests {
 
     #[test]
     fn test_bind_chained() {
-        let f = make_summer();
+        let f = make_summer_raw();
         let bound1 = function_bind(&f, &JsValue::Undefined, &[JsValue::Smi(1)]);
         let bound2 = function_bind(&bound1, &JsValue::Undefined, &[JsValue::Smi(2)]);
         let result = bound2(vec![JsValue::Smi(3)]).unwrap();
@@ -430,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_bind_extra_args_ignored() {
-        let f = make_adder();
+        let f = make_adder_raw();
         let bound = function_bind(&f, &JsValue::Undefined, &[JsValue::Smi(1), JsValue::Smi(2)]);
         // Extra args beyond what adder reads are harmless.
         let result = bound(vec![JsValue::Smi(99)]).unwrap();
