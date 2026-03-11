@@ -2417,15 +2417,14 @@ impl<'src> Parser<'src> {
             let end = arg.loc();
 
             // `delete obj.#private` is an early SyntaxError.
-            if op == UnaryOp::Delete {
-                if let Expr::Member(ref m) = arg {
-                    if matches!(m.property, MemberProp::Private(_)) {
-                        return Err(Self::error_at(
-                            Self::merge_spans(start, end),
-                            "private fields can not be deleted",
-                        ));
-                    }
-                }
+            if op == UnaryOp::Delete
+                && let Expr::Member(ref m) = arg
+                && matches!(m.property, MemberProp::Private(_))
+            {
+                return Err(Self::error_at(
+                    Self::merge_spans(start, end),
+                    "private fields can not be deleted",
+                ));
             }
 
             return Ok(Expr::Unary(Box::new(UnaryExpr {
