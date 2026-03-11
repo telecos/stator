@@ -3927,6 +3927,33 @@ fn make_array() -> JsValue {
         JsValue::PlainObject(Rc::new(RefCell::new(proto))),
     );
 
+    // Array constructor: `Array()`, `Array(len)`, `Array(a, b, …)`
+    props.insert(
+        "__call__".into(),
+        native(|args| {
+            if args.is_empty() {
+                return Ok(JsValue::Array(Rc::new(RefCell::new(Vec::new()))));
+            }
+            if args.len() == 1 {
+                if let Some(len) = match &args[0] {
+                    JsValue::Smi(n) if *n >= 0 => Some(*n as usize),
+                    JsValue::HeapNumber(n)
+                        if n.fract() == 0.0 && *n >= 0.0 && *n <= (u32::MAX as f64) =>
+                    {
+                        Some(*n as usize)
+                    }
+                    _ => None,
+                } {
+                    let v: Vec<JsValue> = vec![JsValue::Undefined; len];
+                    return Ok(JsValue::Array(Rc::new(RefCell::new(v))));
+                }
+                // Single non-numeric arg → Array with one element.
+                return Ok(JsValue::Array(Rc::new(RefCell::new(args))));
+            }
+            Ok(JsValue::Array(Rc::new(RefCell::new(args))))
+        }),
+    );
+
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
