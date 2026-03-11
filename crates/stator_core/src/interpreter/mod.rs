@@ -3214,6 +3214,172 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     None => Ok(JsValue::String("".into())),
                 }));
             }
+            "isWellFormed" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::Boolean(
+                        crate::builtins::string::string_is_well_formed(&s),
+                    ))
+                }));
+            }
+            "toWellFormed" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_to_well_formed(&s).into(),
+                    ))
+                }));
+            }
+            "toLocaleLowerCase" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_to_locale_lower_case(&s).into(),
+                    ))
+                }));
+            }
+            "toLocaleUpperCase" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_to_locale_upper_case(&s).into(),
+                    ))
+                }));
+            }
+            "substr" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let start = args.first().map(|v| v.to_number() as i64).unwrap_or(0);
+                    let length = args.get(1).map(|v| v.to_number() as i64);
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_substr(&s, start, length).into(),
+                    ))
+                }));
+            }
+            "anchor" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let name = args
+                        .first()
+                        .map(|v| v.to_js_string())
+                        .transpose()?
+                        .unwrap_or_default();
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_anchor(&s, &name).into(),
+                    ))
+                }));
+            }
+            "big" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_big(&s).into(),
+                    ))
+                }));
+            }
+            "blink" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_blink(&s).into(),
+                    ))
+                }));
+            }
+            "bold" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_bold(&s).into(),
+                    ))
+                }));
+            }
+            "fixed" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_fixed(&s).into(),
+                    ))
+                }));
+            }
+            "fontcolor" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let color = args
+                        .first()
+                        .map(|v| v.to_js_string())
+                        .transpose()?
+                        .unwrap_or_default();
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_fontcolor(&s, &color).into(),
+                    ))
+                }));
+            }
+            "fontsize" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let size = args
+                        .first()
+                        .map(|v| v.to_js_string())
+                        .transpose()?
+                        .unwrap_or_default();
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_fontsize(&s, &size).into(),
+                    ))
+                }));
+            }
+            "italics" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_italics(&s).into(),
+                    ))
+                }));
+            }
+            "link" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let url = args
+                        .first()
+                        .map(|v| v.to_js_string())
+                        .transpose()?
+                        .unwrap_or_default();
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_link(&s, &url).into(),
+                    ))
+                }));
+            }
+            "small" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_small(&s).into(),
+                    ))
+                }));
+            }
+            "strike" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_strike(&s).into(),
+                    ))
+                }));
+            }
+            "sub" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_sub(&s).into(),
+                    ))
+                }));
+            }
+            "sup" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_sup(&s).into(),
+                    ))
+                }));
+            }
             "@@toPrimitive" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |_args| {
