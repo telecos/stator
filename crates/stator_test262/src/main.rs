@@ -26,6 +26,7 @@ use std::rc::Rc;
 
 use stator_core::builtins::error::clear_call_stack;
 use stator_core::builtins::install_globals::install_globals;
+use stator_core::builtins::promise::drain_active_microtask_queue;
 use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_core::error::StatorError;
 use stator_core::interpreter::{Interpreter, InterpreterFrame, set_execution_deadline};
@@ -419,8 +420,6 @@ fn has_unsupported_feature(features: &[String]) -> bool {
 /// for test categories that are known to hang or that exercise entirely
 /// unimplemented subsystems.  Checked via [`is_skipped_path`].
 const SKIPPED_PATH_PREFIXES: &[&str] = &[
-    // Promise — no microtask queue; tests hang waiting for resolution
-    "built-ins/Promise/",
     // Async generators / iterators — incomplete async runtime
     "built-ins/AsyncGeneratorFunction/",
     "built-ins/AsyncGeneratorPrototype/",
@@ -430,9 +429,6 @@ const SKIPPED_PATH_PREFIXES: &[&str] = &[
     "intl402/",
     // Annex B — legacy browser features, low priority
     "annexB/",
-    // Generators — partially supported but many tests hang
-    "built-ins/GeneratorFunction/",
-    "built-ins/GeneratorPrototype/",
 ];
 
 /// Individual test files (relative to the `test/` directory, forward-slash
@@ -1098,6 +1094,13 @@ fn run_test(
         execute_source(source, &effective_prefix, effective_globals)
     }));
 
+    // Drain the microtask queue so that promise reactions (e.g. .then($DONE))
+    // execute before we check the outcome.  This is a no-op when no queue is
+    // installed or the queue is empty.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drain_active_microtask_queue();
+    }));
+
     // A panic inside the interpreter may leave frames on the thread-local
     // call stack.  Clear it so the next test starts with a clean slate.
     clear_call_stack();
@@ -1396,8 +1399,6 @@ fn main_inner() {
             Some("CanBlock flag".to_string())
         } else if meta.is_module() {
             Some("module tests require ES module loader".to_string())
-        } else if meta.is_async() {
-            Some("async tests require microtask queue".to_string())
         } else if has_unsupported_feature(&meta.features) {
             let f = meta
                 .features

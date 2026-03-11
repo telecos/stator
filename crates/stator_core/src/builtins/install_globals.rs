@@ -6901,13 +6901,14 @@ fn make_string() -> JsValue {
 /// `allSettled`, `any`, `race`, `withResolvers`) are available as properties.
 fn make_promise() -> JsValue {
     use crate::builtins::promise::{
-        MicrotaskQueue, promise_all, promise_all_settled, promise_any, promise_catch,
-        promise_finally, promise_new, promise_race, promise_reject, promise_resolve, promise_then,
-        promise_with_resolvers,
+        MicrotaskQueue, install_active_microtask_queue, promise_all, promise_all_settled,
+        promise_any, promise_catch, promise_finally, promise_new, promise_race, promise_reject,
+        promise_resolve, promise_then, promise_with_resolvers,
     };
 
     let mut props = PropertyMap::new();
     let queue = MicrotaskQueue::new();
+    install_active_microtask_queue(&queue);
 
     // ── Constructor: new Promise(executor) ─────────────────────────────────
     //
