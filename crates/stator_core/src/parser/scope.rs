@@ -718,6 +718,7 @@ impl Analyzer {
                 match &s.left {
                     ForInOfLeft::VarDecl(v) => self.visit_var_decl(v),
                     ForInOfLeft::Pat(p) => self.visit_pat_ref(p),
+                    ForInOfLeft::Expr(e) => self.visit_expr(e),
                 }
                 self.visit_expr(&s.right);
                 self.visit_stmt(&s.body);
@@ -734,6 +735,7 @@ impl Analyzer {
                 match &s.left {
                     ForInOfLeft::VarDecl(v) => self.visit_var_decl(v),
                     ForInOfLeft::Pat(p) => self.visit_pat_ref(p),
+                    ForInOfLeft::Expr(e) => self.visit_expr(e),
                 }
                 self.visit_expr(&s.right);
                 self.visit_stmt(&s.body);

@@ -599,7 +599,7 @@ impl<'src> Parser<'src> {
             let body = self.parse_stmt()?;
             let end = body.loc();
 
-            let left = ForInOfLeft::Pat(self.expr_to_for_lhs(init_expr)?);
+            let left = self.expr_to_for_lhs(init_expr)?;
 
             return if is_of {
                 Ok(Stmt::ForOf(ForOfStmt {
@@ -658,17 +658,13 @@ impl<'src> Parser<'src> {
 
     /// Convert an expression to a pattern suitable for the left-hand side of
     /// a `for-in` or `for-of` statement.
-    fn expr_to_for_lhs(&self, expr: Expr) -> StatorResult<Pat> {
+    fn expr_to_for_lhs(&self, expr: Expr) -> StatorResult<ForInOfLeft> {
         match expr {
-            Expr::Ident(id) => Ok(Pat::Ident(id)),
-            Expr::Array(_) | Expr::Object(_) => self.expr_to_pat(expr),
-            Expr::Member(m) => {
-                // `for (a.b in obj)` — repack as a member-access pattern.
-                // For now, just wrap in a simple ident if possible.
-                Err(Self::error_at(
-                    m.loc,
-                    "member expressions as for-in/of targets are not yet supported",
-                ))
+            Expr::Ident(id) => Ok(ForInOfLeft::Pat(Pat::Ident(id))),
+            Expr::Array(_) | Expr::Object(_) => Ok(ForInOfLeft::Pat(self.expr_to_pat(expr)?)),
+            Expr::Member(_) => {
+                // `for (a.b in obj)` / `for (a.b of iter)` — expression LHS.
+                Ok(ForInOfLeft::Expr(Box::new(expr)))
             }
             other => {
                 let loc = other.loc();
@@ -1693,6 +1689,20 @@ impl<'src> Parser<'src> {
             }
             TokenKind::LeftBracket => self.parse_array_pat(),
             TokenKind::LeftBrace => self.parse_object_pat(),
+            // Contextual keywords that can serve as binding identifiers.
+            kind if self.is_contextual_keyword_identifier(kind) => {
+                let tok = self.bump()?;
+                let name = self.name_from_token(&tok)?;
+                if self.strict_mode && (name == "let" || name == "static" || name == "yield") {
+                    return Err(self.error(&format!(
+                        "'{name}' cannot be used as a binding name in strict mode",
+                    )));
+                }
+                Ok(Pat::Ident(Ident {
+                    loc: tok.span,
+                    name,
+                }))
+            }
             _ => Err(self.error("expected binding pattern")),
         }
     }
@@ -3263,6 +3273,15 @@ impl<'src> Parser<'src> {
                     expressions,
                 })))
             }
+            // Contextual keywords used as identifiers in expression context.
+            kind if self.is_contextual_keyword_identifier(kind) => {
+                let tok = self.bump()?;
+                let name = self.name_from_token(&tok)?;
+                Ok(Expr::Ident(Ident {
+                    loc: tok.span,
+                    name,
+                }))
+            }
             other => Err(self.error(&format!("unexpected token {:?}", other))),
         }
     }
@@ -3345,6 +3364,26 @@ impl<'src> Parser<'src> {
         })
     }
 
+    /// Returns `true` for keyword token kinds that can act as identifiers
+    /// in binding positions (contextual keywords and soft keywords).
+    fn is_contextual_keyword_identifier(&self, kind: TokenKind) -> bool {
+        matches!(
+            kind,
+            TokenKind::Let
+                | TokenKind::Of
+                | TokenKind::Async
+                | TokenKind::From
+                | TokenKind::As
+                | TokenKind::Get
+                | TokenKind::Set
+                | TokenKind::Target
+                | TokenKind::Meta
+                | TokenKind::Static
+                | TokenKind::Using
+                | TokenKind::Yield
+        )
+    }
+
     /// Accept identifiers **and** keyword tokens as property names.
     fn name_from_token(&self, tok: &Token) -> StatorResult<String> {
         match &tok.value {
@@ -3406,6 +3445,32 @@ impl<'src> Parser<'src> {
             Expr::Assign(assign) if assign.op == AssignOp::Assign => {
                 Ok(vec![self.assign_expr_to_param(*assign)?])
             }
+            // `({x}) => body` or `([x]) => body` — destructuring param
+            Expr::Array(_) | Expr::Object(_) => {
+                let loc = expr.loc();
+                let pat = self.expr_to_pat(expr)?;
+                Ok(vec![Param {
+                    loc: Span {
+                        start: loc.start,
+                        end: loc.end,
+                    },
+                    pat,
+                    default: None,
+                }])
+            }
+            // `(...args) => body` — rest param
+            Expr::Spread(spread) => {
+                let loc = spread.loc;
+                let arg = self.expr_to_pat(*spread.argument)?;
+                Ok(vec![Param {
+                    loc,
+                    pat: Pat::Rest(Box::new(RestElement {
+                        loc,
+                        argument: Box::new(arg),
+                    })),
+                    default: None,
+                }])
+            }
             other => {
                 let loc = other.loc();
                 Err(Self::error_at(
@@ -3430,6 +3495,32 @@ impl<'src> Parser<'src> {
             Expr::Assign(assign) if assign.op == AssignOp::Assign => {
                 self.assign_expr_to_param(*assign)
             }
+            // Destructuring patterns: `({x}, [y]) => body`
+            Expr::Array(_) | Expr::Object(_) => {
+                let loc = expr.loc();
+                let pat = self.expr_to_pat(expr)?;
+                Ok(Param {
+                    loc: Span {
+                        start: loc.start,
+                        end: loc.end,
+                    },
+                    pat,
+                    default: None,
+                })
+            }
+            // Rest element: `(...args) => body`
+            Expr::Spread(spread) => {
+                let loc = spread.loc;
+                let arg = self.expr_to_pat(*spread.argument)?;
+                Ok(Param {
+                    loc,
+                    pat: Pat::Rest(Box::new(RestElement {
+                        loc,
+                        argument: Box::new(arg),
+                    })),
+                    default: None,
+                })
+            }
             other => {
                 let loc = other.loc();
                 Err(Self::error_at(
@@ -3443,25 +3534,24 @@ impl<'src> Parser<'src> {
         }
     }
 
-    /// Convert an assignment expression (`id = default`) to a parameter with
+    /// Convert an assignment expression (`pat = default`) to a parameter with
     /// a default value.
     fn assign_expr_to_param(&self, assign: AssignExpr) -> StatorResult<Param> {
-        if let AssignTarget::Expr(lhs) = assign.left
-            && let Expr::Ident(id) = *lhs
-        {
-            return Ok(Param {
+        match assign.left {
+            AssignTarget::Expr(lhs) => {
+                let pat = self.expr_to_pat(*lhs)?;
+                Ok(Param {
+                    loc: assign.loc,
+                    pat,
+                    default: Some(*assign.right),
+                })
+            }
+            AssignTarget::Pat(pat) => Ok(Param {
                 loc: assign.loc,
-                pat: Pat::Ident(id),
+                pat,
                 default: Some(*assign.right),
-            });
+            }),
         }
-        Err(Self::error_at(
-            Span {
-                start: assign.loc.start,
-                end: assign.loc.end,
-            },
-            "invalid arrow-function parameter with default",
-        ))
     }
 
     // ── Assignment-target and destructuring validation ────────────────────

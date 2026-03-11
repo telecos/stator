@@ -2107,6 +2107,22 @@ fn make_object() -> JsValue {
         }
 
         if has_get || has_set {
+            // Non-extensible: cannot add new accessor property on objects that
+            // don't already have this key as an accessor.
+            {
+                let borrow = map.borrow();
+                let getter_key = format!("__get_{key}__");
+                let setter_key = format!("__set_{key}__");
+                if !borrow.extensible
+                    && !borrow.contains_key(key)
+                    && !borrow.contains_key(&getter_key)
+                    && !borrow.contains_key(&setter_key)
+                {
+                    return Err(crate::error::StatorError::TypeError(format!(
+                        "Cannot define property {key}, object is not extensible"
+                    )));
+                }
+            }
             let getter_key = format!("__get_{key}__");
             let setter_key = format!("__set_{key}__");
             let enumerable = desc.get("enumerable").is_some_and(|v| v.to_boolean());
@@ -2134,6 +2150,12 @@ fn make_object() -> JsValue {
             let configurable_val = desc.get("configurable").map(|v| v.to_boolean());
 
             if !map.borrow().contains_key(key) {
+                // Non-extensible: cannot add new properties.
+                if !map.borrow().extensible {
+                    return Err(crate::error::StatorError::TypeError(format!(
+                        "Cannot define property {key}, object is not extensible"
+                    )));
+                }
                 let value = if has_value {
                     desc.get("value").cloned().unwrap_or(JsValue::Undefined)
                 } else {
@@ -2712,6 +2734,28 @@ fn make_object() -> JsValue {
             let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
             let proto = args.get(1).unwrap_or(&JsValue::Undefined).clone();
             if let JsValue::PlainObject(map) = &obj {
+                // Non-extensible objects: TypeError unless prototype is unchanged.
+                if !map.borrow().extensible {
+                    let current_proto = map.borrow().get("__proto__").cloned();
+                    let same = match (&current_proto, &proto) {
+                        (None, JsValue::Null) => true,
+                        (Some(cur), _) => {
+                            if let JsValue::PlainObject(cur_map) = cur
+                                && let JsValue::PlainObject(new_map) = &proto
+                            {
+                                Rc::ptr_eq(cur_map, new_map)
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    if !same {
+                        return Err(StatorError::TypeError(
+                            "Cannot set prototype of a non-extensible object".to_string(),
+                        ));
+                    }
+                }
                 // Cycle detection: walk the new proto chain and check for obj.
                 if let JsValue::PlainObject(_) = &proto {
                     let mut current = proto.clone();

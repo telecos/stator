@@ -262,6 +262,8 @@ pub enum ForInOfLeft {
     VarDecl(VarDecl),
     /// An assignment pattern (destructuring target).
     Pat(Pat),
+    /// A plain expression (e.g. `obj.prop` in `for (obj.prop of iter)`).
+    Expr(Box<Expr>),
 }
 
 /// `while (test) body`

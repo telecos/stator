@@ -2397,9 +2397,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let n = *n;
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let radix = match args.first() {
-                        Some(JsValue::Smi(r)) if *r >= 2 && *r <= 36 => *r as u32,
-                        None => 10,
-                        _ => 10,
+                        None | Some(JsValue::Undefined) => 10u32,
+                        Some(v) => {
+                            let r = v.to_number()?;
+                            let ri = r.floor() as i64;
+                            if ri < 2 || ri > 36 {
+                                return Err(StatorError::RangeError(
+                                    "toString() radix must be between 2 and 36".to_string(),
+                                ));
+                            }
+                            ri as u32
+                        }
                     };
                     if radix == 10 {
                         return Ok(JsValue::String(n.to_string().into()));
@@ -2484,8 +2492,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let n = *n;
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let radix = match args.first() {
-                        Some(JsValue::Smi(r)) if *r >= 2 && *r <= 36 => *r as u32,
-                        _ => 10,
+                        None | Some(JsValue::Undefined) => 10u32,
+                        Some(v) => {
+                            let r = v.to_number()?;
+                            let ri = r.floor() as i64;
+                            if ri < 2 || ri > 36 {
+                                return Err(StatorError::RangeError(
+                                    "toString() radix must be between 2 and 36".to_string(),
+                                ));
+                            }
+                            ri as u32
+                        }
                     };
                     if radix == 10 {
                         return Ok(JsValue::String(format!("{n}").into()));
@@ -4775,7 +4792,22 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
             fn_props_set(ba, prop_name, value);
         }
         JsValue::Array(arr) => {
-            if let Some(idx) = to_array_index(key) {
+            if let JsValue::String(s) = key
+                && &**s == "length"
+            {
+                let new_len = value.to_number()?;
+                let new_len_u32 = new_len as u32;
+                if (new_len_u32 as f64) != new_len || new_len < 0.0 || !new_len.is_finite() {
+                    return Err(StatorError::RangeError("Invalid array length".to_string()));
+                }
+                let mut v = arr.borrow_mut();
+                let current_len = v.len();
+                if (new_len_u32 as usize) < current_len {
+                    v.truncate(new_len_u32 as usize);
+                } else {
+                    v.resize(new_len_u32 as usize, JsValue::Undefined);
+                }
+            } else if let Some(idx) = to_array_index(key) {
                 let mut v = arr.borrow_mut();
                 // Extend the array if needed
                 if idx >= v.len() {
