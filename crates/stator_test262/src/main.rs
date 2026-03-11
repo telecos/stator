@@ -944,13 +944,55 @@ fn execute_source_inner(
 
     // The deep-cloned globals contain Rc cycles (e.g. Object ↔ prototype ↔
     // constructor) that prevent automatic deallocation via reference counting.
-    // Clearing the map severs these cycles so all Rc-held objects are freed,
-    // preventing memory from accumulating across 53k+ tests.
-    if let Ok(mut g) = globals_cleanup.try_borrow_mut() {
-        g.clear();
-    }
+    // Recursively clear all nested PlainObject maps to break ALL cycles.
+    break_rc_cycles(&globals_cleanup);
 
     result
+}
+
+/// Recursively clear all `PlainObject` maps reachable from the given
+/// globals `Rc` to break Rc-based reference cycles.  Without this,
+/// each of the 53k+ test runs leaks its cloned globals (~100–200 KB
+/// each), exhausting runner memory within minutes.
+fn break_rc_cycles(globals: &Rc<RefCell<HashMap<String, JsValue>>>) {
+    let values: Vec<JsValue> = if let Ok(mut g) = globals.try_borrow_mut() {
+        let v: Vec<JsValue> = g.values().cloned().collect();
+        g.clear();
+        v
+    } else {
+        return;
+    };
+    for val in values {
+        clear_value_cycles(&val);
+    }
+}
+
+/// Clear the PropertyMap of a JsValue::PlainObject (and any nested objects)
+/// to break Rc cycles.
+fn clear_value_cycles(val: &JsValue) {
+    match val {
+        JsValue::PlainObject(map) => {
+            if let Ok(mut pm) = map.try_borrow_mut() {
+                let nested: Vec<JsValue> = pm.iter().map(|(_, v)| v.clone()).collect();
+                let keys: Vec<String> = pm.keys().cloned().collect();
+                for k in &keys {
+                    pm.remove(k);
+                }
+                for v in nested {
+                    clear_value_cycles(&v);
+                }
+            }
+        }
+        JsValue::Array(arr) => {
+            if let Ok(mut a) = arr.try_borrow_mut() {
+                let items: Vec<JsValue> = std::mem::take(&mut *a);
+                for v in items {
+                    clear_value_cycles(&v);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Runs a single Test262 test and returns its outcome.
@@ -1063,7 +1105,11 @@ fn run_test(
     // Break Rc cycles in the async globals clone (if any) to prevent
     // memory leaks from prototype-chain cycles.
     if let Some(ref mut g) = async_globals {
+        let values: Vec<JsValue> = g.values().cloned().collect();
         g.clear();
+        for v in values {
+            clear_value_cycles(&v);
+        }
     }
 
     let exec = match result {
