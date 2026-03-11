@@ -31,7 +31,7 @@ use crate::parser::ast::{
     EmptyStmt, ExportAllDecl, ExportDefaultDecl, ExportDefaultExpr, ExportNamedDecl,
     ExportSpecifier, Expr, ExprStmt, FnDecl, FnExpr, ForInOfLeft, ForInStmt, ForInit, ForOfStmt,
     ForStmt, Ident, IfStmt, ImportDecl, ImportDefaultSpecifier, ImportExpr, ImportNamedSpecifier,
-    ImportNamespaceSpecifier, ImportSpecifier, KeyValuePatProp, LogicalExpr, LogicalOp,
+    ImportNamespaceSpecifier, ImportSpecifier, KeyValuePatProp, LogicalExpr, LogicalOp, MemberProp,
     MetaPropExpr, MethodDef, MethodKind, ModuleDecl, ModuleExportName, NewExpr, NullLit, NumLit,
     ObjectExpr, ObjectPat, ObjectPatProp, ObjectProp, Param, Pat, PrivateIdent, Program,
     ProgramItem, Prop, PropKey, PropValue, PropertyDef, RegExpLit, RestElement, ReturnStmt,
@@ -657,10 +657,11 @@ impl<'src> Parser<'src> {
     }
 
     /// Convert an expression to a pattern suitable for the left-hand side of
-    /// a `for-in` or `for-of` statement (currently only simple identifiers).
+    /// a `for-in` or `for-of` statement.
     fn expr_to_for_lhs(&self, expr: Expr) -> StatorResult<Pat> {
         match expr {
             Expr::Ident(id) => Ok(Pat::Ident(id)),
+            Expr::Array(_) | Expr::Object(_) => self.expr_to_pat(expr),
             Expr::Member(m) => {
                 // `for (a.b in obj)` — repack as a member-access pattern.
                 // For now, just wrap in a simple ident if possible.
@@ -2142,13 +2143,14 @@ impl<'src> Parser<'src> {
             _ => None,
         };
         if let Some(op) = assign_op {
+            let left = self.expr_to_assign_target(lhs, op)?;
             self.bump()?;
             let rhs = self.parse_assignment_expr()?;
             let end = rhs.loc();
             return Ok(Expr::Assign(Box::new(AssignExpr {
                 loc: Self::merge_spans(start, end),
                 op,
-                left: AssignTarget::Expr(Box::new(lhs)),
+                left,
                 right: Box::new(rhs),
             })));
         }
@@ -2387,6 +2389,7 @@ impl<'src> Parser<'src> {
                 self.bump()?;
                 let arg = self.parse_unary()?;
                 let end = arg.loc();
+                self.validate_update_target(&arg)?;
                 return Ok(Expr::Update(Box::new(UpdateExpr {
                     loc: Self::merge_spans(start, end),
                     op: UpdateOp::Increment,
@@ -2398,6 +2401,7 @@ impl<'src> Parser<'src> {
                 self.bump()?;
                 let arg = self.parse_unary()?;
                 let end = arg.loc();
+                self.validate_update_target(&arg)?;
                 return Ok(Expr::Update(Box::new(UpdateExpr {
                     loc: Self::merge_spans(start, end),
                     op: UpdateOp::Decrement,
@@ -2411,6 +2415,19 @@ impl<'src> Parser<'src> {
             self.bump()?;
             let arg = self.parse_unary()?;
             let end = arg.loc();
+
+            // `delete obj.#private` is an early SyntaxError.
+            if op == UnaryOp::Delete {
+                if let Expr::Member(ref m) = arg {
+                    if matches!(m.property, MemberProp::Private(_)) {
+                        return Err(Self::error_at(
+                            Self::merge_spans(start, end),
+                            "private fields can not be deleted",
+                        ));
+                    }
+                }
+            }
+
             return Ok(Expr::Unary(Box::new(UnaryExpr {
                 loc: Self::merge_spans(start, end),
                 op,
@@ -2430,6 +2447,7 @@ impl<'src> Parser<'src> {
                 _ => None,
             };
             if let Some(op) = op {
+                self.validate_update_target(&expr)?;
                 let end = self.current_span();
                 self.bump()?;
                 return Ok(Expr::Update(Box::new(UpdateExpr {
@@ -2924,7 +2942,29 @@ impl<'src> Parser<'src> {
                         } else {
                             // Shorthand — only valid for identifier keys.
                             match &key {
-                                PropKey::Ident(_) => PropValue::Shorthand,
+                                PropKey::Ident(id) => {
+                                    // CoverInitializedName: `{ id = default }`.
+                                    // Only valid in destructuring context; we
+                                    // parse it here and validate at use-site.
+                                    if self.peek_kind() == TokenKind::Equal {
+                                        self.bump()?; // consume `=`
+                                        let rhs = self.parse_assignment_expr()?;
+                                        let ident = id.clone();
+                                        let assign_loc = Self::merge_spans(ident.loc, rhs.loc());
+                                        PropValue::Value(Box::new(Expr::Assign(Box::new(
+                                            AssignExpr {
+                                                loc: assign_loc,
+                                                op: AssignOp::Assign,
+                                                left: AssignTarget::Expr(Box::new(Expr::Ident(
+                                                    ident,
+                                                ))),
+                                                right: Box::new(rhs),
+                                            },
+                                        ))))
+                                    } else {
+                                        PropValue::Shorthand
+                                    }
+                                }
                                 _ => {
                                     return Err(Self::error_at(
                                         prop_start,
@@ -3423,6 +3463,178 @@ impl<'src> Parser<'src> {
             },
             "invalid arrow-function parameter with default",
         ))
+    }
+
+    // ── Assignment-target and destructuring validation ────────────────────
+
+    /// Validate and convert an expression to an assignment target.
+    ///
+    /// For simple `=` assignments, array and object expressions are
+    /// reinterpreted as destructuring patterns (the "cover grammar"
+    /// conversion).  For compound assignments (`+=`, `-=`, etc.), only
+    /// simple l-values (identifiers and member expressions) are allowed.
+    fn expr_to_assign_target(&self, expr: Expr, op: AssignOp) -> StatorResult<AssignTarget> {
+        match expr {
+            // Simple l-values: identifiers and member expressions.
+            Expr::Ident(ref id) => {
+                if self.strict_mode && (id.name == "eval" || id.name == "arguments") {
+                    return Err(Self::error_at(
+                        id.loc,
+                        &format!("cannot assign to '{}' in strict mode", id.name),
+                    ));
+                }
+                Ok(AssignTarget::Expr(Box::new(expr)))
+            }
+            Expr::Member(_) => Ok(AssignTarget::Expr(Box::new(expr))),
+
+            // Destructuring patterns: only valid with simple `=`.
+            Expr::Array(_) if op == AssignOp::Assign => {
+                let pat = self.expr_to_pat(expr)?;
+                Ok(AssignTarget::Pat(pat))
+            }
+            Expr::Object(_) if op == AssignOp::Assign => {
+                let pat = self.expr_to_pat(expr)?;
+                Ok(AssignTarget::Pat(pat))
+            }
+
+            // Everything else is an invalid assignment target.
+            other => {
+                let loc = other.loc();
+                Err(Self::error_at(loc, "invalid left-hand side in assignment"))
+            }
+        }
+    }
+
+    /// Reinterpret an expression as a destructuring pattern
+    /// (the "cover grammar" conversion for array/object literals).
+    fn expr_to_pat(&self, expr: Expr) -> StatorResult<Pat> {
+        match expr {
+            Expr::Ident(id) => Ok(Pat::Ident(id)),
+
+            Expr::Array(arr) => {
+                let mut elements = Vec::with_capacity(arr.elements.len());
+                for elem in arr.elements {
+                    match elem {
+                        None => elements.push(None),
+                        Some(e) => elements.push(Some(self.expr_to_pat(e)?)),
+                    }
+                }
+                Ok(Pat::Array(Box::new(ArrayPat {
+                    loc: arr.loc,
+                    elements,
+                })))
+            }
+
+            Expr::Object(obj) => {
+                let mut properties = Vec::with_capacity(obj.properties.len());
+                for prop in obj.properties {
+                    properties.push(self.obj_prop_to_pat_prop(prop)?);
+                }
+                Ok(Pat::Object(Box::new(ObjectPat {
+                    loc: obj.loc,
+                    properties,
+                })))
+            }
+
+            Expr::Assign(assign) if assign.op == AssignOp::Assign => {
+                let left = match assign.left {
+                    AssignTarget::Expr(e) => self.expr_to_pat(*e)?,
+                    AssignTarget::Pat(p) => p,
+                };
+                Ok(Pat::Assign(Box::new(AssignPat {
+                    loc: assign.loc,
+                    left: Box::new(left),
+                    right: assign.right,
+                })))
+            }
+
+            Expr::Spread(spread) => {
+                let arg = self.expr_to_pat(*spread.argument)?;
+                Ok(Pat::Rest(Box::new(RestElement {
+                    loc: spread.loc,
+                    argument: Box::new(arg),
+                })))
+            }
+
+            // Member expressions are valid assignment targets in
+            // destructuring, but our Pat enum has no Member variant.
+            // Return an error for now; a future change could add one.
+            other => {
+                let loc = other.loc();
+                Err(Self::error_at(loc, "invalid destructuring target"))
+            }
+        }
+    }
+
+    /// Convert an object-literal property to an object-pattern property.
+    fn obj_prop_to_pat_prop(&self, prop: ObjectProp) -> StatorResult<ObjectPatProp> {
+        match prop {
+            ObjectProp::Spread(spread) => {
+                let arg = self.expr_to_pat(*spread.argument)?;
+                Ok(ObjectPatProp::Rest(RestElement {
+                    loc: spread.loc,
+                    argument: Box::new(arg),
+                }))
+            }
+            ObjectProp::Prop(p) => match p.value {
+                PropValue::Shorthand => {
+                    // `{ a }` → shorthand binding.
+                    if let PropKey::Ident(id) = p.key {
+                        Ok(ObjectPatProp::Assign(AssignPatProp {
+                            loc: p.loc,
+                            key: id,
+                            value: None,
+                        }))
+                    } else {
+                        Err(Self::error_at(
+                            p.loc,
+                            "invalid shorthand in destructuring pattern",
+                        ))
+                    }
+                }
+                PropValue::Value(expr) => {
+                    // `{ key: value }` → key-value pattern.
+                    let pat = self.expr_to_pat(*expr)?;
+                    Ok(ObjectPatProp::KeyValue(KeyValuePatProp {
+                        loc: p.loc,
+                        key: p.key,
+                        is_computed: p.is_computed,
+                        value: pat,
+                    }))
+                }
+                _ => {
+                    // Methods, getters, setters are not valid in
+                    // destructuring.
+                    Err(Self::error_at(
+                        p.loc,
+                        "invalid property in destructuring pattern",
+                    ))
+                }
+            },
+        }
+    }
+
+    /// Validate that an expression is a valid update (`++`/`--`) target.
+    fn validate_update_target(&self, expr: &Expr) -> StatorResult<()> {
+        match expr {
+            Expr::Ident(id) => {
+                if self.strict_mode && (id.name == "eval" || id.name == "arguments") {
+                    return Err(Self::error_at(
+                        id.loc,
+                        &format!("cannot update '{}' in strict mode", id.name),
+                    ));
+                }
+                Ok(())
+            }
+            Expr::Member(_) => Ok(()),
+            other => {
+                let loc = other.loc();
+                Err(Self::error_at(
+                    loc,
+                    "invalid left-hand side in update expression",
+                ))
+            }
+        }
     }
 
     fn merge_spans(a: Span, b: Span) -> SourceLocation {
