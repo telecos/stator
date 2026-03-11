@@ -2084,10 +2084,9 @@ fn make_number() -> JsValue {
             match args.first().unwrap_or(&JsValue::Undefined) {
                 JsValue::Smi(n) => Ok(*n as f64),
                 JsValue::HeapNumber(n) => Ok(*n),
-                other => Err(crate::error::StatorError::TypeError(format!(
-                    "Number.prototype method requires a number, got {}",
-                    other.type_of()
-                ))),
+                _ => Err(crate::error::StatorError::TypeError(
+                    "Number.prototype method requires that 'this' be a Number".to_string(),
+                )),
             }
         }
 
