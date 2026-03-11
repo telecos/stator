@@ -221,6 +221,26 @@ fn require_object_coercible(val: &JsValue) -> StatorResult<()> {
     }
 }
 
+/// ES §22.1.3 step 1: RequireObjectCoercible then ToString for String.prototype methods.
+///
+/// This ensures `String.prototype.foo.call(null)` and
+/// `String.prototype.foo.call(undefined)` throw TypeError as required by spec.
+fn require_coercible_string(args: &[JsValue]) -> StatorResult<String> {
+    let this_val = args.first().unwrap_or(&JsValue::Undefined);
+    require_object_coercible(this_val)?;
+    this_val.to_js_string()
+}
+
+/// Returns `true` when `val` is callable (Function, NativeFunction, or PlainObject
+/// with a `__call__` slot).
+fn is_callable(val: &JsValue) -> bool {
+    match val {
+        JsValue::Function(_) | JsValue::NativeFunction(_) => true,
+        JsValue::PlainObject(map) => map.borrow().contains_key("__call__"),
+        _ => false,
+    }
+}
+
 /// ECMAScript §23.1.3.1 step 5.b — check `@@isConcatSpreadable`.
 ///
 /// Returns `true` when the value should be spread by `Array.prototype.concat`:
@@ -2088,6 +2108,12 @@ fn make_object() -> JsValue {
         "keys".into(),
         builtin_fn("keys", 1, |args| {
             let val = args.first().unwrap_or(&JsValue::Undefined);
+            // §20.1.2.15 step 1: throw TypeError for null/undefined.
+            if matches!(val, JsValue::Null | JsValue::Undefined) {
+                return Err(StatorError::TypeError(
+                    "Cannot convert undefined or null to object".into(),
+                ));
+            }
             if let JsValue::PlainObject(map) = val {
                 let borrow = map.borrow();
                 if borrow.get("__is_array__").is_some() {
@@ -2127,6 +2153,12 @@ fn make_object() -> JsValue {
         "values".into(),
         builtin_fn("values", 1, |args| {
             let val = args.first().unwrap_or(&JsValue::Undefined);
+            // §20.1.2.22 step 1: throw TypeError for null/undefined.
+            if matches!(val, JsValue::Null | JsValue::Undefined) {
+                return Err(StatorError::TypeError(
+                    "Cannot convert undefined or null to object".into(),
+                ));
+            }
             if let JsValue::PlainObject(map) = val {
                 let borrow = map.borrow();
                 if borrow.get("__is_array__").is_some() {
@@ -2158,6 +2190,12 @@ fn make_object() -> JsValue {
         "entries".into(),
         builtin_fn("entries", 1, |args| {
             let val = args.first().unwrap_or(&JsValue::Undefined);
+            // §20.1.2.5 step 1: throw TypeError for null/undefined.
+            if matches!(val, JsValue::Null | JsValue::Undefined) {
+                return Err(StatorError::TypeError(
+                    "Cannot convert undefined or null to object".into(),
+                ));
+            }
             if let JsValue::PlainObject(map) = val {
                 let borrow = map.borrow();
                 if borrow.get("__is_array__").is_some() {
@@ -2421,6 +2459,12 @@ fn make_object() -> JsValue {
         "getOwnPropertyDescriptor".into(),
         builtin_fn("getOwnPropertyDescriptor", 2, |args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined);
+            // §20.1.2.6 step 1: throw TypeError for null/undefined.
+            if matches!(obj, JsValue::Null | JsValue::Undefined) {
+                return Err(StatorError::TypeError(
+                    "Cannot convert undefined or null to object".into(),
+                ));
+            }
             let prop = args.get(1).unwrap_or(&JsValue::Undefined);
 
             let key = prop.to_js_string()?;
@@ -2587,6 +2631,12 @@ fn make_object() -> JsValue {
         "getOwnPropertyNames".into(),
         builtin_fn("getOwnPropertyNames", 1, |args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined);
+            // §20.1.2.7 step 1: throw TypeError for null/undefined.
+            if matches!(obj, JsValue::Null | JsValue::Undefined) {
+                return Err(StatorError::TypeError(
+                    "Cannot convert undefined or null to object".into(),
+                ));
+            }
             if let JsValue::PlainObject(map) = obj {
                 let keys: Vec<JsValue> = map
                     .borrow()
@@ -2893,6 +2943,12 @@ fn make_object() -> JsValue {
         "getPrototypeOf".into(),
         builtin_fn("getPrototypeOf", 1, |args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined);
+            // §20.1.2.12 step 1: throw TypeError for null/undefined.
+            if matches!(obj, JsValue::Null | JsValue::Undefined) {
+                return Err(StatorError::TypeError(
+                    "Cannot convert undefined or null to object".into(),
+                ));
+            }
             match obj {
                 JsValue::PlainObject(map) => {
                     let borrow = map.borrow();
@@ -2997,6 +3053,12 @@ fn make_object() -> JsValue {
         "getOwnPropertyDescriptors".into(),
         builtin_fn("getOwnPropertyDescriptors", 1, |args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined);
+            // §20.1.2.8 step 1: throw TypeError for null/undefined.
+            if matches!(obj, JsValue::Null | JsValue::Undefined) {
+                return Err(StatorError::TypeError(
+                    "Cannot convert undefined or null to object".into(),
+                ));
+            }
             if let JsValue::PlainObject(map) = obj {
                 let mut result = PropertyMap::new();
                 let borrow = map.borrow();
@@ -3319,6 +3381,14 @@ fn make_array() -> JsValue {
         builtin_fn("from", 1, |args| {
             let iterable = args.first().unwrap_or(&JsValue::Undefined);
             let map_fn = args.get(1).cloned();
+            // §23.1.2.1 step 3: if mapFn is provided and not undefined, it must be callable.
+            if let Some(ref mf) = map_fn {
+                if !matches!(mf, JsValue::Undefined) && !is_callable(mf) {
+                    return Err(StatorError::TypeError(
+                        "Array.from: mapFn is not a function".into(),
+                    ));
+                }
+            }
             let items: Vec<JsValue> = match iterable {
                 JsValue::Array(arr) => arr.borrow().clone(),
                 JsValue::String(s) => s
@@ -3359,12 +3429,21 @@ fn make_array() -> JsValue {
                 _ => Vec::new(),
             };
             // Apply mapFn if provided.
-            let mapped = if let Some(JsValue::NativeFunction(f)) = map_fn {
-                items
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, v)| f(vec![v, JsValue::Smi(i as i32)]))
-                    .collect::<Result<Vec<_>, _>>()?
+            let mapped = if let Some(ref mf) = map_fn {
+                if !matches!(mf, JsValue::Undefined) {
+                    items
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            dispatch_call_value(
+                                mf,
+                                vec![v, JsValue::Smi(i as i32)],
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    items
+                }
             } else {
                 items
             };
@@ -6282,7 +6361,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "charAt".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let pos = args
                 .get(1)
                 .unwrap_or(&JsValue::Undefined)
@@ -6296,7 +6375,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "charCodeAt".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let pos = args
                 .get(1)
                 .unwrap_or(&JsValue::Undefined)
@@ -6310,7 +6389,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "codePointAt".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let pos = args
                 .get(1)
                 .unwrap_or(&JsValue::Undefined)
@@ -6327,7 +6406,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "concat".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let parts: StatorResult<Vec<String>> =
                 args.iter().skip(1).map(|a| a.to_js_string()).collect();
             let parts = parts?;
@@ -6340,7 +6419,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "slice".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let start = args
                 .get(1)
                 .unwrap_or(&JsValue::Undefined)
@@ -6358,7 +6437,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "substring".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let start = args
                 .get(1)
                 .unwrap_or(&JsValue::Undefined)
@@ -6376,7 +6455,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "indexOf".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
             let pos = match args.get(2) {
                 Some(JsValue::Undefined) | None => None,
@@ -6390,7 +6469,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "lastIndexOf".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
             let pos = match args.get(2) {
                 Some(JsValue::Undefined) | None => None,
@@ -6404,7 +6483,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "includes".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
             let pos = match args.get(2) {
                 Some(JsValue::Undefined) | None => None,
@@ -6418,7 +6497,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "startsWith".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
             let pos = match args.get(2) {
                 Some(JsValue::Undefined) | None => None,
@@ -6432,7 +6511,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "endsWith".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
             let end = match args.get(2) {
                 Some(JsValue::Undefined) | None => None,
@@ -6446,7 +6525,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "toUpperCase".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_to_upper_case(&s).into()))
         }),
     );
@@ -6455,7 +6534,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "toLowerCase".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_to_lower_case(&s).into()))
         }),
     );
@@ -6464,7 +6543,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "trim".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_trim(&s).into()))
         }),
     );
@@ -6473,7 +6552,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "trimStart".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_trim_start(&s).into()))
         }),
     );
@@ -6482,7 +6561,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "trimEnd".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_trim_end(&s).into()))
         }),
     );
@@ -6491,7 +6570,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "trimLeft".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_trim_start(&s).into()))
         }),
     );
@@ -6500,7 +6579,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "trimRight".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_trim_end(&s).into()))
         }),
     );
@@ -6509,7 +6588,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "split".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let sep_arg = args.get(1).unwrap_or(&JsValue::Undefined);
             // Delegate to RegExp[@@split] when separator is a regexp.
             if let Some(result) = try_regexp_symbol(sep_arg, "__symbol_split__", {
@@ -6542,7 +6621,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "replace".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let search_arg = args.get(1).unwrap_or(&JsValue::Undefined);
             // Delegate to RegExp[@@replace] when searchValue is a regexp.
             if let Some(result) = try_regexp_symbol(
@@ -6567,7 +6646,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "replaceAll".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let search_arg = args.get(1).unwrap_or(&JsValue::Undefined);
             // Delegate to RegExp[@@replace] when searchValue is a regexp.
             // Per spec, replaceAll with a non-global regexp throws TypeError.
@@ -6604,7 +6683,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "match".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let pattern_arg = args.get(1).unwrap_or(&JsValue::Undefined);
             // Delegate to RegExp[@@match] when argument is a regexp.
             if let Some(result) = try_regexp_symbol(
@@ -6632,7 +6711,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "matchAll".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let pattern_arg = args.get(1).unwrap_or(&JsValue::Undefined);
             // Delegate to RegExp[@@matchAll] when argument is a regexp.
             if let Some(result) = try_regexp_symbol(
@@ -6660,7 +6739,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "repeat".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let n = args
                 .get(1)
                 .unwrap_or(&JsValue::Undefined)
@@ -6679,7 +6758,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "padStart".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let raw = args
                 .get(1)
                 .unwrap_or(&JsValue::Undefined)
@@ -6704,7 +6783,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "padEnd".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let raw = args
                 .get(1)
                 .unwrap_or(&JsValue::Undefined)
@@ -6729,7 +6808,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "at".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let idx = args
                 .get(1)
                 .unwrap_or(&JsValue::Undefined)
@@ -6746,7 +6825,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "normalize".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let form = match args.get(1) {
                 Some(JsValue::Undefined) | None => None,
                 Some(v) => Some(v.to_js_string()?),
@@ -6761,7 +6840,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "search".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let pattern_arg = args.get(1).unwrap_or(&JsValue::Undefined);
             // Delegate to RegExp[@@search] when argument is a regexp.
             if let Some(result) = try_regexp_symbol(
@@ -6780,7 +6859,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "isWellFormed".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::Boolean(string_is_well_formed(&s)))
         }),
     );
@@ -6789,7 +6868,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "toWellFormed".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_to_well_formed(&s).into()))
         }),
     );
@@ -6798,7 +6877,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "localeCompare".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let that = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(num(string_locale_compare(&s, &that) as f64))
         }),
@@ -6808,7 +6887,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "toLocaleLowerCase".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_to_locale_lower_case(&s).into()))
         }),
     );
@@ -6817,7 +6896,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "toLocaleUpperCase".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_to_locale_upper_case(&s).into()))
         }),
     );
@@ -6826,7 +6905,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "toString".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(s.into()))
         }),
     );
@@ -6835,7 +6914,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "valueOf".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(s.into()))
         }),
     );
@@ -6844,7 +6923,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "@@iterator".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let chars: Vec<JsValue> = string_iter(&s)
                 .into_iter()
                 .map(|s| JsValue::String(s.into()))
@@ -6859,7 +6938,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "substr".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let start = args
                 .get(1)
                 .unwrap_or(&JsValue::Undefined)
@@ -6877,7 +6956,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "anchor".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let name = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(JsValue::String(string_anchor(&s, &name).into()))
         }),
@@ -6887,7 +6966,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "big".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_big(&s).into()))
         }),
     );
@@ -6896,7 +6975,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "blink".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_blink(&s).into()))
         }),
     );
@@ -6905,7 +6984,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "bold".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_bold(&s).into()))
         }),
     );
@@ -6914,7 +6993,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "fixed".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_fixed(&s).into()))
         }),
     );
@@ -6923,7 +7002,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "fontcolor".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let color = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(JsValue::String(string_fontcolor(&s, &color).into()))
         }),
@@ -6933,7 +7012,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "fontsize".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let size = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(JsValue::String(string_fontsize(&s, &size).into()))
         }),
@@ -6943,7 +7022,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "italics".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_italics(&s).into()))
         }),
     );
@@ -6952,7 +7031,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "link".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             let url = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
             Ok(JsValue::String(string_link(&s, &url).into()))
         }),
@@ -6962,7 +7041,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "small".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_small(&s).into()))
         }),
     );
@@ -6971,7 +7050,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "strike".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_strike(&s).into()))
         }),
     );
@@ -6980,7 +7059,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "sub".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_sub(&s).into()))
         }),
     );
@@ -6989,7 +7068,7 @@ fn make_string() -> JsValue {
     proto.insert(
         "sup".into(),
         native(|args| {
-            let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            let s = require_coercible_string(&args)?;
             Ok(JsValue::String(string_sup(&s).into()))
         }),
     );
