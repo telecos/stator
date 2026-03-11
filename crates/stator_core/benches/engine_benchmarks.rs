@@ -464,4 +464,9 @@ criterion_group!(
     bench_js_closure_capture,
 );
 
-criterion_main!(infra_benches, property_map_benches, jsvalue_benches, js_benches);
+criterion_main!(
+    infra_benches,
+    property_map_benches,
+    jsvalue_benches,
+    js_benches
+);
