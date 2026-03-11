@@ -2553,6 +2553,18 @@ fn handle_sta_named_property(
                 return Ok(DispatchAction::Continue);
             }
             drop(pm);
+            // Non-extensible: TypeError for new property additions in strict mode.
+            {
+                let pm = map.borrow();
+                if !pm.extensible && !pm.contains_key(prop_name.as_ref()) {
+                    if ctx.frame.bytecode_array.is_strict() {
+                        return Err(StatorError::TypeError(format!(
+                            "Cannot add property {prop_name}, object is not extensible"
+                        )));
+                    }
+                    return Ok(DispatchAction::Continue);
+                }
+            }
             map.borrow_mut().insert(prop_name.to_string(), val);
             // Populate shape store IC for future fast-path stores.
             if slot != u32::MAX {
@@ -2579,6 +2591,22 @@ fn handle_sta_named_property(
         }
         JsValue::Function(ref ba) => {
             fn_props_set(ba, prop_name.to_string(), val);
+        }
+        JsValue::Array(ref arr) => {
+            if prop_name.as_ref() == "length" {
+                let new_len = val.to_number()?;
+                let new_len_u32 = new_len as u32;
+                if (new_len_u32 as f64) != new_len || new_len < 0.0 || !new_len.is_finite() {
+                    return Err(StatorError::RangeError("Invalid array length".to_string()));
+                }
+                let mut v = arr.borrow_mut();
+                let current_len = v.len();
+                if (new_len_u32 as usize) < current_len {
+                    v.truncate(new_len_u32 as usize);
+                } else {
+                    v.resize(new_len_u32 as usize, JsValue::Undefined);
+                }
+            }
         }
         JsValue::Error(ref e) => {
             e.props.borrow_mut().insert(prop_name.to_string(), val);
@@ -2639,6 +2667,18 @@ fn handle_sta_keyed_property(
                 "undefined"
             }
         )));
+    }
+    // Strict mode: TypeError when assigning to a non-writable property.
+    if ctx.frame.bytecode_array.is_strict()
+        && let JsValue::PlainObject(ref map) = obj
+    {
+        let key_str = to_property_key(&key)?;
+        let pm = map.borrow();
+        if pm.contains_key(&key_str) && !pm.is_writable(&key_str) {
+            return Err(StatorError::TypeError(format!(
+                "Cannot assign to read only property '{key_str}'"
+            )));
+        }
     }
     keyed_store(&obj, &key, val)?;
     // Accumulator stays unchanged.
@@ -3761,7 +3801,27 @@ fn handle_test_in(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
                 !matches!(proto_lookup(&object, &prop), JsValue::Undefined)
             }
         }
-        _ => false,
+        JsValue::Function(_)
+        | JsValue::Error(_)
+        | JsValue::Promise(_)
+        | JsValue::Generator(_)
+        | JsValue::Iterator(_)
+        | JsValue::NativeFunction(_)
+        | JsValue::TypedArray(_)
+        | JsValue::ArrayBuffer(_)
+        | JsValue::DataView(_)
+        | JsValue::Object(_) => {
+            // Object-like types without own properties — fall back to proto.
+            let prop = to_property_key(key)?;
+            !matches!(proto_lookup(&object, &prop), JsValue::Undefined)
+        }
+        other => {
+            return Err(StatorError::TypeError(format!(
+                "Cannot use 'in' operator to search for '{}' in {}",
+                key.to_display_string(),
+                other.to_display_string()
+            )));
+        }
     };
 
     ctx.frame.accumulator = JsValue::Boolean(result);

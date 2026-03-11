@@ -2397,9 +2397,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let n = *n;
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let radix = match args.first() {
-                        Some(JsValue::Smi(r)) if *r >= 2 && *r <= 36 => *r as u32,
-                        None => 10,
-                        _ => 10,
+                        None | Some(JsValue::Undefined) => 10u32,
+                        Some(v) => {
+                            let r = v.to_number()?;
+                            let ri = r.floor() as i64;
+                            if !(2..=36).contains(&ri) {
+                                return Err(StatorError::RangeError(
+                                    "toString() radix must be between 2 and 36".to_string(),
+                                ));
+                            }
+                            ri as u32
+                        }
                     };
                     if radix == 10 {
                         return Ok(JsValue::String(n.to_string().into()));
@@ -2484,8 +2492,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let n = *n;
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let radix = match args.first() {
-                        Some(JsValue::Smi(r)) if *r >= 2 && *r <= 36 => *r as u32,
-                        _ => 10,
+                        None | Some(JsValue::Undefined) => 10u32,
+                        Some(v) => {
+                            let r = v.to_number()?;
+                            let ri = r.floor() as i64;
+                            if !(2..=36).contains(&ri) {
+                                return Err(StatorError::RangeError(
+                                    "toString() radix must be between 2 and 36".to_string(),
+                                ));
+                            }
+                            ri as u32
+                        }
                     };
                     if radix == 10 {
                         return Ok(JsValue::String(format!("{n}").into()));
@@ -4775,7 +4792,22 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
             fn_props_set(ba, prop_name, value);
         }
         JsValue::Array(arr) => {
-            if let Some(idx) = to_array_index(key) {
+            if let JsValue::String(s) = key
+                && &**s == "length"
+            {
+                let new_len = value.to_number()?;
+                let new_len_u32 = new_len as u32;
+                if (new_len_u32 as f64) != new_len || new_len < 0.0 || !new_len.is_finite() {
+                    return Err(StatorError::RangeError("Invalid array length".to_string()));
+                }
+                let mut v = arr.borrow_mut();
+                let current_len = v.len();
+                if (new_len_u32 as usize) < current_len {
+                    v.truncate(new_len_u32 as usize);
+                } else {
+                    v.resize(new_len_u32 as usize, JsValue::Undefined);
+                }
+            } else if let Some(idx) = to_array_index(key) {
                 let mut v = arr.borrow_mut();
                 // Extend the array if needed
                 if idx >= v.len() {
@@ -8746,17 +8778,18 @@ mod tests {
 
     #[test]
     fn test_test_in_non_object() {
-        // "x" in 42 → false (non-object target)
-        let result = run_with_acc_and_regs(
-            JsValue::String("x".to_string().into()),
-            &[JsValue::Smi(42)],
-            vec![Instruction::new_unchecked(
-                Opcode::TestIn,
-                vec![Operand::Register(0), Operand::FeedbackSlot(0)],
-            )],
-            1,
-        );
-        assert_eq!(result, JsValue::Boolean(false));
+        // "x" in 42 → TypeError (non-object target per spec)
+        let mut all = vec![Instruction::new_unchecked(
+            Opcode::TestIn,
+            vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+        )];
+        all.push(Instruction::new_unchecked(Opcode::Return, vec![]));
+        let ba = make_bytecode(all, 1, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        frame.accumulator = JsValue::String("x".to_string().into());
+        frame.write_reg(0, JsValue::Smi(42)).unwrap();
+        let result = Interpreter::run(&mut frame);
+        assert!(result.is_err(), "expected TypeError for `in` on non-object");
     }
 
     // ── CreateEmptyArrayLiteral + StaInArrayLiteral ─────────────────────────

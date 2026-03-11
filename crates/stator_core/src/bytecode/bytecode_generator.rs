@@ -3974,7 +3974,7 @@ impl FunctionCompiler {
                     ));
                 }
             }
-            ForInOfLeft::Pat(_) => None,
+            ForInOfLeft::Pat(_) | ForInOfLeft::Expr(_) => None,
         };
 
         // Evaluate the right-hand (object) expression → acc.
@@ -4073,6 +4073,11 @@ impl FunctionCompiler {
                     self.compile_binding_pattern(pat, scratch)?;
                 }
             },
+            ForInOfLeft::Expr(expr) => {
+                // Expression target (e.g. `obj.prop`): acc holds the key.
+                let target = AssignTarget::Expr(expr.clone());
+                self.compile_assign_target_store(&target)?;
+            }
         }
 
         // Compile the loop body.
@@ -4155,7 +4160,7 @@ impl FunctionCompiler {
                     ));
                 }
             }
-            ForInOfLeft::Pat(_) => None, // existing variable — no new allocation
+            ForInOfLeft::Pat(_) | ForInOfLeft::Expr(_) => None, // existing variable — no new allocation
         };
 
         // Evaluate the right-hand (iterable) expression → acc.
@@ -4235,6 +4240,12 @@ impl FunctionCompiler {
                     self.compile_binding_pattern(pat, scratch)?;
                 }
             },
+            ForInOfLeft::Expr(expr) => {
+                // Expression target (e.g. `obj.prop`): load value then assign.
+                self.emit_ldar(val_reg);
+                let target = AssignTarget::Expr(expr.clone());
+                self.compile_assign_target_store(&target)?;
+            }
         }
 
         // Compile the loop body (no extra scope — scope was opened above).

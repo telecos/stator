@@ -19,6 +19,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::rc::Rc;
 
 use crate::builtins::date::{
@@ -548,6 +549,15 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
         "stackTraceLimit".into(),
         JsValue::Smi(get_stack_trace_limit() as i32),
     );
+    // §20.5.4.3 Error.isError(arg)  — ES2026
+    error_props.insert(
+        "isError".into(),
+        builtin_fn("isError", 1, |args| {
+            let val = args.first().unwrap_or(&JsValue::Undefined);
+            Ok(JsValue::Boolean(matches!(val, JsValue::Error(_))))
+        }),
+    );
+
     error_props.make_all_non_enumerable();
     globals.insert(
         "Error".into(),
@@ -869,6 +879,60 @@ fn make_math() -> JsValue {
         builtin_fn("clz32", 1, |args| {
             let x = arg_f64(&args, 0)?;
             Ok(JsValue::Smi(math_clz32(x) as i32))
+        }),
+    );
+
+    // §21.3.2.42 Math.sumPrecise(items)  — ES2025
+    props.insert(
+        "sumPrecise".into(),
+        builtin_fn("sumPrecise", 1, |args| {
+            let items = args.first().unwrap_or(&JsValue::Undefined);
+            let elems = match items {
+                JsValue::Array(arr) => arr.borrow().clone(),
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "Math.sumPrecise: argument must be iterable".into(),
+                    ));
+                }
+            };
+            // Use compensated (Kahan) summation for extra precision.
+            let mut sum: f64 = 0.0;
+            let mut comp: f64 = 0.0;
+            for v in &elems {
+                let n = v.to_number()?;
+                if n.is_nan() {
+                    return Ok(JsValue::HeapNumber(f64::NAN));
+                }
+                if n.is_infinite() {
+                    // Check for +∞ and −∞ in same list → NaN.
+                    let mut has_pos = false;
+                    let mut has_neg = false;
+                    for v2 in &elems {
+                        let n2 = v2.to_number()?;
+                        if n2 == f64::INFINITY {
+                            has_pos = true;
+                        } else if n2 == f64::NEG_INFINITY {
+                            has_neg = true;
+                        }
+                    }
+                    return Ok(JsValue::HeapNumber(if has_pos && has_neg {
+                        f64::NAN
+                    } else if has_pos {
+                        f64::INFINITY
+                    } else {
+                        f64::NEG_INFINITY
+                    }));
+                }
+                let y = n - comp;
+                let t = sum + y;
+                comp = (t - sum) - y;
+                sum = t;
+            }
+            // Normalise −0 to +0 per spec.
+            if sum == 0.0 {
+                sum = 0.0;
+            }
+            Ok(num(sum))
         }),
     );
 
@@ -2107,6 +2171,22 @@ fn make_object() -> JsValue {
         }
 
         if has_get || has_set {
+            // Non-extensible: cannot add new accessor property on objects that
+            // don't already have this key as an accessor.
+            {
+                let borrow = map.borrow();
+                let getter_key = format!("__get_{key}__");
+                let setter_key = format!("__set_{key}__");
+                if !borrow.extensible
+                    && !borrow.contains_key(key)
+                    && !borrow.contains_key(&getter_key)
+                    && !borrow.contains_key(&setter_key)
+                {
+                    return Err(crate::error::StatorError::TypeError(format!(
+                        "Cannot define property {key}, object is not extensible"
+                    )));
+                }
+            }
             let getter_key = format!("__get_{key}__");
             let setter_key = format!("__set_{key}__");
             let enumerable = desc.get("enumerable").is_some_and(|v| v.to_boolean());
@@ -2134,6 +2214,12 @@ fn make_object() -> JsValue {
             let configurable_val = desc.get("configurable").map(|v| v.to_boolean());
 
             if !map.borrow().contains_key(key) {
+                // Non-extensible: cannot add new properties.
+                if !map.borrow().extensible {
+                    return Err(crate::error::StatorError::TypeError(format!(
+                        "Cannot define property {key}, object is not extensible"
+                    )));
+                }
                 let value = if has_value {
                     desc.get("value").cloned().unwrap_or(JsValue::Undefined)
                 } else {
@@ -2712,6 +2798,28 @@ fn make_object() -> JsValue {
             let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
             let proto = args.get(1).unwrap_or(&JsValue::Undefined).clone();
             if let JsValue::PlainObject(map) = &obj {
+                // Non-extensible objects: TypeError unless prototype is unchanged.
+                if !map.borrow().extensible {
+                    let current_proto = map.borrow().get("__proto__").cloned();
+                    let same = match (&current_proto, &proto) {
+                        (None, JsValue::Null) => true,
+                        (Some(cur), _) => {
+                            if let JsValue::PlainObject(cur_map) = cur
+                                && let JsValue::PlainObject(new_map) = &proto
+                            {
+                                Rc::ptr_eq(cur_map, new_map)
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    if !same {
+                        return Err(StatorError::TypeError(
+                            "Cannot set prototype of a non-extensible object".to_string(),
+                        ));
+                    }
+                }
                 // Cycle detection: walk the new proto chain and check for obj.
                 if let JsValue::PlainObject(_) = &proto {
                     let mut current = proto.clone();
@@ -2938,6 +3046,98 @@ fn make_object() -> JsValue {
                 }
                 _ => Ok(JsValue::Boolean(false)),
             }
+        }),
+    );
+
+    // Annex B §B.2.2.4 — Object.prototype.__lookupGetter__(key)
+    obj_proto.insert(
+        "__lookupGetter__".into(),
+        native(|args| {
+            let this = args.first().unwrap_or(&JsValue::Undefined);
+            let key = args.get(1).unwrap_or(&JsValue::Undefined);
+            let prop = key.to_js_string()?;
+            let getter_key = format!("__getter_{prop}__");
+            if let JsValue::PlainObject(map) = this {
+                if let Some(g) = map.borrow().get(&getter_key) {
+                    return Ok(g.clone());
+                }
+                // Walk the prototype chain.
+                let mut current = map.borrow().get("__proto__").cloned();
+                for _ in 0..256 {
+                    match current {
+                        Some(JsValue::PlainObject(p)) => {
+                            if let Some(g) = p.borrow().get(&getter_key) {
+                                return Ok(g.clone());
+                            }
+                            current = p.borrow().get("__proto__").cloned();
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+
+    // Annex B §B.2.2.5 — Object.prototype.__lookupSetter__(key)
+    obj_proto.insert(
+        "__lookupSetter__".into(),
+        native(|args| {
+            let this = args.first().unwrap_or(&JsValue::Undefined);
+            let key = args.get(1).unwrap_or(&JsValue::Undefined);
+            let prop = key.to_js_string()?;
+            let setter_key = format!("__setter_{prop}__");
+            if let JsValue::PlainObject(map) = this {
+                if let Some(s) = map.borrow().get(&setter_key) {
+                    return Ok(s.clone());
+                }
+                // Walk the prototype chain.
+                let mut current = map.borrow().get("__proto__").cloned();
+                for _ in 0..256 {
+                    match current {
+                        Some(JsValue::PlainObject(p)) => {
+                            if let Some(s) = p.borrow().get(&setter_key) {
+                                return Ok(s.clone());
+                            }
+                            current = p.borrow().get("__proto__").cloned();
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+
+    // Annex B §B.2.2.2 — Object.prototype.__defineGetter__(key, getter)
+    obj_proto.insert(
+        "__defineGetter__".into(),
+        native(|args| {
+            let this = args.first().unwrap_or(&JsValue::Undefined);
+            let key = args.get(1).unwrap_or(&JsValue::Undefined);
+            let getter = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+            let prop = key.to_js_string()?;
+            if let JsValue::PlainObject(map) = this {
+                map.borrow_mut()
+                    .insert(format!("__getter_{prop}__"), getter);
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+
+    // Annex B §B.2.2.3 — Object.prototype.__defineSetter__(key, setter)
+    obj_proto.insert(
+        "__defineSetter__".into(),
+        native(|args| {
+            let this = args.first().unwrap_or(&JsValue::Undefined);
+            let key = args.get(1).unwrap_or(&JsValue::Undefined);
+            let setter = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+            let prop = key.to_js_string()?;
+            if let JsValue::PlainObject(map) = this {
+                map.borrow_mut()
+                    .insert(format!("__setter_{prop}__"), setter);
+            }
+            Ok(JsValue::Undefined)
         }),
     );
 
@@ -4244,6 +4444,39 @@ fn make_iterator() -> JsValue {
         }),
     );
 
+    // ── Static method: Iterator.concat(...iterables) — ES2025 §27.1.2.1 ──
+    props.insert(
+        "concat".into(),
+        native(|args| {
+            let mut all_items: Vec<JsValue> = Vec::new();
+            for arg in &args {
+                match arg {
+                    JsValue::Array(arr) => {
+                        all_items.extend(arr.borrow().iter().cloned());
+                    }
+                    JsValue::Iterator(iter) => {
+                        let mut it = iter.borrow_mut();
+                        while let Some(val) = it.next_item() {
+                            all_items.push(val);
+                        }
+                    }
+                    JsValue::String(s) => {
+                        for ch in s.chars() {
+                            all_items.push(JsValue::String(ch.to_string().into()));
+                        }
+                    }
+                    _ => {
+                        return Err(StatorError::TypeError(format!(
+                            "Iterator.concat: value is not iterable (got {:?})",
+                            arg
+                        )));
+                    }
+                }
+            }
+            Ok(JsValue::Iterator(NativeIterator::from_items(all_items)))
+        }),
+    );
+
     // ── Prototype (instance) methods ─────────────────────────────────────
     //
     // In a full engine these would live on Iterator.prototype.  Here we
@@ -4695,6 +4928,43 @@ fn make_map_builtin() -> JsValue {
                     }),
                 );
             }
+            // §24.1.3.5.1 Map.prototype.getOrInsert(key, value)  — ES2025
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "getOrInsert".into(),
+                    native(move |a| {
+                        let key = a.first().cloned().unwrap_or(JsValue::Undefined);
+                        let default_val = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        let existing = map_get(&inner.borrow(), &key);
+                        if existing != JsValue::Undefined {
+                            Ok(existing)
+                        } else {
+                            map_set(&mut inner.borrow_mut(), key, default_val.clone());
+                            Ok(default_val)
+                        }
+                    }),
+                );
+            }
+            // §24.1.3.5.2 Map.prototype.getOrInsertComputed(key, callbackFn)  — ES2025
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "getOrInsertComputed".into(),
+                    native(move |a| {
+                        let key = a.first().cloned().unwrap_or(JsValue::Undefined);
+                        let callback = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        let existing = map_get(&inner.borrow(), &key);
+                        if existing != JsValue::Undefined {
+                            Ok(existing)
+                        } else {
+                            let computed = dispatch_call_value(&callback, vec![key.clone()])?;
+                            map_set(&mut inner.borrow_mut(), key, computed.clone());
+                            Ok(computed)
+                        }
+                    }),
+                );
+            }
             // §24.1.3.13 Map.prototype[@@toStringTag] = "Map"
             obj.insert_with_attrs(
                 "@@toStringTag".into(),
@@ -4805,7 +5075,17 @@ fn make_map_builtin() -> JsValue {
     {
         let mut proto = PropertyMap::new();
         for method_name in &[
-            "has", "get", "set", "delete", "clear", "forEach", "entries", "keys", "values",
+            "has",
+            "get",
+            "set",
+            "delete",
+            "clear",
+            "forEach",
+            "entries",
+            "keys",
+            "values",
+            "getOrInsert",
+            "getOrInsertComputed",
         ] {
             let name = method_name.to_string();
             proto.insert(
@@ -5226,6 +5506,56 @@ fn make_weak_map_builtin() -> JsValue {
                 );
             }
 
+            // §24.3.3.2.1 WeakMap.prototype.getOrInsert(key, value)  — ES2025
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "getOrInsert".into(),
+                    native(move |a| {
+                        let key = a.first().unwrap_or(&JsValue::Undefined);
+                        let default_val = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        if let JsValue::Object(ptr) = key {
+                            let existing = weak_map_get(&inner.borrow(), *ptr);
+                            if existing != JsValue::Undefined {
+                                Ok(existing)
+                            } else {
+                                weak_map_set(&mut inner.borrow_mut(), *ptr, default_val.clone())?;
+                                Ok(default_val)
+                            }
+                        } else {
+                            Err(StatorError::TypeError(
+                                "Invalid value used as weak map key".into(),
+                            ))
+                        }
+                    }),
+                );
+            }
+            // §24.3.3.2.2 WeakMap.prototype.getOrInsertComputed(key, callbackFn)  — ES2025
+            {
+                let inner = Rc::clone(&inner);
+                obj.insert(
+                    "getOrInsertComputed".into(),
+                    native(move |a| {
+                        let key = a.first().unwrap_or(&JsValue::Undefined);
+                        let callback = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        if let JsValue::Object(ptr) = key {
+                            let existing = weak_map_get(&inner.borrow(), *ptr);
+                            if existing != JsValue::Undefined {
+                                Ok(existing)
+                            } else {
+                                let computed = dispatch_call_value(&callback, vec![key.clone()])?;
+                                weak_map_set(&mut inner.borrow_mut(), *ptr, computed.clone())?;
+                                Ok(computed)
+                            }
+                        } else {
+                            Err(StatorError::TypeError(
+                                "Invalid value used as weak map key".into(),
+                            ))
+                        }
+                    }),
+                );
+            }
+
             // §24.3.3.6 WeakMap.prototype[@@toStringTag] = "WeakMap"
             obj.insert_with_attrs(
                 "@@toStringTag".into(),
@@ -5240,7 +5570,14 @@ fn make_weak_map_builtin() -> JsValue {
     // ── WeakMap.prototype ──────────────────────────────────────────────
     {
         let mut proto = PropertyMap::new();
-        for method_name in &["has", "get", "set", "delete"] {
+        for method_name in &[
+            "has",
+            "get",
+            "set",
+            "delete",
+            "getOrInsert",
+            "getOrInsertComputed",
+        ] {
             let name = method_name.to_string();
             proto.insert(
                 name.clone(),
@@ -6835,6 +7172,52 @@ fn make_regexp() -> JsValue {
     props.insert("lastParen".into(), JsValue::String(String::new().into()));
     props.insert("leftContext".into(), JsValue::String(String::new().into()));
     props.insert("rightContext".into(), JsValue::String(String::new().into()));
+
+    // §22.2.4.2 RegExp.escape(string)  — ES2025
+    props.insert(
+        "escape".into(),
+        builtin_fn("escape", 1, |args| {
+            let val = args.first().unwrap_or(&JsValue::Undefined);
+            let s = val.to_js_string()?;
+            let mut result = String::with_capacity(s.len() * 2);
+            for ch in s.chars() {
+                match ch {
+                    // SyntaxCharacter: ^ $ \ . * + ? ( ) [ ] { } |
+                    '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{'
+                    | '}' | '|' | '/' => {
+                        result.push('\\');
+                        result.push(ch);
+                    }
+                    // Characters that could be special at the start of a pattern.
+                    _ if result.is_empty()
+                        && (ch.is_ascii_whitespace()
+                            || ch.is_ascii_digit()
+                            || ch == ','
+                            || ch == '-'
+                            || ch == '='
+                            || ch == '<'
+                            || ch == '>'
+                            || ch == '#'
+                            || ch == '&'
+                            || ch == '!'
+                            || ch == '%'
+                            || ch == ':'
+                            || ch == ';'
+                            || ch == '@'
+                            || ch == '~'
+                            || ch == '`'
+                            || ch == '\u{200D}'
+                            || ch == '\u{FEFF}') =>
+                    {
+                        // Escape via unicode escape sequence.
+                        write!(result, "\\x{:02X}", ch as u32).unwrap_or_default();
+                    }
+                    _ => result.push(ch),
+                }
+            }
+            Ok(JsValue::String(result.into()))
+        }),
+    );
 
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
