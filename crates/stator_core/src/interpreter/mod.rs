@@ -3249,8 +3249,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "substr" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let start = args.first().map(|v| v.to_number().unwrap_or(f64::NAN) as i64).unwrap_or(0);
-                    let length = args.get(1).map(|v| v.to_number().unwrap_or(f64::NAN) as i64);
+                    let start = args
+                        .first()
+                        .map(|v| v.to_number().unwrap_or(f64::NAN) as i64)
+                        .unwrap_or(0);
+                    let length = args
+                        .get(1)
+                        .map(|v| v.to_number().unwrap_or(f64::NAN) as i64);
                     Ok(JsValue::String(
                         crate::builtins::string::string_substr(&s, start, length).into(),
                     ))
