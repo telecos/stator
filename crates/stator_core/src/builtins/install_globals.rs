@@ -3524,12 +3524,13 @@ fn make_array() -> JsValue {
             let iterable = args.first().unwrap_or(&JsValue::Undefined);
             let map_fn = args.get(1).cloned();
             // §23.1.2.1 step 3: if mapFn is provided and not undefined, it must be callable.
-            if let Some(ref mf) = map_fn {
-                if !matches!(mf, JsValue::Undefined) && !is_callable(mf) {
-                    return Err(StatorError::TypeError(
-                        "Array.from: mapFn is not a function".into(),
-                    ));
-                }
+            if let Some(ref mf) = map_fn
+                && !matches!(mf, JsValue::Undefined)
+                && !is_callable(mf)
+            {
+                return Err(StatorError::TypeError(
+                    "Array.from: mapFn is not a function".into(),
+                ));
             }
             let items: Vec<JsValue> = match iterable {
                 JsValue::Array(arr) => arr.borrow().clone(),
