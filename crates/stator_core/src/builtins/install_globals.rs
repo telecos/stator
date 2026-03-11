@@ -3056,7 +3056,7 @@ fn make_array() -> JsValue {
     // push(...items)
     proto.insert(
         "push".into(),
-        native(|args| {
+        builtin_fn("push", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             match arr {
@@ -3087,7 +3087,7 @@ fn make_array() -> JsValue {
     // pop()
     proto.insert(
         "pop".into(),
-        native(|args| {
+        builtin_fn("pop", 0, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3101,7 +3101,7 @@ fn make_array() -> JsValue {
     // shift()
     proto.insert(
         "shift".into(),
-        native(|args| {
+        builtin_fn("shift", 0, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3119,7 +3119,7 @@ fn make_array() -> JsValue {
     // unshift(...items)
     proto.insert(
         "unshift".into(),
-        native(|args| {
+        builtin_fn("unshift", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3134,7 +3134,7 @@ fn make_array() -> JsValue {
     // indexOf(searchElement, fromIndex?)
     proto.insert(
         "indexOf".into(),
-        native(|args| {
+        builtin_fn("indexOf", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             let search = args.get(1).unwrap_or(&JsValue::Undefined);
@@ -3158,7 +3158,7 @@ fn make_array() -> JsValue {
     // lastIndexOf(searchElement, fromIndex?)
     proto.insert(
         "lastIndexOf".into(),
-        native(|args| {
+        builtin_fn("lastIndexOf", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             let search = args.get(1).unwrap_or(&JsValue::Undefined);
@@ -3188,7 +3188,7 @@ fn make_array() -> JsValue {
     // includes(searchElement, fromIndex?)
     proto.insert(
         "includes".into(),
-        native(|args| {
+        builtin_fn("includes", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             let search = args.get(1).unwrap_or(&JsValue::Undefined);
@@ -3212,7 +3212,7 @@ fn make_array() -> JsValue {
     // join(separator?)
     proto.insert(
         "join".into(),
-        native(|args| {
+        builtin_fn("join", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             let sep = match args.get(1) {
@@ -3234,7 +3234,7 @@ fn make_array() -> JsValue {
     // concat(...arrays) — §23.1.3.1, respects @@isConcatSpreadable
     proto.insert(
         "concat".into(),
-        native(|args| {
+        builtin_fn("concat", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             let mut result: Vec<JsValue> = if let JsValue::Array(items) = arr {
@@ -3275,7 +3275,7 @@ fn make_array() -> JsValue {
     // slice(start?, end?)
     proto.insert(
         "slice".into(),
-        native(|args| {
+        builtin_fn("slice", 2, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3309,7 +3309,7 @@ fn make_array() -> JsValue {
     // reverse()
     proto.insert(
         "reverse".into(),
-        native(|args| {
+        builtin_fn("reverse", 0, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3325,7 +3325,7 @@ fn make_array() -> JsValue {
     // sort(compareFn?)
     proto.insert(
         "sort".into(),
-        native(|args| {
+        builtin_fn("sort", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3358,7 +3358,7 @@ fn make_array() -> JsValue {
     // fill(value, start?, end?)
     proto.insert(
         "fill".into(),
-        native(|args| {
+        builtin_fn("fill", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3397,7 +3397,7 @@ fn make_array() -> JsValue {
     // at(index)
     proto.insert(
         "at".into(),
-        native(|args| {
+        builtin_fn("at", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3422,7 +3422,7 @@ fn make_array() -> JsValue {
     // flat(depth?)
     proto.insert(
         "flat".into(),
-        native(|args| {
+        builtin_fn("flat", 0, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3454,7 +3454,7 @@ fn make_array() -> JsValue {
     // flatMap(callback)
     proto.insert(
         "flatMap".into(),
-        native(|args| {
+        builtin_fn("flatMap", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3482,7 +3482,7 @@ fn make_array() -> JsValue {
     // copyWithin(target, start, end?)
     proto.insert(
         "copyWithin".into(),
-        native(|args| {
+        builtin_fn("copyWithin", 2, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3532,7 +3532,7 @@ fn make_array() -> JsValue {
     // splice(start, deleteCount?, ...items)
     proto.insert(
         "splice".into(),
-        native(|args| {
+        builtin_fn("splice", 2, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3573,7 +3573,7 @@ fn make_array() -> JsValue {
     // map(callback)
     proto.insert(
         "map".into(),
-        native(|args| {
+        builtin_fn("map", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
@@ -3594,7 +3594,7 @@ fn make_array() -> JsValue {
     // filter(callback)
     proto.insert(
         "filter".into(),
-        native(|args| {
+        builtin_fn("filter", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
@@ -3617,7 +3617,7 @@ fn make_array() -> JsValue {
     // reduce(callback, initialValue?)
     proto.insert(
         "reduce".into(),
-        native(|args| {
+        builtin_fn("reduce", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
@@ -3645,7 +3645,7 @@ fn make_array() -> JsValue {
     // reduceRight(callback, initialValue?)
     proto.insert(
         "reduceRight".into(),
-        native(|args| {
+        builtin_fn("reduceRight", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
@@ -3678,7 +3678,7 @@ fn make_array() -> JsValue {
     // forEach(callback)
     proto.insert(
         "forEach".into(),
-        native(|args| {
+        builtin_fn("forEach", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
@@ -3697,7 +3697,7 @@ fn make_array() -> JsValue {
     // find(callback)
     proto.insert(
         "find".into(),
-        native(|args| {
+        builtin_fn("find", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
@@ -3719,7 +3719,7 @@ fn make_array() -> JsValue {
     // findIndex(callback)
     proto.insert(
         "findIndex".into(),
-        native(|args| {
+        builtin_fn("findIndex", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
@@ -3741,7 +3741,7 @@ fn make_array() -> JsValue {
     // findLast(callback)
     proto.insert(
         "findLast".into(),
-        native(|args| {
+        builtin_fn("findLast", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
@@ -3763,7 +3763,7 @@ fn make_array() -> JsValue {
     // findLastIndex(callback)
     proto.insert(
         "findLastIndex".into(),
-        native(|args| {
+        builtin_fn("findLastIndex", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
@@ -3785,7 +3785,7 @@ fn make_array() -> JsValue {
     // some(callback)
     proto.insert(
         "some".into(),
-        native(|args| {
+        builtin_fn("some", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
@@ -3807,7 +3807,7 @@ fn make_array() -> JsValue {
     // every(callback)
     proto.insert(
         "every".into(),
-        native(|args| {
+        builtin_fn("every", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
@@ -3829,7 +3829,7 @@ fn make_array() -> JsValue {
     // keys()
     proto.insert(
         "keys".into(),
-        native(|args| {
+        builtin_fn("keys", 0, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3846,7 +3846,7 @@ fn make_array() -> JsValue {
     // values()
     proto.insert(
         "values".into(),
-        native(|args| {
+        builtin_fn("values", 0, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3860,7 +3860,7 @@ fn make_array() -> JsValue {
     // entries()
     proto.insert(
         "entries".into(),
-        native(|args| {
+        builtin_fn("entries", 0, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3880,7 +3880,7 @@ fn make_array() -> JsValue {
     // toReversed()
     proto.insert(
         "toReversed".into(),
-        native(|args| {
+        builtin_fn("toReversed", 0, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3896,7 +3896,7 @@ fn make_array() -> JsValue {
     // toSorted(compareFn?)
     proto.insert(
         "toSorted".into(),
-        native(|args| {
+        builtin_fn("toSorted", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3929,7 +3929,7 @@ fn make_array() -> JsValue {
     // toSpliced(start, deleteCount, ...items)
     proto.insert(
         "toSpliced".into(),
-        native(|args| {
+        builtin_fn("toSpliced", 2, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
@@ -3968,7 +3968,7 @@ fn make_array() -> JsValue {
     // with(index, value)
     proto.insert(
         "with".into(),
-        native(|args| {
+        builtin_fn("with", 2, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
