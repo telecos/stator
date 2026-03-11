@@ -2075,6 +2075,149 @@ fn make_number() -> JsValue {
     );
     props.insert("NaN".into(), JsValue::HeapNumber(f64::NAN));
 
+    // ── Number.prototype ─────────────────────────────────────────────────
+    {
+        let mut proto = PropertyMap::new();
+
+        // Helper: extract the numeric value from `this` (args[0]).
+        fn this_number_value(args: &[JsValue]) -> StatorResult<f64> {
+            match args.first().unwrap_or(&JsValue::Undefined) {
+                JsValue::Smi(n) => Ok(*n as f64),
+                JsValue::HeapNumber(n) => Ok(*n),
+                other => Err(crate::error::StatorError::TypeError(format!(
+                    "Number.prototype method requires a number, got {}",
+                    other.type_of()
+                ))),
+            }
+        }
+
+        // Number.prototype.toString([radix])
+        proto.insert(
+            "toString".into(),
+            native(|args| {
+                let n = this_number_value(&args)?;
+                let radix = match args.get(1) {
+                    None | Some(JsValue::Undefined) => 10u32,
+                    Some(v) => {
+                        let r = v.to_number()?;
+                        let ri = r.floor() as i64;
+                        if !(2..=36).contains(&ri) {
+                            return Err(StatorError::RangeError(
+                                "toString() radix must be between 2 and 36".to_string(),
+                            ));
+                        }
+                        ri as u32
+                    }
+                };
+                if radix == 10 {
+                    if n.fract() == 0.0
+                        && !n.is_nan()
+                        && !n.is_infinite()
+                        && n.abs() < i64::MAX as f64
+                    {
+                        return Ok(JsValue::String((n as i64).to_string().into()));
+                    }
+                    return Ok(JsValue::String(format!("{n}").into()));
+                }
+                if n.fract() == 0.0 && !n.is_nan() && !n.is_infinite() && n.abs() < i64::MAX as f64
+                {
+                    Ok(JsValue::String(
+                        crate::builtins::util::i64_to_radix_string(n as i64, radix).into(),
+                    ))
+                } else {
+                    Ok(JsValue::String(
+                        crate::builtins::util::f64_to_radix_string(n, radix).into(),
+                    ))
+                }
+            }),
+        );
+
+        // Number.prototype.valueOf()
+        proto.insert(
+            "valueOf".into(),
+            native(|args| {
+                let n = this_number_value(&args)?;
+                Ok(num(n))
+            }),
+        );
+
+        // Number.prototype.toFixed([digits])
+        proto.insert(
+            "toFixed".into(),
+            native(|args| {
+                let n = this_number_value(&args)?;
+                let digits = match args.get(1) {
+                    Some(JsValue::Smi(d)) => (*d).max(0) as usize,
+                    Some(JsValue::HeapNumber(d)) => crate::builtins::util::clamped_f64_to_usize(*d),
+                    _ => 0,
+                };
+                Ok(JsValue::String(format!("{n:.digits$}").into()))
+            }),
+        );
+
+        // Number.prototype.toExponential([fractionDigits])
+        proto.insert(
+            "toExponential".into(),
+            native(|args| {
+                let n = this_number_value(&args)?;
+                let digits = match args.get(1) {
+                    Some(JsValue::Smi(d)) => Some((*d).clamp(0, 100) as usize),
+                    Some(JsValue::HeapNumber(d)) => {
+                        Some(crate::builtins::util::clamped_f64_to_usize(*d).min(100))
+                    }
+                    Some(JsValue::Undefined) | None => None,
+                    _ => None,
+                };
+                match digits {
+                    Some(d) => Ok(JsValue::String(format!("{n:.d$e}").into())),
+                    None => Ok(JsValue::String(format!("{n:e}").into())),
+                }
+            }),
+        );
+
+        // Number.prototype.toPrecision([precision])
+        proto.insert(
+            "toPrecision".into(),
+            native(|args| {
+                let n = this_number_value(&args)?;
+                match args.get(1) {
+                    None | Some(JsValue::Undefined) => Ok(JsValue::String(format!("{n}").into())),
+                    Some(v) => {
+                        let p = v.to_number()? as usize;
+                        if p == 0 || p > 100 {
+                            return Err(StatorError::RangeError(
+                                "toPrecision() argument must be between 1 and 100".to_string(),
+                            ));
+                        }
+                        Ok(JsValue::String(
+                            format!("{n:.prec$}", prec = p.saturating_sub(1)).into(),
+                        ))
+                    }
+                }
+            }),
+        );
+
+        // Number.prototype.toLocaleString()
+        proto.insert(
+            "toLocaleString".into(),
+            native(|args| {
+                let n = this_number_value(&args)?;
+                if n.fract() == 0.0 && !n.is_nan() && !n.is_infinite() && n.abs() < i64::MAX as f64
+                {
+                    Ok(JsValue::String((n as i64).to_string().into()))
+                } else {
+                    Ok(JsValue::String(format!("{n}").into()))
+                }
+            }),
+        );
+
+        proto.make_all_non_enumerable();
+        props.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        );
+    }
+
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
@@ -3434,12 +3577,7 @@ fn make_array() -> JsValue {
                     items
                         .into_iter()
                         .enumerate()
-                        .map(|(i, v)| {
-                            dispatch_call_value(
-                                mf,
-                                vec![v, JsValue::Smi(i as i32)],
-                            )
-                        })
+                        .map(|(i, v)| dispatch_call_value(mf, vec![v, JsValue::Smi(i as i32)]))
                         .collect::<Result<Vec<_>, _>>()?
                 } else {
                     items
