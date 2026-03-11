@@ -397,6 +397,7 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
             }),
         );
     }
+    obj.make_all_non_enumerable();
     Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
 }
 
@@ -1712,6 +1713,7 @@ fn make_date_instance(t: f64) -> JsValue {
         );
     }
 
+    obj.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(obj)))
 }
 
@@ -2184,21 +2186,31 @@ fn make_object() -> JsValue {
             let prop = args.get(1).unwrap_or(&JsValue::Undefined);
             let descriptor = args.get(2).unwrap_or(&JsValue::Undefined);
 
+            // §20.1.2.4 step 1: target must be an object.
+            if obj.is_primitive() {
+                return Err(crate::error::StatorError::TypeError(
+                    "Object.defineProperty called on non-object".into(),
+                ));
+            }
+
             let key = prop.to_js_string()?;
+
+            // §20.1.2.4 step 3: descriptor must be an object.
+            if descriptor.is_primitive() {
+                return Err(crate::error::StatorError::TypeError(
+                    "Property description must be an object".into(),
+                ));
+            }
 
             if let JsValue::PlainObject(map) = &obj {
                 if let JsValue::PlainObject(desc_map) = descriptor {
                     let desc = desc_map.borrow();
                     define_own_property(map, &key, &desc)?;
-                } else {
-                    // If descriptor is not an object, just set undefined
-                    map.borrow_mut().insert(key, JsValue::Undefined);
                 }
                 Ok(obj)
             } else {
-                Err(crate::error::StatorError::TypeError(
-                    "Object.defineProperty called on non-object".into(),
-                ))
+                // Non-PlainObject objects (Array, Function, etc.): return as-is
+                Ok(obj)
             }
         }),
     );
@@ -2336,6 +2348,13 @@ fn make_object() -> JsValue {
         builtin_fn("defineProperties", 2, |args| {
             let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
             let descriptors = args.get(1).unwrap_or(&JsValue::Undefined);
+
+            // §20.1.2.3 step 1: target must be an object.
+            if obj.is_primitive() {
+                return Err(crate::error::StatorError::TypeError(
+                    "Object.defineProperties called on non-object".into(),
+                ));
+            }
 
             if let JsValue::PlainObject(map) = &obj {
                 if let JsValue::PlainObject(desc_map) = descriptors {
@@ -4336,10 +4355,12 @@ fn make_iterator() -> JsValue {
     );
 
     props.insert(
+    proto.make_all_non_enumerable();
         "prototype".into(),
         JsValue::PlainObject(Rc::new(RefCell::new(proto))),
     );
 
+    props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
@@ -4771,9 +4792,46 @@ fn make_map_builtin() -> JsValue {
                     }),
                 );
             }
+            obj.make_all_non_enumerable();
             Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
         }),
     );
+
+    // ── Map.prototype ─────────────────────────────────────────────────
+    {
+        let mut proto = PropertyMap::new();
+        for method_name in &[
+            "has", "get", "set", "delete", "clear", "forEach", "entries", "keys", "values",
+        ] {
+            let name = method_name.to_string();
+            proto.insert(
+                name.clone(),
+                native(move |args| {
+                    let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                    let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
+                    if let JsValue::PlainObject(map) = receiver {
+                        if let Some(JsValue::NativeFunction(f)) =
+                            map.borrow().get(&name).cloned()
+                        {
+                            return f(rest);
+                        }
+                    }
+                    Ok(JsValue::Undefined)
+                }),
+            );
+        }
+        proto.insert("constructor".into(), JsValue::Undefined);
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("Map".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+        props.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        );
+    }
 
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
@@ -5029,6 +5087,56 @@ fn make_set_builtin() -> JsValue {
         }),
     );
 
+    // ── Set.prototype ──────────────────────────────────────────────────
+    {
+        let mut proto = PropertyMap::new();
+        for method_name in &[
+            "has",
+            "add",
+            "delete",
+            "clear",
+            "forEach",
+            "entries",
+            "keys",
+            "values",
+            "union",
+            "intersection",
+            "difference",
+            "symmetricDifference",
+            "isSubsetOf",
+            "isSupersetOf",
+            "isDisjointFrom",
+        ] {
+            let name = method_name.to_string();
+            proto.insert(
+                name.clone(),
+                native(move |args| {
+                    let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                    let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
+                    if let JsValue::PlainObject(map) = receiver {
+                        if let Some(JsValue::NativeFunction(f)) =
+                            map.borrow().get(&name).cloned()
+                        {
+                            return f(rest);
+                        }
+                    }
+                    Ok(JsValue::Undefined)
+                }),
+            );
+        }
+        proto.insert("constructor".into(), JsValue::Undefined);
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("Set".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+        props.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        );
+    }
+
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
@@ -5129,6 +5237,40 @@ fn make_weak_map_builtin() -> JsValue {
         }),
     );
 
+    // ── WeakMap.prototype ──────────────────────────────────────────────
+    {
+        let mut proto = PropertyMap::new();
+        for method_name in &["has", "get", "set", "delete"] {
+            let name = method_name.to_string();
+            proto.insert(
+                name.clone(),
+                native(move |args| {
+                    let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                    let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
+                    if let JsValue::PlainObject(map) = receiver {
+                        if let Some(JsValue::NativeFunction(f)) =
+                            map.borrow().get(&name).cloned()
+                        {
+                            return f(rest);
+                        }
+                    }
+                    Ok(JsValue::Undefined)
+                }),
+            );
+        }
+        proto.insert("constructor".into(), JsValue::Undefined);
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("WeakMap".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+        props.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        );
+    }
+
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
@@ -5211,6 +5353,40 @@ fn make_weak_set_builtin() -> JsValue {
             Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
         }),
     );
+
+    // ── WeakSet.prototype ─────────────────────────────────────────────
+    {
+        let mut proto = PropertyMap::new();
+        for method_name in &["has", "add", "delete"] {
+            let name = method_name.to_string();
+            proto.insert(
+                name.clone(),
+                native(move |args| {
+                    let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                    let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
+                    if let JsValue::PlainObject(map) = receiver {
+                        if let Some(JsValue::NativeFunction(f)) =
+                            map.borrow().get(&name).cloned()
+                        {
+                            return f(rest);
+                        }
+                    }
+                    Ok(JsValue::Undefined)
+                }),
+            );
+        }
+        proto.insert("constructor".into(), JsValue::Undefined);
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("WeakSet".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+        props.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        );
+    }
 
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
