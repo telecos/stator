@@ -3202,7 +3202,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     _ => Ok(JsValue::Iterator(NativeIterator::from_items(vec![]))),
                 }));
             }
-            "@@iterator" => {
+            "@@iterator" | "Symbol(1)" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |_args| {
                     Ok(JsValue::Iterator(NativeIterator::from_string(&s)))
@@ -3713,7 +3713,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Ok(JsValue::Iterator(NativeIterator::from_items(entries)))
                     }));
                 }
-                "@@iterator" => {
+                "@@iterator" | "Symbol(1)" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |_args| {
                         let items = a.borrow().clone();
@@ -4067,9 +4067,45 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }))
             }
             // §27.5.1.2 — Generator.prototype[@@iterator]() returns `this`.
-            "@@iterator" => {
+            "@@iterator" | "Symbol(1)" => {
                 let generator = obj.clone();
                 JsValue::NativeFunction(Rc::new(move |_args| Ok(generator.clone())))
+            }
+            _ => JsValue::Undefined,
+        };
+    }
+    // Handle JsValue::Iterator — expose next/return/@@iterator so that
+    // user-land code can call `iter.next()` and iterators satisfy the
+    // iterable protocol (`iter[Symbol.iterator]() === iter`).
+    if let JsValue::Iterator(ni) = obj {
+        let ni = Rc::clone(ni);
+        return match key {
+            "next" => {
+                let ni = ni.clone();
+                JsValue::NativeFunction(Rc::new(move |_args| {
+                    let item = ni.borrow_mut().next_item();
+                    match item {
+                        Some(v) => Ok(make_iterator_result(v, false)),
+                        None => Ok(make_iterator_result(JsValue::Undefined, true)),
+                    }
+                }))
+            }
+            "return" => {
+                let ni = ni.clone();
+                JsValue::NativeFunction(Rc::new(move |args| {
+                    // Force the iterator to its end so subsequent .next()
+                    // calls return done: true.
+                    let mut inner = ni.borrow_mut();
+                    inner.index = inner.items.len();
+                    let value = args.into_iter().next().unwrap_or(JsValue::Undefined);
+                    Ok(make_iterator_result(value, true))
+                }))
+            }
+            // §27.1.2 %IteratorPrototype%[@@iterator]() — return this.
+            // Handle both internal "@@iterator" and computed "Symbol(1)".
+            "@@iterator" | "Symbol(1)" => {
+                let iter = obj.clone();
+                JsValue::NativeFunction(Rc::new(move |_args| Ok(iter.clone())))
             }
             _ => JsValue::Undefined,
         };
