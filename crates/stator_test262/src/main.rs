@@ -898,7 +898,7 @@ fn execute_source(
     // Each test execution gets a generous stack guarantee so that
     // pathological inputs (deep regex, deep eval chains) cannot
     // overflow the main thread stack across 53k+ tests.
-    stacker::maybe_grow(256 * 1024, 8 * 1024 * 1024, || {
+    stacker::maybe_grow(512 * 1024, 16 * 1024 * 1024, || {
         execute_source_inner(source, harness_prefix, template_globals)
     })
 }
@@ -918,22 +918,38 @@ fn execute_source_inner(
     // independent PlainObject/Array instances that cannot be mutated by
     // other tests through shared `Rc` references.
     let globals = Rc::new(RefCell::new(deep_clone_globals(template_globals)));
+    // Keep a handle so we can break Rc cycles after the test finishes.
+    let globals_cleanup = Rc::clone(&globals);
 
-    let program = parser::parse(&combined)?;
-    let bc = BytecodeGenerator::compile_program(&program)?;
-    let mut frame = InterpreterFrame::new_with_globals(bc, vec![], globals);
-    // Limit each test to 10 million instructions to prevent infinite
-    // loops from hanging the runner.
-    frame.instruction_limit = 10_000_000;
-    // Wall-clock deadline: 10 seconds per test.  Set both on the frame AND as
-    // a thread-local so that child frames created by eval() / Function()
-    // also respect the timeout.
-    let dl = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    frame.deadline = Some(dl);
-    set_execution_deadline(Some(dl));
-    let result = Interpreter::run(&mut frame);
-    // Clear the thread-local deadline after each test.
-    set_execution_deadline(None);
+    // Run parse → compile → interpret inside a closure so that early `?`
+    // returns still reach the cycle-breaking cleanup below.
+    let result = (|| -> Result<JsValue, StatorError> {
+        let program = parser::parse(&combined)?;
+        let bc = BytecodeGenerator::compile_program(&program)?;
+        let mut frame = InterpreterFrame::new_with_globals(bc, vec![], globals);
+        // Limit each test to 10 million instructions to prevent infinite
+        // loops from hanging the runner.
+        frame.instruction_limit = 10_000_000;
+        // Wall-clock deadline: 10 seconds per test.  Set both on the frame AND as
+        // a thread-local so that child frames created by eval() / Function()
+        // also respect the timeout.
+        let dl = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        frame.deadline = Some(dl);
+        set_execution_deadline(Some(dl));
+        let result = Interpreter::run(&mut frame);
+        // Clear the thread-local deadline after each test.
+        set_execution_deadline(None);
+        result
+    })();
+
+    // The deep-cloned globals contain Rc cycles (e.g. Object ↔ prototype ↔
+    // constructor) that prevent automatic deallocation via reference counting.
+    // Clearing the map severs these cycles so all Rc-held objects are freed,
+    // preventing memory from accumulating across 53k+ tests.
+    if let Ok(mut g) = globals_cleanup.try_borrow_mut() {
+        g.clear();
+    }
+
     result
 }
 
@@ -1010,7 +1026,7 @@ fn run_test(
     let is_async = meta.is_async();
     let done_called = Rc::new(Cell::new(false));
 
-    let async_globals = if is_async {
+    let mut async_globals = if is_async {
         let mut g = deep_clone_globals(template_globals);
         let dc = done_called.clone();
         g.insert(
@@ -1043,6 +1059,12 @@ fn run_test(
     // A panic inside the interpreter may leave frames on the thread-local
     // call stack.  Clear it so the next test starts with a clean slate.
     clear_call_stack();
+
+    // Break Rc cycles in the async globals clone (if any) to prevent
+    // memory leaks from prototype-chain cycles.
+    if let Some(ref mut g) = async_globals {
+        g.clear();
+    }
 
     let exec = match result {
         Ok(r) => ExecResult::from_result(r),
@@ -1234,7 +1256,7 @@ fn main() {
     // pathological test inputs from overflowing the default 8 MB stack.
     let builder = std::thread::Builder::new()
         .name("test262-main".into())
-        .stack_size(1024 * 1024 * 1024); // 1 GiB
+        .stack_size(128 * 1024 * 1024); // 128 MiB — stacker guards handle further growth
     let handler = builder
         .spawn(main_inner)
         .expect("failed to spawn main thread");
