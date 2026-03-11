@@ -2669,15 +2669,15 @@ fn handle_sta_keyed_property(
         )));
     }
     // Strict mode: TypeError when assigning to a non-writable property.
-    if ctx.frame.bytecode_array.is_strict() {
-        if let JsValue::PlainObject(ref map) = obj {
-            let key_str = to_property_key(&key)?;
-            let pm = map.borrow();
-            if pm.contains_key(&key_str) && !pm.is_writable(&key_str) {
-                return Err(StatorError::TypeError(format!(
-                    "Cannot assign to read only property '{key_str}'"
-                )));
-            }
+    if ctx.frame.bytecode_array.is_strict()
+        && let JsValue::PlainObject(ref map) = obj
+    {
+        let key_str = to_property_key(&key)?;
+        let pm = map.borrow();
+        if pm.contains_key(&key_str) && !pm.is_writable(&key_str) {
+            return Err(StatorError::TypeError(format!(
+                "Cannot assign to read only property '{key_str}'"
+            )));
         }
     }
     keyed_store(&obj, &key, val)?;

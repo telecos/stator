@@ -2401,7 +2401,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Some(v) => {
                             let r = v.to_number()?;
                             let ri = r.floor() as i64;
-                            if ri < 2 || ri > 36 {
+                            if !(2..=36).contains(&ri) {
                                 return Err(StatorError::RangeError(
                                     "toString() radix must be between 2 and 36".to_string(),
                                 ));
@@ -2496,7 +2496,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Some(v) => {
                             let r = v.to_number()?;
                             let ri = r.floor() as i64;
-                            if ri < 2 || ri > 36 {
+                            if !(2..=36).contains(&ri) {
                                 return Err(StatorError::RangeError(
                                     "toString() radix must be between 2 and 36".to_string(),
                                 ));
@@ -8778,17 +8778,18 @@ mod tests {
 
     #[test]
     fn test_test_in_non_object() {
-        // "x" in 42 → false (non-object target)
-        let result = run_with_acc_and_regs(
-            JsValue::String("x".to_string().into()),
-            &[JsValue::Smi(42)],
-            vec![Instruction::new_unchecked(
-                Opcode::TestIn,
-                vec![Operand::Register(0), Operand::FeedbackSlot(0)],
-            )],
-            1,
-        );
-        assert_eq!(result, JsValue::Boolean(false));
+        // "x" in 42 → TypeError (non-object target per spec)
+        let mut all = vec![Instruction::new_unchecked(
+            Opcode::TestIn,
+            vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+        )];
+        all.push(Instruction::new_unchecked(Opcode::Return, vec![]));
+        let ba = make_bytecode(all, 1, 0);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        frame.accumulator = JsValue::String("x".to_string().into());
+        frame.write_reg(0, JsValue::Smi(42)).unwrap();
+        let result = Interpreter::run(&mut frame);
+        assert!(result.is_err(), "expected TypeError for `in` on non-object");
     }
 
     // ── CreateEmptyArrayLiteral + StaInArrayLiteral ─────────────────────────
