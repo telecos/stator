@@ -2401,6 +2401,114 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     Ok(JsValue::String(obj_clone.obj_to_string_tag().into()))
                 }));
             }
+            "valueOf" => {
+                let obj_clone = obj.clone();
+                drop(borrow);
+                return JsValue::NativeFunction(Rc::new(move |_args| Ok(obj_clone.clone())));
+            }
+            "toLocaleString" => {
+                let obj_clone = obj.clone();
+                drop(borrow);
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    let ts = proto_lookup(&obj_clone, "toString");
+                    dispatch_call_value(&ts, vec![obj_clone.clone()])
+                }));
+            }
+            "__lookupGetter__" => {
+                let map = Rc::clone(map);
+                drop(borrow);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let prop = match args.first() {
+                        Some(JsValue::String(s)) => s.to_string(),
+                        Some(v) => js_to_string(v),
+                        None => return Ok(JsValue::Undefined),
+                    };
+                    let getter_key = format!("__get_{prop}__");
+                    // Walk the prototype chain looking for the getter.
+                    let mut cur = JsValue::PlainObject(Rc::clone(&map));
+                    for _ in 0..256 {
+                        if let JsValue::PlainObject(ref m) = cur {
+                            let b = m.borrow();
+                            if let Some(g) = b.get(&getter_key) {
+                                return Ok(g.clone());
+                            }
+                            match b.get("__proto__") {
+                                Some(next) => {
+                                    let next = next.clone();
+                                    drop(b);
+                                    cur = next;
+                                    continue;
+                                }
+                                None => break,
+                            }
+                        }
+                        break;
+                    }
+                    Ok(JsValue::Undefined)
+                }));
+            }
+            "__lookupSetter__" => {
+                let map = Rc::clone(map);
+                drop(borrow);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let prop = match args.first() {
+                        Some(JsValue::String(s)) => s.to_string(),
+                        Some(v) => js_to_string(v),
+                        None => return Ok(JsValue::Undefined),
+                    };
+                    let setter_key = format!("__set_{prop}__");
+                    let mut cur = JsValue::PlainObject(Rc::clone(&map));
+                    for _ in 0..256 {
+                        if let JsValue::PlainObject(ref m) = cur {
+                            let b = m.borrow();
+                            if let Some(s) = b.get(&setter_key) {
+                                return Ok(s.clone());
+                            }
+                            match b.get("__proto__") {
+                                Some(next) => {
+                                    let next = next.clone();
+                                    drop(b);
+                                    cur = next;
+                                    continue;
+                                }
+                                None => break,
+                            }
+                        }
+                        break;
+                    }
+                    Ok(JsValue::Undefined)
+                }));
+            }
+            "__defineGetter__" => {
+                let map = Rc::clone(map);
+                drop(borrow);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let prop = match args.first() {
+                        Some(JsValue::String(s)) => s.to_string(),
+                        Some(v) => js_to_string(v),
+                        None => return Ok(JsValue::Undefined),
+                    };
+                    let getter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let getter_key = format!("__get_{prop}__");
+                    map.borrow_mut().insert(getter_key, getter);
+                    Ok(JsValue::Undefined)
+                }));
+            }
+            "__defineSetter__" => {
+                let map = Rc::clone(map);
+                drop(borrow);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let prop = match args.first() {
+                        Some(JsValue::String(s)) => s.to_string(),
+                        Some(v) => js_to_string(v),
+                        None => return Ok(JsValue::Undefined),
+                    };
+                    let setter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let setter_key = format!("__set_{prop}__");
+                    map.borrow_mut().insert(setter_key, setter);
+                    Ok(JsValue::Undefined)
+                }));
+            }
             _ => {}
         }
         // If this PlainObject is an array literal, delegate to Array.prototype.
@@ -2514,6 +2622,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let n = *n;
                 return JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Smi(n))));
             }
+            "toLocaleString" => {
+                let n = *n;
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(n.to_string().into()))
+                }));
+            }
             _ => {}
         },
         JsValue::HeapNumber(n) => match key {
@@ -2608,6 +2722,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "@@toPrimitive" => {
                 let n = *n;
                 return JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::HeapNumber(n))));
+            }
+            "toLocaleString" => {
+                let n = *n;
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(format!("{n}").into()))
+                }));
             }
             _ => {}
         },
@@ -4557,6 +4677,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let obj_clone = obj.clone();
                 return JsValue::NativeFunction(Rc::new(move |_args| Ok(obj_clone.clone())));
             }
+            "toLocaleString" => {
+                return JsValue::NativeFunction(Rc::new(|_args| {
+                    Ok(JsValue::String(
+                        "function () { [native code] }".to_string().into(),
+                    ))
+                }));
+            }
             _ => {}
         }
     }
@@ -4649,6 +4776,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "valueOf" => {
                 let obj_clone = obj.clone();
                 return JsValue::NativeFunction(Rc::new(move |_args| Ok(obj_clone.clone())));
+            }
+            "toLocaleString" => {
+                return JsValue::NativeFunction(Rc::new(|_args| {
+                    Ok(JsValue::String(
+                        "function () { [native code] }".to_string().into(),
+                    ))
+                }));
             }
             _ => {}
         }
@@ -4774,6 +4908,67 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
             }
         }
         break;
+    }
+    // Object.prototype fallback — provide basic methods when the __proto__
+    // chain is exhausted without an explicit Object.prototype.
+    match key {
+        "hasOwnProperty" => {
+            let this = this_obj.clone();
+            return JsValue::NativeFunction(Rc::new(move |args| {
+                let prop = match args.first() {
+                    Some(JsValue::String(s)) => s.to_string(),
+                    Some(JsValue::Smi(n)) => n.to_string(),
+                    Some(JsValue::HeapNumber(n)) => format!("{n}"),
+                    Some(JsValue::Boolean(b)) => b.to_string(),
+                    Some(JsValue::Null) => "null".to_string(),
+                    Some(JsValue::Undefined) => "undefined".to_string(),
+                    _ => return Ok(JsValue::Boolean(false)),
+                };
+                if let JsValue::PlainObject(ref m) = this {
+                    return Ok(JsValue::Boolean(m.borrow().contains_key(&prop)));
+                }
+                Ok(JsValue::Boolean(false))
+            }));
+        }
+        "propertyIsEnumerable" => {
+            let this = this_obj.clone();
+            return JsValue::NativeFunction(Rc::new(move |args| {
+                let prop = match args.first() {
+                    Some(JsValue::String(s)) => s.to_string(),
+                    Some(JsValue::Smi(n)) => n.to_string(),
+                    _ => return Ok(JsValue::Boolean(false)),
+                };
+                if let JsValue::PlainObject(ref m) = this {
+                    return Ok(JsValue::Boolean(m.borrow().is_enumerable(&prop)));
+                }
+                Ok(JsValue::Boolean(false))
+            }));
+        }
+        "isPrototypeOf" => {
+            return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
+        }
+        "constructor" => return JsValue::Undefined,
+        "toString" => {
+            let this = this_obj.clone();
+            return JsValue::NativeFunction(Rc::new(move |args| {
+                if let Some(value) = args.first() {
+                    return Ok(JsValue::String(value.obj_to_string_tag().into()));
+                }
+                Ok(JsValue::String(this.obj_to_string_tag().into()))
+            }));
+        }
+        "valueOf" => {
+            let this = this_obj.clone();
+            return JsValue::NativeFunction(Rc::new(move |_args| Ok(this.clone())));
+        }
+        "toLocaleString" => {
+            let this = this_obj.clone();
+            return JsValue::NativeFunction(Rc::new(move |_args| {
+                let ts = proto_lookup(&this, "toString");
+                dispatch_call_value(&ts, vec![this.clone()])
+            }));
+        }
+        _ => {}
     }
     JsValue::Undefined
 }
@@ -12793,6 +12988,146 @@ mod tests {
              } } \
              let f = new Foo(); \
              f.hasNewTarget",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── proto_lookup: Object.prototype valueOf / toLocaleString ───────────
+
+    #[test]
+    fn test_proto_lookup_plain_object_valueof() {
+        let result =
+            crate::builtins::global::global_eval("var o = {x:1}; o.valueOf() === o").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_plain_object_tolocalestring() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; typeof o.toLocaleString() === 'string'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── proto_lookup: Number.prototype.toLocaleString ─────────────────────
+
+    #[test]
+    fn test_proto_lookup_smi_tolocalestring() {
+        let result =
+            crate::builtins::global::global_eval("var n = 42; n.toLocaleString()").unwrap();
+        assert_eq!(result, JsValue::String("42".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_heapnumber_tolocalestring() {
+        let result =
+            crate::builtins::global::global_eval("var n = 3.14; n.toLocaleString()").unwrap();
+        assert_eq!(result, JsValue::String("3.14".into()));
+    }
+
+    // ── proto_lookup: __lookupGetter__ / __lookupSetter__ ─────────────────
+
+    #[test]
+    fn test_proto_lookup_lookup_getter() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 42; } }); \
+             typeof o.__lookupGetter__('x') === 'function'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_lookup_setter() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { set: function(v) {} }); \
+             typeof o.__lookupSetter__('x') === 'function'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_lookup_getter_undefined_when_missing() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {x: 1}; o.__lookupGetter__('x') === undefined",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── proto_lookup: __defineGetter__ / __defineSetter__ ─────────────────
+
+    #[test]
+    fn test_proto_lookup_define_getter() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             o.__defineGetter__('x', function() { return 99; }); \
+             o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_proto_lookup_define_setter() {
+        // Verify __defineSetter__ installs a setter (the setter itself is callable).
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             o.__defineSetter__('x', function(v) {}); \
+             typeof o.__lookupSetter__('x') === 'function'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── proto_lookup: Function/NativeFunction toLocaleString ──────────────
+
+    #[test]
+    fn test_proto_lookup_function_tolocalestring() {
+        let result = crate::builtins::global::global_eval(
+            "function foo() {} typeof foo.toLocaleString() === 'string'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── proto_lookup_chain: Object.prototype fallback ─────────────────────
+
+    #[test]
+    fn test_proto_lookup_chain_tostring_fallback() {
+        // An object with a custom __proto__ still gets toString.
+        let result = crate::builtins::global::global_eval(
+            "var proto = {}; \
+             var o = Object.create(proto); \
+             typeof o.toString === 'function'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_chain_valueof_fallback() {
+        let result = crate::builtins::global::global_eval(
+            "var proto = {}; \
+             var o = Object.create(proto); \
+             typeof o.valueOf === 'function'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_chain_hasownproperty_fallback() {
+        let result = crate::builtins::global::global_eval(
+            "var proto = {}; \
+             var o = Object.create(proto); \
+             o.x = 1; \
+             o.hasOwnProperty('x')",
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));

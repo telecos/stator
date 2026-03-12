@@ -14677,4 +14677,397 @@ mod tests {
         .unwrap();
         assert_eq!(result, JsValue::String("  hello".into()));
     }
+
+    // ── Array static methods e2e tests ──────────────────────────────────
+
+    /// `Array.from` converts a string into an array of characters.
+    #[test]
+    fn e2e_array_from_string_length() {
+        let result = global_eval("Array.from('abc').length").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Array.from` with a string produces correct first element.
+    #[test]
+    fn e2e_array_from_string_elem() {
+        let result = global_eval("Array.from('abc')[0]").unwrap();
+        assert_eq!(result, JsValue::String("a".into()));
+    }
+
+    /// `Array.from` with a mapping function.
+    #[test]
+    fn e2e_array_from_map_fn() {
+        let result = global_eval("Array.from([1,2,3], function(x){ return x * 2 })[1]").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    /// `Array.of` creates an array from arguments.
+    #[test]
+    fn e2e_array_of_length() {
+        let result = global_eval("Array.of(10, 20, 30).length").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Array.of` preserves argument values.
+    #[test]
+    fn e2e_array_of_elem() {
+        let result = global_eval("Array.of(10, 20, 30)[2]").unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    /// `Array.of` with a single argument.
+    #[test]
+    fn e2e_array_of_single() {
+        let result = global_eval("Array.of(7)[0]").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    // ── String static methods e2e tests ─────────────────────────────────
+
+    /// `String.fromCharCode` converts char codes to a string.
+    #[test]
+    fn e2e_string_from_char_code() {
+        let result = global_eval("String.fromCharCode(72, 101, 108)").unwrap();
+        assert_eq!(result, JsValue::String("Hel".into()));
+    }
+
+    /// `String.fromCharCode` with a single code.
+    #[test]
+    fn e2e_string_from_char_code_single() {
+        let result = global_eval("String.fromCharCode(65)").unwrap();
+        assert_eq!(result, JsValue::String("A".into()));
+    }
+
+    /// `String.fromCodePoint` converts Unicode code points.
+    #[test]
+    fn e2e_string_from_code_point() {
+        let result = global_eval("String.fromCodePoint(9731)").unwrap();
+        assert_eq!(result, JsValue::String("\u{2603}".into()));
+    }
+
+    /// `String.fromCodePoint` with multiple code points.
+    #[test]
+    fn e2e_string_from_code_point_multi() {
+        let result = global_eval("String.fromCodePoint(65, 66, 67)").unwrap();
+        assert_eq!(result, JsValue::String("ABC".into()));
+    }
+
+    /// `String.raw` is a function.
+    #[test]
+    fn e2e_string_raw_is_function() {
+        let result = global_eval("typeof String.raw").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    // ── Number static methods e2e tests ─────────────────────────────────
+
+    /// `Number.isNaN` returns true for NaN.
+    #[test]
+    fn e2e_number_is_nan_true_val() {
+        let result = global_eval("Number.isNaN(NaN)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Number.isNaN` returns false for a number.
+    #[test]
+    fn e2e_number_is_nan_false_val() {
+        let result = global_eval("Number.isNaN(42)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Number.isNaN` returns false for a string (unlike global isNaN).
+    #[test]
+    fn e2e_number_is_nan_string() {
+        let result = global_eval("Number.isNaN('hello')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Number.isFinite` returns true for finite numbers.
+    #[test]
+    fn e2e_number_is_finite_true_val() {
+        let result = global_eval("Number.isFinite(42)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Number.isFinite` returns false for Infinity.
+    #[test]
+    fn e2e_number_is_finite_infinity() {
+        let result = global_eval("Number.isFinite(Infinity)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Number.isFinite` returns false for NaN.
+    #[test]
+    fn e2e_number_is_finite_nan() {
+        let result = global_eval("Number.isFinite(NaN)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Number.isSafeInteger` returns true for safe integers.
+    #[test]
+    fn e2e_number_is_safe_integer_true_val() {
+        let result = global_eval("Number.isSafeInteger(42)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Number.isSafeInteger` returns false for floats.
+    #[test]
+    fn e2e_number_is_safe_integer_float() {
+        let result = global_eval("Number.isSafeInteger(1.5)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Number.parseInt` parses a decimal string.
+    #[test]
+    fn e2e_number_parse_int_basic() {
+        let result = global_eval("Number.parseInt('42')").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `Number.parseInt` with radix.
+    #[test]
+    fn e2e_number_parse_int_radix() {
+        let result = global_eval("Number.parseInt('ff', 16)").unwrap();
+        assert_eq!(result, JsValue::Smi(255));
+    }
+
+    /// `Number.parseFloat` parses a decimal string.
+    #[test]
+    fn e2e_number_parse_float_basic() {
+        let result = global_eval("Number.parseFloat('3.14')").unwrap();
+        assert_eq!(result, JsValue::HeapNumber(3.14));
+    }
+
+    // ── Number constants e2e tests ──────────────────────────────────────
+
+    /// `Number.EPSILON` is a very small positive number.
+    #[test]
+    fn e2e_number_epsilon() {
+        let result = global_eval("Number.EPSILON < 1 && Number.EPSILON > 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Number.MAX_SAFE_INTEGER` is 2^53 - 1.
+    #[test]
+    fn e2e_number_max_safe_integer() {
+        let result = global_eval("Number.MAX_SAFE_INTEGER === 9007199254740991").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Number.MIN_SAFE_INTEGER` is -(2^53 - 1).
+    #[test]
+    fn e2e_number_min_safe_integer() {
+        let result = global_eval("Number.MIN_SAFE_INTEGER === -9007199254740991").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Number.MAX_VALUE` is a large positive number.
+    #[test]
+    fn e2e_number_max_value() {
+        let result = global_eval("Number.MAX_VALUE > 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Number.MIN_VALUE` is a small positive number.
+    #[test]
+    fn e2e_number_min_value() {
+        let result = global_eval("Number.MIN_VALUE > 0 && Number.MIN_VALUE < 1").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Number.POSITIVE_INFINITY` equals Infinity.
+    #[test]
+    fn e2e_number_positive_infinity() {
+        let result = global_eval("Number.POSITIVE_INFINITY === Infinity").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Number.NEGATIVE_INFINITY` equals -Infinity.
+    #[test]
+    fn e2e_number_negative_infinity() {
+        let result = global_eval("Number.NEGATIVE_INFINITY === -Infinity").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Number.NaN` is NaN.
+    #[test]
+    fn e2e_number_nan_constant() {
+        let result = global_eval("Number.isNaN(Number.NaN)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Object.fromEntries e2e tests ────────────────────────────────────
+
+    /// `Object.fromEntries` builds an object from key-value pairs.
+    #[test]
+    fn e2e_object_from_entries_basic() {
+        let result =
+            global_eval("var o = Object.fromEntries([['a',1],['b',2]]); o.a + o.b").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Object.fromEntries` with string values.
+    #[test]
+    fn e2e_object_from_entries_strings() {
+        let result = global_eval("var o = Object.fromEntries([['x','hello']]); o.x").unwrap();
+        assert_eq!(result, JsValue::String("hello".into()));
+    }
+
+    // ── Math method e2e tests ───────────────────────────────────────────
+
+    /// `Math.cbrt` computes the cube root.
+    #[test]
+    fn e2e_math_cbrt_integer() {
+        let result = global_eval("Math.cbrt(27)").unwrap();
+        match result {
+            JsValue::Smi(3) | JsValue::HeapNumber(_) => {}
+            other => panic!("expected 3, got {other:?}"),
+        }
+    }
+
+    /// `Math.cbrt` with a negative value.
+    #[test]
+    fn e2e_math_cbrt_negative() {
+        let result = global_eval("Math.cbrt(-8)").unwrap();
+        match result {
+            JsValue::Smi(-2) | JsValue::HeapNumber(_) => {}
+            other => panic!("expected -2, got {other:?}"),
+        }
+    }
+
+    /// `Math.log2` computes the base-2 logarithm.
+    #[test]
+    fn e2e_math_log2_power_of_2() {
+        let result = global_eval("Math.log2(8)").unwrap();
+        match result {
+            JsValue::Smi(3) | JsValue::HeapNumber(_) => {}
+            other => panic!("expected 3, got {other:?}"),
+        }
+    }
+
+    /// `Math.log2(1)` is 0.
+    #[test]
+    fn e2e_math_log2_one() {
+        let result = global_eval("Math.log2(1)").unwrap();
+        match result {
+            JsValue::Smi(0) | JsValue::HeapNumber(_) => {}
+            other => panic!("expected 0, got {other:?}"),
+        }
+    }
+
+    /// `Math.log10` computes the base-10 logarithm.
+    #[test]
+    fn e2e_math_log10_hundred() {
+        let result = global_eval("Math.log10(100)").unwrap();
+        match result {
+            JsValue::Smi(2) | JsValue::HeapNumber(_) => {}
+            other => panic!("expected 2, got {other:?}"),
+        }
+    }
+
+    /// `Math.log10(1)` is 0.
+    #[test]
+    fn e2e_math_log10_one() {
+        let result = global_eval("Math.log10(1)").unwrap();
+        match result {
+            JsValue::Smi(0) | JsValue::HeapNumber(_) => {}
+            other => panic!("expected 0, got {other:?}"),
+        }
+    }
+
+    /// `Math.fround` rounds to nearest float32.
+    #[test]
+    fn e2e_math_fround_integer() {
+        let result = global_eval("Math.fround(1)").unwrap();
+        match result {
+            JsValue::Smi(1) | JsValue::HeapNumber(_) => {}
+            other => panic!("expected 1, got {other:?}"),
+        }
+    }
+
+    /// `Math.clz32` counts leading zeros.
+    #[test]
+    fn e2e_math_clz32_one() {
+        let result = global_eval("Math.clz32(1)").unwrap();
+        assert_eq!(result, JsValue::Smi(31));
+    }
+
+    /// `Math.clz32(0)` returns 32.
+    #[test]
+    fn e2e_math_clz32_zero() {
+        let result = global_eval("Math.clz32(0)").unwrap();
+        assert_eq!(result, JsValue::Smi(32));
+    }
+
+    /// `Math.imul` performs 32-bit integer multiplication.
+    #[test]
+    fn e2e_math_imul_basic() {
+        let result = global_eval("Math.imul(3, 4)").unwrap();
+        assert_eq!(result, JsValue::Smi(12));
+    }
+
+    /// `Math.imul` with large values wraps around.
+    #[test]
+    fn e2e_math_imul_large() {
+        let result = global_eval("Math.imul(0xffffffff, 5)").unwrap();
+        assert_eq!(result, JsValue::Smi(-5));
+    }
+
+    /// `Math.hypot` computes the Euclidean distance.
+    #[test]
+    fn e2e_math_hypot_3_4() {
+        let result = global_eval("Math.hypot(3, 4)").unwrap();
+        match result {
+            JsValue::Smi(5) | JsValue::HeapNumber(_) => {}
+            other => panic!("expected 5, got {other:?}"),
+        }
+    }
+
+    /// `Math.hypot` with zero arguments returns 0.
+    #[test]
+    fn e2e_math_hypot_no_args() {
+        let result = global_eval("Math.hypot()").unwrap();
+        match result {
+            JsValue::Smi(0) | JsValue::HeapNumber(_) => {}
+            other => panic!("expected 0, got {other:?}"),
+        }
+    }
+
+    /// `Math.trunc` removes the fractional part (positive).
+    #[test]
+    fn e2e_math_trunc_positive_frac() {
+        let result = global_eval("Math.trunc(3.7)").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Math.trunc` removes the fractional part (negative).
+    #[test]
+    fn e2e_math_trunc_negative_frac() {
+        let result = global_eval("Math.trunc(-3.7)").unwrap();
+        assert_eq!(result, JsValue::Smi(-3));
+    }
+
+    /// `Math.sign` returns 1 for positive.
+    #[test]
+    fn e2e_math_sign_pos() {
+        let result = global_eval("Math.sign(42)").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `Math.sign` returns -1 for negative.
+    #[test]
+    fn e2e_math_sign_neg() {
+        let result = global_eval("Math.sign(-42)").unwrap();
+        assert_eq!(result, JsValue::Smi(-1));
+    }
+
+    /// `Math.sign` returns 0 for zero.
+    #[test]
+    fn e2e_math_sign_zero_val() {
+        let result = global_eval("Math.sign(0)").unwrap();
+        match result {
+            JsValue::Smi(0) | JsValue::HeapNumber(_) => {}
+            other => panic!("expected 0, got {other:?}"),
+        }
+    }
 }
