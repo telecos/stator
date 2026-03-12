@@ -352,8 +352,6 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "regexp-v-flag",
     // Resource management — `using` keyword not yet in the parser
     "explicit-resource-management",
-    // Iterator helpers — partial, not spec-complete
-    "iterator-helpers",
     // Atomics — waitAsync not implemented
     "Atomics.waitAsync",
     "Atomics",
@@ -363,35 +361,12 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "Float16Array",
     // Tail-call optimisation not implemented in the interpreter
     "tail-call-optimization",
-    // Proxy / Reflect — not implemented
-    "Proxy",
-    "Reflect",
-    "Reflect.construct",
-    "Reflect.set",
-    "Reflect.defineProperty",
-    "Reflect.deleteProperty",
-    "Reflect.getOwnPropertyDescriptor",
-    "Reflect.getPrototypeOf",
-    "Reflect.isExtensible",
-    "Reflect.ownKeys",
-    "Reflect.preventExtensions",
-    "Reflect.setPrototypeOf",
-    "Reflect.apply",
     // SharedArrayBuffer — not implemented
     "SharedArrayBuffer",
-    // WeakRef / FinalizationRegistry — not implemented
-    "WeakRef",
-    "FinalizationRegistry",
     // cross-realm — requires full realm support
     "cross-realm",
-    // Well-known intrinsic objects — not yet implemented
+    // Symbol.species — defined but constructor integration incomplete
     "Symbol.species",
-    // Typed arrays not fully implemented
-    "TypedArray",
-    // String/RegExp features requiring lookbehind
-    "regexp-lookbehind",
-    "regexp-named-groups",
-    "regexp-unicode-property-escapes",
     // Intl not implemented
     "Intl-enumeration",
     "Intl.DateTimeFormat-datetimestyle",
