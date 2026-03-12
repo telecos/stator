@@ -9,6 +9,9 @@
 //! * [`to_int32`][JsValue::to_int32] (§7.1.6)
 //! * [`to_uint32`][JsValue::to_uint32] (§7.1.7)
 //! * [`to_int16`][JsValue::to_int16] (§7.1.9)
+//! * [`to_integer_or_infinity`][JsValue::to_integer_or_infinity] (§7.1.5)
+//! * [`to_length`][JsValue::to_length] (§7.1.15)
+//! * [`to_numeric`][JsValue::to_numeric] (§7.1.3)
 //! * [`to_js_string`][JsValue::to_js_string] (§7.1.17 ToString)
 //! * [`to_object`][JsValue::to_object] (§7.1.18)
 //! * [`to_property_key`][JsValue::to_property_key] (§7.1.19)
@@ -786,6 +789,54 @@ impl JsValue {
         Ok(f64_to_int16(n))
     }
 
+    /// ECMAScript §7.1.5 **ToIntegerOrInfinity**.
+    ///
+    /// Used extensively by `Array`, `String`, and `TypedArray` built-in methods
+    /// (e.g. `slice`, `indexOf`, `at`) to clamp numeric arguments.
+    ///
+    /// * `NaN` → `0`
+    /// * `+∞` / `−∞` → `+∞` / `−∞`
+    /// * Otherwise → truncate toward zero (`Math.trunc` semantics)
+    pub fn to_integer_or_infinity(&self) -> StatorResult<f64> {
+        let number = self.to_number()?;
+        if number.is_nan() || number == 0.0 {
+            Ok(0.0)
+        } else if number.is_infinite() {
+            Ok(number)
+        } else {
+            Ok(number.trunc())
+        }
+    }
+
+    /// ECMAScript §7.1.15 **ToLength**.
+    ///
+    /// Clamps the result of [`to_integer_or_infinity`][Self::to_integer_or_infinity]
+    /// to the range \[0, 2⁵³ − 1\].  Used by array/string methods that accept
+    /// a `length` argument.
+    pub fn to_length(&self) -> StatorResult<u64> {
+        let len = self.to_integer_or_infinity()?;
+        if len <= 0.0 {
+            Ok(0)
+        } else {
+            // 2^53 − 1
+            Ok((len.min(9_007_199_254_740_991.0)) as u64)
+        }
+    }
+
+    /// ECMAScript §7.1.3 **ToNumeric**.
+    ///
+    /// Returns the value as either a `Number` ([`HeapNumber`][Self::HeapNumber])
+    /// or a [`BigInt`][Self::BigInt].  Object-like types are first converted
+    /// via [`to_primitive`][Self::to_primitive] with a `Number` hint.
+    pub fn to_numeric(&self) -> StatorResult<JsValue> {
+        let prim = self.to_primitive(ToPrimitiveHint::Number)?;
+        if matches!(prim, JsValue::BigInt(_)) {
+            Ok(prim)
+        } else {
+            Ok(JsValue::HeapNumber(prim.to_number()?))
+        }
+    }
+
     /// ECMAScript §7.1.18 **ToObject**.
     ///
     /// Returns `Err(TypeError)` for `undefined` and `null`.
@@ -835,7 +886,7 @@ impl JsValue {
     /// custom `toString` method is available.
     fn default_obj_to_string(&self) -> String {
         match self {
-            Self::Function(_) => "function () {}".to_string(),
+            Self::Function(_) => "function () { [native code] }".to_string(),
             Self::Array(items) => {
                 // Array.prototype.toString → join with ","
                 let parts: Vec<String> = items
@@ -1082,24 +1133,46 @@ impl Trace for JsValue {
 /// Formats an `f64` as a JavaScript number string (ECMAScript §7.1.12.1).
 ///
 /// Special cases: `NaN → "NaN"`, `+∞ → "Infinity"`, `-∞ → "-Infinity"`,
-/// and both `+0.0` and `-0.0` → `"0"`.  All other values use Rust's default
-/// `f64` `Display` formatting, which provides a minimal decimal representation
-/// compatible with the ECMAScript spec for common values.
+/// and both `+0.0` and `-0.0` → `"0"`.
+///
+/// For values ≥ 10²¹ or in (0, 10⁻⁶) ECMAScript mandates exponential
+/// notation with an explicit `+` sign on positive exponents (e.g. `"1e+21"`).
+/// All other finite values use the shortest decimal representation via Rust's
+/// `Display` formatting.
 fn number_to_string(n: f64) -> String {
     if n.is_nan() {
-        "NaN".to_string()
-    } else if n.is_infinite() {
-        if n > 0.0 {
-            "Infinity".to_string()
-        } else {
-            "-Infinity".to_string()
-        }
-    } else if n == 0.0 {
-        // Both +0.0 and -0.0 produce "0".
-        "0".to_string()
-    } else {
-        format!("{n}")
+        return "NaN".to_string();
     }
+    if n == 0.0 {
+        // Both +0.0 and -0.0 produce "0".
+        return "0".to_string();
+    }
+    if n.is_infinite() {
+        return if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    // Negative: "-" + NumberToString(abs(n)).
+    if n < 0.0 {
+        return format!("-{}", number_to_string(-n));
+    }
+
+    // ECMAScript §7.1.12.1: values >= 1e21 or < 1e-6 use exponential notation.
+    if n >= 1e21 || n < 1e-6 {
+        let s = format!("{n:e}");
+        // Rust omits the '+' on positive exponents; ECMAScript requires it.
+        if let Some(e_pos) = s.find('e') {
+            let (mantissa, rest) = s.split_at(e_pos);
+            let exp = &rest[1..]; // skip 'e'
+            return if exp.starts_with('-') {
+                format!("{mantissa}e{exp}")
+            } else {
+                format!("{mantissa}e+{exp}")
+            };
+        }
+        return s;
+    }
+
+    // Normal range: Rust's Display produces the correct shortest representation.
+    format!("{n}")
 }
 
 /// ECMAScript §7.1.4.1 **StringToNumber** — parse a string into a numeric
@@ -1129,7 +1202,7 @@ pub(crate) fn string_to_number(s: &str) -> f64 {
     {
         return u64::from_str_radix(hex, 16)
             .map(|n| n as f64)
-            .unwrap_or(f64::NAN);
+            .unwrap_or_else(|_| parse_radix_digits(hex, 16));
     }
     // Octal integer literal: 0o / 0O.
     if let Some(oct) = trimmed
@@ -1138,7 +1211,7 @@ pub(crate) fn string_to_number(s: &str) -> f64 {
     {
         return u64::from_str_radix(oct, 8)
             .map(|n| n as f64)
-            .unwrap_or(f64::NAN);
+            .unwrap_or_else(|_| parse_radix_digits(oct, 8));
     }
     // Binary integer literal: 0b / 0B.
     if let Some(bin) = trimmed
@@ -1147,7 +1220,7 @@ pub(crate) fn string_to_number(s: &str) -> f64 {
     {
         return u64::from_str_radix(bin, 2)
             .map(|n| n as f64)
-            .unwrap_or(f64::NAN);
+            .unwrap_or_else(|_| parse_radix_digits(bin, 2));
     }
 
     // Reject Rust-specific float strings not valid in ECMAScript (e.g.
@@ -1161,6 +1234,25 @@ pub(crate) fn string_to_number(s: &str) -> f64 {
     }
 
     trimmed.parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// Parse a radix-prefixed digit string into an `f64` by accumulating
+/// digit-by-digit.
+///
+/// Used as a fallback when the integer value exceeds [`u64::MAX`], which
+/// [`u64::from_str_radix`] cannot handle.  Returns [`f64::NAN`] for empty
+/// input or invalid digit characters.
+fn parse_radix_digits(s: &str, radix: u32) -> f64 {
+    if s.is_empty() {
+        return f64::NAN;
+    }
+    let base = f64::from(radix);
+    s.chars()
+        .try_fold(0.0_f64, |acc, c| {
+            let digit = c.to_digit(radix)?;
+            Some(acc.mul_add(base, f64::from(digit)))
+        })
+        .unwrap_or(f64::NAN)
 }
 
 /// OrdinaryToPrimitive for [`JsValue::PlainObject`] (ECMAScript §7.1.1.1).
@@ -2544,5 +2636,255 @@ mod tests {
     fn test_f64_to_int16_wrap() {
         assert_eq!(f64_to_int16(32768.0), -32768);
         assert_eq!(f64_to_int16(-1.0), -1);
+    }
+
+    // ── number_to_string exponential notation ────────────────────────────────
+
+    #[test]
+    fn test_number_to_string_large_exponential() {
+        // Values >= 1e21 use exponential notation with e+.
+        assert_eq!(number_to_string(1e21), "1e+21");
+        assert_eq!(number_to_string(1e25), "1e+25");
+        assert_eq!(number_to_string(1.5e21), "1.5e+21");
+    }
+
+    #[test]
+    fn test_number_to_string_small_exponential() {
+        // Values < 1e-6 use exponential notation.
+        assert_eq!(number_to_string(5e-7), "5e-7");
+        assert_eq!(number_to_string(1e-7), "1e-7");
+        assert_eq!(number_to_string(1.5e-8), "1.5e-8");
+    }
+
+    #[test]
+    fn test_number_to_string_boundary_no_exponential() {
+        // Exactly 1e-6 stays decimal.
+        assert_eq!(number_to_string(1e-6), "0.000001");
+        // Values just below 1e21 stay decimal.
+        assert_eq!(number_to_string(1e20), "100000000000000000000");
+    }
+
+    #[test]
+    fn test_number_to_string_negative_exponential() {
+        assert_eq!(number_to_string(-1e21), "-1e+21");
+        assert_eq!(number_to_string(-5e-8), "-5e-8");
+    }
+
+    #[test]
+    fn test_number_to_string_ordinary_values() {
+        assert_eq!(number_to_string(42.0), "42");
+        assert_eq!(number_to_string(3.14), "3.14");
+        assert_eq!(number_to_string(0.5), "0.5");
+        assert_eq!(number_to_string(1.0), "1");
+        assert_eq!(number_to_string(-42.0), "-42");
+        assert_eq!(number_to_string(-3.14), "-3.14");
+    }
+
+    // ── string_to_number overflow handling ───────────────────────────────────
+
+    #[test]
+    fn test_string_to_number_hex_overflow_u64() {
+        // 0x10000000000000000 = 2^64, which exceeds u64::MAX.
+        let n = string_to_number("0x10000000000000000");
+        assert!(n.is_finite());
+        assert!(n > u64::MAX as f64);
+    }
+
+    #[test]
+    fn test_string_to_number_binary_overflow_u64() {
+        // 65 binary ones exceed u64.
+        let s = format!("0b{}", "1".repeat(65));
+        let n = string_to_number(&s);
+        assert!(n.is_finite());
+        assert!(n > u64::MAX as f64);
+    }
+
+    #[test]
+    fn test_string_to_number_hex_empty_after_prefix() {
+        assert!(string_to_number("0x").is_nan());
+        assert!(string_to_number("0o").is_nan());
+        assert!(string_to_number("0b").is_nan());
+    }
+
+    // ── parse_radix_digits helper ────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_radix_digits_empty() {
+        assert!(parse_radix_digits("", 16).is_nan());
+    }
+
+    #[test]
+    fn test_parse_radix_digits_hex() {
+        assert_eq!(parse_radix_digits("FF", 16), 255.0);
+        assert_eq!(parse_radix_digits("0", 16), 0.0);
+        assert_eq!(parse_radix_digits("a", 16), 10.0);
+    }
+
+    #[test]
+    fn test_parse_radix_digits_invalid() {
+        assert!(parse_radix_digits("ZZ", 16).is_nan());
+        assert!(parse_radix_digits("9", 8).is_nan());
+        assert!(parse_radix_digits("2", 2).is_nan());
+    }
+
+    // ── to_integer_or_infinity ───────────────────────────────────────────────
+
+    #[test]
+    fn test_to_integer_or_infinity_nan_is_zero() {
+        assert_eq!(
+            JsValue::Undefined.to_integer_or_infinity().unwrap(),
+            0.0
+        );
+        assert_eq!(
+            JsValue::HeapNumber(f64::NAN)
+                .to_integer_or_infinity()
+                .unwrap(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn test_to_integer_or_infinity_infinity_passthrough() {
+        assert_eq!(
+            JsValue::HeapNumber(f64::INFINITY)
+                .to_integer_or_infinity()
+                .unwrap(),
+            f64::INFINITY
+        );
+        assert_eq!(
+            JsValue::HeapNumber(f64::NEG_INFINITY)
+                .to_integer_or_infinity()
+                .unwrap(),
+            f64::NEG_INFINITY
+        );
+    }
+
+    #[test]
+    fn test_to_integer_or_infinity_truncation() {
+        assert_eq!(
+            JsValue::HeapNumber(3.9).to_integer_or_infinity().unwrap(),
+            3.0
+        );
+        assert_eq!(
+            JsValue::HeapNumber(-3.9).to_integer_or_infinity().unwrap(),
+            -3.0
+        );
+        assert_eq!(
+            JsValue::HeapNumber(0.5).to_integer_or_infinity().unwrap(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn test_to_integer_or_infinity_zero() {
+        assert_eq!(JsValue::Smi(0).to_integer_or_infinity().unwrap(), 0.0);
+        assert_eq!(JsValue::Null.to_integer_or_infinity().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn test_to_integer_or_infinity_whole_numbers() {
+        assert_eq!(JsValue::Smi(42).to_integer_or_infinity().unwrap(), 42.0);
+        assert_eq!(JsValue::Smi(-7).to_integer_or_infinity().unwrap(), -7.0);
+    }
+
+    #[test]
+    fn test_to_integer_or_infinity_string_coercion() {
+        assert_eq!(
+            JsValue::String("3.7".into())
+                .to_integer_or_infinity()
+                .unwrap(),
+            3.0
+        );
+        assert_eq!(
+            JsValue::String("".into())
+                .to_integer_or_infinity()
+                .unwrap(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn test_to_integer_or_infinity_bigint_error() {
+        assert!(JsValue::BigInt(42).to_integer_or_infinity().is_err());
+    }
+
+    // ── to_length ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_to_length_positive() {
+        assert_eq!(JsValue::Smi(5).to_length().unwrap(), 5);
+        assert_eq!(JsValue::HeapNumber(3.9).to_length().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_to_length_negative_clamps_to_zero() {
+        assert_eq!(JsValue::Smi(-1).to_length().unwrap(), 0);
+        assert_eq!(JsValue::HeapNumber(-100.5).to_length().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_to_length_infinity_clamps_to_max() {
+        let max_safe = 9_007_199_254_740_991_u64;
+        assert_eq!(
+            JsValue::HeapNumber(f64::INFINITY).to_length().unwrap(),
+            max_safe
+        );
+    }
+
+    #[test]
+    fn test_to_length_nan_is_zero() {
+        assert_eq!(JsValue::Undefined.to_length().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_to_length_zero() {
+        assert_eq!(JsValue::Smi(0).to_length().unwrap(), 0);
+        assert_eq!(JsValue::Null.to_length().unwrap(), 0);
+    }
+
+    // ── to_numeric ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_to_numeric_number() {
+        let result = JsValue::Smi(42).to_numeric().unwrap();
+        assert_eq!(result, JsValue::HeapNumber(42.0));
+    }
+
+    #[test]
+    fn test_to_numeric_bigint_passthrough() {
+        let result = JsValue::BigInt(42).to_numeric().unwrap();
+        assert_eq!(result, JsValue::BigInt(42));
+    }
+
+    #[test]
+    fn test_to_numeric_string_coercion() {
+        let result = JsValue::String("3.14".into()).to_numeric().unwrap();
+        assert_eq!(result, JsValue::HeapNumber(3.14));
+    }
+
+    #[test]
+    fn test_to_numeric_boolean_coercion() {
+        assert_eq!(
+            JsValue::Boolean(true).to_numeric().unwrap(),
+            JsValue::HeapNumber(1.0)
+        );
+        assert_eq!(
+            JsValue::Boolean(false).to_numeric().unwrap(),
+            JsValue::HeapNumber(0.0)
+        );
+    }
+
+    #[test]
+    fn test_to_numeric_undefined_is_nan() {
+        if let JsValue::HeapNumber(n) = JsValue::Undefined.to_numeric().unwrap() {
+            assert!(n.is_nan());
+        } else {
+            panic!("Expected HeapNumber");
+        }
+    }
+
+    #[test]
+    fn test_to_numeric_symbol_error() {
+        assert!(JsValue::Symbol(0).to_numeric().is_err());
     }
 }
