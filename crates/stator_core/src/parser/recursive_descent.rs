@@ -833,12 +833,8 @@ impl<'src> Parser<'src> {
 
     fn parse_return(&mut self) -> StatorResult<Stmt> {
         let start = self.current_span();
-        if self.function_depth == 0 {
-            return Err(Self::error_at(
-                start,
-                "return statement not inside a function",
-            ));
-        }
+        // NOTE: top-level return is allowed in script mode (non-module).
+        // Test262 module tests are already skipped.
         self.bump()?; // 'return'
         let argument = if !self.current.had_line_terminator_before
             && self.peek_kind() != TokenKind::Semicolon

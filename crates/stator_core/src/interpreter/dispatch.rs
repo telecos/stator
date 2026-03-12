@@ -3890,9 +3890,7 @@ fn handle_for_in_enumerate(
                     let is_enumerable = attrs.contains(PropertyAttributes::ENUMERABLE);
                     // Translate accessor convention keys (__get_X__ / __set_X__)
                     // to the actual property name X.
-                    if let Some(prop) = k
-                        .strip_prefix("__get_")
-                        .and_then(|s| s.strip_suffix("__"))
+                    if let Some(prop) = k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
                     {
                         seen.insert(k.clone());
                         if seen.insert(prop.to_string()) && is_enumerable {
@@ -3900,9 +3898,7 @@ fn handle_for_in_enumerate(
                         }
                         continue;
                     }
-                    if let Some(prop) = k
-                        .strip_prefix("__set_")
-                        .and_then(|s| s.strip_suffix("__"))
+                    if let Some(prop) = k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
                     {
                         seen.insert(k.clone());
                         if seen.insert(prop.to_string()) && is_enumerable {

@@ -455,16 +455,18 @@ pub fn object_define_property_from_descriptor(
             if let FullPropertyDescriptor::Accessor { get, set, .. } = &desc
                 && is_current_accessor
             {
-                let cur_get =
-                    obj.get_own_property(&getter_key).unwrap_or(JsValue::Undefined);
+                let cur_get = obj
+                    .get_own_property(&getter_key)
+                    .unwrap_or(JsValue::Undefined);
                 if *get != cur_get {
                     return Err(StatorError::TypeError(format!(
                         "Cannot redefine property '{key}': \
                          cannot change getter of a non-configurable accessor"
                     )));
                 }
-                let cur_set =
-                    obj.get_own_property(&setter_key).unwrap_or(JsValue::Undefined);
+                let cur_set = obj
+                    .get_own_property(&setter_key)
+                    .unwrap_or(JsValue::Undefined);
                 if *set != cur_set {
                     return Err(StatorError::TypeError(format!(
                         "Cannot redefine property '{key}': \
@@ -488,8 +490,7 @@ pub fn object_define_property_from_descriptor(
             obj.define_own_property(key, value.clone(), attrs)
         }
         FullPropertyDescriptor::Accessor { get, set, .. } => {
-            let internal_attrs =
-                PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
+            let internal_attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
             // Update or create the internal getter/setter entries.
             if obj.has_own_property(&getter_key) {
                 obj.set_property(&getter_key, get.clone())?;
