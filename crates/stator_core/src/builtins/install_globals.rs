@@ -7815,10 +7815,7 @@ fn make_regexp() -> JsValue {
         );
 
         // Static property defaults for the prototype object itself.
-        proto.insert(
-            "source".into(),
-            JsValue::String("(?:)".to_string().into()),
-        );
+        proto.insert("source".into(), JsValue::String("(?:)".to_string().into()));
         proto.insert("flags".into(), JsValue::String(String::new().into()));
         proto.insert("global".into(), JsValue::Boolean(false));
         proto.insert("ignoreCase".into(), JsValue::Boolean(false));
