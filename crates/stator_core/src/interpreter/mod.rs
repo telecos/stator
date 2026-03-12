@@ -2349,10 +2349,39 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             "isPrototypeOf" => {
-                let map = Rc::clone(map);
+                let this_map = Rc::clone(map);
                 drop(borrow);
-                return JsValue::NativeFunction(Rc::new(move |_args| {
-                    let _ = &map;
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    // ES §20.1.3.2 Object.prototype.isPrototypeOf(V)
+                    // 1. If V is not an object, return false.
+                    let mut v = match args.first() {
+                        Some(JsValue::PlainObject(_)) => args[0].clone(),
+                        _ => return Ok(JsValue::Boolean(false)),
+                    };
+                    // 2. Let O = ToObject(this) — already a PlainObject.
+                    // 3. Loop: walk the prototype chain of V.
+                    for _ in 0..256 {
+                        // V = V.[[GetPrototypeOf]]()
+                        v = match v {
+                            JsValue::PlainObject(ref obj_map) => {
+                                match obj_map.borrow().get("__proto__") {
+                                    Some(proto) => proto.clone(),
+                                    None => return Ok(JsValue::Boolean(false)),
+                                }
+                            }
+                            _ => return Ok(JsValue::Boolean(false)),
+                        };
+                        // If V is null, return false.
+                        if matches!(v, JsValue::Null | JsValue::Undefined) {
+                            return Ok(JsValue::Boolean(false));
+                        }
+                        // If SameValue(O, V), return true.
+                        if let JsValue::PlainObject(ref v_map) = v {
+                            if Rc::ptr_eq(&this_map, v_map) {
+                                return Ok(JsValue::Boolean(true));
+                            }
+                        }
+                    }
                     Ok(JsValue::Boolean(false))
                 }));
             }
@@ -3060,8 +3089,25 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             "normalize" => {
                 let s = s.clone();
-                return JsValue::NativeFunction(Rc::new(move |_args| {
-                    Ok(JsValue::String(s.clone()))
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    // ES §22.1.3.13 String.prototype.normalize([form])
+                    // Determine the normalization form (default: "NFC").
+                    let form = match args.first() {
+                        None | Some(JsValue::Undefined) => "NFC".to_string(),
+                        Some(v) => v.to_js_string()?,
+                    };
+                    match form.as_str() {
+                        "NFC" | "NFD" | "NFKC" | "NFKD" => {
+                            // ASCII-only strings are already in all normalization
+                            // forms, so we can return as-is.  For non-ASCII we
+                            // also return as-is (best-effort without the
+                            // unicode-normalization crate).
+                            Ok(JsValue::String(s.clone()))
+                        }
+                        _ => Err(StatorError::RangeError(
+                            "The normalization form should be one of NFC, NFD, NFKC, NFKD.".to_string(),
+                        )),
+                    }
                 }));
             }
             "localeCompare" => {
@@ -3175,6 +3221,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 Some(JsValue::String(s)) => s.to_string(),
                                 _ => String::new(),
                             };
+                            // ES §22.1.3.12: matchAll requires the global flag.
+                            if !flags.contains('g') {
+                                return Err(StatorError::TypeError(
+                                    "String.prototype.matchAll called with a non-global RegExp argument".to_string(),
+                                ));
+                            }
                             drop(borrow);
                             let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
                             let matches = re.symbol_match_all(&s);
