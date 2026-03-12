@@ -3524,7 +3524,8 @@ fn make_object() -> JsValue {
         native(|args| {
             let this = args.first().cloned().unwrap_or(JsValue::Undefined);
             if let JsValue::PlainObject(ref map) = this {
-                if let Some(to_str) = map.borrow().get("toString").cloned() {
+                let to_str = map.borrow().get("toString").cloned();
+                if let Some(to_str) = to_str {
                     return dispatch_call_value(&to_str, vec![this]);
                 }
             }
