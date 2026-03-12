@@ -1156,7 +1156,7 @@ fn number_to_string(n: f64) -> String {
     }
 
     // ECMAScript §7.1.12.1: values >= 1e21 or < 1e-6 use exponential notation.
-    if n >= 1e21 || n < 1e-6 {
+    if !(1e-6..1e21).contains(&n) {
         let s = format!("{n:e}");
         // Rust omits the '+' on positive exponents; ECMAScript requires it.
         if let Some(e_pos) = s.find('e') {

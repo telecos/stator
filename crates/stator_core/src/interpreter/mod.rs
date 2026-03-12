@@ -2376,10 +2376,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             return Ok(JsValue::Boolean(false));
                         }
                         // If SameValue(O, V), return true.
-                        if let JsValue::PlainObject(ref v_map) = v {
-                            if Rc::ptr_eq(&this_map, v_map) {
-                                return Ok(JsValue::Boolean(true));
-                            }
+                        if let JsValue::PlainObject(ref v_map) = v
+                            && Rc::ptr_eq(&this_map, v_map)
+                        {
+                            return Ok(JsValue::Boolean(true));
                         }
                     }
                     Ok(JsValue::Boolean(false))
