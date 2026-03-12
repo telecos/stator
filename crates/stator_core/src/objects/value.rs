@@ -1064,6 +1064,118 @@ impl JsValue {
             _ => false,
         }
     }
+
+    /// ECMAScript §7.2.14 **IsLessThan(x, y, LeftFirst)**.
+    ///
+    /// Performs the Abstract Relational Comparison algorithm:
+    /// 1. Converts both operands to primitives via [`ToPrimitive`] with a
+    ///    `Number` hint.
+    /// 2. If **both** primitives are strings, compares them lexicographically.
+    /// 3. Otherwise converts to numeric values and compares numerically,
+    ///    including mixed `BigInt` × `Number` comparisons.
+    ///
+    /// Returns `Ok(None)` (**undefined**) when either operand is `NaN`,
+    /// `Ok(Some(true))` when `x < y`, and `Ok(Some(false))` otherwise.
+    ///
+    /// The `left_first` parameter controls evaluation order (ES spec
+    /// §7.2.14 step 1 vs step 2). Pass `true` for `<` and `<=`, `false`
+    /// for `>` and `>=`.
+    pub fn abstract_relational_comparison(
+        x: &JsValue,
+        y: &JsValue,
+        left_first: bool,
+    ) -> StatorResult<Option<bool>> {
+        // Step 1/2: ToPrimitive with hint Number.
+        let (px, py) = if left_first {
+            let px = x.to_primitive(ToPrimitiveHint::Number)?;
+            let py = y.to_primitive(ToPrimitiveHint::Number)?;
+            (px, py)
+        } else {
+            let py = y.to_primitive(ToPrimitiveHint::Number)?;
+            let px = x.to_primitive(ToPrimitiveHint::Number)?;
+            (px, py)
+        };
+
+        // Step 3: If both are strings, compare lexicographically.
+        if let (JsValue::String(a), JsValue::String(b)) = (&px, &py) {
+            return Ok(Some(a < b));
+        }
+
+        // Step 4a: BigInt × String
+        if let (JsValue::BigInt(n), JsValue::String(s)) = (&px, &py) {
+            return Ok(s.trim().parse::<i128>().ok().map(|parsed| *n < parsed));
+        }
+        // Step 4b: String × BigInt
+        if let (JsValue::String(s), JsValue::BigInt(n)) = (&px, &py) {
+            return Ok(s.trim().parse::<i128>().ok().map(|parsed| parsed < *n));
+        }
+
+        // Step 4d-e: ToNumeric on both sides.
+        let nx = px.to_numeric()?;
+        let ny = py.to_numeric()?;
+
+        // Step 4f: Same numeric type.
+        match (&nx, &ny) {
+            // Number × Number
+            (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                if a.is_nan() || b.is_nan() {
+                    return Ok(None); // undefined
+                }
+                Ok(Some(a < b))
+            }
+            // BigInt × BigInt
+            (JsValue::BigInt(a), JsValue::BigInt(b)) => Ok(Some(a < b)),
+            // Step 4g-h: BigInt × Number
+            (JsValue::BigInt(a), JsValue::HeapNumber(b)) => {
+                if b.is_nan() {
+                    return Ok(None);
+                }
+                if b.is_infinite() {
+                    return Ok(Some(b.is_sign_positive()));
+                }
+                Ok(Some((*a as f64) < *b))
+            }
+            // Number × BigInt
+            (JsValue::HeapNumber(a), JsValue::BigInt(b)) => {
+                if a.is_nan() {
+                    return Ok(None);
+                }
+                if a.is_infinite() {
+                    return Ok(Some(a.is_sign_negative()));
+                }
+                Ok(Some(*a < (*b as f64)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Convenience: `x < y` using [`abstract_relational_comparison`] with
+    /// `left_first = true`.
+    ///
+    /// Returns `false` when the spec result is **undefined** (i.e. NaN
+    /// comparisons), matching the runtime semantics of the `<` operator.
+    pub fn js_less_than(x: &JsValue, y: &JsValue) -> StatorResult<bool> {
+        Ok(Self::abstract_relational_comparison(x, y, true)?.unwrap_or(false))
+    }
+
+    /// Convenience: `x > y` — equivalent to `IsLessThan(y, x, false)`.
+    pub fn js_greater_than(x: &JsValue, y: &JsValue) -> StatorResult<bool> {
+        Ok(Self::abstract_relational_comparison(y, x, false)?.unwrap_or(false))
+    }
+
+    /// Convenience: `x <= y` — equivalent to `!(y < x)`.
+    pub fn js_less_than_or_equal(x: &JsValue, y: &JsValue) -> StatorResult<bool> {
+        Ok(Self::abstract_relational_comparison(y, x, false)?
+            .map(|r| !r)
+            .unwrap_or(false))
+    }
+
+    /// Convenience: `x >= y` — equivalent to `!(x < y)`.
+    pub fn js_greater_than_or_equal(x: &JsValue, y: &JsValue) -> StatorResult<bool> {
+        Ok(Self::abstract_relational_comparison(x, y, true)?
+            .map(|r| !r)
+            .unwrap_or(false))
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2883,5 +2995,215 @@ mod tests {
     #[test]
     fn test_to_numeric_symbol_error() {
         assert!(JsValue::Symbol(0).to_numeric().is_err());
+    }
+
+    // ── abstract_relational_comparison / js_less_than ────────────────────────
+
+    #[test]
+    fn test_less_than_numbers() {
+        assert!(JsValue::js_less_than(&JsValue::Smi(1), &JsValue::Smi(2)).unwrap());
+        assert!(!JsValue::js_less_than(&JsValue::Smi(2), &JsValue::Smi(1)).unwrap());
+        assert!(!JsValue::js_less_than(&JsValue::Smi(1), &JsValue::Smi(1)).unwrap());
+        assert!(
+            JsValue::js_less_than(&JsValue::HeapNumber(1.5), &JsValue::HeapNumber(2.5)).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_less_than_nan_is_false() {
+        // NaN < anything → false; anything < NaN → false
+        assert!(!JsValue::js_less_than(&JsValue::HeapNumber(f64::NAN), &JsValue::Smi(1)).unwrap());
+        assert!(!JsValue::js_less_than(&JsValue::Smi(1), &JsValue::HeapNumber(f64::NAN)).unwrap());
+        assert!(
+            !JsValue::js_less_than(
+                &JsValue::HeapNumber(f64::NAN),
+                &JsValue::HeapNumber(f64::NAN)
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_less_than_returns_undefined_for_nan() {
+        // The raw comparison returns None for NaN.
+        assert_eq!(
+            JsValue::abstract_relational_comparison(
+                &JsValue::HeapNumber(f64::NAN),
+                &JsValue::Smi(1),
+                true
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_less_than_strings_lexicographic() {
+        // String comparison is lexicographic, not numeric.
+        assert!(
+            JsValue::js_less_than(&JsValue::String("a".into()), &JsValue::String("b".into()))
+                .unwrap()
+        );
+        assert!(
+            !JsValue::js_less_than(&JsValue::String("b".into()), &JsValue::String("a".into()))
+                .unwrap()
+        );
+        // "10" < "9" is true lexicographically (digit '1' < digit '9').
+        assert!(
+            JsValue::js_less_than(&JsValue::String("10".into()), &JsValue::String("9".into()))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_less_than_string_vs_number_coercion() {
+        // "5" < 10 → 5 < 10 → true (string converted to number)
+        assert!(JsValue::js_less_than(&JsValue::String("5".into()), &JsValue::Smi(10)).unwrap());
+        // 10 < "5" → 10 < 5 → false
+        assert!(!JsValue::js_less_than(&JsValue::Smi(10), &JsValue::String("5".into())).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_boolean_coercion() {
+        // true → 1, false → 0
+        assert!(JsValue::js_less_than(&JsValue::Boolean(false), &JsValue::Boolean(true)).unwrap());
+        assert!(!JsValue::js_less_than(&JsValue::Boolean(true), &JsValue::Boolean(false)).unwrap());
+        // false (0) < 1 → true
+        assert!(JsValue::js_less_than(&JsValue::Boolean(false), &JsValue::Smi(1)).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_null_undefined() {
+        // null → 0, undefined → NaN
+        assert!(JsValue::js_less_than(&JsValue::Null, &JsValue::Smi(1)).unwrap());
+        // undefined → NaN, NaN < 1 → false
+        assert!(!JsValue::js_less_than(&JsValue::Undefined, &JsValue::Smi(1)).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_bigint() {
+        assert!(JsValue::js_less_than(&JsValue::BigInt(1), &JsValue::BigInt(2)).unwrap());
+        assert!(!JsValue::js_less_than(&JsValue::BigInt(2), &JsValue::BigInt(1)).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_bigint_vs_number() {
+        assert!(JsValue::js_less_than(&JsValue::BigInt(1), &JsValue::HeapNumber(1.5)).unwrap());
+        assert!(!JsValue::js_less_than(&JsValue::HeapNumber(2.5), &JsValue::BigInt(2)).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_bigint_vs_string() {
+        // BigInt(1) < "2" → 1 < 2 → true
+        assert!(JsValue::js_less_than(&JsValue::BigInt(1), &JsValue::String("2".into())).unwrap());
+        // "1" < BigInt(2) → 1 < 2 → true
+        assert!(JsValue::js_less_than(&JsValue::String("1".into()), &JsValue::BigInt(2)).unwrap());
+        // BigInt vs unparseable string → None → false
+        assert!(
+            !JsValue::js_less_than(&JsValue::BigInt(1), &JsValue::String("abc".into())).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_less_than_infinity() {
+        assert!(
+            JsValue::js_less_than(&JsValue::HeapNumber(f64::NEG_INFINITY), &JsValue::Smi(0))
+                .unwrap()
+        );
+        assert!(
+            !JsValue::js_less_than(&JsValue::HeapNumber(f64::INFINITY), &JsValue::Smi(0)).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_greater_than() {
+        assert!(JsValue::js_greater_than(&JsValue::Smi(2), &JsValue::Smi(1)).unwrap());
+        assert!(!JsValue::js_greater_than(&JsValue::Smi(1), &JsValue::Smi(2)).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_or_equal() {
+        assert!(JsValue::js_less_than_or_equal(&JsValue::Smi(1), &JsValue::Smi(2)).unwrap());
+        assert!(JsValue::js_less_than_or_equal(&JsValue::Smi(1), &JsValue::Smi(1)).unwrap());
+        assert!(!JsValue::js_less_than_or_equal(&JsValue::Smi(2), &JsValue::Smi(1)).unwrap());
+    }
+
+    #[test]
+    fn test_greater_than_or_equal() {
+        assert!(JsValue::js_greater_than_or_equal(&JsValue::Smi(2), &JsValue::Smi(1)).unwrap());
+        assert!(JsValue::js_greater_than_or_equal(&JsValue::Smi(1), &JsValue::Smi(1)).unwrap());
+        assert!(!JsValue::js_greater_than_or_equal(&JsValue::Smi(1), &JsValue::Smi(2)).unwrap());
+    }
+
+    #[test]
+    fn test_relational_nan_all_false() {
+        let nan = JsValue::HeapNumber(f64::NAN);
+        let one = JsValue::Smi(1);
+        // NaN makes all relational operators return false.
+        assert!(!JsValue::js_less_than(&nan, &one).unwrap());
+        assert!(!JsValue::js_greater_than(&nan, &one).unwrap());
+        assert!(!JsValue::js_less_than_or_equal(&nan, &one).unwrap());
+        assert!(!JsValue::js_greater_than_or_equal(&nan, &one).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_object_to_primitive_string_path() {
+        use crate::objects::property_map::PropertyMap;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // Create a PlainObject with valueOf returning "abc".
+        let mut map_a = PropertyMap::new();
+        let val_fn_a: Rc<dyn Fn(Vec<JsValue>) -> StatorResult<JsValue>> =
+            Rc::new(|_| Ok(JsValue::String("abc".into())));
+        map_a.insert("valueOf".to_string(), JsValue::NativeFunction(val_fn_a));
+        let obj_a = JsValue::PlainObject(Rc::new(RefCell::new(map_a)));
+
+        // Create a PlainObject with valueOf returning "xyz".
+        let mut map_b = PropertyMap::new();
+        let val_fn_b: Rc<dyn Fn(Vec<JsValue>) -> StatorResult<JsValue>> =
+            Rc::new(|_| Ok(JsValue::String("xyz".into())));
+        map_b.insert("valueOf".to_string(), JsValue::NativeFunction(val_fn_b));
+        let obj_b = JsValue::PlainObject(Rc::new(RefCell::new(map_b)));
+
+        // Both ToPrimitive to strings → lexicographic: "abc" < "xyz" → true.
+        assert!(JsValue::js_less_than(&obj_a, &obj_b).unwrap());
+        assert!(!JsValue::js_less_than(&obj_b, &obj_a).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_object_to_primitive_number_path() {
+        use crate::objects::property_map::PropertyMap;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // PlainObject with valueOf returning 10.
+        let mut map = PropertyMap::new();
+        let val_fn: Rc<dyn Fn(Vec<JsValue>) -> StatorResult<JsValue>> =
+            Rc::new(|_| Ok(JsValue::Smi(10)));
+        map.insert("valueOf".to_string(), JsValue::NativeFunction(val_fn));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+
+        // obj (→ 10) < 20 → true
+        assert!(JsValue::js_less_than(&obj, &JsValue::Smi(20)).unwrap());
+        // 5 < obj (→ 10) → true
+        assert!(JsValue::js_less_than(&JsValue::Smi(5), &obj).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_object_with_toprimitive() {
+        use crate::objects::property_map::PropertyMap;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // PlainObject with @@toPrimitive returning 42.
+        let mut map = PropertyMap::new();
+        let tp_fn: Rc<dyn Fn(Vec<JsValue>) -> StatorResult<JsValue>> =
+            Rc::new(|_| Ok(JsValue::Smi(42)));
+        map.insert("@@toPrimitive".to_string(), JsValue::NativeFunction(tp_fn));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+
+        assert!(JsValue::js_less_than(&obj, &JsValue::Smi(100)).unwrap());
+        assert!(!JsValue::js_less_than(&obj, &JsValue::Smi(10)).unwrap());
     }
 }
