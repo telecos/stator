@@ -32,3 +32,7 @@ _codeql_detected_source_root
 
 # Runner log files
 *.log
+
+# Build artifacts that may leak to repo root
+*.rcgu.o
+4610
