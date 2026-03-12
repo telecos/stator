@@ -2731,10 +2731,7 @@ mod tests {
 
     #[test]
     fn test_to_integer_or_infinity_nan_is_zero() {
-        assert_eq!(
-            JsValue::Undefined.to_integer_or_infinity().unwrap(),
-            0.0
-        );
+        assert_eq!(JsValue::Undefined.to_integer_or_infinity().unwrap(), 0.0);
         assert_eq!(
             JsValue::HeapNumber(f64::NAN)
                 .to_integer_or_infinity()
@@ -2796,9 +2793,7 @@ mod tests {
             3.0
         );
         assert_eq!(
-            JsValue::String("".into())
-                .to_integer_or_infinity()
-                .unwrap(),
+            JsValue::String("".into()).to_integer_or_infinity().unwrap(),
             0.0
         );
     }

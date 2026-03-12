@@ -3105,7 +3105,8 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             Ok(JsValue::String(s.clone()))
                         }
                         _ => Err(StatorError::RangeError(
-                            "The normalization form should be one of NFC, NFD, NFKC, NFKD.".to_string(),
+                            "The normalization form should be one of NFC, NFD, NFKC, NFKD."
+                                .to_string(),
                         )),
                     }
                 }));
