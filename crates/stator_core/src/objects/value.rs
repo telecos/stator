@@ -2687,7 +2687,8 @@ mod tests {
         // 0x10000000000000000 = 2^64, which exceeds u64::MAX.
         let n = string_to_number("0x10000000000000000");
         assert!(n.is_finite());
-        assert!(n > u64::MAX as f64);
+        // u64::MAX rounds up to 2^64 in f64, so check >=.
+        assert!(n >= u64::MAX as f64);
     }
 
     #[test]
@@ -2696,7 +2697,8 @@ mod tests {
         let s = format!("0b{}", "1".repeat(65));
         let n = string_to_number(&s);
         assert!(n.is_finite());
-        assert!(n > u64::MAX as f64);
+        // u64::MAX rounds up to 2^64 in f64, so check >=.
+        assert!(n >= u64::MAX as f64);
     }
 
     #[test]

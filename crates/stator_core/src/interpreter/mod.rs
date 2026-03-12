@@ -6158,9 +6158,9 @@ mod tests {
 
         assert!(f.to_boolean());
         assert!(f.is_function());
-        // Function → ToPrimitive → "function () {}" → NaN
+        // Function → ToPrimitive → "function () { [native code] }" → NaN
         assert!(f.to_number().unwrap().is_nan());
-        assert_eq!(f.to_js_string().unwrap(), "function () {}");
+        assert_eq!(f.to_js_string().unwrap(), "function () { [native code] }");
     }
 
     /// Calling a non-function value with `CallAnyReceiver` should produce a
