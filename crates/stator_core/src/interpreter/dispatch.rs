@@ -10,6 +10,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
 
 use super::{
@@ -2668,17 +2669,37 @@ fn handle_sta_keyed_property(
             }
         )));
     }
-    // Strict mode: TypeError when assigning to a non-writable property.
-    if ctx.frame.bytecode_array.is_strict()
-        && let JsValue::PlainObject(ref map) = obj
-    {
+    // PlainObject: check for setter accessor, writable, and extensibility
+    // before falling through to keyed_store.
+    if let JsValue::PlainObject(ref map) = obj {
         let key_str = to_property_key(&key)?;
-        let pm = map.borrow();
-        if pm.contains_key(&key_str) && !pm.is_writable(&key_str) {
-            return Err(StatorError::TypeError(format!(
-                "Cannot assign to read only property '{key_str}'"
-            )));
+        // Check for setter accessor first (__set_<key>__).
+        let setter_key = format!("__set_{key_str}__");
+        let setter = map.borrow().get(&setter_key).cloned();
+        if let Some(setter_fn) = setter {
+            dispatch_setter(&setter_fn, &obj, val)?;
+            return Ok(DispatchAction::Continue);
         }
+        let pm = map.borrow();
+        // Existing non-writable property: TypeError in strict mode.
+        if pm.contains_key(&key_str) && !pm.is_writable(&key_str) {
+            if ctx.frame.bytecode_array.is_strict() {
+                return Err(StatorError::TypeError(format!(
+                    "Cannot assign to read only property '{key_str}'"
+                )));
+            }
+            return Ok(DispatchAction::Continue);
+        }
+        // Non-extensible object: TypeError for new property in strict mode.
+        if !pm.extensible && !pm.contains_key(&key_str) {
+            if ctx.frame.bytecode_array.is_strict() {
+                return Err(StatorError::TypeError(format!(
+                    "Cannot add property {key_str}, object is not extensible"
+                )));
+            }
+            return Ok(DispatchAction::Continue);
+        }
+        drop(pm);
     }
     keyed_store(&obj, &key, val)?;
     // Accumulator stays unchanged.
@@ -3858,12 +3879,36 @@ fn handle_for_in_enumerate(
             let mut all_keys = Vec::new();
             let mut seen = std::collections::HashSet::new();
             // Walk the prototype chain collecting enumerable keys.
+            // ALL own keys (including non-enumerable) are added to `seen` so
+            // that non-enumerable own properties correctly shadow inherited
+            // enumerable ones (ES §14.7.5.9).
             let mut current_map = Some(Rc::clone(map));
             for _ in 0..256 {
                 let Some(m) = current_map.take() else { break };
                 let borrow = m.borrow();
-                for k in borrow.enumerable_keys() {
-                    if seen.insert(k.clone()) {
+                for (k, _val, attrs) in borrow.iter_with_attrs() {
+                    let is_enumerable = attrs.contains(PropertyAttributes::ENUMERABLE);
+                    // Translate accessor convention keys (__get_X__ / __set_X__)
+                    // to the actual property name X.
+                    if let Some(prop) = k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
+                    {
+                        seen.insert(k.clone());
+                        if seen.insert(prop.to_string()) && is_enumerable {
+                            all_keys.push(JsValue::String(prop.to_string().into()));
+                        }
+                        continue;
+                    }
+                    if let Some(prop) = k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
+                    {
+                        seen.insert(k.clone());
+                        if seen.insert(prop.to_string()) && is_enumerable {
+                            all_keys.push(JsValue::String(prop.to_string().into()));
+                        }
+                        continue;
+                    }
+                    // Regular property: add to seen for shadowing, push if
+                    // enumerable and not already seen at a higher level.
+                    if seen.insert(k.clone()) && is_enumerable {
                         all_keys.push(JsValue::String(k.clone().into()));
                     }
                 }

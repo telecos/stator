@@ -4192,6 +4192,66 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     }));
                 }
                 "constructor" => return JsValue::Undefined,
+                "hasOwnProperty" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(JsValue::Smi(n)) => n.to_string(),
+                            Some(JsValue::HeapNumber(n)) => format!("{n}"),
+                            Some(JsValue::Boolean(b)) => b.to_string(),
+                            Some(JsValue::Null) => "null".to_string(),
+                            Some(JsValue::Undefined) => "undefined".to_string(),
+                            _ => return Ok(JsValue::Boolean(false)),
+                        };
+                        if prop == "length" {
+                            return Ok(JsValue::Boolean(true));
+                        }
+                        if let Ok(idx) = prop.parse::<usize>() {
+                            return Ok(JsValue::Boolean(idx < a.borrow().len()));
+                        }
+                        Ok(JsValue::Boolean(false))
+                    }));
+                }
+                "propertyIsEnumerable" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(JsValue::Smi(n)) => n.to_string(),
+                            _ => return Ok(JsValue::Boolean(false)),
+                        };
+                        // Array numeric indices are enumerable.
+                        if let Ok(idx) = prop.parse::<usize>() {
+                            return Ok(JsValue::Boolean(idx < a.borrow().len()));
+                        }
+                        Ok(JsValue::Boolean(false))
+                    }));
+                }
+                "isPrototypeOf" => {
+                    return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
+                }
+                "toLocaleString" => {
+                    let a = Rc::clone(&arr_rc);
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        let parts: Vec<String> = a
+                            .borrow()
+                            .iter()
+                            .map(|v| match v {
+                                JsValue::Null | JsValue::Undefined => String::new(),
+                                other => {
+                                    let to_ls = proto_lookup(other, "toLocaleString");
+                                    match dispatch_call_value(&to_ls, vec![other.clone()]) {
+                                        Ok(JsValue::String(s)) => s.to_string(),
+                                        Ok(v) => js_to_string(&v),
+                                        Err(_) => js_to_string(other),
+                                    }
+                                }
+                            })
+                            .collect();
+                        Ok(JsValue::String(parts.join(",").into()))
+                    }));
+                }
                 _ => {
                     // Numeric index access: arr[0], arr[1], etc.
                     if let Ok(idx) = key.parse::<usize>()
@@ -4276,6 +4336,28 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Error(Rc::clone(&e2)))))
             }
             "constructor" => JsValue::Undefined,
+            "hasOwnProperty" => {
+                let e = Rc::clone(e);
+                JsValue::NativeFunction(Rc::new(move |args| {
+                    let prop = match args.first() {
+                        Some(JsValue::String(s)) => s.to_string(),
+                        Some(JsValue::Smi(n)) => n.to_string(),
+                        Some(v) => v.to_js_string()?,
+                        None => return Ok(JsValue::Boolean(false)),
+                    };
+                    // Check user overlay first.
+                    if e.props.borrow().contains_key(&prop) {
+                        return Ok(JsValue::Boolean(true));
+                    }
+                    Ok(JsValue::Boolean(matches!(
+                        prop.as_str(),
+                        "name" | "message" | "stack"
+                    )))
+                }))
+            }
+            "propertyIsEnumerable" => {
+                JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))))
+            }
             _ => JsValue::Undefined,
         };
     }
@@ -4440,6 +4522,41 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             "constructor" => return JsValue::Undefined,
+            "hasOwnProperty" => {
+                let ba = Rc::clone(ba);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let prop = match args.first() {
+                        Some(JsValue::String(s)) => s.to_string(),
+                        Some(JsValue::Smi(n)) => n.to_string(),
+                        Some(JsValue::HeapNumber(n)) => format!("{n}"),
+                        Some(JsValue::Boolean(b)) => b.to_string(),
+                        Some(JsValue::Null) => "null".to_string(),
+                        Some(JsValue::Undefined) => "undefined".to_string(),
+                        _ => return Ok(JsValue::Boolean(false)),
+                    };
+                    // Check fn_props side table first.
+                    if !matches!(fn_props_get(&ba, &prop), JsValue::Undefined) {
+                        return Ok(JsValue::Boolean(true));
+                    }
+                    Ok(JsValue::Boolean(matches!(
+                        prop.as_str(),
+                        "length" | "name" | "prototype"
+                    )))
+                }));
+            }
+            "propertyIsEnumerable" => {
+                return JsValue::NativeFunction(Rc::new(|_args| {
+                    // Function own properties are not enumerable.
+                    Ok(JsValue::Boolean(false))
+                }));
+            }
+            "isPrototypeOf" => {
+                return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
+            }
+            "valueOf" => {
+                let obj_clone = obj.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| Ok(obj_clone.clone())));
+            }
             _ => {}
         }
     }
@@ -4506,6 +4623,33 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             "constructor" => return JsValue::Undefined,
+            "hasOwnProperty" => {
+                return JsValue::NativeFunction(Rc::new(|args| {
+                    let prop = match args.first() {
+                        Some(JsValue::String(s)) => s.to_string(),
+                        Some(JsValue::Smi(n)) => n.to_string(),
+                        Some(JsValue::HeapNumber(n)) => format!("{n}"),
+                        Some(JsValue::Boolean(b)) => b.to_string(),
+                        Some(JsValue::Null) => "null".to_string(),
+                        Some(JsValue::Undefined) => "undefined".to_string(),
+                        _ => return Ok(JsValue::Boolean(false)),
+                    };
+                    Ok(JsValue::Boolean(matches!(prop.as_str(), "length" | "name")))
+                }));
+            }
+            "propertyIsEnumerable" => {
+                return JsValue::NativeFunction(Rc::new(|_args| {
+                    // NativeFunction own properties are not enumerable.
+                    Ok(JsValue::Boolean(false))
+                }));
+            }
+            "isPrototypeOf" => {
+                return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
+            }
+            "valueOf" => {
+                let obj_clone = obj.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| Ok(obj_clone.clone())));
+            }
             _ => {}
         }
     }

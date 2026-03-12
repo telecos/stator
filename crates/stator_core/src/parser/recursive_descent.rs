@@ -79,6 +79,15 @@ pub struct Parser<'src> {
     /// top-level program had a `"use strict"` directive or we are inside a
     /// function whose body contains one).
     strict_mode: bool,
+    /// Nesting depth of function bodies (functions, methods, arrows with block
+    /// body).  Used to validate `return` and `new.target`.
+    function_depth: usize,
+    /// Nesting depth of iteration statements (`for`, `while`, `do-while`).
+    /// Used to validate `continue`.
+    iteration_depth: usize,
+    /// Nesting depth of breakable statements (iteration + `switch`).
+    /// Used to validate `break`.
+    breakable_depth: usize,
 }
 
 impl<'src> Parser<'src> {
@@ -95,6 +104,9 @@ impl<'src> Parser<'src> {
             depth: 0,
             class_depth: 0,
             strict_mode: false,
+            function_depth: 0,
+            iteration_depth: 0,
+            breakable_depth: 0,
         })
     }
 
@@ -442,6 +454,17 @@ impl<'src> Parser<'src> {
                 break;
             }
         }
+        // `const` declarations require an initializer.
+        if kind == VarKind::Const {
+            for d in &declarators {
+                if d.init.is_none() {
+                    return Err(Self::error_at(
+                        d.loc,
+                        "const declarations must have an initializer",
+                    ));
+                }
+            }
+        }
         self.consume_semicolon()?;
         let end = declarators.last().map(|d| d.id.loc()).unwrap_or(kw_span);
         Ok(Stmt::VarDecl(VarDecl {
@@ -479,14 +502,87 @@ impl<'src> Parser<'src> {
         }))
     }
 
+    /// Check if the current token starts a statement that is forbidden in
+    /// statement position.
+    ///
+    /// * `async function`, `class`, `let`, `const`, `function*` — always
+    ///   forbidden in statement position.
+    /// * Plain `function` — forbidden in strict mode everywhere; in sloppy
+    ///   mode it is allowed inside `if` bodies (Annex B.3.3) but forbidden
+    ///   in iteration / `with` bodies. Pass `annex_b_function` = `true`
+    ///   for `if` bodies to permit this relaxation.
+    fn check_forbidden_statement_position(&self, annex_b_function: bool) -> StatorResult<()> {
+        let span = self.current_span();
+        match self.peek_kind() {
+            // `async function` in statement position.
+            TokenKind::Async => {
+                let mut scanner_clone = self.scanner.clone();
+                if let Ok(next) = Self::next_significant(&mut scanner_clone)
+                    && next.kind == TokenKind::Function
+                    && !next.had_line_terminator_before
+                {
+                    return Err(Self::error_at(
+                        span,
+                        "async function declaration is not allowed in statement position",
+                    ));
+                }
+                Ok(())
+            }
+            // `class` in statement position.
+            TokenKind::Class => Err(Self::error_at(
+                span,
+                "class declaration is not allowed in statement position",
+            )),
+            // `let` and `const` are lexical declarations, not statements.
+            TokenKind::Let | TokenKind::Const => Err(Self::error_at(
+                span,
+                "lexical declaration is not allowed in statement position",
+            )),
+            // `function` handling:
+            // - In strict mode: always forbidden.
+            // - `function*` (generator): always forbidden.
+            // - In sloppy mode (non-generator): allowed only in `if` bodies
+            //   (Annex B.3.3), forbidden in iteration/with bodies.
+            TokenKind::Function => {
+                if self.strict_mode {
+                    return Err(Self::error_at(
+                        span,
+                        "function declaration is not allowed in statement position in strict mode",
+                    ));
+                }
+                // Check for `function*` (generator) — always forbidden.
+                let mut scanner_clone = self.scanner.clone();
+                if let Ok(next) = Self::next_significant(&mut scanner_clone)
+                    && next.kind == TokenKind::Star
+                {
+                    return Err(Self::error_at(
+                        span,
+                        "generator function declaration is not allowed in statement position",
+                    ));
+                }
+                // Sloppy-mode non-generator: Annex B allows in `if` bodies.
+                if !annex_b_function {
+                    return Err(Self::error_at(
+                        span,
+                        "function declaration is not allowed in statement position",
+                    ));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn parse_if(&mut self) -> StatorResult<Stmt> {
         let start = self.current_span();
         self.bump()?; // 'if'
         self.expect(TokenKind::LeftParen)?;
         let test = self.parse_expr()?;
         self.expect(TokenKind::RightParen)?;
+        self.check_forbidden_statement_position(true)?;
         let consequent = self.parse_stmt()?;
         let alternate = if self.eat(TokenKind::Else)? {
+            self.check_forbidden_statement_position(true)?;
             Some(Box::new(self.parse_stmt()?))
         } else {
             None
@@ -509,7 +605,13 @@ impl<'src> Parser<'src> {
         self.expect(TokenKind::LeftParen)?;
         let test = self.parse_expr()?;
         self.expect(TokenKind::RightParen)?;
-        let body = self.parse_stmt()?;
+        self.check_forbidden_statement_position(false)?;
+        self.iteration_depth += 1;
+        self.breakable_depth += 1;
+        let body = self.parse_stmt();
+        self.breakable_depth -= 1;
+        self.iteration_depth -= 1;
+        let body = body?;
         let end = body.loc();
         Ok(Stmt::While(WhileStmt {
             loc: Self::merge_spans(start, end),
@@ -521,7 +623,13 @@ impl<'src> Parser<'src> {
     fn parse_do_while(&mut self) -> StatorResult<Stmt> {
         let start = self.current_span();
         self.bump()?; // 'do'
-        let body = self.parse_stmt()?;
+        self.check_forbidden_statement_position(false)?;
+        self.iteration_depth += 1;
+        self.breakable_depth += 1;
+        let body = self.parse_stmt();
+        self.breakable_depth -= 1;
+        self.iteration_depth -= 1;
+        let body = body?;
         self.expect(TokenKind::While)?;
         self.expect(TokenKind::LeftParen)?;
         let test = self.parse_expr()?;
@@ -565,7 +673,13 @@ impl<'src> Parser<'src> {
                 self.bump()?; // consume `in` / `of`
                 let right = self.parse_assignment_expr()?;
                 self.expect(TokenKind::RightParen)?;
-                let body = self.parse_stmt()?;
+                self.check_forbidden_statement_position(false)?;
+                self.iteration_depth += 1;
+                self.breakable_depth += 1;
+                let body = self.parse_stmt();
+                self.breakable_depth -= 1;
+                self.iteration_depth -= 1;
+                let body = body?;
                 let end = body.loc();
 
                 let var_decl = VarDecl {
@@ -625,7 +739,13 @@ impl<'src> Parser<'src> {
             self.bump()?; // consume `in` / `of`
             let right = self.parse_assignment_expr()?;
             self.expect(TokenKind::RightParen)?;
-            let body = self.parse_stmt()?;
+            self.check_forbidden_statement_position(false)?;
+            self.iteration_depth += 1;
+            self.breakable_depth += 1;
+            let body = self.parse_stmt();
+            self.breakable_depth -= 1;
+            self.iteration_depth -= 1;
+            let body = body?;
             let end = body.loc();
 
             let left = self.expr_to_for_lhs(init_expr)?;
@@ -674,7 +794,13 @@ impl<'src> Parser<'src> {
             Some(Box::new(self.parse_expr()?))
         };
         self.expect(TokenKind::RightParen)?;
-        let body = self.parse_stmt()?;
+        self.check_forbidden_statement_position(false)?;
+        self.iteration_depth += 1;
+        self.breakable_depth += 1;
+        let body = self.parse_stmt();
+        self.breakable_depth -= 1;
+        self.iteration_depth -= 1;
+        let body = body?;
         let end = body.loc();
         Ok(Stmt::For(ForStmt {
             loc: Self::merge_spans(start, end),
@@ -707,6 +833,8 @@ impl<'src> Parser<'src> {
 
     fn parse_return(&mut self) -> StatorResult<Stmt> {
         let start = self.current_span();
+        // NOTE: top-level return is allowed in script mode (non-module).
+        // Test262 module tests are already skipped.
         self.bump()?; // 'return'
         let argument = if !self.current.had_line_terminator_before
             && self.peek_kind() != TokenKind::Semicolon
@@ -736,6 +864,13 @@ impl<'src> Parser<'src> {
         } else {
             None
         };
+        // `break` without a label requires an enclosing breakable statement.
+        if label.is_none() && self.breakable_depth == 0 {
+            return Err(Self::error_at(
+                start,
+                "break statement not inside a loop or switch",
+            ));
+        }
         let end = label.as_ref().map(|l| l.loc).unwrap_or(start);
         self.consume_semicolon()?;
         Ok(Stmt::Break(BreakStmt {
@@ -755,6 +890,13 @@ impl<'src> Parser<'src> {
         } else {
             None
         };
+        // `continue` (with or without label) requires an enclosing iteration.
+        if self.iteration_depth == 0 {
+            return Err(Self::error_at(
+                start,
+                "continue statement not inside a loop",
+            ));
+        }
         let end = label.as_ref().map(|l| l.loc).unwrap_or(start);
         self.consume_semicolon()?;
         Ok(Stmt::Continue(ContinueStmt {
@@ -832,6 +974,7 @@ impl<'src> Parser<'src> {
         self.expect(TokenKind::LeftParen)?;
         let object = self.parse_expr()?;
         self.expect(TokenKind::RightParen)?;
+        self.check_forbidden_statement_position(false)?;
         let body = self.parse_stmt()?;
         Ok(Stmt::With(WithStmt {
             loc: Self::merge_spans(start, self.current_span()),
@@ -848,6 +991,7 @@ impl<'src> Parser<'src> {
         self.expect(TokenKind::RightParen)?;
         self.expect(TokenKind::LeftBrace)?;
 
+        self.breakable_depth += 1;
         let mut cases = Vec::new();
         while self.peek_kind() != TokenKind::RightBrace {
             if self.peek_kind() == TokenKind::Eof {
@@ -888,6 +1032,7 @@ impl<'src> Parser<'src> {
 
         let end = self.current_span();
         self.bump()?; // consume '}'
+        self.breakable_depth -= 1;
         Ok(Stmt::Switch(SwitchStmt {
             loc: Self::merge_spans(start, end),
             discriminant: Box::new(discriminant),
@@ -900,7 +1045,9 @@ impl<'src> Parser<'src> {
         let is_generator = self.eat(TokenKind::Star)?;
         let id = if self.peek_kind() == TokenKind::Identifier {
             let tok = self.bump()?;
-            Some(self.ident_from_token(&tok)?)
+            let ident = self.ident_from_token(&tok)?;
+            self.check_strict_binding_ident(&ident.name, ident.loc)?;
+            Some(ident)
         } else {
             None
         };
@@ -909,11 +1056,24 @@ impl<'src> Parser<'src> {
 
         // Save enclosing strict mode, then parse function body.
         let outer_strict = self.strict_mode;
-        let (body, fn_strict) = self.parse_function_body()?;
+        let (body, fn_strict, has_use_strict) = self.parse_function_body()?;
         self.strict_mode = outer_strict;
 
-        // Duplicate parameter names are a SyntaxError in strict mode.
+        // "use strict" inside a function with non-simple parameters is an
+        // early error (ES2025 §15.1.1).
+        if has_use_strict && Self::has_non_simple_params(&params) {
+            return Err(Self::error_at(
+                fn_span,
+                "illegal 'use strict' directive in function with non-simple parameter list",
+            ));
+        }
+
+        // If the function body is strict, retroactively validate the name
+        // and parameters.
         if fn_strict {
+            if let Some(ref ident) = id {
+                self.check_strict_binding_ident(&ident.name, ident.loc)?;
+            }
             self.check_strict_duplicate_params(&params)?;
         }
 
@@ -930,9 +1090,8 @@ impl<'src> Parser<'src> {
     }
 
     /// Parse a function body block `{ … }`, detecting a `"use strict"`
-    /// directive prologue.  Returns `(block, is_strict)` where `is_strict`
-    /// is `true` when the function inherits or declares strict mode.
-    fn parse_function_body(&mut self) -> StatorResult<(BlockStmt, bool)> {
+    /// directive prologue.  Returns `(block, is_strict, has_use_strict_directive)`.
+    fn parse_function_body(&mut self) -> StatorResult<(BlockStmt, bool, bool)> {
         let start = self.current_span();
         self.expect(TokenKind::LeftBrace)?;
 
@@ -943,6 +1102,15 @@ impl<'src> Parser<'src> {
             self.strict_mode = true;
         }
 
+        // Save and reset loop/breakable depths — a new function body starts
+        // a fresh context for break/continue/return.
+        let outer_function_depth = self.function_depth;
+        let outer_iteration_depth = self.iteration_depth;
+        let outer_breakable_depth = self.breakable_depth;
+        self.function_depth = 1;
+        self.iteration_depth = 0;
+        self.breakable_depth = 0;
+
         let mut body = Vec::new();
         while self.peek_kind() != TokenKind::RightBrace {
             if self.peek_kind() == TokenKind::Eof {
@@ -952,12 +1120,19 @@ impl<'src> Parser<'src> {
         }
         let end = self.current_span();
         self.bump()?; // consume '}'
+
+        // Restore enclosing depths.
+        self.function_depth = outer_function_depth;
+        self.iteration_depth = outer_iteration_depth;
+        self.breakable_depth = outer_breakable_depth;
+
         Ok((
             BlockStmt {
                 loc: Self::merge_spans(start, end),
                 body,
             },
             is_strict,
+            has_directive,
         ))
     }
 
@@ -969,7 +1144,9 @@ impl<'src> Parser<'src> {
 
         let id = if self.peek_kind() == TokenKind::Identifier {
             let tok = self.bump()?;
-            Some(self.ident_from_token(&tok)?)
+            let ident = self.ident_from_token(&tok)?;
+            self.check_strict_binding_ident(&ident.name, ident.loc)?;
+            Some(ident)
         } else {
             None
         };
@@ -996,7 +1173,9 @@ impl<'src> Parser<'src> {
 
         let id = if self.peek_kind() == TokenKind::Identifier {
             let tok = self.bump()?;
-            Some(self.ident_from_token(&tok)?)
+            let ident = self.ident_from_token(&tok)?;
+            self.check_strict_binding_ident(&ident.name, ident.loc)?;
+            Some(ident)
         } else {
             None
         };
@@ -1127,7 +1306,17 @@ impl<'src> Parser<'src> {
                 let fn_start = self.current_span();
                 self.expect(TokenKind::LeftParen)?;
                 let params = self.parse_formal_params()?;
-                let body = self.parse_block()?;
+                let outer_fn = self.function_depth;
+                let outer_it = self.iteration_depth;
+                let outer_br = self.breakable_depth;
+                self.function_depth = 1;
+                self.iteration_depth = 0;
+                self.breakable_depth = 0;
+                let body = self.parse_block();
+                self.function_depth = outer_fn;
+                self.iteration_depth = outer_it;
+                self.breakable_depth = outer_br;
+                let body = body?;
                 let fn_end = body.loc;
 
                 let value = FnExpr {
@@ -1657,8 +1846,13 @@ impl<'src> Parser<'src> {
                     pat: rest_pat,
                     default: None,
                 });
-                // Rest must be last — eat optional trailing comma then break.
-                let _ = self.eat(TokenKind::Comma)?;
+                // Trailing comma after rest is a SyntaxError.
+                if self.peek_kind() == TokenKind::Comma {
+                    return Err(Self::error_at(
+                        self.current_span(),
+                        "rest parameter may not have a trailing comma",
+                    ));
+                }
                 break;
             }
 
@@ -1699,6 +1893,21 @@ impl<'src> Parser<'src> {
             }
         }
         Ok(())
+    }
+
+    /// Returns `true` if `params` contains any non-simple parameter
+    /// (destructuring, default value, or rest element).
+    fn has_non_simple_params(params: &[Param]) -> bool {
+        for param in params {
+            if param.default.is_some() {
+                return true;
+            }
+            match &param.pat {
+                Pat::Ident(_) => {}
+                _ => return true,
+            }
+        }
+        false
     }
 
     /// Strict mode: octal escape sequences in strings (e.g. `"\012"`,
@@ -1758,14 +1967,7 @@ impl<'src> Parser<'src> {
             TokenKind::Identifier => {
                 let tok = self.bump()?;
                 let ident = self.ident_from_token(&tok)?;
-                // In strict mode, `eval` and `arguments` cannot be used as
-                // binding identifiers.
-                if self.strict_mode && (ident.name == "eval" || ident.name == "arguments") {
-                    return Err(self.error(&format!(
-                        "'{}' cannot be used as a binding name in strict mode",
-                        ident.name
-                    )));
-                }
+                self.check_strict_binding_ident(&ident.name, ident.loc)?;
                 Ok(Pat::Ident(ident))
             }
             TokenKind::LeftBracket => self.parse_array_pat(),
@@ -2508,10 +2710,8 @@ impl<'src> Parser<'src> {
             let end = arg.loc();
 
             // `delete obj.#private` is an early SyntaxError.
-            if op == UnaryOp::Delete
-                && let Expr::Member(ref m) = arg
-                && matches!(m.property, MemberProp::Private(_))
-            {
+            // Also covers parenthesized forms like `delete (obj.#private)`.
+            if op == UnaryOp::Delete && Self::contains_private_member_delete(&arg) {
                 return Err(Self::error_at(
                     Self::merge_spans(start, end),
                     "private fields can not be deleted",
@@ -2843,6 +3043,7 @@ impl<'src> Parser<'src> {
                 let start = self.current_span();
                 self.bump()?; // consume `{`
                 let mut properties: Vec<ObjectProp> = Vec::new();
+                let mut proto_count: u32 = 0;
                 while self.peek_kind() != TokenKind::RightBrace {
                     if self.peek_kind() == TokenKind::Eof {
                         return Err(self.error("unexpected end of input in object literal"));
@@ -3000,12 +3201,23 @@ impl<'src> Parser<'src> {
                         };
 
                         // Determine property value kind.
+                        let mut is_proto_value_prop = false;
                         let value = if let Some(accessor_kind) = getter_setter_kind {
                             // getter/setter: `get key() { … }` / `set key(v) { … }`
                             let fn_start = self.current_span();
                             self.expect(TokenKind::LeftParen)?;
                             let params = self.parse_formal_params()?;
-                            let body = self.parse_block()?;
+                            let outer_fn = self.function_depth;
+                            let outer_it = self.iteration_depth;
+                            let outer_br = self.breakable_depth;
+                            self.function_depth = 1;
+                            self.iteration_depth = 0;
+                            self.breakable_depth = 0;
+                            let body = self.parse_block();
+                            self.function_depth = outer_fn;
+                            self.iteration_depth = outer_it;
+                            self.breakable_depth = outer_br;
+                            let body = body?;
                             let fn_end = body.loc;
                             let fn_expr = FnExpr {
                                 loc: Self::merge_spans(fn_start, fn_end),
@@ -3030,7 +3242,17 @@ impl<'src> Parser<'src> {
                             let fn_start = self.current_span();
                             self.expect(TokenKind::LeftParen)?;
                             let params = self.parse_formal_params()?;
-                            let body = self.parse_block()?;
+                            let outer_fn = self.function_depth;
+                            let outer_it = self.iteration_depth;
+                            let outer_br = self.breakable_depth;
+                            self.function_depth = 1;
+                            self.iteration_depth = 0;
+                            self.breakable_depth = 0;
+                            let body = self.parse_block();
+                            self.function_depth = outer_fn;
+                            self.iteration_depth = outer_it;
+                            self.breakable_depth = outer_br;
+                            let body = body?;
                             let fn_end = body.loc;
                             PropValue::Method(FnExpr {
                                 loc: Self::merge_spans(fn_start, fn_end),
@@ -3042,6 +3264,7 @@ impl<'src> Parser<'src> {
                                 is_strict: false,
                             })
                         } else if self.eat(TokenKind::Colon)? {
+                            is_proto_value_prop = true;
                             PropValue::Value(Box::new(self.parse_assignment_expr()?))
                         } else {
                             // Shorthand — only valid for identifier keys.
@@ -3091,10 +3314,34 @@ impl<'src> Parser<'src> {
                                 start: prop_start.start,
                                 end: prop_end,
                             },
-                            key,
+                            key: key.clone(),
                             is_computed,
                             value,
                         })));
+
+                        // Duplicate __proto__ check (B.3.1): only applies to
+                        // `PropertyDefinition : PropertyName : AssignmentExpression`
+                        // with a non-computed key whose string value is "__proto__".
+                        if !is_computed && is_proto_value_prop {
+                            let is_proto = match &key {
+                                PropKey::Ident(id) => id.name == "__proto__",
+                                PropKey::Str(s) => {
+                                    s.value == "\"__proto__\""
+                                        || s.value == "'__proto__'"
+                                        || s.value == "__proto__"
+                                }
+                                _ => false,
+                            };
+                            if is_proto {
+                                proto_count += 1;
+                                if proto_count > 1 {
+                                    return Err(Self::error_at(
+                                        prop_start,
+                                        "duplicate __proto__ property in object literal",
+                                    ));
+                                }
+                            }
+                        }
                     }
                     if !self.eat(TokenKind::Comma)? {
                         break;
@@ -3118,6 +3365,12 @@ impl<'src> Parser<'src> {
                     let prop_tok = self.bump()?;
                     let name = self.name_from_token(&prop_tok)?;
                     if name == "target" {
+                        if self.function_depth == 0 {
+                            return Err(Self::error_at(
+                                Self::merge_spans(new_start, prop_tok.span),
+                                "new.target is only valid inside functions",
+                            ));
+                        }
                         let end = prop_tok.span;
                         return Ok(Expr::MetaProp(MetaPropExpr {
                             loc: Self::merge_spans(new_start, end),
@@ -3385,7 +3638,9 @@ impl<'src> Parser<'src> {
         let is_generator = self.eat(TokenKind::Star)?;
         let id = if self.peek_kind() == TokenKind::Identifier {
             let tok = self.bump()?;
-            Some(self.ident_from_token(&tok)?)
+            let ident = self.ident_from_token(&tok)?;
+            self.check_strict_binding_ident(&ident.name, ident.loc)?;
+            Some(ident)
         } else {
             None
         };
@@ -3393,11 +3648,23 @@ impl<'src> Parser<'src> {
         let params = self.parse_formal_params()?;
 
         let outer_strict = self.strict_mode;
-        let (body, fn_strict) = self.parse_function_body()?;
+        let (body, fn_strict, has_use_strict) = self.parse_function_body()?;
         self.strict_mode = outer_strict;
 
-        // Duplicate parameter names are a SyntaxError in strict mode.
+        // "use strict" inside a function with non-simple parameters.
+        if has_use_strict && Self::has_non_simple_params(&params) {
+            return Err(Self::error_at(
+                fn_span,
+                "illegal 'use strict' directive in function with non-simple parameter list",
+            ));
+        }
+
+        // If the function body is strict, retroactively validate the name
+        // and parameters.
         if fn_strict {
+            if let Some(ref ident) = id {
+                self.check_strict_binding_ident(&ident.name, ident.loc)?;
+            }
             self.check_strict_duplicate_params(&params)?;
         }
 
@@ -3459,6 +3726,37 @@ impl<'src> Parser<'src> {
         })
     }
 
+    /// Return `true` if `name` is a strict-mode future reserved word
+    /// (ES2015 §11.6.2.2).
+    fn is_strict_reserved_word(name: &str) -> bool {
+        matches!(
+            name,
+            "implements" | "interface" | "package" | "private" | "protected" | "public"
+        )
+    }
+
+    /// In strict mode, check that `name` is not a future reserved word
+    /// or `eval`/`arguments` (which cannot appear as binding identifiers).
+    fn check_strict_binding_ident(&self, name: &str, span: Span) -> StatorResult<()> {
+        if self.strict_mode {
+            if name == "eval" || name == "arguments" {
+                return Err(Self::error_at(
+                    span,
+                    &format!("'{name}' cannot be used as a binding name in strict mode"),
+                ));
+            }
+            if Self::is_strict_reserved_word(name) {
+                return Err(Self::error_at(
+                    span,
+                    &format!(
+                        "'{name}' is a reserved word and cannot be used as a binding name in strict mode"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Returns `true` for keyword token kinds that can act as identifiers
     /// in binding positions (contextual keywords and soft keywords).
     fn is_contextual_keyword_identifier(&self, kind: TokenKind) -> bool {
@@ -3497,7 +3795,18 @@ impl<'src> Parser<'src> {
     /// concise expression body.
     fn parse_arrow_body(&mut self) -> StatorResult<ArrowBody> {
         if self.peek_kind() == TokenKind::LeftBrace {
-            Ok(ArrowBody::Block(self.parse_block()?))
+            // Arrow block body is a function context for break/continue/return.
+            let outer_function_depth = self.function_depth;
+            let outer_iteration_depth = self.iteration_depth;
+            let outer_breakable_depth = self.breakable_depth;
+            self.function_depth = 1;
+            self.iteration_depth = 0;
+            self.breakable_depth = 0;
+            let block = self.parse_block();
+            self.function_depth = outer_function_depth;
+            self.iteration_depth = outer_iteration_depth;
+            self.breakable_depth = outer_breakable_depth;
+            Ok(ArrowBody::Block(block?))
         } else {
             Ok(ArrowBody::Expr(Box::new(self.parse_assignment_expr()?)))
         }
@@ -3795,6 +4104,25 @@ impl<'src> Parser<'src> {
                     ))
                 }
             },
+        }
+    }
+
+    /// Check if an expression contains a private member access that would
+    /// make it invalid as the operand of `delete`.  This walks through
+    /// parenthesized expressions (which the parser represents directly —
+    /// no Paren wrapper), comma expressions, and conditional expressions.
+    fn contains_private_member_delete(expr: &Expr) -> bool {
+        match expr {
+            Expr::Member(m) => matches!(m.property, MemberProp::Private(_)),
+            Expr::Sequence(seq) => seq
+                .expressions
+                .last()
+                .is_some_and(Self::contains_private_member_delete),
+            Expr::Conditional(c) => {
+                Self::contains_private_member_delete(&c.consequent)
+                    || Self::contains_private_member_delete(&c.alternate)
+            }
+            _ => false,
         }
     }
 

@@ -23,6 +23,12 @@ use crate::objects::map::PropertyAttributes;
 use crate::objects::property_descriptor::FullPropertyDescriptor;
 use crate::objects::value::JsValue;
 
+/// Returns `true` if `key` is an internal accessor-storage key
+/// (`__get_<name>__` or `__set_<name>__`).
+fn is_internal_accessor_key(key: &str) -> bool {
+    (key.starts_with("__get_") || key.starts_with("__set_")) && key.ends_with("__")
+}
+
 // ── Object.create ─────────────────────────────────────────────────────────────
 
 /// ECMAScript §20.1.2.2 `Object.create(proto)`.
@@ -60,6 +66,9 @@ pub fn object_create(proto: Option<Rc<RefCell<JsObject>>>) -> JsObject {
 pub fn object_assign(target: &mut JsObject, sources: &[&JsObject]) -> StatorResult<()> {
     for src in sources {
         for key in src.own_property_keys() {
+            if is_internal_accessor_key(&key) {
+                continue;
+            }
             // Only copy enumerable own properties.
             if let Some((value, attrs)) = src.get_own_property_descriptor(&key)
                 && attrs.contains(PropertyAttributes::ENUMERABLE)
@@ -81,9 +90,11 @@ pub fn object_keys(obj: &JsObject) -> Vec<String> {
     obj.own_property_keys()
         .into_iter()
         .filter(|k| {
-            obj.get_own_property_descriptor(k)
-                .map(|(_, a)| a.contains(PropertyAttributes::ENUMERABLE))
-                .unwrap_or(false)
+            !is_internal_accessor_key(k)
+                && obj
+                    .get_own_property_descriptor(k)
+                    .map(|(_, a)| a.contains(PropertyAttributes::ENUMERABLE))
+                    .unwrap_or(false)
         })
         .collect()
 }
@@ -227,6 +238,9 @@ pub fn object_is_frozen(obj: &JsObject) -> bool {
         return false;
     }
     for key in obj.own_property_keys() {
+        if is_internal_accessor_key(&key) {
+            continue;
+        }
         if let Some((_, attrs)) = obj.get_own_property_descriptor(&key)
             && (attrs.contains(PropertyAttributes::WRITABLE)
                 || attrs.contains(PropertyAttributes::CONFIGURABLE))
@@ -245,6 +259,9 @@ pub fn object_is_sealed(obj: &JsObject) -> bool {
         return false;
     }
     for key in obj.own_property_keys() {
+        if is_internal_accessor_key(&key) {
+            continue;
+        }
         if let Some((_, attrs)) = obj.get_own_property_descriptor(&key)
             && attrs.contains(PropertyAttributes::CONFIGURABLE)
         {
@@ -259,6 +276,9 @@ pub fn object_is_sealed(obj: &JsObject) -> bool {
 /// Returns an array of all own property names (including non-enumerable ones).
 pub fn object_get_own_property_names(obj: &JsObject) -> Vec<String> {
     obj.own_property_keys()
+        .into_iter()
+        .filter(|k| !is_internal_accessor_key(k))
+        .collect()
 }
 // ── Object.is ────────────────────────────────────────────────────────────────
 
@@ -377,6 +397,7 @@ pub fn object_get_own_property_descriptors(
 ) -> Vec<(String, JsValue, PropertyAttributes)> {
     obj.own_property_keys()
         .into_iter()
+        .filter(|k| !is_internal_accessor_key(k))
         .filter_map(|k| obj.get_own_property_descriptor(&k).map(|(v, a)| (k, v, a)))
         .collect()
 }
@@ -408,21 +429,87 @@ pub fn object_define_property_from_descriptor(
     descriptor: &JsValue,
 ) -> StatorResult<()> {
     let desc = FullPropertyDescriptor::from_object(descriptor)?;
+
+    let getter_key = format!("__get_{key}__");
+    let setter_key = format!("__set_{key}__");
+    let is_current_accessor =
+        obj.has_own_property(&getter_key) || obj.has_own_property(&setter_key);
+
     let attrs = if let Some((_, current_attrs)) = obj.get_own_property_descriptor(key) {
+        let is_configurable = current_attrs.contains(PropertyAttributes::CONFIGURABLE);
+        if !is_configurable {
+            // Non-configurable: cannot switch between data ↔ accessor.
+            if is_current_accessor && desc.is_data() {
+                return Err(StatorError::TypeError(format!(
+                    "Cannot redefine property '{key}': \
+                     cannot convert accessor to data on a non-configurable property"
+                )));
+            }
+            if !is_current_accessor && desc.is_accessor() {
+                return Err(StatorError::TypeError(format!(
+                    "Cannot redefine property '{key}': \
+                     cannot convert data to accessor on a non-configurable property"
+                )));
+            }
+            // Non-configurable accessor → accessor: getter/setter must not change.
+            if let FullPropertyDescriptor::Accessor { get, set, .. } = &desc
+                && is_current_accessor
+            {
+                let cur_get = obj
+                    .get_own_property(&getter_key)
+                    .unwrap_or(JsValue::Undefined);
+                if *get != cur_get {
+                    return Err(StatorError::TypeError(format!(
+                        "Cannot redefine property '{key}': \
+                         cannot change getter of a non-configurable accessor"
+                    )));
+                }
+                let cur_set = obj
+                    .get_own_property(&setter_key)
+                    .unwrap_or(JsValue::Undefined);
+                if *set != cur_set {
+                    return Err(StatorError::TypeError(format!(
+                        "Cannot redefine property '{key}': \
+                         cannot change setter of a non-configurable accessor"
+                    )));
+                }
+            }
+        }
         desc.validate_against(key, current_attrs)?
     } else {
         desc.to_attributes()
     };
 
-    let value = match &desc {
-        FullPropertyDescriptor::Data { value, .. } => value.clone(),
-        FullPropertyDescriptor::Accessor { .. } | FullPropertyDescriptor::Generic { .. } => {
-            // For accessor/generic descriptors, preserve the existing value
-            // if present, otherwise use undefined.
-            obj.get_own_property(key).unwrap_or(JsValue::Undefined)
+    match &desc {
+        FullPropertyDescriptor::Data { value, .. } => {
+            // Transition from accessor → data: remove getter/setter entries.
+            if is_current_accessor {
+                let _ = obj.delete_own_property(&getter_key);
+                let _ = obj.delete_own_property(&setter_key);
+            }
+            obj.define_own_property(key, value.clone(), attrs)
         }
-    };
-    obj.define_own_property(key, value, attrs)
+        FullPropertyDescriptor::Accessor { get, set, .. } => {
+            let internal_attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
+            // Update or create the internal getter/setter entries.
+            if obj.has_own_property(&getter_key) {
+                obj.set_property(&getter_key, get.clone())?;
+            } else {
+                obj.define_own_property(&getter_key, get.clone(), internal_attrs)?;
+            }
+            if obj.has_own_property(&setter_key) {
+                obj.set_property(&setter_key, set.clone())?;
+            } else {
+                obj.define_own_property(&setter_key, set.clone(), internal_attrs)?;
+            }
+            // Store the property key with accessor attributes (no WRITABLE).
+            obj.define_own_property(key, JsValue::Undefined, attrs)
+        }
+        FullPropertyDescriptor::Generic { .. } => {
+            let value = obj.get_own_property(key).unwrap_or(JsValue::Undefined);
+            obj.define_own_property(key, value, attrs)
+        }
+    }
 }
 
 // ── Object.defineProperties ──────────────────────────────────────────────────
@@ -456,19 +543,37 @@ pub fn object_define_properties(obj: &mut JsObject, props: &JsValue) -> StatorRe
 /// ECMAScript §20.1.2.8 `Object.getOwnPropertyDescriptor(obj, key)` — returns
 /// a descriptor *object*.
 ///
-/// Wraps the internal `(value, attributes)` pair into a
-/// [`FullPropertyDescriptor::Data`] and converts it to a
-/// [`JsValue::PlainObject`] with `value`, `writable`, `enumerable`, and
-/// `configurable` keys.
+/// If the property uses the `__get_<key>__`/`__set_<key>__` accessor
+/// convention, returns an accessor descriptor with `get`, `set`,
+/// `enumerable`, and `configurable` keys.  Otherwise returns a data
+/// descriptor with `value`, `writable`, `enumerable`, and `configurable`.
 pub fn object_get_own_property_descriptor_as_object(obj: &JsObject, key: &str) -> Option<JsValue> {
     obj.get_own_property_descriptor(key).map(|(value, attrs)| {
-        let desc = FullPropertyDescriptor::Data {
-            value,
-            writable: attrs.contains(PropertyAttributes::WRITABLE),
-            enumerable: attrs.contains(PropertyAttributes::ENUMERABLE),
-            configurable: attrs.contains(PropertyAttributes::CONFIGURABLE),
-        };
-        desc.to_object()
+        let getter_key = format!("__get_{key}__");
+        let setter_key = format!("__set_{key}__");
+        if obj.has_own_property(&getter_key) || obj.has_own_property(&setter_key) {
+            let get = obj
+                .get_own_property(&getter_key)
+                .unwrap_or(JsValue::Undefined);
+            let set = obj
+                .get_own_property(&setter_key)
+                .unwrap_or(JsValue::Undefined);
+            let desc = FullPropertyDescriptor::Accessor {
+                get,
+                set,
+                enumerable: attrs.contains(PropertyAttributes::ENUMERABLE),
+                configurable: attrs.contains(PropertyAttributes::CONFIGURABLE),
+            };
+            desc.to_object()
+        } else {
+            let desc = FullPropertyDescriptor::Data {
+                value,
+                writable: attrs.contains(PropertyAttributes::WRITABLE),
+                enumerable: attrs.contains(PropertyAttributes::ENUMERABLE),
+                configurable: attrs.contains(PropertyAttributes::CONFIGURABLE),
+            };
+            desc.to_object()
+        }
     })
 }
 
@@ -1267,5 +1372,196 @@ mod tests {
 
         let err = object_define_property_from_descriptor(&mut obj, "p", &desc);
         assert!(matches!(err, Err(StatorError::TypeError(_))));
+    }
+
+    // ── Accessor descriptor support ─────────────────────────────────────
+
+    #[test]
+    fn test_define_property_accessor_stores_getter_setter() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+        let mut desc_map = PropertyMap::new();
+        desc_map.insert("get".to_string(), JsValue::Boolean(true));
+        desc_map.insert("set".to_string(), JsValue::Boolean(false));
+        desc_map.insert("enumerable".to_string(), JsValue::Boolean(true));
+        desc_map.insert("configurable".to_string(), JsValue::Boolean(true));
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+
+        object_define_property_from_descriptor(&mut obj, "x", &desc).unwrap();
+        // Internal getter/setter entries must be stored.
+        assert_eq!(
+            obj.get_own_property("__get_x__"),
+            Some(JsValue::Boolean(true))
+        );
+        assert_eq!(
+            obj.get_own_property("__set_x__"),
+            Some(JsValue::Boolean(false))
+        );
+    }
+
+    #[test]
+    fn test_get_own_property_descriptor_returns_accessor() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+        let mut desc_map = PropertyMap::new();
+        desc_map.insert("get".to_string(), JsValue::Boolean(true));
+        desc_map.insert("set".to_string(), JsValue::Boolean(false));
+        desc_map.insert("enumerable".to_string(), JsValue::Boolean(true));
+        desc_map.insert("configurable".to_string(), JsValue::Boolean(true));
+        let desc_val = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+        object_define_property_from_descriptor(&mut obj, "x", &desc_val).unwrap();
+
+        let result = object_get_own_property_descriptor_as_object(&obj, "x");
+        assert!(result.is_some());
+        let desc = FullPropertyDescriptor::from_object(&result.unwrap()).unwrap();
+        assert!(desc.is_accessor());
+        if let FullPropertyDescriptor::Accessor {
+            get,
+            set,
+            enumerable,
+            configurable,
+        } = desc
+        {
+            assert_eq!(get, JsValue::Boolean(true));
+            assert_eq!(set, JsValue::Boolean(false));
+            assert!(enumerable);
+            assert!(configurable);
+        }
+    }
+
+    #[test]
+    fn test_define_property_accessor_to_data_transition() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+        // Define as accessor first.
+        let mut acc_map = PropertyMap::new();
+        acc_map.insert("get".to_string(), JsValue::Boolean(true));
+        acc_map.insert("configurable".to_string(), JsValue::Boolean(true));
+        let acc_desc = JsValue::PlainObject(Rc::new(RefCell::new(acc_map)));
+        object_define_property_from_descriptor(&mut obj, "x", &acc_desc).unwrap();
+        assert!(obj.has_own_property("__get_x__"));
+
+        // Redefine as data.
+        let mut data_map = PropertyMap::new();
+        data_map.insert("value".to_string(), JsValue::Smi(42));
+        data_map.insert("writable".to_string(), JsValue::Boolean(true));
+        let data_desc = JsValue::PlainObject(Rc::new(RefCell::new(data_map)));
+        object_define_property_from_descriptor(&mut obj, "x", &data_desc).unwrap();
+
+        // Accessor entries must be removed.
+        assert!(!obj.has_own_property("__get_x__"));
+        assert!(!obj.has_own_property("__set_x__"));
+        assert_eq!(obj.get_own_property("x"), Some(JsValue::Smi(42)));
+    }
+
+    #[test]
+    fn test_define_property_data_to_accessor_transition() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(10)).unwrap();
+
+        // Redefine as accessor.
+        let mut acc_map = PropertyMap::new();
+        acc_map.insert("get".to_string(), JsValue::Boolean(true));
+        acc_map.insert("set".to_string(), JsValue::Boolean(false));
+        acc_map.insert("configurable".to_string(), JsValue::Boolean(true));
+        let acc_desc = JsValue::PlainObject(Rc::new(RefCell::new(acc_map)));
+        object_define_property_from_descriptor(&mut obj, "x", &acc_desc).unwrap();
+
+        assert!(obj.has_own_property("__get_x__"));
+        assert!(obj.has_own_property("__set_x__"));
+        // Descriptor should be accessor.
+        let result = object_get_own_property_descriptor_as_object(&obj, "x");
+        let desc = FullPropertyDescriptor::from_object(&result.unwrap()).unwrap();
+        assert!(desc.is_accessor());
+    }
+
+    #[test]
+    fn test_define_property_nonconfigurable_accessor_rejects_data_conversion() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+        // Non-configurable accessor.
+        let mut acc_map = PropertyMap::new();
+        acc_map.insert("get".to_string(), JsValue::Boolean(true));
+        acc_map.insert("configurable".to_string(), JsValue::Boolean(false));
+        let acc_desc = JsValue::PlainObject(Rc::new(RefCell::new(acc_map)));
+        object_define_property_from_descriptor(&mut obj, "x", &acc_desc).unwrap();
+
+        // Try to redefine as data → must fail.
+        let mut data_map = PropertyMap::new();
+        data_map.insert("value".to_string(), JsValue::Smi(1));
+        let data_desc = JsValue::PlainObject(Rc::new(RefCell::new(data_map)));
+        let err = object_define_property_from_descriptor(&mut obj, "x", &data_desc);
+        assert!(matches!(err, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn test_define_property_nonconfigurable_data_rejects_accessor_conversion() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+        // Non-configurable data.
+        obj.define_own_property("x", JsValue::Smi(1), PropertyAttributes::empty())
+            .unwrap();
+
+        // Try to redefine as accessor → must fail.
+        let mut acc_map = PropertyMap::new();
+        acc_map.insert("get".to_string(), JsValue::Boolean(true));
+        let acc_desc = JsValue::PlainObject(Rc::new(RefCell::new(acc_map)));
+        let err = object_define_property_from_descriptor(&mut obj, "x", &acc_desc);
+        assert!(matches!(err, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn test_define_property_nonconfigurable_accessor_rejects_getter_change() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+        // Non-configurable accessor.
+        let mut acc_map = PropertyMap::new();
+        acc_map.insert("get".to_string(), JsValue::Boolean(true));
+        acc_map.insert("set".to_string(), JsValue::Boolean(false));
+        acc_map.insert("configurable".to_string(), JsValue::Boolean(false));
+        let acc_desc = JsValue::PlainObject(Rc::new(RefCell::new(acc_map)));
+        object_define_property_from_descriptor(&mut obj, "x", &acc_desc).unwrap();
+
+        // Try to change getter → must fail.
+        let mut new_acc = PropertyMap::new();
+        new_acc.insert("get".to_string(), JsValue::Smi(999));
+        new_acc.insert("set".to_string(), JsValue::Boolean(false));
+        let new_desc = JsValue::PlainObject(Rc::new(RefCell::new(new_acc)));
+        let err = object_define_property_from_descriptor(&mut obj, "x", &new_desc);
+        assert!(matches!(err, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn test_accessor_hidden_from_own_property_names() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+        let mut desc_map = PropertyMap::new();
+        desc_map.insert("get".to_string(), JsValue::Boolean(true));
+        desc_map.insert("configurable".to_string(), JsValue::Boolean(true));
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+        object_define_property_from_descriptor(&mut obj, "x", &desc).unwrap();
+
+        let names = object_get_own_property_names(&obj);
+        assert!(names.contains(&"x".to_string()));
+        assert!(!names.contains(&"__get_x__".to_string()));
+        assert!(!names.contains(&"__set_x__".to_string()));
+    }
+
+    #[test]
+    fn test_accessor_attributes_no_writable() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+        let mut desc_map = PropertyMap::new();
+        desc_map.insert("get".to_string(), JsValue::Boolean(true));
+        desc_map.insert("enumerable".to_string(), JsValue::Boolean(true));
+        desc_map.insert("configurable".to_string(), JsValue::Boolean(true));
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+        object_define_property_from_descriptor(&mut obj, "x", &desc).unwrap();
+
+        let (_, attrs) = obj.get_own_property_descriptor("x").unwrap();
+        assert!(!attrs.contains(PropertyAttributes::WRITABLE));
+        assert!(attrs.contains(PropertyAttributes::ENUMERABLE));
+        assert!(attrs.contains(PropertyAttributes::CONFIGURABLE));
     }
 }
