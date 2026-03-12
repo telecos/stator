@@ -1246,6 +1246,37 @@ fn make_json() -> JsValue {
         PropertyAttributes::CONFIGURABLE,
     );
 
+    // §25.5.2.2 JSON.rawJSON(string)  — ES2025
+    // Returns a "raw JSON" object with a single `rawJSON` property.
+    props.insert(
+        "rawJSON".into(),
+        builtin_fn("rawJSON", 1, |args| {
+            let text = args.first().unwrap_or(&JsValue::Undefined);
+            let s = text.to_js_string()?;
+            let mut obj = PropertyMap::new();
+            obj.insert("rawJSON".into(), JsValue::String(s.into()));
+            obj.insert("__is_raw_json__".into(), JsValue::Boolean(true));
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+        }),
+    );
+
+    // §25.5.2.1 JSON.isRawJSON(value)  — ES2025
+    // Returns true if `value` is a raw JSON object created by `JSON.rawJSON`.
+    props.insert(
+        "isRawJSON".into(),
+        builtin_fn("isRawJSON", 1, |args| {
+            let val = args.first().unwrap_or(&JsValue::Undefined);
+            let is_raw = match val {
+                JsValue::PlainObject(map) => map
+                    .borrow()
+                    .get("__is_raw_json__")
+                    .is_some_and(|v| matches!(v, JsValue::Boolean(true))),
+                _ => false,
+            };
+            Ok(JsValue::Boolean(is_raw))
+        }),
+    );
+
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
@@ -3471,6 +3502,32 @@ fn make_object() -> JsValue {
             // When called via .call(value), args[0] is the value.
             if let Some(value) = args.first() {
                 return Ok(JsValue::String(value.obj_to_string_tag().into()));
+            }
+            Ok(JsValue::String("[object Object]".to_string().into()))
+        }),
+    );
+
+    // Object.prototype.valueOf()
+    // ECMAScript §20.1.3.7 — returns the `this` value.
+    obj_proto.insert(
+        "valueOf".into(),
+        native(|args| {
+            let this = args.first().cloned().unwrap_or(JsValue::Undefined);
+            Ok(this)
+        }),
+    );
+
+    // Object.prototype.toLocaleString()
+    // ECMAScript §20.1.3.5 — delegates to this.toString().
+    obj_proto.insert(
+        "toLocaleString".into(),
+        native(|args| {
+            let this = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if let JsValue::PlainObject(ref map) = this {
+                let to_str = map.borrow().get("toString").cloned();
+                if let Some(to_str) = to_str {
+                    return dispatch_call_value(&to_str, vec![this]);
+                }
             }
             Ok(JsValue::String("[object Object]".to_string().into()))
         }),
@@ -9970,6 +10027,13 @@ fn make_atomics() -> JsValue {
         }),
     );
 
+    // §25.4.12 Atomics.pause([iterationNumber])  — ES2025
+    // Performance hint for spin-wait loops; no-op in single-threaded engines.
+    props.insert(
+        "pause".into(),
+        builtin_fn("pause", 0, |_args| Ok(JsValue::Undefined)),
+    );
+
     // @@toStringTag
     props.insert("@@toStringTag".into(), JsValue::String("Atomics".into()));
 
@@ -10115,13 +10179,10 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     globals.insert("DisposableStack".into(), make_disposable_stack());
 
     // ── Simple constructor-like wrappers ─────────────────────────────────
-    globals.insert(
-        "Boolean".into(),
-        native(|args| {
-            let val = args.first().unwrap_or(&JsValue::Undefined);
-            Ok(JsValue::Boolean(val.to_boolean()))
-        }),
-    );
+    // NOTE: Boolean is already installed via make_boolean() above, which
+    // provides both __call__ (constructor) and prototype.  Do NOT
+    // overwrite it with a bare NativeFunction—that would lose
+    // Boolean.prototype.
     globals.insert("String".into(), make_string());
 
     // ── TypedArray / ArrayBuffer / DataView constructors ─────────────────
