@@ -7766,8 +7766,7 @@ fn make_regexp() -> JsValue {
             native(|args| {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 if let JsValue::PlainObject(map) = this
-                    && let Some(JsValue::NativeFunction(f)) =
-                        map.borrow().get("exec").cloned()
+                    && let Some(JsValue::NativeFunction(f)) = map.borrow().get("exec").cloned()
                 {
                     let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                     return f(vec![input]);
@@ -10312,8 +10311,7 @@ fn make_disposable_stack() -> JsValue {
                     let items: Vec<JsValue> = res.borrow_mut().drain(..).rev().collect();
                     for item in &items {
                         if let JsValue::PlainObject(obj) = item
-                            && let Some(JsValue::NativeFunction(f)) =
-                                obj.borrow().get("@@dispose").cloned()
+                            && let Some(JsValue::NativeFunction(f)) = obj.borrow().get("@@dispose").cloned()
                         {
                             let _ = f(vec![item.clone()]);
                         }
@@ -10337,8 +10335,7 @@ fn make_disposable_stack() -> JsValue {
                     let items: Vec<JsValue> = res2.borrow_mut().drain(..).rev().collect();
                     for item in &items {
                         if let JsValue::PlainObject(obj) = item
-                            && let Some(JsValue::NativeFunction(f)) =
-                                obj.borrow().get("@@dispose").cloned()
+                            && let Some(JsValue::NativeFunction(f)) = obj.borrow().get("@@dispose").cloned()
                         {
                             let _ = f(vec![item.clone()]);
                         }
