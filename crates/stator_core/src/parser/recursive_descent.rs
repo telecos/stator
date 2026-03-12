@@ -517,13 +517,14 @@ impl<'src> Parser<'src> {
             // `async function` in statement position.
             TokenKind::Async => {
                 let mut scanner_clone = self.scanner.clone();
-                if let Ok(next) = Self::next_significant(&mut scanner_clone) {
-                    if next.kind == TokenKind::Function && !next.had_line_terminator_before {
-                        return Err(Self::error_at(
-                            span,
-                            "async function declaration is not allowed in statement position",
-                        ));
-                    }
+                if let Ok(next) = Self::next_significant(&mut scanner_clone)
+                    && next.kind == TokenKind::Function
+                    && !next.had_line_terminator_before
+                {
+                    return Err(Self::error_at(
+                        span,
+                        "async function declaration is not allowed in statement position",
+                    ));
                 }
                 Ok(())
             }
@@ -551,13 +552,13 @@ impl<'src> Parser<'src> {
                 }
                 // Check for `function*` (generator) — always forbidden.
                 let mut scanner_clone = self.scanner.clone();
-                if let Ok(next) = Self::next_significant(&mut scanner_clone) {
-                    if next.kind == TokenKind::Star {
-                        return Err(Self::error_at(
-                            span,
-                            "generator function declaration is not allowed in statement position",
-                        ));
-                    }
+                if let Ok(next) = Self::next_significant(&mut scanner_clone)
+                    && next.kind == TokenKind::Star
+                {
+                    return Err(Self::error_at(
+                        span,
+                        "generator function declaration is not allowed in statement position",
+                    ));
                 }
                 // Sloppy-mode non-generator: Annex B allows in `if` bodies.
                 if !annex_b_function {
@@ -4120,7 +4121,7 @@ impl<'src> Parser<'src> {
             Expr::Sequence(seq) => seq
                 .expressions
                 .last()
-                .is_some_and(|e| Self::contains_private_member_delete(e)),
+                .is_some_and(Self::contains_private_member_delete),
             Expr::Conditional(c) => {
                 Self::contains_private_member_delete(&c.consequent)
                     || Self::contains_private_member_delete(&c.alternate)

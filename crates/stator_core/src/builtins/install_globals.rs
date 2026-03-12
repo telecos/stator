@@ -7782,13 +7782,12 @@ fn make_regexp() -> JsValue {
             "test".into(),
             native(|args| {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
-                if let JsValue::PlainObject(map) = this {
-                    if let Some(JsValue::NativeFunction(f)) =
+                if let JsValue::PlainObject(map) = this
+                    && let Some(JsValue::NativeFunction(f)) =
                         map.borrow().get("test").cloned()
-                    {
-                        let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                        return f(vec![input]);
-                    }
+                {
+                    let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    return f(vec![input]);
                 }
                 Ok(JsValue::Boolean(false))
             }),
