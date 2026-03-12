@@ -575,6 +575,31 @@ fn make_error_constructor_object(kind: ErrorKind) -> JsValue {
             }
         }),
     );
+    // ── Subtype prototype ───────────────────────────────────────────────
+    {
+        let mut proto = PropertyMap::new();
+        proto.insert(
+            "name".into(),
+            JsValue::String(kind.as_name().to_string().into()),
+        );
+        proto.insert("message".into(), JsValue::String(String::new().into()));
+        proto.insert(
+            "toString".into(),
+            native(move |args| {
+                let this = args.first().unwrap_or(&JsValue::Undefined);
+                if let JsValue::Error(e) = this {
+                    Ok(JsValue::String(e.to_error_string().into()))
+                } else {
+                    Ok(JsValue::String(kind.as_name().to_string().into()))
+                }
+            }),
+        );
+        proto.make_all_non_enumerable();
+        props.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        );
+    }
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
@@ -692,6 +717,47 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
             Ok(JsValue::Boolean(matches!(val, JsValue::Error(_))))
         }),
     );
+
+    // ── Error.prototype ─────────────────────────────────────────────────
+    {
+        let mut proto = PropertyMap::new();
+        proto.insert("name".into(), JsValue::String("Error".into()));
+        proto.insert("message".into(), JsValue::String(String::new().into()));
+        proto.insert(
+            "toString".into(),
+            native(|args| {
+                let this = args.first().unwrap_or(&JsValue::Undefined);
+                match this {
+                    JsValue::Error(e) => Ok(JsValue::String(e.to_error_string().into())),
+                    JsValue::PlainObject(map) => {
+                        let borrow = map.borrow();
+                        let name = match borrow.get("name") {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(JsValue::Undefined) | None => "Error".to_string(),
+                            Some(v) => v.to_js_string().unwrap_or_else(|_| "Error".to_string()),
+                        };
+                        let message = match borrow.get("message") {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(JsValue::Undefined) | None => String::new(),
+                            Some(v) => v.to_js_string().unwrap_or_default(),
+                        };
+                        if message.is_empty() {
+                            Ok(JsValue::String(name.into()))
+                        } else {
+                            Ok(JsValue::String(format!("{name}: {message}").into()))
+                        }
+                    }
+                    _ => Ok(JsValue::String("Error".to_string().into())),
+                }
+            }),
+        );
+        proto.insert("@@toStringTag".into(), JsValue::String("Error".into()));
+        proto.make_all_non_enumerable();
+        error_props.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        );
+    }
 
     error_props.make_all_non_enumerable();
     globals.insert(
@@ -1317,6 +1383,27 @@ fn apply_js_reviver(
 
 // ── Date constructor ─────────────────────────────────────────────────────────
 
+/// Create a Date prototype method that delegates to the instance's own method.
+///
+/// When `Date.prototype.<method>.call(dateInstance, ...)` is invoked, the
+/// generated closure locates the same-named `NativeFunction` on the Date
+/// instance and forwards the remaining arguments.
+fn date_proto_delegate(name: &str) -> JsValue {
+    let name = name.to_string();
+    native(move |args| {
+        let this = args.first().unwrap_or(&JsValue::Undefined);
+        if let JsValue::PlainObject(map) = this {
+            if let Some(JsValue::NativeFunction(f)) = map.borrow().get(&name).cloned() {
+                let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
+                return f(rest);
+            }
+        }
+        Err(StatorError::TypeError(
+            "this is not a Date object".to_string(),
+        ))
+    })
+}
+
 /// Build the `Date` constructor/namespace object.
 ///
 /// The returned `PlainObject` has:
@@ -1427,6 +1514,66 @@ fn make_date() -> JsValue {
             )))
         }),
     );
+
+    // ── Date.prototype ──────────────────────────────────────────────────
+    {
+        let mut proto = PropertyMap::new();
+        let date_methods: &[&str] = &[
+            "getTime",
+            "valueOf",
+            "getFullYear",
+            "getMonth",
+            "getDate",
+            "getDay",
+            "getHours",
+            "getMinutes",
+            "getSeconds",
+            "getMilliseconds",
+            "getTimezoneOffset",
+            "getUTCFullYear",
+            "getUTCMonth",
+            "getUTCDate",
+            "getUTCDay",
+            "getUTCHours",
+            "getUTCMinutes",
+            "getUTCSeconds",
+            "getUTCMilliseconds",
+            "setTime",
+            "setMilliseconds",
+            "setSeconds",
+            "setMinutes",
+            "setHours",
+            "setDate",
+            "setMonth",
+            "setFullYear",
+            "setUTCMilliseconds",
+            "setUTCSeconds",
+            "setUTCMinutes",
+            "setUTCHours",
+            "setUTCDate",
+            "setUTCMonth",
+            "setUTCFullYear",
+            "toString",
+            "toDateString",
+            "toTimeString",
+            "toISOString",
+            "toUTCString",
+            "toGMTString",
+            "toJSON",
+            "toLocaleDateString",
+            "toLocaleString",
+            "toLocaleTimeString",
+        ];
+        for method in date_methods {
+            proto.insert((*method).into(), date_proto_delegate(method));
+        }
+        proto.insert("@@toStringTag".into(), JsValue::String("Date".into()));
+        proto.make_all_non_enumerable();
+        props.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        );
+    }
 
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
@@ -7608,6 +7755,90 @@ fn make_regexp() -> JsValue {
             Ok(JsValue::String(result.into()))
         }),
     );
+
+    // ── RegExp.prototype ────────────────────────────────────────────────
+    {
+        let mut proto = PropertyMap::new();
+
+        // RegExp.prototype.exec(string) — delegates to instance exec.
+        proto.insert(
+            "exec".into(),
+            native(|args| {
+                let this = args.first().unwrap_or(&JsValue::Undefined);
+                if let JsValue::PlainObject(map) = this {
+                    if let Some(JsValue::NativeFunction(f)) =
+                        map.borrow().get("exec").cloned()
+                    {
+                        let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        return f(vec![input]);
+                    }
+                }
+                Ok(JsValue::Null)
+            }),
+        );
+
+        // RegExp.prototype.test(string) — delegates to instance test.
+        proto.insert(
+            "test".into(),
+            native(|args| {
+                let this = args.first().unwrap_or(&JsValue::Undefined);
+                if let JsValue::PlainObject(map) = this {
+                    if let Some(JsValue::NativeFunction(f)) =
+                        map.borrow().get("test").cloned()
+                    {
+                        let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        return f(vec![input]);
+                    }
+                }
+                Ok(JsValue::Boolean(false))
+            }),
+        );
+
+        // RegExp.prototype.toString() — returns "/source/flags".
+        proto.insert(
+            "toString".into(),
+            native(|args| {
+                let this = args.first().unwrap_or(&JsValue::Undefined);
+                if let JsValue::PlainObject(map) = this {
+                    let borrow = map.borrow();
+                    let source = match borrow.get("source") {
+                        Some(JsValue::String(s)) => s.to_string(),
+                        _ => "(?:)".to_string(),
+                    };
+                    let flags = match borrow.get("flags") {
+                        Some(JsValue::String(s)) => s.to_string(),
+                        _ => String::new(),
+                    };
+                    Ok(JsValue::String(format!("/{source}/{flags}").into()))
+                } else {
+                    Ok(JsValue::String("/(?:)/".to_string().into()))
+                }
+            }),
+        );
+
+        // Static property defaults for the prototype object itself.
+        proto.insert(
+            "source".into(),
+            JsValue::String("(?:)".to_string().into()),
+        );
+        proto.insert("flags".into(), JsValue::String(String::new().into()));
+        proto.insert("global".into(), JsValue::Boolean(false));
+        proto.insert("ignoreCase".into(), JsValue::Boolean(false));
+        proto.insert("multiline".into(), JsValue::Boolean(false));
+        proto.insert("dotAll".into(), JsValue::Boolean(false));
+        proto.insert("sticky".into(), JsValue::Boolean(false));
+        proto.insert("unicode".into(), JsValue::Boolean(false));
+        proto.insert("unicodeSets".into(), JsValue::Boolean(false));
+        proto.insert("hasIndices".into(), JsValue::Boolean(false));
+        proto.insert("lastIndex".into(), JsValue::Smi(0));
+
+        proto.insert("@@toStringTag".into(), JsValue::String("RegExp".into()));
+        proto.make_all_non_enumerable();
+        props.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        );
+    }
 
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
