@@ -3056,6 +3056,7 @@ fn handle_test_type_of(
         5 => matches!(ctx.frame.accumulator, JsValue::Undefined),
         6 => match &ctx.frame.accumulator {
             JsValue::Function(_) | JsValue::NativeFunction(_) => true,
+            JsValue::PlainObject(map) => map.borrow().get("__call__").is_some(),
             JsValue::Proxy(p) => p.borrow().is_callable(),
             _ => false,
         },
@@ -3063,11 +3064,15 @@ fn handle_test_type_of(
             JsValue::Null
             | JsValue::Object(_)
             | JsValue::Array(_)
-            | JsValue::PlainObject(_)
             | JsValue::Error(_)
             | JsValue::Generator(_)
             | JsValue::Iterator(_)
-            | JsValue::Promise(_) => true,
+            | JsValue::Promise(_)
+            | JsValue::ArrayBuffer(_)
+            | JsValue::TypedArray(_)
+            | JsValue::DataView(_)
+            | JsValue::Context(_) => true,
+            JsValue::PlainObject(map) => map.borrow().get("__call__").is_none(),
             JsValue::Proxy(p) => !p.borrow().is_callable(),
             _ => false,
         },
@@ -3801,13 +3806,25 @@ fn handle_test_in(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
                 !matches!(proto_lookup(&object, &prop), JsValue::Undefined)
             }
         }
+        JsValue::TypedArray(ta) => {
+            // TypedArray: numeric indices check bounds, "length" is always present.
+            if let JsValue::String(s) = key
+                && &**s == "length"
+            {
+                true
+            } else if let Some(idx) = to_array_index(key) {
+                idx < ta.borrow().length
+            } else {
+                let prop = to_property_key(key)?;
+                !matches!(proto_lookup(&object, &prop), JsValue::Undefined)
+            }
+        }
         JsValue::Function(_)
         | JsValue::Error(_)
         | JsValue::Promise(_)
         | JsValue::Generator(_)
         | JsValue::Iterator(_)
         | JsValue::NativeFunction(_)
-        | JsValue::TypedArray(_)
         | JsValue::ArrayBuffer(_)
         | JsValue::DataView(_)
         | JsValue::Object(_) => {
@@ -3978,15 +3995,35 @@ fn handle_delete_property_sloppy(
         proxy_delete_property(&mut p.borrow_mut(), &key).unwrap_or(false)
     } else if let JsValue::PlainObject(ref map) = obj {
         let pm = map.borrow();
-        if pm.contains_key(&key) && !pm.is_configurable(&key) {
-            // Non-configurable: silently fail in sloppy mode.
-            false
+        if pm.contains_key(&key) {
+            if !pm.is_configurable(&key) {
+                // Non-configurable: silently fail in sloppy mode.
+                false
+            } else {
+                drop(pm);
+                map.borrow_mut().remove(&key);
+                true
+            }
         } else {
-            drop(pm);
-            map.borrow_mut().remove(&key).is_some()
+            // Non-existent property: return true per spec.
+            true
+        }
+    } else if let JsValue::Array(ref items) = obj {
+        if key == "length" {
+            // "length" is non-configurable on arrays.
+            false
+        } else if let Ok(idx) = key.parse::<usize>() {
+            let mut arr = items.borrow_mut();
+            if idx < arr.len() {
+                arr[idx] = JsValue::Undefined;
+            }
+            true
+        } else {
+            true
         }
     } else {
-        false
+        // Primitives and other object types: delete returns true.
+        true
     };
     ctx.frame.accumulator = JsValue::Boolean(removed);
     Ok(DispatchAction::Continue)
@@ -4012,6 +4049,18 @@ fn handle_delete_property_strict(
         }
         drop(pm);
         map.borrow_mut().remove(&key);
+    } else if let JsValue::Array(ref items) = obj {
+        if key == "length" {
+            return Err(StatorError::TypeError(
+                "Cannot delete property 'length' of array".to_string(),
+            ));
+        }
+        if let Ok(idx) = key.parse::<usize>() {
+            let mut arr = items.borrow_mut();
+            if idx < arr.len() {
+                arr[idx] = JsValue::Undefined;
+            }
+        }
     }
     ctx.frame.accumulator = JsValue::Boolean(true);
     Ok(DispatchAction::Continue)
