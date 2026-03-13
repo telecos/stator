@@ -4839,7 +4839,7 @@ mod tests {
 
     // ── Arrow function tests ─────────────────────────────────────────────
 
-    use crate::parser::ast::{ArrowBody, ArrowExpr};
+    use crate::parser::ast::ArrowBody;
 
     /// Helper: parse an expression statement and return the inner `Expr`.
     fn parse_expr_stmt(src: &str) -> Expr {
@@ -6087,9 +6087,7 @@ mod tests {
     // ── Import declaration tests ─────────────────────────────────────────
 
     use crate::parser::ast::{
-        ExportDefaultDecl, ExportDefaultExpr, ExportNamedDecl, ExportSpecifier, ImportDecl,
-        ImportDefaultSpecifier, ImportNamedSpecifier, ImportNamespaceSpecifier, ImportSpecifier,
-        ModuleDecl, ModuleExportName, SourceType,
+        ExportDefaultExpr, ImportSpecifier, ModuleDecl, ModuleExportName, SourceType,
     };
 
     #[test]

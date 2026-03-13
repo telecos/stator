@@ -15724,9 +15724,9 @@ mod tests {
 
     // ── Object.hasOwn tests ─────────────────────────────────────────────
 
-    /// `Object.hasOwn` returns true for own properties.
+    /// `Object.hasOwn` returns true for own properties (with value check).
     #[test]
-    fn e2e_object_has_own_true() {
+    fn e2e_object_has_own_present() {
         let result = global_eval("Object.hasOwn({a: 1}, 'a')").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
