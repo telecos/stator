@@ -13561,7 +13561,7 @@ mod tests {
             "[2,4,6].every(function(e) { return e % 2 === 0; })",
         )
         .unwrap();
-        assert_eq!(result, JsValue::Bool(true));
+        assert_eq!(result, JsValue::Boolean(true));
     }
 
     #[test]
@@ -13570,7 +13570,7 @@ mod tests {
         let result =
             crate::builtins::global::global_eval("[1,2,3].some(function(e) { return e > 2; })")
                 .unwrap();
-        assert_eq!(result, JsValue::Bool(true));
+        assert_eq!(result, JsValue::Boolean(true));
     }
 
     // ── Array.prototype.fill ──────────────────────────────────────────────────
