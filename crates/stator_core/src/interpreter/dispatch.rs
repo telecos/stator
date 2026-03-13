@@ -5908,4 +5908,43 @@ mod tests {
             JsValue::String("Function is not a constructor".into())
         );
     }
+
+    #[test]
+    fn e2e_typeof_callable_object() {
+        // typeof should return "function" for callable PlainObjects (those with __call__)
+        let result = crate::builtins::global::global_eval("typeof Date").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn e2e_for_of_string() {
+        let result = crate::builtins::global::global_eval(
+            "var r = ''; for (var c of 'abc') r += c + ','; r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,b,c,".into()));
+    }
+
+    #[test]
+    fn e2e_destructure_default() {
+        let result =
+            crate::builtins::global::global_eval("var {x = 10, y = 20} = {x: 5}; x + y").unwrap();
+        assert_eq!(result, JsValue::Smi(25));
+    }
+
+    #[test]
+    fn e2e_spread_call() {
+        let result = crate::builtins::global::global_eval(
+            "function sum(a,b,c) { return a+b+c; } sum(...[1,2,3])",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_template_literal_expr() {
+        let result =
+            crate::builtins::global::global_eval("var x = 10; `value is ${x + 5}`").unwrap();
+        assert_eq!(result, JsValue::String("value is 15".into()));
+    }
 }

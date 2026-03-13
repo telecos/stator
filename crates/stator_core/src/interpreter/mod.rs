@@ -2278,6 +2278,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             "constructor" => {
+                // Walk __proto__ chain to find constructor (set by finalize_ctor).
+                if let Some(proto) = borrow.get("__proto__").cloned() {
+                    drop(borrow);
+                    return proto_lookup(&proto, "constructor");
+                }
                 drop(borrow);
                 return JsValue::Undefined;
             }

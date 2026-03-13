@@ -15407,4 +15407,116 @@ mod tests {
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
+
+    // ── Object.assign e2e tests ─────────────────────────────────────────
+
+    /// `Object.assign` copies properties from source to target.
+    #[test]
+    fn e2e_object_assign() {
+        let result = global_eval("var a = {x:1}; Object.assign(a, {y:2}); a.y").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `Object.assign` merges multiple sources.
+    #[test]
+    fn e2e_object_assign_multiple_sources() {
+        let result = global_eval("var a = {}; Object.assign(a, {x:1}, {y:2}); a.x + a.y").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Object.assign` returns the target object.
+    #[test]
+    fn e2e_object_assign_returns_target() {
+        let result = global_eval("var a = {x:1}; Object.assign(a, {y:2}) === a").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Array.prototype.flat e2e tests ──────────────────────────────────
+
+    /// `Array.prototype.flat` flattens one level by default.
+    #[test]
+    fn e2e_array_flat_default() {
+        let result = global_eval("[1,[2,[3]]].flat().length").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Array.prototype.flat` with depth 2.
+    #[test]
+    fn e2e_array_flat_depth_2() {
+        let result = global_eval("[1,[2,[3]]].flat(2).length").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── Array.prototype.flatMap e2e tests ───────────────────────────────
+
+    /// `Array.prototype.flatMap` maps then flattens one level.
+    #[test]
+    fn e2e_array_flatmap() {
+        let result = global_eval("[1,2,3].flatMap(function(x){ return [x, x*2] }).length").unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    // ── Array.prototype.at e2e tests ────────────────────────────────────
+
+    /// `Array.prototype.at` with positive index.
+    #[test]
+    fn e2e_array_at_positive() {
+        let result = global_eval("[10,20,30].at(0)").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// `Array.prototype.at` with negative index.
+    #[test]
+    fn e2e_array_at_negative() {
+        let result = global_eval("[10,20,30].at(-1)").unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    /// `Array.prototype.at` out of range returns undefined.
+    #[test]
+    fn e2e_array_at_out_of_range() {
+        let result = global_eval("[10,20,30].at(5)").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    // ── String.prototype.at e2e tests ───────────────────────────────────
+
+    /// `String.prototype.at` with positive index.
+    #[test]
+    fn e2e_string_at_positive() {
+        let result = global_eval("'hello'.at(0)").unwrap();
+        assert_eq!(result, JsValue::String("h".into()));
+    }
+
+    /// `String.prototype.at` with negative index.
+    #[test]
+    fn e2e_string_at_negative() {
+        let result = global_eval("'hello'.at(-1)").unwrap();
+        assert_eq!(result, JsValue::String("o".into()));
+    }
+
+    /// `String.prototype.at` out of range returns undefined.
+    #[test]
+    fn e2e_string_at_out_of_range() {
+        let result = global_eval("'hello'.at(10)").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    // ── String.raw e2e tests ────────────────────────────────────────────
+
+    /// `String.raw` returns raw string content.
+    #[test]
+    fn e2e_string_raw_basic() {
+        let result = global_eval("String.raw({ raw: ['a', 'b', 'c'] }, 1, 2)").unwrap();
+        assert_eq!(result, JsValue::String("a1b2c".into()));
+    }
+
+    // ── Object.fromEntries e2e tests (additional) ───────────────────────
+
+    /// `Object.fromEntries` with empty array returns empty object.
+    #[test]
+    fn e2e_object_from_entries_empty() {
+        let result = global_eval("Object.keys(Object.fromEntries([])).length").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
 }
