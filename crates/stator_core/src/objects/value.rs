@@ -3289,4 +3289,145 @@ mod tests {
             panic!("Expected string from error ToPrimitive");
         }
     }
+
+    // ── Symbol / BigInt TypeError conformance (ES §7.1) ─────────────────────
+
+    #[test]
+    fn test_symbol_to_number_throws() {
+        let sym = JsValue::Symbol(42);
+        assert!(sym.to_number().is_err());
+        match sym.to_number() {
+            Err(StatorError::TypeError(msg)) => {
+                assert_eq!(msg, "Cannot convert a Symbol value to a number");
+            }
+            other => panic!("Expected TypeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_symbol_to_js_string_throws() {
+        let sym = JsValue::Symbol(7);
+        assert!(sym.to_js_string().is_err());
+        match sym.to_js_string() {
+            Err(StatorError::TypeError(msg)) => {
+                assert_eq!(msg, "Cannot convert a Symbol value to a string");
+            }
+            other => panic!("Expected TypeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_symbol_to_display_string_does_not_throw() {
+        // Explicit String(sym) path — should succeed, not throw.
+        let sym = JsValue::Symbol(99);
+        let s = sym.to_display_string();
+        assert_eq!(s, "Symbol(99)");
+    }
+
+    #[test]
+    fn test_symbol_to_int32_propagates_type_error() {
+        // to_int32 delegates to to_number, which must throw for Symbol.
+        assert!(matches!(
+            JsValue::Symbol(1).to_int32(),
+            Err(StatorError::TypeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_symbol_to_uint32_propagates_type_error() {
+        assert!(matches!(
+            JsValue::Symbol(1).to_uint32(),
+            Err(StatorError::TypeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_symbol_to_integer_or_infinity_propagates_type_error() {
+        assert!(matches!(
+            JsValue::Symbol(1).to_integer_or_infinity(),
+            Err(StatorError::TypeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_symbol_to_length_propagates_type_error() {
+        assert!(matches!(
+            JsValue::Symbol(1).to_length(),
+            Err(StatorError::TypeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_bigint_to_number_throws() {
+        let big = JsValue::BigInt(123);
+        assert!(big.to_number().is_err());
+        match big.to_number() {
+            Err(StatorError::TypeError(msg)) => {
+                assert_eq!(msg, "Cannot convert a BigInt value to a number");
+            }
+            other => panic!("Expected TypeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_bigint_to_int32_propagates_type_error() {
+        assert!(matches!(
+            JsValue::BigInt(1).to_int32(),
+            Err(StatorError::TypeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_bigint_to_uint32_propagates_type_error() {
+        assert!(matches!(
+            JsValue::BigInt(1).to_uint32(),
+            Err(StatorError::TypeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_symbol_to_numeric_throws_type_error() {
+        // to_numeric → to_primitive (no-op for Symbol) → to_number → TypeError.
+        match JsValue::Symbol(5).to_numeric() {
+            Err(StatorError::TypeError(msg)) => {
+                assert_eq!(msg, "Cannot convert a Symbol value to a number");
+            }
+            other => panic!("Expected TypeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_symbol_to_boolean_is_true() {
+        // Symbols are truthy (ES §7.1.2).
+        assert!(JsValue::Symbol(0).to_boolean());
+    }
+
+    #[test]
+    fn test_symbol_is_primitive() {
+        assert!(JsValue::Symbol(1).is_primitive());
+    }
+
+    #[test]
+    fn test_symbol_to_property_key_succeeds() {
+        // ToPropertyKey on Symbol should not throw.
+        let key = JsValue::Symbol(42).to_property_key().unwrap();
+        assert_eq!(key, "Symbol(42)");
+    }
+
+    #[test]
+    fn test_bigint_to_js_string_succeeds() {
+        // BigInt → ToString should produce the decimal representation.
+        assert_eq!(JsValue::BigInt(42).to_js_string().unwrap(), "42");
+        assert_eq!(JsValue::BigInt(-1).to_js_string().unwrap(), "-1");
+        assert_eq!(JsValue::BigInt(0).to_js_string().unwrap(), "0");
+    }
+
+    #[test]
+    fn test_bigint_to_numeric_passthrough() {
+        // to_numeric on BigInt returns itself, not HeapNumber.
+        assert_eq!(
+            JsValue::BigInt(99).to_numeric().unwrap(),
+            JsValue::BigInt(99)
+        );
+    }
 }
