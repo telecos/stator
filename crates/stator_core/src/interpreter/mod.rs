@@ -5036,6 +5036,18 @@ pub(super) fn wire_construct_prototype(result: JsValue, ctor_proto: &JsValue) ->
 }
 
 pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> {
+    // TypeError for keyed property access on null or undefined (ES §13.10.3).
+    if matches!(obj, JsValue::Null | JsValue::Undefined) {
+        let key_str = to_property_key(key).unwrap_or_default();
+        return Err(StatorError::TypeError(format!(
+            "Cannot read properties of {} (reading '{key_str}')",
+            if matches!(obj, JsValue::Null) {
+                "null"
+            } else {
+                "undefined"
+            }
+        )));
+    }
     match obj {
         JsValue::Proxy(_) => {
             let prop_name = to_property_key(key)?;
@@ -13197,5 +13209,37 @@ mod tests {
     fn test_plain_object_constructor_identity() {
         let result = crate::builtins::global::global_eval("({}).constructor === Object").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── TypeError on null / undefined property access ────────────────────
+
+    #[test]
+    fn test_null_property_access_throws() {
+        let result = compile_source_and_run("var x = null; x.foo");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_undefined_property_access_throws() {
+        let result = compile_source_and_run("var x = undefined; x.foo");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_null_method_call_throws() {
+        let result = compile_source_and_run("null.toString()");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_null_keyed_property_access_throws() {
+        let result = compile_source_and_run("var x = null; x['foo']");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_undefined_keyed_property_access_throws() {
+        let result = compile_source_and_run("var x = undefined; x['foo']");
+        assert!(result.is_err());
     }
 }
