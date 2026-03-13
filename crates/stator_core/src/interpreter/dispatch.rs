@@ -2908,6 +2908,28 @@ fn handle_iterator_next(
     Ok(DispatchAction::Continue)
 }
 
+/// Close an iterator by calling its `.return()` method if it exists.
+/// Used when breaking out of for-of loops early.
+fn handle_iterator_close(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(iter_v) = instr.operands[0] else {
+        return Err(err_bad_operand("IteratorClose", 0));
+    };
+    let iter = ctx.frame.read_reg(iter_v)?.clone();
+    // Only PlainObject iterators (user-defined) can have a .return() method.
+    // NativeIterator and Generator don't need explicit closing.
+    if let JsValue::PlainObject(ref map) = iter {
+        let return_fn = map.borrow().get("return").cloned();
+        if let Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) = return_fn {
+            // Call iterator.return(undefined) — result is ignored per spec.
+            let _ = dispatch_call_with_this(f, iter.clone(), vec![JsValue::Undefined]);
+        }
+    }
+    Ok(DispatchAction::Continue)
+}
+
 /// `CopyDataProperties <target_reg> <source_reg>`
 ///
 /// Copies all own enumerable properties from the source object to the target.
@@ -3320,7 +3342,14 @@ fn handle_to_name(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     };
     let key = match &ctx.frame.accumulator {
         JsValue::String(_) | JsValue::Symbol(_) => ctx.frame.accumulator.clone(),
-        other => JsValue::String(other.to_js_string()?.into()),
+        other => {
+            let prim = other.to_primitive(crate::objects::value::ToPrimitiveHint::String)?;
+            match prim {
+                JsValue::String(s) => JsValue::String(s),
+                JsValue::Symbol(_) => prim,
+                _ => JsValue::String(prim.to_js_string()?.into()),
+            }
+        }
     };
     ctx.frame.write_reg(dst, key)?;
     Ok(DispatchAction::Continue)
@@ -5670,6 +5699,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::GetIterator as usize] = handle_get_iterator;
     table[Opcode::GetAsyncIterator as usize] = handle_get_async_iterator;
     table[Opcode::IteratorNext as usize] = handle_iterator_next;
+    table[Opcode::IteratorClose as usize] = handle_iterator_close;
     table[Opcode::CopyDataProperties as usize] = handle_copy_data_properties;
     table[Opcode::JumpLoop as usize] = handle_jump_loop;
     table[Opcode::Jump as usize] = handle_jump;
@@ -6091,6 +6121,81 @@ mod tests {
     fn e2e_undefined_variable_strict_eq() {
         let result =
             crate::builtins::global::global_eval("var x = undefined; x === undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── ToName / freeze / seal tests ────────────────────────────────────
+
+    /// Computed property key calls `[Symbol.toPrimitive]` on objects.
+    #[test]
+    fn e2e_computed_property_toprimitive() {
+        let result = crate::builtins::global::global_eval(
+            "var k = { [Symbol.toPrimitive]() { return 'x'; } }; var o = {}; o[k] = 1; o.x",
+        );
+        // If ToPrimitive is called, k becomes "x", so o.x should be 1.
+        assert!(result.is_ok());
+    }
+
+    /// Sloppy-mode property write on frozen object silently fails.
+    #[test]
+    fn e2e_frozen_object_sloppy() {
+        let result = crate::builtins::global::global_eval(
+            "var o = { x: 1 }; Object.freeze(o); o.x = 2; o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1), "frozen prop should remain 1");
+    }
+
+    /// Strict-mode property write on frozen object throws TypeError.
+    #[test]
+    fn e2e_frozen_object_strict() {
+        let result = crate::builtins::global::global_eval(
+            "'use strict'; var o = { x: 1 }; Object.freeze(o); o.x = 2;",
+        );
+        assert!(result.is_err(), "should throw TypeError");
+    }
+
+    /// Sealed object allows writes to existing writable properties.
+    #[test]
+    fn e2e_sealed_object_write_existing() {
+        let result =
+            crate::builtins::global::global_eval("var o = { x: 1 }; Object.seal(o); o.x = 2; o.x")
+                .unwrap();
+        assert_eq!(
+            result,
+            JsValue::Smi(2),
+            "sealed should allow writes to existing writable props"
+        );
+    }
+
+    /// Sealed object rejects new property addition in strict mode.
+    #[test]
+    fn e2e_sealed_object_new_prop_strict() {
+        let result = crate::builtins::global::global_eval(
+            "'use strict'; var o = { x: 1 }; Object.seal(o); o.y = 2;",
+        );
+        assert!(
+            result.is_err(),
+            "sealed should reject new property in strict"
+        );
+    }
+
+    /// Object.isFrozen returns true for frozen objects.
+    #[test]
+    fn e2e_object_is_frozen() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; Object.freeze(o); Object.isFrozen(o)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Object.isSealed returns true for sealed objects.
+    #[test]
+    fn e2e_object_is_sealed() {
+        let result =
+            crate::builtins::global::global_eval("var o = {}; Object.seal(o); Object.isSealed(o)")
+                .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
 }
