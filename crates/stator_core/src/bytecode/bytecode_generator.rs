@@ -8553,4 +8553,261 @@ mod tests {
         // Should compile without errors.
         let _arr = BytecodeGenerator::compile_program(&prog).unwrap();
     }
+
+    // ── Conformance integration tests ─────────────────────────────────────
+
+    /// Helper: parse and evaluate a JS snippet, returning the final value.
+    fn eval_to_value(source: &str) -> crate::objects::value::JsValue {
+        crate::builtins::global::global_eval(source).unwrap()
+    }
+
+    // ── 1. Comma / sequence operator ─────────────────────────────────────
+
+    #[test]
+    fn test_comma_operator() {
+        let result = eval_to_value("var x = (1, 2, 3); x");
+        assert_eq!(result, crate::objects::value::JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_comma_operator_side_effects() {
+        let result = eval_to_value("var a = 0; var x = (a = 10, a + 5); x");
+        assert_eq!(result, crate::objects::value::JsValue::Smi(15));
+    }
+
+    #[test]
+    fn test_comma_operator_bytecode() {
+        // (1, 2, 3) — should compile all three sub-expressions.
+        use crate::parser::ast::SequenceExpr;
+        let prog = make_program(vec![Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(Expr::Sequence(Box::new(SequenceExpr {
+                loc: span(),
+                expressions: vec![num_expr(1.0), num_expr(2.0), num_expr(3.0)],
+            }))),
+        })]);
+        // Should compile without error.
+        let _arr = BytecodeGenerator::compile_program(&prog).unwrap();
+    }
+
+    // ── 2. Conditional (ternary) operator ────────────────────────────────
+
+    #[test]
+    fn test_conditional_truthy() {
+        let result = eval_to_value("var x = true ? 42 : 99; x");
+        assert_eq!(result, crate::objects::value::JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_conditional_falsy() {
+        let result = eval_to_value("var x = false ? 42 : 99; x");
+        assert_eq!(result, crate::objects::value::JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_conditional_complex_expressions() {
+        let result = eval_to_value("var a = 5; var x = (a > 3) ? a * 2 : a + 1; x");
+        assert_eq!(result, crate::objects::value::JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_conditional_nested() {
+        let result = eval_to_value("var x = true ? (false ? 1 : 2) : 3; x");
+        assert_eq!(result, crate::objects::value::JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_conditional_bytecode() {
+        use crate::parser::ast::ConditionalExpr;
+        let prog = make_program(vec![Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(Expr::Conditional(Box::new(ConditionalExpr {
+                loc: span(),
+                test: Box::new(bool_expr(true)),
+                consequent: Box::new(num_expr(1.0)),
+                alternate: Box::new(num_expr(2.0)),
+            }))),
+        })]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::JumpIfToBooleanFalse),
+            "conditional must emit JumpIfToBooleanFalse, got {instrs:?}"
+        );
+    }
+
+    // ── 3. Logical assignment operators ──────────────────────────────────
+
+    #[test]
+    fn test_logical_and_assign() {
+        let result = eval_to_value("var a = 1; a &&= 42; a");
+        assert_eq!(result, crate::objects::value::JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_logical_and_assign_short_circuit() {
+        let result = eval_to_value("var a = 0; a &&= 42; a");
+        assert_eq!(result, crate::objects::value::JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_logical_or_assign() {
+        let result = eval_to_value("var a = 0; a ||= 42; a");
+        assert_eq!(result, crate::objects::value::JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_logical_or_assign_short_circuit() {
+        let result = eval_to_value("var a = 1; a ||= 42; a");
+        assert_eq!(result, crate::objects::value::JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_nullish_assign_null() {
+        let result = eval_to_value("var a = null; a ??= 42; a");
+        assert_eq!(result, crate::objects::value::JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_nullish_assign_undefined() {
+        let result = eval_to_value("var a = undefined; a ??= 42; a");
+        assert_eq!(result, crate::objects::value::JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_nullish_assign_non_nullish() {
+        let result = eval_to_value("var a = 0; a ??= 42; a");
+        assert_eq!(result, crate::objects::value::JsValue::Smi(0));
+    }
+
+    // ── 4. Tagged template literals ──────────────────────────────────────
+
+    #[test]
+    fn test_tagged_template_basic() {
+        // Define a tag function that returns the first substitution value.
+        let result = eval_to_value(
+            "function tag(strings, val) { return val; } var x = tag`hello ${42} world`; x",
+        );
+        assert_eq!(result, crate::objects::value::JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_tagged_template_strings_array() {
+        // The tag function should receive the strings array as first argument.
+        let result = eval_to_value(
+            "function tag(strings) { return strings.length; } var x = tag`a${1}b${2}c`; x",
+        );
+        assert_eq!(result, crate::objects::value::JsValue::Smi(3));
+    }
+
+    // ── 5. Destructuring default values ──────────────────────────────────
+
+    #[test]
+    fn test_object_destructuring_default_used() {
+        // b should be 2 because it's not in the source object (undefined).
+        let result = eval_to_value("var {a, b = 2} = {a: 10}; b");
+        assert_eq!(result, crate::objects::value::JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_object_destructuring_default_overridden() {
+        // a should be 10 from the source, not the default of 1.
+        let result = eval_to_value("var {a = 1, b = 2} = {a: 10}; a");
+        assert_eq!(result, crate::objects::value::JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_array_destructuring_default() {
+        let result = eval_to_value("var [a = 5, b = 10] = [1]; a + b");
+        assert_eq!(result, crate::objects::value::JsValue::Smi(11));
+    }
+
+    // ── 6. Computed property names in classes ────────────────────────────
+
+    #[test]
+    fn test_computed_class_method_bytecode() {
+        // `class C { [k]() {} }` should emit DefineKeyedOwnProperty.
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "k", Some(str_expr("myMethod"))),
+            class_decl_stmt(
+                "C",
+                None,
+                vec![ClassMember::Method(MethodDef {
+                    loc: span(),
+                    is_static: false,
+                    kind: MethodKind::Method,
+                    key: PropKey::Computed(Box::new(ident_expr("k"))),
+                    is_computed: true,
+                    value: empty_fn_expr(&[]),
+                })],
+            ),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::DefineKeyedOwnProperty),
+            "computed class method must emit DefineKeyedOwnProperty"
+        );
+    }
+
+    // ── 7. for-of with destructuring ─────────────────────────────────────
+
+    #[test]
+    fn test_for_of_array_destructuring() {
+        let result = eval_to_value(
+            "var sum = 0; for (var [a, b] of [[1, 2], [3, 4]]) { sum = sum + a + b; } sum",
+        );
+        assert_eq!(result, crate::objects::value::JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_for_of_object_destructuring() {
+        let result = eval_to_value(
+            "var sum = 0; for (var {x, y} of [{x:1,y:2},{x:3,y:4}]) { sum = sum + x + y; } sum",
+        );
+        assert_eq!(result, crate::objects::value::JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_for_of_destructuring_compiles() {
+        // for (let [a, b] of arr) {} — should compile with GetIterator.
+        use crate::parser::ast::{ArrayPat as TestArrayPat, ForInOfLeft, ForOfStmt};
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Var, "arr", Some(num_expr(0.0))),
+            Stmt::ForOf(ForOfStmt {
+                loc: span(),
+                is_await: false,
+                left: ForInOfLeft::VarDecl(VarDecl {
+                    loc: span(),
+                    kind: VarKind::Let,
+                    declarators: vec![VarDeclarator {
+                        loc: span(),
+                        id: Pat::Array(Box::new(TestArrayPat {
+                            loc: span(),
+                            elements: vec![
+                                Some(Pat::Ident(ident("a"))),
+                                Some(Pat::Ident(ident("b"))),
+                            ],
+                        })),
+                        init: None,
+                    }],
+                }),
+                right: Box::new(ident_expr("arr")),
+                body: Box::new(Stmt::Block(BlockStmt {
+                    loc: span(),
+                    body: vec![],
+                })),
+            }),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::GetIterator),
+            "for-of with destructuring must emit GetIterator"
+        );
+    }
 }
