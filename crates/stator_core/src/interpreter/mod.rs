@@ -2491,7 +2491,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Some(v) => v.to_number()?,
                         None => 0.0,
                     };
-                    if frac.is_nan() || frac < 0.0 || frac > 100.0 {
+                    if frac.is_nan() || !(0.0..=100.0).contains(&frac) {
                         return Err(StatorError::RangeError(
                             "toFixed() digits argument must be between 0 and 100".into(),
                         ));
@@ -2585,7 +2585,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Some(v) => v.to_number()?,
                         None => 0.0,
                     };
-                    if frac.is_nan() || frac < 0.0 || frac > 100.0 {
+                    if frac.is_nan() || !(0.0..=100.0).contains(&frac) {
                         return Err(StatorError::RangeError(
                             "toFixed() digits argument must be between 0 and 100".into(),
                         ));

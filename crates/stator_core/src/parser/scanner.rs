@@ -540,13 +540,6 @@ impl<'src> Scanner<'src> {
         it.next()
     }
 
-    fn peek3(&self) -> Option<char> {
-        let mut it = self.source[self.pos..].chars();
-        it.next();
-        it.next();
-        it.next()
-    }
-
     /// Advance past the current character and update line/column tracking.
     ///
     /// `\r\n` is treated as a single line terminator; the `\n` is consumed
