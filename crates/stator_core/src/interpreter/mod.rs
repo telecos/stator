@@ -13411,4 +13411,21 @@ mod tests {
                 .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
+
+    // ── Array join/toString null/undefined handling ─────────────────────────
+
+    #[test]
+    fn test_array_join_null_undefined() {
+        // null and undefined should produce empty strings in join/toString
+        let result =
+            crate::builtins::global::global_eval("var a = [1, null, undefined, 4]; a.join(',')")
+                .unwrap();
+        assert_eq!(result, JsValue::String("1,,,4".into()));
+    }
+
+    #[test]
+    fn test_array_tostring_null_elements() {
+        let result = crate::builtins::global::global_eval("[null, undefined].toString()").unwrap();
+        assert_eq!(result, JsValue::String(",".into()));
+    }
 }
