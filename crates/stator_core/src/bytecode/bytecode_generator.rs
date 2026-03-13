@@ -332,37 +332,66 @@ impl FunctionCompiler {
                         self.bind_label(done_lbl);
                     }
                     // Use param register directly — no temporary needed.
-                    self.compile_binding_pattern(&param.pat, param_reg)?;
+                    self.compile_binding_pattern(&param.pat, param_reg, BindingMode::Declare)?;
                 }
                 Pat::Rest(_) => {
                     // Rest parameters in the parameter list itself are
                     // handled by the runtime; nothing to emit here.
                 }
                 Pat::Assign(assign) => {
-                    self.compile_binding_pattern(&param.pat, param_reg)?;
+                    self.compile_binding_pattern(&param.pat, param_reg, BindingMode::Declare)?;
                     let _ = assign;
                 }
             }
         }
         Ok(())
     }
+}
 
+/// Whether a destructuring pattern creates new bindings or stores to
+/// existing variables.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindingMode {
+    /// Variable declarations and function parameters — calls `define_local`.
+    Declare,
+    /// Destructuring assignment expressions — calls `compile_ident_store`.
+    Assign,
+}
+
+impl FunctionCompiler {
     /// Compile a binding pattern, destructuring the value held in
     /// `source_reg` into new local variables.
     ///
     /// Handles object patterns (`{a, b: c}`), array patterns (`[x, y]`),
     /// rest elements, and default-value sub-patterns recursively.
     ///
+    /// When `mode` is [`BindingMode::Declare`] (variable declarations,
+    /// function parameters), each identifier creates a fresh local via
+    /// [`define_local`].  When `mode` is [`BindingMode::Assign`]
+    /// (destructuring assignment expressions like `[a, b] = arr`), each
+    /// identifier stores to an existing variable via [`compile_ident_store`].
+    ///
     /// Scratch registers are allocated via `new_local` (unnamed) rather than
     /// `allocate_temporary` because the recursive calls may define new named
     /// locals, which would break the LIFO invariant that temporaries require.
-    fn compile_binding_pattern(&mut self, pat: &Pat, source_reg: Register) -> StatorResult<()> {
+    fn compile_binding_pattern(
+        &mut self,
+        pat: &Pat,
+        source_reg: Register,
+        mode: BindingMode,
+    ) -> StatorResult<()> {
         match pat {
-            Pat::Ident(ident) => {
-                let local = self.define_local(&ident.name);
-                self.emit_ldar(source_reg);
-                self.emit_star(local);
-            }
+            Pat::Ident(ident) => match mode {
+                BindingMode::Declare => {
+                    let local = self.define_local(&ident.name);
+                    self.emit_ldar(source_reg);
+                    self.emit_star(local);
+                }
+                BindingMode::Assign => {
+                    self.emit_ldar(source_reg);
+                    self.compile_ident_store(&ident.name);
+                }
+            },
             Pat::Object(obj_pat) => {
                 for prop in &obj_pat.properties {
                     match prop {
@@ -427,7 +456,7 @@ impl FunctionCompiler {
                             }
                             let scratch = self.allocator.new_local();
                             self.emit_star(scratch);
-                            self.compile_binding_pattern(&kv.value, scratch)?;
+                            self.compile_binding_pattern(&kv.value, scratch, mode)?;
                         }
                         ObjectPatProp::Assign(assign_prop) => {
                             let name_idx = self.add_string(&assign_prop.key.name);
@@ -440,17 +469,32 @@ impl FunctionCompiler {
                                     slot,
                                 ],
                             ));
-                            let local = self.define_local(&assign_prop.key.name);
-                            if let Some(default_expr) = &assign_prop.value {
-                                let done_lbl = self.new_label();
-                                self.emit_star(local);
-                                self.emit_ldar(local);
-                                self.emit_jump(Opcode::JumpIfNotUndefined, done_lbl);
-                                self.compile_expr(default_expr)?;
-                                self.emit_star(local);
-                                self.bind_label(done_lbl);
-                            } else {
-                                self.emit_star(local);
+                            match mode {
+                                BindingMode::Declare => {
+                                    let local = self.define_local(&assign_prop.key.name);
+                                    if let Some(default_expr) = &assign_prop.value {
+                                        let done_lbl = self.new_label();
+                                        self.emit_star(local);
+                                        self.emit_ldar(local);
+                                        self.emit_jump(Opcode::JumpIfNotUndefined, done_lbl);
+                                        self.compile_expr(default_expr)?;
+                                        self.emit_star(local);
+                                        self.bind_label(done_lbl);
+                                    } else {
+                                        self.emit_star(local);
+                                    }
+                                }
+                                BindingMode::Assign => {
+                                    if let Some(default_expr) = &assign_prop.value {
+                                        let done_lbl = self.new_label();
+                                        self.emit_jump(Opcode::JumpIfNotUndefined, done_lbl);
+                                        self.compile_expr(default_expr)?;
+                                        self.bind_label(done_lbl);
+                                    }
+                                    // acc holds either the property value or the
+                                    // default — store to the existing variable.
+                                    self.compile_ident_store(&assign_prop.key.name);
+                                }
                             }
                         }
                         ObjectPatProp::Rest(rest) => {
@@ -467,7 +511,7 @@ impl FunctionCompiler {
                                 Opcode::CopyDataProperties,
                                 vec![to_reg_op(rest_reg), to_reg_op(source_reg)],
                             ));
-                            self.compile_binding_pattern(&rest.argument, rest_reg)?;
+                            self.compile_binding_pattern(&rest.argument, rest_reg, mode)?;
                         }
                     }
                 }
@@ -523,14 +567,14 @@ impl FunctionCompiler {
                         self.emit_jump_loop_to(loop_lbl);
                         self.bind_label(done_lbl);
 
-                        self.compile_binding_pattern(&rest.argument, rest_arr_reg)?;
+                        self.compile_binding_pattern(&rest.argument, rest_arr_reg, mode)?;
                     } else {
                         self.emit(Instruction::new_unchecked(
                             Opcode::IteratorNext,
                             vec![to_reg_op(iter_reg), to_reg_op(val_reg)],
                         ));
                         if let Some(elem_pat) = element {
-                            self.compile_binding_pattern(elem_pat, val_reg)?;
+                            self.compile_binding_pattern(elem_pat, val_reg, mode)?;
                         }
                     }
                 }
@@ -542,7 +586,7 @@ impl FunctionCompiler {
                 self.compile_expr(&assign_pat.right)?;
                 self.emit_star(source_reg);
                 self.bind_label(done_lbl);
-                self.compile_binding_pattern(&assign_pat.left, source_reg)?;
+                self.compile_binding_pattern(&assign_pat.left, source_reg, mode)?;
             }
             Pat::Rest(rest) => {
                 let arr_slot = self.alloc_slot(FeedbackSlotKind::Literal);
@@ -554,7 +598,7 @@ impl FunctionCompiler {
                 self.emit_star(arr_reg);
                 // Just bind the source (the remaining value) for now.
                 // Full rest-collect would require knowing the iterator reg.
-                self.compile_binding_pattern(&rest.argument, arr_reg)?;
+                self.compile_binding_pattern(&rest.argument, arr_reg, mode)?;
             }
         }
         Ok(())
@@ -926,7 +970,7 @@ impl FunctionCompiler {
                     self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
                 }
                 self.emit_star(source_reg);
-                self.compile_binding_pattern(pat, source_reg)?;
+                self.compile_binding_pattern(pat, source_reg, BindingMode::Declare)?;
                 Ok(Some(source_reg))
             }
         }
@@ -1836,7 +1880,7 @@ impl FunctionCompiler {
                         // Destructuring catch param: acc holds thrown value.
                         let source_reg = self.allocator.new_local();
                         self.emit_star(source_reg);
-                        self.compile_binding_pattern(pat, source_reg)?;
+                        self.compile_binding_pattern(pat, source_reg, BindingMode::Declare)?;
                     }
                 }
             }
@@ -2552,7 +2596,7 @@ impl FunctionCompiler {
                 // Destructuring assignment: acc holds the RHS value.
                 let source_reg = self.allocator.new_local();
                 self.emit_star(source_reg);
-                self.compile_binding_pattern(pat, source_reg)?;
+                self.compile_binding_pattern(pat, source_reg, BindingMode::Assign)?;
                 Ok(())
             }
         }
@@ -4055,7 +4099,11 @@ impl FunctionCompiler {
                     if decl.declarators.len() == 1
                         && !matches!(decl.declarators[0].id, crate::parser::ast::Pat::Ident(_))
                     {
-                        self.compile_binding_pattern(&decl.declarators[0].id, reg)?;
+                        self.compile_binding_pattern(
+                            &decl.declarators[0].id,
+                            reg,
+                            BindingMode::Declare,
+                        )?;
                     }
                 }
             }
@@ -4070,7 +4118,7 @@ impl FunctionCompiler {
                     // Destructuring: store key in scratch, then unpack.
                     let scratch = self.allocator.new_local();
                     self.emit_star(scratch);
-                    self.compile_binding_pattern(pat, scratch)?;
+                    self.compile_binding_pattern(pat, scratch, BindingMode::Declare)?;
                 }
             },
             ForInOfLeft::Expr(expr) => {
@@ -4220,7 +4268,11 @@ impl FunctionCompiler {
                     if decl.declarators.len() == 1
                         && !matches!(decl.declarators[0].id, crate::parser::ast::Pat::Ident(_))
                     {
-                        self.compile_binding_pattern(&decl.declarators[0].id, reg)?;
+                        self.compile_binding_pattern(
+                            &decl.declarators[0].id,
+                            reg,
+                            BindingMode::Declare,
+                        )?;
                     }
                 }
             }
@@ -4237,7 +4289,7 @@ impl FunctionCompiler {
                     let scratch = self.allocator.new_local();
                     self.emit_ldar(val_reg);
                     self.emit_star(scratch);
-                    self.compile_binding_pattern(pat, scratch)?;
+                    self.compile_binding_pattern(pat, scratch, BindingMode::Declare)?;
                 }
             },
             ForInOfLeft::Expr(expr) => {
@@ -7757,5 +7809,22 @@ mod tests {
             sta_count >= 1,
             "export let must emit at least one StaModuleVariable for live binding"
         );
+    }
+
+    // ── Destructuring-assignment integration tests ────────────────────────
+
+    #[test]
+    fn test_array_destructuring_assign() {
+        let result =
+            crate::builtins::global::global_eval("var a, b; [a, b] = [10, 20]; a + b").unwrap();
+        assert_eq!(result, crate::objects::value::JsValue::Smi(30));
+    }
+
+    #[test]
+    fn test_object_destructuring_assign() {
+        let result =
+            crate::builtins::global::global_eval("var x, y; ({x, y} = {x: 10, y: 20}); x + y")
+                .unwrap();
+        assert_eq!(result, crate::objects::value::JsValue::Smi(30));
     }
 }
