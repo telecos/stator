@@ -240,7 +240,12 @@ impl FunctionCompiler {
     /// recorded so that [`emit_param_prologue`] can emit the
     /// corresponding bytecode at function entry.
     fn new(params: &[crate::parser::ast::Param]) -> StatorResult<Self> {
-        let param_count = params.len() as u32;
+        // parameter_count excludes rest params so the runtime can collect
+        // excess arguments starting from this index.
+        let param_count = params
+            .iter()
+            .filter(|p| !matches!(p.pat, Pat::Rest(_)))
+            .count() as u32;
         let mut compiler = Self {
             instructions: Vec::new(),
             constant_pool: Vec::new(),
@@ -334,9 +339,18 @@ impl FunctionCompiler {
                     // Use param register directly — no temporary needed.
                     self.compile_binding_pattern(&param.pat, param_reg, BindingMode::Declare)?;
                 }
-                Pat::Rest(_) => {
-                    // Rest parameters in the parameter list itself are
-                    // handled by the runtime; nothing to emit here.
+                Pat::Rest(rest) => {
+                    // Emit CreateRestParameter — collects all excess arguments
+                    // beyond the declared non-rest parameter count into an array.
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::CreateRestParameter,
+                        vec![],
+                    ));
+                    // Bind the rest name to a fresh local.
+                    if let Pat::Ident(ident) = &*rest.argument {
+                        let local = self.define_local(&ident.name);
+                        self.emit_star(local);
+                    }
                 }
                 Pat::Assign(assign) => {
                     self.compile_binding_pattern(&param.pat, param_reg, BindingMode::Declare)?;

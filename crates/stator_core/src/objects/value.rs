@@ -669,19 +669,36 @@ impl JsValue {
             Self::PlainObject(map) => {
                 // §7.1.1 step 2: check for @@toPrimitive method
                 let exotic = map.borrow().get("@@toPrimitive").cloned();
-                if let Some(JsValue::NativeFunction(f)) = exotic {
-                    let hint_str = match hint {
-                        ToPrimitiveHint::String => "string",
-                        ToPrimitiveHint::Number => "number",
-                        ToPrimitiveHint::Default => "default",
-                    };
-                    let result = f(vec![self.clone(), JsValue::String(hint_str.into())])?;
-                    if result.is_primitive() {
-                        return Ok(result);
+                let hint_str = match hint {
+                    ToPrimitiveHint::String => "string",
+                    ToPrimitiveHint::Number => "number",
+                    ToPrimitiveHint::Default => "default",
+                };
+                match exotic {
+                    Some(JsValue::NativeFunction(f)) => {
+                        let result = f(vec![self.clone(), JsValue::String(hint_str.into())])?;
+                        if result.is_primitive() {
+                            return Ok(result);
+                        }
+                        return Err(StatorError::TypeError(
+                            "Symbol.toPrimitive returned a non-primitive".into(),
+                        ));
                     }
-                    return Err(StatorError::TypeError(
-                        "Symbol.toPrimitive returned a non-primitive".into(),
-                    ));
+                    Some(JsValue::Function(ref ba)) => {
+                        let mut frame = crate::interpreter::InterpreterFrame::new(
+                            (**ba).clone(),
+                            vec![JsValue::String(hint_str.into())],
+                        );
+                        frame.context = Some(self.clone());
+                        let result = crate::interpreter::Interpreter::run(&mut frame)?;
+                        if result.is_primitive() {
+                            return Ok(result);
+                        }
+                        return Err(StatorError::TypeError(
+                            "Symbol.toPrimitive returned a non-primitive".into(),
+                        ));
+                    }
+                    _ => {}
                 }
                 ordinary_to_primitive_plain_object(map, hint)
             }

@@ -2112,6 +2112,30 @@ fn make_date_instance(t: f64) -> JsValue {
         );
     }
 
+    // §20.4.4.45 Date.prototype[@@toPrimitive](hint)
+    {
+        let inner = Rc::clone(&inner);
+        obj.insert(
+            "@@toPrimitive".into(),
+            native(move |args| {
+                let hint = match args.first() {
+                    Some(JsValue::String(s)) => s.to_string(),
+                    _ => "default".to_string(),
+                };
+                match hint.as_str() {
+                    "number" => Ok(num(date_value_of(*inner.borrow()))),
+                    // "string" and "default" both return the string representation
+                    "string" | "default" => {
+                        Ok(JsValue::String(date_to_string(*inner.borrow()).into()))
+                    }
+                    _ => Err(StatorError::TypeError(
+                        "Invalid hint for Date.prototype[@@toPrimitive]".into(),
+                    )),
+                }
+            }),
+        );
+    }
+
     obj.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(obj)))
 }
