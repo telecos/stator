@@ -4086,8 +4086,9 @@ impl<'src> Parser<'src> {
             }
 
             // Member expressions are valid assignment targets in
-            // destructuring, but our Pat enum has no Member variant.
-            // Return an error for now; a future change could add one.
+            // destructuring — wrap them as Pat::Expr.
+            expr @ Expr::Member(_) => Ok(Pat::Expr(Box::new(expr))),
+
             other => {
                 let loc = other.loc();
                 Err(Self::error_at(loc, "invalid destructuring target"))

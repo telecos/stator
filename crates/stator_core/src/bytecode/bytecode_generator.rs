@@ -362,6 +362,10 @@ impl FunctionCompiler {
                     self.compile_binding_pattern(&param.pat, param_reg, BindingMode::Declare)?;
                     let _ = assign;
                 }
+                Pat::Expr(_) => {
+                    // Expression targets should not appear in function parameters.
+                    self.compile_binding_pattern(&param.pat, param_reg, BindingMode::Declare)?;
+                }
             }
         }
         Ok(())
@@ -619,6 +623,31 @@ impl FunctionCompiler {
                 // Just bind the source (the remaining value) for now.
                 // Full rest-collect would require knowing the iterator reg.
                 self.compile_binding_pattern(&rest.argument, arr_reg, mode)?;
+            }
+            Pat::Expr(expr) => {
+                // Expression target inside a destructuring pattern, e.g.
+                // `({a: obj.prop} = val)`.  Load the extracted value then
+                // store to the expression target.
+                self.emit_ldar(source_reg);
+                match expr.as_ref() {
+                    Expr::Member(m) => self.compile_member_store(m)?,
+                    Expr::Ident(id) => match mode {
+                        BindingMode::Declare => {
+                            let local = self.define_local(&id.name);
+                            self.emit_star(local);
+                        }
+                        BindingMode::Assign => {
+                            self.compile_ident_store(&id.name);
+                        }
+                    },
+                    other => {
+                        let loc = other.loc();
+                        return Err(StatorError::SyntaxError(format!(
+                            "at {}:{} — Invalid destructuring assignment target",
+                            loc.start.line, loc.start.column
+                        )));
+                    }
+                }
             }
         }
         Ok(())
@@ -2657,9 +2686,13 @@ impl FunctionCompiler {
                     Ok(())
                 }
                 Expr::Member(m) => self.compile_member(m),
-                _ => Err(StatorError::SyntaxError(
-                    "unsupported assignment target".into(),
-                )),
+                other => {
+                    let loc = other.loc();
+                    Err(StatorError::SyntaxError(format!(
+                        "at {}:{} — Invalid assignment target",
+                        loc.start.line, loc.start.column
+                    )))
+                }
             },
             AssignTarget::Pat(_pat) => {
                 // The real unpack happens in compile_assign_target_store.
@@ -2678,9 +2711,13 @@ impl FunctionCompiler {
                     Ok(())
                 }
                 Expr::Member(m) => self.compile_member_store(m),
-                _ => Err(StatorError::SyntaxError(
-                    "unsupported assignment target".into(),
-                )),
+                other => {
+                    let loc = other.loc();
+                    Err(StatorError::SyntaxError(format!(
+                        "at {}:{} — Invalid assignment target",
+                        loc.start.line, loc.start.column
+                    )))
+                }
             },
             AssignTarget::Pat(pat) => {
                 // Destructuring assignment: acc holds the RHS value.
@@ -4241,7 +4278,7 @@ impl FunctionCompiler {
                     // Destructuring: store key in scratch, then unpack.
                     let scratch = self.allocator.new_local();
                     self.emit_star(scratch);
-                    self.compile_binding_pattern(pat, scratch, BindingMode::Declare)?;
+                    self.compile_binding_pattern(pat, scratch, BindingMode::Assign)?;
                 }
             },
             ForInOfLeft::Expr(expr) => {
@@ -4420,7 +4457,7 @@ impl FunctionCompiler {
                     let scratch = self.allocator.new_local();
                     self.emit_ldar(val_reg);
                     self.emit_star(scratch);
-                    self.compile_binding_pattern(pat, scratch, BindingMode::Declare)?;
+                    self.compile_binding_pattern(pat, scratch, BindingMode::Assign)?;
                 }
             },
             ForInOfLeft::Expr(expr) => {
@@ -8390,5 +8427,116 @@ mod tests {
             instrs.iter().any(|i| i.opcode == Opcode::CallProperty),
             "tagged template on method must use CallProperty for correct `this`"
         );
+    }
+
+    #[test]
+    fn test_member_expr_in_object_destructuring_assignment() {
+        // `({a: obj.x} = {a: 42})` — member expression as destructuring target.
+        use crate::parser::ast::{AssignExpr, AssignOp, AssignTarget, MemberExpr};
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Var, "obj", Some(num_expr(0.0))),
+            Stmt::Expr(ExprStmt {
+                loc: span(),
+                expr: Box::new(Expr::Assign(Box::new(AssignExpr {
+                    loc: span(),
+                    op: AssignOp::Assign,
+                    left: AssignTarget::Pat(Pat::Object(Box::new(ObjectPat {
+                        loc: span(),
+                        properties: vec![ObjectPatProp::KeyValue(KeyValuePatProp {
+                            loc: span(),
+                            key: PropKey::Ident(ident("a")),
+                            is_computed: false,
+                            value: Pat::Expr(Box::new(Expr::Member(Box::new(MemberExpr {
+                                loc: span(),
+                                object: Box::new(ident_expr("obj")),
+                                property: crate::parser::ast::MemberProp::Ident(ident("x")),
+                                is_computed: false,
+                            })))),
+                        })],
+                    }))),
+                    right: Box::new(num_expr(42.0)),
+                }))),
+            }),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        // Must load the property "a" from the RHS, then store via StaNamedProperty.
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::LdaNamedProperty),
+            "destructuring must load property from source, got {instrs:?}"
+        );
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::StaNamedProperty),
+            "member target must emit StaNamedProperty, got {instrs:?}"
+        );
+    }
+
+    #[test]
+    fn test_member_expr_in_array_destructuring_assignment() {
+        // `[obj.x] = [1]` — member expression inside array destructuring.
+        use crate::parser::ast::{AssignExpr, AssignOp, AssignTarget, MemberExpr};
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Var, "obj", Some(num_expr(0.0))),
+            Stmt::Expr(ExprStmt {
+                loc: span(),
+                expr: Box::new(Expr::Assign(Box::new(AssignExpr {
+                    loc: span(),
+                    op: AssignOp::Assign,
+                    left: AssignTarget::Pat(Pat::Array(Box::new(crate::parser::ast::ArrayPat {
+                        loc: span(),
+                        elements: vec![Some(Pat::Expr(Box::new(Expr::Member(Box::new(
+                            MemberExpr {
+                                loc: span(),
+                                object: Box::new(ident_expr("obj")),
+                                property: crate::parser::ast::MemberProp::Ident(ident("x")),
+                                is_computed: false,
+                            },
+                        )))))],
+                    }))),
+                    right: Box::new(num_expr(1.0)),
+                }))),
+            }),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::GetIterator),
+            "array destructuring must use iterator, got {instrs:?}"
+        );
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::StaNamedProperty),
+            "member target must emit StaNamedProperty, got {instrs:?}"
+        );
+    }
+
+    #[test]
+    fn test_for_of_pat_uses_assign_mode() {
+        // `for ({a} of arr) {}` — Pat branch should use Assign, not Declare.
+        // When mode=Assign, identifiers go through StaGlobal (since they
+        // are not locally defined), not Star into a fresh local.
+        use crate::parser::ast::{ForInOfLeft, ForOfStmt};
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Var, "arr", Some(num_expr(0.0))),
+            var_decl_stmt(VarKind::Var, "a", Some(num_expr(0.0))),
+            Stmt::ForOf(ForOfStmt {
+                loc: span(),
+                is_await: false,
+                left: ForInOfLeft::Pat(Pat::Object(Box::new(ObjectPat {
+                    loc: span(),
+                    properties: vec![ObjectPatProp::Assign(AssignPatProp {
+                        loc: span(),
+                        key: ident("a"),
+                        value: None,
+                    })],
+                }))),
+                right: Box::new(ident_expr("arr")),
+                body: Box::new(Stmt::Block(BlockStmt {
+                    loc: span(),
+                    body: vec![],
+                })),
+            }),
+        ]);
+        // Should compile without errors.
+        let _arr = BytecodeGenerator::compile_program(&prog).unwrap();
     }
 }

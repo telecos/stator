@@ -1433,6 +1433,9 @@ pub enum Pat {
     Rest(Box<RestElement>),
     /// Default-value binding `pattern = default`.
     Assign(Box<AssignPat>),
+    /// An expression used as an assignment target inside a destructuring
+    /// pattern (e.g. `obj.prop` in `({a: obj.prop} = val)`).
+    Expr(Box<Expr>),
 }
 
 impl Pat {
@@ -1444,6 +1447,7 @@ impl Pat {
             Pat::Object(p) => p.loc,
             Pat::Rest(p) => p.loc,
             Pat::Assign(p) => p.loc,
+            Pat::Expr(e) => e.loc(),
         }
     }
 }
@@ -1935,6 +1939,7 @@ mod tests {
                 left: Box::new(Pat::Ident(ident.clone())),
                 right: Box::new(Expr::Null(NullLit { loc })),
             })),
+            Pat::Expr(Box::new(Expr::Ident(ident.clone()))),
         ];
         for p in &pats {
             let _ = p.loc();
