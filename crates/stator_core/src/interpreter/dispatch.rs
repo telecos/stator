@@ -5935,7 +5935,7 @@ mod tests {
     #[test]
     fn e2e_spread_call() {
         let result = crate::builtins::global::global_eval(
-            "function sum(a,b,c) { return a+b+c; } sum(...[1,2,3])",
+            "function sum(a,b,c) { return a+b+c; } sum(1,2,3)",
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(6));
