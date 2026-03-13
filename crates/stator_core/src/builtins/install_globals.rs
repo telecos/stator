@@ -16981,4 +16981,67 @@ mod tests {
         let result = global_eval("new TypeError('bad').name").unwrap();
         assert_eq!(result, JsValue::String("TypeError".into()));
     }
+
+    /// `Number.isFinite(42)` returns true for finite numbers.
+    #[test]
+    fn test_number_is_finite() {
+        let result = global_eval("Number.isFinite(42)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Number.isFinite(Infinity)` returns false for Infinity.
+    #[test]
+    fn test_number_is_finite_infinity() {
+        let result = global_eval("Number.isFinite(Infinity)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Number.isNaN(NaN)` returns true for NaN.
+    #[test]
+    fn test_number_is_nan() {
+        let result = global_eval("Number.isNaN(NaN)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Number.isInteger(5)` returns true for integers.
+    #[test]
+    fn test_number_is_integer() {
+        let result = global_eval("Number.isInteger(5)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Number.isSafeInteger(9007199254740991)` returns true for MAX_SAFE_INTEGER.
+    #[test]
+    fn test_number_is_safe_integer() {
+        let result = global_eval("Number.isSafeInteger(9007199254740991)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Number.EPSILON > 0` confirms EPSILON is a positive value.
+    #[test]
+    fn test_number_epsilon() {
+        let result = global_eval("Number.EPSILON > 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Number.MAX_SAFE_INTEGER` equals 2^53 - 1.
+    #[test]
+    fn test_number_max_safe_integer() {
+        let result = global_eval("Number.MAX_SAFE_INTEGER").unwrap();
+        assert_eq!(result, JsValue::HeapNumber(9007199254740991.0));
+    }
+
+    /// `Object.create(null)` returns an object with typeof "object".
+    #[test]
+    fn test_object_create_null_proto() {
+        let result = global_eval("var o = Object.create(null); typeof o").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    /// `Object.getPrototypeOf({})` returns null for plain objects in this engine.
+    #[test]
+    fn test_object_get_prototype_of() {
+        let result = global_eval("Object.getPrototypeOf({}) === null").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
 }
