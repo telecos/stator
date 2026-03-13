@@ -7359,7 +7359,7 @@ mod tests {
         let prog = parse("function* g() { yield* other(); }").unwrap();
         if let ProgramItem::Stmt(Stmt::FnDecl(f)) = &prog.body[0] {
             assert!(f.is_generator);
-            if let Stmt::Expr(ref es) = f.body.body[0] {
+            if let Stmt::Expr(es) = &f.body.body[0] {
                 if let Expr::Yield(y) = es.expr.as_ref() {
                     assert!(y.delegate, "should be yield* delegation");
                     assert!(y.argument.is_some());
@@ -8094,7 +8094,7 @@ mod tests {
             if let Expr::Call(call) = es.expr.as_ref() {
                 if let Expr::OptionalMember(m) = call.callee.as_ref() {
                     assert!(!m.is_computed);
-                    if let crate::parser::ast::MemberProp::Ident(ref id) = m.property {
+                    if let crate::parser::ast::MemberProp::Ident(id) = &m.property {
                         assert_eq!(id.name, "method");
                     } else {
                         panic!("expected Ident property");
@@ -8165,7 +8165,7 @@ mod tests {
             assert!(!fo.is_await);
             if let crate::parser::ast::ForInOfLeft::VarDecl(vd) = &fo.left {
                 assert_eq!(vd.kind, VarKind::Const);
-                if let Pat::Ident(ref id) = vd.declarators[0].id {
+                if let Pat::Ident(id) = &vd.declarators[0].id {
                     assert_eq!(id.name, "item");
                 } else {
                     panic!("expected Ident pattern");
@@ -8185,8 +8185,8 @@ mod tests {
         if let ProgramItem::Stmt(Stmt::ForOf(fo)) = &prog.body[0] {
             if let crate::parser::ast::ForInOfLeft::VarDecl(vd) = &fo.left {
                 assert_eq!(vd.kind, VarKind::Let);
-                if let Pat::Array(ref ap) = vd.declarators[0].id {
-                    assert_eq!(ap.elems.len(), 2);
+                if let Pat::Array(ap) = &vd.declarators[0].id {
+                    assert_eq!(ap.elements.len(), 2);
                 } else {
                     panic!("expected Array pattern");
                 }
@@ -8206,7 +8206,7 @@ mod tests {
         if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
             assert_eq!(c.id.as_ref().unwrap().name, "Foo");
             assert!(c.super_class.is_some());
-            if let Expr::Ident(ref sc) = **c.super_class.as_ref().unwrap() {
+            if let Expr::Ident(sc) = c.super_class.as_deref().unwrap() {
                 assert_eq!(sc.name, "Bar");
             } else {
                 panic!("expected Ident super class");
@@ -8216,7 +8216,7 @@ mod tests {
                 assert_eq!(m.kind, MethodKind::Constructor);
                 // The body should contain `super()` as a call expression
                 assert!(!m.value.body.body.is_empty());
-                if let Stmt::Expr(ref es) = m.value.body.body[0] {
+                if let Stmt::Expr(es) = &m.value.body.body[0] {
                     assert!(
                         matches!(es.expr.as_ref(), Expr::Call(_)),
                         "expected super() call"
@@ -8247,7 +8247,7 @@ mod tests {
             // Second member: method()
             if let ClassMember::Method(m) = &c.body.body[1] {
                 assert_eq!(m.kind, MethodKind::Method);
-                if let PropKey::Ident(ref id) = m.key {
+                if let PropKey::Ident(id) = &m.key {
                     assert_eq!(id.name, "method");
                 } else {
                     panic!("expected Ident key for method");
@@ -8268,7 +8268,7 @@ mod tests {
             if let ClassMember::Method(m) = &c.body.body[0] {
                 assert!(m.is_static);
                 assert_eq!(m.kind, MethodKind::Method);
-                if let PropKey::Ident(ref id) = m.key {
+                if let PropKey::Ident(id) = &m.key {
                     assert_eq!(id.name, "method");
                 } else {
                     panic!("expected Ident key");
@@ -8315,7 +8315,7 @@ mod tests {
             assert_eq!(f.body.body.len(), 2);
             // Both statements should be yield expressions
             for stmt in &f.body.body {
-                if let Stmt::Expr(ref es) = stmt {
+                if let Stmt::Expr(es) = stmt {
                     if let Expr::Yield(y) = es.expr.as_ref() {
                         assert!(!y.delegate, "should not be yield*");
                         assert!(y.argument.is_some());
@@ -8336,7 +8336,7 @@ mod tests {
         let prog = parse("function* gen() { yield* [1, 2]; }").unwrap();
         if let ProgramItem::Stmt(Stmt::FnDecl(f)) = &prog.body[0] {
             assert!(f.is_generator);
-            if let Stmt::Expr(ref es) = f.body.body[0] {
+            if let Stmt::Expr(es) = &f.body.body[0] {
                 if let Expr::Yield(y) = es.expr.as_ref() {
                     assert!(y.delegate, "should be yield* delegation");
                     assert!(
@@ -8377,7 +8377,7 @@ mod tests {
         if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
             if let Some(Expr::Arrow(arrow)) = vd.declarators[0].init.as_deref() {
                 assert!(arrow.is_async, "should be async");
-                if let ArrowBody::Expr(ref body_expr) = arrow.body {
+                if let ArrowBody::Expr(body_expr) = &arrow.body {
                     assert!(
                         matches!(body_expr.as_ref(), Expr::Await(_)),
                         "body should be Await expression"
@@ -8400,8 +8400,8 @@ mod tests {
             assert!(fd.is_async);
             assert!(!fd.is_generator);
             assert_eq!(fd.id.as_ref().unwrap().name, "foo");
-            if let Stmt::Expr(ref es) = fd.body.body[0] {
-                if let Expr::Await(ref aw) = *es.expr {
+            if let Stmt::Expr(es) = &fd.body.body[0] {
+                if let Expr::Await(aw) = es.expr.as_ref() {
                     assert!(
                         matches!(aw.argument.as_ref(), Expr::Call(_)),
                         "await argument should be a call"
