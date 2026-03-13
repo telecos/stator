@@ -4886,24 +4886,31 @@ fn make_array() -> JsValue {
                 return Ok(JsValue::Array(Rc::new(RefCell::new(Vec::new()))));
             }
             if args.len() == 1 {
-                let numeric_len: Option<Result<usize, _>> = match &args[0] {
-                    JsValue::Smi(n) if *n >= 0 => {
-                        Some(crate::builtins::util::checked_f64_to_length(*n as f64))
+                // §23.1.1.1: if the single argument is numeric, treat it
+                // as the array length — throw RangeError for invalid values
+                // (negative, fractional, NaN, ±Infinity).
+                match &args[0] {
+                    JsValue::Smi(n) => {
+                        let len = crate::builtins::util::checked_f64_to_length(*n as f64)?;
+                        let v: Vec<JsValue> = vec![JsValue::Undefined; len];
+                        return Ok(JsValue::Array(Rc::new(RefCell::new(v))));
                     }
-                    JsValue::HeapNumber(n)
-                        if n.fract() == 0.0 && *n >= 0.0 && *n <= (u32::MAX as f64) =>
-                    {
-                        Some(crate::builtins::util::checked_f64_to_length(*n))
+                    JsValue::HeapNumber(n) => {
+                        // Fractional, NaN, or ±Infinity → invalid array length.
+                        if n.fract() != 0.0 {
+                            return Err(crate::error::StatorError::RangeError(
+                                "Invalid array length".to_string(),
+                            ));
+                        }
+                        let len = crate::builtins::util::checked_f64_to_length(*n)?;
+                        let v: Vec<JsValue> = vec![JsValue::Undefined; len];
+                        return Ok(JsValue::Array(Rc::new(RefCell::new(v))));
                     }
-                    _ => None,
-                };
-                if let Some(result) = numeric_len {
-                    let len = result?;
-                    let v: Vec<JsValue> = vec![JsValue::Undefined; len];
-                    return Ok(JsValue::Array(Rc::new(RefCell::new(v))));
+                    _ => {
+                        // Single non-numeric arg → Array with one element.
+                        return Ok(JsValue::Array(Rc::new(RefCell::new(args))));
+                    }
                 }
-                // Single non-numeric arg → Array with one element.
-                return Ok(JsValue::Array(Rc::new(RefCell::new(args))));
             }
             Ok(JsValue::Array(Rc::new(RefCell::new(args))))
         }),
@@ -15746,5 +15753,135 @@ mod tests {
         let result =
             global_eval("var o = Object.fromEntries([['a', 1], ['b', 2]]); o.a + o.b").unwrap();
         assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── TypeError / RangeError / SyntaxError throw tests ─────────────────
+
+    /// `new Array(-1)` must throw RangeError (§23.1.1.1).
+    #[test]
+    fn e2e_array_constructor_negative_length() {
+        let result = global_eval("new Array(-1)");
+        assert!(
+            result.is_err(),
+            "Expected RangeError for negative array length"
+        );
+    }
+
+    /// `new Array(1.5)` must throw RangeError (§23.1.1.1).
+    #[test]
+    fn e2e_array_constructor_fractional_length() {
+        let result = global_eval("new Array(1.5)");
+        assert!(
+            result.is_err(),
+            "Expected RangeError for fractional array length"
+        );
+    }
+
+    /// `new Array(NaN)` must throw RangeError (§23.1.1.1).
+    #[test]
+    fn e2e_array_constructor_nan_length() {
+        let result = global_eval("new Array(NaN)");
+        assert!(result.is_err(), "Expected RangeError for NaN array length");
+    }
+
+    /// `new Array(Infinity)` must throw RangeError (§23.1.1.1).
+    #[test]
+    fn e2e_array_constructor_infinity_length() {
+        let result = global_eval("new Array(Infinity)");
+        assert!(
+            result.is_err(),
+            "Expected RangeError for Infinity array length"
+        );
+    }
+
+    /// `new Array(0)` is valid and produces an empty array.
+    #[test]
+    fn e2e_array_constructor_zero_length() {
+        let result = global_eval("new Array(0).length").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// `new Array(5)` produces a 5-element array.
+    #[test]
+    fn e2e_array_constructor_positive_length() {
+        let result = global_eval("new Array(5).length").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// `Object.defineProperty` on a frozen object must throw TypeError.
+    #[test]
+    fn e2e_object_define_property_frozen_throws() {
+        let result =
+            global_eval("var o = Object.freeze({}); Object.defineProperty(o, 'x', { value: 1 })");
+        assert!(
+            result.is_err(),
+            "Expected TypeError for defineProperty on frozen object"
+        );
+    }
+
+    /// `Object.setPrototypeOf` on a non-extensible object must throw TypeError
+    /// when the prototype would change.
+    #[test]
+    fn e2e_object_set_prototype_of_non_extensible_throws() {
+        let result =
+            global_eval("var o = Object.preventExtensions({}); Object.setPrototypeOf(o, { x: 1 })");
+        assert!(
+            result.is_err(),
+            "Expected TypeError for setPrototypeOf on non-extensible object"
+        );
+    }
+
+    /// `String.prototype.charAt.call(null)` must throw TypeError (§22.1.3).
+    #[test]
+    fn e2e_string_char_at_on_null_throws() {
+        let result = global_eval("String.prototype.charAt.call(null, 0)");
+        assert!(result.is_err(), "Expected TypeError for charAt on null");
+    }
+
+    /// `String.prototype.indexOf.call(undefined)` must throw TypeError (§22.1.3).
+    #[test]
+    fn e2e_string_index_of_on_undefined_throws() {
+        let result = global_eval("String.prototype.indexOf.call(undefined, 'a')");
+        assert!(
+            result.is_err(),
+            "Expected TypeError for indexOf on undefined"
+        );
+    }
+
+    /// `Array.prototype.push.call(null)` must throw TypeError.
+    #[test]
+    fn e2e_array_push_on_null_throws() {
+        let result = global_eval("Array.prototype.push.call(null, 1)");
+        assert!(result.is_err(), "Expected TypeError for push on null");
+    }
+
+    /// `Array.prototype.forEach.call(undefined, function(){})` must throw TypeError.
+    #[test]
+    fn e2e_array_for_each_on_undefined_throws() {
+        let result = global_eval("Array.prototype.forEach.call(undefined, function(){})");
+        assert!(
+            result.is_err(),
+            "Expected TypeError for forEach on undefined"
+        );
+    }
+
+    /// `new RegExp('.', 'xyz')` must throw SyntaxError for invalid flags.
+    #[test]
+    fn e2e_regexp_invalid_flags_throws() {
+        let result = global_eval("new RegExp('.', 'xyz')");
+        assert!(
+            result.is_err(),
+            "Expected SyntaxError for invalid RegExp flags"
+        );
+    }
+
+    /// `new RegExp('.', 'gg')` must throw SyntaxError for duplicate flags.
+    #[test]
+    fn e2e_regexp_duplicate_flags_throws() {
+        let result = global_eval("new RegExp('.', 'gg')");
+        assert!(
+            result.is_err(),
+            "Expected SyntaxError for duplicate RegExp flags"
+        );
     }
 }
