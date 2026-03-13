@@ -143,6 +143,21 @@ fn native(f: impl Fn(Vec<JsValue>) -> StatorResult<JsValue> + 'static) -> JsValu
     JsValue::NativeFunction(Rc::new(f))
 }
 
+/// Extract a stable identity key from a JsValue for use in weak collections.
+///
+/// Returns `Some(usize)` for object-like values (`Object`, `PlainObject`,
+/// `Function`, `NativeFunction`) that have heap identity, or `None` for
+/// primitives which cannot be weak collection keys.
+fn weak_collection_key(val: &JsValue) -> Option<usize> {
+    match val {
+        JsValue::Object(ptr) => Some(*ptr as usize),
+        JsValue::PlainObject(rc) => Some(Rc::as_ptr(rc) as usize),
+        JsValue::Function(rc) => Some(Rc::as_ptr(rc) as usize),
+        JsValue::NativeFunction(rc) => Some(Rc::as_ptr(rc) as usize),
+        _ => None,
+    }
+}
+
 /// Create a built-in function object with `.name` and `.length` properties.
 ///
 /// Per the ES spec, every built-in function should expose a non-enumerable,
@@ -6169,10 +6184,8 @@ fn make_weak_set_builtin() -> JsValue {
                     "add".into(),
                     native(move |a| {
                         let val = a.first().unwrap_or(&JsValue::Undefined);
-                        if let JsValue::Object(ptr) = val {
-                            inner.borrow_mut().insert(*ptr as usize);
-                            // Return Undefined here; the prototype wrapper
-                            // is responsible for returning the receiver.
+                        if let Some(key) = weak_collection_key(val) {
+                            inner.borrow_mut().insert(key);
                             Ok(JsValue::Undefined)
                         } else {
                             Err(StatorError::TypeError(
@@ -6189,8 +6202,8 @@ fn make_weak_set_builtin() -> JsValue {
                     "has".into(),
                     native(move |a| {
                         let val = a.first().unwrap_or(&JsValue::Undefined);
-                        if let JsValue::Object(ptr) = val {
-                            Ok(JsValue::Boolean(inner.borrow().contains(&(*ptr as usize))))
+                        if let Some(key) = weak_collection_key(val) {
+                            Ok(JsValue::Boolean(inner.borrow().contains(&key)))
                         } else {
                             Ok(JsValue::Boolean(false))
                         }
@@ -6204,10 +6217,8 @@ fn make_weak_set_builtin() -> JsValue {
                     "delete".into(),
                     native(move |a| {
                         let val = a.first().unwrap_or(&JsValue::Undefined);
-                        if let JsValue::Object(ptr) = val {
-                            Ok(JsValue::Boolean(
-                                inner.borrow_mut().remove(&(*ptr as usize)),
-                            ))
+                        if let Some(key) = weak_collection_key(val) {
+                            Ok(JsValue::Boolean(inner.borrow_mut().remove(&key)))
                         } else {
                             Ok(JsValue::Boolean(false))
                         }

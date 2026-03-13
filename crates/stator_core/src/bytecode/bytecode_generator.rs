@@ -2233,10 +2233,11 @@ impl FunctionCompiler {
                                     vec![Operand::ConstantPoolIdx(idx)],
                                 ));
                             }
-                            crate::parser::ast::MemberProp::Private(_) => {
-                                return Err(StatorError::Internal(
-                                    "delete of private property is not supported".into(),
-                                ));
+                            crate::parser::ast::MemberProp::Private(name) => {
+                                return Err(StatorError::SyntaxError(format!(
+                                    "private fields can not be deleted (field #{})",
+                                    name.name
+                                )));
                             }
                         }
                         let delete_op = if self.is_strict {
