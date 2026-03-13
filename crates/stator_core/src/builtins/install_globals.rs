@@ -4869,6 +4869,54 @@ fn make_array() -> JsValue {
         }),
     );
 
+    // §23.1.3.36 Array.prototype.toString()
+    // Equivalent to calling this.join() — produces a comma-separated string
+    // of elements (undefined/null become empty strings).
+    proto.insert(
+        "toString".into(),
+        builtin_fn("toString", 0, |args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            require_object_coercible(arr)?;
+            let (elements, _len) = to_array_like_elements(arr);
+            let parts: Vec<String> = elements
+                .iter()
+                .map(|v| match v {
+                    JsValue::Undefined | JsValue::Null => Ok(String::new()),
+                    other => other.to_js_string(),
+                })
+                .collect::<StatorResult<_>>()?;
+            Ok(JsValue::String(parts.join(",").into()))
+        }),
+    );
+
+    // §23.1.3.35 Array.prototype.toLocaleString()
+    // Calls toLocaleString() on each element (falling back to toString()),
+    // then joins results with ",".
+    proto.insert(
+        "toLocaleString".into(),
+        builtin_fn("toLocaleString", 0, |args| {
+            let arr = args.first().unwrap_or(&JsValue::Undefined);
+            require_object_coercible(arr)?;
+            let (elements, _len) = to_array_like_elements(arr);
+            let parts: Vec<String> = elements
+                .iter()
+                .map(|v| match v {
+                    JsValue::Undefined | JsValue::Null => Ok(String::new()),
+                    JsValue::PlainObject(map) => {
+                        if let Some(func) = map.borrow().get("toLocaleString").cloned() {
+                            let result = dispatch_call_value(&func, vec![v.clone()])?;
+                            result.to_js_string()
+                        } else {
+                            v.to_js_string()
+                        }
+                    }
+                    other => other.to_js_string(),
+                })
+                .collect::<StatorResult<_>>()?;
+            Ok(JsValue::String(parts.join(",").into()))
+        }),
+    );
+
     // §23.1.3.38 Array.prototype[@@toStringTag] is NOT defined by spec,
     // but we set @@unscopables. Skip toStringTag for Array.
 
@@ -10780,6 +10828,93 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         }),
     );
 
+    // ── btoa(stringToEncode) ─────────────────────────────────────────────
+    // HTML spec — encodes a binary string to Base64.
+    globals.insert(
+        "btoa".into(),
+        builtin_fn("btoa", 1, |args| {
+            let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            // Validate: btoa only accepts Latin-1 (each char code < 256).
+            for ch in input.chars() {
+                if ch as u32 > 255 {
+                    return Err(StatorError::TypeError(
+                        "btoa: string contains characters outside of the Latin1 range".into(),
+                    ));
+                }
+            }
+            let bytes: Vec<u8> = input.chars().map(|c| c as u8).collect();
+            const B64: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+            for chunk in bytes.chunks(3) {
+                let b0 = chunk[0] as u32;
+                let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+                let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+                let n = (b0 << 16) | (b1 << 8) | b2;
+                out.push(B64[((n >> 18) & 0x3F) as usize] as char);
+                out.push(B64[((n >> 12) & 0x3F) as usize] as char);
+                if chunk.len() > 1 {
+                    out.push(B64[((n >> 6) & 0x3F) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+                if chunk.len() > 2 {
+                    out.push(B64[(n & 0x3F) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+            Ok(JsValue::String(out.into()))
+        }),
+    );
+
+    // ── atob(encodedData) ───────────────────────────────────────────────
+    // HTML spec — decodes a Base64 string back to a binary string.
+    globals.insert(
+        "atob".into(),
+        builtin_fn("atob", 1, |args| {
+            let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+            // Strip whitespace per spec.
+            let clean: String = input.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+            fn b64_val(c: u8) -> Option<u32> {
+                match c {
+                    b'A'..=b'Z' => Some((c - b'A') as u32),
+                    b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+                    b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+                    b'+' => Some(62),
+                    b'/' => Some(63),
+                    b'=' => Some(0),
+                    _ => None,
+                }
+            }
+            let bytes = clean.as_bytes();
+            if bytes.len() % 4 != 0 {
+                return Err(StatorError::TypeError("atob: invalid character".into()));
+            }
+            let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+            for chunk in bytes.chunks(4) {
+                let a = b64_val(chunk[0])
+                    .ok_or_else(|| StatorError::TypeError("atob: invalid character".into()))?;
+                let b = b64_val(chunk[1])
+                    .ok_or_else(|| StatorError::TypeError("atob: invalid character".into()))?;
+                let c = b64_val(chunk[2])
+                    .ok_or_else(|| StatorError::TypeError("atob: invalid character".into()))?;
+                let d = b64_val(chunk[3])
+                    .ok_or_else(|| StatorError::TypeError("atob: invalid character".into()))?;
+                let n = (a << 18) | (b << 12) | (c << 6) | d;
+                out.push(((n >> 16) & 0xFF) as u8);
+                if chunk[2] != b'=' {
+                    out.push(((n >> 8) & 0xFF) as u8);
+                }
+                if chunk[3] != b'=' {
+                    out.push((n & 0xFF) as u8);
+                }
+            }
+            let result: String = out.iter().map(|&b| b as char).collect();
+            Ok(JsValue::String(result.into()))
+        }),
+    );
+
     // ── structuredClone(value) ──────────────────────────────────────────
     globals.insert(
         "structuredClone".into(),
@@ -10887,6 +11022,9 @@ mod tests {
         assert!(globals.contains_key("Float64Array"));
         assert!(globals.contains_key("BigInt64Array"));
         assert!(globals.contains_key("BigUint64Array"));
+        // Base64 encoding/decoding
+        assert!(globals.contains_key("btoa"));
+        assert!(globals.contains_key("atob"));
     }
 
     /// Verify that the `Math` object has the expected properties.
@@ -15883,5 +16021,81 @@ mod tests {
             result.is_err(),
             "Expected SyntaxError for duplicate RegExp flags"
         );
+    }
+
+    // ── Array.prototype.toString e2e tests ──────────────────────────────
+
+    /// `Array.prototype.toString` returns comma-separated elements.
+    #[test]
+    fn e2e_array_to_string_basic() {
+        let result = global_eval("[1, 2, 3].toString()").unwrap();
+        assert_eq!(result, JsValue::String("1,2,3".into()));
+    }
+
+    /// `Array.prototype.toString` on an empty array returns "".
+    #[test]
+    fn e2e_array_to_string_empty() {
+        let result = global_eval("[].toString()").unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    /// `Array.prototype.toString` treats null/undefined as empty strings.
+    #[test]
+    fn e2e_array_to_string_with_holes() {
+        let result = global_eval("[1, null, undefined, 4].toString()").unwrap();
+        assert_eq!(result, JsValue::String("1,,,4".into()));
+    }
+
+    // ── Array.prototype.toLocaleString e2e tests ────────────────────────
+
+    /// `Array.prototype.toLocaleString` returns comma-separated elements.
+    #[test]
+    fn e2e_array_to_locale_string_basic() {
+        let result = global_eval("[1, 2, 3].toLocaleString()").unwrap();
+        assert_eq!(result, JsValue::String("1,2,3".into()));
+    }
+
+    /// `Array.prototype.toLocaleString` on an empty array returns "".
+    #[test]
+    fn e2e_array_to_locale_string_empty() {
+        let result = global_eval("[].toLocaleString()").unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    // ── btoa / atob e2e tests ───────────────────────────────────────────
+
+    /// `btoa` encodes a simple ASCII string.
+    #[test]
+    fn e2e_btoa_basic() {
+        let result = global_eval("btoa('Hello')").unwrap();
+        assert_eq!(result, JsValue::String("SGVsbG8=".into()));
+    }
+
+    /// `atob` decodes a Base64 string back to the original.
+    #[test]
+    fn e2e_atob_basic() {
+        let result = global_eval("atob('SGVsbG8=')").unwrap();
+        assert_eq!(result, JsValue::String("Hello".into()));
+    }
+
+    /// `atob(btoa(x))` round-trips correctly.
+    #[test]
+    fn e2e_atob_btoa_roundtrip() {
+        let result = global_eval("atob(btoa('test string'))").unwrap();
+        assert_eq!(result, JsValue::String("test string".into()));
+    }
+
+    /// `btoa` with empty string returns empty string.
+    #[test]
+    fn e2e_btoa_empty() {
+        let result = global_eval("btoa('')").unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    /// `atob` with empty string returns empty string.
+    #[test]
+    fn e2e_atob_empty() {
+        let result = global_eval("atob('')").unwrap();
+        assert_eq!(result, JsValue::String("".into()));
     }
 }
