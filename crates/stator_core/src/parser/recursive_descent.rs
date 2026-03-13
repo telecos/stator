@@ -8435,4 +8435,56 @@ mod tests {
             panic!("expected expression statement");
         }
     }
+
+    // ── Strict-mode rejection tests (single-quote directive) ─────────────
+
+    #[test]
+    fn test_strict_with_rejected() {
+        let src = "'use strict'; with ({}) {}";
+        let result = parse(src);
+        assert!(
+            result.is_err(),
+            "with statement should be rejected in strict mode"
+        );
+    }
+
+    #[test]
+    fn test_strict_delete_ident_rejected() {
+        let src = "'use strict'; var x = 1; delete x;";
+        let result = parse(src);
+        assert!(
+            result.is_err(),
+            "delete of unqualified identifier should be rejected in strict mode"
+        );
+    }
+
+    #[test]
+    fn test_strict_eval_binding_rejected() {
+        let src = "'use strict'; var eval = 1;";
+        let result = parse(src);
+        assert!(
+            result.is_err(),
+            "eval as binding should be rejected in strict mode"
+        );
+    }
+
+    #[test]
+    fn test_strict_duplicate_params_rejected() {
+        let src = "'use strict'; function f(a, a) {}";
+        let result = parse(src);
+        assert!(
+            result.is_err(),
+            "duplicate params should be rejected in strict mode"
+        );
+    }
+
+    #[test]
+    fn test_strict_octal_literal_rejected() {
+        let src = "'use strict'; var x = 0123;";
+        let result = parse(src);
+        assert!(
+            result.is_err(),
+            "legacy octal literals should be rejected in strict mode"
+        );
+    }
 }
