@@ -15070,4 +15070,70 @@ mod tests {
             other => panic!("expected 0, got {other:?}"),
         }
     }
+
+    // —— Array.prototype.with e2e tests ——————————————
+
+    #[test]
+    fn e2e_array_with_basic() {
+        let result = global_eval("[1, 2, 3].with(1, 99)[1]").unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn e2e_array_with_negative_index() {
+        let result = global_eval("[1, 2, 3].with(-1, 99)[2]").unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn e2e_array_with_preserves_other_elements() {
+        let result = global_eval("[1, 2, 3].with(0, 99)[1]").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_array_with_returns_new_array() {
+        let result = global_eval("var a = [1,2,3]; var b = a.with(0, 99); a[0]").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    // —— Number.isInteger e2e tests ——————————————
+
+    #[test]
+    fn e2e_number_is_integer_true() {
+        let result = global_eval("Number.isInteger(42)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_number_is_integer_float() {
+        let result = global_eval("Number.isInteger(1.5)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_number_is_integer_nan() {
+        let result = global_eval("Number.isInteger(NaN)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // —— Object.is e2e tests ——————————————
+
+    #[test]
+    fn e2e_object_is_nan() {
+        let result = global_eval("Object.is(NaN, NaN)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_object_is_zero() {
+        let result = global_eval("Object.is(0, -0)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_object_is_same() {
+        let result = global_eval("Object.is(42, 42)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
 }

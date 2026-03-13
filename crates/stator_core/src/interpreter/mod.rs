@@ -1794,151 +1794,39 @@ pub(super) fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
     }
 }
 
-/// ECMAScript §7.2.11 **Abstract Relational Comparison** (`<`).
+/// ECMAScript §7.2.14 **IsLessThan** (`<`).
 ///
-/// Returns `false` when either operand is `NaN` (consistent with IEEE 754).
-/// String operands are compared lexicographically; all other combinations
-/// convert to numbers first.
+/// Delegates to [`JsValue::abstract_relational_comparison`] which performs the
+/// full spec algorithm including ToPrimitive on objects.  Fast paths for Smi
+/// and String comparisons avoid the ToPrimitive overhead for primitives.
 pub(super) fn js_less_than(lhs: &JsValue, rhs: &JsValue) -> StatorResult<bool> {
+    // Fast paths for common types (avoid ToPrimitive overhead)
+    if let (JsValue::Smi(a), JsValue::Smi(b)) = (lhs, rhs) {
+        return Ok(a < b);
+    }
     if let (JsValue::String(a), JsValue::String(b)) = (lhs, rhs) {
         return Ok(a < b);
     }
-    // BigInt × BigInt
-    if let (JsValue::BigInt(a), JsValue::BigInt(b)) = (lhs, rhs) {
-        return Ok(a < b);
-    }
-    // BigInt × Number and Number × BigInt (mixed comparison is allowed)
-    if let (JsValue::BigInt(a), rhs_val) = (lhs, rhs) {
-        let r = rhs_val.to_number()?;
-        if r.is_nan() {
-            return Ok(false);
-        }
-        return Ok((*a as f64) < r);
-    }
-    if let (lhs_val, JsValue::BigInt(b)) = (lhs, rhs) {
-        let l = lhs_val.to_number()?;
-        if l.is_nan() {
-            return Ok(false);
-        }
-        return Ok(l < (*b as f64));
-    }
-    let l = lhs.to_number()?;
-    let r = rhs.to_number()?;
-    if l.is_nan() || r.is_nan() {
-        return Ok(false);
-    }
-    Ok(l < r)
+    // Full spec: §7.2.14 IsLessThan(x, y, true)
+    // Returns None for undefined (NaN cases) → map to false
+    Ok(JsValue::abstract_relational_comparison(lhs, rhs, true)?.unwrap_or(false))
 }
 
 /// ECMAScript §7.2.13 **Abstract Equality Comparison** (`==`).
+///
+/// Delegates to [`JsValue::is_loosely_equal`] which implements the full spec
+/// algorithm including ToPrimitive coercion for objects.
 pub(super) fn abstract_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
-    match (lhs, rhs) {
-        // Same primitive type.
-        (JsValue::Undefined, JsValue::Undefined) | (JsValue::Null, JsValue::Null) => true,
-        (JsValue::Boolean(a), JsValue::Boolean(b)) => a == b,
-        (JsValue::String(a), JsValue::String(b)) => a == b,
-        (JsValue::Symbol(a), JsValue::Symbol(b)) => a == b,
-        // BigInt × BigInt
-        (JsValue::BigInt(a), JsValue::BigInt(b)) => a == b,
-        // Numeric — covers Smi×Smi, Smi×HeapNumber, HeapNumber×HeapNumber.
-        (lhs, rhs) if lhs.is_number() && rhs.is_number() => {
-            matches!((lhs.to_number(), rhs.to_number()), (Ok(a), Ok(b)) if a == b)
-        }
-        // null == undefined.
-        (JsValue::Null, JsValue::Undefined) | (JsValue::Undefined, JsValue::Null) => true,
-        // Boolean → Number coercion (ECMAScript §7.2.13 steps 9/10).
-        (JsValue::Boolean(b), _) => abstract_eq(&JsValue::Smi(i32::from(*b)), rhs),
-        (_, JsValue::Boolean(b)) => abstract_eq(lhs, &JsValue::Smi(i32::from(*b))),
-        // BigInt × Number and Number × BigInt (mixed comparison is allowed for ==).
-        (JsValue::BigInt(a), rhs_val) if rhs_val.is_number() => {
-            if let Ok(r) = rhs_val.to_number() {
-                if r.is_nan() || r.is_infinite() {
-                    return false;
-                }
-                if r.fract() != 0.0 {
-                    return false;
-                }
-                *a == r as i128
-            } else {
-                false
-            }
-        }
-        (lhs_val, JsValue::BigInt(b)) if lhs_val.is_number() => {
-            if let Ok(l) = lhs_val.to_number() {
-                if l.is_nan() || l.is_infinite() {
-                    return false;
-                }
-                if l.fract() != 0.0 {
-                    return false;
-                }
-                l as i128 == *b
-            } else {
-                false
-            }
-        }
-        // BigInt × String: parse string as BigInt.
-        (JsValue::BigInt(a), JsValue::String(s)) => s.trim().parse::<i128>() == Ok(*a),
-        (JsValue::String(s), JsValue::BigInt(b)) => s.trim().parse::<i128>() == Ok(*b),
-        // String → Number coercion (steps 5/6).
-        (JsValue::String(s), _) if rhs.is_number() => {
-            let n = crate::objects::value::string_to_number(s);
-            abstract_eq(&JsValue::HeapNumber(n), rhs)
-        }
-        (_, JsValue::String(s)) if lhs.is_number() => {
-            let n = crate::objects::value::string_to_number(s);
-            abstract_eq(lhs, &JsValue::HeapNumber(n))
-        }
-        // Object identity — `JsValue::Object` holds a raw `*mut HeapObject`
-        // pointer; comparing the pointer values gives reference identity.
-        (JsValue::Object(a), JsValue::Object(b)) => std::ptr::eq(*a, *b),
-        // PlainObject, Array, Function identity — Rc pointer comparison.
-        (JsValue::PlainObject(a), JsValue::PlainObject(b)) => Rc::ptr_eq(a, b),
-        (JsValue::Array(a), JsValue::Array(b)) => Rc::ptr_eq(a, b),
-        (JsValue::Function(a), JsValue::Function(b)) => Rc::ptr_eq(a, b),
-        (JsValue::NativeFunction(a), JsValue::NativeFunction(b)) => Rc::ptr_eq(a, b),
-        (JsValue::Error(a), JsValue::Error(b)) => Rc::ptr_eq(a, b),
-        // Object == primitive → ToPrimitive(Object, default) then compare
-        // (ECMAScript §7.2.14 steps 12/13).
-        (lhs_val, rhs_val) if !lhs_val.is_primitive() && rhs_val.is_primitive() => {
-            match lhs_val.to_primitive(crate::objects::value::ToPrimitiveHint::Default) {
-                Ok(prim) => abstract_eq(&prim, rhs_val),
-                Err(_) => false,
-            }
-        }
-        (lhs_val, rhs_val) if lhs_val.is_primitive() && !rhs_val.is_primitive() => {
-            match rhs_val.to_primitive(crate::objects::value::ToPrimitiveHint::Default) {
-                Ok(prim) => abstract_eq(lhs_val, &prim),
-                Err(_) => false,
-            }
-        }
-        _ => false,
-    }
+    lhs.is_loosely_equal(rhs).unwrap_or(false)
 }
 
 /// ECMAScript §7.2.15 **Strict Equality Comparison** (`===`).
+///
+/// Delegates to [`JsValue::is_strictly_equal`] which handles all JsValue
+/// variants including Generator, Iterator, ArrayBuffer, TypedArray, DataView,
+/// and Context.
 pub(super) fn strict_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
-    match (lhs, rhs) {
-        (JsValue::Undefined, JsValue::Undefined) | (JsValue::Null, JsValue::Null) => true,
-        (JsValue::Boolean(a), JsValue::Boolean(b)) => a == b,
-        (JsValue::String(a), JsValue::String(b)) => a == b,
-        (JsValue::Symbol(a), JsValue::Symbol(b)) => a == b,
-        (JsValue::BigInt(a), JsValue::BigInt(b)) => a == b,
-        // Numeric — IEEE 754: NaN !== NaN is handled correctly by f64's PartialEq.
-        (JsValue::Smi(a), JsValue::Smi(b)) => a == b,
-        (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => a == b,
-        (JsValue::Smi(a), JsValue::HeapNumber(b)) => (*a as f64) == *b,
-        (JsValue::HeapNumber(a), JsValue::Smi(b)) => *a == (*b as f64),
-        // Object identity — pointer comparison for all object-like types.
-        (JsValue::Object(a), JsValue::Object(b)) => std::ptr::eq(*a, *b),
-        (JsValue::PlainObject(a), JsValue::PlainObject(b)) => Rc::ptr_eq(a, b),
-        (JsValue::Array(a), JsValue::Array(b)) => Rc::ptr_eq(a, b),
-        (JsValue::Function(a), JsValue::Function(b)) => Rc::ptr_eq(a, b),
-        (JsValue::NativeFunction(a), JsValue::NativeFunction(b)) => Rc::ptr_eq(a, b),
-        (JsValue::Error(a), JsValue::Error(b)) => Rc::ptr_eq(a, b),
-        (JsValue::Promise(a), JsValue::Promise(b)) => a == b,
-        (JsValue::Proxy(a), JsValue::Proxy(b)) => Rc::ptr_eq(a, b),
-        _ => false,
-    }
+    lhs.is_strictly_equal(rhs)
 }
 
 /// Construct a diagnostic error for an unexpected operand kind.
@@ -13131,5 +13019,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // —— Comparison with ToPrimitive ————————————————
+
+    #[test]
+    fn test_js_less_than_with_valueof() {
+        let result = crate::builtins::global::global_eval(
+            "var a = { valueOf: function() { return 5; } }; a < 10",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_js_less_than_with_valueof_false() {
+        let result = crate::builtins::global::global_eval(
+            "var a = { valueOf: function() { return 15; } }; a < 10",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_js_greater_than_with_valueof() {
+        let result = crate::builtins::global::global_eval(
+            "var a = { valueOf: function() { return 15; } }; a > 10",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_abstract_eq_object_to_number() {
+        let result = crate::builtins::global::global_eval(
+            "var a = { valueOf: function() { return 42; } }; a == 42",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_abstract_eq_object_to_string() {
+        let result = crate::builtins::global::global_eval(
+            "var a = { toString: function() { return 'hello'; } }; a == 'hello'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_comparison_nan_object() {
+        let result = crate::builtins::global::global_eval(
+            "var a = { valueOf: function() { return NaN; } }; a < 10",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
     }
 }

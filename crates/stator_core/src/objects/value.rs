@@ -686,6 +686,24 @@ impl JsValue {
                 ordinary_to_primitive_plain_object(map, hint)
             }
 
+            // Array — OrdinaryToPrimitive: toString produces join(","),
+            // valueOf returns the array itself (not primitive), so
+            // toString always wins regardless of hint.
+            Self::Array(items) => {
+                let parts: Vec<String> = items
+                    .borrow()
+                    .iter()
+                    .map(|v| match v {
+                        Self::Null | Self::Undefined => String::new(),
+                        other => other.to_js_string().unwrap_or_default(),
+                    })
+                    .collect();
+                Ok(JsValue::String(parts.join(",").into()))
+            }
+
+            // Error — convert to its string representation (e.g. "TypeError: msg").
+            Self::Error(e) => Ok(JsValue::String(e.to_error_string().into())),
+
             // All other object-like types: default string representation.
             _ => Ok(JsValue::String(self.default_obj_to_string().into())),
         }
@@ -3205,5 +3223,53 @@ mod tests {
 
         assert!(JsValue::js_less_than(&obj, &JsValue::Smi(100)).unwrap());
         assert!(!JsValue::js_less_than(&obj, &JsValue::Smi(10)).unwrap());
+    }
+
+    // ── to_primitive: Array ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_to_primitive_array_number_hint() {
+        let items = vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)];
+        let arr = JsValue::Array(Rc::new(RefCell::new(items)));
+        let result = arr.to_primitive(ToPrimitiveHint::Number).unwrap();
+        assert_eq!(result, JsValue::String("1,2,3".into()));
+    }
+
+    #[test]
+    fn test_to_primitive_array_with_null_undefined() {
+        let items = vec![
+            JsValue::Smi(1),
+            JsValue::Null,
+            JsValue::Undefined,
+            JsValue::Smi(4),
+        ];
+        let arr = JsValue::Array(Rc::new(RefCell::new(items)));
+        let result = arr.to_primitive(ToPrimitiveHint::Default).unwrap();
+        assert_eq!(result, JsValue::String("1,,,4".into()));
+    }
+
+    #[test]
+    fn test_to_primitive_empty_array() {
+        let items: Vec<JsValue> = vec![];
+        let arr = JsValue::Array(Rc::new(RefCell::new(items)));
+        let result = arr.to_primitive(ToPrimitiveHint::Number).unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    // ── to_primitive: Error ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_to_primitive_error() {
+        let err = JsValue::Error(Rc::new(crate::builtins::error::JsError::new(
+            crate::builtins::error::ErrorKind::TypeError,
+            "test error".to_string(),
+        )));
+        let result = err.to_primitive(ToPrimitiveHint::String).unwrap();
+        if let JsValue::String(s) = result {
+            assert!(s.contains("TypeError"));
+            assert!(s.contains("test error"));
+        } else {
+            panic!("Expected string from error ToPrimitive");
+        }
     }
 }

@@ -5620,3 +5620,42 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::Illegal as usize] = handle_unimplemented;
     table
 };
+
+#[cfg(test)]
+mod tests {
+    use crate::objects::value::JsValue;
+
+    #[test]
+    fn test_typeof_generator() {
+        let result =
+            crate::builtins::global::global_eval("function* gen() { yield 1; } typeof gen()")
+                .unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn test_typeof_promise() {
+        let result =
+            crate::builtins::global::global_eval("typeof new Promise(function(r) { r(1); })")
+                .unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn test_for_in_array() {
+        let result = crate::builtins::global::global_eval(
+            "var a = [10, 20, 30]; var keys = []; for (var k in a) { keys.push(k); } keys.length",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_for_in_array_keys_are_strings() {
+        let result = crate::builtins::global::global_eval(
+            "var a = [10, 20]; var keys = []; for (var k in a) { keys.push(k); } keys[0]",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("0".into()));
+    }
+}
