@@ -1653,7 +1653,7 @@ impl<'src> Scanner<'src> {
                         TokenKind::QuestionQuestion
                     }
                 } else if self.peek() == Some('.')
-                    && !matches!(self.peek3(), Some(d) if d.is_ascii_digit())
+                    && !matches!(self.peek2(), Some(d) if d.is_ascii_digit())
                 {
                     // `?.` — but NOT `?.0` (that would be `?` + `.0`)
                     self.advance();

@@ -2487,13 +2487,16 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toFixed" => {
                 let n = *n as f64;
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let digits = match args.first() {
-                        Some(JsValue::Smi(d)) => (*d).max(0) as usize,
-                        Some(JsValue::HeapNumber(d)) => {
-                            crate::builtins::util::clamped_f64_to_usize(*d)
-                        }
-                        _ => 0,
+                    let frac = match args.first() {
+                        Some(v) => v.to_number()?,
+                        None => 0.0,
                     };
+                    if frac.is_nan() || frac < 0.0 || frac > 100.0 {
+                        return Err(StatorError::RangeError(
+                            "toFixed() digits argument must be between 0 and 100".into(),
+                        ));
+                    }
+                    let digits = frac as usize;
                     Ok(JsValue::String(format!("{n:.digits$}").into()))
                 }));
             }
@@ -2578,13 +2581,24 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toFixed" => {
                 let n = *n;
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let digits = match args.first() {
-                        Some(JsValue::Smi(d)) => (*d).max(0) as usize,
-                        Some(JsValue::HeapNumber(d)) => {
-                            crate::builtins::util::clamped_f64_to_usize(*d)
-                        }
-                        _ => 0,
+                    let frac = match args.first() {
+                        Some(v) => v.to_number()?,
+                        None => 0.0,
                     };
+                    if frac.is_nan() || frac < 0.0 || frac > 100.0 {
+                        return Err(StatorError::RangeError(
+                            "toFixed() digits argument must be between 0 and 100".into(),
+                        ));
+                    }
+                    let digits = frac as usize;
+                    if n.is_nan() {
+                        return Ok(JsValue::String("NaN".into()));
+                    }
+                    if n.is_infinite() {
+                        return Ok(JsValue::String(
+                            if n > 0.0 { "Infinity" } else { "-Infinity" }.into(),
+                        ));
+                    }
                     Ok(JsValue::String(format!("{n:.digits$}").into()))
                 }));
             }
@@ -3606,8 +3620,29 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let search = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let items = a.borrow();
+                        let len = items.len() as i32;
+                        let from = match args.get(1) {
+                            Some(JsValue::Smi(i)) => {
+                                if *i < 0 {
+                                    (len + *i).max(0) as usize
+                                } else {
+                                    (*i as usize).min(items.len())
+                                }
+                            }
+                            Some(JsValue::HeapNumber(n)) => {
+                                let i = *n as i32;
+                                if i < 0 {
+                                    (len + i).max(0) as usize
+                                } else {
+                                    (i as usize).min(items.len())
+                                }
+                            }
+                            _ => 0,
+                        };
+                        // SameValueZero: NaN === NaN, unlike strict equality
                         Ok(JsValue::Boolean(
-                            a.borrow().iter().any(|v| strict_eq(v, &search)),
+                            items[from..].iter().any(|v| v.same_value_zero(&search)),
                         ))
                     }));
                 }
@@ -3780,10 +3815,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let arr_val = JsValue::Array(Rc::clone(&a));
                         for (i, item) in a.borrow().iter().enumerate() {
                             let val = dispatch_call_value(
                                 &callback,
-                                vec![item.clone(), JsValue::Smi(i as i32)],
+                                vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if !val.to_boolean() {
                                 return Ok(JsValue::Boolean(false));
@@ -3796,10 +3832,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let arr_val = JsValue::Array(Rc::clone(&a));
                         for (i, item) in a.borrow().iter().enumerate() {
                             let val = dispatch_call_value(
                                 &callback,
-                                vec![item.clone(), JsValue::Smi(i as i32)],
+                                vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if val.to_boolean() {
                                 return Ok(JsValue::Boolean(true));
@@ -13427,5 +13464,140 @@ mod tests {
     fn test_array_tostring_null_elements() {
         let result = crate::builtins::global::global_eval("[null, undefined].toString()").unwrap();
         assert_eq!(result, JsValue::String(",".into()));
+    }
+
+    // ── Array.prototype.includes — SameValueZero ──────────────────────────────
+
+    #[test]
+    fn test_array_includes_nan() {
+        // SameValueZero: NaN is equal to NaN
+        let result = crate::builtins::global::global_eval("[NaN].includes(NaN)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_includes_basic() {
+        let result = crate::builtins::global::global_eval("[1,2,3].includes(2)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_includes_missing() {
+        let result = crate::builtins::global::global_eval("[1,2,3].includes(4)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_array_includes_from_index() {
+        // includes with fromIndex skips earlier elements
+        let result = crate::builtins::global::global_eval("[1,2,3].includes(1, 1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_array_includes_negative_from_index() {
+        // Negative fromIndex counts from end
+        let result = crate::builtins::global::global_eval("[1,2,3].includes(3, -1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Array.prototype.indexOf — strict equality (NaN !== NaN) ───────────────
+
+    #[test]
+    fn test_array_indexof_nan_not_found() {
+        // Strict equality: NaN !== NaN, so indexOf returns -1
+        let result = crate::builtins::global::global_eval("[NaN].indexOf(NaN)").unwrap();
+        assert_eq!(result, JsValue::Smi(-1));
+    }
+
+    #[test]
+    fn test_array_lastindexof_nan_not_found() {
+        let result = crate::builtins::global::global_eval("[NaN].lastIndexOf(NaN)").unwrap();
+        assert_eq!(result, JsValue::Smi(-1));
+    }
+
+    // ── Array.prototype.splice — returns removed elements ─────────────────────
+
+    #[test]
+    fn test_array_splice_returns_removed() {
+        let result =
+            crate::builtins::global::global_eval("var a = [1,2,3,4,5]; a.splice(1,2)").unwrap();
+        assert_eq!(
+            result,
+            JsValue::new_array(vec![JsValue::Smi(2), JsValue::Smi(3)])
+        );
+    }
+
+    #[test]
+    fn test_array_splice_mutates_original() {
+        let result =
+            crate::builtins::global::global_eval("var a = [1,2,3,4,5]; a.splice(1,2); a.length")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── Array.prototype.every / some — third callback arg ─────────────────────
+
+    #[test]
+    fn test_array_every_short_circuits() {
+        // every stops on first falsy return
+        let result = crate::builtins::global::global_eval(
+            "var count = 0; [1,2,3].every(function(x) { count++; return x < 2; }); count",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_array_some_short_circuits() {
+        // some stops on first truthy return
+        let result = crate::builtins::global::global_eval(
+            "var count = 0; [1,2,3].some(function(x) { count++; return x === 2; }); count",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_array_every_receives_array_arg() {
+        // Callback receives (element, index, array) — verify 3rd arg is the array
+        let result = crate::builtins::global::global_eval(
+            "var arr = [10]; var ref; arr.every(function(e, i, a) { ref = a; return true; }); ref === arr",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_some_receives_array_arg() {
+        let result = crate::builtins::global::global_eval(
+            "var arr = [10]; var ref; arr.some(function(e, i, a) { ref = a; return true; }); ref === arr",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Array.prototype.fill ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_array_fill_all() {
+        let result = crate::builtins::global::global_eval("[1,2,3].fill(0).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("0,0,0".into()));
+    }
+
+    #[test]
+    fn test_array_fill_with_range() {
+        let result =
+            crate::builtins::global::global_eval("[1,2,3].fill(4, 1, 2).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("1,4,3".into()));
+    }
+
+    // ── Array.prototype.copyWithin ────────────────────────────────────────────
+
+    #[test]
+    fn test_array_copyin_basic() {
+        let result =
+            crate::builtins::global::global_eval("[1,2,3,4,5].copyWithin(0, 3).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("4,5,3,4,5".into()));
     }
 }
