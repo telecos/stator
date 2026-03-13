@@ -4174,7 +4174,7 @@ impl FunctionCompiler {
                     None
                 } else {
                     return Err(StatorError::SyntaxError(
-                        "multiple declarators in for-in are not supported".into(),
+                        "for-in loop head must contain a single declaration".into(),
                     ));
                 }
             }
@@ -4378,7 +4378,7 @@ impl FunctionCompiler {
                     None
                 } else {
                     return Err(StatorError::SyntaxError(
-                        "multiple declarators in for-of are not supported".into(),
+                        "for-of loop head must contain a single declaration".into(),
                     ));
                 }
             }
@@ -8752,5 +8752,179 @@ mod tests {
                 .any(|i| i.opcode == Opcode::DefineKeyedOwnProperty),
             "computed class method must emit DefineKeyedOwnProperty"
         );
+    }
+
+    // ── 7. Labeled continue in for-of (bytecode) ────────────────────────
+
+    #[test]
+    fn test_labeled_continue_for_of_loop() {
+        // L: for (var x of iter) { continue L; }
+        use crate::parser::ast::{ForInOfLeft, ForOfStmt};
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Var, "iter", Some(num_expr(0.0))),
+            Stmt::Labeled(LabeledStmt {
+                loc: span(),
+                label: ident("L"),
+                body: Box::new(Stmt::ForOf(ForOfStmt {
+                    loc: span(),
+                    is_await: false,
+                    left: ForInOfLeft::VarDecl(VarDecl {
+                        loc: span(),
+                        kind: VarKind::Var,
+                        declarators: vec![VarDeclarator {
+                            loc: span(),
+                            id: Pat::Ident(ident("x")),
+                            init: None,
+                        }],
+                    }),
+                    right: Box::new(ident_expr("iter")),
+                    body: Box::new(Stmt::Continue(ContinueStmt {
+                        loc: span(),
+                        label: Some(ident("L")),
+                    })),
+                })),
+            }),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::Jump),
+            "labeled continue L in for-of must emit a Jump"
+        );
+    }
+
+    // ── 8. Conformance tests (eval-based) ───────────────────────────────
+
+    use crate::objects::value::JsValue;
+
+    /// Switch statement with fall-through
+    #[test]
+    fn test_switch_fallthrough() {
+        let result = crate::builtins::global::global_eval(
+            "var x = 0; switch(2) { case 1: x += 1; case 2: x += 2; case 3: x += 4; } x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    /// Switch with default
+    #[test]
+    fn test_switch_default() {
+        let result = crate::builtins::global::global_eval(
+            "var x = 0; switch(99) { case 1: x = 1; break; default: x = 42; } x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Nested ternary
+    #[test]
+    fn test_nested_ternary() {
+        let result = crate::builtins::global::global_eval(
+            "var x = 5; x > 10 ? 'big' : x > 3 ? 'medium' : 'small'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("medium".into()));
+    }
+
+    /// try-catch-finally
+    #[test]
+    fn test_try_catch_finally() {
+        let result = crate::builtins::global::global_eval(
+            "var x = 0; try { throw 'err'; } catch(e) { x = 1; } finally { x += 10; } x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(11));
+    }
+
+    /// Labeled break in nested loop
+    #[test]
+    fn test_labeled_break_nested() {
+        let result = crate::builtins::global::global_eval(
+            "var sum = 0; outer: for (var i = 0; i < 5; i++) { for (var j = 0; j < 5; j++) { if (j === 2) break outer; sum++; } } sum",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// Comma operator (direct expression result)
+    #[test]
+    fn test_comma_operator_direct_eval() {
+        let result = crate::builtins::global::global_eval("(1, 2, 3)").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// Void operator
+    #[test]
+    fn test_void_operator() {
+        let result = crate::builtins::global::global_eval("void 42").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// delete on object property
+    #[test]
+    fn test_delete_property() {
+        let result =
+            crate::builtins::global::global_eval("var obj = {x: 1, y: 2}; delete obj.x; obj.x")
+                .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// Getter in object literal
+    #[test]
+    fn test_getter_in_object() {
+        let result =
+            crate::builtins::global::global_eval("var obj = { get val() { return 42; } }; obj.val")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Setter in object literal
+    #[test]
+    fn test_setter_in_object() {
+        let result = crate::builtins::global::global_eval(
+            "var obj = { _x: 0, set x(v) { this._x = v; }, get x() { return this._x; } }; obj.x = 5; obj.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// Symbol basic
+    #[test]
+    fn test_symbol_typeof() {
+        let result = crate::builtins::global::global_eval("typeof Symbol('test')").unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// for-in over object keys
+    #[test]
+    fn test_for_in_object_keys() {
+        let result = crate::builtins::global::global_eval(
+            "var keys = ''; var obj = {a:1, b:2, c:3}; for (var k in obj) keys += k; keys",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("abc".into()));
+    }
+
+    /// Bitwise AND
+    #[test]
+    fn test_bitwise_and() {
+        let result = crate::builtins::global::global_eval("0xFF & 0x0F").unwrap();
+        assert_eq!(result, JsValue::Smi(15));
+    }
+
+    /// Bitwise left shift
+    #[test]
+    fn test_bitwise_left_shift() {
+        let result = crate::builtins::global::global_eval("1 << 10").unwrap();
+        assert_eq!(result, JsValue::Smi(1024));
+    }
+
+    /// Unsigned right shift
+    #[test]
+    fn test_unsigned_right_shift() {
+        let result = crate::builtins::global::global_eval("-1 >>> 0").unwrap();
+        // Result is 4294967295 which exceeds Smi range, so HeapNumber
+        assert_eq!(result, JsValue::HeapNumber(4294967295.0));
     }
 }

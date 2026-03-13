@@ -16822,4 +16822,163 @@ mod tests {
             panic!("Array should be PlainObject");
         }
     }
+
+    // ── Conformance round-21 tests ──────────────────────────────────────
+
+    /// `Number.parseFloat` delegates to global parseFloat.
+    #[test]
+    fn test_number_parse_float() {
+        let result = global_eval("Number.parseFloat('3.14')").unwrap();
+        assert_eq!(result, JsValue::HeapNumber(3.14));
+    }
+
+    /// `Number.parseInt` delegates to global parseInt.
+    #[test]
+    fn test_number_parse_int() {
+        let result = global_eval("Number.parseInt('42')").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `Object.keys` returns own enumerable string-keyed property names.
+    #[test]
+    fn test_object_keys_basic() {
+        let result = global_eval("Object.keys({a:1, b:2, c:3}).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("a,b,c".into()));
+    }
+
+    /// `Object.values` returns own enumerable string-keyed property values.
+    #[test]
+    fn test_object_values_basic() {
+        let result = global_eval("Object.values({a:1, b:2, c:3}).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("1,2,3".into()));
+    }
+
+    /// `Object.entries` returns [key, value] pairs.
+    #[test]
+    fn test_object_entries_basic() {
+        let result = global_eval("Object.entries({a:1, b:2}).length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `Object.assign` merges source properties into target.
+    #[test]
+    fn test_object_assign_basic() {
+        let result = global_eval(
+            "var target = {}; Object.assign(target, {x:1}, {y:2}); target.x + target.y",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Array.isArray` returns true for arrays.
+    #[test]
+    fn test_array_is_array_true() {
+        let result = global_eval("Array.isArray([1,2,3])").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Array.isArray` returns false for plain objects.
+    #[test]
+    fn test_array_is_array_false() {
+        let result = global_eval("Array.isArray({length: 3})").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Array.from` converts a string into an array of characters.
+    #[test]
+    fn test_array_from_string() {
+        let result = global_eval("Array.from('abc').join(',')").unwrap();
+        assert_eq!(result, JsValue::String("a,b,c".into()));
+    }
+
+    /// `Array.of` creates an array from its arguments.
+    #[test]
+    fn test_array_of_basic() {
+        let result = global_eval("Array.of(1,2,3).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("1,2,3".into()));
+    }
+
+    /// `Map` set/get round-trip.
+    #[test]
+    fn test_map_has_get() {
+        let result = global_eval("var m = new Map(); m.set('key', 42); m.get('key')").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `Set.prototype.has` returns true for added values.
+    #[test]
+    fn test_set_has() {
+        let result = global_eval("var s = new Set(); s.add(42); s.has(42)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `JSON.parse` deserializes a JSON string.
+    #[test]
+    fn test_json_parse_basic() {
+        let result = global_eval("JSON.parse('{\"x\":42}').x").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `JSON.stringify` serializes an object.
+    #[test]
+    fn test_json_stringify_basic() {
+        let result = global_eval("JSON.stringify({x:1,y:2})").unwrap();
+        assert_eq!(result, JsValue::String("{\"x\":1,\"y\":2}".into()));
+    }
+
+    /// `RegExp.prototype.test` matches patterns.
+    #[test]
+    fn test_regexp_test_true() {
+        let result = global_eval("new RegExp('hello').test('hello world')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `String.fromCharCode` builds a string from char codes.
+    #[test]
+    fn test_string_from_char_code() {
+        let result = global_eval("String.fromCharCode(72, 101, 108, 108, 111)").unwrap();
+        assert_eq!(result, JsValue::String("Hello".into()));
+    }
+
+    /// `Math.max` returns the largest argument.
+    #[test]
+    fn test_math_max() {
+        let result = global_eval("Math.max(1, 3, 2)").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Math.min` returns the smallest argument.
+    #[test]
+    fn test_math_min() {
+        let result = global_eval("Math.min(1, 3, 2)").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `Math.abs` returns the absolute value.
+    #[test]
+    fn test_math_abs() {
+        let result = global_eval("Math.abs(-42)").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `Date.now()` returns a number.
+    #[test]
+    fn test_date_now_type() {
+        let result = global_eval("typeof Date.now()").unwrap();
+        assert_eq!(result, JsValue::String("number".into()));
+    }
+
+    /// `new Error('test').message` returns the message.
+    #[test]
+    fn test_error_message() {
+        let result = global_eval("new Error('test').message").unwrap();
+        assert_eq!(result, JsValue::String("test".into()));
+    }
+
+    /// `new TypeError('bad').name` returns "TypeError".
+    #[test]
+    fn test_type_error_name() {
+        let result = global_eval("new TypeError('bad').name").unwrap();
+        assert_eq!(result, JsValue::String("TypeError".into()));
+    }
 }
