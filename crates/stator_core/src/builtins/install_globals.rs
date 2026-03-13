@@ -1605,6 +1605,13 @@ fn make_date_instance(t: f64) -> JsValue {
     // §20.1.3.6 — identify as Date for Object.prototype.toString.
     obj.insert("@@toStringTag".into(), JsValue::String("Date".into()));
 
+    // Mark as Date instance for instanceof checks.
+    obj.insert_with_attrs(
+        "__is_date__".into(),
+        JsValue::Boolean(true),
+        PropertyAttributes::empty(),
+    );
+
     // ── getTime / valueOf ────────────────────────────────────────────────
     {
         let inner = Rc::clone(&inner);
@@ -5348,6 +5355,11 @@ fn make_map_builtin() -> JsValue {
             // Store the JsMap in a RefCell so prototype methods can mutate it.
             let inner = Rc::new(RefCell::new(m));
             let mut obj = PropertyMap::new();
+            obj.insert_with_attrs(
+                "__is_map__".into(),
+                JsValue::Boolean(true),
+                PropertyAttributes::empty(),
+            );
             // size getter
             {
                 let inner = Rc::clone(&inner);
@@ -5692,7 +5704,11 @@ fn make_set_builtin() -> JsValue {
             };
             let inner = Rc::new(RefCell::new(s));
             let mut obj = PropertyMap::new();
-            // size getter
+            obj.insert_with_attrs(
+                "__is_set__".into(),
+                JsValue::Boolean(true),
+                PropertyAttributes::empty(),
+            );
             {
                 let inner = Rc::clone(&inner);
                 obj.insert(
@@ -5988,6 +6004,11 @@ fn make_weak_map_builtin() -> JsValue {
         native(|_args| {
             let inner = Rc::new(RefCell::new(weak_map_new()));
             let mut obj = PropertyMap::new();
+            obj.insert_with_attrs(
+                "__is_weakmap__".into(),
+                JsValue::Boolean(true),
+                PropertyAttributes::empty(),
+            );
 
             // get(key)
             {
@@ -6176,6 +6197,11 @@ fn make_weak_set_builtin() -> JsValue {
         native(|_args| {
             let inner: Rc<RefCell<HashSet<usize>>> = Rc::new(RefCell::new(HashSet::new()));
             let mut obj = PropertyMap::new();
+            obj.insert_with_attrs(
+                "__is_weakset__".into(),
+                JsValue::Boolean(true),
+                PropertyAttributes::empty(),
+            );
 
             // add(value) — returns the WeakSet for chaining
             {
@@ -6298,6 +6324,11 @@ fn make_weak_ref_builtin() -> JsValue {
             };
             let inner = Rc::new(RefCell::new(wr));
             let mut obj = PropertyMap::new();
+            obj.insert_with_attrs(
+                "__is_weakref__".into(),
+                JsValue::Boolean(true),
+                PropertyAttributes::empty(),
+            );
 
             // deref()
             {

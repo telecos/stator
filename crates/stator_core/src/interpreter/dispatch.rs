@@ -3730,9 +3730,15 @@ fn handle_test_instance_of(
     let constructor = ctx.frame.read_reg(v)?.clone();
 
     // §7.3.21 OrdinaryHasInstance — first check @@hasInstance
-    if let JsValue::PlainObject(map) = &constructor
-        && let Some(JsValue::NativeFunction(f)) = map.borrow().get("@@hasInstance").cloned()
-    {
+    let has_instance_fn = match &constructor {
+        JsValue::PlainObject(map) => map.borrow().get("@@hasInstance").cloned(),
+        JsValue::NativeFunction(_) | JsValue::Function(_) => {
+            // Check global scope for @@hasInstance on the constructor
+            None
+        }
+        _ => None,
+    };
+    if let Some(JsValue::NativeFunction(f)) = has_instance_fn {
         let result = f(vec![ctx.frame.accumulator.clone()])?;
         ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
         return Ok(DispatchAction::Continue);
@@ -3758,6 +3764,34 @@ fn handle_test_instance_of(
             ("Promise", |v| matches!(v, JsValue::Promise(_))),
             // Error hierarchy: instanceof Error matches ALL error kinds
             ("Error", |v| matches!(v, JsValue::Error(_))),
+            (
+                "RegExp",
+                |v| matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_regexp__").is_some()),
+            ),
+            (
+                "Date",
+                |v| matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_date__").is_some()),
+            ),
+            (
+                "Map",
+                |v| matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_map__").is_some()),
+            ),
+            (
+                "Set",
+                |v| matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_set__").is_some()),
+            ),
+            (
+                "WeakMap",
+                |v| matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_weakmap__").is_some()),
+            ),
+            (
+                "WeakSet",
+                |v| matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_weakset__").is_some()),
+            ),
+            (
+                "WeakRef",
+                |v| matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_weakref__").is_some()),
+            ),
         ];
         for &(name, predicate) in builtin_checks {
             if let Some(JsValue::NativeFunction(global_fn)) = global.get(name)
@@ -3796,6 +3830,7 @@ fn handle_test_instance_of(
     // Obtain the constructor's "prototype" property.
     let ctor_proto = match &constructor {
         JsValue::PlainObject(map) => map.borrow().get("prototype").cloned(),
+        JsValue::Function(f) => f.borrow().get("prototype").cloned(),
         _ => None,
     };
 
