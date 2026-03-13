@@ -36,3 +36,4 @@ _codeql_detected_source_root
 # Build artifacts that may leak to repo root
 *.rcgu.o
 4610
+vs_BuildTools.exe
