@@ -4822,6 +4822,14 @@ fn handle_get_template_object(
                 ))
             })?;
         let tpl_val = constant_to_value(entry);
+        // ES §12.2.9.3: The template object and its `raw` property must be frozen.
+        if let JsValue::PlainObject(ref map) = tpl_val {
+            let raw_clone = map.borrow().get("raw").cloned();
+            if let Some(JsValue::PlainObject(ref raw_map)) = raw_clone {
+                raw_map.borrow_mut().freeze();
+            }
+            map.borrow_mut().freeze();
+        }
         ctx.frame.template_cache.insert(cache_key, tpl_val.clone());
         ctx.frame.accumulator = tpl_val;
     }
@@ -6317,5 +6325,232 @@ mod tests {
     fn e2e_positive_negative_zero_equal() {
         let result = crate::builtins::global::global_eval("+0 === -0").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── §1 Object literal prototype chain ───────────────────────────────
+
+    #[test]
+    fn test_object_literal_has_tostring() {
+        let result = crate::builtins::global::global_eval("({}).toString()").unwrap();
+        assert_eq!(result, JsValue::String("[object Object]".into()));
+    }
+
+    #[test]
+    fn test_object_literal_has_valueof() {
+        let result = crate::builtins::global::global_eval("typeof ({}).valueOf()").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn test_object_literal_has_hasownproperty() {
+        let result = crate::builtins::global::global_eval("({a: 1}).hasOwnProperty('a')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_object_literal_hasownproperty_missing() {
+        let result = crate::builtins::global::global_eval("({a: 1}).hasOwnProperty('b')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_object_literal_tostring_tag() {
+        // Object.prototype.toString.call(null) should classify the receiver.
+        let result = crate::builtins::global::global_eval("var o = {x: 1}; o.toString()").unwrap();
+        assert_eq!(result, JsValue::String("[object Object]".into()));
+    }
+
+    // ── §2 Property descriptor: writable / enumerable / configurable ────
+
+    #[test]
+    fn test_object_literal_property_writable() {
+        let result = crate::builtins::global::global_eval("var o = {a: 1}; o.a = 2; o.a").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_object_literal_property_enumerable() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {a: 1, b: 2}; var r = ''; for (var k in o) r += k + ','; r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,b,".into()));
+    }
+
+    #[test]
+    fn test_object_literal_property_configurable() {
+        let result =
+            crate::builtins::global::global_eval("var o = {a: 1}; delete o.a; o.a === undefined")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_object_literal_descriptor_all_true() {
+        let result = crate::builtins::global::global_eval(
+            "var d = Object.getOwnPropertyDescriptor({a: 1}, 'a'); \
+             d.writable === true && d.enumerable === true && d.configurable === true",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── §3 Frozen / sealed object store behaviour ───────────────────────
+
+    #[test]
+    fn test_frozen_object_strict_throws() {
+        let result = crate::builtins::global::global_eval(
+            "var o = Object.freeze({a: 1}); \
+             (function() { 'use strict'; try { o.a = 2; return 'no error'; } catch(e) { return e.message; } })()",
+        )
+        .unwrap();
+        match result {
+            JsValue::String(s) => assert!(
+                s.contains("read only"),
+                "Expected 'read only' in error: {s}"
+            ),
+            other => panic!("Expected string error message, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sealed_object_no_add_strict() {
+        let result = crate::builtins::global::global_eval(
+            "var o = Object.seal({a: 1}); \
+             (function() { 'use strict'; try { o.b = 2; return 'no error'; } catch(e) { return e.message; } })()",
+        )
+        .unwrap();
+        match result {
+            JsValue::String(s) => assert!(
+                s.contains("not extensible"),
+                "Expected 'not extensible' in error: {s}"
+            ),
+            other => panic!("Expected string error message, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_frozen_object_is_frozen() {
+        let result =
+            crate::builtins::global::global_eval("Object.isFrozen(Object.freeze({a: 1}))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_sealed_object_existing_prop_writable() {
+        // Sealed objects allow writing to existing writable properties.
+        let result =
+            crate::builtins::global::global_eval("var o = Object.seal({a: 1}); o.a = 99; o.a")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    // ── §4 Arguments object ─────────────────────────────────────────────
+
+    #[test]
+    fn test_arguments_length() {
+        let result = crate::builtins::global::global_eval(
+            "(function(a, b, c) { return arguments.length; })(10, 20, 30)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_arguments_indexed_access() {
+        let result = crate::builtins::global::global_eval(
+            "(function(a, b) { return arguments[0] + arguments[1]; })(3, 7)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_arguments_callee_sloppy() {
+        let result = crate::builtins::global::global_eval(
+            "(function f() { return typeof arguments.callee; })()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn test_arguments_is_array_like() {
+        // arguments has numeric indices and length but is not an Array.
+        let result = crate::builtins::global::global_eval(
+            "(function() { return arguments.length === 2 && arguments[0] === 'a' && arguments[1] === 'b'; })('a', 'b')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── §5 for-in enumeration order ─────────────────────────────────────
+
+    #[test]
+    fn test_for_in_insertion_order_strings() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {b: 1, a: 2, c: 3}; var r = ''; for (var k in o) r += k + ','; r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("b,a,c,".into()));
+    }
+
+    #[test]
+    fn test_for_in_integer_indices_first() {
+        // Integer indices should come first in ascending order,
+        // then string keys in insertion order.
+        let result = crate::builtins::global::global_eval(
+            "var o = {b: 1, 2: 2, a: 3, 0: 4}; var r = ''; for (var k in o) r += k + ','; r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("0,2,b,a,".into()));
+    }
+
+    #[test]
+    fn test_for_in_skips_nonenumerable() {
+        // Object.freeze does not change enumerability, so all keys should still appear.
+        let result = crate::builtins::global::global_eval(
+            "var o = Object.freeze({x: 1, y: 2}); var r = ''; for (var k in o) r += k + ','; r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("x,y,".into()));
+    }
+
+    // ── §6 Template object frozen ───────────────────────────────────────
+
+    #[test]
+    fn test_template_object_is_frozen() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strs) { return Object.isFrozen(strs); } tag`hello`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_template_object_raw_is_frozen() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strs) { return Object.isFrozen(strs.raw); } tag`hello`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_template_object_has_raw() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strs) { return strs.raw !== undefined; } tag`hello`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_template_object_length() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strs) { return strs.length; } tag`a${1}b`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
     }
 }
