@@ -1684,7 +1684,7 @@ impl FunctionCompiler {
     fn compile_break(&mut self, s: &crate::parser::ast::BreakStmt) -> StatorResult<()> {
         if let Some(label) = &s.label {
             let (_, break_label) = *self.label_map.get(&label.name).ok_or_else(|| {
-                StatorError::Internal(format!("undefined label '{}'", label.name))
+                StatorError::SyntaxError(format!("undefined label '{}'", label.name))
             })?;
             self.emit_jump(Opcode::Jump, break_label);
             return Ok(());
@@ -1692,7 +1692,7 @@ impl FunctionCompiler {
         let (_, break_label) = *self
             .loop_stack
             .last()
-            .ok_or_else(|| StatorError::Internal("break outside loop".into()))?;
+            .ok_or_else(|| StatorError::SyntaxError("break outside loop".into()))?;
         self.emit_jump(Opcode::Jump, break_label);
         Ok(())
     }
@@ -1705,10 +1705,10 @@ impl FunctionCompiler {
     fn compile_continue(&mut self, s: &crate::parser::ast::ContinueStmt) -> StatorResult<()> {
         if let Some(label) = &s.label {
             let (continue_label, _) = *self.label_map.get(&label.name).ok_or_else(|| {
-                StatorError::Internal(format!("undefined label '{}'", label.name))
+                StatorError::SyntaxError(format!("undefined label '{}'", label.name))
             })?;
             let continue_label = continue_label.ok_or_else(|| {
-                StatorError::Internal(format!(
+                StatorError::SyntaxError(format!(
                     "label '{}' is not a loop — continue is invalid",
                     label.name
                 ))
@@ -1719,7 +1719,7 @@ impl FunctionCompiler {
         let (continue_label, _) = *self
             .loop_stack
             .last()
-            .ok_or_else(|| StatorError::Internal("continue outside loop".into()))?;
+            .ok_or_else(|| StatorError::SyntaxError("continue outside loop".into()))?;
         self.emit_jump(Opcode::Jump, continue_label);
         Ok(())
     }
@@ -1734,7 +1734,9 @@ impl FunctionCompiler {
     fn compile_labeled(&mut self, s: &crate::parser::ast::LabeledStmt) -> StatorResult<()> {
         let name = s.label.name.clone();
         if self.label_map.contains_key(&name) {
-            return Err(StatorError::Internal(format!("duplicate label '{name}'")));
+            return Err(StatorError::SyntaxError(format!(
+                "duplicate label '{name}'"
+            )));
         }
 
         let break_label = self.new_label();
@@ -2100,7 +2102,7 @@ impl FunctionCompiler {
                 // ── Async / generators ────────────────────────────────────────
                 Expr::Yield(y) => {
                     if !self.is_generator {
-                        return Err(StatorError::Internal(
+                        return Err(StatorError::SyntaxError(
                             "yield expression outside of a generator function".into(),
                         ));
                     }
@@ -2108,7 +2110,7 @@ impl FunctionCompiler {
                 }
                 Expr::Await(a) => {
                     if !self.is_async {
-                        return Err(StatorError::Internal(
+                        return Err(StatorError::SyntaxError(
                             "await expression outside of an async function".into(),
                         ));
                     }
@@ -2123,7 +2125,7 @@ impl FunctionCompiler {
                 }
                 Expr::Import(imp) => self.compile_import_call(imp),
                 Expr::MetaProp(m) => self.compile_meta_prop(m),
-                Expr::PrivateName(_) => Err(StatorError::Internal(
+                Expr::PrivateName(_) => Err(StatorError::SyntaxError(
                     "bare private name expression should only appear as LHS of 'in'".into(),
                 )),
             }
@@ -2295,7 +2297,7 @@ impl FunctionCompiler {
             Expr::Ident(id) => self.compile_ident_store(&id.name),
             Expr::Member(m) => self.compile_member_store(m)?,
             _ => {
-                return Err(StatorError::Internal(
+                return Err(StatorError::SyntaxError(
                     "update target must be an identifier or member expression".into(),
                 ));
             }
@@ -2568,7 +2570,7 @@ impl FunctionCompiler {
                     Ok(())
                 }
                 Expr::Member(m) => self.compile_member(m),
-                _ => Err(StatorError::Internal(
+                _ => Err(StatorError::SyntaxError(
                     "unsupported assignment target".into(),
                 )),
             },
@@ -2589,7 +2591,7 @@ impl FunctionCompiler {
                     Ok(())
                 }
                 Expr::Member(m) => self.compile_member_store(m),
-                _ => Err(StatorError::Internal(
+                _ => Err(StatorError::SyntaxError(
                     "unsupported assignment target".into(),
                 )),
             },
@@ -4014,7 +4016,7 @@ impl FunctionCompiler {
                 } else if decl.declarators.is_empty() {
                     None
                 } else {
-                    return Err(StatorError::Internal(
+                    return Err(StatorError::SyntaxError(
                         "multiple declarators in for-in are not supported".into(),
                     ));
                 }
@@ -4204,7 +4206,7 @@ impl FunctionCompiler {
                 } else if decl.declarators.is_empty() {
                     None
                 } else {
-                    return Err(StatorError::Internal(
+                    return Err(StatorError::SyntaxError(
                         "multiple declarators in for-of are not supported".into(),
                     ));
                 }
@@ -4816,7 +4818,7 @@ impl BytecodeGenerator {
                 ProgramItem::Stmt(stmt) => compiler.compile_stmt(stmt)?,
                 ProgramItem::ModuleDecl(decl) => {
                     if !is_module {
-                        return Err(StatorError::Internal(
+                        return Err(StatorError::SyntaxError(
                             "module declarations are not allowed in scripts".into(),
                         ));
                     }
@@ -4849,7 +4851,7 @@ impl BytecodeGenerator {
                 ProgramItem::Stmt(Stmt::FnDecl(_)) => {}
                 ProgramItem::Stmt(stmt) => compiler.compile_stmt(stmt)?,
                 ProgramItem::ModuleDecl(_) => {
-                    return Err(StatorError::Internal(
+                    return Err(StatorError::SyntaxError(
                         "module declarations are not allowed in eval".into(),
                     ));
                 }
