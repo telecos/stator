@@ -2235,6 +2235,15 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 Err(_) => JsValue::Undefined,
             };
         }
+        // If this PlainObject is an array literal, delegate to Array.prototype
+        // BEFORE falling through to Object.prototype methods (e.g. toString).
+        if borrow
+            .get("__is_array__")
+            .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
+        {
+            drop(borrow);
+            return array_literal_proto_lookup(obj, key);
+        }
         // Object.prototype methods available on all plain objects.
         match key {
             "hasOwnProperty" => {
@@ -2435,14 +2444,6 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             _ => {}
-        }
-        // If this PlainObject is an array literal, delegate to Array.prototype.
-        if borrow
-            .get("__is_array__")
-            .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
-        {
-            drop(borrow);
-            return array_literal_proto_lookup(obj, key);
         }
         // Walk __proto__ chain.
         if let Some(proto) = borrow.get("__proto__") {
