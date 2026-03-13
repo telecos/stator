@@ -4256,7 +4256,12 @@ fn handle_delete_property_strict(
     let key = to_property_key(&ctx.frame.accumulator)?;
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     if let JsValue::Proxy(ref p) = obj {
-        proxy_delete_property(&mut p.borrow_mut(), &key)?;
+        let deleted = proxy_delete_property(&mut p.borrow_mut(), &key)?;
+        if !deleted {
+            return Err(StatorError::TypeError(format!(
+                "Cannot delete property '{key}'"
+            )));
+        }
     } else if let JsValue::PlainObject(ref map) = obj {
         let pm = map.borrow();
         if pm.contains_key(&key) && !pm.is_configurable(&key) {
@@ -6294,5 +6299,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn e2e_typeof_null() {
+        let result = crate::builtins::global::global_eval("typeof null").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_nan_strict_equal() {
+        let result = crate::builtins::global::global_eval("NaN === NaN").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_positive_negative_zero_equal() {
+        let result = crate::builtins::global::global_eval("+0 === -0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 }
