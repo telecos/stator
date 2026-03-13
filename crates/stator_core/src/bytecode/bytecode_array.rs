@@ -240,6 +240,11 @@ pub struct BytecodeArray {
     is_module: bool,
     /// `true` if this bytecode was compiled in strict mode (`"use strict"`).
     is_strict: bool,
+    /// `true` if this bytecode belongs to an arrow function (`=>`).
+    ///
+    /// Arrow functions are not constructable — invoking them with `new`
+    /// must throw a `TypeError`.
+    is_arrow: bool,
     // ─── Tiering state (shared across clones via Rc / Arc) ───────────────────
     /// Number of times this function has been invoked.
     ///
@@ -299,6 +304,7 @@ impl PartialEq for BytecodeArray {
             && self.is_async == other.is_async
             && self.is_module == other.is_module
             && self.is_strict == other.is_strict
+            && self.is_arrow == other.is_arrow
     }
 }
 
@@ -337,6 +343,7 @@ impl BytecodeArray {
             is_async: false,
             is_module: false,
             is_strict: false,
+            is_arrow: false,
             invocation_count: Rc::new(Cell::new(0)),
             jit_code: Rc::new(RefCell::new(None)),
             maglev_jit_code: Arc::new(Mutex::new(None)),
@@ -402,6 +409,20 @@ impl BytecodeArray {
     /// Returns `true` if this bytecode was compiled in strict mode.
     pub fn is_strict(&self) -> bool {
         self.is_strict
+    }
+
+    /// Mark this [`BytecodeArray`] as belonging to an arrow function.
+    ///
+    /// Arrow functions are not constructable — invoking them with `new`
+    /// must throw a `TypeError` per ES §15.3.4.
+    pub fn with_arrow_flag(mut self, flag: bool) -> Self {
+        self.is_arrow = flag;
+        self
+    }
+
+    /// Returns `true` if this bytecode belongs to an arrow function (`=>`).
+    pub fn is_arrow(&self) -> bool {
+        self.is_arrow
     }
 
     /// Returns the captured closure context, if any.

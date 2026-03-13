@@ -1929,6 +1929,12 @@ fn handle_construct(
     let ctor_proto = proto_lookup(&ctor, "prototype");
     match ctor {
         JsValue::Function(ba) => {
+            // Arrow functions are not constructable (ES §15.3.4).
+            if ba.is_arrow() {
+                return Err(StatorError::TypeError(
+                    "Function is not a constructor".to_string(),
+                ));
+            }
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
             // [[Construct]]: create a fresh object for `this`,
             // wire its __proto__ to the constructor's prototype,
@@ -1964,7 +1970,8 @@ fn handle_construct(
         }
         JsValue::NativeFunction(f) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-            ctx.frame.accumulator = f(args)?;
+            let val = f(args)?;
+            ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
         }
         JsValue::PlainObject(ref map) => {
             let call_val = map.borrow().get("__call__").cloned();
@@ -2052,7 +2059,8 @@ fn handle_construct_with_spread(
             };
         }
         JsValue::NativeFunction(f) => {
-            ctx.frame.accumulator = f(args)?;
+            let val = f(args)?;
+            ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
         }
         JsValue::PlainObject(ref map) => {
             let call_val = map.borrow().get("__call__").cloned();
@@ -5083,6 +5091,11 @@ fn handle_construct_forward_all_args(
         .to_vec();
     match ctor {
         JsValue::Function(ba) => {
+            if ba.is_arrow() {
+                return Err(StatorError::TypeError(
+                    "Function is not a constructor".to_string(),
+                ));
+            }
             let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
             if !matches!(ctor_proto, JsValue::Undefined) {
                 this_obj
@@ -5111,7 +5124,8 @@ fn handle_construct_forward_all_args(
             };
         }
         JsValue::NativeFunction(f) => {
-            ctx.frame.accumulator = f(args)?;
+            let val = f(args)?;
+            ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
         }
         JsValue::PlainObject(ref map) => {
             let call_val = map.borrow().get("__call__").cloned();
@@ -5881,5 +5895,17 @@ mod tests {
             crate::builtins::global::global_eval("var d = new Date(); d.constructor === Date")
                 .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_arrow_not_constructable() {
+        let result = crate::builtins::global::global_eval(
+            "var f = () => {}; try { new f(); 'no error' } catch(e) { e.message }",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("Function is not a constructor".into())
+        );
     }
 }
