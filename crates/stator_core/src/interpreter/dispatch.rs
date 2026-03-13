@@ -5833,7 +5833,7 @@ mod tests {
              var f = new Foo(); f.test()",
         )
         .unwrap();
-        assert_eq!(result, JsValue::Number(42.0));
+        assert_eq!(result, JsValue::Smi(42));
     }
 
     #[test]
@@ -5842,7 +5842,7 @@ mod tests {
             "class C { #x = 10; get() { return this.#x; } } new C().get()",
         )
         .unwrap();
-        assert_eq!(result, JsValue::Number(10.0));
+        assert_eq!(result, JsValue::Smi(10));
     }
 
     #[test]
@@ -5852,7 +5852,7 @@ mod tests {
              var c = new C(); c.set(99); c.get()",
         )
         .unwrap();
-        assert_eq!(result, JsValue::Number(99.0));
+        assert_eq!(result, JsValue::Smi(99));
     }
 
     #[test]
