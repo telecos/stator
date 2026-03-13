@@ -3539,8 +3539,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 JsValue::Smi(n) => n.to_string(),
                                 JsValue::HeapNumber(n) => format!("{n}"),
                                 JsValue::Boolean(b) => b.to_string(),
-                                JsValue::Null => "null".to_string(),
-                                JsValue::Undefined => "".to_string(),
+                                JsValue::Null | JsValue::Undefined => String::new(),
                                 _ => String::new(),
                             })
                             .collect();
@@ -3558,8 +3557,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 JsValue::Smi(n) => n.to_string(),
                                 JsValue::HeapNumber(n) => format!("{n}"),
                                 JsValue::Boolean(b) => b.to_string(),
-                                JsValue::Null => "null".to_string(),
-                                JsValue::Undefined => "".to_string(),
+                                JsValue::Null | JsValue::Undefined => String::new(),
                                 _ => String::new(),
                             })
                             .collect();
