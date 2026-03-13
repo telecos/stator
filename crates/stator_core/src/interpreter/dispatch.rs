@@ -1161,7 +1161,22 @@ fn handle_create_closure(
     if let Some(JsValue::Context(c)) = &ctx.frame.context {
         closure_ba.set_closure_context(Rc::clone(c));
     }
-    ctx.frame.accumulator = JsValue::Function(Rc::new(closure_ba));
+    let func_rc = Rc::new(closure_ba);
+
+    // Non-arrow functions (flag == 0) get a .prototype property per ES §10.2.5.
+    let is_arrow = matches!(instr.operands.get(2), Some(Operand::Flag(1)));
+    if !is_arrow {
+        let func_val = JsValue::Function(Rc::clone(&func_rc));
+        let mut proto = PropertyMap::new();
+        proto.insert("constructor".to_string(), func_val);
+        fn_props_set(
+            &func_rc,
+            "prototype".to_string(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        );
+    }
+
+    ctx.frame.accumulator = JsValue::Function(func_rc);
     Ok(DispatchAction::Continue)
 }
 
@@ -3830,7 +3845,6 @@ fn handle_test_instance_of(
     // Obtain the constructor's "prototype" property.
     let ctor_proto = match &constructor {
         JsValue::PlainObject(map) => map.borrow().get("prototype").cloned(),
-        JsValue::Function(f) => f.borrow().get("prototype").cloned(),
         _ => None,
     };
 
@@ -5734,5 +5748,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::String("0".into()));
+    }
+
+    #[test]
+    fn e2e_user_constructor_instanceof() {
+        let result = crate::builtins::global::global_eval(
+            "function Foo() {} var x = new Foo(); x instanceof Foo",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_function_has_prototype() {
+        let result = crate::builtins::global::global_eval(
+            "function Foo() {} typeof Foo.prototype === 'object'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_prototype_constructor_points_back() {
+        let result = crate::builtins::global::global_eval(
+            "function Foo() {} Foo.prototype.constructor === Foo",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_arrow_no_prototype() {
+        let result =
+            crate::builtins::global::global_eval("var f = () => {}; f.prototype === undefined")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 }

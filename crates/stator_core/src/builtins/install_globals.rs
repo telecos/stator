@@ -124,9 +124,6 @@ use crate::builtins::typed_array::{
     typed_array_new_from_length, typed_array_reverse, typed_array_set_from, typed_array_slice,
     typed_array_sort, typed_array_subarray, typed_array_values,
 };
-use crate::builtins::weak_map::{
-    weak_map_delete, weak_map_get, weak_map_has, weak_map_new, weak_map_set,
-};
 use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new, weak_ref_new_plain};
 use crate::error::{StatorError, StatorResult};
 use crate::interpreter::{dispatch_call_value, dispatch_call_with_this};
@@ -153,7 +150,7 @@ fn weak_collection_key(val: &JsValue) -> Option<usize> {
         JsValue::Object(ptr) => Some(*ptr as usize),
         JsValue::PlainObject(rc) => Some(Rc::as_ptr(rc) as usize),
         JsValue::Function(rc) => Some(Rc::as_ptr(rc) as usize),
-        JsValue::NativeFunction(rc) => Some(Rc::as_ptr(rc) as usize),
+        JsValue::NativeFunction(rc) => Some(Rc::as_ptr(rc) as *const () as usize),
         _ => None,
     }
 }
@@ -5378,188 +5375,192 @@ fn make_map_builtin() -> JsValue {
             };
             // Store the JsMap in a RefCell so prototype methods can mutate it.
             let inner = Rc::new(RefCell::new(m));
-            let mut obj = PropertyMap::new();
-            obj.insert_with_attrs(
-                "__is_map__".into(),
-                JsValue::Boolean(true),
-                PropertyAttributes::empty(),
-            );
-            // size getter
+            let obj_rc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
             {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "size".into(),
-                    JsValue::Smi(map_size(&inner.borrow()) as i32),
+                let mut obj = obj_rc.borrow_mut();
+                obj.insert_with_attrs(
+                    "__is_map__".into(),
+                    JsValue::Boolean(true),
+                    PropertyAttributes::empty(),
                 );
-            }
-            // get(key)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "get".into(),
-                    native(move |a| {
-                        let key = a.first().unwrap_or(&JsValue::Undefined);
-                        Ok(map_get(&inner.borrow(), key))
-                    }),
-                );
-            }
-            // set(key, value)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "set".into(),
-                    native(move |a| {
-                        let key = a.first().cloned().unwrap_or(JsValue::Undefined);
-                        let val = a.get(1).cloned().unwrap_or(JsValue::Undefined);
-                        map_set(&mut inner.borrow_mut(), key, val);
-                        Ok(JsValue::Undefined)
-                    }),
-                );
-            }
-            // has(key)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "has".into(),
-                    native(move |a| {
-                        let key = a.first().unwrap_or(&JsValue::Undefined);
-                        Ok(JsValue::Boolean(map_has(&inner.borrow(), key)))
-                    }),
-                );
-            }
-            // delete(key)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "delete".into(),
-                    native(move |a| {
-                        let key = a.first().unwrap_or(&JsValue::Undefined);
-                        Ok(JsValue::Boolean(map_delete(&mut inner.borrow_mut(), key)))
-                    }),
-                );
-            }
-            // clear()
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "clear".into(),
-                    native(move |_| {
-                        map_clear(&mut inner.borrow_mut());
-                        Ok(JsValue::Undefined)
-                    }),
-                );
-            }
-            // forEach(callback)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "forEach".into(),
-                    native(move |a| {
-                        let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
-                        let snapshot = map_entries(&inner.borrow());
-                        for (k, v) in snapshot {
-                            if let JsValue::NativeFunction(f) = &cb {
-                                f(vec![v, k])?;
+                // size getter
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "size".into(),
+                        JsValue::Smi(map_size(&inner.borrow()) as i32),
+                    );
+                }
+                // get(key)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "get".into(),
+                        native(move |a| {
+                            let key = a.first().unwrap_or(&JsValue::Undefined);
+                            Ok(map_get(&inner.borrow(), key))
+                        }),
+                    );
+                }
+                // set(key, value) — returns the Map per ES §24.1.3.9
+                {
+                    let inner = Rc::clone(&inner);
+                    let self_ref = Rc::clone(&obj_rc);
+                    obj.insert(
+                        "set".into(),
+                        native(move |a| {
+                            let key = a.first().cloned().unwrap_or(JsValue::Undefined);
+                            let val = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                            map_set(&mut inner.borrow_mut(), key, val);
+                            Ok(JsValue::PlainObject(Rc::clone(&self_ref)))
+                        }),
+                    );
+                }
+                // has(key)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "has".into(),
+                        native(move |a| {
+                            let key = a.first().unwrap_or(&JsValue::Undefined);
+                            Ok(JsValue::Boolean(map_has(&inner.borrow(), key)))
+                        }),
+                    );
+                }
+                // delete(key)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "delete".into(),
+                        native(move |a| {
+                            let key = a.first().unwrap_or(&JsValue::Undefined);
+                            Ok(JsValue::Boolean(map_delete(&mut inner.borrow_mut(), key)))
+                        }),
+                    );
+                }
+                // clear()
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "clear".into(),
+                        native(move |_| {
+                            map_clear(&mut inner.borrow_mut());
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                }
+                // forEach(callback)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "forEach".into(),
+                        native(move |a| {
+                            let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                            let snapshot = map_entries(&inner.borrow());
+                            for (k, v) in snapshot {
+                                if let JsValue::NativeFunction(f) = &cb {
+                                    f(vec![v, k])?;
+                                }
                             }
-                        }
-                        Ok(JsValue::Undefined)
-                    }),
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                }
+                // keys()
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "keys".into(),
+                        native(move |_| {
+                            Ok(map_create_iterator(&inner.borrow(), MapIteratorKind::Keys))
+                        }),
+                    );
+                }
+                // values()
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "values".into(),
+                        native(move |_| {
+                            Ok(map_create_iterator(
+                                &inner.borrow(),
+                                MapIteratorKind::Values,
+                            ))
+                        }),
+                    );
+                }
+                // entries()
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "entries".into(),
+                        native(move |_| {
+                            Ok(map_create_iterator(
+                                &inner.borrow(),
+                                MapIteratorKind::Entries,
+                            ))
+                        }),
+                    );
+                }
+                // [Symbol.iterator]() — same as entries() per §24.1.3.13
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "@@iterator".into(),
+                        native(move |_| {
+                            Ok(map_create_iterator(
+                                &inner.borrow(),
+                                MapIteratorKind::Entries,
+                            ))
+                        }),
+                    );
+                }
+                // §24.1.3.5.1 Map.prototype.getOrInsert(key, value)  — ES2025
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "getOrInsert".into(),
+                        native(move |a| {
+                            let key = a.first().cloned().unwrap_or(JsValue::Undefined);
+                            let default_val = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                            let existing = map_get(&inner.borrow(), &key);
+                            if existing != JsValue::Undefined {
+                                Ok(existing)
+                            } else {
+                                map_set(&mut inner.borrow_mut(), key, default_val.clone());
+                                Ok(default_val)
+                            }
+                        }),
+                    );
+                }
+                // §24.1.3.5.2 Map.prototype.getOrInsertComputed(key, callbackFn)  — ES2025
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "getOrInsertComputed".into(),
+                        native(move |a| {
+                            let key = a.first().cloned().unwrap_or(JsValue::Undefined);
+                            let callback = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                            let existing = map_get(&inner.borrow(), &key);
+                            if existing != JsValue::Undefined {
+                                Ok(existing)
+                            } else {
+                                let computed = dispatch_call_value(&callback, vec![key.clone()])?;
+                                map_set(&mut inner.borrow_mut(), key, computed.clone());
+                                Ok(computed)
+                            }
+                        }),
+                    );
+                }
+                // §24.1.3.13 Map.prototype[@@toStringTag] = "Map"
+                obj.insert_with_attrs(
+                    "@@toStringTag".into(),
+                    JsValue::String("Map".into()),
+                    PropertyAttributes::CONFIGURABLE,
                 );
+                obj.make_all_non_enumerable();
             }
-            // keys()
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "keys".into(),
-                    native(move |_| {
-                        Ok(map_create_iterator(&inner.borrow(), MapIteratorKind::Keys))
-                    }),
-                );
-            }
-            // values()
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "values".into(),
-                    native(move |_| {
-                        Ok(map_create_iterator(
-                            &inner.borrow(),
-                            MapIteratorKind::Values,
-                        ))
-                    }),
-                );
-            }
-            // entries()
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "entries".into(),
-                    native(move |_| {
-                        Ok(map_create_iterator(
-                            &inner.borrow(),
-                            MapIteratorKind::Entries,
-                        ))
-                    }),
-                );
-            }
-            // [Symbol.iterator]() — same as entries() per §24.1.3.13
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "@@iterator".into(),
-                    native(move |_| {
-                        Ok(map_create_iterator(
-                            &inner.borrow(),
-                            MapIteratorKind::Entries,
-                        ))
-                    }),
-                );
-            }
-            // §24.1.3.5.1 Map.prototype.getOrInsert(key, value)  — ES2025
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "getOrInsert".into(),
-                    native(move |a| {
-                        let key = a.first().cloned().unwrap_or(JsValue::Undefined);
-                        let default_val = a.get(1).cloned().unwrap_or(JsValue::Undefined);
-                        let existing = map_get(&inner.borrow(), &key);
-                        if existing != JsValue::Undefined {
-                            Ok(existing)
-                        } else {
-                            map_set(&mut inner.borrow_mut(), key, default_val.clone());
-                            Ok(default_val)
-                        }
-                    }),
-                );
-            }
-            // §24.1.3.5.2 Map.prototype.getOrInsertComputed(key, callbackFn)  — ES2025
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "getOrInsertComputed".into(),
-                    native(move |a| {
-                        let key = a.first().cloned().unwrap_or(JsValue::Undefined);
-                        let callback = a.get(1).cloned().unwrap_or(JsValue::Undefined);
-                        let existing = map_get(&inner.borrow(), &key);
-                        if existing != JsValue::Undefined {
-                            Ok(existing)
-                        } else {
-                            let computed = dispatch_call_value(&callback, vec![key.clone()])?;
-                            map_set(&mut inner.borrow_mut(), key, computed.clone());
-                            Ok(computed)
-                        }
-                    }),
-                );
-            }
-            // §24.1.3.13 Map.prototype[@@toStringTag] = "Map"
-            obj.insert_with_attrs(
-                "@@toStringTag".into(),
-                JsValue::String("Map".into()),
-                PropertyAttributes::CONFIGURABLE,
-            );
-            obj.make_all_non_enumerable();
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            Ok(JsValue::PlainObject(obj_rc))
         }),
     );
 
@@ -5727,236 +5728,240 @@ fn make_set_builtin() -> JsValue {
                 set_new()
             };
             let inner = Rc::new(RefCell::new(s));
-            let mut obj = PropertyMap::new();
-            obj.insert_with_attrs(
-                "__is_set__".into(),
-                JsValue::Boolean(true),
-                PropertyAttributes::empty(),
-            );
+            let obj_rc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
             {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "size".into(),
-                    JsValue::Smi(set_size(&inner.borrow()) as i32),
+                let mut obj = obj_rc.borrow_mut();
+                obj.insert_with_attrs(
+                    "__is_set__".into(),
+                    JsValue::Boolean(true),
+                    PropertyAttributes::empty(),
                 );
-            }
-            // add(value)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "add".into(),
-                    native(move |a| {
-                        let val = a.first().cloned().unwrap_or(JsValue::Undefined);
-                        set_add(&mut inner.borrow_mut(), val);
-                        Ok(JsValue::Undefined)
-                    }),
-                );
-            }
-            // has(value)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "has".into(),
-                    native(move |a| {
-                        let val = a.first().unwrap_or(&JsValue::Undefined);
-                        Ok(JsValue::Boolean(set_has(&inner.borrow(), val)))
-                    }),
-                );
-            }
-            // delete(value)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "delete".into(),
-                    native(move |a| {
-                        let val = a.first().unwrap_or(&JsValue::Undefined);
-                        Ok(JsValue::Boolean(set_delete(&mut inner.borrow_mut(), val)))
-                    }),
-                );
-            }
-            // clear()
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "clear".into(),
-                    native(move |_| {
-                        set_clear(&mut inner.borrow_mut());
-                        Ok(JsValue::Undefined)
-                    }),
-                );
-            }
-            // forEach(callback)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "forEach".into(),
-                    native(move |a| {
-                        let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
-                        let snapshot = set_values(&inner.borrow());
-                        for v in snapshot {
-                            if let JsValue::NativeFunction(f) = &cb {
-                                f(vec![v.clone(), v])?;
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "size".into(),
+                        JsValue::Smi(set_size(&inner.borrow()) as i32),
+                    );
+                }
+                // add(value) — returns the Set per ES §24.2.3.1
+                {
+                    let inner = Rc::clone(&inner);
+                    let self_ref = Rc::clone(&obj_rc);
+                    obj.insert(
+                        "add".into(),
+                        native(move |a| {
+                            let val = a.first().cloned().unwrap_or(JsValue::Undefined);
+                            set_add(&mut inner.borrow_mut(), val);
+                            Ok(JsValue::PlainObject(Rc::clone(&self_ref)))
+                        }),
+                    );
+                }
+                // has(value)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "has".into(),
+                        native(move |a| {
+                            let val = a.first().unwrap_or(&JsValue::Undefined);
+                            Ok(JsValue::Boolean(set_has(&inner.borrow(), val)))
+                        }),
+                    );
+                }
+                // delete(value)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "delete".into(),
+                        native(move |a| {
+                            let val = a.first().unwrap_or(&JsValue::Undefined);
+                            Ok(JsValue::Boolean(set_delete(&mut inner.borrow_mut(), val)))
+                        }),
+                    );
+                }
+                // clear()
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "clear".into(),
+                        native(move |_| {
+                            set_clear(&mut inner.borrow_mut());
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                }
+                // forEach(callback)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "forEach".into(),
+                        native(move |a| {
+                            let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                            let snapshot = set_values(&inner.borrow());
+                            for v in snapshot {
+                                if let JsValue::NativeFunction(f) = &cb {
+                                    f(vec![v.clone(), v])?;
+                                }
                             }
-                        }
-                        Ok(JsValue::Undefined)
-                    }),
+                            Ok(JsValue::Undefined)
+                        }),
+                    );
+                }
+                // keys() — alias for values()
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "keys".into(),
+                        native(move |_| {
+                            Ok(set_create_iterator(&inner.borrow(), SetIteratorKind::Keys))
+                        }),
+                    );
+                }
+                // values()
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "values".into(),
+                        native(move |_| {
+                            Ok(set_create_iterator(
+                                &inner.borrow(),
+                                SetIteratorKind::Values,
+                            ))
+                        }),
+                    );
+                }
+                // entries()
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "entries".into(),
+                        native(move |_| {
+                            Ok(set_create_iterator(
+                                &inner.borrow(),
+                                SetIteratorKind::Entries,
+                            ))
+                        }),
+                    );
+                }
+                // [Symbol.iterator]() — same as values() per §24.2.3.11
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "@@iterator".into(),
+                        native(move |_| {
+                            Ok(set_create_iterator(
+                                &inner.borrow(),
+                                SetIteratorKind::Values,
+                            ))
+                        }),
+                    );
+                }
+                // ── ES2025 Set composition methods ──────────────────────────
+                // union(other)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "union".into(),
+                        native(move |a| {
+                            let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                            let other_set = extract_set_from_arg(other_val)?;
+                            let result = set_union(&inner.borrow(), &other_set);
+                            build_set_instance(result)
+                        }),
+                    );
+                }
+                // intersection(other)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "intersection".into(),
+                        native(move |a| {
+                            let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                            let other_set = extract_set_from_arg(other_val)?;
+                            let result = set_intersection(&inner.borrow(), &other_set);
+                            build_set_instance(result)
+                        }),
+                    );
+                }
+                // difference(other)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "difference".into(),
+                        native(move |a| {
+                            let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                            let other_set = extract_set_from_arg(other_val)?;
+                            let result = set_difference(&inner.borrow(), &other_set);
+                            build_set_instance(result)
+                        }),
+                    );
+                }
+                // symmetricDifference(other)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "symmetricDifference".into(),
+                        native(move |a| {
+                            let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                            let other_set = extract_set_from_arg(other_val)?;
+                            let result = set_symmetric_difference(&inner.borrow(), &other_set);
+                            build_set_instance(result)
+                        }),
+                    );
+                }
+                // isSubsetOf(other)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "isSubsetOf".into(),
+                        native(move |a| {
+                            let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                            let other_set = extract_set_from_arg(other_val)?;
+                            Ok(JsValue::Boolean(set_is_subset_of(
+                                &inner.borrow(),
+                                &other_set,
+                            )))
+                        }),
+                    );
+                }
+                // isSupersetOf(other)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "isSupersetOf".into(),
+                        native(move |a| {
+                            let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                            let other_set = extract_set_from_arg(other_val)?;
+                            Ok(JsValue::Boolean(set_is_superset_of(
+                                &inner.borrow(),
+                                &other_set,
+                            )))
+                        }),
+                    );
+                }
+                // isDisjointFrom(other)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "isDisjointFrom".into(),
+                        native(move |a| {
+                            let other_val = a.first().unwrap_or(&JsValue::Undefined);
+                            let other_set = extract_set_from_arg(other_val)?;
+                            Ok(JsValue::Boolean(set_is_disjoint_from(
+                                &inner.borrow(),
+                                &other_set,
+                            )))
+                        }),
+                    );
+                }
+                // §24.2.3.12 Set.prototype[@@toStringTag] = "Set"
+                obj.insert_with_attrs(
+                    "@@toStringTag".into(),
+                    JsValue::String("Set".into()),
+                    PropertyAttributes::CONFIGURABLE,
                 );
+                obj.make_all_non_enumerable();
             }
-            // keys() — alias for values()
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "keys".into(),
-                    native(move |_| {
-                        Ok(set_create_iterator(&inner.borrow(), SetIteratorKind::Keys))
-                    }),
-                );
-            }
-            // values()
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "values".into(),
-                    native(move |_| {
-                        Ok(set_create_iterator(
-                            &inner.borrow(),
-                            SetIteratorKind::Values,
-                        ))
-                    }),
-                );
-            }
-            // entries()
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "entries".into(),
-                    native(move |_| {
-                        Ok(set_create_iterator(
-                            &inner.borrow(),
-                            SetIteratorKind::Entries,
-                        ))
-                    }),
-                );
-            }
-            // [Symbol.iterator]() — same as values() per §24.2.3.11
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "@@iterator".into(),
-                    native(move |_| {
-                        Ok(set_create_iterator(
-                            &inner.borrow(),
-                            SetIteratorKind::Values,
-                        ))
-                    }),
-                );
-            }
-            // ── ES2025 Set composition methods ──────────────────────────
-            // union(other)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "union".into(),
-                    native(move |a| {
-                        let other_val = a.first().unwrap_or(&JsValue::Undefined);
-                        let other_set = extract_set_from_arg(other_val)?;
-                        let result = set_union(&inner.borrow(), &other_set);
-                        build_set_instance(result)
-                    }),
-                );
-            }
-            // intersection(other)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "intersection".into(),
-                    native(move |a| {
-                        let other_val = a.first().unwrap_or(&JsValue::Undefined);
-                        let other_set = extract_set_from_arg(other_val)?;
-                        let result = set_intersection(&inner.borrow(), &other_set);
-                        build_set_instance(result)
-                    }),
-                );
-            }
-            // difference(other)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "difference".into(),
-                    native(move |a| {
-                        let other_val = a.first().unwrap_or(&JsValue::Undefined);
-                        let other_set = extract_set_from_arg(other_val)?;
-                        let result = set_difference(&inner.borrow(), &other_set);
-                        build_set_instance(result)
-                    }),
-                );
-            }
-            // symmetricDifference(other)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "symmetricDifference".into(),
-                    native(move |a| {
-                        let other_val = a.first().unwrap_or(&JsValue::Undefined);
-                        let other_set = extract_set_from_arg(other_val)?;
-                        let result = set_symmetric_difference(&inner.borrow(), &other_set);
-                        build_set_instance(result)
-                    }),
-                );
-            }
-            // isSubsetOf(other)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "isSubsetOf".into(),
-                    native(move |a| {
-                        let other_val = a.first().unwrap_or(&JsValue::Undefined);
-                        let other_set = extract_set_from_arg(other_val)?;
-                        Ok(JsValue::Boolean(set_is_subset_of(
-                            &inner.borrow(),
-                            &other_set,
-                        )))
-                    }),
-                );
-            }
-            // isSupersetOf(other)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "isSupersetOf".into(),
-                    native(move |a| {
-                        let other_val = a.first().unwrap_or(&JsValue::Undefined);
-                        let other_set = extract_set_from_arg(other_val)?;
-                        Ok(JsValue::Boolean(set_is_superset_of(
-                            &inner.borrow(),
-                            &other_set,
-                        )))
-                    }),
-                );
-            }
-            // isDisjointFrom(other)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "isDisjointFrom".into(),
-                    native(move |a| {
-                        let other_val = a.first().unwrap_or(&JsValue::Undefined);
-                        let other_set = extract_set_from_arg(other_val)?;
-                        Ok(JsValue::Boolean(set_is_disjoint_from(
-                            &inner.borrow(),
-                            &other_set,
-                        )))
-                    }),
-                );
-            }
-            // §24.2.3.12 Set.prototype[@@toStringTag] = "Set"
-            obj.insert_with_attrs(
-                "@@toStringTag".into(),
-                JsValue::String("Set".into()),
-                PropertyAttributes::CONFIGURABLE,
-            );
-            obj.make_all_non_enumerable();
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+            Ok(JsValue::PlainObject(obj_rc))
         }),
     );
 
@@ -6026,140 +6031,144 @@ fn make_weak_map_builtin() -> JsValue {
     props.insert(
         "__call__".into(),
         native(|_args| {
-            let inner = Rc::new(RefCell::new(weak_map_new()));
-            let mut obj = PropertyMap::new();
-            obj.insert_with_attrs(
-                "__is_weakmap__".into(),
-                JsValue::Boolean(true),
-                PropertyAttributes::empty(),
-            );
+            let inner: Rc<RefCell<HashMap<usize, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+            let obj_rc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+            {
+                let mut obj = obj_rc.borrow_mut();
+                obj.insert_with_attrs(
+                    "__is_weakmap__".into(),
+                    JsValue::Boolean(true),
+                    PropertyAttributes::empty(),
+                );
 
-            // get(key)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "get".into(),
-                    native(move |a| {
-                        let key = a.first().unwrap_or(&JsValue::Undefined);
-                        if let JsValue::Object(ptr) = key {
-                            Ok(weak_map_get(&inner.borrow(), *ptr))
-                        } else {
-                            Ok(JsValue::Undefined)
-                        }
-                    }),
-                );
-            }
-            // set(key, value)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "set".into(),
-                    native(move |a| {
-                        let key = a.first().unwrap_or(&JsValue::Undefined);
-                        let val = a.get(1).cloned().unwrap_or(JsValue::Undefined);
-                        if let JsValue::Object(ptr) = key {
-                            weak_map_set(&mut inner.borrow_mut(), *ptr, val)?;
-                            Ok(JsValue::Undefined)
-                        } else {
-                            Err(StatorError::TypeError(
-                                "Invalid value used as weak map key".into(),
-                            ))
-                        }
-                    }),
-                );
-            }
-            // has(key)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "has".into(),
-                    native(move |a| {
-                        let key = a.first().unwrap_or(&JsValue::Undefined);
-                        if let JsValue::Object(ptr) = key {
-                            Ok(JsValue::Boolean(weak_map_has(&inner.borrow(), *ptr)))
-                        } else {
-                            Ok(JsValue::Boolean(false))
-                        }
-                    }),
-                );
-            }
-            // delete(key)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "delete".into(),
-                    native(move |a| {
-                        let key = a.first().unwrap_or(&JsValue::Undefined);
-                        if let JsValue::Object(ptr) = key {
-                            Ok(JsValue::Boolean(weak_map_delete(
-                                &mut inner.borrow_mut(),
-                                *ptr,
-                            )))
-                        } else {
-                            Ok(JsValue::Boolean(false))
-                        }
-                    }),
-                );
-            }
-
-            // §24.3.3.2.1 WeakMap.prototype.getOrInsert(key, value)  — ES2025
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "getOrInsert".into(),
-                    native(move |a| {
-                        let key = a.first().unwrap_or(&JsValue::Undefined);
-                        let default_val = a.get(1).cloned().unwrap_or(JsValue::Undefined);
-                        if let JsValue::Object(ptr) = key {
-                            let existing = weak_map_get(&inner.borrow(), *ptr);
-                            if existing != JsValue::Undefined {
-                                Ok(existing)
+                // get(key)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "get".into(),
+                        native(move |a| {
+                            let key = a.first().unwrap_or(&JsValue::Undefined);
+                            if let Some(id) = weak_collection_key(key) {
+                                Ok(inner
+                                    .borrow()
+                                    .get(&id)
+                                    .cloned()
+                                    .unwrap_or(JsValue::Undefined))
                             } else {
-                                weak_map_set(&mut inner.borrow_mut(), *ptr, default_val.clone())?;
-                                Ok(default_val)
+                                Ok(JsValue::Undefined)
                             }
-                        } else {
-                            Err(StatorError::TypeError(
-                                "Invalid value used as weak map key".into(),
-                            ))
-                        }
-                    }),
-                );
-            }
-            // §24.3.3.2.2 WeakMap.prototype.getOrInsertComputed(key, callbackFn)  — ES2025
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "getOrInsertComputed".into(),
-                    native(move |a| {
-                        let key = a.first().unwrap_or(&JsValue::Undefined);
-                        let callback = a.get(1).cloned().unwrap_or(JsValue::Undefined);
-                        if let JsValue::Object(ptr) = key {
-                            let existing = weak_map_get(&inner.borrow(), *ptr);
-                            if existing != JsValue::Undefined {
-                                Ok(existing)
+                        }),
+                    );
+                }
+                // set(key, value) — returns the WeakMap per ES §24.3.3.5
+                {
+                    let inner = Rc::clone(&inner);
+                    let self_ref = Rc::clone(&obj_rc);
+                    obj.insert(
+                        "set".into(),
+                        native(move |a| {
+                            let key = a.first().unwrap_or(&JsValue::Undefined);
+                            let val = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                            if let Some(id) = weak_collection_key(key) {
+                                inner.borrow_mut().insert(id, val);
+                                Ok(JsValue::PlainObject(Rc::clone(&self_ref)))
                             } else {
-                                let computed = dispatch_call_value(&callback, vec![key.clone()])?;
-                                weak_map_set(&mut inner.borrow_mut(), *ptr, computed.clone())?;
-                                Ok(computed)
+                                Err(StatorError::TypeError(
+                                    "Invalid value used as weak map key".into(),
+                                ))
                             }
-                        } else {
-                            Err(StatorError::TypeError(
-                                "Invalid value used as weak map key".into(),
-                            ))
-                        }
-                    }),
-                );
-            }
+                        }),
+                    );
+                }
+                // has(key)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "has".into(),
+                        native(move |a| {
+                            let key = a.first().unwrap_or(&JsValue::Undefined);
+                            if let Some(id) = weak_collection_key(key) {
+                                Ok(JsValue::Boolean(inner.borrow().contains_key(&id)))
+                            } else {
+                                Ok(JsValue::Boolean(false))
+                            }
+                        }),
+                    );
+                }
+                // delete(key)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "delete".into(),
+                        native(move |a| {
+                            let key = a.first().unwrap_or(&JsValue::Undefined);
+                            if let Some(id) = weak_collection_key(key) {
+                                Ok(JsValue::Boolean(inner.borrow_mut().remove(&id).is_some()))
+                            } else {
+                                Ok(JsValue::Boolean(false))
+                            }
+                        }),
+                    );
+                }
 
-            // §24.3.3.6 WeakMap.prototype[@@toStringTag] = "WeakMap"
-            obj.insert_with_attrs(
-                "@@toStringTag".into(),
-                JsValue::String("WeakMap".into()),
-                PropertyAttributes::CONFIGURABLE,
-            );
-            obj.make_all_non_enumerable();
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+                // §24.3.3.2.1 WeakMap.prototype.getOrInsert(key, value)  — ES2025
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "getOrInsert".into(),
+                        native(move |a| {
+                            let key = a.first().unwrap_or(&JsValue::Undefined);
+                            let default_val = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                            if let Some(id) = weak_collection_key(key) {
+                                if let Some(existing) = inner.borrow().get(&id).cloned() {
+                                    Ok(existing)
+                                } else {
+                                    inner.borrow_mut().insert(id, default_val.clone());
+                                    Ok(default_val)
+                                }
+                            } else {
+                                Err(StatorError::TypeError(
+                                    "Invalid value used as weak map key".into(),
+                                ))
+                            }
+                        }),
+                    );
+                }
+                // §24.3.3.2.2 WeakMap.prototype.getOrInsertComputed(key, callbackFn)  — ES2025
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "getOrInsertComputed".into(),
+                        native(move |a| {
+                            let key = a.first().unwrap_or(&JsValue::Undefined);
+                            let callback = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                            if let Some(id) = weak_collection_key(key) {
+                                if let Some(existing) = inner.borrow().get(&id).cloned() {
+                                    Ok(existing)
+                                } else {
+                                    let computed =
+                                        dispatch_call_value(&callback, vec![key.clone()])?;
+                                    inner.borrow_mut().insert(id, computed.clone());
+                                    Ok(computed)
+                                }
+                            } else {
+                                Err(StatorError::TypeError(
+                                    "Invalid value used as weak map key".into(),
+                                ))
+                            }
+                        }),
+                    );
+                }
+
+                // §24.3.3.6 WeakMap.prototype[@@toStringTag] = "WeakMap"
+                obj.insert_with_attrs(
+                    "@@toStringTag".into(),
+                    JsValue::String("WeakMap".into()),
+                    PropertyAttributes::CONFIGURABLE,
+                );
+                obj.make_all_non_enumerable();
+            }
+            Ok(JsValue::PlainObject(obj_rc))
         }),
     );
 
@@ -6220,70 +6229,74 @@ fn make_weak_set_builtin() -> JsValue {
         "__call__".into(),
         native(|_args| {
             let inner: Rc<RefCell<HashSet<usize>>> = Rc::new(RefCell::new(HashSet::new()));
-            let mut obj = PropertyMap::new();
-            obj.insert_with_attrs(
-                "__is_weakset__".into(),
-                JsValue::Boolean(true),
-                PropertyAttributes::empty(),
-            );
+            let obj_rc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+            {
+                let mut obj = obj_rc.borrow_mut();
+                obj.insert_with_attrs(
+                    "__is_weakset__".into(),
+                    JsValue::Boolean(true),
+                    PropertyAttributes::empty(),
+                );
 
-            // add(value) — returns the WeakSet for chaining
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "add".into(),
-                    native(move |a| {
-                        let val = a.first().unwrap_or(&JsValue::Undefined);
-                        if let Some(key) = weak_collection_key(val) {
-                            inner.borrow_mut().insert(key);
-                            Ok(JsValue::Undefined)
-                        } else {
-                            Err(StatorError::TypeError(
-                                "Invalid value used as weak set key".into(),
-                            ))
-                        }
-                    }),
-                );
-            }
-            // has(value)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "has".into(),
-                    native(move |a| {
-                        let val = a.first().unwrap_or(&JsValue::Undefined);
-                        if let Some(key) = weak_collection_key(val) {
-                            Ok(JsValue::Boolean(inner.borrow().contains(&key)))
-                        } else {
-                            Ok(JsValue::Boolean(false))
-                        }
-                    }),
-                );
-            }
-            // delete(value)
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "delete".into(),
-                    native(move |a| {
-                        let val = a.first().unwrap_or(&JsValue::Undefined);
-                        if let Some(key) = weak_collection_key(val) {
-                            Ok(JsValue::Boolean(inner.borrow_mut().remove(&key)))
-                        } else {
-                            Ok(JsValue::Boolean(false))
-                        }
-                    }),
-                );
-            }
+                // add(value) — returns the WeakSet per ES §24.4.3.1
+                {
+                    let inner = Rc::clone(&inner);
+                    let self_ref = Rc::clone(&obj_rc);
+                    obj.insert(
+                        "add".into(),
+                        native(move |a| {
+                            let val = a.first().unwrap_or(&JsValue::Undefined);
+                            if let Some(key) = weak_collection_key(val) {
+                                inner.borrow_mut().insert(key);
+                                Ok(JsValue::PlainObject(Rc::clone(&self_ref)))
+                            } else {
+                                Err(StatorError::TypeError(
+                                    "Invalid value used as weak set key".into(),
+                                ))
+                            }
+                        }),
+                    );
+                }
+                // has(value)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "has".into(),
+                        native(move |a| {
+                            let val = a.first().unwrap_or(&JsValue::Undefined);
+                            if let Some(key) = weak_collection_key(val) {
+                                Ok(JsValue::Boolean(inner.borrow().contains(&key)))
+                            } else {
+                                Ok(JsValue::Boolean(false))
+                            }
+                        }),
+                    );
+                }
+                // delete(value)
+                {
+                    let inner = Rc::clone(&inner);
+                    obj.insert(
+                        "delete".into(),
+                        native(move |a| {
+                            let val = a.first().unwrap_or(&JsValue::Undefined);
+                            if let Some(key) = weak_collection_key(val) {
+                                Ok(JsValue::Boolean(inner.borrow_mut().remove(&key)))
+                            } else {
+                                Ok(JsValue::Boolean(false))
+                            }
+                        }),
+                    );
+                }
 
-            // §24.4.3.5 WeakSet.prototype[@@toStringTag] = "WeakSet"
-            obj.insert_with_attrs(
-                "@@toStringTag".into(),
-                JsValue::String("WeakSet".into()),
-                PropertyAttributes::CONFIGURABLE,
-            );
-            obj.make_all_non_enumerable();
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+                // §24.4.3.5 WeakSet.prototype[@@toStringTag] = "WeakSet"
+                obj.insert_with_attrs(
+                    "@@toStringTag".into(),
+                    JsValue::String("WeakSet".into()),
+                    PropertyAttributes::CONFIGURABLE,
+                );
+                obj.make_all_non_enumerable();
+            }
+            Ok(JsValue::PlainObject(obj_rc))
         }),
     );
 
@@ -15231,5 +15244,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_map_set_returns_this() {
+        let result =
+            crate::builtins::global::global_eval("var m = new Map(); m.set('a', 1) === m").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_set_chaining() {
+        let result = crate::builtins::global::global_eval(
+            "var m = new Map(); m.set('a', 1).set('b', 2); m.get('b')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_set_add_returns_this() {
+        let result =
+            crate::builtins::global::global_eval("var s = new Set(); s.add(1) === s").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_add_chaining() {
+        let result = crate::builtins::global::global_eval(
+            "var s = new Set(); s.add(1).add(2).add(3); s.has(3)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_set_returns_this() {
+        let result = crate::builtins::global::global_eval(
+            "var wm = new WeakMap(); var k = {}; wm.set(k, 1) === wm",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_add_returns_this() {
+        let result = crate::builtins::global::global_eval(
+            "var ws = new WeakSet(); var o = {}; ws.add(o) === ws",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 }

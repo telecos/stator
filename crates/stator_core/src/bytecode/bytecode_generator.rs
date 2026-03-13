@@ -3263,9 +3263,10 @@ impl FunctionCompiler {
         let func_array = compile_function(&a.params, &body_block, false, a.is_async, a.is_strict)?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
+        // Flag(1) marks this as an arrow function (no .prototype property).
         self.emit(Instruction::new_unchecked(
             Opcode::CreateClosure,
-            vec![Operand::ConstantPoolIdx(pool_idx), slot, Operand::Flag(0)],
+            vec![Operand::ConstantPoolIdx(pool_idx), slot, Operand::Flag(1)],
         ));
         Ok(())
     }
