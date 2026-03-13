@@ -776,6 +776,19 @@ impl JsValue {
                 "Cannot convert a Symbol value to a string".to_string(),
             )),
             Self::BigInt(n) => Ok(n.to_string()),
+            // Array.prototype.toString — join elements with ",".
+            // Handles the common case directly without a ToPrimitive roundtrip.
+            Self::Array(items) => {
+                let parts: Vec<String> = items
+                    .borrow()
+                    .iter()
+                    .map(|v| match v {
+                        Self::Null | Self::Undefined => String::new(),
+                        other => other.to_js_string().unwrap_or_default(),
+                    })
+                    .collect();
+                Ok(parts.join(","))
+            }
             // Object-like types: ToPrimitive(input, string) then ToString.
             _ => {
                 let prim = self.to_primitive(ToPrimitiveHint::String)?;
@@ -3429,5 +3442,219 @@ mod tests {
             JsValue::BigInt(99).to_numeric().unwrap(),
             JsValue::BigInt(99)
         );
+    }
+
+    // ── to_number: PlainObject valueOf/toString chain ─────────────────────────
+
+    #[test]
+    fn test_to_number_plain_object_valueof_returns_number() {
+        let mut map = PropertyMap::new();
+        let f: NativeFn = Rc::new(|_| Ok(JsValue::Smi(7)));
+        map.insert("valueOf".to_string(), JsValue::NativeFunction(f));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert_eq!(obj.to_number().unwrap(), 7.0);
+    }
+
+    #[test]
+    fn test_to_number_plain_object_valueof_non_primitive_falls_to_tostring() {
+        let mut map = PropertyMap::new();
+        // valueOf returns an array (non-primitive) → skipped
+        let val_fn: NativeFn = Rc::new(|_| Ok(JsValue::new_array(vec![])));
+        map.insert("valueOf".to_string(), JsValue::NativeFunction(val_fn));
+        // toString returns "42" → used instead
+        let ts_fn: NativeFn = Rc::new(|_| Ok(JsValue::String("42".into())));
+        map.insert("toString".to_string(), JsValue::NativeFunction(ts_fn));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert_eq!(obj.to_number().unwrap(), 42.0);
+    }
+
+    #[test]
+    fn test_to_number_plain_object_both_non_primitive_gives_nan() {
+        let mut map = PropertyMap::new();
+        // Both methods return non-primitives → fallback to "[object Object]" → NaN
+        let val_fn: NativeFn = Rc::new(|_| Ok(JsValue::new_array(vec![])));
+        map.insert("valueOf".to_string(), JsValue::NativeFunction(val_fn));
+        let ts_fn: NativeFn = Rc::new(|_| Ok(JsValue::new_array(vec![])));
+        map.insert("toString".to_string(), JsValue::NativeFunction(ts_fn));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        let n = obj.to_number().unwrap();
+        assert!(n.is_nan());
+    }
+
+    #[test]
+    fn test_to_number_plain_object_tostring_only() {
+        let mut map = PropertyMap::new();
+        // No valueOf, toString returns "100"
+        let ts_fn: NativeFn = Rc::new(|_| Ok(JsValue::String("100".into())));
+        map.insert("toString".to_string(), JsValue::NativeFunction(ts_fn));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert_eq!(obj.to_number().unwrap(), 100.0);
+    }
+
+    // ── to_js_string: Array direct arm ───────────────────────────────────────
+
+    #[test]
+    fn test_to_js_string_empty_array() {
+        assert_eq!(JsValue::new_array(vec![]).to_js_string().unwrap(), "");
+    }
+
+    #[test]
+    fn test_to_js_string_array_single_element() {
+        let arr = JsValue::new_array(vec![JsValue::Smi(42)]);
+        assert_eq!(arr.to_js_string().unwrap(), "42");
+    }
+
+    #[test]
+    fn test_to_js_string_array_nested() {
+        // [[3,4]] → inner toString is "3,4" → outer join is "3,4"
+        let inner = JsValue::new_array(vec![JsValue::Smi(3), JsValue::Smi(4)]);
+        let outer = JsValue::new_array(vec![JsValue::Smi(1), JsValue::Smi(2), inner]);
+        assert_eq!(outer.to_js_string().unwrap(), "1,2,3,4");
+    }
+
+    #[test]
+    fn test_to_js_string_array_with_booleans() {
+        let arr = JsValue::new_array(vec![JsValue::Boolean(true), JsValue::Boolean(false)]);
+        assert_eq!(arr.to_js_string().unwrap(), "true,false");
+    }
+
+    #[test]
+    fn test_to_js_string_array_with_mixed_types() {
+        let arr = JsValue::new_array(vec![
+            JsValue::Smi(1),
+            JsValue::String("hello".into()),
+            JsValue::Null,
+            JsValue::Undefined,
+            JsValue::Boolean(true),
+        ]);
+        assert_eq!(arr.to_js_string().unwrap(), "1,hello,,,true");
+    }
+
+    // ── to_boolean: comprehensive edge cases ─────────────────────────────────
+
+    #[test]
+    fn test_to_boolean_empty_string_is_false() {
+        assert!(!JsValue::String("".into()).to_boolean());
+    }
+
+    #[test]
+    fn test_to_boolean_whitespace_string_is_true() {
+        // " " is non-empty → true
+        assert!(JsValue::String(" ".into()).to_boolean());
+    }
+
+    #[test]
+    fn test_to_boolean_string_zero_is_true() {
+        // "0" is non-empty → true
+        assert!(JsValue::String("0".into()).to_boolean());
+    }
+
+    #[test]
+    fn test_to_boolean_smi_negative_is_true() {
+        assert!(JsValue::Smi(-42).to_boolean());
+    }
+
+    #[test]
+    fn test_to_boolean_heap_number_neg_infinity_is_true() {
+        assert!(JsValue::HeapNumber(f64::NEG_INFINITY).to_boolean());
+    }
+
+    #[test]
+    fn test_to_boolean_bigint_negative_is_true() {
+        assert!(JsValue::BigInt(-1).to_boolean());
+    }
+
+    // ── to_int32 / to_uint32: cross-type coercion ────────────────────────────
+
+    #[test]
+    fn test_to_int32_from_string() {
+        assert_eq!(JsValue::String("42".into()).to_int32().unwrap(), 42);
+        assert_eq!(JsValue::String("".into()).to_int32().unwrap(), 0);
+        assert_eq!(JsValue::String("3.9".into()).to_int32().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_to_int32_from_boolean() {
+        assert_eq!(JsValue::Boolean(true).to_int32().unwrap(), 1);
+        assert_eq!(JsValue::Boolean(false).to_int32().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_to_uint32_from_string() {
+        assert_eq!(JsValue::String("42".into()).to_uint32().unwrap(), 42);
+        assert_eq!(JsValue::String("".into()).to_uint32().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_to_uint32_from_boolean() {
+        assert_eq!(JsValue::Boolean(true).to_uint32().unwrap(), 1);
+        assert_eq!(JsValue::Boolean(false).to_uint32().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_to_int32_large_negative() {
+        // -2^31 - 1 wraps to 2^31 - 1 = 2147483647
+        assert_eq!(
+            JsValue::HeapNumber(-2_147_483_649.0).to_int32().unwrap(),
+            2_147_483_647
+        );
+    }
+
+    #[test]
+    fn test_to_uint32_large_wrap() {
+        // 2^32 + 5 wraps to 5
+        assert_eq!(JsValue::HeapNumber(4_294_967_301.0).to_uint32().unwrap(), 5);
+    }
+
+    // ── same_value: cross-type numeric edge cases ────────────────────────────
+
+    #[test]
+    fn test_same_value_smi_vs_heap_number_equal() {
+        assert!(JsValue::Smi(42).same_value(&JsValue::HeapNumber(42.0)));
+        assert!(JsValue::HeapNumber(42.0).same_value(&JsValue::Smi(42)));
+    }
+
+    #[test]
+    fn test_same_value_smi_vs_heap_number_not_equal() {
+        assert!(!JsValue::Smi(1).same_value(&JsValue::HeapNumber(2.0)));
+        assert!(!JsValue::HeapNumber(2.0).same_value(&JsValue::Smi(1)));
+    }
+
+    #[test]
+    fn test_same_value_negative_zero_vs_negative_zero() {
+        assert!(JsValue::HeapNumber(-0.0).same_value(&JsValue::HeapNumber(-0.0)));
+    }
+
+    #[test]
+    fn test_same_value_strings() {
+        assert!(JsValue::String("abc".into()).same_value(&JsValue::String("abc".into())));
+        assert!(!JsValue::String("abc".into()).same_value(&JsValue::String("xyz".into())));
+    }
+
+    #[test]
+    fn test_same_value_different_types() {
+        assert!(!JsValue::Smi(0).same_value(&JsValue::Boolean(false)));
+        assert!(!JsValue::Smi(0).same_value(&JsValue::String("0".into())));
+        assert!(!JsValue::Null.same_value(&JsValue::Smi(0)));
+    }
+
+    // ── same_value_zero: cross-type numeric edge cases ───────────────────────
+
+    #[test]
+    fn test_same_value_zero_smi_vs_negative_zero() {
+        // SameValueZero: +0 === -0
+        assert!(JsValue::Smi(0).same_value_zero(&JsValue::HeapNumber(-0.0)));
+        assert!(JsValue::HeapNumber(-0.0).same_value_zero(&JsValue::Smi(0)));
+    }
+
+    #[test]
+    fn test_same_value_zero_negative_zero_vs_negative_zero() {
+        assert!(JsValue::HeapNumber(-0.0).same_value_zero(&JsValue::HeapNumber(-0.0)));
+    }
+
+    #[test]
+    fn test_same_value_zero_different_types() {
+        assert!(!JsValue::Smi(0).same_value_zero(&JsValue::Boolean(false)));
+        assert!(!JsValue::Smi(0).same_value_zero(&JsValue::String("0".into())));
     }
 }

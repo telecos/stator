@@ -8065,6 +8065,358 @@ mod tests {
         }
     }
 
+    // ── Optional chaining (additional) ──────────────────────────────────────────
+
+    #[test]
+    fn test_parse_optional_member_then_call() {
+        // obj?.method() → Call(OptionalMember(obj, "method"), [])
+        let prog = parse("obj?.method()").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::Call(call) = es.expr.as_ref() {
+                assert!(
+                    matches!(call.callee.as_ref(), Expr::OptionalMember(_)),
+                    "callee should be OptionalMember"
+                );
+                assert!(call.arguments.is_empty());
+            } else {
+                panic!("expected Call expression, got {:?}", es.expr);
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_optional_member_then_call_with_args() {
+        // obj?.method(1, 2) → Call(OptionalMember(obj, "method"), [1, 2])
+        let prog = parse("obj?.method(1, 2)").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::Call(call) = es.expr.as_ref() {
+                if let Expr::OptionalMember(m) = call.callee.as_ref() {
+                    assert!(!m.is_computed);
+                    if let crate::parser::ast::MemberProp::Ident(ref id) = m.property {
+                        assert_eq!(id.name, "method");
+                    } else {
+                        panic!("expected Ident property");
+                    }
+                } else {
+                    panic!("expected OptionalMember callee");
+                }
+                assert_eq!(call.arguments.len(), 2);
+            } else {
+                panic!("expected Call expression");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_optional_call_with_args() {
+        // fn?.(1, 2) → OptionalCall(fn, [1, 2])
+        let prog = parse("fn?.(1, 2)").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::OptionalCall(oc) = es.expr.as_ref() {
+                assert_eq!(oc.arguments.len(), 2);
+            } else {
+                panic!("expected OptionalCall expression");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_optional_computed_member_string_key() {
+        // obj?.["key"] → OptionalMember(obj, "key", computed=true)
+        let prog = parse(r#"obj?.["key"]"#).unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::OptionalMember(m) = es.expr.as_ref() {
+                assert!(m.is_computed);
+            } else {
+                panic!("expected OptionalMember");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    // ── For-of with destructuring (additional) ──────────────────────────────────
+
+    #[test]
+    fn test_for_of_object_destructuring() {
+        let prog = parse("for (let {x, y} of arr) {}").unwrap();
+        if let ProgramItem::Stmt(Stmt::ForOf(fo)) = &prog.body[0] {
+            if let crate::parser::ast::ForInOfLeft::VarDecl(vd) = &fo.left {
+                assert_eq!(vd.kind, VarKind::Let);
+                assert!(matches!(&vd.declarators[0].id, Pat::Object(_)));
+            } else {
+                panic!("expected VarDecl left");
+            }
+        } else {
+            panic!("expected ForOf, got {:?}", prog.body[0]);
+        }
+    }
+
+    #[test]
+    fn test_for_of_const_item() {
+        let prog = parse("for (const item of arr) { item; }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ForOf(fo)) = &prog.body[0] {
+            assert!(!fo.is_await);
+            if let crate::parser::ast::ForInOfLeft::VarDecl(vd) = &fo.left {
+                assert_eq!(vd.kind, VarKind::Const);
+                if let Pat::Ident(ref id) = vd.declarators[0].id {
+                    assert_eq!(id.name, "item");
+                } else {
+                    panic!("expected Ident pattern");
+                }
+            } else {
+                panic!("expected VarDecl left");
+            }
+        } else {
+            panic!("expected ForOf");
+        }
+    }
+
+    #[test]
+    fn test_for_of_array_destructuring_detailed() {
+        // Verify the destructuring pattern structure
+        let prog = parse("for (let [a, b] of arr) {}").unwrap();
+        if let ProgramItem::Stmt(Stmt::ForOf(fo)) = &prog.body[0] {
+            if let crate::parser::ast::ForInOfLeft::VarDecl(vd) = &fo.left {
+                assert_eq!(vd.kind, VarKind::Let);
+                if let Pat::Array(ref ap) = vd.declarators[0].id {
+                    assert_eq!(ap.elems.len(), 2);
+                } else {
+                    panic!("expected Array pattern");
+                }
+            } else {
+                panic!("expected VarDecl left");
+            }
+        } else {
+            panic!("expected ForOf");
+        }
+    }
+
+    // ── Class features (additional) ─────────────────────────────────────────────
+
+    #[test]
+    fn test_class_extends_with_super_call() {
+        let prog = parse("class Foo extends Bar { constructor() { super(); } }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.id.as_ref().unwrap().name, "Foo");
+            assert!(c.super_class.is_some());
+            if let Expr::Ident(ref sc) = **c.super_class.as_ref().unwrap() {
+                assert_eq!(sc.name, "Bar");
+            } else {
+                panic!("expected Ident super class");
+            }
+            assert_eq!(c.body.body.len(), 1);
+            if let ClassMember::Method(m) = &c.body.body[0] {
+                assert_eq!(m.kind, MethodKind::Constructor);
+                // The body should contain `super()` as a call expression
+                assert!(!m.value.body.body.is_empty());
+                if let Stmt::Expr(ref es) = m.value.body.body[0] {
+                    assert!(
+                        matches!(es.expr.as_ref(), Expr::Call(_)),
+                        "expected super() call"
+                    );
+                } else {
+                    panic!("expected ExprStmt in constructor body");
+                }
+            } else {
+                panic!("expected Method (constructor)");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_private_field_with_method_access() {
+        let prog = parse("class Foo { #private = 0; method() { return this.#private; } }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 2);
+            // First member: private field #private = 0
+            if let ClassMember::Property(p) = &c.body.body[0] {
+                assert!(matches!(&p.key, PropKey::Private(_)));
+                assert!(p.value.is_some());
+            } else {
+                panic!("expected Property for #private");
+            }
+            // Second member: method()
+            if let ClassMember::Method(m) = &c.body.body[1] {
+                assert_eq!(m.kind, MethodKind::Method);
+                if let PropKey::Ident(ref id) = m.key {
+                    assert_eq!(id.name, "method");
+                } else {
+                    panic!("expected Ident key for method");
+                }
+            } else {
+                panic!("expected Method");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_static_method_detailed() {
+        let prog = parse("class Foo { static method() {} }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 1);
+            if let ClassMember::Method(m) = &c.body.body[0] {
+                assert!(m.is_static);
+                assert_eq!(m.kind, MethodKind::Method);
+                if let PropKey::Ident(ref id) = m.key {
+                    assert_eq!(id.name, "method");
+                } else {
+                    panic!("expected Ident key");
+                }
+            } else {
+                panic!("expected Method");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_getter_setter_detailed() {
+        let prog = parse("class Foo { get prop() { return 1; } set prop(v) {} }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 2);
+            if let ClassMember::Method(getter) = &c.body.body[0] {
+                assert_eq!(getter.kind, MethodKind::Get);
+                assert!(getter.value.params.is_empty());
+            } else {
+                panic!("expected getter Method");
+            }
+            if let ClassMember::Method(setter) = &c.body.body[1] {
+                assert_eq!(setter.kind, MethodKind::Set);
+                assert_eq!(setter.value.params.len(), 1);
+            } else {
+                panic!("expected setter Method");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    // ── Generator functions (additional) ────────────────────────────────────────
+
+    #[test]
+    fn test_generator_function_multiple_yields() {
+        let prog = parse("function* gen() { yield 1; yield 2; }").unwrap();
+        if let ProgramItem::Stmt(Stmt::FnDecl(f)) = &prog.body[0] {
+            assert!(f.is_generator, "should be generator");
+            assert!(!f.is_async, "should not be async");
+            assert_eq!(f.id.as_ref().unwrap().name, "gen");
+            assert_eq!(f.body.body.len(), 2);
+            // Both statements should be yield expressions
+            for stmt in &f.body.body {
+                if let Stmt::Expr(ref es) = stmt {
+                    if let Expr::Yield(y) = es.expr.as_ref() {
+                        assert!(!y.delegate, "should not be yield*");
+                        assert!(y.argument.is_some());
+                    } else {
+                        panic!("expected YieldExpr");
+                    }
+                } else {
+                    panic!("expected ExprStmt");
+                }
+            }
+        } else {
+            panic!("expected generator FnDecl");
+        }
+    }
+
+    #[test]
+    fn test_generator_yield_star_array() {
+        let prog = parse("function* gen() { yield* [1, 2]; }").unwrap();
+        if let ProgramItem::Stmt(Stmt::FnDecl(f)) = &prog.body[0] {
+            assert!(f.is_generator);
+            if let Stmt::Expr(ref es) = f.body.body[0] {
+                if let Expr::Yield(y) = es.expr.as_ref() {
+                    assert!(y.delegate, "should be yield* delegation");
+                    assert!(
+                        matches!(y.argument.as_deref(), Some(Expr::Array(_))),
+                        "argument should be array literal"
+                    );
+                } else {
+                    panic!("expected YieldExpr");
+                }
+            } else {
+                panic!("expected ExprStmt");
+            }
+        } else {
+            panic!("expected generator FnDecl");
+        }
+    }
+
+    #[test]
+    fn test_generator_expression() {
+        let prog = parse("var g = function*() { yield 42; };").unwrap();
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(Expr::Fn(fe)) = vd.declarators[0].init.as_deref() {
+                assert!(fe.is_generator, "should be generator");
+                assert!(!fe.is_async);
+            } else {
+                panic!("expected generator function expression");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    // ── Async functions (additional) ────────────────────────────────────────────
+
+    #[test]
+    fn test_async_arrow_with_await() {
+        let prog = parse("var f = async () => await bar();").unwrap();
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(Expr::Arrow(arrow)) = vd.declarators[0].init.as_deref() {
+                assert!(arrow.is_async, "should be async");
+                if let ArrowBody::Expr(ref body_expr) = arrow.body {
+                    assert!(
+                        matches!(body_expr.as_ref(), Expr::Await(_)),
+                        "body should be Await expression"
+                    );
+                } else {
+                    panic!("expected expression body");
+                }
+            } else {
+                panic!("expected async arrow expression");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_async_function_with_await_call() {
+        let prog = parse("async function foo() { await bar(); }").unwrap();
+        if let ProgramItem::Stmt(Stmt::FnDecl(fd)) = &prog.body[0] {
+            assert!(fd.is_async);
+            assert!(!fd.is_generator);
+            assert_eq!(fd.id.as_ref().unwrap().name, "foo");
+            if let Stmt::Expr(ref es) = fd.body.body[0] {
+                if let Expr::Await(ref aw) = *es.expr {
+                    assert!(
+                        matches!(aw.argument.as_ref(), Expr::Call(_)),
+                        "await argument should be a call"
+                    );
+                } else {
+                    panic!("expected Await expression");
+                }
+            } else {
+                panic!("expected ExprStmt");
+            }
+        } else {
+            panic!("expected async FnDecl");
+        }
+    }
+
     // ── Nullish coalescing ────────────────────────────────────────────────────
 
     #[test]
