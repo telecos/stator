@@ -5947,4 +5947,150 @@ mod tests {
             crate::builtins::global::global_eval("var x = 10; `value is ${x + 5}`").unwrap();
         assert_eq!(result, JsValue::String("value is 15".into()));
     }
+
+    // ── typeof tests for all primitive types (ES §12.5.6) ───────────────
+
+    #[test]
+    fn e2e_typeof_undefined() {
+        let result = crate::builtins::global::global_eval("typeof undefined").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_null_is_object() {
+        let result = crate::builtins::global::global_eval("typeof null").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_boolean() {
+        let result = crate::builtins::global::global_eval("typeof true").unwrap();
+        assert_eq!(result, JsValue::String("boolean".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_number_smi() {
+        let result = crate::builtins::global::global_eval("typeof 42").unwrap();
+        assert_eq!(result, JsValue::String("number".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_number_float() {
+        let result = crate::builtins::global::global_eval("typeof 3.14").unwrap();
+        assert_eq!(result, JsValue::String("number".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_string() {
+        let result = crate::builtins::global::global_eval("typeof 'hello'").unwrap();
+        assert_eq!(result, JsValue::String("string".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_function_expr() {
+        let result =
+            crate::builtins::global::global_eval("var f = function() {}; typeof f").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_arrow_is_function() {
+        let result = crate::builtins::global::global_eval("var f = () => {}; typeof f").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_object_literal() {
+        let result = crate::builtins::global::global_eval("var o = {}; typeof o").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_array_is_object() {
+        let result = crate::builtins::global::global_eval("typeof []").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    // ── Strict equality edge cases (ES §7.2.16) ────────────────────────
+
+    #[test]
+    fn e2e_strict_eq_null_null() {
+        let result = crate::builtins::global::global_eval("null === null").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_strict_eq_undefined_undefined() {
+        let result = crate::builtins::global::global_eval("undefined === undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_strict_eq_null_undefined_is_false() {
+        // null and undefined are different types → strict equality is false
+        let result = crate::builtins::global::global_eval("null === undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_strict_not_equal_null_undefined() {
+        // Exercises TestEqualStrict + LogicalNot (the !== path)
+        let result = crate::builtins::global::global_eval("null !== undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_strict_eq_nan_is_not_nan() {
+        // IEEE 754: NaN !== NaN
+        let result = crate::builtins::global::global_eval("NaN === NaN").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_strict_not_equal_nan_nan() {
+        let result = crate::builtins::global::global_eval("NaN !== NaN").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── ToObject TypeError on null/undefined (ES §7.1.18) ──────────────
+
+    #[test]
+    fn e2e_to_object_null_throws_type_error() {
+        // `with(null)` emits the ToObject opcode, which must throw TypeError.
+        let result = crate::builtins::global::global_eval(
+            "var r; try { with(null) { r = 1; } } catch(e) { r = e.message; } r",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("Cannot convert undefined or null to object".into())
+        );
+    }
+
+    #[test]
+    fn e2e_to_object_undefined_throws_type_error() {
+        let result = crate::builtins::global::global_eval(
+            "var r; try { with(undefined) { r = 1; } } catch(e) { r = e.message; } r",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("Cannot convert undefined or null to object".into())
+        );
+    }
+
+    // ── Null / undefined identity via variables ─────────────────────────
+
+    #[test]
+    fn e2e_null_variable_strict_eq() {
+        let result = crate::builtins::global::global_eval("var x = null; x === null").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_undefined_variable_strict_eq() {
+        let result =
+            crate::builtins::global::global_eval("var x = undefined; x === undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
 }
