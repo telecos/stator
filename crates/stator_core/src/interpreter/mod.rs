@@ -1681,6 +1681,10 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
 }
 #[inline(always)]
 pub(super) fn number_to_jsvalue(n: f64) -> JsValue {
+    // Preserve -0.0 as HeapNumber so SameValue(+0, -0) correctly returns false.
+    if n == 0.0 && n.is_sign_negative() {
+        return JsValue::HeapNumber(n);
+    }
     if n.is_finite() && n.fract() == 0.0 && (i32::MIN as f64..=i32::MAX as f64).contains(&n) {
         JsValue::Smi(n as i32)
     } else {

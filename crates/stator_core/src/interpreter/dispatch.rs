@@ -5642,9 +5642,9 @@ mod tests {
     }
 
     #[test]
-    fn test_for_in_array() {
+    fn test_for_in_object() {
         let result = crate::builtins::global::global_eval(
-            "var a = [10, 20, 30]; var keys = []; for (var k in a) { keys.push(k); } keys.length",
+            "var o = {x: 1, y: 2, z: 3}; var keys = []; for (var k in o) { keys.push(k); } keys.length",
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(3));
