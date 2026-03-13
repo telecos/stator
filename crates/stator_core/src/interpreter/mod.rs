@@ -3875,11 +3875,35 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         };
                         fn flatten(items: &[JsValue], depth: u32, out: &mut Vec<JsValue>) {
                             for item in items {
-                                if depth > 0
-                                    && let JsValue::Array(inner) = item
-                                {
-                                    flatten(&inner.borrow(), depth - 1, out);
-                                    continue;
+                                if depth > 0 {
+                                    if let JsValue::Array(inner) = item {
+                                        flatten(&inner.borrow(), depth - 1, out);
+                                        continue;
+                                    }
+                                    // Also handle PlainObject arrays (from CreateArrayLiteral)
+                                    if let JsValue::PlainObject(map) = item {
+                                        let borrow = map.borrow();
+                                        if borrow
+                                            .get("__is_array__")
+                                            .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
+                                        {
+                                            let len = match borrow.get("length") {
+                                                Some(JsValue::Smi(n)) => *n as usize,
+                                                _ => 0,
+                                            };
+                                            let elems: Vec<JsValue> = (0..len)
+                                                .map(|i| {
+                                                    borrow
+                                                        .get(&i.to_string())
+                                                        .cloned()
+                                                        .unwrap_or(JsValue::Undefined)
+                                                })
+                                                .collect();
+                                            drop(borrow);
+                                            flatten(&elems, depth - 1, out);
+                                            continue;
+                                        }
+                                    }
                                 }
                                 out.push(item.clone());
                             }
@@ -3899,10 +3923,35 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 &callback,
                                 vec![item.clone(), JsValue::Smi(i as i32)],
                             )?;
-                            if let JsValue::Array(inner) = val {
-                                result.extend_from_slice(&inner.borrow());
-                            } else {
-                                result.push(val);
+                            match &val {
+                                JsValue::Array(inner) => {
+                                    result.extend_from_slice(&inner.borrow());
+                                }
+                                JsValue::PlainObject(map) => {
+                                    let borrow = map.borrow();
+                                    if borrow
+                                        .get("__is_array__")
+                                        .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
+                                    {
+                                        let len = match borrow.get("length") {
+                                            Some(JsValue::Smi(n)) => *n as usize,
+                                            _ => 0,
+                                        };
+                                        for idx in 0..len {
+                                            result.push(
+                                                borrow
+                                                    .get(&idx.to_string())
+                                                    .cloned()
+                                                    .unwrap_or(JsValue::Undefined),
+                                            );
+                                        }
+                                    } else {
+                                        result.push(val.clone());
+                                    }
+                                }
+                                _ => {
+                                    result.push(val);
+                                }
                             }
                         }
                         Ok(JsValue::new_array(result))
