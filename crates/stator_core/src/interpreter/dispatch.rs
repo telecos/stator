@@ -3845,6 +3845,14 @@ fn handle_test_instance_of(
     // Obtain the constructor's "prototype" property.
     let ctor_proto = match &constructor {
         JsValue::PlainObject(map) => map.borrow().get("prototype").cloned(),
+        JsValue::Function(_) => {
+            let v = proto_lookup(&constructor, "prototype");
+            if matches!(v, JsValue::Undefined) {
+                None
+            } else {
+                Some(v)
+            }
+        }
         _ => None,
     };
 
