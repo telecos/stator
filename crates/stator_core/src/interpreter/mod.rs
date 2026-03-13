@@ -2648,17 +2648,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let idx = match args.first() {
-                        Some(JsValue::Smi(i)) => (*i).max(0) as usize,
-                        Some(JsValue::HeapNumber(n)) => {
-                            crate::builtins::util::clamped_f64_to_usize(*n)
-                        }
-                        _ => 0,
+                        Some(v) => v.to_number().unwrap_or(0.0) as i64,
+                        None => 0,
                     };
                     Ok(JsValue::String(
-                        s.chars()
-                            .nth(idx)
-                            .map_or(String::new(), |c| c.to_string())
-                            .into(),
+                        crate::builtins::string::string_char_at(&s, idx).into(),
                     ))
                 }));
             }
@@ -2666,88 +2660,66 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let idx = match args.first() {
-                        Some(JsValue::Smi(i)) => (*i).max(0) as usize,
-                        Some(JsValue::HeapNumber(n)) => {
-                            crate::builtins::util::clamped_f64_to_usize(*n)
-                        }
-                        _ => 0,
+                        Some(v) => v.to_number().unwrap_or(0.0) as i64,
+                        None => 0,
                     };
-                    Ok(s.chars()
-                        .nth(idx)
-                        .map_or(JsValue::HeapNumber(f64::NAN), |c| JsValue::Smi(c as i32)))
+                    let code = crate::builtins::string::string_char_code_at(&s, idx);
+                    if code.is_nan() {
+                        Ok(JsValue::HeapNumber(f64::NAN))
+                    } else {
+                        Ok(JsValue::Smi(code as i32))
+                    }
                 }));
             }
             "slice" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let len = s.len() as i32;
                     let start = match args.first() {
-                        Some(JsValue::Smi(i)) => {
-                            if *i < 0 {
-                                (len + *i).max(0) as usize
-                            } else {
-                                *i as usize
-                            }
-                        }
-                        Some(JsValue::HeapNumber(n)) => {
-                            let i = *n as i32;
-                            if i < 0 {
-                                (len + i).max(0) as usize
-                            } else {
-                                i as usize
-                            }
-                        }
-                        _ => 0,
+                        Some(v) => v.to_number().unwrap_or(0.0) as i64,
+                        None => 0,
                     };
                     let end = match args.get(1) {
-                        Some(JsValue::Smi(i)) => {
-                            if *i < 0 {
-                                (len + *i).max(0) as usize
-                            } else {
-                                *i as usize
-                            }
-                        }
-                        Some(JsValue::HeapNumber(n)) => {
-                            let i = *n as i32;
-                            if i < 0 {
-                                (len + i).max(0) as usize
-                            } else {
-                                i as usize
-                            }
-                        }
-                        _ => len as usize,
+                        Some(JsValue::Undefined) | None => None,
+                        Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
                     };
-                    if start >= end {
-                        Ok(JsValue::String(String::new().into()))
-                    } else {
-                        Ok(JsValue::String(
-                            s.chars()
-                                .skip(start)
-                                .take(end - start)
-                                .collect::<String>()
-                                .into(),
-                        ))
-                    }
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_slice(&s, start, end).into(),
+                    ))
                 }));
             }
             "includes" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let search = match args.first() {
-                        Some(JsValue::String(ss)) => ss.to_string(),
-                        _ => String::new(),
+                        Some(v) => v.to_js_string()?,
+                        None => "undefined".to_string(),
                     };
-                    Ok(JsValue::Boolean(s.contains(&search)))
+                    let pos = match args.get(1) {
+                        Some(JsValue::Undefined) | None => None,
+                        Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+                    };
+                    Ok(JsValue::Boolean(crate::builtins::string::string_includes(
+                        &s, &search, pos,
+                    )))
                 }));
             }
             "indexOf" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let search = match args.first() {
-                        Some(JsValue::String(ss)) => ss.to_string(),
-                        _ => String::new(),
+                        Some(v) => v.to_js_string()?,
+                        None => "undefined".to_string(),
                     };
-                    Ok(JsValue::Smi(s.find(&search).map_or(-1, |i| i as i32)))
+                    let pos = match args.get(1) {
+                        Some(JsValue::Undefined) | None => None,
+                        Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+                    };
+                    let result = crate::builtins::string::string_index_of(&s, &search, pos);
+                    if result <= i32::MAX as i64 {
+                        Ok(JsValue::Smi(result as i32))
+                    } else {
+                        Ok(JsValue::HeapNumber(result as f64))
+                    }
                 }));
             }
             "lastIndexOf" => {
@@ -2758,20 +2730,15 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         None => "undefined".to_string(),
                     };
                     let pos = match args.get(1) {
-                        Some(v) => {
-                            let n = v.to_number()?;
-                            if n.is_nan() {
-                                s.len()
-                            } else {
-                                (n as usize).min(s.len())
-                            }
-                        }
-                        None => s.len(),
+                        Some(JsValue::Undefined) | None => None,
+                        Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
                     };
-                    let haystack = &s[..pos.min(s.len())];
-                    Ok(JsValue::Smi(
-                        haystack.rfind(&search).map_or(-1, |i| i as i32),
-                    ))
+                    let result = crate::builtins::string::string_last_index_of(&s, &search, pos);
+                    if result >= i32::MIN as i64 && result <= i32::MAX as i64 {
+                        Ok(JsValue::Smi(result as i32))
+                    } else {
+                        Ok(JsValue::HeapNumber(result as f64))
+                    }
                 }));
             }
             "toUpperCase" => {
@@ -2859,21 +2826,33 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "startsWith" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let prefix = match args.first() {
-                        Some(JsValue::String(ss)) => ss.to_string(),
-                        _ => String::new(),
+                    let search = match args.first() {
+                        Some(v) => v.to_js_string()?,
+                        None => String::new(),
                     };
-                    Ok(JsValue::Boolean(s.starts_with(&prefix)))
+                    let pos = match args.get(1) {
+                        Some(JsValue::Undefined) | None => None,
+                        Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+                    };
+                    Ok(JsValue::Boolean(
+                        crate::builtins::string::string_starts_with(&s, &search, pos),
+                    ))
                 }));
             }
             "endsWith" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let suffix = match args.first() {
-                        Some(JsValue::String(ss)) => ss.to_string(),
-                        _ => String::new(),
+                    let search = match args.first() {
+                        Some(v) => v.to_js_string()?,
+                        None => String::new(),
                     };
-                    Ok(JsValue::Boolean(s.ends_with(&suffix)))
+                    let end = match args.get(1) {
+                        Some(JsValue::Undefined) | None => None,
+                        Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+                    };
+                    Ok(JsValue::Boolean(crate::builtins::string::string_ends_with(
+                        &s, &search, end,
+                    )))
                 }));
             }
             "repeat" => {
@@ -2980,28 +2959,16 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "substring" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let len = s.len();
                     let start = match args.first() {
-                        Some(JsValue::Smi(i)) => ((*i).max(0) as usize).min(len),
-                        Some(JsValue::HeapNumber(n)) => {
-                            crate::builtins::util::clamped_f64_to_usize(*n).min(len)
-                        }
-                        _ => 0,
+                        Some(v) => v.to_number().unwrap_or(0.0) as i64,
+                        None => 0,
                     };
                     let end = match args.get(1) {
-                        Some(JsValue::Smi(i)) => ((*i).max(0) as usize).min(len),
-                        Some(JsValue::HeapNumber(n)) => {
-                            crate::builtins::util::clamped_f64_to_usize(*n).min(len)
-                        }
-                        _ => len,
-                    };
-                    let (s0, s1) = if start <= end {
-                        (start, end)
-                    } else {
-                        (end, start)
+                        Some(JsValue::Undefined) | None => None,
+                        Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
                     };
                     Ok(JsValue::String(
-                        s.chars().skip(s0).take(s1 - s0).collect::<String>().into(),
+                        crate::builtins::string::string_substring(&s, start, end).into(),
                     ))
                 }));
             }
@@ -3049,20 +3016,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let idx = match args.first() {
-                        Some(JsValue::Smi(i)) => *i,
-                        Some(JsValue::HeapNumber(n)) => *n as i32,
-                        _ => 0,
+                        Some(v) => v.to_number().unwrap_or(0.0) as i64,
+                        None => 0,
                     };
-                    let len = s.chars().count() as i32;
-                    let actual = if idx < 0 { len + idx } else { idx };
-                    if actual < 0 || actual >= len {
-                        return Ok(JsValue::Undefined);
+                    match crate::builtins::string::string_at(&s, idx) {
+                        Some(ch) => Ok(JsValue::String(ch.into())),
+                        None => Ok(JsValue::Undefined),
                     }
-                    Ok(s.chars()
-                        .nth(actual as usize)
-                        .map_or(JsValue::Undefined, |c| {
-                            JsValue::String(c.to_string().into())
-                        }))
                 }));
             }
             "trimStart" | "trimLeft" => {
@@ -3101,15 +3061,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let idx = match args.first() {
-                        Some(JsValue::Smi(i)) => (*i).max(0) as usize,
-                        Some(JsValue::HeapNumber(n)) => {
-                            crate::builtins::util::clamped_f64_to_usize(*n)
-                        }
-                        _ => 0,
+                        Some(v) => v.to_number().unwrap_or(0.0) as i64,
+                        None => 0,
                     };
-                    Ok(s.chars()
-                        .nth(idx)
-                        .map_or(JsValue::Undefined, |c| JsValue::Smi(c as i32)))
+                    match crate::builtins::string::string_code_point_at(&s, idx) {
+                        Some(cp) => Ok(JsValue::Smi(cp as i32)),
+                        None => Ok(JsValue::Undefined),
+                    }
                 }));
             }
             "normalize" => {
@@ -13241,5 +13199,217 @@ mod tests {
     fn test_undefined_keyed_property_access_throws() {
         let result = compile_source_and_run("var x = undefined; x['foo']");
         assert!(result.is_err());
+    }
+
+    // ── proto_lookup: String method fast-path tests ──────────────────────
+
+    #[test]
+    fn test_proto_lookup_string_starts_with() {
+        let result = crate::builtins::global::global_eval("'hello'.startsWith('hel')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_starts_with_false() {
+        let result = crate::builtins::global::global_eval("'hello'.startsWith('ell')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_starts_with_position() {
+        let result = crate::builtins::global::global_eval("'hello'.startsWith('ell', 1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_ends_with() {
+        let result = crate::builtins::global::global_eval("'hello'.endsWith('llo')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_ends_with_false() {
+        let result = crate::builtins::global::global_eval("'hello'.endsWith('hel')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_ends_with_end_position() {
+        let result = crate::builtins::global::global_eval("'hello'.endsWith('hel', 3)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_repeat() {
+        let result = crate::builtins::global::global_eval("'ab'.repeat(3)").unwrap();
+        assert_eq!(result, JsValue::String("ababab".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_repeat_zero() {
+        let result = crate::builtins::global::global_eval("'ab'.repeat(0)").unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_pad_start() {
+        let result = crate::builtins::global::global_eval("'5'.padStart(3, '0')").unwrap();
+        assert_eq!(result, JsValue::String("005".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_pad_end() {
+        let result = crate::builtins::global::global_eval("'5'.padEnd(3, '0')").unwrap();
+        assert_eq!(result, JsValue::String("500".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_trim_start() {
+        let result = crate::builtins::global::global_eval("'  hello  '.trimStart()").unwrap();
+        assert_eq!(result, JsValue::String("hello  ".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_trim_end() {
+        let result = crate::builtins::global::global_eval("'  hello  '.trimEnd()").unwrap();
+        assert_eq!(result, JsValue::String("  hello".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_at_positive() {
+        let result = crate::builtins::global::global_eval("'hello'.at(1)").unwrap();
+        assert_eq!(result, JsValue::String("e".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_at_negative() {
+        let result = crate::builtins::global::global_eval("'hello'.at(-1)").unwrap();
+        assert_eq!(result, JsValue::String("o".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_at_out_of_range() {
+        let result = crate::builtins::global::global_eval("'hello'.at(10)").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_proto_lookup_string_includes_from_index() {
+        let result =
+            crate::builtins::global::global_eval("'hello world'.includes('world', 6)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_includes_from_index_miss() {
+        let result =
+            crate::builtins::global::global_eval("'hello world'.includes('hello', 1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_index_of_from_index() {
+        let result = crate::builtins::global::global_eval("'abcabc'.indexOf('bc', 2)").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_last_index_of() {
+        let result = crate::builtins::global::global_eval("'abcabc'.lastIndexOf('bc')").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_slice() {
+        let result = crate::builtins::global::global_eval("'hello'.slice(1, 4)").unwrap();
+        assert_eq!(result, JsValue::String("ell".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_slice_negative() {
+        let result = crate::builtins::global::global_eval("'hello'.slice(-3)").unwrap();
+        assert_eq!(result, JsValue::String("llo".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_substring() {
+        let result = crate::builtins::global::global_eval("'hello'.substring(1, 4)").unwrap();
+        assert_eq!(result, JsValue::String("ell".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_char_at() {
+        let result = crate::builtins::global::global_eval("'hello'.charAt(1)").unwrap();
+        assert_eq!(result, JsValue::String("e".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_char_code_at() {
+        let result = crate::builtins::global::global_eval("'A'.charCodeAt(0)").unwrap();
+        assert_eq!(result, JsValue::Smi(65));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_code_point_at() {
+        let result = crate::builtins::global::global_eval("'A'.codePointAt(0)").unwrap();
+        assert_eq!(result, JsValue::Smi(65));
+    }
+
+    // ── proto_lookup: Array method fast-path tests ───────────────────────
+
+    #[test]
+    fn test_proto_lookup_array_at_positive() {
+        let result = crate::builtins::global::global_eval("[10, 20, 30].at(1)").unwrap();
+        assert_eq!(result, JsValue::Smi(20));
+    }
+
+    #[test]
+    fn test_proto_lookup_array_at_negative() {
+        let result = crate::builtins::global::global_eval("[10, 20, 30].at(-1)").unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    #[test]
+    fn test_proto_lookup_array_find_last() {
+        let result = crate::builtins::global::global_eval(
+            "[1, 2, 3, 4].findLast(function(x) { return x % 2 === 0; })",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_proto_lookup_array_find_last_index() {
+        let result = crate::builtins::global::global_eval(
+            "[1, 2, 3, 4].findLastIndex(function(x) { return x % 2 === 0; })",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── proto_lookup: Object method fast-path tests ──────────────────────
+
+    #[test]
+    fn test_proto_lookup_object_has_own_property() {
+        let result =
+            crate::builtins::global::global_eval("var o = { x: 1 }; o.hasOwnProperty('x')")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_object_has_own_property_false() {
+        let result =
+            crate::builtins::global::global_eval("var o = { x: 1 }; o.hasOwnProperty('y')")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_proto_lookup_object_property_is_enumerable() {
+        let result =
+            crate::builtins::global::global_eval("var o = { x: 1 }; o.propertyIsEnumerable('x')")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 }
