@@ -2854,6 +2854,59 @@ impl<'src> Parser<'src> {
                         arguments: args,
                     }));
                 }
+                TokenKind::QuestionDot => {
+                    self.bump()?;
+                    match self.peek_kind() {
+                        TokenKind::LeftParen => {
+                            // `callee?.(args)`
+                            self.bump()?;
+                            let args = self.parse_call_args()?;
+                            let end = self.current_span();
+                            expr = Expr::OptionalCall(Box::new(
+                                crate::parser::ast::OptionalCallExpr {
+                                    loc: Self::merge_spans(start, end),
+                                    callee: Box::new(expr),
+                                    arguments: args,
+                                },
+                            ));
+                        }
+                        TokenKind::LeftBracket => {
+                            // `object?.[expr]`
+                            self.bump()?;
+                            let prop = self.parse_expr()?;
+                            let end = self.current_span();
+                            self.expect(TokenKind::RightBracket)?;
+                            expr = Expr::OptionalMember(Box::new(
+                                crate::parser::ast::OptionalMemberExpr {
+                                    loc: Self::merge_spans(start, end),
+                                    object: Box::new(expr),
+                                    property: crate::parser::ast::MemberProp::Computed(Box::new(
+                                        prop,
+                                    )),
+                                    is_computed: true,
+                                },
+                            ));
+                        }
+                        _ => {
+                            // `object?.property`
+                            let prop_tok = self.bump()?;
+                            let name = self.name_from_token(&prop_tok)?;
+                            let prop_ident = Ident {
+                                loc: prop_tok.span,
+                                name,
+                            };
+                            let end = prop_tok.span;
+                            expr = Expr::OptionalMember(Box::new(
+                                crate::parser::ast::OptionalMemberExpr {
+                                    loc: Self::merge_spans(start, end),
+                                    object: Box::new(expr),
+                                    property: crate::parser::ast::MemberProp::Ident(prop_ident),
+                                    is_computed: false,
+                                },
+                            ));
+                        }
+                    }
+                }
                 TokenKind::NoSubstitutionTemplate | TokenKind::TemplateHead => {
                     // Tagged template: expr`template`
                     let tpl_expr = self.parse_primary()?;
@@ -7959,5 +8012,75 @@ mod tests {
     fn test_strict_delete_identifier_with_decl_error() {
         let result = parse("'use strict'; var x = 1; delete x;");
         assert!(result.is_err());
+    }
+
+    // ── Optional chaining ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_optional_member() {
+        let prog = parse("obj?.prop").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            assert!(matches!(es.expr.as_ref(), Expr::OptionalMember(_)));
+        } else {
+            panic!("expected OptionalMember expression");
+        }
+    }
+
+    #[test]
+    fn test_parse_optional_member_computed() {
+        let prog = parse("obj?.[0]").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::OptionalMember(m) = es.expr.as_ref() {
+                assert!(m.is_computed);
+            } else {
+                panic!("expected OptionalMember");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_optional_call() {
+        let prog = parse("fn?.()").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            assert!(matches!(es.expr.as_ref(), Expr::OptionalCall(_)));
+        } else {
+            panic!("expected OptionalCall expression");
+        }
+    }
+
+    #[test]
+    fn test_parse_optional_chain_chained() {
+        // a?.b?.c should parse as OptionalMember(OptionalMember(a, b), c)
+        let prog = parse("a?.b?.c").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::OptionalMember(outer) = es.expr.as_ref() {
+                assert!(matches!(outer.object.as_ref(), Expr::OptionalMember(_)));
+            } else {
+                panic!("expected nested OptionalMember");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    // ── Nullish coalescing ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_nullish_coalescing() {
+        let prog = parse("a ?? b").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::Logical(l) = es.expr.as_ref() {
+                assert!(matches!(
+                    l.op,
+                    crate::parser::ast::LogicalOp::NullishCoalesce
+                ));
+            } else {
+                panic!("expected Logical expression");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
     }
 }
