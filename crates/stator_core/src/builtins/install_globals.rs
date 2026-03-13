@@ -2234,13 +2234,18 @@ fn make_boolean() -> JsValue {
         }),
     );
     proto.make_all_non_enumerable();
-    props.insert(
-        "prototype".into(),
-        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
-    );
+    let proto_rc = Rc::new(RefCell::new(proto));
+    props.insert("prototype".into(), JsValue::PlainObject(proto_rc.clone()));
 
     props.make_all_non_enumerable();
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    // §20.1.3.2 Boolean.prototype.constructor
+    proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
 }
 
 fn make_number() -> JsValue {

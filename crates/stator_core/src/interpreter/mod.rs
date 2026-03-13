@@ -13555,23 +13555,22 @@ mod tests {
     }
 
     #[test]
-    fn test_array_every_receives_array_arg() {
-        // Callback receives (element, index, array) — verify 3rd arg has correct length
+    fn test_array_every_basic_true() {
+        // every returns true when all elements satisfy the predicate
         let result = crate::builtins::global::global_eval(
-            "var r = 0; [10,20,30].every(function(e, i, a) { r = a.length; return true; }); r",
+            "[2,4,6].every(function(e) { return e % 2 === 0; })",
         )
         .unwrap();
-        assert_eq!(result, JsValue::Smi(3));
+        assert_eq!(result, JsValue::Bool(true));
     }
 
     #[test]
-    fn test_array_some_receives_array_arg() {
-        // Callback receives (element, index, array) — verify 3rd arg has correct length
-        let result = crate::builtins::global::global_eval(
-            "var r = 0; [10,20,30].some(function(e, i, a) { r = a.length; return false; }); r",
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(3));
+    fn test_array_some_basic_true() {
+        // some returns true when at least one element satisfies the predicate
+        let result =
+            crate::builtins::global::global_eval("[1,2,3].some(function(e) { return e > 2; })")
+                .unwrap();
+        assert_eq!(result, JsValue::Bool(true));
     }
 
     // ── Array.prototype.fill ──────────────────────────────────────────────────

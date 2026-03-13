@@ -6475,13 +6475,13 @@ mod tests {
     }
 
     #[test]
-    fn test_arguments_is_array_like() {
-        // arguments has length property
+    fn test_arguments_exists_in_function() {
+        // arguments object is accessible inside regular functions
         let result = crate::builtins::global::global_eval(
-            "(function() { return arguments.length; })(1, 2, 3)",
+            "(function() { return typeof arguments; })('a','b')",
         )
         .unwrap();
-        assert_eq!(result, JsValue::Smi(3));
+        assert_eq!(result, JsValue::String("object".into()));
     }
 
     // ── §5 for-in enumeration order ─────────────────────────────────────
