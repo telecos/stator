@@ -128,13 +128,13 @@ use crate::builtins::weak_map::{
     weak_map_delete, weak_map_get, weak_map_has, weak_map_new, weak_map_set,
 };
 use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new, weak_ref_new_plain};
-use crate::builtins::weak_set::{weak_set_add, weak_set_delete, weak_set_has, weak_set_new};
 use crate::error::{StatorError, StatorResult};
 use crate::interpreter::{dispatch_call_value, dispatch_call_with_this};
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
 use crate::objects::value::{JsValue, NativeIterator};
+use std::collections::HashSet;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -6159,10 +6159,10 @@ fn make_weak_set_builtin() -> JsValue {
     props.insert(
         "__call__".into(),
         native(|_args| {
-            let inner = Rc::new(RefCell::new(weak_set_new()));
+            let inner: Rc<RefCell<HashSet<usize>>> = Rc::new(RefCell::new(HashSet::new()));
             let mut obj = PropertyMap::new();
 
-            // add(value)
+            // add(value) — returns the WeakSet for chaining
             {
                 let inner = Rc::clone(&inner);
                 obj.insert(
@@ -6170,11 +6170,13 @@ fn make_weak_set_builtin() -> JsValue {
                     native(move |a| {
                         let val = a.first().unwrap_or(&JsValue::Undefined);
                         if let JsValue::Object(ptr) = val {
-                            weak_set_add(&mut inner.borrow_mut(), *ptr)?;
+                            inner.borrow_mut().insert(*ptr as usize);
+                            // Return Undefined here; the prototype wrapper
+                            // is responsible for returning the receiver.
                             Ok(JsValue::Undefined)
                         } else {
                             Err(StatorError::TypeError(
-                                "Invalid value used in weak set".into(),
+                                "Invalid value used as weak set key".into(),
                             ))
                         }
                     }),
@@ -6188,7 +6190,7 @@ fn make_weak_set_builtin() -> JsValue {
                     native(move |a| {
                         let val = a.first().unwrap_or(&JsValue::Undefined);
                         if let JsValue::Object(ptr) = val {
-                            Ok(JsValue::Boolean(weak_set_has(&inner.borrow(), *ptr)))
+                            Ok(JsValue::Boolean(inner.borrow().contains(&(*ptr as usize))))
                         } else {
                             Ok(JsValue::Boolean(false))
                         }
@@ -6203,10 +6205,9 @@ fn make_weak_set_builtin() -> JsValue {
                     native(move |a| {
                         let val = a.first().unwrap_or(&JsValue::Undefined);
                         if let JsValue::Object(ptr) = val {
-                            Ok(JsValue::Boolean(weak_set_delete(
-                                &mut inner.borrow_mut(),
-                                *ptr,
-                            )))
+                            Ok(JsValue::Boolean(
+                                inner.borrow_mut().remove(&(*ptr as usize)),
+                            ))
                         } else {
                             Ok(JsValue::Boolean(false))
                         }
@@ -15135,5 +15136,34 @@ mod tests {
     fn e2e_object_is_same() {
         let result = global_eval("Object.is(42, 42)").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // —— WeakSet e2e tests ——————————————————————————
+
+    #[test]
+    fn e2e_weak_set_has() {
+        let result = crate::builtins::global::global_eval(
+            "var s = new WeakSet(); var o = {}; s.add(o); s.has(o)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weak_set_delete() {
+        let result = crate::builtins::global::global_eval(
+            "var s = new WeakSet(); var o = {}; s.add(o); s.delete(o)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weak_set_not_has_after_delete() {
+        let result = crate::builtins::global::global_eval(
+            "var s = new WeakSet(); var o = {}; s.add(o); s.delete(o); s.has(o)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
     }
 }
