@@ -948,9 +948,12 @@ pub fn string_iter(s: &str) -> Vec<String> {
 /// ```
 pub fn string_raw(raw_strings: &[&str], substitutions: &[&str]) -> String {
     let mut result = String::new();
+    let literal_segments = raw_strings.len();
     for (i, raw) in raw_strings.iter().enumerate() {
         result.push_str(raw);
-        if i < substitutions.len() {
+        // Only interleave substitutions *between* segments (i.e. at most
+        // literalSegments − 1 substitutions).
+        if i + 1 < literal_segments && i < substitutions.len() {
             result.push_str(substitutions[i]);
         }
     }
