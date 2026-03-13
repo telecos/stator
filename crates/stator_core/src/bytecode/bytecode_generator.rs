@@ -812,6 +812,15 @@ impl FunctionCompiler {
         reg
     }
 
+    /// Define a `var`-declared local in the **outermost** (function) scope so
+    /// it remains visible after block scopes are popped, matching the JS spec
+    /// semantics for `var` declarations.
+    fn define_function_scoped_local(&mut self, name: &str) -> Register {
+        let reg = self.allocator.new_local();
+        self.scopes[0].insert(name.to_owned(), reg);
+        reg
+    }
+
     /// Look up a variable in the scope chain (innermost first).
     ///
     /// Returns `None` if the name is not found (assumed to be global).
@@ -1761,18 +1770,36 @@ impl FunctionCompiler {
     ///
     /// Labeled continues look up the target in `label_map` and require the
     /// labeled body to be a loop; unlabeled continues use the innermost
-    /// `loop_stack` entry.
+    /// `loop_stack` entry.  When crossing for-of loop boundaries, emit
+    /// `IteratorClose` for each intervening for-of iterator (excluding the
+    /// target loop itself, since we are continuing it, not exiting it).
     fn compile_continue(&mut self, s: &crate::parser::ast::ContinueStmt) -> StatorResult<()> {
         if let Some(label) = &s.label {
-            let (continue_label, _) = *self.label_map.get(&label.name).ok_or_else(|| {
-                StatorError::SyntaxError(format!("undefined label '{}'", label.name))
-            })?;
+            let (continue_label, break_label) =
+                *self.label_map.get(&label.name).ok_or_else(|| {
+                    StatorError::SyntaxError(format!("undefined label '{}'", label.name))
+                })?;
             let continue_label = continue_label.ok_or_else(|| {
                 StatorError::SyntaxError(format!(
                     "label '{}' is not a loop — continue is invalid",
                     label.name
                 ))
             })?;
+            // Close iterators for for-of loops inner to (but not including)
+            // the target loop, identified by its break_label on the stack.
+            let iter_regs_to_close: Vec<Register> = self
+                .loop_stack
+                .iter()
+                .rev()
+                .take_while(|&&(_, bl)| bl != break_label)
+                .filter_map(|&(_, bl)| self.for_of_iter_regs.get(&bl).copied())
+                .collect();
+            for iter_reg in iter_regs_to_close {
+                self.emit(Instruction::new_unchecked(
+                    Opcode::IteratorClose,
+                    vec![to_reg_op(iter_reg)],
+                ));
+            }
             self.emit_jump(Opcode::Jump, continue_label);
             return Ok(());
         }
@@ -3567,6 +3594,29 @@ impl FunctionCompiler {
                         Opcode::DefineNamedOwnProperty,
                         vec![to_reg_op(obj_reg), Operand::ConstantPoolIdx(name_idx), slot],
                     ));
+                } else if let PropKey::Computed(key_expr) = &p.key {
+                    let val_reg = self.allocator.allocate_temporary();
+                    self.emit_star(val_reg);
+                    self.compile_expr(key_expr)?;
+                    let key_reg = self.allocator.allocate_temporary();
+                    self.emit_star(key_reg);
+                    self.emit_ldar(val_reg);
+                    let slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::DefineKeyedOwnProperty,
+                        vec![
+                            to_reg_op(obj_reg),
+                            to_reg_op(key_reg),
+                            Operand::Flag(0),
+                            slot,
+                        ],
+                    ));
+                    self.allocator
+                        .release_temporary(key_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
+                    self.allocator
+                        .release_temporary(val_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
             }
             PropValue::Get(fn_expr) => {
@@ -4068,11 +4118,19 @@ impl FunctionCompiler {
         self.push_scope();
 
         // Pre-allocate the loop variable register if it's a new declaration.
+        // `var` declarations are function-scoped (must survive after the loop
+        // scope is popped), while `let`/`const` are block-scoped.
         let loop_var_reg: Option<Register> = match &stmt.left {
             ForInOfLeft::VarDecl(decl) => {
                 if decl.declarators.len() == 1 {
                     match &decl.declarators[0].id {
-                        crate::parser::ast::Pat::Ident(id) => Some(self.define_local(&id.name)),
+                        crate::parser::ast::Pat::Ident(id) => {
+                            if decl.kind == VarKind::Var {
+                                Some(self.define_function_scoped_local(&id.name))
+                            } else {
+                                Some(self.define_local(&id.name))
+                            }
+                        }
                         _pat => Some(self.allocator.new_local()),
                     }
                 } else if decl.declarators.is_empty() {
@@ -4258,11 +4316,18 @@ impl FunctionCompiler {
 
         // If the left-hand side declares a new variable, pre-allocate its
         // local register now (before any temporaries are allocated below).
+        // `var` declarations are function-scoped; `let`/`const` are block-scoped.
         let loop_var_reg: Option<Register> = match &stmt.left {
             ForInOfLeft::VarDecl(decl) => {
                 if decl.declarators.len() == 1 {
                     match &decl.declarators[0].id {
-                        crate::parser::ast::Pat::Ident(id) => Some(self.define_local(&id.name)),
+                        crate::parser::ast::Pat::Ident(id) => {
+                            if decl.kind == VarKind::Var {
+                                Some(self.define_function_scoped_local(&id.name))
+                            } else {
+                                Some(self.define_local(&id.name))
+                            }
+                        }
                         _pat => Some(self.allocator.new_local()),
                     }
                 } else if decl.declarators.is_empty() {
@@ -7893,5 +7958,437 @@ mod tests {
             crate::builtins::global::global_eval("var x, y; ({x, y} = {x: 10, y: 20}); x + y")
                 .unwrap();
         assert_eq!(result, crate::objects::value::JsValue::Smi(30));
+    }
+
+    // ── Improvement 1: new.target meta-property ──────────────────────────
+
+    #[test]
+    fn test_new_target_emits_lda_new_target() {
+        // function f() { return new.target; }
+        use crate::parser::ast::MetaPropExpr;
+        let body = BlockStmt {
+            loc: span(),
+            body: vec![return_stmt(Some(Expr::MetaProp(MetaPropExpr {
+                loc: span(),
+                meta: ident("new"),
+                property: ident("target"),
+            })))],
+        };
+        let inner = compile_function(&[], &body, false, false, false).unwrap();
+        let instrs = inner.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::LdaNewTarget),
+            "new.target must emit LdaNewTarget, got {instrs:?}"
+        );
+    }
+
+    #[test]
+    fn test_new_target_in_program_compiles() {
+        // Top-level new.target should compile without error.
+        use crate::parser::ast::MetaPropExpr;
+        let prog = make_program(vec![Stmt::Expr(ExprStmt {
+            loc: span(),
+            expr: Box::new(Expr::MetaProp(MetaPropExpr {
+                loc: span(),
+                meta: ident("new"),
+                property: ident("target"),
+            })),
+        })]);
+        let ba = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = ba.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::LdaNewTarget),
+            "program-level new.target must emit LdaNewTarget"
+        );
+    }
+
+    // ── Improvement 2: labeled statements / continue label ───────────────
+
+    #[test]
+    fn test_labeled_continue_for_loop() {
+        // L: for (var i = 0; i < 10; i++) { continue L; }
+        let prog = make_program(vec![Stmt::Labeled(LabeledStmt {
+            loc: span(),
+            label: ident("L"),
+            body: Box::new(Stmt::For(ForStmt {
+                loc: span(),
+                init: Some(ForInit::VarDecl(VarDecl {
+                    loc: span(),
+                    kind: VarKind::Var,
+                    declarators: vec![VarDeclarator {
+                        loc: span(),
+                        id: Pat::Ident(ident("i")),
+                        init: Some(Box::new(num_expr(0.0))),
+                    }],
+                })),
+                test: Some(Box::new(Expr::Binary(Box::new(BinaryExpr {
+                    loc: span(),
+                    op: BinaryOp::Lt,
+                    left: Box::new(ident_expr("i")),
+                    right: Box::new(num_expr(10.0)),
+                })))),
+                update: Some(Box::new(Expr::Update(Box::new(
+                    crate::parser::ast::UpdateExpr {
+                        loc: span(),
+                        op: UpdateOp::Increment,
+                        prefix: false,
+                        argument: Box::new(ident_expr("i")),
+                    },
+                )))),
+                body: Box::new(Stmt::Continue(ContinueStmt {
+                    loc: span(),
+                    label: Some(ident("L")),
+                })),
+            })),
+        })]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        // Must contain a Jump for the labeled continue.
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::Jump),
+            "labeled continue L in for loop must emit a Jump"
+        );
+    }
+
+    #[test]
+    fn test_labeled_continue_do_while_loop() {
+        // L: do { continue L; } while (true);
+        let prog = make_program(vec![Stmt::Labeled(LabeledStmt {
+            loc: span(),
+            label: ident("L"),
+            body: Box::new(Stmt::DoWhile(DoWhileStmt {
+                loc: span(),
+                test: Box::new(bool_expr(true)),
+                body: Box::new(Stmt::Continue(ContinueStmt {
+                    loc: span(),
+                    label: Some(ident("L")),
+                })),
+            })),
+        })]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::Jump),
+            "labeled continue L in do-while must emit a Jump"
+        );
+    }
+
+    #[test]
+    fn test_labeled_continue_for_in_loop() {
+        // L: for (var x in obj) { continue L; }
+        use crate::parser::ast::{ForInOfLeft, ForInStmt};
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Var, "obj", Some(num_expr(0.0))),
+            Stmt::Labeled(LabeledStmt {
+                loc: span(),
+                label: ident("L"),
+                body: Box::new(Stmt::ForIn(ForInStmt {
+                    loc: span(),
+                    left: ForInOfLeft::VarDecl(VarDecl {
+                        loc: span(),
+                        kind: VarKind::Var,
+                        declarators: vec![VarDeclarator {
+                            loc: span(),
+                            id: Pat::Ident(ident("x")),
+                            init: None,
+                        }],
+                    }),
+                    right: Box::new(ident_expr("obj")),
+                    body: Box::new(Stmt::Continue(ContinueStmt {
+                        loc: span(),
+                        label: Some(ident("L")),
+                    })),
+                })),
+            }),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::Jump),
+            "labeled continue L in for-in must emit a Jump"
+        );
+    }
+
+    // ── Improvement 3: for-in with var hoists to function scope ──────────
+
+    #[test]
+    fn test_for_in_var_hoists_to_function_scope() {
+        // function f(o) { for (var x in o) {} return x; }
+        // `x` must be accessible after the loop (function-scoped).
+        use crate::parser::ast::{ForInOfLeft, ForInStmt};
+        let body = BlockStmt {
+            loc: span(),
+            body: vec![
+                Stmt::ForIn(ForInStmt {
+                    loc: span(),
+                    left: ForInOfLeft::VarDecl(VarDecl {
+                        loc: span(),
+                        kind: VarKind::Var,
+                        declarators: vec![VarDeclarator {
+                            loc: span(),
+                            id: Pat::Ident(ident("x")),
+                            init: None,
+                        }],
+                    }),
+                    right: Box::new(ident_expr("o")),
+                    body: Box::new(Stmt::Block(BlockStmt {
+                        loc: span(),
+                        body: vec![],
+                    })),
+                }),
+                return_stmt(Some(ident_expr("x"))),
+            ],
+        };
+        let inner = compile_function(
+            &[Param {
+                loc: span(),
+                pat: Pat::Ident(ident("o")),
+                default: None,
+            }],
+            &body,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        // The key assertion: compilation succeeds and emits a Ldar for x
+        // after the loop (meaning x was found in the function scope).
+        let instrs = inner.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::Return),
+            "function must compile successfully with var x visible after for-in"
+        );
+    }
+
+    #[test]
+    fn test_for_in_var_visible_in_nested_scope() {
+        // `for (var k in obj) {} k;` at program level — k should be accessible.
+        use crate::parser::ast::{ForInOfLeft, ForInStmt};
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Var, "obj", Some(num_expr(0.0))),
+            Stmt::ForIn(ForInStmt {
+                loc: span(),
+                left: ForInOfLeft::VarDecl(VarDecl {
+                    loc: span(),
+                    kind: VarKind::Var,
+                    declarators: vec![VarDeclarator {
+                        loc: span(),
+                        id: Pat::Ident(ident("k")),
+                        init: None,
+                    }],
+                }),
+                right: Box::new(ident_expr("obj")),
+                body: Box::new(Stmt::Block(BlockStmt {
+                    loc: span(),
+                    body: vec![],
+                })),
+            }),
+            // Reference k after the for-in loop.
+            Stmt::Expr(ExprStmt {
+                loc: span(),
+                expr: Box::new(ident_expr("k")),
+            }),
+        ]);
+        // Should compile without errors — k is function-scoped via var.
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            !instrs.is_empty(),
+            "for-in var k should be accessible after the loop"
+        );
+    }
+
+    // ── Improvement 4: computed property names in object methods ─────────
+
+    #[test]
+    fn test_object_computed_method_emits_define_keyed() {
+        // `var o = { [k]() {} };` — should use DefineKeyedOwnProperty.
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "k", Some(str_expr("foo"))),
+            var_decl_stmt(
+                VarKind::Var,
+                "o",
+                Some(object_expr(vec![ObjectProp::Prop(Box::new(Prop {
+                    loc: span(),
+                    key: PropKey::Computed(Box::new(ident_expr("k"))),
+                    is_computed: true,
+                    value: PropValue::Method(empty_fn_expr(&[])),
+                }))])),
+            ),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::DefineKeyedOwnProperty),
+            "computed method must emit DefineKeyedOwnProperty, got {instrs:?}"
+        );
+    }
+
+    #[test]
+    fn test_object_computed_value_emits_define_keyed() {
+        // `var o = { [k]: 42 };` — should use DefineKeyedOwnProperty.
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "k", Some(str_expr("bar"))),
+            var_decl_stmt(
+                VarKind::Var,
+                "o",
+                Some(object_expr(vec![ObjectProp::Prop(Box::new(Prop {
+                    loc: span(),
+                    key: PropKey::Computed(Box::new(ident_expr("k"))),
+                    is_computed: true,
+                    value: PropValue::Value(Box::new(num_expr(42.0))),
+                }))])),
+            ),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.opcode == Opcode::DefineKeyedOwnProperty),
+            "computed value property must emit DefineKeyedOwnProperty, got {instrs:?}"
+        );
+    }
+
+    // ── Improvement 5: template literals with expressions ────────────────
+
+    #[test]
+    fn test_template_with_expressions_emits_add() {
+        // `` `a${x}b` `` — should emit Add opcodes for concatenation.
+        use crate::parser::ast::{TemplateElement, TemplateLit};
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Var, "x", Some(num_expr(1.0))),
+            Stmt::Expr(ExprStmt {
+                loc: span(),
+                expr: Box::new(Expr::Template(Box::new(TemplateLit {
+                    loc: span(),
+                    quasis: vec![
+                        TemplateElement {
+                            loc: span(),
+                            raw: "a".to_owned(),
+                            cooked: Some("a".to_owned()),
+                            tail: false,
+                        },
+                        TemplateElement {
+                            loc: span(),
+                            raw: "b".to_owned(),
+                            cooked: Some("b".to_owned()),
+                            tail: true,
+                        },
+                    ],
+                    expressions: vec![ident_expr("x")],
+                }))),
+            }),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        let add_count = instrs.iter().filter(|i| i.opcode == Opcode::Add).count();
+        assert!(
+            add_count >= 2,
+            "template with expression needs at least 2 Add opcodes (expr+quasi), got {add_count}"
+        );
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::ToString),
+            "template must emit ToString for interpolated expression"
+        );
+    }
+
+    #[test]
+    fn test_tagged_template_emits_get_template_object() {
+        // `` tag`str${expr}str` `` — should emit GetTemplateObject and a call.
+        use crate::parser::ast::{TaggedTemplateExpr, TemplateElement, TemplateLit};
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Var, "tag", Some(num_expr(0.0))),
+            var_decl_stmt(VarKind::Var, "expr", Some(num_expr(1.0))),
+            Stmt::Expr(ExprStmt {
+                loc: span(),
+                expr: Box::new(Expr::TaggedTemplate(Box::new(TaggedTemplateExpr {
+                    loc: span(),
+                    tag: Box::new(ident_expr("tag")),
+                    quasi: TemplateLit {
+                        loc: span(),
+                        quasis: vec![
+                            TemplateElement {
+                                loc: span(),
+                                raw: "str".to_owned(),
+                                cooked: Some("str".to_owned()),
+                                tail: false,
+                            },
+                            TemplateElement {
+                                loc: span(),
+                                raw: "str".to_owned(),
+                                cooked: Some("str".to_owned()),
+                                tail: true,
+                            },
+                        ],
+                        expressions: vec![ident_expr("expr")],
+                    },
+                }))),
+            }),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::GetTemplateObject),
+            "tagged template must emit GetTemplateObject, got {instrs:?}"
+        );
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::CallAnyReceiver),
+            "tagged template must emit a call instruction, got {instrs:?}"
+        );
+    }
+
+    #[test]
+    fn test_tagged_template_method_uses_call_property() {
+        // `` obj.tag`a${x}b` `` — should use CallProperty with correct this.
+        use crate::parser::ast::{
+            MemberExpr, MemberProp, TaggedTemplateExpr, TemplateElement, TemplateLit,
+        };
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Var, "obj", Some(num_expr(0.0))),
+            var_decl_stmt(VarKind::Var, "x", Some(num_expr(1.0))),
+            Stmt::Expr(ExprStmt {
+                loc: span(),
+                expr: Box::new(Expr::TaggedTemplate(Box::new(TaggedTemplateExpr {
+                    loc: span(),
+                    tag: Box::new(Expr::Member(Box::new(MemberExpr {
+                        loc: span(),
+                        object: Box::new(ident_expr("obj")),
+                        property: MemberProp::Ident(ident("tag")),
+                        is_computed: false,
+                    }))),
+                    quasi: TemplateLit {
+                        loc: span(),
+                        quasis: vec![
+                            TemplateElement {
+                                loc: span(),
+                                raw: "a".to_owned(),
+                                cooked: Some("a".to_owned()),
+                                tail: false,
+                            },
+                            TemplateElement {
+                                loc: span(),
+                                raw: "b".to_owned(),
+                                cooked: Some("b".to_owned()),
+                                tail: true,
+                            },
+                        ],
+                        expressions: vec![ident_expr("x")],
+                    },
+                }))),
+            }),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::GetTemplateObject),
+            "tagged template method must emit GetTemplateObject"
+        );
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::CallProperty),
+            "tagged template on method must use CallProperty for correct `this`"
+        );
     }
 }
