@@ -240,6 +240,19 @@ fn to_array_like_elements(val: &JsValue) -> (Vec<JsValue>, usize) {
     }
 }
 
+/// Check whether a value is a JavaScript array — either a native
+/// `JsValue::Array` or a `PlainObject` carrying the `__is_array__` marker.
+fn is_js_array(val: &JsValue) -> bool {
+    match val {
+        JsValue::Array(_) => true,
+        JsValue::PlainObject(map) => map
+            .borrow()
+            .get("__is_array__")
+            .is_some_and(|v| matches!(v, JsValue::Boolean(true))),
+        _ => false,
+    }
+}
+
 /// Invoke a JS callback (NativeFunction, bytecode Function, or PlainObject
 /// with `__call__`) with the given arguments.  This is the bridge between
 /// native built-in implementations and user-defined JS callbacks.
@@ -4269,29 +4282,25 @@ fn make_array() -> JsValue {
         builtin_fn("flat", 0, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
-            if let JsValue::Array(items) = arr {
-                let depth = args
-                    .get(1)
-                    .unwrap_or(&JsValue::Smi(1))
-                    .to_number()
-                    .unwrap_or(1.0) as u32;
-                fn flatten(items: &[JsValue], depth: u32) -> Vec<JsValue> {
-                    let mut result = Vec::new();
-                    for item in items {
-                        if depth > 0
-                            && let JsValue::Array(inner) = item
-                        {
-                            result.extend(flatten(&inner.borrow(), depth - 1));
-                            continue;
-                        }
-                        result.push(item.clone());
+            let (elements, _) = to_array_like_elements(arr);
+            let depth = args
+                .get(1)
+                .unwrap_or(&JsValue::Smi(1))
+                .to_number()
+                .unwrap_or(1.0) as u32;
+            fn flatten(items: &[JsValue], depth: u32) -> Vec<JsValue> {
+                let mut result = Vec::new();
+                for item in items {
+                    if depth > 0 && is_js_array(item) {
+                        let (inner, _) = to_array_like_elements(item);
+                        result.extend(flatten(&inner, depth - 1));
+                        continue;
                     }
-                    result
+                    result.push(item.clone());
                 }
-                Ok(JsValue::new_array(flatten(&items.borrow(), depth)))
-            } else {
-                Ok(JsValue::new_array(Vec::new()))
+                result
             }
+            Ok(JsValue::new_array(flatten(&elements, depth)))
         }),
     );
 
@@ -4301,25 +4310,23 @@ fn make_array() -> JsValue {
         builtin_fn("flatMap", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
-            if let JsValue::Array(items) = arr {
-                let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let mut result = Vec::new();
-                for (i, item) in items.borrow().iter().enumerate() {
-                    let mapped = if let JsValue::NativeFunction(f) = &cb {
-                        f(vec![item.clone(), JsValue::Smi(i as i32)])?
-                    } else {
-                        item.clone()
-                    };
-                    if let JsValue::Array(inner) = mapped {
-                        result.extend(inner.borrow().iter().cloned());
-                    } else {
-                        result.push(mapped);
-                    }
+            let (elements, _) = to_array_like_elements(arr);
+            let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let arr_val = arr.clone();
+            let mut result = Vec::new();
+            for (i, item) in elements.iter().enumerate() {
+                let mapped = call_callback(
+                    &cb,
+                    vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                )?;
+                if is_js_array(&mapped) {
+                    let (inner, _) = to_array_like_elements(&mapped);
+                    result.extend(inner);
+                } else {
+                    result.push(mapped);
                 }
-                Ok(JsValue::new_array(result))
-            } else {
-                Ok(JsValue::new_array(Vec::new()))
             }
+            Ok(JsValue::new_array(result))
         }),
     );
 
@@ -15449,6 +15456,30 @@ mod tests {
         assert_eq!(result, JsValue::String("function".into()));
     }
 
+    /// `Array.prototype.flat` flattens one level by default.
+    #[test]
+    fn e2e_flat_basic() {
+        let result = crate::builtins::global::global_eval("[1,[2,3]].flat().length").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Array.prototype.flat` with explicit depth 2.
+    #[test]
+    fn e2e_flat_depth_2() {
+        let result = crate::builtins::global::global_eval("[1,[2,[3]]].flat(2).length").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Array.prototype.flatMap` maps and flattens one level.
+    #[test]
+    fn e2e_flatmap_basic() {
+        let result = crate::builtins::global::global_eval(
+            "[1,2,3].flatMap(function(x) { return [x, x*2]; }).length",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
     // ── Array.prototype.at e2e tests ────────────────────────────────────
 
     /// `Array.prototype.at` with positive index.
@@ -15542,16 +15573,13 @@ mod tests {
     /// `Object.defineProperty` with writable:false prevents writes in strict mode.
     #[test]
     fn e2e_object_define_property_non_writable() {
+        // defineProperty with writable:false should prevent writes — verify the
+        // property keeps its original value after an attempted write (sloppy mode).
         let result = global_eval(
-            "'use strict'; var o = {}; Object.defineProperty(o, 'x', { value: 1, writable: false }); try { o.x = 2; 'no error'; } catch(e) { 'TypeError'; }",
+            "var o = {}; Object.defineProperty(o, 'x', { value: 42, writable: false }); o.x = 99; o.x",
         )
         .unwrap();
-        // If strict mode throws, we get 'TypeError'; otherwise 'no error'.
-        assert!(
-            result == JsValue::String("TypeError".into())
-                || result == JsValue::String("no error".into()),
-            "expected 'TypeError' or 'no error', got {result:?}"
-        );
+        assert_eq!(result, JsValue::Smi(42));
     }
 
     /// `Object.getOwnPropertyDescriptor` returns the value field.
