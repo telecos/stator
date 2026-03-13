@@ -2421,15 +2421,36 @@ fn make_number() -> JsValue {
         );
 
         // Number.prototype.toFixed([digits])
+        // ES2023 §21.1.3.3
         proto.insert(
             "toFixed".into(),
             native(|args| {
                 let n = this_number_value(&args)?;
-                let digits = match args.get(1) {
-                    Some(JsValue::Smi(d)) => (*d).max(0) as usize,
-                    Some(JsValue::HeapNumber(d)) => crate::builtins::util::clamped_f64_to_usize(*d),
-                    _ => 0,
+                let f_raw = match args.get(1) {
+                    None | Some(JsValue::Undefined) => 0.0,
+                    Some(v) => v.to_number().unwrap_or(0.0),
                 };
+                let f = f_raw.floor() as i64;
+                if !(0..=100).contains(&f) {
+                    return Err(StatorError::RangeError(
+                        "toFixed() digits argument must be between 0 and 100".to_string(),
+                    ));
+                }
+                let digits = f as usize;
+                if n.is_nan() {
+                    return Ok(JsValue::String("NaN".into()));
+                }
+                if n.is_infinite() {
+                    return Ok(JsValue::String(
+                        if n > 0.0 { "Infinity" } else { "-Infinity" }.into(),
+                    ));
+                }
+                // For very large numbers (>= 1e21) the spec says ToString(x).
+                if n.abs() >= 1e21 {
+                    return Ok(JsValue::String(
+                        JsValue::HeapNumber(n).to_js_string()?.into(),
+                    ));
+                }
                 Ok(JsValue::String(format!("{n:.digits$}").into()))
             }),
         );
@@ -16097,5 +16118,197 @@ mod tests {
     fn e2e_atob_empty() {
         let result = global_eval("atob('')").unwrap();
         assert_eq!(result, JsValue::String("".into()));
+    }
+
+    // ── Number.prototype.toFixed tests ──────────────────────────────────
+
+    /// `toFixed` with no arguments defaults to 0 digits.
+    #[test]
+    fn e2e_number_to_fixed_default() {
+        let result = global_eval("(1.5).toFixed()").unwrap();
+        assert_eq!(result, JsValue::String("2".into()));
+    }
+
+    /// `toFixed(2)` on a positive float.
+    #[test]
+    fn e2e_number_to_fixed_two_digits() {
+        let result = global_eval("(3.14159).toFixed(2)").unwrap();
+        assert_eq!(result, JsValue::String("3.14".into()));
+    }
+
+    /// `toFixed` on a negative number.
+    #[test]
+    fn e2e_number_to_fixed_negative() {
+        let result = global_eval("(-1.5).toFixed(1)").unwrap();
+        assert_eq!(result, JsValue::String("-1.5".into()));
+    }
+
+    /// `toFixed(0)` on an integer.
+    #[test]
+    fn e2e_number_to_fixed_integer() {
+        let result = global_eval("(42).toFixed(0)").unwrap();
+        assert_eq!(result, JsValue::String("42".into()));
+    }
+
+    /// `toFixed` throws RangeError for negative digits.
+    #[test]
+    fn e2e_number_to_fixed_range_error_negative() {
+        let result = global_eval("(1).toFixed(-1)");
+        assert!(result.is_err());
+    }
+
+    /// `toFixed` throws RangeError for digits > 100.
+    #[test]
+    fn e2e_number_to_fixed_range_error_high() {
+        let result = global_eval("(1).toFixed(101)");
+        assert!(result.is_err());
+    }
+
+    /// `toFixed` on NaN returns "NaN".
+    #[test]
+    fn e2e_number_to_fixed_nan() {
+        let result = global_eval("Number.NaN.toFixed(2)").unwrap();
+        assert_eq!(result, JsValue::String("NaN".into()));
+    }
+
+    /// `toFixed` on Infinity returns "Infinity".
+    #[test]
+    fn e2e_number_to_fixed_infinity() {
+        let result = global_eval("Infinity.toFixed(2)").unwrap();
+        assert_eq!(result, JsValue::String("Infinity".into()));
+    }
+
+    // ── String.prototype.repeat tests ───────────────────────────────────
+
+    /// `repeat(3)` repeats the string.
+    #[test]
+    fn e2e_string_repeat_basic() {
+        let result = global_eval("'abc'.repeat(3)").unwrap();
+        assert_eq!(result, JsValue::String("abcabcabc".into()));
+    }
+
+    /// `repeat(0)` returns empty string.
+    #[test]
+    fn e2e_string_repeat_zero() {
+        let result = global_eval("'x'.repeat(0)").unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    /// `repeat` on empty string returns empty string.
+    #[test]
+    fn e2e_string_repeat_empty() {
+        let result = global_eval("''.repeat(5)").unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    /// `repeat` throws RangeError for negative count.
+    #[test]
+    fn e2e_string_repeat_negative() {
+        let result = global_eval("'x'.repeat(-1)");
+        assert!(result.is_err());
+    }
+
+    /// `repeat` throws RangeError for Infinity count.
+    #[test]
+    fn e2e_string_repeat_infinity() {
+        let result = global_eval("'x'.repeat(Infinity)");
+        assert!(result.is_err());
+    }
+
+    // ── String.prototype.padStart / padEnd tests ────────────────────────
+
+    /// `padStart` pads from the left.
+    #[test]
+    fn e2e_string_pad_start_basic() {
+        let result = global_eval("'5'.padStart(3, '0')").unwrap();
+        assert_eq!(result, JsValue::String("005".into()));
+    }
+
+    /// `padStart` with default pad uses spaces.
+    #[test]
+    fn e2e_string_pad_start_default_pad() {
+        let result = global_eval("'x'.padStart(3)").unwrap();
+        assert_eq!(result, JsValue::String("  x".into()));
+    }
+
+    /// `padStart` returns original if already long enough.
+    #[test]
+    fn e2e_string_pad_start_no_pad_needed() {
+        let result = global_eval("'hello'.padStart(3, '0')").unwrap();
+        assert_eq!(result, JsValue::String("hello".into()));
+    }
+
+    /// `padEnd` pads from the right.
+    #[test]
+    fn e2e_string_pad_end_basic() {
+        let result = global_eval("'abc'.padEnd(6)").unwrap();
+        assert_eq!(result, JsValue::String("abc   ".into()));
+    }
+
+    /// `padEnd` with a fill string.
+    #[test]
+    fn e2e_string_pad_end_fill() {
+        let result = global_eval("'abc'.padEnd(6, '.')").unwrap();
+        assert_eq!(result, JsValue::String("abc...".into()));
+    }
+
+    /// `padEnd` returns original if already long enough.
+    #[test]
+    fn e2e_string_pad_end_no_pad_needed() {
+        let result = global_eval("'hello'.padEnd(3)").unwrap();
+        assert_eq!(result, JsValue::String("hello".into()));
+    }
+
+    // ── String.prototype.normalize tests ────────────────────────────────
+
+    /// `normalize()` with no argument defaults to NFC (no-op for ASCII).
+    #[test]
+    fn e2e_string_normalize_default() {
+        let result = global_eval("'hello'.normalize()").unwrap();
+        assert_eq!(result, JsValue::String("hello".into()));
+    }
+
+    /// `normalize('NFC')` on ASCII is identity.
+    #[test]
+    fn e2e_string_normalize_nfc() {
+        let result = global_eval("'test'.normalize('NFC')").unwrap();
+        assert_eq!(result, JsValue::String("test".into()));
+    }
+
+    // ── Object.entries / Object.values tests ────────────────────────────
+
+    /// `Object.entries` returns key-value pairs.
+    #[test]
+    fn e2e_object_entries_basic() {
+        let result = global_eval("Object.entries({a: 1}).length").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `Object.entries` first entry key is a string.
+    #[test]
+    fn e2e_object_entries_key() {
+        let result = global_eval("Object.entries({a: 1})[0][0]").unwrap();
+        assert_eq!(result, JsValue::String("a".into()));
+    }
+
+    /// `Object.entries` first entry value.
+    #[test]
+    fn e2e_object_entries_value() {
+        let result = global_eval("Object.entries({a: 1})[0][1]").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `Object.values` returns values array.
+    #[test]
+    fn e2e_object_values_basic() {
+        let result = global_eval("Object.values({a: 1, b: 2}).length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `Object.values` on empty object.
+    #[test]
+    fn e2e_object_values_empty() {
+        let result = global_eval("Object.values({}).length").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
     }
 }
