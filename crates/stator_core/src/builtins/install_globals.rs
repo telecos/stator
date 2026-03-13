@@ -628,7 +628,7 @@ fn make_error_constructor_object(kind: ErrorKind) -> JsValue {
         }),
     );
     // ── Subtype prototype ───────────────────────────────────────────────
-    {
+    let err_proto_rc = {
         let mut proto = PropertyMap::new();
         proto.insert(
             "name".into(),
@@ -647,13 +647,19 @@ fn make_error_constructor_object(kind: ErrorKind) -> JsValue {
             }),
         );
         proto.make_all_non_enumerable();
-        props.insert(
-            "prototype".into(),
-            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
-        );
-    }
+        let proto_rc = Rc::new(RefCell::new(proto));
+        props.insert("prototype".into(), JsValue::PlainObject(proto_rc.clone()));
+        proto_rc
+    };
     props.make_all_non_enumerable();
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    // §20.5.6.2 NativeError.prototype.constructor
+    err_proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
 }
 
 /// Extract the `cause` value from an options argument, if present.
@@ -2361,7 +2367,7 @@ fn make_number() -> JsValue {
     props.insert("NaN".into(), JsValue::HeapNumber(f64::NAN));
 
     // ── Number.prototype ─────────────────────────────────────────────────
-    {
+    let num_proto_rc = {
         let mut proto = PropertyMap::new();
 
         // Helper: extract the numeric value from `this` (args[0]).
@@ -2517,14 +2523,23 @@ fn make_number() -> JsValue {
         );
 
         proto.make_all_non_enumerable();
+        let num_proto_rc = Rc::new(RefCell::new(proto));
         props.insert(
             "prototype".into(),
-            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+            JsValue::PlainObject(num_proto_rc.clone()),
         );
-    }
+        num_proto_rc
+    };
 
     props.make_all_non_enumerable();
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    // §21.1.3.1 Number.prototype.constructor
+    num_proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
 }
 
 // ── Object constructor ───────────────────────────────────────────────────────
@@ -3809,13 +3824,21 @@ fn make_object() -> JsValue {
     );
 
     obj_proto.make_all_non_enumerable();
+    let obj_proto_rc = Rc::new(RefCell::new(obj_proto));
     props.insert(
         "prototype".into(),
-        JsValue::PlainObject(Rc::new(RefCell::new(obj_proto))),
+        JsValue::PlainObject(obj_proto_rc.clone()),
     );
 
     props.make_all_non_enumerable();
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    // §20.1.3.1 Object.prototype.constructor
+    obj_proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
 }
 
 // ── Array constructor ────────────────────────────────────────────────────────
@@ -3925,6 +3948,85 @@ fn make_array() -> JsValue {
     props.insert(
         "of".into(),
         builtin_fn("of", 0, |args| Ok(JsValue::new_array(args))),
+    );
+
+    // Array.fromAsync(arrayLike, mapFn?, thisArg?) — ES2024 §23.1.2.1.1
+    //
+    // Creates a new Array from an async iterable, sync iterable, or
+    // array-like object.  Returns a Promise that resolves to the new
+    // array.  This simplified implementation handles the common synchronous
+    // collection cases and wraps the result in a resolved promise.
+    props.insert(
+        "fromAsync".into(),
+        builtin_fn("fromAsync", 1, |args| {
+            use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
+
+            let iterable = args.first().unwrap_or(&JsValue::Undefined);
+            let map_fn = args.get(1).cloned();
+            // Validate mapFn.
+            if let Some(ref mf) = map_fn
+                && !matches!(mf, JsValue::Undefined)
+                && !is_callable(mf)
+            {
+                return Err(StatorError::TypeError(
+                    "Array.fromAsync: mapFn is not a function".into(),
+                ));
+            }
+            // Collect items synchronously (covers sync iterables / array-like).
+            let items: Vec<JsValue> = match iterable {
+                JsValue::Array(arr) => arr.borrow().clone(),
+                JsValue::String(s) => s
+                    .chars()
+                    .map(|c| JsValue::String(c.to_string().into()))
+                    .collect(),
+                JsValue::PlainObject(map) => {
+                    let borrow = map.borrow();
+                    if let Some(len_val) = borrow.get("length") {
+                        let len = match len_val {
+                            JsValue::Smi(n) => *n as usize,
+                            JsValue::HeapNumber(n) => n.trunc() as usize,
+                            _ => 0,
+                        };
+                        (0..len)
+                            .map(|i| {
+                                borrow
+                                    .get(&i.to_string())
+                                    .cloned()
+                                    .unwrap_or(JsValue::Undefined)
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    }
+                }
+                JsValue::Iterator(iter) => {
+                    let mut v = Vec::new();
+                    while let Some(item) = iter.borrow_mut().next_item() {
+                        v.push(item);
+                    }
+                    v
+                }
+                _ => Vec::new(),
+            };
+            // Apply mapFn if provided.
+            let mapped = if let Some(ref mf) = map_fn {
+                if !matches!(mf, JsValue::Undefined) {
+                    items
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, v)| dispatch_call_value(mf, vec![v, JsValue::Smi(i as i32)]))
+                        .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    items
+                }
+            } else {
+                items
+            };
+            let result_arr = JsValue::new_array(mapped);
+            // Wrap in a resolved Promise.
+            let queue = MicrotaskQueue::new();
+            Ok(JsValue::Promise(promise_resolve(result_arr, &queue)))
+        }),
     );
 
     // ── Prototype methods ───────────────────────────────────────────────
@@ -4946,10 +5048,42 @@ fn make_array() -> JsValue {
     // §23.1.3.38 Array.prototype[@@toStringTag] is NOT defined by spec,
     // but we set @@unscopables. Skip toStringTag for Array.
 
+    // §23.1.3.39 Array.prototype[@@unscopables]
+    {
+        let mut unscopables = PropertyMap::new();
+        for name in &[
+            "at",
+            "copyWithin",
+            "entries",
+            "fill",
+            "find",
+            "findIndex",
+            "findLast",
+            "findLastIndex",
+            "flat",
+            "flatMap",
+            "includes",
+            "keys",
+            "toReversed",
+            "toSorted",
+            "toSpliced",
+            "values",
+        ] {
+            unscopables.insert((*name).into(), JsValue::Boolean(true));
+        }
+        unscopables.freeze();
+        proto.insert_with_attrs(
+            "@@unscopables".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(unscopables))),
+            PropertyAttributes::CONFIGURABLE,
+        );
+    }
+
     proto.make_all_non_enumerable();
+    let arr_proto_rc = Rc::new(RefCell::new(proto));
     props.insert(
         "prototype".into(),
-        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        JsValue::PlainObject(arr_proto_rc.clone()),
     );
 
     // Array constructor: `Array()`, `Array(len)`, `Array(a, b, …)`
@@ -4991,7 +5125,14 @@ fn make_array() -> JsValue {
     );
 
     props.make_all_non_enumerable();
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    // §23.1.3.1 Array.prototype.constructor
+    arr_proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
 }
 // ── Symbol constructor ────────────────────────────────────────────────────────────
 
@@ -5800,7 +5941,7 @@ fn make_map_builtin() -> JsValue {
     );
 
     // ── Map.prototype ─────────────────────────────────────────────────
-    {
+    let map_proto_rc = {
         let mut proto = PropertyMap::new();
         for method_name in &[
             "has",
@@ -5830,21 +5971,29 @@ fn make_map_builtin() -> JsValue {
                 }),
             );
         }
-        proto.insert("constructor".into(), JsValue::Undefined);
         proto.insert_with_attrs(
             "@@toStringTag".into(),
             JsValue::String("Map".into()),
             PropertyAttributes::CONFIGURABLE,
         );
         proto.make_all_non_enumerable();
+        let map_proto_rc = Rc::new(RefCell::new(proto));
         props.insert(
             "prototype".into(),
-            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+            JsValue::PlainObject(map_proto_rc.clone()),
         );
-    }
+        map_proto_rc
+    };
 
     props.make_all_non_enumerable();
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    // §24.1.3.1 Map.prototype.constructor
+    map_proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
 }
 
 // ── Set constructor (ES2025 §24.2) ───────────────────────────────────────────
@@ -6106,7 +6255,7 @@ fn make_set_builtin() -> JsValue {
     );
 
     // ── Set.prototype ──────────────────────────────────────────────────
-    {
+    let set_proto_rc = {
         let mut proto = PropertyMap::new();
         for method_name in &[
             "has",
@@ -6140,21 +6289,29 @@ fn make_set_builtin() -> JsValue {
                 }),
             );
         }
-        proto.insert("constructor".into(), JsValue::Undefined);
         proto.insert_with_attrs(
             "@@toStringTag".into(),
             JsValue::String("Set".into()),
             PropertyAttributes::CONFIGURABLE,
         );
         proto.make_all_non_enumerable();
+        let set_proto_rc_inner = Rc::new(RefCell::new(proto));
         props.insert(
             "prototype".into(),
-            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+            JsValue::PlainObject(set_proto_rc_inner.clone()),
         );
-    }
+        set_proto_rc_inner
+    };
 
     props.make_all_non_enumerable();
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    // §24.2.3.1 Set.prototype.constructor
+    set_proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
 }
 
 // ── WeakMap constructor (ES2025 §24.3) ───────────────────────────────────────
@@ -6826,13 +6983,21 @@ fn make_function() -> JsValue {
     props.insert("name".into(), JsValue::String("Function".into()));
 
     proto.make_all_non_enumerable();
+    let fn_proto_rc = Rc::new(RefCell::new(proto));
     props.insert(
         "prototype".into(),
-        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        JsValue::PlainObject(fn_proto_rc.clone()),
     );
 
     props.make_all_non_enumerable();
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    // §20.2.3.1 Function.prototype.constructor
+    fn_proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
 }
 
 /// Build the `String` constructor/namespace object with static and prototype
@@ -7645,13 +7810,21 @@ fn make_string() -> JsValue {
     // §22.1.3 String.prototype[@@toStringTag] is NOT defined by spec.
 
     proto.make_all_non_enumerable();
+    let str_proto_rc = Rc::new(RefCell::new(proto));
     props.insert(
         "prototype".into(),
-        JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        JsValue::PlainObject(str_proto_rc.clone()),
     );
 
     props.make_all_non_enumerable();
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    // §22.1.3.1 String.prototype.constructor
+    str_proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
 }
 
 // ── Promise ─────────────────────────────────────────────────────────────────
@@ -7984,7 +8157,7 @@ fn make_regexp() -> JsValue {
     );
 
     // ── RegExp.prototype ────────────────────────────────────────────────
-    {
+    let regexp_proto_rc = {
         let mut proto = PropertyMap::new();
 
         // RegExp.prototype.exec(string) — delegates to instance exec.
@@ -8054,14 +8227,23 @@ fn make_regexp() -> JsValue {
 
         proto.insert("@@toStringTag".into(), JsValue::String("RegExp".into()));
         proto.make_all_non_enumerable();
+        let re_proto_rc = Rc::new(RefCell::new(proto));
         props.insert(
             "prototype".into(),
-            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+            JsValue::PlainObject(re_proto_rc.clone()),
         );
-    }
+        re_proto_rc
+    };
 
     props.make_all_non_enumerable();
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    // §22.2.4.1 RegExp.prototype.constructor
+    regexp_proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        ctor.clone(),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+    ctor
 }
 
 /// Build the `BigInt` global constructor with `asIntN` and `asUintN` static methods.
@@ -16315,5 +16497,329 @@ mod tests {
     fn e2e_object_values_empty() {
         let result = global_eval("Object.values({}).length").unwrap();
         assert_eq!(result, JsValue::Smi(0));
+    }
+
+    // ── constructor property tests ──────────────────────────────────────
+
+    /// Array.prototype.constructor exists and is a function-like object.
+    #[test]
+    fn test_array_prototype_has_constructor() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let arr = globals.get("Array").unwrap();
+        if let JsValue::PlainObject(map) = arr {
+            let borrow = map.borrow();
+            if let Some(JsValue::PlainObject(proto_obj)) = borrow.get("prototype") {
+                let proto = proto_obj.borrow();
+                assert!(
+                    proto.contains_key("constructor"),
+                    "Array.prototype should have constructor"
+                );
+            } else {
+                panic!("Array should have prototype");
+            }
+        } else {
+            panic!("Array should be PlainObject");
+        }
+    }
+
+    /// Object.prototype.constructor exists.
+    #[test]
+    fn test_object_prototype_has_constructor() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let obj = globals.get("Object").unwrap();
+        if let JsValue::PlainObject(map) = obj {
+            let borrow = map.borrow();
+            if let Some(JsValue::PlainObject(proto_obj)) = borrow.get("prototype") {
+                let proto = proto_obj.borrow();
+                assert!(
+                    proto.contains_key("constructor"),
+                    "Object.prototype should have constructor"
+                );
+            } else {
+                panic!("Object should have prototype");
+            }
+        } else {
+            panic!("Object should be PlainObject");
+        }
+    }
+
+    /// String.prototype.constructor exists.
+    #[test]
+    fn test_string_prototype_has_constructor() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let s = globals.get("String").unwrap();
+        if let JsValue::PlainObject(map) = s {
+            let borrow = map.borrow();
+            if let Some(JsValue::PlainObject(proto_obj)) = borrow.get("prototype") {
+                let proto = proto_obj.borrow();
+                assert!(
+                    proto.contains_key("constructor"),
+                    "String.prototype should have constructor"
+                );
+            } else {
+                panic!("String should have prototype");
+            }
+        } else {
+            panic!("String should be PlainObject");
+        }
+    }
+
+    /// Number.prototype.constructor exists.
+    #[test]
+    fn test_number_prototype_has_constructor() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let n = globals.get("Number").unwrap();
+        if let JsValue::PlainObject(map) = n {
+            let borrow = map.borrow();
+            if let Some(JsValue::PlainObject(proto_obj)) = borrow.get("prototype") {
+                let proto = proto_obj.borrow();
+                assert!(
+                    proto.contains_key("constructor"),
+                    "Number.prototype should have constructor"
+                );
+            } else {
+                panic!("Number should have prototype");
+            }
+        } else {
+            panic!("Number should be PlainObject");
+        }
+    }
+
+    /// Boolean.prototype.constructor exists.
+    #[test]
+    fn test_boolean_prototype_has_constructor() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let b = globals.get("Boolean").unwrap();
+        if let JsValue::PlainObject(map) = b {
+            let borrow = map.borrow();
+            if let Some(JsValue::PlainObject(proto_obj)) = borrow.get("prototype") {
+                let proto = proto_obj.borrow();
+                assert!(
+                    proto.contains_key("constructor"),
+                    "Boolean.prototype should have constructor"
+                );
+            } else {
+                panic!("Boolean should have prototype");
+            }
+        } else {
+            panic!("Boolean should be PlainObject");
+        }
+    }
+
+    /// Function.prototype.constructor exists.
+    #[test]
+    fn test_function_prototype_has_constructor() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let f = globals.get("Function").unwrap();
+        if let JsValue::PlainObject(map) = f {
+            let borrow = map.borrow();
+            if let Some(JsValue::PlainObject(proto_obj)) = borrow.get("prototype") {
+                let proto = proto_obj.borrow();
+                assert!(
+                    proto.contains_key("constructor"),
+                    "Function.prototype should have constructor"
+                );
+            } else {
+                panic!("Function should have prototype");
+            }
+        } else {
+            panic!("Function should be PlainObject");
+        }
+    }
+
+    /// RegExp.prototype.constructor exists.
+    #[test]
+    fn test_regexp_prototype_has_constructor() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let r = globals.get("RegExp").unwrap();
+        if let JsValue::PlainObject(map) = r {
+            let borrow = map.borrow();
+            if let Some(JsValue::PlainObject(proto_obj)) = borrow.get("prototype") {
+                let proto = proto_obj.borrow();
+                assert!(
+                    proto.contains_key("constructor"),
+                    "RegExp.prototype should have constructor"
+                );
+            } else {
+                panic!("RegExp should have prototype");
+            }
+        } else {
+            panic!("RegExp should be PlainObject");
+        }
+    }
+
+    /// Map.prototype.constructor is not Undefined (was previously a bug).
+    #[test]
+    fn test_map_prototype_constructor_not_undefined() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let m = globals.get("Map").unwrap();
+        if let JsValue::PlainObject(map) = m {
+            let borrow = map.borrow();
+            if let Some(JsValue::PlainObject(proto_obj)) = borrow.get("prototype") {
+                let proto = proto_obj.borrow();
+                let ctor = proto.get("constructor").cloned();
+                assert!(
+                    !matches!(ctor, Some(JsValue::Undefined) | None),
+                    "Map.prototype.constructor should not be Undefined"
+                );
+            } else {
+                panic!("Map should have prototype");
+            }
+        } else {
+            panic!("Map should be PlainObject");
+        }
+    }
+
+    /// Set.prototype.constructor is not Undefined (was previously a bug).
+    #[test]
+    fn test_set_prototype_constructor_not_undefined() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let s = globals.get("Set").unwrap();
+        if let JsValue::PlainObject(map) = s {
+            let borrow = map.borrow();
+            if let Some(JsValue::PlainObject(proto_obj)) = borrow.get("prototype") {
+                let proto = proto_obj.borrow();
+                let ctor = proto.get("constructor").cloned();
+                assert!(
+                    !matches!(ctor, Some(JsValue::Undefined) | None),
+                    "Set.prototype.constructor should not be Undefined"
+                );
+            } else {
+                panic!("Set should have prototype");
+            }
+        } else {
+            panic!("Set should be PlainObject");
+        }
+    }
+
+    /// Error.prototype.constructor exists (for TypeError specifically).
+    #[test]
+    fn test_error_prototype_has_constructor() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let e = globals.get("TypeError").unwrap();
+        if let JsValue::PlainObject(map) = e {
+            let borrow = map.borrow();
+            if let Some(JsValue::PlainObject(proto_obj)) = borrow.get("prototype") {
+                let proto = proto_obj.borrow();
+                assert!(
+                    proto.contains_key("constructor"),
+                    "TypeError.prototype should have constructor"
+                );
+            } else {
+                panic!("TypeError should have prototype");
+            }
+        } else {
+            panic!("TypeError should be PlainObject");
+        }
+    }
+
+    /// Array.prototype.constructor is the same object as the Array constructor.
+    #[test]
+    fn test_array_constructor_circular_ref() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let arr = globals.get("Array").unwrap();
+        if let JsValue::PlainObject(arr_rc) = arr {
+            let borrow = arr_rc.borrow();
+            if let Some(JsValue::PlainObject(proto_obj)) = borrow.get("prototype") {
+                let proto = proto_obj.borrow();
+                if let Some(JsValue::PlainObject(ctor_rc)) = proto.get("constructor") {
+                    assert!(
+                        Rc::ptr_eq(arr_rc, ctor_rc),
+                        "Array.prototype.constructor should be Array itself"
+                    );
+                } else {
+                    panic!("constructor should be PlainObject");
+                }
+            } else {
+                panic!("Array should have prototype");
+            }
+        } else {
+            panic!("Array should be PlainObject");
+        }
+    }
+
+    // ── Array.prototype[@@unscopables] tests ────────────────────────────
+
+    /// Array.prototype has @@unscopables.
+    #[test]
+    fn test_array_unscopables_exists() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let arr = globals.get("Array").unwrap();
+        if let JsValue::PlainObject(map) = arr {
+            let borrow = map.borrow();
+            if let Some(JsValue::PlainObject(proto_obj)) = borrow.get("prototype") {
+                let proto = proto_obj.borrow();
+                assert!(
+                    proto.contains_key("@@unscopables"),
+                    "Array.prototype should have @@unscopables"
+                );
+            } else {
+                panic!("Array should have prototype");
+            }
+        }
+    }
+
+    /// Array.prototype[@@unscopables] contains expected keys.
+    #[test]
+    fn test_array_unscopables_keys() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let arr = globals.get("Array").unwrap();
+        if let JsValue::PlainObject(map) = arr {
+            let borrow = map.borrow();
+            if let Some(JsValue::PlainObject(proto_obj)) = borrow.get("prototype") {
+                let proto = proto_obj.borrow();
+                if let Some(JsValue::PlainObject(unscopables)) = proto.get("@@unscopables") {
+                    let u = unscopables.borrow();
+                    for key in &[
+                        "at",
+                        "copyWithin",
+                        "entries",
+                        "fill",
+                        "find",
+                        "findIndex",
+                        "flat",
+                        "flatMap",
+                        "includes",
+                        "keys",
+                        "values",
+                    ] {
+                        assert!(u.contains_key(*key), "@@unscopables should contain {key}");
+                    }
+                } else {
+                    panic!("@@unscopables should be PlainObject");
+                }
+            }
+        }
+    }
+
+    // ── Array.fromAsync tests ───────────────────────────────────────────
+
+    /// Array.fromAsync is registered on Array.
+    #[test]
+    fn test_array_from_async_exists() {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let arr = globals.get("Array").unwrap();
+        if let JsValue::PlainObject(map) = arr {
+            assert!(
+                map.borrow().contains_key("fromAsync"),
+                "Array should have fromAsync"
+            );
+        } else {
+            panic!("Array should be PlainObject");
+        }
     }
 }
