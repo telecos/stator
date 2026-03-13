@@ -1200,6 +1200,9 @@ impl<'src> Parser<'src> {
         let start = self.current_span();
         self.expect(TokenKind::LeftBrace)?;
         self.class_depth += 1;
+        // Class bodies are always strict (ES2015 §10.2.1).
+        let outer_strict = self.strict_mode;
+        self.strict_mode = true;
         let mut members = Vec::new();
 
         while self.peek_kind() != TokenKind::RightBrace {
@@ -1306,6 +1309,8 @@ impl<'src> Parser<'src> {
                 let fn_start = self.current_span();
                 self.expect(TokenKind::LeftParen)?;
                 let params = self.parse_formal_params()?;
+                // Class bodies are always strict — reject duplicate params.
+                self.check_strict_duplicate_params(&params)?;
                 let outer_fn = self.function_depth;
                 let outer_it = self.iteration_depth;
                 let outer_br = self.breakable_depth;
@@ -1326,7 +1331,7 @@ impl<'src> Parser<'src> {
                     is_generator,
                     params,
                     body,
-                    is_strict: false,
+                    is_strict: true,
                 };
 
                 members.push(ClassMember::Method(MethodDef {
@@ -1364,6 +1369,7 @@ impl<'src> Parser<'src> {
         }
 
         self.class_depth -= 1;
+        self.strict_mode = outer_strict;
         let end = self.current_span();
         self.bump()?; // consume '}'
         Ok(ClassBody {
@@ -1895,6 +1901,24 @@ impl<'src> Parser<'src> {
         Ok(())
     }
 
+    /// Arrow functions, methods, getters, and setters always use
+    /// `UniqueFormalParameters` — duplicate simple names are a `SyntaxError`
+    /// regardless of strict mode.
+    fn check_unique_params(&self, params: &[Param]) -> StatorResult<()> {
+        let mut seen = std::collections::HashSet::new();
+        for param in params {
+            if let Pat::Ident(id) = &param.pat
+                && !seen.insert(&id.name)
+            {
+                return Err(self.error(&format!(
+                    "duplicate parameter name '{}' not allowed",
+                    id.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Returns `true` if `params` contains any non-simple parameter
     /// (destructuring, default value, or rest element).
     fn has_non_simple_params(params: &[Param]) -> bool {
@@ -2393,6 +2417,7 @@ impl<'src> Parser<'src> {
                     .into_iter()
                     .map(|e| self.expr_to_single_param(e))
                     .collect::<StatorResult<Vec<_>>>()?;
+                self.check_unique_params(&params)?;
                 let body = self.parse_arrow_body()?;
                 let end = self.arrow_body_loc(&body);
                 return Ok(Expr::Arrow(Box::new(ArrowExpr {
@@ -2405,6 +2430,7 @@ impl<'src> Parser<'src> {
             }
 
             let params = self.expr_to_arrow_params(lhs)?;
+            self.check_unique_params(&params)?;
             let body = self.parse_arrow_body()?;
             let end = self.arrow_body_loc(&body);
             return Ok(Expr::Arrow(Box::new(ArrowExpr {
@@ -3207,6 +3233,8 @@ impl<'src> Parser<'src> {
                             let fn_start = self.current_span();
                             self.expect(TokenKind::LeftParen)?;
                             let params = self.parse_formal_params()?;
+                            // Accessors always use UniqueFormalParameters.
+                            self.check_unique_params(&params)?;
                             let outer_fn = self.function_depth;
                             let outer_it = self.iteration_depth;
                             let outer_br = self.breakable_depth;
@@ -3242,6 +3270,8 @@ impl<'src> Parser<'src> {
                             let fn_start = self.current_span();
                             self.expect(TokenKind::LeftParen)?;
                             let params = self.parse_formal_params()?;
+                            // Method definitions always use UniqueFormalParameters.
+                            self.check_unique_params(&params)?;
                             let outer_fn = self.function_depth;
                             let outer_it = self.iteration_depth;
                             let outer_br = self.breakable_depth;
@@ -7639,5 +7669,194 @@ mod tests {
         } else {
             panic!("expected FnDecl");
         }
+    }
+
+    // ── Duplicate parameter names ────────────────────────────────────────
+
+    #[test]
+    fn test_strict_duplicate_params_error() {
+        let result = parse("'use strict'; function f(a, a) {}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_duplicate_params_fn_body_directive() {
+        let result = parse("function f(a, a) { 'use strict'; }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sloppy_duplicate_params_ok() {
+        let result = parse("function f(a, a) {}");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_duplicate_params_fn_expr() {
+        let result = parse("'use strict'; var f = function(a, a) {};");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_arrow_duplicate_params_error() {
+        // Arrow functions always reject duplicate params.
+        let result = parse("(a, a) => {}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_arrow_unique_params_ok() {
+        let result = parse("(a, b) => {}");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_class_method_duplicate_params_error() {
+        // Class bodies are always strict.
+        let result = parse("class C { m(a, a) {} }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_object_method_duplicate_params_error() {
+        let result = parse("({ m(a, a) {} })");
+        assert!(result.is_err());
+    }
+
+    // ── Assignment to eval/arguments in strict mode ──────────────────────
+
+    #[test]
+    fn test_strict_assign_eval_error() {
+        let result = parse("'use strict'; eval = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_assign_arguments_error() {
+        let result = parse("'use strict'; arguments = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sloppy_assign_eval_ok() {
+        let result = parse("eval = 1;");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_sloppy_assign_arguments_ok() {
+        let result = parse("arguments = 1;");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_prefix_increment_eval_error() {
+        let result = parse("'use strict'; ++eval;");
+        assert!(result.is_err());
+    }
+
+    // ── Octal literals in strict mode ────────────────────────────────────
+
+    #[test]
+    fn test_strict_octal_literal_error() {
+        let result = parse("'use strict'; var x = 010;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sloppy_octal_literal_ok() {
+        let result = parse("var x = 010;");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_octal_escape_in_string_error() {
+        let result = parse("'use strict'; var x = '\\012';");
+        assert!(result.is_err());
+    }
+
+    // ── Delete of unqualified identifier in strict mode ──────────────────
+
+    #[test]
+    fn test_strict_delete_identifier_error() {
+        let result = parse("'use strict'; delete x;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sloppy_delete_identifier_ok() {
+        let result = parse("delete x;");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_delete_member_ok() {
+        // Deleting a member expression is fine even in strict mode.
+        let result = parse("'use strict'; delete obj.x;");
+        assert!(result.is_ok());
+    }
+
+    // ── With statement in strict mode ────────────────────────────────────
+
+    #[test]
+    fn test_sloppy_with_ok() {
+        let result = parse("with (obj) { x; }");
+        assert!(result.is_ok());
+    }
+
+    // (test_strict_mode_with_statement_error already exists above)
+
+    // ── Duplicate __proto__ in object literal ────────────────────────────
+
+    #[test]
+    fn test_duplicate_proto_error() {
+        let result = parse("({__proto__: null, __proto__: null})");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_single_proto_ok() {
+        let result = parse("({__proto__: null})");
+        assert!(result.is_ok());
+    }
+
+    // ── const without initializer ────────────────────────────────────────
+
+    #[test]
+    fn test_const_no_init_error() {
+        let result = parse("const x;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_const_with_init_ok() {
+        let result = parse("const x = 1;");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_let_no_init_ok() {
+        let result = parse("let x;");
+        assert!(result.is_ok());
+    }
+
+    // ── Class body is always strict ──────────────────────────────────────
+
+    #[test]
+    fn test_class_body_rejects_octal() {
+        let result = parse("class C { m() { var x = 010; } }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_class_body_rejects_with() {
+        let result = parse("class C { m() { with (obj) {} } }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_class_body_rejects_delete_ident() {
+        let result = parse("class C { m() { delete x; } }");
+        assert!(result.is_err());
     }
 }
