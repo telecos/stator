@@ -7740,7 +7740,7 @@ fn make_promise() -> JsValue {
         let q = queue.clone();
         props.insert(
             "prototype_then".into(),
-            JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+            builtin_fn("then", 2, move |args: Vec<JsValue>| {
                 let promise = match args.first() {
                     Some(JsValue::Promise(p)) => p.clone(),
                     _ => {
@@ -7757,7 +7757,7 @@ fn make_promise() -> JsValue {
                     on_rejected,
                     &q,
                 )))
-            })),
+            }),
         );
     }
 
@@ -7766,7 +7766,7 @@ fn make_promise() -> JsValue {
         let q = queue.clone();
         props.insert(
             "prototype_catch".into(),
-            JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+            builtin_fn("catch", 1, move |args: Vec<JsValue>| {
                 let promise = match args.first() {
                     Some(JsValue::Promise(p)) => p.clone(),
                     _ => {
@@ -7780,7 +7780,7 @@ fn make_promise() -> JsValue {
                     .and_then(|v| extract_handler(v))
                     .unwrap_or_else(|| Box::new(Err));
                 Ok(JsValue::Promise(promise_catch(&promise, handler, &q)))
-            })),
+            }),
         );
     }
 
@@ -7789,7 +7789,7 @@ fn make_promise() -> JsValue {
         let q = queue.clone();
         props.insert(
             "prototype_finally".into(),
-            JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+            builtin_fn("finally", 1, move |args: Vec<JsValue>| {
                 let promise = match args.first() {
                     Some(JsValue::Promise(p)) => p.clone(),
                     _ => {
@@ -7809,7 +7809,7 @@ fn make_promise() -> JsValue {
                     _ => Box::new(|| Ok(())) as Box<dyn Fn() -> Result<(), JsValue>>,
                 };
                 Ok(JsValue::Promise(promise_finally(&promise, callback, &q)))
-            })),
+            }),
         );
     }
 
