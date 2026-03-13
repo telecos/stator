@@ -155,6 +155,33 @@ fn weak_collection_key(val: &JsValue) -> Option<usize> {
     }
 }
 
+/// Wire up the spec-mandated `.name` and `.prototype.constructor` properties
+/// on a built-in constructor `PlainObject`.
+///
+/// Per ES §20.2.3.1 and §20.2.3.2:
+/// - `Ctor.name` = *name* (configurable, non-writable, non-enumerable)
+/// - `Ctor.prototype.constructor` = *Ctor* (writable, configurable, non-enumerable)
+fn finalize_ctor(ctor: JsValue, name: &str) -> JsValue {
+    if let JsValue::PlainObject(ref rc) = ctor {
+        // .name — §20.2.3.1 (configurable only)
+        rc.borrow_mut().insert_with_attrs(
+            "name".into(),
+            JsValue::String(name.into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        // .prototype.constructor — §20.2.3.2 (writable | configurable)
+        let proto = rc.borrow().get("prototype").cloned();
+        if let Some(JsValue::PlainObject(proto_rc)) = proto {
+            proto_rc.borrow_mut().insert_with_attrs(
+                "constructor".into(),
+                ctor.clone(),
+                PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+            );
+        }
+    }
+    ctor
+}
+
 /// Create a built-in function object with `.name` and `.length` properties.
 ///
 /// Per the ES spec, every built-in function should expose a non-enumerable,
@@ -772,39 +799,58 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
     }
 
     error_props.make_all_non_enumerable();
-    globals.insert(
-        "Error".into(),
-        JsValue::PlainObject(Rc::new(RefCell::new(error_props))),
-    );
+    let error_val = JsValue::PlainObject(Rc::new(RefCell::new(error_props)));
+    globals.insert("Error".into(), finalize_ctor(error_val, "Error"));
 
     globals.insert(
         "TypeError".into(),
-        make_error_constructor_object(ErrorKind::TypeError),
+        finalize_ctor(
+            make_error_constructor_object(ErrorKind::TypeError),
+            "TypeError",
+        ),
     );
     globals.insert(
         "RangeError".into(),
-        make_error_constructor_object(ErrorKind::RangeError),
+        finalize_ctor(
+            make_error_constructor_object(ErrorKind::RangeError),
+            "RangeError",
+        ),
     );
     globals.insert(
         "ReferenceError".into(),
-        make_error_constructor_object(ErrorKind::ReferenceError),
+        finalize_ctor(
+            make_error_constructor_object(ErrorKind::ReferenceError),
+            "ReferenceError",
+        ),
     );
     globals.insert(
         "SyntaxError".into(),
-        make_error_constructor_object(ErrorKind::SyntaxError),
+        finalize_ctor(
+            make_error_constructor_object(ErrorKind::SyntaxError),
+            "SyntaxError",
+        ),
     );
     globals.insert(
         "URIError".into(),
-        make_error_constructor_object(ErrorKind::URIError),
+        finalize_ctor(
+            make_error_constructor_object(ErrorKind::URIError),
+            "URIError",
+        ),
     );
     globals.insert(
         "EvalError".into(),
-        make_error_constructor_object(ErrorKind::EvalError),
+        finalize_ctor(
+            make_error_constructor_object(ErrorKind::EvalError),
+            "EvalError",
+        ),
     );
-    globals.insert("AggregateError".into(), make_aggregate_error_constructor());
+    globals.insert(
+        "AggregateError".into(),
+        finalize_ctor(make_aggregate_error_constructor(), "AggregateError"),
+    );
     globals.insert(
         "SuppressedError".into(),
-        make_suppressed_error_constructor(),
+        finalize_ctor(make_suppressed_error_constructor(), "SuppressedError"),
     );
 }
 
@@ -10445,96 +10491,162 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     globals.insert("Intl".into(), make_intl());
 
     // ── Constructor / namespace objects ──────────────────────────────────
-    globals.insert("Number".into(), make_number());
-    globals.insert("Boolean".into(), make_boolean());
-    globals.insert("Date".into(), make_date());
-    globals.insert("Object".into(), make_object());
-    globals.insert("Array".into(), make_array());
-    globals.insert("Symbol".into(), make_symbol());
-    globals.insert("Iterator".into(), make_iterator());
-    globals.insert("AsyncIterator".into(), make_async_iterator());
-    globals.insert("Map".into(), make_map_builtin());
-    globals.insert("Set".into(), make_set_builtin());
-    globals.insert("WeakMap".into(), make_weak_map_builtin());
-    globals.insert("WeakSet".into(), make_weak_set_builtin());
-    globals.insert("WeakRef".into(), make_weak_ref_builtin());
+    globals.insert("Number".into(), finalize_ctor(make_number(), "Number"));
+    globals.insert("Boolean".into(), finalize_ctor(make_boolean(), "Boolean"));
+    globals.insert("Date".into(), finalize_ctor(make_date(), "Date"));
+    globals.insert("Object".into(), finalize_ctor(make_object(), "Object"));
+    globals.insert("Array".into(), finalize_ctor(make_array(), "Array"));
+    globals.insert("Symbol".into(), finalize_ctor(make_symbol(), "Symbol"));
+    globals.insert(
+        "Iterator".into(),
+        finalize_ctor(make_iterator(), "Iterator"),
+    );
+    globals.insert(
+        "AsyncIterator".into(),
+        finalize_ctor(make_async_iterator(), "AsyncIterator"),
+    );
+    globals.insert("Map".into(), finalize_ctor(make_map_builtin(), "Map"));
+    globals.insert("Set".into(), finalize_ctor(make_set_builtin(), "Set"));
+    globals.insert(
+        "WeakMap".into(),
+        finalize_ctor(make_weak_map_builtin(), "WeakMap"),
+    );
+    globals.insert(
+        "WeakSet".into(),
+        finalize_ctor(make_weak_set_builtin(), "WeakSet"),
+    );
+    globals.insert(
+        "WeakRef".into(),
+        finalize_ctor(make_weak_ref_builtin(), "WeakRef"),
+    );
     globals.insert(
         "FinalizationRegistry".into(),
-        make_finalization_registry_builtin(),
+        finalize_ctor(make_finalization_registry_builtin(), "FinalizationRegistry"),
     );
-    globals.insert("Promise".into(), make_promise());
-    globals.insert("RegExp".into(), make_regexp());
-    globals.insert("BigInt".into(), make_bigint());
-    globals.insert("Function".into(), make_function());
-    globals.insert("Proxy".into(), make_proxy());
+    globals.insert("Promise".into(), finalize_ctor(make_promise(), "Promise"));
+    globals.insert("RegExp".into(), finalize_ctor(make_regexp(), "RegExp"));
+    globals.insert("BigInt".into(), finalize_ctor(make_bigint(), "BigInt"));
+    globals.insert(
+        "Function".into(),
+        finalize_ctor(make_function(), "Function"),
+    );
+    globals.insert("Proxy".into(), finalize_ctor(make_proxy(), "Proxy"));
     globals.insert("Reflect".into(), make_reflect());
 
     // ── Atomics / SharedArrayBuffer ─────────────────────────────────────
     globals.insert("Atomics".into(), make_atomics());
-    globals.insert("SharedArrayBuffer".into(), make_shared_arraybuffer());
+    globals.insert(
+        "SharedArrayBuffer".into(),
+        finalize_ctor(make_shared_arraybuffer(), "SharedArrayBuffer"),
+    );
 
     // ── ShadowRealm ────────────────────────────────────────────────────
-    globals.insert("ShadowRealm".into(), make_shadow_realm());
+    globals.insert(
+        "ShadowRealm".into(),
+        finalize_ctor(make_shadow_realm(), "ShadowRealm"),
+    );
 
     // ── Error constructors ────────────────────────────────────────────────
     install_error_constructors(globals);
 
     // ── Explicit resource management ────────────────────────────────────
-    globals.insert("DisposableStack".into(), make_disposable_stack());
+    globals.insert(
+        "DisposableStack".into(),
+        finalize_ctor(make_disposable_stack(), "DisposableStack"),
+    );
 
     // ── Simple constructor-like wrappers ─────────────────────────────────
     // NOTE: Boolean is already installed via make_boolean() above, which
     // provides both __call__ (constructor) and prototype.  Do NOT
     // overwrite it with a bare NativeFunction—that would lose
     // Boolean.prototype.
-    globals.insert("String".into(), make_string());
+    globals.insert("String".into(), finalize_ctor(make_string(), "String"));
 
     // ── TypedArray / ArrayBuffer / DataView constructors ─────────────────
-    globals.insert("ArrayBuffer".into(), make_arraybuffer());
-    globals.insert("DataView".into(), make_dataview());
+    globals.insert(
+        "ArrayBuffer".into(),
+        finalize_ctor(make_arraybuffer(), "ArrayBuffer"),
+    );
+    globals.insert(
+        "DataView".into(),
+        finalize_ctor(make_dataview(), "DataView"),
+    );
     globals.insert(
         "Int8Array".into(),
-        make_typed_array_constructor(TypedArrayKind::Int8),
+        finalize_ctor(
+            make_typed_array_constructor(TypedArrayKind::Int8),
+            "Int8Array",
+        ),
     );
     globals.insert(
         "Uint8Array".into(),
-        make_typed_array_constructor(TypedArrayKind::Uint8),
+        finalize_ctor(
+            make_typed_array_constructor(TypedArrayKind::Uint8),
+            "Uint8Array",
+        ),
     );
     globals.insert(
         "Uint8ClampedArray".into(),
-        make_typed_array_constructor(TypedArrayKind::Uint8Clamped),
+        finalize_ctor(
+            make_typed_array_constructor(TypedArrayKind::Uint8Clamped),
+            "Uint8ClampedArray",
+        ),
     );
     globals.insert(
         "Int16Array".into(),
-        make_typed_array_constructor(TypedArrayKind::Int16),
+        finalize_ctor(
+            make_typed_array_constructor(TypedArrayKind::Int16),
+            "Int16Array",
+        ),
     );
     globals.insert(
         "Uint16Array".into(),
-        make_typed_array_constructor(TypedArrayKind::Uint16),
+        finalize_ctor(
+            make_typed_array_constructor(TypedArrayKind::Uint16),
+            "Uint16Array",
+        ),
     );
     globals.insert(
         "Int32Array".into(),
-        make_typed_array_constructor(TypedArrayKind::Int32),
+        finalize_ctor(
+            make_typed_array_constructor(TypedArrayKind::Int32),
+            "Int32Array",
+        ),
     );
     globals.insert(
         "Uint32Array".into(),
-        make_typed_array_constructor(TypedArrayKind::Uint32),
+        finalize_ctor(
+            make_typed_array_constructor(TypedArrayKind::Uint32),
+            "Uint32Array",
+        ),
     );
     globals.insert(
         "Float32Array".into(),
-        make_typed_array_constructor(TypedArrayKind::Float32),
+        finalize_ctor(
+            make_typed_array_constructor(TypedArrayKind::Float32),
+            "Float32Array",
+        ),
     );
     globals.insert(
         "Float64Array".into(),
-        make_typed_array_constructor(TypedArrayKind::Float64),
+        finalize_ctor(
+            make_typed_array_constructor(TypedArrayKind::Float64),
+            "Float64Array",
+        ),
     );
     globals.insert(
         "BigInt64Array".into(),
-        make_typed_array_constructor(TypedArrayKind::BigInt64),
+        finalize_ctor(
+            make_typed_array_constructor(TypedArrayKind::BigInt64),
+            "BigInt64Array",
+        ),
     );
     globals.insert(
         "BigUint64Array".into(),
-        make_typed_array_constructor(TypedArrayKind::BigUint64),
+        finalize_ctor(
+            make_typed_array_constructor(TypedArrayKind::BigUint64),
+            "BigUint64Array",
+        ),
     );
 
     // ── Global constants ────────────────────────────────────────────────

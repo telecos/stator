@@ -5825,4 +5825,61 @@ mod tests {
             crate::builtins::global::global_eval("var o = {...'hi'}; o[0] + o[1]").unwrap();
         assert_eq!(result, JsValue::String("hi".into()));
     }
+
+    #[test]
+    fn e2e_private_method() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo { #bar() { return 42; } test() { return this.#bar(); } } \
+             var f = new Foo(); f.test()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Number(42.0));
+    }
+
+    #[test]
+    fn e2e_private_field() {
+        let result = crate::builtins::global::global_eval(
+            "class C { #x = 10; get() { return this.#x; } } new C().get()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Number(10.0));
+    }
+
+    #[test]
+    fn e2e_private_field_write() {
+        let result = crate::builtins::global::global_eval(
+            "class C { #x = 0; set(v) { this.#x = v; } get() { return this.#x; } } \
+             var c = new C(); c.set(99); c.get()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Number(99.0));
+    }
+
+    #[test]
+    fn e2e_constructor_name() {
+        let result = crate::builtins::global::global_eval(
+            "Date.name + ',' + Map.name + ',' + Set.name + ',' + Array.name",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("Date,Map,Set,Array".into()));
+    }
+
+    #[test]
+    fn e2e_prototype_constructor() {
+        let result = crate::builtins::global::global_eval(
+            "Date.prototype.constructor === Date && \
+             Map.prototype.constructor === Map && \
+             Array.prototype.constructor === Array",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_instance_constructor() {
+        let result =
+            crate::builtins::global::global_eval("var d = new Date(); d.constructor === Date")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
 }
