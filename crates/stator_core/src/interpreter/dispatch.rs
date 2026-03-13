@@ -6553,4 +6553,160 @@ mod tests {
         .unwrap();
         assert_eq!(result, JsValue::Smi(2));
     }
+
+    // ── §7 Conformance round-21 ─────────────────────────────────────────
+
+    /// `typeof null` → "object"
+    #[test]
+    fn test_typeof_null_is_object() {
+        let result = crate::builtins::global::global_eval("typeof null").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    /// Template literal basic string
+    #[test]
+    fn test_template_literal_basic() {
+        let result = crate::builtins::global::global_eval("`hello world`").unwrap();
+        assert_eq!(result, JsValue::String("hello world".into()));
+    }
+
+    /// Template literal with expression
+    #[test]
+    fn test_template_literal_expression() {
+        let result = crate::builtins::global::global_eval("var x = 42; `value is ${x}`").unwrap();
+        assert_eq!(result, JsValue::String("value is 42".into()));
+    }
+
+    /// Spread in array literal
+    #[test]
+    fn test_spread_in_array_literal() {
+        let result =
+            crate::builtins::global::global_eval("var a = [1,2,3]; [...a].length").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// Object spread
+    #[test]
+    fn test_object_spread() {
+        let result =
+            crate::builtins::global::global_eval("var a = {x:1}; var b = {...a, y:2}; b.x + b.y")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// Nullish coalescing
+    #[test]
+    fn test_nullish_coalescing_null() {
+        let result = crate::builtins::global::global_eval("null ?? 42").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Nullish coalescing with non-null
+    #[test]
+    fn test_nullish_coalescing_zero() {
+        let result = crate::builtins::global::global_eval("0 ?? 42").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// Optional chaining with null
+    #[test]
+    fn test_optional_chaining_null() {
+        let result = crate::builtins::global::global_eval("var obj = null; obj?.x").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// Optional chaining with value
+    #[test]
+    fn test_optional_chaining_value() {
+        let result = crate::builtins::global::global_eval("var obj = {x: 10}; obj?.x").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// Logical assignment ||=
+    #[test]
+    fn test_logical_or_assignment() {
+        let result = crate::builtins::global::global_eval("var x = 0; x ||= 5; x").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// Logical assignment &&=
+    #[test]
+    fn test_logical_and_assignment() {
+        let result = crate::builtins::global::global_eval("var x = 1; x &&= 5; x").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// Logical assignment ??=
+    #[test]
+    fn test_nullish_assignment() {
+        let result = crate::builtins::global::global_eval("var x = null; x ??= 5; x").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// Exponentiation operator
+    #[test]
+    fn test_exponentiation() {
+        let result = crate::builtins::global::global_eval("2 ** 10").unwrap();
+        assert_eq!(result, JsValue::Smi(1024));
+    }
+
+    /// Destructuring with default values
+    #[test]
+    fn test_destructuring_default() {
+        let result = crate::builtins::global::global_eval("var {x = 10} = {}; x").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// Array destructuring
+    #[test]
+    fn test_array_destructuring_basic() {
+        let result = crate::builtins::global::global_eval("var [a, b] = [1, 2]; a + b").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// Computed property names
+    #[test]
+    fn test_computed_property_name() {
+        let result =
+            crate::builtins::global::global_eval("var key = 'x'; var obj = {[key]: 42}; obj.x")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// for...of with array
+    #[test]
+    fn test_for_of_array_sum() {
+        let result = crate::builtins::global::global_eval(
+            "var sum = 0; for (var x of [1,2,3]) { sum += x; } sum",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    /// Generator basic
+    #[test]
+    fn test_generator_basic_next() {
+        let result = crate::builtins::global::global_eval(
+            "function* gen() { yield 1; yield 2; } var g = gen(); g.next().value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// Promise.resolve returns object
+    #[test]
+    fn test_promise_resolve_type() {
+        let result = crate::builtins::global::global_eval("typeof Promise.resolve(42)").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    /// Class basic
+    #[test]
+    fn test_class_basic_method() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo { bar() { return 42; } } new Foo().bar()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
 }

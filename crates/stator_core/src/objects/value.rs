@@ -1005,6 +1005,15 @@ impl JsValue {
                 if matches!(borrow.get("__is_regexp__"), Some(Self::Boolean(true))) {
                     return "[object RegExp]".to_string();
                 }
+                if matches!(borrow.get("__is_date__"), Some(Self::Boolean(true))) {
+                    return "[object Date]".to_string();
+                }
+                if borrow.get("__call__").is_some() {
+                    return "[object Function]".to_string();
+                }
+                if matches!(borrow.get("__is_error__"), Some(Self::Boolean(true))) {
+                    return "[object Error]".to_string();
+                }
                 "[object Object]".to_string()
             }
             _ => "[object Object]".to_string(),
@@ -1144,9 +1153,9 @@ impl JsValue {
             (px, py)
         };
 
-        // Step 3: If both are strings, compare lexicographically.
+        // Step 3: If both are strings, compare by UTF-16 code units (ES spec).
         if let (JsValue::String(a), JsValue::String(b)) = (&px, &py) {
-            return Ok(Some(a < b));
+            return Ok(Some(compare_utf16(a, b) == std::cmp::Ordering::Less));
         }
 
         // Step 4a: BigInt × String
@@ -1289,6 +1298,29 @@ impl Trace for JsValue {
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
+
+/// Compare two strings by their UTF-16 code units, as required by the
+/// ECMAScript specification for relational comparison of strings.
+///
+/// This differs from Rust's default `str` comparison (which is byte-level
+/// UTF-8, i.e. code-point order) only for strings containing supplementary
+/// characters (above U+FFFF), where UTF-16 surrogate pairs sort differently
+/// than their code-point order.
+fn compare_utf16(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut a_units = a.encode_utf16();
+    let mut b_units = b.encode_utf16();
+    loop {
+        match (a_units.next(), b_units.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(au), Some(bu)) => match au.cmp(&bu) {
+                std::cmp::Ordering::Equal => continue,
+                ord => return ord,
+            },
+        }
+    }
+}
 
 /// Formats an `f64` as a JavaScript number string (ECMAScript §7.1.12.1).
 ///
@@ -3656,5 +3688,97 @@ mod tests {
     fn test_same_value_zero_different_types() {
         assert!(!JsValue::Smi(0).same_value_zero(&JsValue::Boolean(false)));
         assert!(!JsValue::Smi(0).same_value_zero(&JsValue::String("0".into())));
+    }
+
+    // ── conformance round-21: additional coverage ────────────────────────────
+
+    #[test]
+    fn test_to_number_empty_string() {
+        assert_eq!(JsValue::String("".into()).to_number().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn test_to_number_whitespace() {
+        assert_eq!(JsValue::String("  ".into()).to_number().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn test_to_number_hex_string() {
+        assert_eq!(JsValue::String("0xff".into()).to_number().unwrap(), 255.0);
+    }
+
+    #[test]
+    fn test_to_string_neg_zero() {
+        assert_eq!(
+            JsValue::HeapNumber(-0.0).to_js_string().unwrap(),
+            "0".to_string()
+        );
+    }
+
+    #[test]
+    fn test_to_string_infinity() {
+        assert_eq!(
+            JsValue::HeapNumber(f64::INFINITY).to_js_string().unwrap(),
+            "Infinity".to_string()
+        );
+    }
+
+    #[test]
+    fn test_to_string_nan() {
+        assert_eq!(
+            JsValue::HeapNumber(f64::NAN).to_js_string().unwrap(),
+            "NaN".to_string()
+        );
+    }
+
+    #[test]
+    fn test_to_number_true() {
+        assert_eq!(JsValue::Boolean(true).to_number().unwrap(), 1.0);
+    }
+
+    #[test]
+    fn test_to_number_false() {
+        assert_eq!(JsValue::Boolean(false).to_number().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_plain_object_date() {
+        let mut map = PropertyMap::new();
+        map.insert("__is_date__".to_string(), JsValue::Boolean(true));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert_eq!(obj.obj_to_string_tag(), "[object Date]");
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_plain_object_callable() {
+        let mut map = PropertyMap::new();
+        let f: NativeFn = Rc::new(|_| Ok(JsValue::Undefined));
+        map.insert("__call__".to_string(), JsValue::NativeFunction(f));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert_eq!(obj.obj_to_string_tag(), "[object Function]");
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_plain_object_error() {
+        let mut map = PropertyMap::new();
+        map.insert("__is_error__".to_string(), JsValue::Boolean(true));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert_eq!(obj.obj_to_string_tag(), "[object Error]");
+    }
+
+    #[test]
+    fn test_compare_utf16_ascii() {
+        assert!(
+            JsValue::js_less_than(&JsValue::String("a".into()), &JsValue::String("b".into()))
+                .unwrap()
+        );
+        assert!(
+            !JsValue::js_less_than(&JsValue::String("b".into()), &JsValue::String("a".into()))
+                .unwrap()
+        );
+        assert!(
+            !JsValue::js_less_than(&JsValue::String("a".into()), &JsValue::String("a".into()))
+                .unwrap()
+        );
     }
 }

@@ -2873,20 +2873,16 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "repeat" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let count = match args.first() {
-                        Some(JsValue::Smi(n)) => i64::from(*n),
-                        Some(JsValue::HeapNumber(n)) => {
-                            let f = *n;
-                            if f.is_nan() || f.is_infinite() || f < 0.0 {
-                                return Err(crate::error::StatorError::RangeError(
-                                    "Invalid count value".to_string(),
-                                ));
-                            }
-                            f as i64
-                        }
-                        _ => 0,
+                    let count_f = match args.first() {
+                        Some(v) => v.to_number()?,
+                        None => 0.0,
                     };
-                    crate::builtins::string::string_repeat(&s, count)
+                    if count_f.is_nan() || count_f < 0.0 || count_f.is_infinite() {
+                        return Err(crate::error::StatorError::RangeError(
+                            "Invalid count value".into(),
+                        ));
+                    }
+                    crate::builtins::string::string_repeat(&s, count_f as i64)
                         .map(|r| JsValue::String(r.into()))
                 }));
             }
@@ -2906,8 +2902,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         _ => 0,
                     };
                     let pad_str = match args.get(1) {
-                        Some(JsValue::String(ss)) => ss.to_string(),
-                        _ => " ".to_string(),
+                        Some(JsValue::String(f)) => f.to_string(),
+                        Some(JsValue::Undefined) | None => " ".to_string(),
+                        Some(v) => js_to_string(v),
                     };
                     crate::builtins::string::string_pad_start(&s, target_len, Some(&pad_str))
                         .map(|r| JsValue::String(r.into()))
@@ -2929,8 +2926,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         _ => 0,
                     };
                     let pad_str = match args.get(1) {
-                        Some(JsValue::String(ss)) => ss.to_string(),
-                        _ => " ".to_string(),
+                        Some(JsValue::String(f)) => f.to_string(),
+                        Some(JsValue::Undefined) | None => " ".to_string(),
+                        Some(v) => js_to_string(v),
                     };
                     crate::builtins::string::string_pad_end(&s, target_len, Some(&pad_str))
                         .map(|r| JsValue::String(r.into()))
@@ -3031,7 +3029,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let idx = match args.first() {
-                        Some(v) => v.to_number().unwrap_or(0.0) as i64,
+                        Some(v) => v.to_number()? as i64,
                         None => 0,
                     };
                     match crate::builtins::string::string_at(&s, idx) {
@@ -13595,5 +13593,57 @@ mod tests {
         let result =
             crate::builtins::global::global_eval("[1,2,3,4,5].copyWithin(0, 3).join(',')").unwrap();
         assert_eq!(result, JsValue::String("4,5,3,4,5".into()));
+    }
+
+    // ── Boolean.prototype fast-path tests ────────────────────────────────────
+
+    #[test]
+    fn test_boolean_to_string() {
+        let result = crate::builtins::global::global_eval("true.toString()").unwrap();
+        assert_eq!(result, JsValue::String("true".into()));
+    }
+
+    #[test]
+    fn test_boolean_value_of() {
+        let result = crate::builtins::global::global_eval("false.valueOf()").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── String.prototype fast-path edge-case tests ───────────────────────────
+
+    #[test]
+    fn test_string_at_positive() {
+        let result = crate::builtins::global::global_eval("'hello'.at(1)").unwrap();
+        assert_eq!(result, JsValue::String("e".into()));
+    }
+
+    #[test]
+    fn test_string_at_negative() {
+        let result = crate::builtins::global::global_eval("'hello'.at(-1)").unwrap();
+        assert_eq!(result, JsValue::String("o".into()));
+    }
+
+    #[test]
+    fn test_string_repeat() {
+        let result = crate::builtins::global::global_eval("'ab'.repeat(3)").unwrap();
+        assert_eq!(result, JsValue::String("ababab".into()));
+    }
+
+    #[test]
+    fn test_string_pad_start() {
+        let result = crate::builtins::global::global_eval("'5'.padStart(3, '0')").unwrap();
+        assert_eq!(result, JsValue::String("005".into()));
+    }
+
+    #[test]
+    fn test_string_pad_end() {
+        let result = crate::builtins::global::global_eval("'hi'.padEnd(5, '!')").unwrap();
+        assert_eq!(result, JsValue::String("hi!!!".into()));
+    }
+
+    #[test]
+    fn test_string_pad_start_default_space() {
+        let result = crate::builtins::global::global_eval("'x'.padStart(3)").unwrap();
+        assert_eq!(result, JsValue::String("  x".into()));
     }
 }
