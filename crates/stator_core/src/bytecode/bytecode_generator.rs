@@ -4275,10 +4275,17 @@ impl FunctionCompiler {
                     self.emit_star(reg);
                 }
                 pat => {
-                    // Destructuring: store key in scratch, then unpack.
-                    let scratch = self.allocator.new_local();
+                    // Destructuring: store key in a temporary, then unpack.
+                    // Must use allocate_temporary (not new_local) because
+                    // r_obj/r_keys/r_length/r_index temporaries are still
+                    // live — new_local would shift local_count and corrupt
+                    // the temporary release logic.
+                    let scratch = self.allocator.allocate_temporary();
                     self.emit_star(scratch);
                     self.compile_binding_pattern(pat, scratch, BindingMode::Assign)?;
+                    self.allocator
+                        .release_temporary(scratch)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
             },
             ForInOfLeft::Expr(expr) => {
@@ -4453,11 +4460,18 @@ impl FunctionCompiler {
                     self.emit_star(reg);
                 }
                 pat => {
-                    // Destructuring: store value in scratch, then unpack.
-                    let scratch = self.allocator.new_local();
+                    // Destructuring: store value in a temporary, then unpack.
+                    // Must use allocate_temporary (not new_local) because
+                    // iter_reg and val_reg temporaries are still live — calling
+                    // new_local would shift local_count and corrupt the
+                    // temporary release logic.
+                    let scratch = self.allocator.allocate_temporary();
                     self.emit_ldar(val_reg);
                     self.emit_star(scratch);
                     self.compile_binding_pattern(pat, scratch, BindingMode::Assign)?;
+                    self.allocator
+                        .release_temporary(scratch)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
             },
             ForInOfLeft::Expr(expr) => {
