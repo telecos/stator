@@ -2916,14 +2916,30 @@ fn handle_copy_data_properties(
     let target = ctx.frame.read_reg(target_v)?.clone();
     let source = ctx.frame.read_reg(source_v)?.clone();
 
-    if let (JsValue::PlainObject(t), JsValue::PlainObject(s)) = (&target, &source) {
-        let entries: Vec<(String, JsValue)> = s
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (k, v) in entries {
-            t.borrow_mut().insert(k, v);
+    if let JsValue::PlainObject(t) = &target {
+        match &source {
+            JsValue::PlainObject(s) => {
+                let entries: Vec<(String, JsValue)> = s
+                    .borrow()
+                    .enumerable_iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                for (k, v) in entries {
+                    t.borrow_mut().insert(k, v);
+                }
+            }
+            JsValue::Array(items) => {
+                for (i, v) in items.borrow().iter().enumerate() {
+                    t.borrow_mut().insert(i.to_string(), v.clone());
+                }
+            }
+            JsValue::String(s) => {
+                for (i, ch) in s.chars().enumerate() {
+                    t.borrow_mut()
+                        .insert(i.to_string(), JsValue::String(ch.to_string().into()));
+                }
+            }
+            _ => {}
         }
     }
     Ok(DispatchAction::Continue)
@@ -5791,5 +5807,22 @@ mod tests {
             crate::builtins::global::global_eval("var f = () => {}; f.prototype === undefined")
                 .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_spread_skips_non_enumerable() {
+        // Array spread: should copy index keys, not length/__is_array__
+        let result = crate::builtins::global::global_eval(
+            "var a = [10, 20]; var o = {...a}; o[0] + ',' + o[1] + ',' + (o.length === undefined)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("10,20,true".into()));
+    }
+
+    #[test]
+    fn e2e_spread_string() {
+        let result =
+            crate::builtins::global::global_eval("var o = {...'hi'}; o[0] + o[1]").unwrap();
+        assert_eq!(result, JsValue::String("hi".into()));
     }
 }
