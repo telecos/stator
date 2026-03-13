@@ -4752,13 +4752,9 @@ fn make_array() -> JsValue {
         builtin_fn("toReversed", 0, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
-            if let JsValue::Array(items) = arr {
-                let mut v = items.borrow().clone();
-                v.reverse();
-                Ok(JsValue::new_array(v))
-            } else {
-                Ok(JsValue::new_array(Vec::new()))
-            }
+            let (mut elements, _) = to_array_like_elements(arr);
+            elements.reverse();
+            Ok(JsValue::new_array(elements))
         }),
     );
 
@@ -4768,30 +4764,43 @@ fn make_array() -> JsValue {
         builtin_fn("toSorted", 1, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
-            if let JsValue::Array(items) = arr {
-                let mut v = items.borrow().clone();
-                let cmp_fn = args.get(1).cloned();
-                if let Some(JsValue::NativeFunction(cmp)) = cmp_fn {
-                    v.sort_by(|a, b| {
-                        let result = cmp(vec![a.clone(), b.clone()]).unwrap_or(JsValue::Smi(0));
-                        let n = match result {
-                            JsValue::Smi(n) => n as f64,
-                            JsValue::HeapNumber(n) => n,
-                            _ => 0.0,
-                        };
-                        n.partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal)
+            let (mut elements, _) = to_array_like_elements(arr);
+            let cmp_fn = args.get(1).cloned();
+            match &cmp_fn {
+                Some(cb) if !matches!(cb, JsValue::Undefined) => {
+                    let mut sort_err: Option<StatorError> = None;
+                    elements.sort_by(|a, b| {
+                        if sort_err.is_some() {
+                            return std::cmp::Ordering::Equal;
+                        }
+                        match call_callback(cb, vec![a.clone(), b.clone()]) {
+                            Ok(result) => {
+                                let n = match result {
+                                    JsValue::Smi(n) => n as f64,
+                                    JsValue::HeapNumber(n) => n,
+                                    _ => 0.0,
+                                };
+                                n.partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal)
+                            }
+                            Err(e) => {
+                                sort_err = Some(e);
+                                std::cmp::Ordering::Equal
+                            }
+                        }
                     });
-                } else {
-                    v.sort_by(|a, b| {
+                    if let Some(e) = sort_err {
+                        return Err(e);
+                    }
+                }
+                _ => {
+                    elements.sort_by(|a, b| {
                         let sa = a.to_js_string().unwrap_or_default();
                         let sb = b.to_js_string().unwrap_or_default();
                         sa.cmp(&sb)
                     });
                 }
-                Ok(JsValue::new_array(v))
-            } else {
-                Ok(JsValue::new_array(Vec::new()))
             }
+            Ok(JsValue::new_array(elements))
         }),
     );
 
@@ -4801,36 +4810,33 @@ fn make_array() -> JsValue {
         builtin_fn("toSpliced", 2, |args| {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
-            if let JsValue::Array(items) = arr {
-                let len = items.borrow().len() as i64;
-                let start = args
-                    .get(1)
-                    .unwrap_or(&JsValue::Smi(0))
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
-                let s = if start < 0 {
-                    (len + start).max(0)
-                } else {
-                    start.min(len)
-                } as usize;
-                let max_del = (len - s as i64).max(0) as usize;
-                let del = args
-                    .get(2)
-                    .map(|v| {
-                        crate::builtins::util::clamped_f64_to_usize(
-                            v.to_number().unwrap_or(max_del as f64),
-                        )
-                        .min(max_del)
-                    })
-                    .unwrap_or(max_del);
-                let new_items = if args.len() > 3 { &args[3..] } else { &[] };
-                let mut v: Vec<JsValue> = items.borrow()[..s].to_vec();
-                v.extend_from_slice(new_items);
-                v.extend_from_slice(&items.borrow()[s + del..]);
-                Ok(JsValue::new_array(v))
+            let (elements, _) = to_array_like_elements(arr);
+            let len = elements.len() as i64;
+            let start = args
+                .get(1)
+                .unwrap_or(&JsValue::Smi(0))
+                .to_number()
+                .unwrap_or(0.0) as i64;
+            let s = if start < 0 {
+                (len + start).max(0)
             } else {
-                Ok(JsValue::new_array(Vec::new()))
-            }
+                start.min(len)
+            } as usize;
+            let max_del = (len - s as i64).max(0) as usize;
+            let del = args
+                .get(2)
+                .map(|v| {
+                    crate::builtins::util::clamped_f64_to_usize(
+                        v.to_number().unwrap_or(max_del as f64),
+                    )
+                    .min(max_del)
+                })
+                .unwrap_or(max_del);
+            let new_items = if args.len() > 3 { &args[3..] } else { &[] };
+            let mut v: Vec<JsValue> = elements[..s].to_vec();
+            v.extend_from_slice(new_items);
+            v.extend_from_slice(&elements[s + del..]);
+            Ok(JsValue::new_array(v))
         }),
     );
 
@@ -6816,6 +6822,13 @@ fn make_string() -> JsValue {
                     .iter()
                     .map(|v| v.to_js_string().unwrap_or_default())
                     .collect(),
+                Some(val @ JsValue::PlainObject(_)) => {
+                    let (elements, _) = to_array_like_elements(val);
+                    elements
+                        .iter()
+                        .map(|v| v.to_js_string().unwrap_or_default())
+                        .collect()
+                }
                 _ => Vec::new(),
             };
             let subs: Vec<String> = args
@@ -15588,5 +15601,150 @@ mod tests {
         let result =
             global_eval("var d = Object.getOwnPropertyDescriptor({x: 1}, 'x'); d.value").unwrap();
         assert_eq!(result, JsValue::Smi(1));
+    }
+
+    // ── String.raw fix tests ────────────────────────────────────────────
+
+    /// `String.raw` with a plain-object `raw` array returns the correctly
+    /// interleaved string.
+    #[test]
+    fn e2e_string_raw_plain_object() {
+        let result = global_eval("String.raw({ raw: ['a', 'b', 'c'] }, 1, 2)").unwrap();
+        assert_eq!(result, JsValue::String("a1b2c".into()));
+    }
+
+    /// `String.raw` with no substitutions returns raw strings concatenated.
+    #[test]
+    fn e2e_string_raw_no_subs() {
+        let result = global_eval("String.raw({ raw: ['hello', ' ', 'world'] })").unwrap();
+        assert_eq!(result, JsValue::String("hello world".into()));
+    }
+
+    /// `String.raw` with more substitutions than gaps ignores extras.
+    #[test]
+    fn e2e_string_raw_extra_subs() {
+        let result = global_eval("String.raw({ raw: ['a', 'b'] }, 1, 2, 3)").unwrap();
+        assert_eq!(result, JsValue::String("a1b".into()));
+    }
+
+    // ── toReversed tests ────────────────────────────────────────────────
+
+    /// `Array.prototype.toReversed` returns a new reversed array.
+    #[test]
+    fn e2e_to_reversed_basic() {
+        let result = global_eval("[1,2,3].toReversed().join(',')").unwrap();
+        assert_eq!(result, JsValue::String("3,2,1".into()));
+    }
+
+    /// `toReversed` does not mutate the original array.
+    #[test]
+    fn e2e_to_reversed_no_mutate() {
+        let result = global_eval("var a = [1,2,3]; a.toReversed(); a.join(',')").unwrap();
+        assert_eq!(result, JsValue::String("1,2,3".into()));
+    }
+
+    // ── toSorted tests ──────────────────────────────────────────────────
+
+    /// `Array.prototype.toSorted` returns a new sorted array (default).
+    #[test]
+    fn e2e_to_sorted_default() {
+        let result = global_eval("[3,1,2].toSorted().join(',')").unwrap();
+        assert_eq!(result, JsValue::String("1,2,3".into()));
+    }
+
+    /// `toSorted` with a comparator function sorts numerically.
+    #[test]
+    fn e2e_to_sorted_comparator() {
+        let result =
+            global_eval("[10,1,21,2].toSorted(function(a,b){ return a - b }).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("1,2,10,21".into()));
+    }
+
+    /// `toSorted` does not mutate the original array.
+    #[test]
+    fn e2e_to_sorted_no_mutate() {
+        let result = global_eval("var a = [3,1,2]; a.toSorted(); a.join(',')").unwrap();
+        assert_eq!(result, JsValue::String("3,1,2".into()));
+    }
+
+    // ── toSpliced tests ─────────────────────────────────────────────────
+
+    /// `toSpliced` removes elements and returns a new array.
+    #[test]
+    fn e2e_to_spliced_delete() {
+        let result = global_eval("[1,2,3,4,5].toSpliced(1, 2).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("1,4,5".into()));
+    }
+
+    /// `toSpliced` inserts elements and returns a new array.
+    #[test]
+    fn e2e_to_spliced_insert() {
+        let result = global_eval("[1,2,5].toSpliced(2, 0, 3, 4).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("1,2,3,4,5".into()));
+    }
+
+    /// `toSpliced` does not mutate the original array.
+    #[test]
+    fn e2e_to_spliced_no_mutate() {
+        let result = global_eval("var a = [1,2,3]; a.toSpliced(0, 1); a.join(',')").unwrap();
+        assert_eq!(result, JsValue::String("1,2,3".into()));
+    }
+
+    // ── findLast / findLastIndex tests ──────────────────────────────────
+
+    /// `findLast` returns the last element matching the predicate.
+    #[test]
+    fn e2e_find_last_basic() {
+        let result = global_eval("[1,2,3,4].findLast(function(x){ return x % 2 === 0 })").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    /// `findLast` returns undefined when nothing matches.
+    #[test]
+    fn e2e_find_last_none() {
+        let result = global_eval("[1,3,5].findLast(function(x){ return x % 2 === 0 })").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// `findLastIndex` returns the index of the last matching element.
+    #[test]
+    fn e2e_find_last_index_basic() {
+        let result =
+            global_eval("[1,2,3,4].findLastIndex(function(x){ return x % 2 === 0 })").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `findLastIndex` returns -1 when nothing matches.
+    #[test]
+    fn e2e_find_last_index_none() {
+        let result =
+            global_eval("[1,3,5].findLastIndex(function(x){ return x % 2 === 0 })").unwrap();
+        assert_eq!(result, JsValue::Smi(-1));
+    }
+
+    // ── Object.hasOwn tests ─────────────────────────────────────────────
+
+    /// `Object.hasOwn` returns true for own properties.
+    #[test]
+    fn e2e_object_has_own_true() {
+        let result = global_eval("Object.hasOwn({a: 1}, 'a')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.hasOwn` returns false for missing properties (inherited).
+    #[test]
+    fn e2e_object_has_own_inherited() {
+        let result = global_eval("Object.hasOwn({a: 1}, 'b')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── Object.fromEntries tests ────────────────────────────────────────
+
+    /// `Object.fromEntries` builds an object from key-value pairs (sum check).
+    #[test]
+    fn e2e_object_from_entries_sum() {
+        let result =
+            global_eval("var o = Object.fromEntries([['a', 1], ['b', 2]]); o.a + o.b").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
     }
 }
