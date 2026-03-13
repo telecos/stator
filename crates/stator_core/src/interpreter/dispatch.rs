@@ -65,7 +65,7 @@ pub(super) type OpcodeHandler =
     fn(&mut DispatchContext, &Instruction) -> StatorResult<DispatchAction>;
 
 /// Number of opcode variants (= `Opcode::Illegal as usize + 1`).
-const OPCODE_COUNT: usize = 192;
+const OPCODE_COUNT: usize = 193;
 
 #[inline]
 fn handle_lda_zero(
@@ -6197,5 +6197,22 @@ mod tests {
             crate::builtins::global::global_eval("var o = {}; Object.seal(o); Object.isSealed(o)")
                 .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// for-of break calls iterator.return().
+    #[test]
+    fn e2e_for_of_break_calls_return() {
+        let result = crate::builtins::global::global_eval(
+            "var closed = false;\
+             var iter = { [Symbol.iterator]() { return this; }, next() { return { value: 1, done: false }; }, return() { closed = true; return { done: true }; } };\
+             for (var x of iter) { break; }\
+             closed",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::Boolean(true),
+            "iterator.return() should be called on break"
+        );
     }
 }

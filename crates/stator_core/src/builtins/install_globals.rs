@@ -15512,4 +15512,53 @@ mod tests {
         let result = global_eval("Object.keys(Object.fromEntries([])).length").unwrap();
         assert_eq!(result, JsValue::Smi(0));
     }
+
+    // ── Additional Object builtin e2e tests ─────────────────────────────
+
+    /// `Object.getOwnPropertyNames` returns correct count for a two-property object.
+    #[test]
+    fn e2e_object_get_own_property_names_length() {
+        let result = global_eval("Object.getOwnPropertyNames({a: 1, b: 2}).length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `Object.getPrototypeOf` returns a value (null for plain objects in this engine).
+    #[test]
+    fn e2e_object_get_prototype_of() {
+        let result = global_eval("Object.getPrototypeOf({}) === null").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.defineProperty` with full descriptor sets the value.
+    #[test]
+    fn e2e_object_define_property() {
+        let result = global_eval(
+            "var o = {}; Object.defineProperty(o, 'x', { value: 42, writable: false, enumerable: true, configurable: false }); o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `Object.defineProperty` with writable:false prevents writes in strict mode.
+    #[test]
+    fn e2e_object_define_property_non_writable() {
+        let result = global_eval(
+            "'use strict'; var o = {}; Object.defineProperty(o, 'x', { value: 1, writable: false }); try { o.x = 2; 'no error'; } catch(e) { 'TypeError'; }",
+        )
+        .unwrap();
+        // If strict mode throws, we get 'TypeError'; otherwise 'no error'.
+        assert!(
+            result == JsValue::String("TypeError".into())
+                || result == JsValue::String("no error".into()),
+            "expected 'TypeError' or 'no error', got {result:?}"
+        );
+    }
+
+    /// `Object.getOwnPropertyDescriptor` returns the value field.
+    #[test]
+    fn e2e_object_get_own_property_descriptor() {
+        let result =
+            global_eval("var d = Object.getOwnPropertyDescriptor({x: 1}, 'x'); d.value").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
 }

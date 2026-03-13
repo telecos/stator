@@ -250,6 +250,7 @@ thread_local! {
     /// Set at the start of [`Interpreter::run`] so that [`proto_lookup`] can
     /// resolve built-in constructor properties (e.g. `[].constructor === Array`)
     /// without threading the global env through every call site.
+    #[allow(clippy::type_complexity)]
     static CURRENT_GLOBALS: RefCell<Option<Rc<RefCell<HashMap<String, JsValue>>>>> =
         const { RefCell::new(None) };
 }

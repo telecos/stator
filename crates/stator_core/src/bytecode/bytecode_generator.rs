@@ -230,6 +230,11 @@ struct FunctionCompiler {
     /// Stack of `using` variable registers for disposal at scope exit.
     /// Each entry corresponds to a scope level in `scopes`.
     using_vars: Vec<Vec<Register>>,
+    /// Maps break-label indices to the register holding the iterator for
+    /// for-of cleanup.  When a `break` or `return` is compiled inside a
+    /// for-of loop, we emit [`Opcode::IteratorClose`] for the iterator
+    /// register before jumping to the break target.
+    for_of_iter_regs: HashMap<usize, Register>,
 }
 
 impl FunctionCompiler {
@@ -271,6 +276,7 @@ impl FunctionCompiler {
             in_tail_position: false,
             is_strict: false,
             using_vars: vec![Vec::new()],
+            for_of_iter_regs: HashMap::new(),
         };
         // Register simple ident params in the scope immediately; complex
         // patterns are handled by `emit_param_prologue`.
@@ -1450,6 +1456,7 @@ impl FunctionCompiler {
             in_tail_position: false,
             is_strict: false,
             using_vars: vec![Vec::new()],
+            for_of_iter_regs: HashMap::new(),
         };
 
         let this_reg = Register::parameter(0);
@@ -1687,6 +1694,19 @@ impl FunctionCompiler {
         } else {
             self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
         }
+        // Close iterators for all enclosing for-of loops.
+        let iter_regs_to_close: Vec<Register> = self
+            .loop_stack
+            .iter()
+            .rev()
+            .filter_map(|&(_, bl)| self.for_of_iter_regs.get(&bl).copied())
+            .collect();
+        for iter_reg in iter_regs_to_close {
+            self.emit(Instruction::new_unchecked(
+                Opcode::IteratorClose,
+                vec![to_reg_op(iter_reg)],
+            ));
+        }
         self.emit(Instruction::new_unchecked(Opcode::Return, vec![]));
         Ok(())
     }
@@ -1700,6 +1720,26 @@ impl FunctionCompiler {
             let (_, break_label) = *self.label_map.get(&label.name).ok_or_else(|| {
                 StatorError::SyntaxError(format!("undefined label '{}'", label.name))
             })?;
+            // Close iterators for all for-of loops being exited.
+            let iter_regs_to_close: Vec<Register> = self
+                .loop_stack
+                .iter()
+                .rev()
+                .take_while(|&&(_, bl)| bl != break_label)
+                .chain(
+                    self.loop_stack
+                        .iter()
+                        .rev()
+                        .find(|&&(_, bl)| bl == break_label),
+                )
+                .filter_map(|&(_, bl)| self.for_of_iter_regs.get(&bl).copied())
+                .collect();
+            for iter_reg in iter_regs_to_close {
+                self.emit(Instruction::new_unchecked(
+                    Opcode::IteratorClose,
+                    vec![to_reg_op(iter_reg)],
+                ));
+            }
             self.emit_jump(Opcode::Jump, break_label);
             return Ok(());
         }
@@ -1707,6 +1747,12 @@ impl FunctionCompiler {
             .loop_stack
             .last()
             .ok_or_else(|| StatorError::SyntaxError("break outside loop".into()))?;
+        if let Some(&iter_reg) = self.for_of_iter_regs.get(&break_label) {
+            self.emit(Instruction::new_unchecked(
+                Opcode::IteratorClose,
+                vec![to_reg_op(iter_reg)],
+            ));
+        }
         self.emit_jump(Opcode::Jump, break_label);
         Ok(())
     }
@@ -4263,6 +4309,7 @@ impl FunctionCompiler {
         let break_lbl = self.new_label();
         self.patch_pending_label(loop_lbl);
         self.loop_stack.push((loop_lbl, break_lbl));
+        self.for_of_iter_regs.insert(break_lbl, iter_reg);
 
         // Bind loop start.
         self.bind_label(loop_lbl);
@@ -4329,6 +4376,7 @@ impl FunctionCompiler {
         self.bind_label(break_lbl);
 
         self.loop_stack.pop();
+        self.for_of_iter_regs.remove(&break_lbl);
         self.pop_scope();
 
         // Release temporaries in reverse allocation order (val_reg was allocated
