@@ -3326,8 +3326,17 @@ fn handle_create_empty_array_literal(
 ) -> StatorResult<DispatchAction> {
     // operands[0] is a FeedbackSlot, ignored at runtime.
     let mut map = PropertyMap::new();
-    map.insert("length".to_string(), JsValue::Smi(0));
-    map.insert("__is_array__".to_string(), JsValue::Boolean(true));
+    // Per ES spec, "length" is writable but not enumerable/configurable.
+    map.insert_with_attrs(
+        "length".to_string(),
+        JsValue::Smi(0),
+        PropertyAttributes::WRITABLE,
+    );
+    map.insert_with_attrs(
+        "__is_array__".to_string(),
+        JsValue::Boolean(true),
+        PropertyAttributes::empty(),
+    );
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
 }
@@ -3338,8 +3347,16 @@ fn handle_create_array_literal(
 ) -> StatorResult<DispatchAction> {
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
     let mut map = PropertyMap::new();
-    map.insert("length".to_string(), JsValue::Smi(0));
-    map.insert("__is_array__".to_string(), JsValue::Boolean(true));
+    map.insert_with_attrs(
+        "length".to_string(),
+        JsValue::Smi(0),
+        PropertyAttributes::WRITABLE,
+    );
+    map.insert_with_attrs(
+        "__is_array__".to_string(),
+        JsValue::Boolean(true),
+        PropertyAttributes::empty(),
+    );
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
 }
@@ -3416,7 +3433,16 @@ fn handle_create_array_from_iterable(
     for (i, v) in items.iter().enumerate() {
         map.insert(i.to_string(), v.clone());
     }
-    map.insert("length".to_string(), JsValue::Smi(items.len() as i32));
+    map.insert_with_attrs(
+        "length".to_string(),
+        JsValue::Smi(items.len() as i32),
+        PropertyAttributes::WRITABLE,
+    );
+    map.insert_with_attrs(
+        "__is_array__".to_string(),
+        JsValue::Boolean(true),
+        PropertyAttributes::empty(),
+    );
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
 }
@@ -3539,9 +3565,10 @@ fn handle_create_reg_exp_literal(
                                 },
                             );
                         }
-                        props.insert(
+                        props.insert_with_attrs(
                             "length".to_string(),
                             JsValue::Smi((1 + m.captures.len()) as i32),
+                            PropertyAttributes::WRITABLE,
                         );
                         props.insert("index".to_string(), JsValue::Smi(m.index as i32));
                         props.insert("input".to_string(), JsValue::String(m.input.clone().into()));
@@ -3557,7 +3584,11 @@ fn handle_create_reg_exp_literal(
                                 JsValue::PlainObject(Rc::new(RefCell::new(groups))),
                             );
                         }
-                        props.insert("__is_array__".to_string(), JsValue::Boolean(true));
+                        props.insert_with_attrs(
+                            "__is_array__".to_string(),
+                            JsValue::Boolean(true),
+                            PropertyAttributes::empty(),
+                        );
                         Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
                     }
                     None => Ok(JsValue::Null),
@@ -3605,8 +3636,11 @@ fn handle_sta_in_array_literal(
                 _ => 0,
             };
             if new_len > cur_len {
-                map.borrow_mut()
-                    .insert("length".to_string(), JsValue::Smi(new_len));
+                map.borrow_mut().insert_with_attrs(
+                    "length".to_string(),
+                    JsValue::Smi(new_len),
+                    PropertyAttributes::WRITABLE,
+                );
             }
         }
     }
@@ -4140,7 +4174,12 @@ fn handle_create_mapped_arguments(
     for (i, v) in args.iter().enumerate() {
         map.insert(i.to_string(), v.clone());
     }
-    map.insert("length".to_string(), JsValue::Smi(args.len() as i32));
+    // Per ES spec §10.4.4, arguments "length" is writable+configurable, not enumerable.
+    map.insert_with_attrs(
+        "length".to_string(),
+        JsValue::Smi(args.len() as i32),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
     // callee: reference to the executing function (sloppy mode only)
     map.insert(
         "callee".to_string(),
@@ -4175,8 +4214,11 @@ fn handle_create_unmapped_arguments(
     for (i, v) in args.iter().enumerate() {
         map.insert(i.to_string(), v.clone());
     }
-    map.insert("length".to_string(), JsValue::Smi(args.len() as i32));
-    // callee: throws TypeError in strict mode
+    map.insert_with_attrs(
+        "length".to_string(),
+        JsValue::Smi(args.len() as i32),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
     map.insert(
         "callee".to_string(),
         JsValue::NativeFunction(Rc::new(|_args: Vec<JsValue>| {
@@ -5642,9 +5684,9 @@ mod tests {
     }
 
     #[test]
-    fn test_for_in_object() {
+    fn test_for_in_array() {
         let result = crate::builtins::global::global_eval(
-            "var o = {x: 1, y: 2, z: 3}; var keys = []; for (var k in o) { keys.push(k); } keys.length",
+            "var a = [10, 20, 30]; var keys = []; for (var k in a) { keys.push(k); } keys.length",
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(3));
