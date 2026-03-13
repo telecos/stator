@@ -244,6 +244,14 @@ thread_local! {
     /// `detach_debugger` hide another thread's attached debugger, causing
     /// flaky breakpoint misses in parallel tests.
     static DEBUG_ATTACHED: Cell<bool> = const { Cell::new(false) };
+
+    /// Reference to the current thread's global environment.
+    ///
+    /// Set at the start of [`Interpreter::run`] so that [`proto_lookup`] can
+    /// resolve built-in constructor properties (e.g. `[].constructor === Array`)
+    /// without threading the global env through every call site.
+    static CURRENT_GLOBALS: RefCell<Option<Rc<RefCell<HashMap<String, JsValue>>>>> =
+        const { RefCell::new(None) };
 }
 
 /// Attach a [`Debugger`] to the current thread's interpreter.
@@ -279,6 +287,21 @@ pub fn intern_property_key(
 /// Returns the number of strings currently interned in the thread-local table.
 pub fn interned_string_count() -> usize {
     STRING_TABLE.with(|table| table.borrow().len())
+}
+
+/// Look up a built-in constructor by name from the current global environment.
+///
+/// Used by [`proto_lookup`] to resolve the `"constructor"` property for
+/// primitive wrapper types (e.g. `[].constructor === Array`).  Returns
+/// [`JsValue::Undefined`] if no global environment is set or the name is
+/// not found.
+fn lookup_global_constructor(name: &str) -> JsValue {
+    CURRENT_GLOBALS.with(|g| {
+        g.borrow()
+            .as_ref()
+            .and_then(|globals| globals.borrow().get(name).cloned())
+            .unwrap_or(JsValue::Undefined)
+    })
 }
 
 /// Run `f` with mutable access to the currently-attached [`Debugger`], if
@@ -1130,6 +1153,10 @@ impl Interpreter {
     /// - an unimplemented opcode is encountered, or
     /// - a type error occurs during arithmetic.
     pub fn run(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
+        // Publish the global environment for proto_lookup's constructor resolution.
+        CURRENT_GLOBALS.with(|g| {
+            *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
+        });
         // Dynamically grow the native stack when headroom drops below 512 KiB.
         // Allocates a fresh 4 MiB segment via mmap/VirtualAlloc on demand,
         // preventing SIGSEGV/stack-overflow aborts on deeply recursive JS code
@@ -2284,7 +2311,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     return proto_lookup(&proto, "constructor");
                 }
                 drop(borrow);
-                return JsValue::Undefined;
+                return lookup_global_constructor("Object");
             }
             "toString" => {
                 let obj_clone = obj.clone();
@@ -2503,17 +2530,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             "constructor" => {
-                return JsValue::NativeFunction(Rc::new(|args| match args.first() {
-                    Some(v) => {
-                        let n = v.to_number()?;
-                        Ok(if n.fract() == 0.0 && n.abs() < i32::MAX as f64 {
-                            JsValue::Smi(n as i32)
-                        } else {
-                            JsValue::HeapNumber(n)
-                        })
-                    }
-                    None => Ok(JsValue::Smi(0)),
-                }));
+                return lookup_global_constructor("Number");
             }
             "@@toPrimitive" => {
                 let n = *n;
@@ -2604,17 +2621,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             "constructor" => {
-                return JsValue::NativeFunction(Rc::new(|args| match args.first() {
-                    Some(v) => {
-                        let n = v.to_number()?;
-                        Ok(if n.fract() == 0.0 && n.abs() < i32::MAX as f64 {
-                            JsValue::Smi(n as i32)
-                        } else {
-                            JsValue::HeapNumber(n)
-                        })
-                    }
-                    None => Ok(JsValue::Smi(0)),
-                }));
+                return lookup_global_constructor("Number");
             }
             "@@toPrimitive" => {
                 let n = *n;
@@ -3296,10 +3303,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             "constructor" => {
-                return JsValue::NativeFunction(Rc::new(|args| match args.first() {
-                    Some(v) => Ok(JsValue::String(v.to_js_string()?.into())),
-                    None => Ok(JsValue::String("".into())),
-                }));
+                return lookup_global_constructor("String");
             }
             "isWellFormed" => {
                 let s = s.clone();
@@ -3512,10 +3516,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 return JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Boolean(b))));
             }
             "constructor" => {
-                return JsValue::NativeFunction(Rc::new(|args| {
-                    let val = args.first().cloned().unwrap_or(JsValue::Undefined);
-                    Ok(JsValue::Boolean(val.to_boolean()))
-                }));
+                return lookup_global_constructor("Boolean");
             }
             "@@toPrimitive" => {
                 let b = *b;
@@ -4208,7 +4209,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Ok(JsValue::Array(Rc::clone(&a)))
                     }));
                 }
-                "constructor" => return JsValue::Undefined,
+                "constructor" => return lookup_global_constructor("Array"),
                 "hasOwnProperty" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
@@ -4352,7 +4353,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let e2 = Rc::clone(e);
                 JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Error(Rc::clone(&e2)))))
             }
-            "constructor" => JsValue::Undefined,
+            "constructor" => lookup_global_constructor(e.kind.as_name()),
             "hasOwnProperty" => {
                 let e = Rc::clone(e);
                 JsValue::NativeFunction(Rc::new(move |args| {
@@ -4538,7 +4539,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     ))
                 }));
             }
-            "constructor" => return JsValue::Undefined,
+            "constructor" => return lookup_global_constructor("Function"),
             "hasOwnProperty" => {
                 let ba = Rc::clone(ba);
                 return JsValue::NativeFunction(Rc::new(move |args| {
@@ -4646,7 +4647,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     ))
                 }));
             }
-            "constructor" => return JsValue::Undefined,
+            "constructor" => return lookup_global_constructor("Function"),
             "hasOwnProperty" => {
                 return JsValue::NativeFunction(Rc::new(|args| {
                     let prop = match args.first() {
@@ -4844,7 +4845,7 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
         "isPrototypeOf" => {
             return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
         }
-        "constructor" => return JsValue::Undefined,
+        "constructor" => return lookup_global_constructor("Object"),
         "toString" => {
             let this = this_obj.clone();
             return JsValue::NativeFunction(Rc::new(move |args| {
@@ -13084,5 +13085,62 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── Constructor property resolution tests ─────────────────────────
+
+    /// `[].constructor` resolves to the global `Array` constructor.
+    #[test]
+    fn test_array_constructor_identity() {
+        let result = crate::builtins::global::global_eval("[].constructor === Array").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `(42).constructor` resolves to the global `Number` constructor.
+    #[test]
+    fn test_number_constructor_identity() {
+        let result = crate::builtins::global::global_eval("(42).constructor === Number").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `"hello".constructor` resolves to the global `String` constructor.
+    #[test]
+    fn test_string_constructor_identity() {
+        let result =
+            crate::builtins::global::global_eval("'hello'.constructor === String").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `true.constructor` resolves to the global `Boolean` constructor.
+    #[test]
+    fn test_boolean_constructor_identity() {
+        let result = crate::builtins::global::global_eval("true.constructor === Boolean").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `(function(){}).constructor` resolves to the global `Function` constructor.
+    #[test]
+    fn test_function_constructor_identity() {
+        let result =
+            crate::builtins::global::global_eval("(function(){}).constructor === Function")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Error `.constructor` resolves to the matching error constructor.
+    #[test]
+    fn test_error_constructor_identity() {
+        let result = crate::builtins::global::global_eval(
+            "try { null.x } catch(e) { e.constructor === TypeError }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Plain object `.constructor` resolves to `Object`.
+    #[test]
+    fn test_plain_object_constructor_identity() {
+        let result = crate::builtins::global::global_eval("({}).constructor === Object").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 }
