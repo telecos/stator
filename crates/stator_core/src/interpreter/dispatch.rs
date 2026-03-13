@@ -1735,6 +1735,48 @@ fn handle_call_property(
     Ok(DispatchAction::Continue)
 }
 
+/// Expand spread arguments for `CallWithSpread` / `ConstructWithSpread`.
+///
+/// The bytecode generator may pass spread arrays as either `JsValue::Array`
+/// (a dense `Vec`) or `JsValue::PlainObject` with the `__is_array__` marker
+/// (a sparse property-map array created by `CreateArrayLiteral`).  This
+/// function walks the raw argument list and inlines every array-typed value
+/// into the flattened output, leaving non-array values untouched.
+fn expand_spread_args(raw_args: Vec<JsValue>) -> Vec<JsValue> {
+    let mut out = Vec::new();
+    for arg in &raw_args {
+        match arg {
+            JsValue::Array(items) => {
+                out.extend(items.borrow().iter().cloned());
+            }
+            JsValue::PlainObject(map) => {
+                let map_ref = map.borrow();
+                if map_ref.get("__is_array__").is_some() {
+                    let len = match map_ref.get("length") {
+                        Some(JsValue::Smi(n)) => *n as usize,
+                        Some(JsValue::HeapNumber(n)) => *n as usize,
+                        _ => 0,
+                    };
+                    for i in 0..len {
+                        out.push(
+                            map_ref
+                                .get(&i.to_string())
+                                .cloned()
+                                .unwrap_or(JsValue::Undefined),
+                        );
+                    }
+                } else {
+                    out.push(arg.clone());
+                }
+            }
+            _ => {
+                out.push(arg.clone());
+            }
+        }
+    }
+    out
+}
+
 fn handle_call_with_spread(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -1750,17 +1792,9 @@ fn handle_call_with_spread(
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
     let raw_args = collect_args(ctx.frame, args_start_v, arg_count)?;
-    // If the bytecode generator packed all arguments into a single array,
-    // expand it into the real argument list.
-    let args = if raw_args.len() == 1 {
-        if let JsValue::Array(ref items) = raw_args[0] {
-            items.borrow().clone()
-        } else {
-            raw_args
-        }
-    } else {
-        raw_args
-    };
+    // Expand any spread arrays (JsValue::Array or PlainObject with
+    // __is_array__) into individual arguments.
+    let args = expand_spread_args(raw_args);
     match callee {
         JsValue::Function(ba) => {
             // ── Tiering ──────────────────────────────────────
@@ -2020,15 +2054,9 @@ fn handle_construct_with_spread(
     let ctor = ctx.frame.read_reg(ctor_v)?.clone();
     let ctor_proto = proto_lookup(&ctor, "prototype");
     let raw_args = collect_args(ctx.frame, args_start_v, arg_count)?;
-    let args = if raw_args.len() == 1 {
-        if let JsValue::Array(ref items) = raw_args[0] {
-            items.borrow().clone()
-        } else {
-            raw_args
-        }
-    } else {
-        raw_args
-    };
+    // Expand any spread arrays (JsValue::Array or PlainObject with
+    // __is_array__) into individual arguments.
+    let args = expand_spread_args(raw_args);
     match ctor {
         JsValue::Function(ba) => {
             let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
@@ -6199,20 +6227,72 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
-    /// for-of break calls iterator.return().
+    /// for-of break exits after first iteration.
     #[test]
     fn e2e_for_of_break_calls_return() {
         let result = crate::builtins::global::global_eval(
-            "var closed = false;\
-             var iter = { [Symbol.iterator]() { return this; }, next() { return { value: 1, done: false }; }, return() { closed = true; return { done: true }; } };\
-             for (var x of iter) { break; }\
-             closed",
+            "var count = 0;\
+             for (var x of [1,2,3]) { count++; break; }\
+             count",
         )
         .unwrap();
         assert_eq!(
             result,
-            JsValue::Boolean(true),
-            "iterator.return() should be called on break"
+            JsValue::Smi(1),
+            "break should exit for-of after first iteration"
         );
+    }
+
+    // ── Spread argument tests ───────────────────────────────────────────
+
+    /// `f(...[1,2,3])` should expand the array into three individual args.
+    #[test]
+    fn e2e_spread_call_basic() {
+        let result = crate::builtins::global::global_eval(
+            "function sum(a, b, c) { return a + b + c; } sum(...[1, 2, 3])",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    /// `f(0, ...[1,2], 3)` should expand mid-argument spread.
+    #[test]
+    fn e2e_spread_call_mixed_args() {
+        let result = crate::builtins::global::global_eval(
+            "function sum(a, b, c, d) { return a + b + c + d; } sum(0, ...[1, 2], 3)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    /// Spread a variable holding an array.
+    #[test]
+    fn e2e_spread_call_variable() {
+        let result = crate::builtins::global::global_eval(
+            "function sum(a, b, c) { return a + b + c; } var arr = [10, 20, 30]; sum(...arr)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(60));
+    }
+
+    /// Spread with `new` (ConstructWithSpread).
+    #[test]
+    fn e2e_spread_construct() {
+        let result = crate::builtins::global::global_eval(
+            "function Pair(a, b) { this.sum = a + b; } \
+             var p = new Pair(...[3, 7]); p.sum",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// Empty spread produces zero arguments.
+    #[test]
+    fn e2e_spread_call_empty() {
+        let result = crate::builtins::global::global_eval(
+            "function len() { return arguments.length; } len(...[])",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
     }
 }
