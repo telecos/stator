@@ -3864,11 +3864,14 @@ impl<'src> Parser<'src> {
     fn expr_to_arrow_params(&self, expr: Expr) -> StatorResult<Vec<Param>> {
         match expr {
             // `x => body`  or  `(x) => body`
-            Expr::Ident(id) => Ok(vec![Param {
-                loc: id.loc,
-                pat: Pat::Ident(id),
-                default: None,
-            }]),
+            Expr::Ident(id) => {
+                self.check_strict_binding_ident(&id.name, id.loc)?;
+                Ok(vec![Param {
+                    loc: id.loc,
+                    pat: Pat::Ident(id),
+                    default: None,
+                }])
+            }
             // `(x, y) => body`
             Expr::Sequence(seq) => seq
                 .expressions
@@ -3921,11 +3924,14 @@ impl<'src> Parser<'src> {
     /// Convert a single expression to a single parameter.
     fn expr_to_single_param(&self, expr: Expr) -> StatorResult<Param> {
         match expr {
-            Expr::Ident(id) => Ok(Param {
-                loc: id.loc,
-                pat: Pat::Ident(id),
-                default: None,
-            }),
+            Expr::Ident(id) => {
+                self.check_strict_binding_ident(&id.name, id.loc)?;
+                Ok(Param {
+                    loc: id.loc,
+                    pat: Pat::Ident(id),
+                    default: None,
+                })
+            }
             Expr::Assign(assign) if assign.op == AssignOp::Assign => {
                 self.assign_expr_to_param(*assign)
             }
@@ -7855,6 +7861,102 @@ mod tests {
     #[test]
     fn test_class_body_rejects_delete_ident() {
         let result = parse("class C { m() { delete x; } }");
+        assert!(result.is_err());
+    }
+
+    // ── Strict-mode eval/arguments as let/const binding ──────────────────
+
+    #[test]
+    fn test_strict_eval_binding_error() {
+        let result = parse("'use strict'; let eval = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_arguments_binding_error() {
+        let result = parse("'use strict'; let arguments = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_const_eval_binding_error() {
+        let result = parse("'use strict'; const eval = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_const_arguments_binding_error() {
+        let result = parse("'use strict'; const arguments = 1;");
+        assert!(result.is_err());
+    }
+
+    // ── Strict-mode eval/arguments as parameter names ────────────────────
+
+    #[test]
+    fn test_strict_fn_param_eval_error() {
+        let result = parse("'use strict'; function f(eval) {}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_fn_param_arguments_error() {
+        let result = parse("'use strict'; function f(arguments) {}");
+        assert!(result.is_err());
+    }
+
+    // ── Strict-mode eval/arguments as function names ─────────────────────
+
+    #[test]
+    fn test_strict_fn_name_eval_error() {
+        let result = parse("'use strict'; function eval() {}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_fn_name_arguments_error() {
+        let result = parse("'use strict'; function arguments() {}");
+        assert!(result.is_err());
+    }
+
+    // ── Strict-mode eval/arguments in arrow function params ──────────────
+
+    #[test]
+    fn test_strict_arrow_param_eval_error() {
+        let result = parse("'use strict'; (eval) => {};");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_arrow_param_arguments_error() {
+        let result = parse("'use strict'; (arguments) => {};");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_arrow_bare_eval_error() {
+        let result = parse("'use strict'; eval => {};");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_arrow_bare_arguments_error() {
+        let result = parse("'use strict'; arguments => {};");
+        assert!(result.is_err());
+    }
+
+    // ── Strict-mode with statement (single-quote directive) ──────────────
+
+    #[test]
+    fn test_strict_with_statement_error() {
+        let result = parse("'use strict'; with(obj) {}");
+        assert!(result.is_err());
+    }
+
+    // ── Strict-mode delete with preceding decl ───────────────────────────
+
+    #[test]
+    fn test_strict_delete_identifier_with_decl_error() {
+        let result = parse("'use strict'; var x = 1; delete x;");
         assert!(result.is_err());
     }
 }
