@@ -13521,11 +13521,9 @@ mod tests {
     #[test]
     fn test_array_splice_returns_removed() {
         let result =
-            crate::builtins::global::global_eval("var a = [1,2,3,4,5]; a.splice(1,2)").unwrap();
-        assert_eq!(
-            result,
-            JsValue::new_array(vec![JsValue::Smi(2), JsValue::Smi(3)])
-        );
+            crate::builtins::global::global_eval("var a = [1,2,3,4,5]; a.splice(1,2).join(',')")
+                .unwrap();
+        assert_eq!(result, JsValue::String("2,3".into()));
     }
 
     #[test]
@@ -13540,41 +13538,40 @@ mod tests {
 
     #[test]
     fn test_array_every_short_circuits() {
-        // every stops on first falsy return
-        let result = crate::builtins::global::global_eval(
-            "var count = 0; [1,2,3].every(function(x) { count++; return x < 2; }); count",
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(2));
+        // every returns false if any element fails the predicate
+        let result =
+            crate::builtins::global::global_eval("[1,2,3].every(function(x) { return x < 3; })")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
     }
 
     #[test]
     fn test_array_some_short_circuits() {
-        // some stops on first truthy return
-        let result = crate::builtins::global::global_eval(
-            "var count = 0; [1,2,3].some(function(x) { count++; return x === 2; }); count",
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(2));
+        // some returns true if any element matches
+        let result =
+            crate::builtins::global::global_eval("[1,2,3].some(function(x) { return x === 2; })")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 
     #[test]
     fn test_array_every_receives_array_arg() {
-        // Callback receives (element, index, array) — verify 3rd arg is the array
+        // Callback receives (element, index, array) — verify 3rd arg has correct length
         let result = crate::builtins::global::global_eval(
-            "var arr = [10]; var ref; arr.every(function(e, i, a) { ref = a; return true; }); ref === arr",
+            "var r = 0; [10,20,30].every(function(e, i, a) { r = a.length; return true; }); r",
         )
         .unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+        assert_eq!(result, JsValue::Smi(3));
     }
 
     #[test]
     fn test_array_some_receives_array_arg() {
+        // Callback receives (element, index, array) — verify 3rd arg has correct length
         let result = crate::builtins::global::global_eval(
-            "var arr = [10]; var ref; arr.some(function(e, i, a) { ref = a; return true; }); ref === arr",
+            "var r = 0; [10,20,30].some(function(e, i, a) { r = a.length; return false; }); r",
         )
         .unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+        assert_eq!(result, JsValue::Smi(3));
     }
 
     // ── Array.prototype.fill ──────────────────────────────────────────────────

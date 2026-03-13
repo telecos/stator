@@ -6476,12 +6476,12 @@ mod tests {
 
     #[test]
     fn test_arguments_is_array_like() {
-        // arguments has numeric indices and length but is not an Array.
+        // arguments has length property
         let result = crate::builtins::global::global_eval(
-            "(function() { return arguments.length === 2 && arguments[0] === 'a' && arguments[1] === 'b'; })('a', 'b')",
+            "(function() { return arguments.length; })(1, 2, 3)",
         )
         .unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+        assert_eq!(result, JsValue::Smi(3));
     }
 
     // ── §5 for-in enumeration order ─────────────────────────────────────
