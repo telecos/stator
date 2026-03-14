@@ -28,6 +28,13 @@ pub fn intern(s: &str) -> Rc<str> {
     })
 }
 
+/// Clear the thread-local interning pool.
+///
+/// Used by test harnesses to reclaim memory between test runs.
+pub fn clear_intern_pool() {
+    INTERN_POOL.with(|pool| pool.borrow_mut().clear());
+}
+
 /// Check if two interned strings are the same by pointer comparison.
 #[inline]
 pub fn interned_eq(a: &Rc<str>, b: &Rc<str>) -> bool {

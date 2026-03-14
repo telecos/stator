@@ -290,6 +290,19 @@ pub fn interned_string_count() -> usize {
     STRING_TABLE.with(|table| table.borrow().len())
 }
 
+/// Reset interpreter thread-local state between test runs.
+///
+/// Clears the function property side-table and string interning cache so that
+/// state from one test execution does not leak into subsequent tests.  Should
+/// be called by test harnesses (e.g. Test262) after each test completes.
+pub fn clear_interpreter_state() {
+    FUNCTION_PROPS.with(|fp| fp.borrow_mut().clear());
+    STRING_TABLE.with(|table| {
+        *table.borrow_mut() = crate::objects::js_string::StringTable::new();
+    });
+    CURRENT_GLOBALS.with(|g| *g.borrow_mut() = None);
+}
+
 /// Look up a built-in constructor by name from the current global environment.
 ///
 /// Used by [`proto_lookup`] to resolve the `"constructor"` property for
@@ -1335,7 +1348,10 @@ impl Interpreter {
 
         state.borrow_mut().status = GeneratorStatus::Executing;
 
-        let return_val = Interpreter::run(&mut frame)?;
+        push_call_frame("<generator>")?;
+        let return_val = Interpreter::run(&mut frame);
+        pop_call_frame();
+        let return_val = return_val?;
 
         if let Some(yield_val) = frame.suspend_result {
             Ok(GeneratorStep::Yield(yield_val))
@@ -4920,9 +4936,12 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
 fn dispatch_getter(getter: &JsValue, this: &JsValue) -> StatorResult<JsValue> {
     match getter {
         JsValue::Function(ba) => {
+            push_call_frame("<getter>")?;
             let mut frame = InterpreterFrame::new((**ba).clone(), vec![]);
             frame.context = Some(this.clone());
-            Interpreter::run(&mut frame)
+            let result = Interpreter::run(&mut frame);
+            pop_call_frame();
+            result
         }
         JsValue::NativeFunction(f) => f(vec![]),
         _ => Ok(JsValue::Undefined),
@@ -4933,9 +4952,12 @@ fn dispatch_getter(getter: &JsValue, this: &JsValue) -> StatorResult<JsValue> {
 pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) -> StatorResult<()> {
     match setter {
         JsValue::Function(ba) => {
+            push_call_frame("<setter>")?;
             let mut frame = InterpreterFrame::new((**ba).clone(), vec![val]);
             frame.context = Some(this.clone());
-            Interpreter::run(&mut frame)?;
+            let result = Interpreter::run(&mut frame);
+            pop_call_frame();
+            result?;
             Ok(())
         }
         JsValue::NativeFunction(f) => {
