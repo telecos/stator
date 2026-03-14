@@ -160,8 +160,9 @@ struct FunctionCompiler {
     /// Virtual-register allocator.
     allocator: RegisterAllocator,
     /// Variable scope stack.  Each entry is a map from variable name to
-    /// its assigned register.  The outermost scope is `scopes[0]`.
-    scopes: Vec<HashMap<String, Register>>,
+    /// its assigned register and a flag indicating whether the binding is
+    /// `const`.  The outermost scope is `scopes[0]`.
+    scopes: Vec<HashMap<String, (Register, bool)>>,
     /// Source-position table (populated at expression boundaries).
     source_positions: Vec<SourcePosition>,
     /// Pending `(instruction_index, line, column)` entries collected during
@@ -343,7 +344,11 @@ impl FunctionCompiler {
                         self.bind_label(done_lbl);
                     }
                     // Use param register directly — no temporary needed.
-                    self.compile_binding_pattern(&param.pat, param_reg, BindingMode::Declare)?;
+                    self.compile_binding_pattern(
+                        &param.pat,
+                        param_reg,
+                        BindingMode::Declare { is_const: false },
+                    )?;
                 }
                 Pat::Rest(rest) => {
                     // Emit CreateRestParameter — collects all excess arguments
@@ -359,12 +364,20 @@ impl FunctionCompiler {
                     }
                 }
                 Pat::Assign(assign) => {
-                    self.compile_binding_pattern(&param.pat, param_reg, BindingMode::Declare)?;
+                    self.compile_binding_pattern(
+                        &param.pat,
+                        param_reg,
+                        BindingMode::Declare { is_const: false },
+                    )?;
                     let _ = assign;
                 }
                 Pat::Expr(_) => {
                     // Expression targets should not appear in function parameters.
-                    self.compile_binding_pattern(&param.pat, param_reg, BindingMode::Declare)?;
+                    self.compile_binding_pattern(
+                        &param.pat,
+                        param_reg,
+                        BindingMode::Declare { is_const: false },
+                    )?;
                 }
             }
         }
@@ -376,8 +389,9 @@ impl FunctionCompiler {
 /// existing variables.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BindingMode {
-    /// Variable declarations and function parameters — calls `define_local`.
-    Declare,
+    /// Variable declarations and function parameters — calls `define_local`
+    /// (or `define_const_local` when `is_const` is `true`).
+    Declare { is_const: bool },
     /// Destructuring assignment expressions — calls `compile_ident_store`.
     Assign,
 }
@@ -406,14 +420,18 @@ impl FunctionCompiler {
     ) -> StatorResult<()> {
         match pat {
             Pat::Ident(ident) => match mode {
-                BindingMode::Declare => {
-                    let local = self.define_local(&ident.name);
+                BindingMode::Declare { is_const } => {
+                    let local = if is_const {
+                        self.define_const_local(&ident.name)
+                    } else {
+                        self.define_local(&ident.name)
+                    };
                     self.emit_ldar(source_reg);
                     self.emit_star(local);
                 }
                 BindingMode::Assign => {
                     self.emit_ldar(source_reg);
-                    self.compile_ident_store(&ident.name);
+                    self.compile_ident_store(&ident.name)?;
                 }
             },
             Pat::Object(obj_pat) => {
@@ -494,8 +512,12 @@ impl FunctionCompiler {
                                 ],
                             ));
                             match mode {
-                                BindingMode::Declare => {
-                                    let local = self.define_local(&assign_prop.key.name);
+                                BindingMode::Declare { is_const } => {
+                                    let local = if is_const {
+                                        self.define_const_local(&assign_prop.key.name)
+                                    } else {
+                                        self.define_local(&assign_prop.key.name)
+                                    };
                                     if let Some(default_expr) = &assign_prop.value {
                                         let done_lbl = self.new_label();
                                         self.emit_star(local);
@@ -517,7 +539,7 @@ impl FunctionCompiler {
                                     }
                                     // acc holds either the property value or the
                                     // default — store to the existing variable.
-                                    self.compile_ident_store(&assign_prop.key.name);
+                                    self.compile_ident_store(&assign_prop.key.name)?;
                                 }
                             }
                         }
@@ -632,12 +654,16 @@ impl FunctionCompiler {
                 match expr.as_ref() {
                     Expr::Member(m) => self.compile_member_store(m)?,
                     Expr::Ident(id) => match mode {
-                        BindingMode::Declare => {
-                            let local = self.define_local(&id.name);
+                        BindingMode::Declare { is_const } => {
+                            let local = if is_const {
+                                self.define_const_local(&id.name)
+                            } else {
+                                self.define_local(&id.name)
+                            };
                             self.emit_star(local);
                         }
                         BindingMode::Assign => {
-                            self.compile_ident_store(&id.name);
+                            self.compile_ident_store(&id.name)?;
                         }
                     },
                     other => {
@@ -836,8 +862,21 @@ impl FunctionCompiler {
     /// Define a new local variable in the innermost scope and return its
     /// register.
     fn define_local(&mut self, name: &str) -> Register {
+        self.define_local_with_kind(name, false)
+    }
+
+    /// Define a new `const` local variable in the innermost scope.
+    fn define_const_local(&mut self, name: &str) -> Register {
+        self.define_local_with_kind(name, true)
+    }
+
+    /// Define a local variable with an explicit const flag.
+    fn define_local_with_kind(&mut self, name: &str, is_const: bool) -> Register {
         let reg = self.allocator.new_local();
-        self.scopes.last_mut().unwrap().insert(name.to_owned(), reg);
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .insert(name.to_owned(), (reg, is_const));
         reg
     }
 
@@ -846,17 +885,19 @@ impl FunctionCompiler {
     /// semantics for `var` declarations.
     fn define_function_scoped_local(&mut self, name: &str) -> Register {
         let reg = self.allocator.new_local();
-        self.scopes[0].insert(name.to_owned(), reg);
+        self.scopes[0].insert(name.to_owned(), (reg, false));
         reg
     }
 
     /// Look up a variable in the scope chain (innermost first).
     ///
     /// Returns `None` if the name is not found (assumed to be global).
-    fn lookup_var(&self, name: &str) -> Option<Register> {
+    /// The returned tuple contains the register and whether the binding is
+    /// `const`.
+    fn lookup_var(&self, name: &str) -> Option<(Register, bool)> {
         for scope in self.scopes.iter().rev() {
-            if let Some(&reg) = scope.get(name) {
-                return Some(reg);
+            if let Some(&(reg, is_const)) = scope.get(name) {
+                return Some((reg, is_const));
             }
         }
         None
@@ -967,8 +1008,9 @@ impl FunctionCompiler {
     /// Compile `var` / `let` / `const` / `using` / `await using` declarations.
     fn compile_var_decl(&mut self, decl: &VarDecl) -> StatorResult<()> {
         let is_using = matches!(decl.kind, VarKind::Using | VarKind::AwaitUsing);
+        let is_const = matches!(decl.kind, VarKind::Const);
         for declarator in &decl.declarators {
-            let reg = self.compile_var_declarator(declarator)?;
+            let reg = self.compile_var_declarator(declarator, is_const)?;
             if is_using && let Some(r) = reg {
                 self.using_vars.last_mut().unwrap().push(r);
             }
@@ -979,6 +1021,7 @@ impl FunctionCompiler {
     fn compile_var_declarator(
         &mut self,
         declarator: &VarDeclarator,
+        is_const: bool,
     ) -> StatorResult<Option<Register>> {
         match &declarator.id {
             Pat::Ident(ident) => {
@@ -991,11 +1034,15 @@ impl FunctionCompiler {
                     } else {
                         self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
                     }
-                    self.compile_ident_store(&ident.name);
+                    self.compile_ident_store(&ident.name)?;
                     Ok(None)
                 } else {
                     // Normal scope: allocate the local register.
-                    let reg = self.define_local(&ident.name);
+                    let reg = if is_const {
+                        self.define_const_local(&ident.name)
+                    } else {
+                        self.define_local(&ident.name)
+                    };
                     if let Some(init) = &declarator.init {
                         self.compile_expr(init)?;
                     } else {
@@ -1028,7 +1075,7 @@ impl FunctionCompiler {
                     self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
                 }
                 self.emit_star(source_reg);
-                self.compile_binding_pattern(pat, source_reg, BindingMode::Declare)?;
+                self.compile_binding_pattern(pat, source_reg, BindingMode::Declare { is_const })?;
                 Ok(Some(source_reg))
             }
         }
@@ -1471,7 +1518,7 @@ impl FunctionCompiler {
             allocator: RegisterAllocator::new(1),
             scopes: vec![{
                 let mut s = HashMap::new();
-                s.insert(".this".to_owned(), Register::parameter(0));
+                s.insert(".this".to_owned(), (Register::parameter(0), false));
                 s
             }],
             source_positions: Vec::new(),
@@ -1998,7 +2045,11 @@ impl FunctionCompiler {
                         // Destructuring catch param: acc holds thrown value.
                         let source_reg = self.allocator.new_local();
                         self.emit_star(source_reg);
-                        self.compile_binding_pattern(pat, source_reg, BindingMode::Declare)?;
+                        self.compile_binding_pattern(
+                            pat,
+                            source_reg,
+                            BindingMode::Declare { is_const: false },
+                        )?;
                     }
                 }
             }
@@ -2273,7 +2324,7 @@ impl FunctionCompiler {
     /// If the name is in the scope chain, emit `Ldar`.  Otherwise assume it is
     /// a global and emit `LdaGlobal`.
     fn compile_ident_load(&mut self, name: &str) {
-        if let Some(reg) = self.lookup_var(name) {
+        if let Some((reg, _is_const)) = self.lookup_var(name) {
             self.emit_ldar(reg);
         } else {
             let name_idx = self.add_string(name);
@@ -2286,8 +2337,15 @@ impl FunctionCompiler {
     }
 
     /// Store the accumulator to the variable named `name`.
-    fn compile_ident_store(&mut self, name: &str) {
-        if let Some(reg) = self.lookup_var(name) {
+    ///
+    /// Returns an error if the variable is a `const` binding.
+    fn compile_ident_store(&mut self, name: &str) -> StatorResult<()> {
+        if let Some((reg, is_const)) = self.lookup_var(name) {
+            if is_const {
+                return Err(StatorError::TypeError(format!(
+                    "Assignment to constant variable '{name}'"
+                )));
+            }
             self.emit_star(reg);
         } else {
             let name_idx = self.add_string(name);
@@ -2297,6 +2355,7 @@ impl FunctionCompiler {
                 vec![Operand::ConstantPoolIdx(name_idx), slot],
             ));
         }
+        Ok(())
     }
 
     /// Compile a unary expression.
@@ -2410,7 +2469,7 @@ impl FunctionCompiler {
         self.emit(Instruction::new_unchecked(op, vec![slot]));
         // Store updated value back to the target.
         match u.argument.as_ref() {
-            Expr::Ident(id) => self.compile_ident_store(&id.name),
+            Expr::Ident(id) => self.compile_ident_store(&id.name)?,
             Expr::Member(m) => self.compile_member_store(m)?,
             _ => {
                 return Err(StatorError::SyntaxError(
@@ -2707,7 +2766,7 @@ impl FunctionCompiler {
         match target {
             AssignTarget::Expr(expr) => match expr.as_ref() {
                 Expr::Ident(id) => {
-                    self.compile_ident_store(&id.name);
+                    self.compile_ident_store(&id.name)?;
                     Ok(())
                 }
                 Expr::Member(m) => self.compile_member_store(m),
@@ -4164,6 +4223,8 @@ impl FunctionCompiler {
                         crate::parser::ast::Pat::Ident(id) => {
                             if decl.kind == VarKind::Var {
                                 Some(self.define_function_scoped_local(&id.name))
+                            } else if decl.kind == VarKind::Const {
+                                Some(self.define_const_local(&id.name))
                             } else {
                                 Some(self.define_local(&id.name))
                             }
@@ -4262,14 +4323,16 @@ impl FunctionCompiler {
                         self.compile_binding_pattern(
                             &decl.declarators[0].id,
                             reg,
-                            BindingMode::Declare,
+                            BindingMode::Declare {
+                                is_const: decl.kind == VarKind::Const,
+                            },
                         )?;
                     }
                 }
             }
             ForInOfLeft::Pat(pat) => match pat {
                 crate::parser::ast::Pat::Ident(id) => {
-                    let reg = self.lookup_var(&id.name).ok_or_else(|| {
+                    let (reg, _is_const) = self.lookup_var(&id.name).ok_or_else(|| {
                         StatorError::SyntaxError(format!(
                             "for-in: undefined variable '{}'",
                             id.name
@@ -4371,6 +4434,8 @@ impl FunctionCompiler {
                         crate::parser::ast::Pat::Ident(id) => {
                             if decl.kind == VarKind::Var {
                                 Some(self.define_function_scoped_local(&id.name))
+                            } else if decl.kind == VarKind::Const {
+                                Some(self.define_const_local(&id.name))
                             } else {
                                 Some(self.define_local(&id.name))
                             }
@@ -4449,14 +4514,16 @@ impl FunctionCompiler {
                         self.compile_binding_pattern(
                             &decl.declarators[0].id,
                             reg,
-                            BindingMode::Declare,
+                            BindingMode::Declare {
+                                is_const: decl.kind == VarKind::Const,
+                            },
                         )?;
                     }
                 }
             }
             ForInOfLeft::Pat(pat) => match pat {
                 crate::parser::ast::Pat::Ident(id) => {
-                    let reg = self.lookup_var(&id.name).ok_or_else(|| {
+                    let (reg, _is_const) = self.lookup_var(&id.name).ok_or_else(|| {
                         StatorError::SyntaxError(format!(
                             "for-of: undefined variable '{}'",
                             id.name
@@ -4614,7 +4681,7 @@ impl FunctionCompiler {
             // module variable so the runtime can expose them.
             let names = Self::declared_names(inner);
             for name in names {
-                if let Some(reg) = self.lookup_var(&name) {
+                if let Some((reg, _is_const)) = self.lookup_var(&name) {
                     self.emit_ldar(reg);
                 } else {
                     self.compile_ident_load(&name);
@@ -4663,7 +4730,7 @@ impl FunctionCompiler {
                 ModuleExportName::Ident(id) => id.name.as_str(),
                 ModuleExportName::Str(s) => s.value.as_str(),
             };
-            if let Some(reg) = self.lookup_var(local_name) {
+            if let Some((reg, _is_const)) = self.lookup_var(local_name) {
                 self.emit_ldar(reg);
             } else {
                 self.compile_ident_load(local_name);
@@ -8932,5 +8999,48 @@ mod tests {
         let result = crate::builtins::global::global_eval("-1 >>> 0").unwrap();
         // Result is 4294967295 which exceeds Smi range, so HeapNumber
         assert_eq!(result, JsValue::HeapNumber(4294967295.0));
+    }
+
+    // ── const reassignment ───────────────────────────────────────────────
+
+    #[test]
+    fn test_const_reassignment_throws() {
+        let result = crate::builtins::global::global_eval("const x = 1; x = 2;");
+        assert!(result.is_err(), "const reassignment should throw");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("constant variable"),
+            "error should mention constant variable, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_const_compound_assignment_throws() {
+        let result = crate::builtins::global::global_eval("const x = 1; x += 2;");
+        assert!(result.is_err(), "const compound assignment should throw");
+    }
+
+    #[test]
+    fn test_const_increment_throws() {
+        let result = crate::builtins::global::global_eval("const x = 1; x++;");
+        assert!(result.is_err(), "const increment should throw");
+    }
+
+    #[test]
+    fn test_const_decrement_throws() {
+        let result = crate::builtins::global::global_eval("const x = 1; --x;");
+        assert!(result.is_err(), "const decrement should throw");
+    }
+
+    #[test]
+    fn test_let_reassignment_works() {
+        let result = crate::builtins::global::global_eval("let x = 1; x = 2; x").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_const_declaration_works() {
+        let result = crate::builtins::global::global_eval("const x = 42; x").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
     }
 }
