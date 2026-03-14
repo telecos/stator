@@ -4154,8 +4154,10 @@ fn make_array() -> JsValue {
                 .to_number()
                 .unwrap_or(0.0) as i64;
             let start = if from < 0 { (len + from).max(0) } else { from } as usize;
+            // §23.1.3.14 uses Strict Equality (===) — NaN !== NaN, +0 === -0,
+            // and Smi/HeapNumber cross-type comparison must work.
             for (i, v) in elements.iter().enumerate().skip(start) {
-                if v == search {
+                if v.is_strictly_equal(search) {
                     return Ok(JsValue::Smi(i as i32));
                 }
             }
@@ -4184,9 +4186,12 @@ fn make_array() -> JsValue {
             } else {
                 from.min(len - 1) as usize
             };
+            // §23.1.3.17 uses Strict Equality (===).
             for i in (0..=start).rev() {
-                if elements.get(i) == Some(search) {
-                    return Ok(JsValue::Smi(i as i32));
+                if let Some(v) = elements.get(i) {
+                    if v.is_strictly_equal(search) {
+                        return Ok(JsValue::Smi(i as i32));
+                    }
                 }
             }
             Ok(JsValue::Smi(-1))
@@ -4208,8 +4213,9 @@ fn make_array() -> JsValue {
                 .to_number()
                 .unwrap_or(0.0) as i64;
             let start = if from < 0 { (len + from).max(0) } else { from } as usize;
+            // §23.1.3.13 uses SameValueZero — NaN equals NaN, +0 equals -0.
             for v in elements.iter().skip(start) {
-                if v == search {
+                if v.same_value_zero(search) {
                     return Ok(JsValue::Boolean(true));
                 }
             }
@@ -17281,5 +17287,344 @@ mod tests {
     fn test_number_parseint_decimal() {
         let result = global_eval("Number.parseInt('42')").unwrap();
         assert_eq!(result, JsValue::Smi(42));
+    }
+
+    // ── Array.prototype.includes SameValueZero tests ────────────────────
+
+    /// `includes` finds NaN via SameValueZero semantics.
+    #[test]
+    fn test_includes_nan() {
+        let result = global_eval("[1, NaN, 3].includes(NaN)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `includes` respects fromIndex parameter.
+    #[test]
+    fn test_includes_from_index() {
+        let result = global_eval("[1, 2, 3].includes(1, 1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `includes` with negative fromIndex counts from end.
+    #[test]
+    fn test_includes_negative_from_index() {
+        let result = global_eval("[1, 2, 3].includes(3, -1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `includes` returns false when element is not present.
+    #[test]
+    fn test_includes_not_found() {
+        let result = global_eval("[1, 2, 3].includes(4)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── Array.prototype.indexOf strict equality tests ───────────────────
+
+    /// `indexOf` does NOT find NaN (strict equality: NaN !== NaN).
+    #[test]
+    fn test_indexof_nan() {
+        let result = global_eval("[1, NaN, 3].indexOf(NaN)").unwrap();
+        assert_eq!(result, JsValue::Smi(-1));
+    }
+
+    /// `indexOf` with negative fromIndex counts from end.
+    #[test]
+    fn test_indexof_negative_from_index() {
+        let result = global_eval("[1, 2, 3, 1].indexOf(1, -2)").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `indexOf` returns first occurrence.
+    #[test]
+    fn test_indexof_first_occurrence() {
+        let result = global_eval("[1, 2, 1, 3].indexOf(1)").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    // ── Array.prototype.lastIndexOf strict equality tests ───────────────
+
+    /// `lastIndexOf` returns last occurrence.
+    #[test]
+    fn test_lastindexof_basic() {
+        let result = global_eval("[1, 2, 1, 3].lastIndexOf(1)").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `lastIndexOf` with fromIndex limits the search range.
+    #[test]
+    fn test_lastindexof_from_index() {
+        let result = global_eval("[1, 2, 1, 3].lastIndexOf(1, 1)").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// `lastIndexOf` does NOT find NaN.
+    #[test]
+    fn test_lastindexof_nan() {
+        let result = global_eval("[1, NaN, 3].lastIndexOf(NaN)").unwrap();
+        assert_eq!(result, JsValue::Smi(-1));
+    }
+
+    // ── Array.prototype.reduce / reduceRight edge cases ─────────────────
+
+    /// `reduce` on empty array with no initial value throws TypeError.
+    #[test]
+    fn test_reduce_empty_throws() {
+        let result = global_eval("[].reduce(function(a, b) { return a + b })");
+        assert!(
+            result.is_err(),
+            "Expected TypeError for reduce of empty array"
+        );
+    }
+
+    /// `reduceRight` on empty array with no initial value throws TypeError.
+    #[test]
+    fn test_reduce_right_empty_throws() {
+        let result = global_eval("[].reduceRight(function(a, b) { return a + b })");
+        assert!(
+            result.is_err(),
+            "Expected TypeError for reduceRight of empty array"
+        );
+    }
+
+    /// `reduce` with initial value on empty array returns initial value.
+    #[test]
+    fn test_reduce_empty_with_initial() {
+        let result = global_eval("[].reduce(function(a, b) { return a + b }, 42)").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    // ── Array.prototype.every / some edge cases ─────────────────────────
+
+    /// `every` returns true for empty array (vacuous truth).
+    #[test]
+    fn test_every_empty() {
+        let result = global_eval("[].every(function(x) { return false })").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `some` returns false for empty array.
+    #[test]
+    fn test_some_empty() {
+        let result = global_eval("[].some(function(x) { return true })").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── Array.prototype.flat / flatMap tests ────────────────────────────
+
+    /// `flat` with depth 0 returns a shallow copy.
+    #[test]
+    fn test_flat_depth_zero() {
+        let result = global_eval("[1, [2, 3]].flat(0).length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `flat` with Infinity depth flattens deeply.
+    #[test]
+    fn test_flat_infinity_depth() {
+        let result = global_eval("[1, [2, [3, [4]]]].flat(Infinity).length").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    /// `flatMap` maps then flattens one level.
+    #[test]
+    fn test_flatmap_maps_and_flattens() {
+        let result =
+            global_eval("[1, 2, 3].flatMap(function(x) { return [x, x * 2] }).length").unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    // ── Array.from / Array.of conformance ───────────────────────────────
+
+    /// `Array.from` with array-like object (has `length` property).
+    #[test]
+    fn test_array_from_array_like() {
+        let result = global_eval("Array.from({0: 'a', 1: 'b', length: 2}).length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `Array.from` array-like values are correct.
+    #[test]
+    fn test_array_from_array_like_values() {
+        let result = global_eval("Array.from({0: 'a', 1: 'b', length: 2})[1]").unwrap();
+        assert_eq!(result, JsValue::String("b".into()));
+    }
+
+    /// `Array.from` with non-callable mapFn throws TypeError.
+    #[test]
+    fn test_array_from_bad_mapfn() {
+        let result = global_eval("Array.from([1], 42)");
+        assert!(result.is_err(), "Expected TypeError for non-callable mapFn");
+    }
+
+    /// `Array.of` with zero arguments creates empty array.
+    #[test]
+    fn test_array_of_empty() {
+        let result = global_eval("Array.of().length").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    // ── Object.keys / values / entries edge cases ───────────────────────
+
+    /// `Object.keys(null)` throws TypeError.
+    #[test]
+    fn test_object_keys_null_throws() {
+        let result = global_eval("Object.keys(null)");
+        assert!(result.is_err(), "Expected TypeError for Object.keys(null)");
+    }
+
+    /// `Object.values(undefined)` throws TypeError.
+    #[test]
+    fn test_object_values_undefined_throws() {
+        let result = global_eval("Object.values(undefined)");
+        assert!(
+            result.is_err(),
+            "Expected TypeError for Object.values(undefined)"
+        );
+    }
+
+    /// `Object.entries(null)` throws TypeError.
+    #[test]
+    fn test_object_entries_null_throws() {
+        let result = global_eval("Object.entries(null)");
+        assert!(
+            result.is_err(),
+            "Expected TypeError for Object.entries(null)"
+        );
+    }
+
+    /// `Object.freeze` on non-object returns the value unchanged.
+    #[test]
+    fn test_object_freeze_non_object() {
+        let result = global_eval("Object.freeze(42)").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `Object.isFrozen` on a non-object returns true.
+    #[test]
+    fn test_object_is_frozen_primitive() {
+        let result = global_eval("Object.isFrozen('hello')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.isSealed` on a non-object returns true.
+    #[test]
+    fn test_object_is_sealed_primitive() {
+        let result = global_eval("Object.isSealed(42)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Number static method edge cases ─────────────────────────────────
+
+    /// `Number.isNaN` does not coerce string argument.
+    #[test]
+    fn test_number_is_nan_no_coerce() {
+        let result = global_eval("Number.isNaN('NaN')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Number.isFinite` returns false for NaN.
+    #[test]
+    fn test_number_is_finite_nan() {
+        let result = global_eval("Number.isFinite(NaN)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Number.isFinite` does not coerce strings.
+    #[test]
+    fn test_number_is_finite_no_coerce() {
+        let result = global_eval("Number.isFinite('42')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Number.isInteger` returns false for NaN.
+    #[test]
+    fn test_number_is_integer_nan() {
+        let result = global_eval("Number.isInteger(NaN)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Number.isInteger` returns false for Infinity.
+    #[test]
+    fn test_number_is_integer_infinity() {
+        let result = global_eval("Number.isInteger(Infinity)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Number.isSafeInteger` returns false for large values.
+    #[test]
+    fn test_number_is_safe_integer_large() {
+        let result = global_eval("Number.isSafeInteger(9007199254740992)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── Math method existence / edge cases ──────────────────────────────
+
+    /// `Math.trunc(NaN)` returns NaN.
+    #[test]
+    fn test_math_trunc_nan() {
+        let result = global_eval("Number.isNaN(Math.trunc(NaN))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Math.sign(0)` returns 0.
+    #[test]
+    fn test_math_sign_zero() {
+        let result = global_eval("Math.sign(0)").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// `Math.cbrt(27)` returns 3.
+    #[test]
+    fn test_math_cbrt_basic() {
+        let result = global_eval("Math.cbrt(27)").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Math.log2(8)` returns 3.
+    #[test]
+    fn test_math_log2_basic() {
+        let result = global_eval("Math.log2(8)").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Math.log10(1000)` returns 3.
+    #[test]
+    fn test_math_log10_basic() {
+        let result = global_eval("Math.log10(1000)").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── String.prototype.replaceAll edge cases ──────────────────────────
+
+    /// `replaceAll` replaces all occurrences of a plain string.
+    #[test]
+    fn test_string_replace_all_basic() {
+        let result = global_eval("'aabbcc'.replaceAll('b', 'x')").unwrap();
+        assert_eq!(result, JsValue::String("aaxxcc".into()));
+    }
+
+    /// `replaceAll` with empty search string inserts between every char.
+    #[test]
+    fn test_string_replace_all_empty_search() {
+        let result = global_eval("'ab'.replaceAll('', '-').length").unwrap();
+        // 'ab'.replaceAll('', '-') → '-a-b-' (length 5)
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    // ── String.prototype.at edge cases ──────────────────────────────────
+
+    /// `String.prototype.at` with negative index wraps from end.
+    #[test]
+    fn test_string_at_negative() {
+        let result = global_eval("'abcde'.at(-2)").unwrap();
+        assert_eq!(result, JsValue::String("d".into()));
+    }
+
+    /// `String.prototype.at` with 0 returns first char.
+    #[test]
+    fn test_string_at_zero() {
+        let result = global_eval("'hello'.at(0)").unwrap();
+        assert_eq!(result, JsValue::String("h".into()));
     }
 }
