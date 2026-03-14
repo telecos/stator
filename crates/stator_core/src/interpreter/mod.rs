@@ -297,7 +297,9 @@ pub fn interned_string_count() -> usize {
 /// be called by test harnesses (e.g. Test262) after each test completes.
 pub fn clear_interpreter_state() {
     FUNCTION_PROPS.with(|fp| fp.borrow_mut().clear());
-    STRING_TABLE.with(|table| table.borrow_mut().clear());
+    STRING_TABLE.with(|table| {
+        *table.borrow_mut() = crate::objects::js_string::StringTable::new();
+    });
     CURRENT_GLOBALS.with(|g| *g.borrow_mut() = None);
 }
 
