@@ -2970,7 +2970,7 @@ fn handle_iterator_next(
             Some(v) => (v, false),
             None => (JsValue::Undefined, true),
         },
-        JsValue::Generator(gs) => match Interpreter::run_generator_step(gs, JsValue::Undefined)? {
+        JsValue::Generator(gs) => match Interpreter::run_generator_step(&gs, JsValue::Undefined)? {
             GeneratorStep::Yield(v) => (v, false),
             GeneratorStep::Return(v) => (v, true),
         },
@@ -3053,7 +3053,7 @@ fn handle_iterator_close(
     };
     let iter = ctx.frame.read_reg(iter_v)?.clone();
     match &iter {
-        JsValue::PlainObject(ref map) => {
+        JsValue::PlainObject(map) => {
             let return_fn = map.borrow().get("return").cloned();
             match return_fn {
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
