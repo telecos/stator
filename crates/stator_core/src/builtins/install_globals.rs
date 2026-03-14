@@ -3636,6 +3636,58 @@ fn make_object() -> JsValue {
         }),
     );
 
+    // ── Object.hasOwn(obj, prop) — ES2022 §20.1.2.8 ─────────────────────
+    props.insert(
+        "hasOwn".into(),
+        builtin_fn("hasOwn", 2, |args| {
+            let obj = args.first().unwrap_or(&JsValue::Undefined);
+            let key = args.get(1).unwrap_or(&JsValue::Undefined);
+            let prop = key.to_js_string()?;
+            match obj {
+                JsValue::PlainObject(map) => {
+                    let has = map.borrow().contains_key(&prop) && prop != "__proto__";
+                    Ok(JsValue::Boolean(has))
+                }
+                _ => Ok(JsValue::Boolean(false)),
+            }
+        }),
+    );
+
+    // ── Object.fromEntries(iterable) — ES2019 §20.1.2.5 ─────────────────
+    props.insert(
+        "fromEntries".into(),
+        builtin_fn("fromEntries", 1, |args| {
+            let iterable = args.first().unwrap_or(&JsValue::Undefined);
+            let mut result = PropertyMap::new();
+            match iterable {
+                JsValue::Array(items) => {
+                    for item in items.borrow().iter() {
+                        match item {
+                            JsValue::Array(pair) => {
+                                let pair = pair.borrow();
+                                let key =
+                                    pair.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
+                                let value = pair.get(1).cloned().unwrap_or(JsValue::Undefined);
+                                result.insert(key, value);
+                            }
+                            _ => {
+                                return Err(StatorError::TypeError(
+                                    "Iterator value is not an entry object".into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    return Err(StatorError::TypeError(
+                        "Object.fromEntries requires an iterable argument".into(),
+                    ));
+                }
+            }
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
+        }),
+    );
+
     // ── Object.prototype ─────────────────────────────────────────────────
     let mut obj_proto = PropertyMap::new();
 
@@ -16910,6 +16962,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Object.hasOwn` returns true for own properties.
+    #[test]
+    fn test_object_hasown_true() {
+        let result = global_eval("Object.hasOwn({x: 1, y: 2}, 'x')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.hasOwn` returns false for missing properties.
+    #[test]
+    fn test_object_hasown_false() {
+        let result = global_eval("Object.hasOwn({x: 1}, 'z')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Object.fromEntries` creates object from key-value pairs.
+    #[test]
+    fn test_object_fromentries_basic() {
+        let result =
+            global_eval("var o = Object.fromEntries([['a',1],['b',2]]); o.a + o.b").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Object.fromEntries` with empty array produces empty object.
+    #[test]
+    fn test_object_fromentries_empty() {
+        let result = global_eval("Object.keys(Object.fromEntries([])).length").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
     }
 
     /// `Array.isArray` returns true for arrays.

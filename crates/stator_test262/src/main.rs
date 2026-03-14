@@ -29,8 +29,11 @@ use stator_core::builtins::install_globals::install_globals;
 use stator_core::builtins::promise::drain_active_microtask_queue;
 use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_core::error::StatorError;
-use stator_core::interpreter::{Interpreter, InterpreterFrame, set_execution_deadline};
+use stator_core::interpreter::{
+    Interpreter, InterpreterFrame, clear_interpreter_state, set_execution_deadline,
+};
 use stator_core::objects::property_map::PropertyMap;
+use stator_core::objects::string_intern::clear_intern_pool;
 use stator_core::objects::value::JsValue;
 use stator_core::parser;
 
@@ -1080,6 +1083,12 @@ fn run_test(
     // A panic inside the interpreter may leave frames on the thread-local
     // call stack.  Clear it so the next test starts with a clean slate.
     clear_call_stack();
+
+    // Clear interpreter thread-local caches (FUNCTION_PROPS, STRING_TABLE,
+    // CURRENT_GLOBALS) and the string intern pool to prevent cross-test
+    // contamination and unbounded memory growth.
+    clear_interpreter_state();
+    clear_intern_pool();
 
     // Break Rc cycles in the async globals clone (if any) to prevent
     // memory leaks from prototype-chain cycles.
