@@ -2340,9 +2340,14 @@ fn make_number() -> JsValue {
         native(|args| {
             let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
             let radix = if args.len() > 1 {
-                args[1].to_number()?.floor() as u32
+                let r = args[1].to_number()?;
+                if r.is_nan() || r == 0.0 {
+                    0
+                } else {
+                    r.floor() as u32
+                }
             } else {
-                10
+                0
             };
             Ok(num(global_parse_int(&s, radix)))
         }),
@@ -4090,7 +4095,7 @@ fn make_array() -> JsValue {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
-                Ok(items.borrow().last().cloned().unwrap_or(JsValue::Undefined))
+                Ok(items.borrow_mut().pop().unwrap_or(JsValue::Undefined))
             } else {
                 Ok(JsValue::Undefined)
             }
@@ -4104,11 +4109,11 @@ fn make_array() -> JsValue {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
-                Ok(items
-                    .borrow()
-                    .first()
-                    .cloned()
-                    .unwrap_or(JsValue::Undefined))
+                if items.borrow().is_empty() {
+                    Ok(JsValue::Undefined)
+                } else {
+                    Ok(items.borrow_mut().remove(0))
+                }
             } else {
                 Ok(JsValue::Undefined)
             }
@@ -4122,8 +4127,12 @@ fn make_array() -> JsValue {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
-                let new_len = items.borrow().len() + args.len() - 1;
-                Ok(JsValue::Smi(new_len as i32))
+                let new_items = &args[1..];
+                let mut vec = items.borrow_mut();
+                for (i, item) in new_items.iter().enumerate() {
+                    vec.insert(i, item.clone());
+                }
+                Ok(JsValue::Smi(vec.len() as i32))
             } else {
                 Ok(JsValue::Undefined)
             }
@@ -4312,9 +4321,8 @@ fn make_array() -> JsValue {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
-                let mut v = items.borrow().clone();
-                v.reverse();
-                Ok(JsValue::new_array(v))
+                items.borrow_mut().reverse();
+                Ok(arr.clone())
             } else {
                 Ok(JsValue::Undefined)
             }
@@ -4328,11 +4336,14 @@ fn make_array() -> JsValue {
             let arr = args.first().unwrap_or(&JsValue::Undefined);
             require_object_coercible(arr)?;
             if let JsValue::Array(items) = arr {
-                let mut v = items.borrow().clone();
                 let cmp_fn = args.get(1).cloned();
-                if let Some(JsValue::NativeFunction(cmp)) = cmp_fn {
+                let use_comparator = matches!(&cmp_fn, Some(v) if is_callable(v));
+                let mut v = items.borrow().clone();
+                if use_comparator {
+                    let cmp_val = cmp_fn.unwrap();
                     v.sort_by(|a, b| {
-                        let result = cmp(vec![a.clone(), b.clone()]).unwrap_or(JsValue::Smi(0));
+                        let result = call_callback(&cmp_val, vec![a.clone(), b.clone()])
+                            .unwrap_or(JsValue::Smi(0));
                         let n = match result {
                             JsValue::Smi(n) => n as f64,
                             JsValue::HeapNumber(n) => n,
@@ -4347,7 +4358,8 @@ fn make_array() -> JsValue {
                         sa.cmp(&sb)
                     });
                 }
-                Ok(JsValue::new_array(v))
+                *items.borrow_mut() = v;
+                Ok(arr.clone())
             } else {
                 Ok(JsValue::Undefined)
             }
@@ -4382,11 +4394,13 @@ fn make_array() -> JsValue {
                 } else {
                     end.min(len)
                 } as usize;
-                let mut v = items.borrow().clone();
-                for item in v.iter_mut().take(e).skip(s) {
-                    *item = value.clone();
+                {
+                    let mut vec = items.borrow_mut();
+                    for item in vec.iter_mut().take(e).skip(s) {
+                        *item = value.clone();
+                    }
                 }
-                Ok(JsValue::new_array(v))
+                Ok(arr.clone())
             } else {
                 Ok(JsValue::Undefined)
             }
@@ -4511,11 +4525,13 @@ fn make_array() -> JsValue {
                 } as usize;
                 let count = (fin.saturating_sub(from)).min(items.borrow().len().saturating_sub(to));
                 let buf: Vec<JsValue> = items.borrow()[from..from + count].to_vec();
-                let mut v = items.borrow().clone();
-                for (i, val) in buf.into_iter().enumerate() {
-                    v[to + i] = val;
+                {
+                    let mut vec = items.borrow_mut();
+                    for (i, val) in buf.into_iter().enumerate() {
+                        vec[to + i] = val;
+                    }
                 }
-                Ok(JsValue::new_array(v))
+                Ok(arr.clone())
             } else {
                 Ok(JsValue::Undefined)
             }
@@ -4555,6 +4571,7 @@ fn make_array() -> JsValue {
                 let mut v: Vec<JsValue> = items.borrow()[..s].to_vec();
                 v.extend_from_slice(new_items);
                 v.extend_from_slice(&items.borrow()[s + del..]);
+                *items.borrow_mut() = v;
                 // Return the deleted elements as an array.
                 Ok(JsValue::new_array(deleted))
             } else {
@@ -17085,5 +17102,184 @@ mod tests {
     fn test_object_get_prototype_of() {
         let result = global_eval("Object.getPrototypeOf({}) === null").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Array.prototype.pop mutation tests ──────────────────────────────
+
+    /// `pop` removes and returns the last element.
+    #[test]
+    fn test_array_pop_mutates() {
+        let result = global_eval("var a = [1,2,3]; a.pop(); a.length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `pop` returns the removed element.
+    #[test]
+    fn test_array_pop_returns_last() {
+        let result = global_eval("var a = [10,20,30]; a.pop()").unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    /// `pop` on empty array returns undefined.
+    #[test]
+    fn test_array_pop_empty() {
+        let result = global_eval("var a = []; a.pop()").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    // ── Array.prototype.shift mutation tests ────────────────────────────
+
+    /// `shift` removes and returns the first element.
+    #[test]
+    fn test_array_shift_mutates() {
+        let result = global_eval("var a = [1,2,3]; a.shift(); a.length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `shift` returns the removed element.
+    #[test]
+    fn test_array_shift_returns_first() {
+        let result = global_eval("var a = [10,20,30]; a.shift()").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// `shift` on empty array returns undefined.
+    #[test]
+    fn test_array_shift_empty() {
+        let result = global_eval("var a = []; a.shift()").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    // ── Array.prototype.unshift mutation tests ──────────────────────────
+
+    /// `unshift` prepends items and returns new length.
+    #[test]
+    fn test_array_unshift_mutates() {
+        let result = global_eval("var a = [3]; a.unshift(1, 2); a[0]").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `unshift` returns the new length.
+    #[test]
+    fn test_array_unshift_returns_length() {
+        let result = global_eval("var a = [3]; a.unshift(1, 2)").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── Array.prototype.reverse mutation tests ──────────────────────────
+
+    /// `reverse` mutates the original array.
+    #[test]
+    fn test_array_reverse_mutates() {
+        let result = global_eval("var a = [1,2,3]; a.reverse(); a[0]").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `reverse` returns the same array reference.
+    #[test]
+    fn test_array_reverse_returns_same_ref() {
+        let result = global_eval("var a = [1,2,3]; a.reverse() === a").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Array.prototype.sort mutation tests ─────────────────────────────
+
+    /// `sort` mutates the original array in-place.
+    #[test]
+    fn test_array_sort_mutates() {
+        let result = global_eval("var a = [3,1,2]; a.sort(); a[0]").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `sort` returns the same array reference.
+    #[test]
+    fn test_array_sort_returns_same_ref() {
+        let result = global_eval("var a = [3,1,2]; a.sort() === a").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Array.prototype.fill mutation tests ─────────────────────────────
+
+    /// `fill` mutates the original array.
+    #[test]
+    fn test_array_fill_mutates() {
+        let result = global_eval("var a = [1,2,3]; a.fill(0); a[1]").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// `fill` returns the same array reference.
+    #[test]
+    fn test_array_fill_returns_same_ref() {
+        let result = global_eval("var a = [1,2,3]; a.fill(0) === a").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Array.prototype.splice mutation tests ───────────────────────────
+
+    /// `splice` removes elements from the original array.
+    #[test]
+    fn test_array_splice_mutates() {
+        let result = global_eval("var a = [1,2,3,4]; a.splice(1,2); a.length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `splice` returns deleted elements.
+    #[test]
+    fn test_array_splice_returns_deleted() {
+        let result = global_eval("var a = [1,2,3,4]; var d = a.splice(1,2); d[0]").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `splice` with negative start index.
+    #[test]
+    fn test_array_splice_negative_start() {
+        let result = global_eval("var a = [1,2,3,4]; a.splice(-2, 1); a.length").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `splice` inserts new elements.
+    #[test]
+    fn test_array_splice_insert() {
+        let result = global_eval("var a = [1,2,3]; a.splice(1, 0, 10, 20); a[1]").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    // ── Array.prototype.copyWithin mutation tests ───────────────────────
+
+    /// `copyWithin` mutates the original array.
+    #[test]
+    fn test_array_copywithin_mutates() {
+        let result = global_eval("var a = [1,2,3,4,5]; a.copyWithin(0, 3); a[0]").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    /// `copyWithin` returns the same array reference.
+    #[test]
+    fn test_array_copywithin_returns_same_ref() {
+        let result = global_eval("var a = [1,2,3,4,5]; a.copyWithin(0, 3) === a").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Number.parseInt hex auto-detection tests ────────────────────────
+
+    /// `Number.parseInt` auto-detects hex prefix.
+    #[test]
+    fn test_number_parseint_hex() {
+        let result = global_eval("Number.parseInt('0x1A')").unwrap();
+        assert_eq!(result, JsValue::Smi(26));
+    }
+
+    /// `Number.parseInt` with explicit radix.
+    #[test]
+    fn test_number_parseint_explicit_radix() {
+        let result = global_eval("Number.parseInt('ff', 16)").unwrap();
+        assert_eq!(result, JsValue::Smi(255));
+    }
+
+    /// `Number.parseInt` decimal by default.
+    #[test]
+    fn test_number_parseint_decimal() {
+        let result = global_eval("Number.parseInt('42')").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
     }
 }
