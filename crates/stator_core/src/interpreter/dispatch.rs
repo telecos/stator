@@ -2640,9 +2640,20 @@ fn handle_sta_named_property(
             }
             // Check for setter accessor first.
             let setter_key = format!("__set_{prop_name}__");
+            let getter_key = format!("__get_{prop_name}__");
             let setter = map.borrow().get(&setter_key).cloned();
             if let Some(setter_fn) = setter {
                 dispatch_setter(&setter_fn, &obj, val)?;
+                return Ok(DispatchAction::Continue);
+            }
+            // Getter-only accessor: no setter -> TypeError in strict, silent
+            // ignore in sloppy.
+            if map.borrow().contains_key(&getter_key) {
+                if ctx.frame.bytecode_array.is_strict() {
+                    return Err(StatorError::TypeError(format!(
+                        "Cannot set property {prop_name} which has only a getter"
+                    )));
+                }
                 return Ok(DispatchAction::Continue);
             }
             let pm = map.borrow();
@@ -2777,9 +2788,20 @@ fn handle_sta_keyed_property(
         let key_str = to_property_key(&key)?;
         // Check for setter accessor first (__set_<key>__).
         let setter_key = format!("__set_{key_str}__");
+        let getter_key = format!("__get_{key_str}__");
         let setter = map.borrow().get(&setter_key).cloned();
         if let Some(setter_fn) = setter {
             dispatch_setter(&setter_fn, &obj, val)?;
+            return Ok(DispatchAction::Continue);
+        }
+        // Getter-only accessor: no setter -> TypeError in strict, silent
+        // ignore in sloppy.
+        if map.borrow().contains_key(&getter_key) {
+            if ctx.frame.bytecode_array.is_strict() {
+                return Err(StatorError::TypeError(format!(
+                    "Cannot set property {key_str} which has only a getter"
+                )));
+            }
             return Ok(DispatchAction::Continue);
         }
         let pm = map.borrow();
@@ -3703,11 +3725,8 @@ fn handle_create_array_from_iterable(
                 match &iter_obj {
                     JsValue::Iterator(ni) => {
                         let mut out = Vec::new();
-                        loop {
-                            match ni.borrow_mut().next_item() {
-                                Some(v) => out.push(v),
-                                None => break,
-                            }
+                        while let Some(v) = ni.borrow_mut().next_item() {
+                            out.push(v);
                         }
                         out
                     }
