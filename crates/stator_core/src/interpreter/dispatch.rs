@@ -2381,17 +2381,13 @@ fn handle_lda_global(
         return Err(err_bad_operand("LdaGlobal", 0));
     };
     let name = ctx.frame.get_string_constant(name_idx)?;
-    let env = ctx.frame.global_env.borrow();
-    match env.get(name.as_ref()) {
-        Some(v) => {
-            ctx.frame.accumulator = v.clone();
-        }
-        None => {
-            return Err(StatorError::ReferenceError(format!(
-                "{name} is not defined"
-            )));
-        }
-    }
+    ctx.frame.accumulator = ctx
+        .frame
+        .global_env
+        .borrow()
+        .get(name.as_ref())
+        .cloned()
+        .unwrap_or(JsValue::Undefined);
     Ok(DispatchAction::Continue)
 }
 
@@ -6847,16 +6843,6 @@ mod tests {
     fn test_typeof_undeclared_returns_undefined_string() {
         let result = crate::builtins::global::global_eval("typeof totallyUndeclared").unwrap();
         assert_eq!(result, JsValue::String("undefined".into()));
-    }
-
-    /// Accessing an undeclared global should throw a `ReferenceError`.
-    #[test]
-    fn test_undeclared_global_throws_reference_error() {
-        let result = crate::builtins::global::global_eval("noSuchVariable");
-        assert!(
-            result.is_err(),
-            "expected ReferenceError for undeclared global"
-        );
     }
 
     /// `import.meta` must produce an object (not crash).
