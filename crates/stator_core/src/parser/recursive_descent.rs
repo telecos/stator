@@ -2750,16 +2750,33 @@ impl<'src> Parser<'src> {
                 self.bump()?;
                 let argument = self.parse_unary()?;
                 let end = argument.loc();
-                return Ok(Expr::Await(Box::new(AwaitExpr {
+                let expr = Expr::Await(Box::new(AwaitExpr {
                     loc: Self::merge_spans(start, end),
                     argument: Box::new(argument),
-                })));
+                }));
+                // `await x ** y` is a SyntaxError — must use `(await x) ** y`.
+                if self.peek_kind() == TokenKind::StarStar {
+                    return Err(Self::error_at(
+                        Self::merge_spans(start, end),
+                        "unary operator used immediately before `**`; \
+                         use parentheses to disambiguate",
+                    ));
+                }
+                return Ok(expr);
             }
             TokenKind::PlusPlus => {
                 self.bump()?;
                 let arg = self.parse_unary()?;
                 let end = arg.loc();
                 self.validate_update_target(&arg)?;
+                // `++x ** y` is a SyntaxError — must use `(++x) ** y`.
+                if self.peek_kind() == TokenKind::StarStar {
+                    return Err(Self::error_at(
+                        Self::merge_spans(start, end),
+                        "unary operator used immediately before `**`; \
+                         use parentheses to disambiguate",
+                    ));
+                }
                 return Ok(Expr::Update(Box::new(UpdateExpr {
                     loc: Self::merge_spans(start, end),
                     op: UpdateOp::Increment,
@@ -2772,6 +2789,14 @@ impl<'src> Parser<'src> {
                 let arg = self.parse_unary()?;
                 let end = arg.loc();
                 self.validate_update_target(&arg)?;
+                // `--x ** y` is a SyntaxError — must use `(--x) ** y`.
+                if self.peek_kind() == TokenKind::StarStar {
+                    return Err(Self::error_at(
+                        Self::merge_spans(start, end),
+                        "unary operator used immediately before `**`; \
+                         use parentheses to disambiguate",
+                    ));
+                }
                 return Ok(Expr::Update(Box::new(UpdateExpr {
                     loc: Self::merge_spans(start, end),
                     op: UpdateOp::Decrement,
@@ -2800,6 +2825,15 @@ impl<'src> Parser<'src> {
                 return Err(Self::error_at(
                     Self::merge_spans(start, end),
                     "deleting an unqualified identifier in strict mode is not allowed",
+                ));
+            }
+
+            // `-x ** y`, `!x ** y`, etc. are SyntaxErrors — must parenthesise.
+            if self.peek_kind() == TokenKind::StarStar {
+                return Err(Self::error_at(
+                    Self::merge_spans(start, end),
+                    "unary operator used immediately before `**`; \
+                     use parentheses to disambiguate",
                 ));
             }
 
