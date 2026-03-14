@@ -1742,6 +1742,8 @@ fn handle_call_property(
 /// (a sparse property-map array created by `CreateArrayLiteral`).  This
 /// function walks the raw argument list and inlines every array-typed value
 /// into the flattened output, leaving non-array values untouched.
+///
+/// Also handles iterables (String, Iterator, Generator) for robustness.
 fn expand_spread_args(raw_args: Vec<JsValue>) -> Vec<JsValue> {
     let mut out = Vec::new();
     for arg in &raw_args {
@@ -1769,6 +1771,32 @@ fn expand_spread_args(raw_args: Vec<JsValue>) -> Vec<JsValue> {
                     out.push(arg.clone());
                 }
             }
+            // String spread: expand each character.
+            JsValue::String(s) => {
+                for ch in s.chars() {
+                    out.push(JsValue::String(ch.to_string().into()));
+                }
+            }
+            // NativeIterator spread: consume all remaining items.
+            JsValue::Iterator(ni) => {
+                let mut it = ni.borrow_mut();
+                while let Some(v) = it.next_item() {
+                    out.push(v);
+                }
+            }
+            // Generator spread: run to completion.
+            JsValue::Generator(gs) => loop {
+                match Interpreter::run_generator_step(gs, JsValue::Undefined) {
+                    Ok(GeneratorStep::Yield(v)) => out.push(v),
+                    Ok(GeneratorStep::Return(v)) => {
+                        if !matches!(v, JsValue::Undefined) {
+                            out.push(v);
+                        }
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            },
             _ => {
                 out.push(arg.clone());
             }
@@ -2807,16 +2835,41 @@ fn handle_get_iterator(
             drop(borrow);
             match iter_fn {
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
-                    dispatch_call_with_this(f, iterable.clone(), vec![])?
+                    let result = dispatch_call_with_this(f, iterable.clone(), vec![])?;
+                    // §7.4.1: result of @@iterator must be an object.
+                    match &result {
+                        JsValue::PlainObject(_)
+                        | JsValue::Iterator(_)
+                        | JsValue::Generator(_)
+                        | JsValue::Object(_)
+                        | JsValue::Array(_) => result,
+                        _ => {
+                            return Err(StatorError::TypeError(
+                                "Result of the Symbol.iterator method is not an object".into(),
+                            ));
+                        }
+                    }
                 }
                 Some(JsValue::PlainObject(ref call_obj))
                     if call_obj.borrow().contains_key("__call__") =>
                 {
-                    dispatch_call_with_this(
+                    let result = dispatch_call_with_this(
                         &JsValue::PlainObject(call_obj.clone()),
                         iterable.clone(),
                         vec![],
-                    )?
+                    )?;
+                    match &result {
+                        JsValue::PlainObject(_)
+                        | JsValue::Iterator(_)
+                        | JsValue::Generator(_)
+                        | JsValue::Object(_)
+                        | JsValue::Array(_) => result,
+                        _ => {
+                            return Err(StatorError::TypeError(
+                                "Result of the Symbol.iterator method is not an object".into(),
+                            ));
+                        }
+                    }
                 }
                 Some(_) => {
                     return Err(StatorError::TypeError(
@@ -2938,7 +2991,34 @@ fn handle_iterator_next(
                                 .unwrap_or(JsValue::Undefined);
                             (value, done)
                         }
-                        _ => (JsValue::Undefined, true),
+                        // §7.4.3: If the result of .next() is not an object,
+                        // throw a TypeError.
+                        _ => {
+                            return Err(StatorError::TypeError(
+                                "Iterator result is not an object".into(),
+                            ));
+                        }
+                    }
+                }
+                Some(ref f @ JsValue::PlainObject(ref call_obj))
+                    if call_obj.borrow().contains_key("__call__") =>
+                {
+                    let result = dispatch_call_with_this(f, iter.clone(), vec![])?;
+                    match result {
+                        JsValue::PlainObject(ref res_map) => {
+                            let done = res_map.borrow().get("done").is_some_and(|d| d.to_boolean());
+                            let value = res_map
+                                .borrow()
+                                .get("value")
+                                .cloned()
+                                .unwrap_or(JsValue::Undefined);
+                            (value, done)
+                        }
+                        _ => {
+                            return Err(StatorError::TypeError(
+                                "Iterator result is not an object".into(),
+                            ));
+                        }
                     }
                 }
                 _ => {
@@ -2960,7 +3040,12 @@ fn handle_iterator_next(
 }
 
 /// Close an iterator by calling its `.return()` method if it exists.
-/// Used when breaking out of for-of loops early.
+/// Used when breaking out of for-of loops early (break/return/throw).
+///
+/// Per §7.4.6 IteratorClose:
+/// 1. If the iterator has a `.return()` method, call it.
+/// 2. If `.return()` throws, propagate the error.
+/// 3. If `.return()` returns a non-object, throw TypeError.
 fn handle_iterator_close(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -2969,14 +3054,53 @@ fn handle_iterator_close(
         return Err(err_bad_operand("IteratorClose", 0));
     };
     let iter = ctx.frame.read_reg(iter_v)?.clone();
-    // Only PlainObject iterators (user-defined) can have a .return() method.
-    // NativeIterator and Generator don't need explicit closing.
-    if let JsValue::PlainObject(ref map) = iter {
-        let return_fn = map.borrow().get("return").cloned();
-        if let Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) = return_fn {
-            // Call iterator.return(undefined) — result is ignored per spec.
-            let _ = dispatch_call_with_this(f, iter.clone(), vec![JsValue::Undefined]);
+    match &iter {
+        JsValue::PlainObject(ref map) => {
+            let return_fn = map.borrow().get("return").cloned();
+            match return_fn {
+                Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
+                    let result =
+                        dispatch_call_with_this(f, iter.clone(), vec![JsValue::Undefined])?;
+                    // §7.4.6 step 7: If the result is not an object, throw TypeError.
+                    if !matches!(
+                        result,
+                        JsValue::PlainObject(_) | JsValue::Array(_) | JsValue::Object(_)
+                    ) {
+                        return Err(StatorError::TypeError(
+                            "Iterator .return() result is not an object".into(),
+                        ));
+                    }
+                }
+                Some(JsValue::PlainObject(ref call_obj))
+                    if call_obj.borrow().contains_key("__call__") =>
+                {
+                    let result = dispatch_call_with_this(
+                        &JsValue::PlainObject(call_obj.clone()),
+                        iter.clone(),
+                        vec![JsValue::Undefined],
+                    )?;
+                    if !matches!(
+                        result,
+                        JsValue::PlainObject(_) | JsValue::Array(_) | JsValue::Object(_)
+                    ) {
+                        return Err(StatorError::TypeError(
+                            "Iterator .return() result is not an object".into(),
+                        ));
+                    }
+                }
+                // No .return() method — nothing to do (§7.4.6 step 4).
+                _ => {}
+            }
         }
+        // Close a generator by marking it as completed (§27.5.3.4).
+        JsValue::Generator(ref gs) => {
+            let mut state = gs.borrow_mut();
+            if state.status != GeneratorStatus::Completed {
+                state.status = GeneratorStatus::Completed;
+            }
+        }
+        // NativeIterator has no .return() — nothing to do.
+        _ => {}
     }
     Ok(DispatchAction::Continue)
 }
@@ -3480,6 +3604,54 @@ fn handle_create_array_literal(
     Ok(DispatchAction::Continue)
 }
 
+/// Collect all values from a user-defined iterator object (PlainObject with
+/// a `.next()` method) by repeatedly calling `.next()` until `done` is true.
+///
+/// Per the iterator protocol:
+/// - `.next()` must be callable (TypeError otherwise).
+/// - Each result must be an object with `{ value, done }` (TypeError if not).
+fn collect_from_plain_object_iterator(
+    iter_obj: &JsValue,
+    map: &Rc<RefCell<PropertyMap>>,
+) -> StatorResult<Vec<JsValue>> {
+    let mut out = Vec::new();
+    loop {
+        let next_fn = map.borrow().get("next").cloned();
+        match next_fn {
+            Some(ref f) => {
+                let result = dispatch_call_with_this(f, iter_obj.clone(), vec![])?;
+                match result {
+                    JsValue::PlainObject(ref res_map) => {
+                        let done = res_map.borrow().get("done").is_some_and(|d| d.to_boolean());
+                        if done {
+                            break;
+                        }
+                        let value = res_map
+                            .borrow()
+                            .get("value")
+                            .cloned()
+                            .unwrap_or(JsValue::Undefined);
+                        out.push(value);
+                    }
+                    // §7.4.3: If the result of .next() is not an object,
+                    // throw a TypeError.
+                    _ => {
+                        return Err(StatorError::TypeError(
+                            "Iterator result is not an object".into(),
+                        ));
+                    }
+                }
+            }
+            None => {
+                return Err(StatorError::TypeError(
+                    "Iterator .next() is not a function".into(),
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn handle_create_array_from_iterable(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -3517,34 +3689,69 @@ fn handle_create_array_from_iterable(
             }
             out
         }
-        JsValue::PlainObject(map) if map.borrow().contains_key("next") => {
-            let mut out = Vec::new();
-            loop {
-                let next_fn = map.borrow().get("next").cloned();
-                match next_fn {
-                    Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
-                        let result = dispatch_call_with_this(f, iterable.clone(), vec![])?;
-                        match result {
-                            JsValue::PlainObject(ref res_map) => {
-                                let done =
-                                    res_map.borrow().get("done").is_some_and(|d| d.to_boolean());
-                                if done {
+        JsValue::PlainObject(map) => {
+            // Check for @@iterator (iterable protocol) before falling back
+            // to direct "next" (iterator protocol).
+            let iter_fn = {
+                let borrow = map.borrow();
+                borrow.get("@@iterator").cloned().or_else(|| {
+                    let sym_key = format!("Symbol({})", crate::builtins::symbol::SYMBOL_ITERATOR);
+                    borrow.get(&sym_key).cloned()
+                })
+            };
+            if let Some(ref f) = iter_fn {
+                // Call @@iterator to obtain the iterator object.
+                let iter_obj = dispatch_call_with_this(f, iterable.clone(), vec![])?;
+                match &iter_obj {
+                    JsValue::Iterator(ni) => {
+                        let mut out = Vec::new();
+                        loop {
+                            match ni.borrow_mut().next_item() {
+                                Some(v) => out.push(v),
+                                None => break,
+                            }
+                        }
+                        out
+                    }
+                    JsValue::Generator(gs) => {
+                        let mut out = Vec::new();
+                        loop {
+                            match Interpreter::run_generator_step(gs, JsValue::Undefined)? {
+                                GeneratorStep::Yield(v) => out.push(v),
+                                GeneratorStep::Return(v) => {
+                                    if !matches!(v, JsValue::Undefined) {
+                                        out.push(v);
+                                    }
                                     break;
                                 }
-                                let value = res_map
-                                    .borrow()
-                                    .get("value")
-                                    .cloned()
-                                    .unwrap_or(JsValue::Undefined);
-                                out.push(value);
                             }
-                            _ => break,
                         }
+                        out
                     }
-                    _ => break,
+                    JsValue::PlainObject(ref iter_map)
+                        if iter_map.borrow().contains_key("next") =>
+                    {
+                        collect_from_plain_object_iterator(&iter_obj, iter_map)?
+                    }
+                    _ => {
+                        return Err(StatorError::TypeError(
+                            "Result of the Symbol.iterator method is not an object".into(),
+                        ));
+                    }
                 }
+            } else if map.borrow().contains_key("next") {
+                // Object is already an iterator (has "next" directly).
+                collect_from_plain_object_iterator(&iterable, map)?
+            } else if map.borrow().contains_key("length") {
+                // Array-like fallback.
+                plain_object_to_array_items(map)
+            } else {
+                return Err(StatorError::TypeError("object is not iterable".into()));
             }
-            out
+        }
+        // Null and Undefined are not iterable.
+        JsValue::Null | JsValue::Undefined => {
+            return Err(StatorError::TypeError("object is not iterable".into()));
         }
         _ => vec![],
     };
@@ -4118,6 +4325,10 @@ fn handle_for_in_enumerate(
             all_keys
         }
         JsValue::Array(items) => (0..items.borrow().len())
+            .map(|i| JsValue::String(i.to_string().into()))
+            .collect(),
+        // for...in on a string enumerates character indices ("0", "1", …).
+        JsValue::String(s) => (0..s.chars().count())
             .map(|i| JsValue::String(i.to_string().into()))
             .collect(),
         JsValue::Null | JsValue::Undefined => vec![],
