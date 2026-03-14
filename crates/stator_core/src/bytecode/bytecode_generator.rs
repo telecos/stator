@@ -286,7 +286,7 @@ impl FunctionCompiler {
                 && param.default.is_none()
             {
                 let reg = Register::parameter(i as u32);
-                compiler.scopes[0].insert(ident.name.clone(), reg);
+                compiler.scopes[0].insert(ident.name.clone(), (reg, false));
             }
         }
         Ok(compiler)
