@@ -495,6 +495,7 @@ fn deep_clone_globals(template: &HashMap<String, JsValue>) -> HashMap<String, Js
 /// - `assert` harness (native implementations of assert, assert.sameValue, etc.)
 /// - `Test262Error` constructor
 /// - `$DONOTEVALUATE` sentinel function
+#[inline(never)]
 fn make_test_globals() -> HashMap<String, JsValue> {
     let mut map = HashMap::new();
     install_globals(&mut map);
@@ -1345,7 +1346,11 @@ fn main_inner() {
     // Build the template globals once.  Each test clones this template so
     // that per-test mutations don't leak across tests while avoiding the
     // heavy cost of re-running `install_globals` for every test.
-    let template_globals = stacker::maybe_grow(512 * 1024, 32 * 1024 * 1024, make_test_globals);
+    let template_globals = stacker::maybe_grow(
+        512 * 1024 * 1024, // red zone: 512 MiB (always triggers on 256 MiB thread stack)
+        512 * 1024 * 1024, // growth: 512 MiB fresh heap stack
+        make_test_globals,
+    );
 
     // ── Run each test ─────────────────────────────────────────────────────────
     for (idx, path) in test_files.iter().enumerate() {

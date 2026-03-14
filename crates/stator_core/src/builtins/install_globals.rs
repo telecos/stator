@@ -592,6 +592,7 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
 /// Build a NativeFunction that constructs a `JsValue::Error` of the given `ErrorKind`.
 ///
 /// Supports the ES2022 options parameter: `new Error(message, { cause })`.
+#[inline(never)]
 fn make_error_constructor(kind: ErrorKind) -> JsValue {
     native(move |args| {
         let message = match args.first() {
@@ -610,6 +611,7 @@ fn make_error_constructor(kind: ErrorKind) -> JsValue {
 ///
 /// This allows `instanceof` checks (via `@@hasInstance`) and name-based
 /// detection in the Test262 harness (via the `name` property).
+#[inline(never)]
 fn make_error_constructor_object(kind: ErrorKind) -> JsValue {
     let mut props = PropertyMap::new();
     props.insert("__call__".into(), make_error_constructor(kind));
@@ -677,6 +679,7 @@ fn extract_cause(options: Option<&JsValue>) -> Option<JsValue> {
 ///
 /// The `errors` argument is consumed as an `Array`; the optional `options`
 /// object may contain a `cause` property (ES2022).
+#[inline(never)]
 fn make_aggregate_error_constructor() -> JsValue {
     native(|args| {
         // First arg: errors (iterable — we accept Array).
@@ -711,6 +714,7 @@ fn make_aggregate_error_constructor() -> JsValue {
 ///
 /// `SuppressedError(error, suppressed, message)` creates an Error with
 /// `.error`, `.suppressed`, and `.message` properties.
+#[inline(never)]
 fn make_suppressed_error_constructor() -> JsValue {
     native(|args| {
         let error_val = args.first().cloned().unwrap_or(JsValue::Undefined);
@@ -733,6 +737,7 @@ fn make_suppressed_error_constructor() -> JsValue {
 ///
 /// The `Error` constructor additionally exposes the V8-compatible
 /// `Error.captureStackTrace(target)` and `Error.stackTraceLimit` extensions.
+#[inline(never)]
 fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
     // The `Error` constructor is a PlainObject so it can carry static methods.
     let mut error_props = PropertyMap::new();
@@ -934,6 +939,7 @@ fn structured_clone(val: &JsValue) -> JsValue {
 // ── Math ─────────────────────────────────────────────────────────────────────
 
 /// Build the `Math` namespace object with all constants and methods.
+#[inline(never)]
 fn make_math() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -1221,6 +1227,7 @@ fn make_math() -> JsValue {
 // ── console ──────────────────────────────────────────────────────────────────
 
 /// Build the `console` namespace object.
+#[inline(never)]
 fn make_console() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -1294,6 +1301,7 @@ type JsonReplacerFn = Box<
 >;
 
 /// Build the `JSON` namespace object.
+#[inline(never)]
 fn make_json() -> JsValue {
     use crate::builtins::json::{
         JsonReplacer, JsonSpace, JsonValue, js_value_to_json, json_parse, json_stringify_js_value,
@@ -1488,6 +1496,7 @@ fn date_proto_delegate(name: &str) -> JsValue {
 /// - `now`: `Date.now()`
 /// - `parse`: `Date.parse(string)`
 /// - `UTC`: `Date.UTC(year, month, ...)`
+#[inline(never)]
 fn make_date() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -1660,6 +1669,7 @@ fn make_date() -> JsValue {
 ///
 /// The returned `PlainObject` holds a shared `Rc<RefCell<f64>>` timestamp
 /// that all getter/setter methods close over.
+#[inline(never)]
 fn make_date_instance(t: f64) -> JsValue {
     let inner = Rc::new(RefCell::new(t));
     let mut obj = PropertyMap::new();
@@ -2206,6 +2216,7 @@ fn make_date_instance(t: f64) -> JsValue {
 
 /// Build the `Number` constructor/namespace object.
 /// §20.3 Boolean constructor – `Boolean(value)` performs `ToBoolean`.
+#[inline(never)]
 fn make_boolean() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -2254,6 +2265,7 @@ fn make_boolean() -> JsValue {
     ctor
 }
 
+#[inline(never)]
 fn make_number() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -2545,6 +2557,7 @@ fn make_number() -> JsValue {
 // ── Object constructor ───────────────────────────────────────────────────────
 
 /// Build the `Object` constructor/namespace object.
+#[inline(never)]
 fn make_object() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -3850,6 +3863,7 @@ fn make_object() -> JsValue {
 /// - `from` — `Array.from(iterable)`.
 /// - `of` — `Array.of(...items)`.
 /// - `prototype` — an object with all `Array.prototype.*` methods.
+#[inline(never)]
 fn make_array() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -5148,6 +5162,7 @@ fn make_array() -> JsValue {
 /// is a `TypeError`), the top-level value is a `NativeFunction` that
 /// creates symbols, and the static properties are patched onto the
 /// surrounding `PlainObject` wrapper.
+#[inline(never)]
 fn make_symbol() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -5292,6 +5307,7 @@ fn make_symbol() -> JsValue {
 // ── Iterator (ES2025 §27.1.4) ────────────────────────────────────────────────
 
 /// Build the `Iterator` constructor/namespace object with prototype helpers.
+#[inline(never)]
 fn make_iterator() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -5465,6 +5481,7 @@ fn make_iterator() -> JsValue {
 
 /// Build the `AsyncIterator` constructor/namespace object with prototype
 /// helpers mirroring [`make_iterator`].  Each method returns a `Promise`.
+#[inline(never)]
 fn make_async_iterator() -> JsValue {
     use crate::builtins::promise::MicrotaskQueue;
 
@@ -5634,6 +5651,7 @@ fn make_async_iterator() -> JsValue {
 /// optionally accepts an iterable of `[key, value]` pairs, plus prototype
 /// methods (`get`, `set`, `has`, `delete`, `clear`, `forEach`, `keys`,
 /// `values`, `entries`, `size`).
+#[inline(never)]
 fn make_map_builtin() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -6004,6 +6022,7 @@ fn make_map_builtin() -> JsValue {
 /// optionally accepts an iterable of values, plus prototype methods
 /// (`add`, `has`, `delete`, `clear`, `forEach`, `keys`, `values`,
 /// `entries`, `size`).
+#[inline(never)]
 fn make_set_builtin() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -6322,6 +6341,7 @@ fn make_set_builtin() -> JsValue {
 /// a new `WeakMap` instance with prototype methods (`get`, `set`, `has`,
 /// `delete`).  Keys must be `Object` pointers; non-object keys cause a
 /// `TypeError`.
+#[inline(never)]
 fn make_weak_map_builtin() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -6519,6 +6539,7 @@ fn make_weak_map_builtin() -> JsValue {
 /// The returned `PlainObject` provides a `__call__` constructor that creates
 /// a new `WeakSet` instance with prototype methods (`add`, `has`, `delete`).
 /// Values must be `Object` pointers; non-object values cause a `TypeError`.
+#[inline(never)]
 fn make_weak_set_builtin() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -6640,6 +6661,7 @@ fn make_weak_set_builtin() -> JsValue {
 /// The returned `PlainObject` provides a `__call__` constructor that creates
 /// a new `WeakRef` instance with a `deref` prototype method.  The target
 /// must be an `Object` pointer; non-object targets cause a `TypeError`.
+#[inline(never)]
 fn make_weak_ref_builtin() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -6696,6 +6718,7 @@ fn make_weak_ref_builtin() -> JsValue {
 /// a new `FinalizationRegistry` instance with `register` and `unregister`
 /// prototype methods.  The cleanup callback is stored as a JS-level value;
 /// actual invocation happens when the GC integration is complete.
+#[inline(never)]
 fn make_finalization_registry_builtin() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -6845,6 +6868,7 @@ fn make_finalization_registry_builtin() -> JsValue {
 /// - `__call__` — the `Function(…args, body)` dynamic constructor.
 /// - `prototype` — an object with `bind`, `call`, `apply`, `toString`,
 ///   `Symbol.hasInstance`, `name`, and `length`.
+#[inline(never)]
 fn make_function() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -7007,6 +7031,7 @@ fn make_function() -> JsValue {
 /// - `__call__` — the callable `String(value)` conversion.
 /// - Static methods: `fromCharCode`, `fromCodePoint`, `raw`.
 /// - `prototype` — an object with all `String.prototype.*` methods.
+#[inline(never)]
 fn make_string() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -7835,6 +7860,7 @@ fn make_string() -> JsValue {
 /// created through this global.  The constructor (`__call__`) corresponds to
 /// `new Promise(executor)`, and static methods (`resolve`, `reject`, `all`,
 /// `allSettled`, `any`, `race`, `withResolvers`) are available as properties.
+#[inline(never)]
 fn make_promise() -> JsValue {
     use crate::builtins::promise::{
         MicrotaskQueue, install_active_microtask_queue, promise_all, promise_all_settled,
@@ -8094,6 +8120,7 @@ fn make_promise() -> JsValue {
 // ── RegExp ────────────────────────────────────────────────────────────────────
 
 /// Build the `RegExp` constructor.
+#[inline(never)]
 fn make_regexp() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -8247,6 +8274,7 @@ fn make_regexp() -> JsValue {
 }
 
 /// Build the `BigInt` global constructor with `asIntN` and `asUintN` static methods.
+#[inline(never)]
 fn make_bigint() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -8399,6 +8427,7 @@ fn extract_handler(val: &JsValue) -> Option<crate::builtins::promise::PromiseHan
 /// Create a `supportedLocalesOf` native function shared by all Intl constructors.
 ///
 /// Stub: returns all requested locales (we fall back to en-US for everything).
+#[inline(never)]
 fn make_supported_locales_of() -> JsValue {
     native(|args| {
         let locales: Vec<JsValue> = match args.first() {
@@ -8415,6 +8444,7 @@ fn make_supported_locales_of() -> JsValue {
 /// Each property is a constructor-like `PlainObject` with a `__call__` method
 /// that returns an instance (another `PlainObject`) carrying a `format` (or
 /// `compare` / `select`) method.
+#[inline(never)]
 fn make_intl() -> JsValue {
     let mut ns = PropertyMap::new();
 
@@ -8907,6 +8937,7 @@ fn make_intl() -> JsValue {
 ///
 /// Provides `Proxy(target, handler)` as a callable constructor and
 /// `Proxy.revocable(target, handler)` as a static method.
+#[inline(never)]
 fn make_proxy() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -9134,6 +9165,7 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
 // ── Reflect ──────────────────────────────────────────────────────────────────
 
 /// Build the `Reflect` namespace object with all 13 static methods.
+#[inline(never)]
 fn make_reflect() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -9340,6 +9372,7 @@ fn require_object_arg(args: &[JsValue], idx: usize, name: &str) -> StatorResult<
 // ── ArrayBuffer / DataView / TypedArray constructors ─────────────────────────
 
 /// Build the `ArrayBuffer` constructor object.
+#[inline(never)]
 fn make_arraybuffer() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -9370,6 +9403,7 @@ fn make_arraybuffer() -> JsValue {
 }
 
 /// Build the `DataView` constructor object.
+#[inline(never)]
 fn make_dataview() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -9589,6 +9623,7 @@ fn num_value<T: Into<f64>>(v: T) -> JsValue {
 }
 
 /// Build a typed-array constructor for the given `TypedArrayKind`.
+#[inline(never)]
 fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -9669,6 +9704,7 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
 }
 
 /// Build the prototype methods for a `JsValue::TypedArray` instance.
+#[inline(never)]
 fn make_typed_array_instance(
     kind: TypedArrayKind,
     inner: Rc<RefCell<crate::builtins::typed_array::JsTypedArray>>,
@@ -10266,6 +10302,7 @@ fn make_typed_array_instance(
 /// Each `new ShadowRealm()` creates an isolated evaluation environment with
 /// its own set of global builtins.  `evaluate(code)` parses and runs code
 /// inside the realm.
+#[inline(never)]
 fn make_shadow_realm() -> JsValue {
     use crate::bytecode::bytecode_generator::BytecodeGenerator;
     use crate::interpreter::{Interpreter, InterpreterFrame};
@@ -10321,6 +10358,7 @@ fn make_shadow_realm() -> JsValue {
 }
 
 /// Build the `SharedArrayBuffer` constructor.
+#[inline(never)]
 fn make_shared_arraybuffer() -> JsValue {
     native(|args| {
         let byte_length = match args.first() {
@@ -10457,6 +10495,7 @@ fn atomics_extract_ta(
 ///
 /// Since stator is single-threaded, all atomic operations are plain
 /// reads/writes — sequentially consistent by default.
+#[inline(never)]
 fn make_atomics() -> JsValue {
     let mut props = PropertyMap::new();
 
@@ -10678,6 +10717,7 @@ fn make_atomics() -> JsValue {
 ///
 /// `DisposableStack` manages a stack of disposable resources and calls their
 /// `[Symbol.dispose]()` methods in reverse order when `.dispose()` is called.
+#[inline(never)]
 fn make_disposable_stack() -> JsValue {
     native(|_args| {
         let resources: Rc<RefCell<Vec<JsValue>>> = Rc::new(RefCell::new(Vec::new()));
@@ -10766,6 +10806,7 @@ fn make_disposable_stack() -> JsValue {
 /// objects (`Number`, `Object`, `Array`), global functions (`parseInt`,
 /// `parseFloat`, `isNaN`, `isFinite`, URI helpers), and well-known constants
 /// (`undefined`, `NaN`, `Infinity`).
+#[inline(never)]
 pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     // ── Namespace objects ────────────────────────────────────────────────
     globals.insert("Math".into(), make_math());
@@ -15082,6 +15123,7 @@ mod tests {
     // ── String ↔ RegExp delegation tests ────────────────────────────────────
 
     /// Helper: build a RegExp `JsValue` via `regexp_construct`.
+    #[inline(never)]
     fn make_re(pattern: &str, flags: &str) -> JsValue {
         regexp_construct(&[
             JsValue::String(pattern.into()),
