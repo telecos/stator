@@ -2239,10 +2239,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
     // Fast path: PlainObject — the most common case.
     if let JsValue::PlainObject(map) = obj {
         let borrow = map.borrow();
-        if let Some(val) = borrow.get(key) {
-            return val.clone();
-        }
-        // Check for getter accessor (__get_<key>__).
+        // Check for getter accessor (__get_<key>__) BEFORE the data key so
+        // that accessor properties defined via Object.defineProperty are
+        // dispatched correctly even when a placeholder data key exists.
         let getter_key = format!("__get_{key}__");
         if let Some(getter) = borrow.get(&getter_key).cloned() {
             drop(borrow);
@@ -2250,6 +2249,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 Ok(v) => v,
                 Err(_) => JsValue::Undefined,
             };
+        }
+        if let Some(val) = borrow.get(key) {
+            return val.clone();
         }
         // If this PlainObject is an array literal, delegate to Array.prototype
         // BEFORE falling through to Object.prototype methods (e.g. toString).
@@ -4845,9 +4847,9 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
     for _ in 0..256 {
         if let JsValue::PlainObject(ref map) = current {
             let borrow = map.borrow();
-            if let Some(val) = borrow.get(key) {
-                return val.clone();
-            }
+            // Check for getter accessor BEFORE data key (same rationale
+            // as proto_lookup: accessor properties may have a placeholder
+            // data key that should not shadow the getter).
             let getter_key = format!("__get_{key}__");
             if let Some(getter) = borrow.get(&getter_key).cloned() {
                 drop(borrow);
@@ -4855,6 +4857,9 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
                     Ok(v) => v,
                     Err(_) => JsValue::Undefined,
                 };
+            }
+            if let Some(val) = borrow.get(key) {
+                return val.clone();
             }
             if let Some(proto) = borrow.get("__proto__") {
                 let next = proto.clone();
@@ -5124,6 +5129,15 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
 ///
 /// Supports `PlainObject` (string keys).  Stores to non-object types are
 /// silently discarded (matching the existing `StaNamedProperty` behaviour).
+///
+/// For `PlainObject` targets this enforces ECMAScript property descriptor
+/// invariants:
+/// - **Accessor properties**: if a setter (`__set_<key>__`) is defined, the
+///   setter is invoked; if only a getter exists (no setter) the store is
+///   silently ignored (sloppy mode — strict mode callers add a TypeError
+///   before reaching this helper).
+/// - **Non-writable properties**: the store is silently ignored.
+/// - **Non-extensible objects**: adding a new property is silently ignored.
 pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> StatorResult<()> {
     match obj {
         JsValue::Proxy(p) => {
@@ -5132,10 +5146,38 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
         }
         JsValue::PlainObject(map) => {
             let prop_name = to_property_key(key)?;
+            // Check for setter accessor (__set_<key>__) first — accessor
+            // properties take precedence over data properties.
+            let setter_key = format!("__set_{prop_name}__");
+            let getter_key = format!("__get_{prop_name}__");
+            {
+                let pm = map.borrow();
+                let has_setter = pm.contains_key(&setter_key);
+                let has_getter = pm.contains_key(&getter_key);
+                if has_setter {
+                    let setter_fn = pm.get(&setter_key).cloned();
+                    drop(pm);
+                    if let Some(setter) = setter_fn {
+                        dispatch_setter(&setter, obj, value)?;
+                    }
+                    return Ok(());
+                }
+                if has_getter {
+                    // Getter-only accessor: silently ignore store (sloppy).
+                    return Ok(());
+                }
+            }
             // Existing non-writable property: silently ignore (sloppy mode).
             {
                 let pm = map.borrow();
                 if pm.contains_key(&prop_name) && !pm.is_writable(&prop_name) {
+                    return Ok(());
+                }
+            }
+            // Non-extensible object: silently ignore new property (sloppy).
+            {
+                let pm = map.borrow();
+                if !pm.extensible && !pm.contains_key(&prop_name) {
                     return Ok(());
                 }
             }
@@ -8826,6 +8868,119 @@ mod tests {
             JsValue::Smi(1),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_keyed_store_non_extensible_silently_ignores_new_property() {
+        let obj = make_plain_object(vec![("x", JsValue::Smi(1))]);
+        if let JsValue::PlainObject(ref map) = obj {
+            map.borrow_mut().extensible = false;
+        }
+        // Attempting to add a new property on a non-extensible object should
+        // silently succeed (no error) but NOT actually add the property.
+        keyed_store(
+            &obj,
+            &JsValue::String("y".to_string().into()),
+            JsValue::Smi(99),
+        )
+        .unwrap();
+        assert_eq!(
+            keyed_load(&obj, &JsValue::String("y".to_string().into())).unwrap(),
+            JsValue::Undefined,
+            "new property should not be added to non-extensible object"
+        );
+        // Existing properties should still be writable.
+        keyed_store(
+            &obj,
+            &JsValue::String("x".to_string().into()),
+            JsValue::Smi(42),
+        )
+        .unwrap();
+        assert_eq!(
+            keyed_load(&obj, &JsValue::String("x".to_string().into())).unwrap(),
+            JsValue::Smi(42),
+            "existing writable property should still be updatable"
+        );
+    }
+
+    #[test]
+    fn test_keyed_store_non_writable_silently_ignored() {
+        let obj = make_plain_object(vec![("x", JsValue::Smi(1))]);
+        if let JsValue::PlainObject(ref map) = obj {
+            map.borrow_mut().set_writable("x", false);
+        }
+        // Store to non-writable property should be silently ignored.
+        keyed_store(
+            &obj,
+            &JsValue::String("x".to_string().into()),
+            JsValue::Smi(99),
+        )
+        .unwrap();
+        assert_eq!(
+            keyed_load(&obj, &JsValue::String("x".to_string().into())).unwrap(),
+            JsValue::Smi(1),
+            "non-writable property should retain original value"
+        );
+    }
+
+    #[test]
+    fn test_keyed_store_accessor_setter_dispatched() {
+        // Create an object with a setter that records the stored value.
+        let obj = make_plain_object(vec![]);
+        let stored = Rc::new(RefCell::new(JsValue::Undefined));
+        let stored_clone = Rc::clone(&stored);
+        if let JsValue::PlainObject(ref map) = obj {
+            let setter = JsValue::NativeFunction(Rc::new(move |args| {
+                *stored_clone.borrow_mut() = args.first().cloned().unwrap_or(JsValue::Undefined);
+                Ok(JsValue::Undefined)
+            }));
+            map.borrow_mut().insert("__set_x__".to_string(), setter);
+        }
+        keyed_store(
+            &obj,
+            &JsValue::String("x".to_string().into()),
+            JsValue::Smi(42),
+        )
+        .unwrap();
+        assert_eq!(
+            *stored.borrow(),
+            JsValue::Smi(42),
+            "setter should have been invoked with the stored value"
+        );
+    }
+
+    #[test]
+    fn test_keyed_store_getter_only_silently_ignored() {
+        // Create an object with a getter but no setter.
+        let obj = make_plain_object(vec![]);
+        if let JsValue::PlainObject(ref map) = obj {
+            let getter = JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Smi(99))));
+            map.borrow_mut().insert("__get_x__".to_string(), getter);
+        }
+        // Store should be silently ignored (no error in sloppy mode).
+        keyed_store(
+            &obj,
+            &JsValue::String("x".to_string().into()),
+            JsValue::Smi(42),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_proto_lookup_accessor_getter_takes_precedence() {
+        // When a property has both a data key (placeholder) and a getter
+        // accessor, proto_lookup should dispatch the getter.
+        let obj = make_plain_object(vec![("x", JsValue::Undefined)]);
+        if let JsValue::PlainObject(ref map) = obj {
+            let getter = JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Smi(42))));
+            map.borrow_mut().insert("__get_x__".to_string(), getter);
+        }
+        let result = proto_lookup(&obj, "x");
+        assert_eq!(
+            result,
+            JsValue::Smi(42),
+            "getter should take precedence over data key"
+        );
     }
 
     #[test]
