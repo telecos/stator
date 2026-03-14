@@ -2970,12 +2970,10 @@ fn handle_iterator_next(
             Some(v) => (v, false),
             None => (JsValue::Undefined, true),
         },
-        JsValue::Generator(ref gs) => {
-            match Interpreter::run_generator_step(gs, JsValue::Undefined)? {
-                GeneratorStep::Yield(v) => (v, false),
-                GeneratorStep::Return(v) => (v, true),
-            }
-        }
+        JsValue::Generator(gs) => match Interpreter::run_generator_step(gs, JsValue::Undefined)? {
+            GeneratorStep::Yield(v) => (v, false),
+            GeneratorStep::Return(v) => (v, true),
+        },
         JsValue::PlainObject(ref map) if map.borrow().contains_key("next") => {
             let next_fn = map.borrow().get("next").cloned();
             match next_fn {
@@ -3093,7 +3091,7 @@ fn handle_iterator_close(
             }
         }
         // Close a generator by marking it as completed (§27.5.3.4).
-        JsValue::Generator(ref gs) => {
+        JsValue::Generator(gs) => {
             let mut state = gs.borrow_mut();
             if state.status != GeneratorStatus::Completed {
                 state.status = GeneratorStatus::Completed;
@@ -3728,9 +3726,7 @@ fn handle_create_array_from_iterable(
                         }
                         out
                     }
-                    JsValue::PlainObject(ref iter_map)
-                        if iter_map.borrow().contains_key("next") =>
-                    {
+                    JsValue::PlainObject(iter_map) if iter_map.borrow().contains_key("next") => {
                         collect_from_plain_object_iterator(&iter_obj, iter_map)?
                     }
                     _ => {
