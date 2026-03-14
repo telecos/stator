@@ -6573,6 +6573,175 @@ mod tests {
         assert_eq!(result, JsValue::Smi(99));
     }
 
+    // ── Property descriptor accessor / writable enforcement ─────────────
+
+    /// Accessor getter defined via Object.defineProperty is invoked on read.
+    #[test]
+    fn e2e_define_property_getter_invoked() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 42; } }); \
+             o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Accessor setter defined via Object.defineProperty is invoked on write.
+    #[test]
+    fn e2e_define_property_setter_invoked() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; var stored = 0; \
+             Object.defineProperty(o, 'x', { \
+                 get: function() { return stored; }, \
+                 set: function(v) { stored = v * 2; } \
+             }); \
+             o.x = 5; o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// Getter-only accessor: strict-mode write throws TypeError.
+    #[test]
+    fn e2e_getter_only_strict_throws() {
+        let result = crate::builtins::global::global_eval(
+            "'use strict'; var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 1; } }); \
+             o.x = 2;",
+        );
+        assert!(
+            result.is_err(),
+            "strict mode setter on getter-only should throw"
+        );
+    }
+
+    /// Getter-only accessor: sloppy-mode write is silently ignored.
+    #[test]
+    fn e2e_getter_only_sloppy_silent() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 1; } }); \
+             o.x = 2; o.x",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::Smi(1),
+            "getter-only property should remain unchanged"
+        );
+    }
+
+    /// Non-writable property via defineProperty: sloppy silent, value unchanged.
+    #[test]
+    fn e2e_non_writable_sloppy_silent() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 10, writable: false }); \
+             o.x = 99; o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// Non-writable property: strict-mode write throws TypeError.
+    #[test]
+    fn e2e_non_writable_strict_throws() {
+        let result = crate::builtins::global::global_eval(
+            "'use strict'; var o = {}; \
+             Object.defineProperty(o, 'x', { value: 10, writable: false }); \
+             o.x = 99;",
+        );
+        assert!(
+            result.is_err(),
+            "strict mode write to non-writable should throw"
+        );
+    }
+
+    /// preventExtensions: new property in sloppy mode silently fails.
+    #[test]
+    fn e2e_prevent_extensions_sloppy_new_prop() {
+        let result = crate::builtins::global::global_eval(
+            "var o = { x: 1 }; Object.preventExtensions(o); o.y = 2; \
+             typeof o.y",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    /// preventExtensions: existing property is still writable.
+    #[test]
+    fn e2e_prevent_extensions_existing_writable() {
+        let result = crate::builtins::global::global_eval(
+            "var o = { x: 1 }; Object.preventExtensions(o); o.x = 99; o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    /// Object.isExtensible returns false after preventExtensions.
+    #[test]
+    fn e2e_object_is_extensible() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; var before = Object.isExtensible(o); \
+             Object.preventExtensions(o); \
+             var after = Object.isExtensible(o); \
+             '' + before + ',' + after",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("true,false".into()));
+    }
+
+    /// Non-configurable property cannot be deleted in strict mode.
+    #[test]
+    fn e2e_non_configurable_delete_strict() {
+        let result = crate::builtins::global::global_eval(
+            "'use strict'; var o = {}; \
+             Object.defineProperty(o, 'x', { value: 1, configurable: false }); \
+             delete o.x;",
+        );
+        assert!(
+            result.is_err(),
+            "strict delete of non-configurable should throw"
+        );
+    }
+
+    /// Non-configurable property: sloppy delete returns false.
+    #[test]
+    fn e2e_non_configurable_delete_sloppy() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 1, configurable: false }); \
+             delete o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// Object.freeze makes properties non-writable AND non-configurable.
+    #[test]
+    fn e2e_freeze_descriptor_check() {
+        let result = crate::builtins::global::global_eval(
+            "var o = { x: 1 }; Object.freeze(o); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             '' + d.writable + ',' + d.configurable",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("false,false".into()));
+    }
+
+    /// Object.seal makes properties non-configurable but preserves writable.
+    #[test]
+    fn e2e_seal_descriptor_check() {
+        let result = crate::builtins::global::global_eval(
+            "var o = { x: 1 }; Object.seal(o); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             '' + d.writable + ',' + d.configurable",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("true,false".into()));
+    }
+
     // ── §4 Arguments object ─────────────────────────────────────────────
 
     #[test]
