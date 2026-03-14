@@ -1359,6 +1359,9 @@ fn main_inner() {
 
     // ── Run each test ─────────────────────────────────────────────────────────
     for (idx, path) in test_files.iter().enumerate() {
+        if idx < 10 || idx % 5000 == 0 {
+            eprintln!("[diag] test {idx}/{total}: {}", path.display());
+        }
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
