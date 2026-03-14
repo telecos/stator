@@ -1283,7 +1283,7 @@ fn main() {
     // pathological test inputs from overflowing the default 8 MB stack.
     let builder = std::thread::Builder::new()
         .name("test262-main".into())
-        .stack_size(256 * 1024 * 1024); // 256 MiB — install_globals is deeply nested
+        .stack_size(1024 * 1024 * 1024); // 1 GiB virtual — physical pages are lazy
     let handler = builder
         .spawn(main_inner)
         .expect("failed to spawn main thread");
@@ -1350,17 +1350,13 @@ fn main_inner() {
     // Build the template globals once.  Each test clones this template so
     // that per-test mutations don't leak across tests while avoiding the
     // heavy cost of re-running `install_globals` for every test.
-    let template_globals = stacker::maybe_grow(
-        512 * 1024 * 1024, // red zone: 512 MiB (always triggers on 256 MiB thread stack)
-        512 * 1024 * 1024, // growth: 512 MiB fresh heap stack
-        make_test_globals,
-    );
+    let template_globals = make_test_globals();
     eprintln!("[diag] after make_test_globals");
 
     // ── Run each test ─────────────────────────────────────────────────────────
     for (idx, path) in test_files.iter().enumerate() {
-        if idx < 10 || idx % 5000 == 0 {
-            eprintln!("[diag] test {idx}/{total}: {}", path.display());
+        if idx < 200 || idx % 500 == 0 {
+            eprintln!("[diag] test {idx}/{total}");
         }
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
