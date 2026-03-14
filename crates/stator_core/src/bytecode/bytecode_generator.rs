@@ -635,16 +635,11 @@ impl FunctionCompiler {
                 self.compile_binding_pattern(&assign_pat.left, source_reg, mode)?;
             }
             Pat::Rest(rest) => {
-                let arr_slot = self.alloc_slot(FeedbackSlotKind::Literal);
-                self.emit(Instruction::new_unchecked(
-                    Opcode::CreateEmptyArrayLiteral,
-                    vec![arr_slot],
-                ));
-                let arr_reg = self.allocator.new_local();
-                self.emit_star(arr_reg);
-                // Just bind the source (the remaining value) for now.
-                // Full rest-collect would require knowing the iterator reg.
-                self.compile_binding_pattern(&rest.argument, arr_reg, mode)?;
+                // Rest element outside an array/object pattern context (which
+                // have their own specialized handling).  Bind the source value
+                // directly to the inner pattern — the caller already placed the
+                // correct remaining value into source_reg.
+                self.compile_binding_pattern(&rest.argument, source_reg, mode)?;
             }
             Pat::Expr(expr) => {
                 // Expression target inside a destructuring pattern, e.g.
@@ -1879,9 +1874,13 @@ impl FunctionCompiler {
             self.emit_jump(Opcode::Jump, continue_label);
             return Ok(());
         }
-        let (continue_label, _) = *self
+        // Skip switch entries (where continue_label == break_label) and
+        // find the innermost enclosing loop.
+        let &(continue_label, _) = self
             .loop_stack
-            .last()
+            .iter()
+            .rev()
+            .find(|&&(cont, brk)| cont != brk)
             .ok_or_else(|| StatorError::SyntaxError("continue outside loop".into()))?;
         self.emit_jump(Opcode::Jump, continue_label);
         Ok(())
@@ -2002,6 +2001,23 @@ impl FunctionCompiler {
     /// [after_catch] ...
     /// ```
     ///
+    /// ## Layout — try/catch/finally
+    ///
+    /// Two handler table entries: one dispatches exceptions from the try
+    /// body to the catch handler, the second wraps the catch body so that
+    /// finally runs even if catch throws.
+    ///
+    /// ```text
+    /// [try_start]       try body
+    /// [try_end]         Jump(after_catch)
+    /// [catch_start]     Star(e), catch body
+    /// [catch_end]
+    /// [after_catch]     finally body (normal path)
+    ///                   Jump(after_ex_handler)
+    /// [ex_handler]      Star(ex_reg), finally body, Ldar(ex_reg), ReThrow
+    /// [after_ex_handler] ...
+    /// ```
+    ///
     /// ## Layout — try/finally (no catch)
     ///
     /// The finally block is duplicated: once inline for the normal path, and
@@ -2055,6 +2071,7 @@ impl FunctionCompiler {
             }
             self.compile_block(&handler.body)?;
             self.pop_scope();
+            let catch_end = self.instructions.len() as u32;
 
             self.bind_label(after_catch_label);
 
@@ -2067,8 +2084,34 @@ impl FunctionCompiler {
             });
 
             // Compile finally block inline (runs on both paths).
+            // When a finally block is present, an additional exception handler
+            // covers the catch block so that finally executes even if the catch
+            // body throws.
             if let Some(finalizer) = &s.finalizer {
                 self.compile_block(finalizer)?;
+
+                // Exception-path handler for exceptions thrown inside catch.
+                let after_ex_handler_label = self.new_label();
+                self.emit_jump(Opcode::Jump, after_ex_handler_label);
+
+                let ex_handler_start = self.instructions.len() as u32;
+                let ex_reg = self.allocator.allocate_temporary();
+                self.emit_star(ex_reg);
+                self.compile_block(finalizer)?;
+                self.emit_ldar(ex_reg);
+                self.emit(Instruction::new_unchecked(Opcode::ReThrow, vec![]));
+                self.allocator
+                    .release_temporary(ex_reg)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+
+                self.bind_label(after_ex_handler_label);
+
+                self.handler_table.push(HandlerTableEntry {
+                    try_start: catch_start,
+                    try_end: catch_end,
+                    handler: ex_handler_start,
+                    is_finally: true,
+                });
             }
         } else if let Some(finalizer) = &s.finalizer {
             // ── try / finally (no catch) ─────────────────────────────────────
