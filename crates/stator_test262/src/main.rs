@@ -497,8 +497,10 @@ fn deep_clone_globals(template: &HashMap<String, JsValue>) -> HashMap<String, Js
 /// - `$DONOTEVALUATE` sentinel function
 #[inline(never)]
 fn make_test_globals() -> HashMap<String, JsValue> {
+    eprintln!("[diag] inside make_test_globals, before install_globals");
     let mut map = HashMap::new();
     install_globals(&mut map);
+    eprintln!("[diag] after install_globals, {} globals", map.len());
 
     // Silent print — some harness files reference it.
     map.insert(
@@ -1341,7 +1343,9 @@ fn main_inner() {
     let mut fail: u64 = 0;
     let mut skip: u64 = 0;
 
+    eprintln!("[diag] before HarnessCache::new");
     let mut harness = HarnessCache::new(harness_dir);
+    eprintln!("[diag] after HarnessCache::new, before make_test_globals");
 
     // Build the template globals once.  Each test clones this template so
     // that per-test mutations don't leak across tests while avoiding the
@@ -1351,6 +1355,7 @@ fn main_inner() {
         512 * 1024 * 1024, // growth: 512 MiB fresh heap stack
         make_test_globals,
     );
+    eprintln!("[diag] after make_test_globals");
 
     // ── Run each test ─────────────────────────────────────────────────────────
     for (idx, path) in test_files.iter().enumerate() {
