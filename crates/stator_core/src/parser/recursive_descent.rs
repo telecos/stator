@@ -2698,31 +2698,12 @@ impl<'src> Parser<'src> {
 
     fn parse_exponentiation(&mut self) -> StatorResult<Expr> {
         // ** is right-associative.
+        // NOTE: The unary-before-** check lives in `parse_unary` — bare
+        // `unary op ** y` is rejected there.  By the time we reach here,
+        // the base is a valid UpdateExpression (or a parenthesised unary).
         let start = self.current_span();
         let base = self.parse_unary()?;
         if self.peek_kind() == TokenKind::StarStar {
-            // Per spec, any UnaryExpression on the left of `**` is a
-            // SyntaxError — the user must write `(-x) ** y`, `(!x) ** y`,
-            // `(await x) ** y`, etc.
-            if matches!(base, Expr::Unary(_) | Expr::Await(_)) {
-                let loc = base.loc();
-                return Err(Self::error_at(
-                    loc,
-                    "unary operator used immediately before `**`; \
-                     use parentheses to disambiguate",
-                ));
-            }
-            // Prefix ++/-- before ** is also disallowed (`++x ** y`), but
-            // postfix is fine (`x++ ** y`).
-            if let Expr::Update(ref u) = base
-                && u.prefix
-            {
-                return Err(Self::error_at(
-                    u.loc,
-                    "unary operator used immediately before `**`; \
-                     use parentheses to disambiguate",
-                ));
-            }
             self.bump()?;
             let exp = self.parse_exponentiation()?;
             let end = exp.loc();
