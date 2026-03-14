@@ -236,8 +236,10 @@ fn run_with_inspector(
     }
 }
 
-/// Build the initial global environment with the built-in shell functions.
 /// Print JIT compilation statistics for benchmarking.
+///
+/// Emits a human-readable breakdown of the number of functions and total
+/// native-code bytes produced by each JIT tier (Baseline, Maglev, Turbofan).
 fn print_jit_stats() {
     use stator_core::interpreter::{jit_stats, maglev_stats, turbofan_stats};
 
@@ -297,6 +299,11 @@ fn load_globals_from_snapshot(path: &str) -> Rc<RefCell<HashMap<String, JsValue>
     }
 }
 
+/// Build the initial global environment with the built-in shell functions.
+///
+/// Inserts `print`, `console.log`, and the `WebAssembly` namespace into a
+/// fresh globals map and returns it wrapped in an `Rc<RefCell<…>>` for use
+/// by the interpreter.
 fn build_globals() -> Rc<RefCell<HashMap<String, JsValue>>> {
     let globals: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
 

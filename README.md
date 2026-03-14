@@ -67,23 +67,53 @@ cargo test
 
 ## `st8` CLI
 
-`st8` is the Stator command-line shell, analogous to V8's `d8`.  It provides
-script execution, a REPL, and debugging utilities once the interpreter is
-functional.
+`st8` is the Stator command-line shell, analogous to V8's `d8`.  It executes
+JavaScript files, evaluates inline snippets, and supports Chrome DevTools
+Protocol (CDP) inspection.
 
 ```sh
 # Build the shell
 cargo build --bin st8
 
-# Run the shell (placeholder output until interpreter is wired up)
-cargo run --bin st8
+# Execute a JavaScript file
+cargo run --bin st8 -- file.js
+
+# Evaluate an inline expression
+cargo run --bin st8 -- -e '1 + 2'
+
+# Run with Chrome DevTools inspector on port 9229
+cargo run --bin st8 -- --inspect file.js
+
+# Run and pause before the first statement
+cargo run --bin st8 -- --inspect-brk file.js
 ```
 
-Expected output:
+Example session:
 
 ```
-st8: Stator JavaScript shell (not yet implemented)
+$ echo 'print(6 * 7)' > hello.js
+$ cargo run --bin st8 -- hello.js
+42
 ```
+
+### Built-in globals
+
+| Global | Description |
+|---|---|
+| `print(...args)` | Prints arguments joined by a space, followed by a newline |
+| `console.log(...args)` | Alias for `print` |
+| `WebAssembly` | Full WebAssembly JS API namespace |
+
+### Additional options
+
+| Flag | Description |
+|---|---|
+| `-e '<code>'` | Evaluate an inline JavaScript expression |
+| `--inspect[=port]` | Start CDP inspector (default port: 9229) |
+| `--inspect-brk[=port]` | Start inspector and pause before first statement |
+| `--emit-snapshot=<path>` | Serialize built-in globals to a snapshot file |
+| `--snapshot=<path>` | Load globals from a snapshot for faster startup |
+| `--jit-stats` | Print JIT compilation statistics after execution |
 
 ## Embedding example
 
