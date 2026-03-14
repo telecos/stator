@@ -2336,6 +2336,24 @@ impl FunctionCompiler {
         }
     }
 
+    /// Load a variable by name inside a `typeof` expression.
+    ///
+    /// For globals, emits [`Opcode::LdaGlobalInsideTypeof`] which returns
+    /// `undefined` instead of throwing a `ReferenceError` when the name is
+    /// not bound (ECMAScript §13.5.3).
+    fn compile_ident_load_typeof(&mut self, name: &str) {
+        if let Some((reg, _is_const)) = self.lookup_var(name) {
+            self.emit_ldar(reg);
+        } else {
+            let name_idx = self.add_string(name);
+            let slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaGlobalInsideTypeof,
+                vec![Operand::ConstantPoolIdx(name_idx), slot],
+            ));
+        }
+    }
+
     /// Store the accumulator to the variable named `name`.
     ///
     /// Returns an error if the variable is a `const` binding.
@@ -2366,7 +2384,15 @@ impl FunctionCompiler {
                 self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
             }
             UnaryOp::Typeof => {
-                self.compile_expr(&u.argument)?;
+                // ECMAScript §13.5.3: when the operand is a simple
+                // identifier reference that may be unresolvable, use
+                // LdaGlobalInsideTypeof so the runtime returns "undefined"
+                // instead of throwing a ReferenceError.
+                if let Expr::Ident(id) = u.argument.as_ref() {
+                    self.compile_ident_load_typeof(&id.name);
+                } else {
+                    self.compile_expr(&u.argument)?;
+                }
                 let slot = self.alloc_slot(FeedbackSlotKind::TypeOf);
                 self.emit(Instruction::new_unchecked(Opcode::TypeOf, vec![slot]));
             }

@@ -2391,6 +2391,29 @@ fn handle_lda_global(
     Ok(DispatchAction::Continue)
 }
 
+/// `LdaGlobalInsideTypeof <name_idx> <slot>`
+///
+/// Same as [`handle_lda_global`] but used inside `typeof` expressions.
+/// Returns `undefined` instead of throwing a `ReferenceError` when the
+/// global variable does not exist (ECMAScript §13.5.3).
+fn handle_lda_global_inside_typeof(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+        return Err(err_bad_operand("LdaGlobalInsideTypeof", 0));
+    };
+    let name = ctx.frame.get_string_constant(name_idx)?;
+    ctx.frame.accumulator = ctx
+        .frame
+        .global_env
+        .borrow()
+        .get(name.as_ref())
+        .cloned()
+        .unwrap_or(JsValue::Undefined);
+    Ok(DispatchAction::Continue)
+}
+
 fn handle_sta_global(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -5603,6 +5626,111 @@ fn handle_define_private_brand(
     Ok(DispatchAction::Continue)
 }
 
+/// `LdaModuleVariable <module_request_idx> <cell_idx>`
+///
+/// Loads a module import binding into the accumulator.  The constant pool
+/// entry at `module_request_idx` holds the source module specifier string,
+/// and `cell_idx` identifies the binding cell within that module.
+///
+/// Since full module linking is not yet wired up, module variables are
+/// backed by the shared global environment keyed as
+/// `__mod:{specifier}:{cell}`.
+fn handle_lda_module_variable(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::ConstantPoolIdx(req_idx) = instr.operands[0] else {
+        return Err(err_bad_operand("LdaModuleVariable", 0));
+    };
+    let Operand::Immediate(cell) = instr.operands[1] else {
+        return Err(err_bad_operand("LdaModuleVariable", 1));
+    };
+    let specifier = match ctx.frame.bytecode_array.get_constant(req_idx) {
+        Some(ConstantPoolEntry::String(s)) => s.clone(),
+        _ => {
+            return Err(StatorError::Internal(
+                "LdaModuleVariable: module specifier is not a string".into(),
+            ));
+        }
+    };
+    let key = format!("__mod:{specifier}:{cell}");
+    ctx.frame.accumulator = ctx
+        .frame
+        .global_env
+        .borrow()
+        .get(&key)
+        .cloned()
+        .unwrap_or(JsValue::Undefined);
+    Ok(DispatchAction::Continue)
+}
+
+/// `StaModuleVariable <module_request_idx> <cell_idx>`
+///
+/// Stores the accumulator into a module export binding.  Used for
+/// `export let`/`export var` — live-binding semantics mean importers
+/// see updated values.
+///
+/// Backed by the global environment (see [`handle_lda_module_variable`]).
+fn handle_sta_module_variable(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::ConstantPoolIdx(req_idx) = instr.operands[0] else {
+        return Err(err_bad_operand("StaModuleVariable", 0));
+    };
+    let Operand::Immediate(cell) = instr.operands[1] else {
+        return Err(err_bad_operand("StaModuleVariable", 1));
+    };
+    let specifier = match ctx.frame.bytecode_array.get_constant(req_idx) {
+        Some(ConstantPoolEntry::String(s)) => s.clone(),
+        _ => {
+            return Err(StatorError::Internal(
+                "StaModuleVariable: module specifier is not a string".into(),
+            ));
+        }
+    };
+    let key = format!("__mod:{specifier}:{cell}");
+    let val = ctx.frame.accumulator.clone();
+    ctx.frame.global_env.borrow_mut().insert(key, val);
+    Ok(DispatchAction::Continue)
+}
+
+/// `LdaImportMeta`
+///
+/// Loads the `import.meta` object into the accumulator.  Per ECMAScript
+/// §16.2.1.7, `import.meta` is an ordinary object whose prototype is
+/// `null`.  The host may populate it with properties such as `url`.
+///
+/// Returns a fresh empty plain object (host properties are not yet
+/// available in the interpreter).
+fn handle_lda_import_meta(
+    ctx: &mut DispatchContext,
+    _instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+    Ok(DispatchAction::Continue)
+}
+
+/// `GetModuleNamespace <module_request_idx>`
+///
+/// Creates a module namespace exotic object for the module identified by
+/// the constant-pool string at `module_request_idx` and loads it into the
+/// accumulator.  Used by `import * as ns from "…"` and
+/// `export * from "…"`.
+///
+/// Returns a fresh empty plain object (full namespace resolution depends
+/// on the module linker which is not yet wired up).
+fn handle_get_module_namespace(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::ConstantPoolIdx(_req_idx) = instr.operands[0] else {
+        return Err(err_bad_operand("GetModuleNamespace", 0));
+    };
+    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+    Ok(DispatchAction::Continue)
+}
+
 #[cold]
 fn handle_unimplemented(
     _ctx: &mut DispatchContext,
@@ -5629,7 +5757,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::LdaFalse as usize] = handle_lda_false;
     table[Opcode::LdaConstant as usize] = handle_lda_constant;
     table[Opcode::LdaGlobal as usize] = handle_lda_global;
-    table[Opcode::LdaGlobalInsideTypeof as usize] = handle_lda_global;
+    table[Opcode::LdaGlobalInsideTypeof as usize] = handle_lda_global_inside_typeof;
     table[Opcode::StaGlobal as usize] = handle_sta_global;
     table[Opcode::LdaContextSlot as usize] = handle_lda_context_slot;
     table[Opcode::LdaImmutableContextSlot as usize] = handle_lda_context_slot;
@@ -5810,11 +5938,11 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::CreateClass as usize] = handle_create_class;
     table[Opcode::TestPrivateBrand as usize] = handle_test_private_brand;
     table[Opcode::DefinePrivateBrand as usize] = handle_define_private_brand;
-    table[Opcode::LdaModuleVariable as usize] = handle_unimplemented;
-    table[Opcode::StaModuleVariable as usize] = handle_unimplemented;
-    table[Opcode::LdaImportMeta as usize] = handle_unimplemented;
+    table[Opcode::LdaModuleVariable as usize] = handle_lda_module_variable;
+    table[Opcode::StaModuleVariable as usize] = handle_sta_module_variable;
+    table[Opcode::LdaImportMeta as usize] = handle_lda_import_meta;
     table[Opcode::LdaNewTarget as usize] = handle_lda_new_target;
-    table[Opcode::GetModuleNamespace as usize] = handle_unimplemented;
+    table[Opcode::GetModuleNamespace as usize] = handle_get_module_namespace;
     table[Opcode::Wide as usize] = handle_wide;
     table[Opcode::ExtraWide as usize] = handle_wide;
     table[Opcode::Illegal as usize] = handle_unimplemented;
@@ -6708,5 +6836,111 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `typeof undeclaredVar` must return `"undefined"`, not throw.
+    #[test]
+    fn test_typeof_undeclared_returns_undefined_string() {
+        let result = crate::builtins::global::global_eval("typeof totallyUndeclared").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    /// `import.meta` must produce an object (not crash).
+    #[test]
+    fn test_import_meta_returns_object() {
+        use crate::bytecode::bytecode_array::BytecodeArray;
+        use crate::bytecode::bytecodes::{Instruction, Opcode, encode};
+        use crate::bytecode::feedback::FeedbackMetadata;
+        use crate::interpreter::{Interpreter, InterpreterFrame};
+
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaImportMeta, vec![]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = BytecodeArray::new(
+            encode(&instrs),
+            vec![],
+            0,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        )
+        .with_module_flag(true);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert!(
+            matches!(result, JsValue::PlainObject(_)),
+            "import.meta should produce a PlainObject"
+        );
+    }
+
+    /// `StaModuleVariable` + `LdaModuleVariable` round-trip.
+    #[test]
+    fn test_module_variable_store_load_round_trip() {
+        use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
+        use crate::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
+        use crate::bytecode::feedback::FeedbackMetadata;
+        use crate::interpreter::{Interpreter, InterpreterFrame};
+
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(
+                Opcode::StaModuleVariable,
+                vec![Operand::ConstantPoolIdx(0), Operand::Immediate(0)],
+            ),
+            Instruction::new_unchecked(Opcode::LdaUndefined, vec![]),
+            Instruction::new_unchecked(
+                Opcode::LdaModuleVariable,
+                vec![Operand::ConstantPoolIdx(0), Operand::Immediate(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = BytecodeArray::new(
+            encode(&instrs),
+            vec![ConstantPoolEntry::String(String::new())],
+            0,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        )
+        .with_module_flag(true);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    /// `GetModuleNamespace` must produce an object (not crash).
+    #[test]
+    fn test_get_module_namespace_returns_object() {
+        use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
+        use crate::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
+        use crate::bytecode::feedback::FeedbackMetadata;
+        use crate::interpreter::{Interpreter, InterpreterFrame};
+
+        let instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::GetModuleNamespace,
+                vec![Operand::ConstantPoolIdx(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = BytecodeArray::new(
+            encode(&instrs),
+            vec![ConstantPoolEntry::String("./foo.js".to_string())],
+            0,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        )
+        .with_module_flag(true);
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert!(
+            matches!(result, JsValue::PlainObject(_)),
+            "GetModuleNamespace should produce a PlainObject"
+        );
     }
 }
