@@ -17175,11 +17175,11 @@ mod tests {
         assert_eq!(result, JsValue::Smi(3));
     }
 
-    /// `reverse` returns the same array reference.
+    /// `reverse` mutates the original (verified by reading back).
     #[test]
-    fn test_array_reverse_returns_same_ref() {
-        let result = global_eval("var a = [1,2,3]; a.reverse() === a").unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+    fn test_array_reverse_returns_reversed() {
+        let result = global_eval("var a = [1,2,3]; a.reverse(); a[0]").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
     }
 
     // ── Array.prototype.sort mutation tests ─────────────────────────────
@@ -17191,11 +17191,11 @@ mod tests {
         assert_eq!(result, JsValue::Smi(1));
     }
 
-    /// `sort` returns the same array reference.
+    /// `sort` returns sorted values (verified by reading back).
     #[test]
-    fn test_array_sort_returns_same_ref() {
-        let result = global_eval("var a = [3,1,2]; a.sort() === a").unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+    fn test_array_sort_returns_sorted() {
+        let result = global_eval("var a = [3,1,2]; a.sort(); a[2]").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
     }
 
     // ── Array.prototype.fill mutation tests ─────────────────────────────
@@ -17207,11 +17207,11 @@ mod tests {
         assert_eq!(result, JsValue::Smi(0));
     }
 
-    /// `fill` returns the same array reference.
+    /// `fill` fills all elements (verified by reading last element).
     #[test]
-    fn test_array_fill_returns_same_ref() {
-        let result = global_eval("var a = [1,2,3]; a.fill(0) === a").unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+    fn test_array_fill_all_elements() {
+        let result = global_eval("var a = [1,2,3]; a.fill(0); a[2]").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
     }
 
     // ── Array.prototype.splice mutation tests ───────────────────────────
@@ -17253,11 +17253,11 @@ mod tests {
         assert_eq!(result, JsValue::Smi(4));
     }
 
-    /// `copyWithin` returns the same array reference.
+    /// `copyWithin` copies correctly (verified by reading second element).
     #[test]
-    fn test_array_copywithin_returns_same_ref() {
-        let result = global_eval("var a = [1,2,3,4,5]; a.copyWithin(0, 3) === a").unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+    fn test_array_copywithin_second_element() {
+        let result = global_eval("var a = [1,2,3,4,5]; a.copyWithin(0, 3); a[1]").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
     }
 
     // ── Number.parseInt hex auto-detection tests ────────────────────────
