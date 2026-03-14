@@ -52,6 +52,8 @@ jobs:
         # async, generators, classes, symbols, BigInt, destructuring,
         # for-of, dynamic-import, Proxy/Reflect, WeakRef, Intl, RegExp
         # advanced, tail-call-optimization, globalThis.
+        env:
+          RUST_MIN_STACK: "33554432"   # 32 MiB for spawned threads
         run: |
           ./target/release/stator_test262 \
             --test262-dir test262 \

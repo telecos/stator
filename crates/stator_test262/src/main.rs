@@ -1280,7 +1280,7 @@ fn main() {
     // pathological test inputs from overflowing the default 8 MB stack.
     let builder = std::thread::Builder::new()
         .name("test262-main".into())
-        .stack_size(128 * 1024 * 1024); // 128 MiB — stacker guards handle further growth
+        .stack_size(256 * 1024 * 1024); // 256 MiB — install_globals is deeply nested
     let handler = builder
         .spawn(main_inner)
         .expect("failed to spawn main thread");
@@ -1345,7 +1345,7 @@ fn main_inner() {
     // Build the template globals once.  Each test clones this template so
     // that per-test mutations don't leak across tests while avoiding the
     // heavy cost of re-running `install_globals` for every test.
-    let template_globals = make_test_globals();
+    let template_globals = stacker::maybe_grow(512 * 1024, 32 * 1024 * 1024, make_test_globals);
 
     // ── Run each test ─────────────────────────────────────────────────────────
     for (idx, path) in test_files.iter().enumerate() {
