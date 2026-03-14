@@ -2714,14 +2714,14 @@ impl<'src> Parser<'src> {
             }
             // Prefix ++/-- before ** is also disallowed (`++x ** y`), but
             // postfix is fine (`x++ ** y`).
-            if let Expr::Update(ref u) = base {
-                if u.prefix {
-                    return Err(Self::error_at(
-                        u.loc,
-                        "unary operator used immediately before `**`; \
-                         use parentheses to disambiguate",
-                    ));
-                }
+            if let Expr::Update(ref u) = base
+                && u.prefix
+            {
+                return Err(Self::error_at(
+                    u.loc,
+                    "unary operator used immediately before `**`; \
+                     use parentheses to disambiguate",
+                ));
             }
             self.bump()?;
             let exp = self.parse_exponentiation()?;
