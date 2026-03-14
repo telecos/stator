@@ -88,6 +88,11 @@ pub struct Parser<'src> {
     /// Nesting depth of breakable statements (iteration + `switch`).
     /// Used to validate `break`.
     breakable_depth: usize,
+    /// `true` when parsing the right-hand operand of `??`.  Inside this
+    /// context bare `||` and `&&` are forbidden (ES2020+ spec).  The flag
+    /// is saved/restored when entering a parenthesised sub-expression so
+    /// that `a ?? (b || c)` remains legal.
+    in_nullish_coalesce: bool,
 }
 
 impl<'src> Parser<'src> {
@@ -107,6 +112,7 @@ impl<'src> Parser<'src> {
             function_depth: 0,
             iteration_depth: 0,
             breakable_depth: 0,
+            in_nullish_coalesce: false,
         })
     }
 
@@ -2498,12 +2504,17 @@ impl<'src> Parser<'src> {
     }
 
     /// `??` has lower precedence than `||`, so it wraps `parse_logical_or`.
+    /// Mixing `??` with `||` or `&&` without parentheses is a syntax error
+    /// (ES2020).
     fn parse_nullish_coalesce(&mut self) -> StatorResult<Expr> {
         let start = self.current_span();
         let mut left = self.parse_logical_or()?;
         while self.peek_kind() == TokenKind::QuestionQuestion {
             self.bump()?;
+            let saved = self.in_nullish_coalesce;
+            self.in_nullish_coalesce = true;
             let right = self.parse_logical_or()?;
+            self.in_nullish_coalesce = saved;
             let end = right.loc();
             left = Expr::Logical(Box::new(LogicalExpr {
                 loc: Self::merge_spans(start, end),
@@ -2518,7 +2529,12 @@ impl<'src> Parser<'src> {
     fn parse_logical_or(&mut self) -> StatorResult<Expr> {
         let start = self.current_span();
         let mut left = self.parse_logical_and()?;
+        let mut had_or = false;
         while self.peek_kind() == TokenKind::PipePipe {
+            if self.in_nullish_coalesce {
+                return Err(self.error("cannot use `||` inside `??` without parentheses"));
+            }
+            had_or = true;
             self.bump()?;
             let right = self.parse_logical_and()?;
             let end = right.loc();
@@ -2529,13 +2545,22 @@ impl<'src> Parser<'src> {
                 right: Box::new(right),
             }));
         }
+        // `a || b ?? c` — mixing in the other direction.
+        if had_or && self.peek_kind() == TokenKind::QuestionQuestion {
+            return Err(self.error("cannot use `??` after `||` without parentheses"));
+        }
         Ok(left)
     }
 
     fn parse_logical_and(&mut self) -> StatorResult<Expr> {
         let start = self.current_span();
         let mut left = self.parse_bitwise_or()?;
+        let mut had_and = false;
         while self.peek_kind() == TokenKind::AmpersandAmpersand {
+            if self.in_nullish_coalesce {
+                return Err(self.error("cannot use `&&` inside `??` without parentheses"));
+            }
+            had_and = true;
             self.bump()?;
             let right = self.parse_bitwise_or()?;
             let end = right.loc();
@@ -2545,6 +2570,10 @@ impl<'src> Parser<'src> {
                 left: Box::new(left),
                 right: Box::new(right),
             }));
+        }
+        // `a && b ?? c` — mixing in the other direction.
+        if had_and && self.peek_kind() == TokenKind::QuestionQuestion {
+            return Err(self.error("cannot use `??` after `&&` without parentheses"));
         }
         Ok(left)
     }
@@ -2669,6 +2698,9 @@ impl<'src> Parser<'src> {
 
     fn parse_exponentiation(&mut self) -> StatorResult<Expr> {
         // ** is right-associative.
+        // NOTE: The unary-before-** check lives in `parse_unary` — bare
+        // `unary op ** y` is rejected there.  By the time we reach here,
+        // the base is a valid UpdateExpression (or a parenthesised unary).
         let start = self.current_span();
         let base = self.parse_unary()?;
         if self.peek_kind() == TokenKind::StarStar {
@@ -2699,16 +2731,33 @@ impl<'src> Parser<'src> {
                 self.bump()?;
                 let argument = self.parse_unary()?;
                 let end = argument.loc();
-                return Ok(Expr::Await(Box::new(AwaitExpr {
+                let expr = Expr::Await(Box::new(AwaitExpr {
                     loc: Self::merge_spans(start, end),
                     argument: Box::new(argument),
-                })));
+                }));
+                // `await x ** y` is a SyntaxError — must use `(await x) ** y`.
+                if self.peek_kind() == TokenKind::StarStar {
+                    return Err(Self::error_at(
+                        Self::merge_spans(start, end),
+                        "unary operator used immediately before `**`; \
+                         use parentheses to disambiguate",
+                    ));
+                }
+                return Ok(expr);
             }
             TokenKind::PlusPlus => {
                 self.bump()?;
                 let arg = self.parse_unary()?;
                 let end = arg.loc();
                 self.validate_update_target(&arg)?;
+                // `++x ** y` is a SyntaxError — must use `(++x) ** y`.
+                if self.peek_kind() == TokenKind::StarStar {
+                    return Err(Self::error_at(
+                        Self::merge_spans(start, end),
+                        "unary operator used immediately before `**`; \
+                         use parentheses to disambiguate",
+                    ));
+                }
                 return Ok(Expr::Update(Box::new(UpdateExpr {
                     loc: Self::merge_spans(start, end),
                     op: UpdateOp::Increment,
@@ -2721,6 +2770,14 @@ impl<'src> Parser<'src> {
                 let arg = self.parse_unary()?;
                 let end = arg.loc();
                 self.validate_update_target(&arg)?;
+                // `--x ** y` is a SyntaxError — must use `(--x) ** y`.
+                if self.peek_kind() == TokenKind::StarStar {
+                    return Err(Self::error_at(
+                        Self::merge_spans(start, end),
+                        "unary operator used immediately before `**`; \
+                         use parentheses to disambiguate",
+                    ));
+                }
                 return Ok(Expr::Update(Box::new(UpdateExpr {
                     loc: Self::merge_spans(start, end),
                     op: UpdateOp::Decrement,
@@ -2749,6 +2806,15 @@ impl<'src> Parser<'src> {
                 return Err(Self::error_at(
                     Self::merge_spans(start, end),
                     "deleting an unqualified identifier in strict mode is not allowed",
+                ));
+            }
+
+            // `-x ** y`, `!x ** y`, etc. are SyntaxErrors — must parenthesise.
+            if self.peek_kind() == TokenKind::StarStar {
+                return Err(Self::error_at(
+                    Self::merge_spans(start, end),
+                    "unary operator used immediately before `**`; \
+                     use parentheses to disambiguate",
                 ));
             }
 
@@ -2788,6 +2854,7 @@ impl<'src> Parser<'src> {
     fn parse_call_member(&mut self) -> StatorResult<Expr> {
         let start = self.current_span();
         let mut expr = self.parse_primary()?;
+        let mut after_optional = false;
         loop {
             match self.peek_kind() {
                 TokenKind::Dot => {
@@ -2855,6 +2922,7 @@ impl<'src> Parser<'src> {
                     }));
                 }
                 TokenKind::QuestionDot => {
+                    after_optional = true;
                     self.bump()?;
                     match self.peek_kind() {
                         TokenKind::LeftParen => {
@@ -2908,6 +2976,13 @@ impl<'src> Parser<'src> {
                     }
                 }
                 TokenKind::NoSubstitutionTemplate | TokenKind::TemplateHead => {
+                    // Tagged templates are forbidden in an optional chain
+                    // (`obj?.prop`tag`` is a SyntaxError per ES2020).
+                    if after_optional {
+                        return Err(
+                            self.error("tagged template cannot be used in an optional chain")
+                        );
+                    }
                     // Tagged template: expr`template`
                     let tpl_expr = self.parse_primary()?;
                     let quasi = match tpl_expr {
@@ -3072,7 +3147,12 @@ impl<'src> Parser<'src> {
             }
             TokenKind::LeftParen => {
                 self.bump()?;
+                // Parentheses reset the nullish-coalesce context so that
+                // `a ?? (b || c)` is allowed.
+                let saved_nc = self.in_nullish_coalesce;
+                self.in_nullish_coalesce = false;
                 let expr = self.parse_expr()?;
+                self.in_nullish_coalesce = saved_nc;
                 self.expect(TokenKind::RightParen)?;
                 Ok(expr)
             }
@@ -7511,25 +7591,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_nullish_coalesce_lower_than_or() {
-        // a || b ?? c  should parse as (a || b) ?? c
-        use crate::parser::ast::{Expr, LogicalOp};
-        let prog = parse("a || b ?? c").unwrap();
-        if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
-            if let Expr::Logical(outer) = expr.as_ref() {
-                assert_eq!(outer.op, LogicalOp::NullishCoalesce);
-                // Left side should be `a || b`
-                if let Expr::Logical(inner) = outer.left.as_ref() {
-                    assert_eq!(inner.op, LogicalOp::Or);
-                } else {
-                    panic!("expected inner || expression");
-                }
-            } else {
-                panic!("expected logical expression");
-            }
-        } else {
-            panic!("expected expression statement");
-        }
+    fn test_parse_nullish_coalesce_rejects_mixing_with_or() {
+        // `a || b ?? c` is a syntax error per ES2020.
+        let result = parse("a || b ?? c");
+        assert!(
+            result.is_err(),
+            "mixing || and ?? without parentheses should be rejected"
+        );
     }
 
     // ── Logical assignment operators ──────────────────────────────────────────
@@ -8485,6 +8553,165 @@ mod tests {
         assert!(
             result.is_err(),
             "legacy octal literals should be rejected in strict mode"
+        );
+    }
+
+    // ── Nullish coalescing / logical mixing (ES2020) ──────────────────────────
+
+    #[test]
+    fn test_nullish_rejects_or_then_nullish() {
+        // `a || b ?? c` — mixing || before ?? is forbidden.
+        assert!(
+            parse("a || b ?? c").is_err(),
+            "|| then ?? should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_nullish_rejects_nullish_then_or() {
+        // `a ?? b || c` — mixing ?? before || is forbidden.
+        assert!(
+            parse("a ?? b || c").is_err(),
+            "?? then || should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_nullish_rejects_and_then_nullish() {
+        // `a && b ?? c` — mixing && before ?? is forbidden.
+        assert!(
+            parse("a && b ?? c").is_err(),
+            "&& then ?? should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_nullish_rejects_nullish_then_and() {
+        // `a ?? b && c` — mixing ?? before && is forbidden.
+        assert!(
+            parse("a ?? b && c").is_err(),
+            "?? then && should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_nullish_allows_parenthesised_or() {
+        // `(a || b) ?? c` — parentheses make it legal.
+        assert!(parse("(a || b) ?? c").is_ok(), "(|| ) ?? should be allowed");
+    }
+
+    #[test]
+    fn test_nullish_allows_parenthesised_nullish_then_or() {
+        // `(a ?? b) || c` — parentheses make it legal.
+        assert!(parse("(a ?? b) || c").is_ok(), "(??) || should be allowed");
+    }
+
+    #[test]
+    fn test_nullish_allows_nullish_paren_or() {
+        // `a ?? (b || c)` — parentheses on the right side.
+        assert!(parse("a ?? (b || c)").is_ok(), "?? (||) should be allowed");
+    }
+
+    // ── Optional chaining + tagged template ───────────────────────────────────
+
+    #[test]
+    fn test_optional_chain_tagged_template_rejected() {
+        // `obj?.prop` followed by a tagged template is forbidden.
+        assert!(
+            parse("obj?.prop`template`").is_err(),
+            "tagged template in optional chain should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_regular_tagged_template_allowed() {
+        // `obj.prop`template`` is legal (no optional chain).
+        assert!(
+            parse("obj.prop`template`").is_ok(),
+            "tagged template without optional chain should be allowed"
+        );
+    }
+
+    // ── Exponentiation with unary operators ───────────────────────────────────
+
+    #[test]
+    fn test_exp_rejects_unary_minus() {
+        // `-2 ** 2` is ambiguous and forbidden by spec.
+        assert!(
+            parse("-2 ** 2").is_err(),
+            "-x ** y should be rejected without parentheses"
+        );
+    }
+
+    #[test]
+    fn test_exp_rejects_unary_plus() {
+        assert!(
+            parse("+2 ** 2").is_err(),
+            "+x ** y should be rejected without parentheses"
+        );
+    }
+
+    #[test]
+    fn test_exp_allows_parenthesised_unary() {
+        // `(-2) ** 2` is legal.
+        assert!(parse("(-2) ** 2").is_ok(), "(-x) ** y should be allowed");
+    }
+
+    #[test]
+    fn test_exp_rejects_not() {
+        // `!x ** 2` is also forbidden per spec.
+        assert!(parse("!x ** 2").is_err(), "!x ** y should be rejected");
+    }
+
+    #[test]
+    fn test_exp_basic() {
+        use crate::parser::ast::{BinaryOp, Expr};
+        let prog = parse("2 ** 3").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
+            if let Expr::Binary(b) = expr.as_ref() {
+                assert_eq!(b.op, BinaryOp::Exp);
+            } else {
+                panic!("expected binary ** expression");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_exp_right_associative() {
+        use crate::parser::ast::{BinaryOp, Expr};
+        // `2 ** 3 ** 4` should parse as `2 ** (3 ** 4)`.
+        let prog = parse("2 ** 3 ** 4").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
+            if let Expr::Binary(outer) = expr.as_ref() {
+                assert_eq!(outer.op, BinaryOp::Exp);
+                assert!(
+                    matches!(outer.right.as_ref(), Expr::Binary(inner) if inner.op == BinaryOp::Exp),
+                    "right side should be another ** expression"
+                );
+            } else {
+                panic!("expected binary expression");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_exp_rejects_typeof() {
+        assert!(
+            parse("typeof x ** 2").is_err(),
+            "typeof x ** y should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_exp_allows_postfix_increment() {
+        // `x++ ** 2` is legal (postfix update, not unary).
+        assert!(
+            parse("x++ ** 2").is_ok(),
+            "x++ ** y should be allowed (postfix)"
         );
     }
 }
