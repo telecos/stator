@@ -482,6 +482,11 @@ pub enum Opcode {
     /// is set to `undefined` and the accumulator is `true`.
     IteratorNext,
 
+    /// Close an iterator by calling its `.return()` method (if any).
+    /// Emitted before `break` / `return` inside `for…of` loops.
+    /// `[iterator_reg]`
+    IteratorClose,
+
     /// Copy all own enumerable properties from source to target.
     /// `[target_reg, source_reg]`
     CopyDataProperties,
@@ -832,6 +837,7 @@ impl Opcode {
             Opcode::GetIterator => &[Register, FeedbackSlot, FeedbackSlot],
             Opcode::GetAsyncIterator => &[Register, FeedbackSlot, FeedbackSlot],
             Opcode::IteratorNext => &[Register, Register],
+            Opcode::IteratorClose => &[Register],
             Opcode::CopyDataProperties => &[Register, Register],
 
             // Jumps

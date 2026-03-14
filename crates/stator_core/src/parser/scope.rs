@@ -583,6 +583,7 @@ impl Analyzer {
             }
             Pat::Rest(r) => self.hoist_pat_bindings(&r.argument, kind),
             Pat::Assign(a) => self.hoist_pat_bindings(&a.left, kind),
+            Pat::Expr(_) => {} // expression targets don't declare bindings
         }
     }
 
@@ -844,6 +845,7 @@ impl Analyzer {
             }
             Pat::Rest(r) => self.declare_pat_bindings(&r.argument, kind),
             Pat::Assign(a) => self.declare_pat_bindings(&a.left, kind),
+            Pat::Expr(_) => {} // expression targets don't declare bindings
         }
     }
 
@@ -868,6 +870,7 @@ impl Analyzer {
             }
             Pat::Rest(r) => self.exit_tdz_pat(&r.argument),
             Pat::Assign(a) => self.exit_tdz_pat(&a.left),
+            Pat::Expr(_) => {} // expression targets have no TDZ bindings
         }
     }
 
@@ -1175,6 +1178,7 @@ impl Analyzer {
                 self.visit_pat_ref(&a.left);
                 self.visit_expr(&a.right);
             }
+            Pat::Expr(e) => self.visit_expr(e),
         }
     }
 
@@ -1209,6 +1213,7 @@ impl Analyzer {
             }
             Pat::Rest(r) => self.declare_param_pat(&r.argument, scope_id),
             Pat::Assign(a) => self.declare_param_pat(&a.left, scope_id),
+            Pat::Expr(_) => {} // expression targets don't declare param bindings
         }
     }
 }

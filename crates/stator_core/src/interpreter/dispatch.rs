@@ -65,7 +65,7 @@ pub(super) type OpcodeHandler =
     fn(&mut DispatchContext, &Instruction) -> StatorResult<DispatchAction>;
 
 /// Number of opcode variants (= `Opcode::Illegal as usize + 1`).
-const OPCODE_COUNT: usize = 192;
+const OPCODE_COUNT: usize = 193;
 
 #[inline]
 fn handle_lda_zero(
@@ -1161,7 +1161,22 @@ fn handle_create_closure(
     if let Some(JsValue::Context(c)) = &ctx.frame.context {
         closure_ba.set_closure_context(Rc::clone(c));
     }
-    ctx.frame.accumulator = JsValue::Function(Rc::new(closure_ba));
+    let func_rc = Rc::new(closure_ba);
+
+    // Non-arrow functions (flag == 0) get a .prototype property per ES §10.2.5.
+    let is_arrow = matches!(instr.operands.get(2), Some(Operand::Flag(1)));
+    if !is_arrow {
+        let func_val = JsValue::Function(Rc::clone(&func_rc));
+        let mut proto = PropertyMap::new();
+        proto.insert("constructor".to_string(), func_val);
+        fn_props_set(
+            &func_rc,
+            "prototype".to_string(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        );
+    }
+
+    ctx.frame.accumulator = JsValue::Function(func_rc);
     Ok(DispatchAction::Continue)
 }
 
@@ -1720,6 +1735,48 @@ fn handle_call_property(
     Ok(DispatchAction::Continue)
 }
 
+/// Expand spread arguments for `CallWithSpread` / `ConstructWithSpread`.
+///
+/// The bytecode generator may pass spread arrays as either `JsValue::Array`
+/// (a dense `Vec`) or `JsValue::PlainObject` with the `__is_array__` marker
+/// (a sparse property-map array created by `CreateArrayLiteral`).  This
+/// function walks the raw argument list and inlines every array-typed value
+/// into the flattened output, leaving non-array values untouched.
+fn expand_spread_args(raw_args: Vec<JsValue>) -> Vec<JsValue> {
+    let mut out = Vec::new();
+    for arg in &raw_args {
+        match arg {
+            JsValue::Array(items) => {
+                out.extend(items.borrow().iter().cloned());
+            }
+            JsValue::PlainObject(map) => {
+                let map_ref = map.borrow();
+                if map_ref.get("__is_array__").is_some() {
+                    let len = match map_ref.get("length") {
+                        Some(JsValue::Smi(n)) => *n as usize,
+                        Some(JsValue::HeapNumber(n)) => *n as usize,
+                        _ => 0,
+                    };
+                    for i in 0..len {
+                        out.push(
+                            map_ref
+                                .get(&i.to_string())
+                                .cloned()
+                                .unwrap_or(JsValue::Undefined),
+                        );
+                    }
+                } else {
+                    out.push(arg.clone());
+                }
+            }
+            _ => {
+                out.push(arg.clone());
+            }
+        }
+    }
+    out
+}
+
 fn handle_call_with_spread(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -1735,17 +1792,9 @@ fn handle_call_with_spread(
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
     let raw_args = collect_args(ctx.frame, args_start_v, arg_count)?;
-    // If the bytecode generator packed all arguments into a single array,
-    // expand it into the real argument list.
-    let args = if raw_args.len() == 1 {
-        if let JsValue::Array(ref items) = raw_args[0] {
-            items.borrow().clone()
-        } else {
-            raw_args
-        }
-    } else {
-        raw_args
-    };
+    // Expand any spread arrays (JsValue::Array or PlainObject with
+    // __is_array__) into individual arguments.
+    let args = expand_spread_args(raw_args);
     match callee {
         JsValue::Function(ba) => {
             // ── Tiering ──────────────────────────────────────
@@ -1914,6 +1963,12 @@ fn handle_construct(
     let ctor_proto = proto_lookup(&ctor, "prototype");
     match ctor {
         JsValue::Function(ba) => {
+            // Arrow functions are not constructable (ES §15.3.4).
+            if ba.is_arrow() {
+                return Err(StatorError::TypeError(
+                    "Function is not a constructor".to_string(),
+                ));
+            }
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
             // [[Construct]]: create a fresh object for `this`,
             // wire its __proto__ to the constructor's prototype,
@@ -1949,7 +2004,8 @@ fn handle_construct(
         }
         JsValue::NativeFunction(f) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-            ctx.frame.accumulator = f(args)?;
+            let val = f(args)?;
+            ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
         }
         JsValue::PlainObject(ref map) => {
             let call_val = map.borrow().get("__call__").cloned();
@@ -1998,15 +2054,9 @@ fn handle_construct_with_spread(
     let ctor = ctx.frame.read_reg(ctor_v)?.clone();
     let ctor_proto = proto_lookup(&ctor, "prototype");
     let raw_args = collect_args(ctx.frame, args_start_v, arg_count)?;
-    let args = if raw_args.len() == 1 {
-        if let JsValue::Array(ref items) = raw_args[0] {
-            items.borrow().clone()
-        } else {
-            raw_args
-        }
-    } else {
-        raw_args
-    };
+    // Expand any spread arrays (JsValue::Array or PlainObject with
+    // __is_array__) into individual arguments.
+    let args = expand_spread_args(raw_args);
     match ctor {
         JsValue::Function(ba) => {
             let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
@@ -2037,7 +2087,8 @@ fn handle_construct_with_spread(
             };
         }
         JsValue::NativeFunction(f) => {
-            ctx.frame.accumulator = f(args)?;
+            let val = f(args)?;
+            ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
         }
         JsValue::PlainObject(ref map) => {
             let call_val = map.borrow().get("__call__").cloned();
@@ -2885,6 +2936,28 @@ fn handle_iterator_next(
     Ok(DispatchAction::Continue)
 }
 
+/// Close an iterator by calling its `.return()` method if it exists.
+/// Used when breaking out of for-of loops early.
+fn handle_iterator_close(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(iter_v) = instr.operands[0] else {
+        return Err(err_bad_operand("IteratorClose", 0));
+    };
+    let iter = ctx.frame.read_reg(iter_v)?.clone();
+    // Only PlainObject iterators (user-defined) can have a .return() method.
+    // NativeIterator and Generator don't need explicit closing.
+    if let JsValue::PlainObject(ref map) = iter {
+        let return_fn = map.borrow().get("return").cloned();
+        if let Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) = return_fn {
+            // Call iterator.return(undefined) — result is ignored per spec.
+            let _ = dispatch_call_with_this(f, iter.clone(), vec![JsValue::Undefined]);
+        }
+    }
+    Ok(DispatchAction::Continue)
+}
+
 /// `CopyDataProperties <target_reg> <source_reg>`
 ///
 /// Copies all own enumerable properties from the source object to the target.
@@ -2901,14 +2974,30 @@ fn handle_copy_data_properties(
     let target = ctx.frame.read_reg(target_v)?.clone();
     let source = ctx.frame.read_reg(source_v)?.clone();
 
-    if let (JsValue::PlainObject(t), JsValue::PlainObject(s)) = (&target, &source) {
-        let entries: Vec<(String, JsValue)> = s
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (k, v) in entries {
-            t.borrow_mut().insert(k, v);
+    if let JsValue::PlainObject(t) = &target {
+        match &source {
+            JsValue::PlainObject(s) => {
+                let entries: Vec<(String, JsValue)> = s
+                    .borrow()
+                    .enumerable_iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                for (k, v) in entries {
+                    t.borrow_mut().insert(k, v);
+                }
+            }
+            JsValue::Array(items) => {
+                for (i, v) in items.borrow().iter().enumerate() {
+                    t.borrow_mut().insert(i.to_string(), v.clone());
+                }
+            }
+            JsValue::String(s) => {
+                for (i, ch) in s.chars().enumerate() {
+                    t.borrow_mut()
+                        .insert(i.to_string(), JsValue::String(ch.to_string().into()));
+                }
+            }
+            _ => {}
         }
     }
     Ok(DispatchAction::Continue)
@@ -3281,7 +3370,14 @@ fn handle_to_name(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     };
     let key = match &ctx.frame.accumulator {
         JsValue::String(_) | JsValue::Symbol(_) => ctx.frame.accumulator.clone(),
-        other => JsValue::String(other.to_js_string()?.into()),
+        other => {
+            let prim = other.to_primitive(crate::objects::value::ToPrimitiveHint::String)?;
+            match prim {
+                JsValue::String(s) => JsValue::String(s),
+                JsValue::Symbol(_) => prim,
+                _ => JsValue::String(prim.to_js_string()?.into()),
+            }
+        }
     };
     ctx.frame.write_reg(dst, key)?;
     Ok(DispatchAction::Continue)
@@ -3326,8 +3422,17 @@ fn handle_create_empty_array_literal(
 ) -> StatorResult<DispatchAction> {
     // operands[0] is a FeedbackSlot, ignored at runtime.
     let mut map = PropertyMap::new();
-    map.insert("length".to_string(), JsValue::Smi(0));
-    map.insert("__is_array__".to_string(), JsValue::Boolean(true));
+    // Per ES spec, "length" is writable but not enumerable/configurable.
+    map.insert_with_attrs(
+        "length".to_string(),
+        JsValue::Smi(0),
+        PropertyAttributes::WRITABLE,
+    );
+    map.insert_with_attrs(
+        "__is_array__".to_string(),
+        JsValue::Boolean(true),
+        PropertyAttributes::empty(),
+    );
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
 }
@@ -3338,8 +3443,16 @@ fn handle_create_array_literal(
 ) -> StatorResult<DispatchAction> {
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
     let mut map = PropertyMap::new();
-    map.insert("length".to_string(), JsValue::Smi(0));
-    map.insert("__is_array__".to_string(), JsValue::Boolean(true));
+    map.insert_with_attrs(
+        "length".to_string(),
+        JsValue::Smi(0),
+        PropertyAttributes::WRITABLE,
+    );
+    map.insert_with_attrs(
+        "__is_array__".to_string(),
+        JsValue::Boolean(true),
+        PropertyAttributes::empty(),
+    );
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
 }
@@ -3416,7 +3529,16 @@ fn handle_create_array_from_iterable(
     for (i, v) in items.iter().enumerate() {
         map.insert(i.to_string(), v.clone());
     }
-    map.insert("length".to_string(), JsValue::Smi(items.len() as i32));
+    map.insert_with_attrs(
+        "length".to_string(),
+        JsValue::Smi(items.len() as i32),
+        PropertyAttributes::WRITABLE,
+    );
+    map.insert_with_attrs(
+        "__is_array__".to_string(),
+        JsValue::Boolean(true),
+        PropertyAttributes::empty(),
+    );
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
     Ok(DispatchAction::Continue)
 }
@@ -3539,9 +3661,10 @@ fn handle_create_reg_exp_literal(
                                 },
                             );
                         }
-                        props.insert(
+                        props.insert_with_attrs(
                             "length".to_string(),
                             JsValue::Smi((1 + m.captures.len()) as i32),
+                            PropertyAttributes::WRITABLE,
                         );
                         props.insert("index".to_string(), JsValue::Smi(m.index as i32));
                         props.insert("input".to_string(), JsValue::String(m.input.clone().into()));
@@ -3557,7 +3680,11 @@ fn handle_create_reg_exp_literal(
                                 JsValue::PlainObject(Rc::new(RefCell::new(groups))),
                             );
                         }
-                        props.insert("__is_array__".to_string(), JsValue::Boolean(true));
+                        props.insert_with_attrs(
+                            "__is_array__".to_string(),
+                            JsValue::Boolean(true),
+                            PropertyAttributes::empty(),
+                        );
                         Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
                     }
                     None => Ok(JsValue::Null),
@@ -3605,8 +3732,11 @@ fn handle_sta_in_array_literal(
                 _ => 0,
             };
             if new_len > cur_len {
-                map.borrow_mut()
-                    .insert("length".to_string(), JsValue::Smi(new_len));
+                map.borrow_mut().insert_with_attrs(
+                    "length".to_string(),
+                    JsValue::Smi(new_len),
+                    PropertyAttributes::WRITABLE,
+                );
             }
         }
     }
@@ -3696,9 +3826,15 @@ fn handle_test_instance_of(
     let constructor = ctx.frame.read_reg(v)?.clone();
 
     // §7.3.21 OrdinaryHasInstance — first check @@hasInstance
-    if let JsValue::PlainObject(map) = &constructor
-        && let Some(JsValue::NativeFunction(f)) = map.borrow().get("@@hasInstance").cloned()
-    {
+    let has_instance_fn = match &constructor {
+        JsValue::PlainObject(map) => map.borrow().get("@@hasInstance").cloned(),
+        JsValue::NativeFunction(_) | JsValue::Function(_) => {
+            // Check global scope for @@hasInstance on the constructor
+            None
+        }
+        _ => None,
+    };
+    if let Some(JsValue::NativeFunction(f)) = has_instance_fn {
         let result = f(vec![ctx.frame.accumulator.clone()])?;
         ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
         return Ok(DispatchAction::Continue);
@@ -3724,6 +3860,34 @@ fn handle_test_instance_of(
             ("Promise", |v| matches!(v, JsValue::Promise(_))),
             // Error hierarchy: instanceof Error matches ALL error kinds
             ("Error", |v| matches!(v, JsValue::Error(_))),
+            (
+                "RegExp",
+                |v| matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_regexp__").is_some()),
+            ),
+            (
+                "Date",
+                |v| matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_date__").is_some()),
+            ),
+            (
+                "Map",
+                |v| matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_map__").is_some()),
+            ),
+            (
+                "Set",
+                |v| matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_set__").is_some()),
+            ),
+            (
+                "WeakMap",
+                |v| matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_weakmap__").is_some()),
+            ),
+            (
+                "WeakSet",
+                |v| matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_weakset__").is_some()),
+            ),
+            (
+                "WeakRef",
+                |v| matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_weakref__").is_some()),
+            ),
         ];
         for &(name, predicate) in builtin_checks {
             if let Some(JsValue::NativeFunction(global_fn)) = global.get(name)
@@ -3762,6 +3926,14 @@ fn handle_test_instance_of(
     // Obtain the constructor's "prototype" property.
     let ctor_proto = match &constructor {
         JsValue::PlainObject(map) => map.borrow().get("prototype").cloned(),
+        JsValue::Function(_) => {
+            let v = proto_lookup(&constructor, "prototype");
+            if matches!(v, JsValue::Undefined) {
+                None
+            } else {
+                Some(v)
+            }
+        }
         _ => None,
     };
 
@@ -4084,7 +4256,12 @@ fn handle_delete_property_strict(
     let key = to_property_key(&ctx.frame.accumulator)?;
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     if let JsValue::Proxy(ref p) = obj {
-        proxy_delete_property(&mut p.borrow_mut(), &key)?;
+        let deleted = proxy_delete_property(&mut p.borrow_mut(), &key)?;
+        if !deleted {
+            return Err(StatorError::TypeError(format!(
+                "Cannot delete property '{key}'"
+            )));
+        }
     } else if let JsValue::PlainObject(ref map) = obj {
         let pm = map.borrow();
         if pm.contains_key(&key) && !pm.is_configurable(&key) {
@@ -4140,7 +4317,12 @@ fn handle_create_mapped_arguments(
     for (i, v) in args.iter().enumerate() {
         map.insert(i.to_string(), v.clone());
     }
-    map.insert("length".to_string(), JsValue::Smi(args.len() as i32));
+    // Per ES spec §10.4.4, arguments "length" is writable+configurable, not enumerable.
+    map.insert_with_attrs(
+        "length".to_string(),
+        JsValue::Smi(args.len() as i32),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
     // callee: reference to the executing function (sloppy mode only)
     map.insert(
         "callee".to_string(),
@@ -4175,8 +4357,11 @@ fn handle_create_unmapped_arguments(
     for (i, v) in args.iter().enumerate() {
         map.insert(i.to_string(), v.clone());
     }
-    map.insert("length".to_string(), JsValue::Smi(args.len() as i32));
-    // callee: throws TypeError in strict mode
+    map.insert_with_attrs(
+        "length".to_string(),
+        JsValue::Smi(args.len() as i32),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
     map.insert(
         "callee".to_string(),
         JsValue::NativeFunction(Rc::new(|_args: Vec<JsValue>| {
@@ -4637,6 +4822,14 @@ fn handle_get_template_object(
                 ))
             })?;
         let tpl_val = constant_to_value(entry);
+        // ES §12.2.9.3: The template object and its `raw` property must be frozen.
+        if let JsValue::PlainObject(ref map) = tpl_val {
+            let raw_clone = map.borrow().get("raw").cloned();
+            if let Some(JsValue::PlainObject(ref raw_map)) = raw_clone {
+                raw_map.borrow_mut().freeze();
+            }
+            map.borrow_mut().freeze();
+        }
         ctx.frame.template_cache.insert(cache_key, tpl_val.clone());
         ctx.frame.accumulator = tpl_val;
     }
@@ -4968,6 +5161,11 @@ fn handle_construct_forward_all_args(
         .to_vec();
     match ctor {
         JsValue::Function(ba) => {
+            if ba.is_arrow() {
+                return Err(StatorError::TypeError(
+                    "Function is not a constructor".to_string(),
+                ));
+            }
             let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
             if !matches!(ctor_proto, JsValue::Undefined) {
                 this_obj
@@ -4996,7 +5194,8 @@ fn handle_construct_forward_all_args(
             };
         }
         JsValue::NativeFunction(f) => {
-            ctx.frame.accumulator = f(args)?;
+            let val = f(args)?;
+            ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
         }
         JsValue::PlainObject(ref map) => {
             let call_val = map.borrow().get("__call__").cloned();
@@ -5541,6 +5740,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::GetIterator as usize] = handle_get_iterator;
     table[Opcode::GetAsyncIterator as usize] = handle_get_async_iterator;
     table[Opcode::IteratorNext as usize] = handle_iterator_next;
+    table[Opcode::IteratorClose as usize] = handle_iterator_close;
     table[Opcode::CopyDataProperties as usize] = handle_copy_data_properties;
     table[Opcode::JumpLoop as usize] = handle_jump_loop;
     table[Opcode::Jump as usize] = handle_jump;
@@ -5620,3 +5820,893 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::Illegal as usize] = handle_unimplemented;
     table
 };
+
+#[cfg(test)]
+mod tests {
+    use crate::objects::value::JsValue;
+
+    #[test]
+    fn test_typeof_generator() {
+        let result =
+            crate::builtins::global::global_eval("function* gen() { yield 1; } typeof gen()")
+                .unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn test_typeof_promise() {
+        let result =
+            crate::builtins::global::global_eval("typeof new Promise(function(r) { r(1); })")
+                .unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn test_for_in_array() {
+        let result = crate::builtins::global::global_eval(
+            "var a = [10, 20, 30]; var keys = []; for (var k in a) { keys.push(k); } keys.length",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_for_in_array_keys_are_strings() {
+        let result = crate::builtins::global::global_eval(
+            "var a = [10, 20]; var keys = []; for (var k in a) { keys.push(k); } keys[0]",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("0".into()));
+    }
+
+    #[test]
+    fn e2e_user_constructor_instanceof() {
+        let result = crate::builtins::global::global_eval(
+            "function Foo() {} var x = new Foo(); x instanceof Foo",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_function_has_prototype() {
+        let result = crate::builtins::global::global_eval(
+            "function Foo() {} typeof Foo.prototype === 'object'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_prototype_constructor_points_back() {
+        let result = crate::builtins::global::global_eval(
+            "function Foo() {} Foo.prototype.constructor === Foo",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_arrow_no_prototype() {
+        let result =
+            crate::builtins::global::global_eval("var f = () => {}; f.prototype === undefined")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_spread_skips_non_enumerable() {
+        // Array spread: should copy index keys, not length/__is_array__
+        let result = crate::builtins::global::global_eval(
+            "var a = [10, 20]; var o = {...a}; o[0] + ',' + o[1] + ',' + (o.length === undefined)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("10,20,true".into()));
+    }
+
+    #[test]
+    fn e2e_spread_string() {
+        let result =
+            crate::builtins::global::global_eval("var o = {...'hi'}; o[0] + o[1]").unwrap();
+        assert_eq!(result, JsValue::String("hi".into()));
+    }
+
+    #[test]
+    fn e2e_private_method() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo { #bar() { return 42; } test() { return this.#bar(); } } \
+             var f = new Foo(); f.test()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_private_field() {
+        let result = crate::builtins::global::global_eval(
+            "class C { #x = 10; get() { return this.#x; } } new C().get()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_private_field_write() {
+        let result = crate::builtins::global::global_eval(
+            "class C { #x = 0; set(v) { this.#x = v; } get() { return this.#x; } } \
+             var c = new C(); c.set(99); c.get()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn e2e_constructor_name() {
+        let result = crate::builtins::global::global_eval(
+            "Date.name + ',' + Map.name + ',' + Set.name + ',' + Array.name",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("Date,Map,Set,Array".into()));
+    }
+
+    #[test]
+    fn e2e_prototype_constructor() {
+        let result = crate::builtins::global::global_eval(
+            "Date.prototype.constructor === Date && \
+             Map.prototype.constructor === Map && \
+             Array.prototype.constructor === Array",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_instance_constructor() {
+        let result =
+            crate::builtins::global::global_eval("var d = new Date(); d.constructor === Date")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_arrow_not_constructable() {
+        let result = crate::builtins::global::global_eval(
+            "var f = () => {}; try { new f(); 'no error' } catch(e) { e.message }",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("Function is not a constructor".into())
+        );
+    }
+
+    #[test]
+    fn e2e_typeof_callable_object() {
+        // typeof should return "function" for callable PlainObjects (those with __call__)
+        let result = crate::builtins::global::global_eval("typeof Date").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn e2e_for_of_string() {
+        let result = crate::builtins::global::global_eval(
+            "var r = ''; for (var c of 'abc') r += c + ','; r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,b,c,".into()));
+    }
+
+    #[test]
+    fn e2e_destructure_default() {
+        let result =
+            crate::builtins::global::global_eval("var {x = 10, y = 20} = {x: 5}; x + y").unwrap();
+        assert_eq!(result, JsValue::Smi(25));
+    }
+
+    #[test]
+    fn e2e_spread_call() {
+        let result = crate::builtins::global::global_eval(
+            "function sum(a,b,c) { return a+b+c; } sum(1,2,3)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_template_literal_expr() {
+        let result =
+            crate::builtins::global::global_eval("var x = 10; `value is ${x + 5}`").unwrap();
+        assert_eq!(result, JsValue::String("value is 15".into()));
+    }
+
+    // ── typeof tests for all primitive types (ES §12.5.6) ───────────────
+
+    #[test]
+    fn e2e_typeof_undefined() {
+        let result = crate::builtins::global::global_eval("typeof undefined").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_null_is_object() {
+        let result = crate::builtins::global::global_eval("typeof null").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_boolean() {
+        let result = crate::builtins::global::global_eval("typeof true").unwrap();
+        assert_eq!(result, JsValue::String("boolean".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_number_smi() {
+        let result = crate::builtins::global::global_eval("typeof 42").unwrap();
+        assert_eq!(result, JsValue::String("number".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_number_float() {
+        let result = crate::builtins::global::global_eval("typeof 3.14").unwrap();
+        assert_eq!(result, JsValue::String("number".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_string() {
+        let result = crate::builtins::global::global_eval("typeof 'hello'").unwrap();
+        assert_eq!(result, JsValue::String("string".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_function_expr() {
+        let result =
+            crate::builtins::global::global_eval("var f = function() {}; typeof f").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_arrow_is_function() {
+        let result = crate::builtins::global::global_eval("var f = () => {}; typeof f").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_object_literal() {
+        let result = crate::builtins::global::global_eval("var o = {}; typeof o").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_array_is_object() {
+        let result = crate::builtins::global::global_eval("typeof []").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    // ── Strict equality edge cases (ES §7.2.16) ────────────────────────
+
+    #[test]
+    fn e2e_strict_eq_null_null() {
+        let result = crate::builtins::global::global_eval("null === null").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_strict_eq_undefined_undefined() {
+        let result = crate::builtins::global::global_eval("undefined === undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_strict_eq_null_undefined_is_false() {
+        // null and undefined are different types → strict equality is false
+        let result = crate::builtins::global::global_eval("null === undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_strict_not_equal_null_undefined() {
+        // Exercises TestEqualStrict + LogicalNot (the !== path)
+        let result = crate::builtins::global::global_eval("null !== undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_strict_eq_nan_is_not_nan() {
+        // IEEE 754: NaN !== NaN
+        let result = crate::builtins::global::global_eval("NaN === NaN").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_strict_not_equal_nan_nan() {
+        let result = crate::builtins::global::global_eval("NaN !== NaN").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── ToObject TypeError on null/undefined (ES §7.1.18) ──────────────
+
+    #[test]
+    fn e2e_to_object_null_throws_type_error() {
+        // `with(null)` emits the ToObject opcode, which must throw TypeError.
+        let result = crate::builtins::global::global_eval(
+            "var r; try { with(null) { r = 1; } } catch(e) { r = e.message; } r",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("Cannot convert undefined or null to object".into())
+        );
+    }
+
+    #[test]
+    fn e2e_to_object_undefined_throws_type_error() {
+        let result = crate::builtins::global::global_eval(
+            "var r; try { with(undefined) { r = 1; } } catch(e) { r = e.message; } r",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("Cannot convert undefined or null to object".into())
+        );
+    }
+
+    // ── Null / undefined identity via variables ─────────────────────────
+
+    #[test]
+    fn e2e_null_variable_strict_eq() {
+        let result = crate::builtins::global::global_eval("var x = null; x === null").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_undefined_variable_strict_eq() {
+        let result =
+            crate::builtins::global::global_eval("var x = undefined; x === undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── ToName / freeze / seal tests ────────────────────────────────────
+
+    /// Computed property key calls `[Symbol.toPrimitive]` on objects.
+    #[test]
+    fn e2e_computed_property_toprimitive() {
+        let result = crate::builtins::global::global_eval(
+            "var k = { [Symbol.toPrimitive]() { return 'x'; } }; var o = {}; o[k] = 1; o.x",
+        );
+        // If ToPrimitive is called, k becomes "x", so o.x should be 1.
+        assert!(result.is_ok());
+    }
+
+    /// Sloppy-mode property write on frozen object silently fails.
+    #[test]
+    fn e2e_frozen_object_sloppy() {
+        let result = crate::builtins::global::global_eval(
+            "var o = { x: 1 }; Object.freeze(o); o.x = 2; o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1), "frozen prop should remain 1");
+    }
+
+    /// Strict-mode property write on frozen object throws TypeError.
+    #[test]
+    fn e2e_frozen_object_strict() {
+        let result = crate::builtins::global::global_eval(
+            "'use strict'; var o = { x: 1 }; Object.freeze(o); o.x = 2;",
+        );
+        assert!(result.is_err(), "should throw TypeError");
+    }
+
+    /// Sealed object allows writes to existing writable properties.
+    #[test]
+    fn e2e_sealed_object_write_existing() {
+        let result =
+            crate::builtins::global::global_eval("var o = { x: 1 }; Object.seal(o); o.x = 2; o.x")
+                .unwrap();
+        assert_eq!(
+            result,
+            JsValue::Smi(2),
+            "sealed should allow writes to existing writable props"
+        );
+    }
+
+    /// Sealed object rejects new property addition in strict mode.
+    #[test]
+    fn e2e_sealed_object_new_prop_strict() {
+        let result = crate::builtins::global::global_eval(
+            "'use strict'; var o = { x: 1 }; Object.seal(o); o.y = 2;",
+        );
+        assert!(
+            result.is_err(),
+            "sealed should reject new property in strict"
+        );
+    }
+
+    /// Object.isFrozen returns true for frozen objects.
+    #[test]
+    fn e2e_object_is_frozen() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; Object.freeze(o); Object.isFrozen(o)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Object.isSealed returns true for sealed objects.
+    #[test]
+    fn e2e_object_is_sealed() {
+        let result =
+            crate::builtins::global::global_eval("var o = {}; Object.seal(o); Object.isSealed(o)")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// for-of break exits after first iteration.
+    #[test]
+    fn e2e_for_of_break_calls_return() {
+        let result = crate::builtins::global::global_eval(
+            "var count = 0;\
+             for (var x of [1,2,3]) { count++; break; }\
+             count",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::Smi(1),
+            "break should exit for-of after first iteration"
+        );
+    }
+
+    // ── Spread argument tests ───────────────────────────────────────────
+
+    /// `f(...[1,2,3])` should expand the array into three individual args.
+    #[test]
+    fn e2e_spread_call_basic() {
+        let result = crate::builtins::global::global_eval(
+            "function sum(a, b, c) { return a + b + c; } sum(...[1, 2, 3])",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    /// `f(0, ...[1,2], 3)` should expand mid-argument spread.
+    #[test]
+    fn e2e_spread_call_mixed_args() {
+        let result = crate::builtins::global::global_eval(
+            "function sum(a, b, c, d) { return a + b + c + d; } sum(0, ...[1, 2], 3)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    /// Spread a variable holding an array.
+    #[test]
+    fn e2e_spread_call_variable() {
+        let result = crate::builtins::global::global_eval(
+            "function sum(a, b, c) { return a + b + c; } var arr = [10, 20, 30]; sum(...arr)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(60));
+    }
+
+    /// Spread with `new` (ConstructWithSpread).
+    #[test]
+    fn e2e_spread_construct() {
+        let result = crate::builtins::global::global_eval(
+            "function Pair(a, b) { this.sum = a + b; } \
+             var p = new Pair(...[3, 7]); p.sum",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// Empty spread produces zero arguments.
+    #[test]
+    fn e2e_spread_call_empty() {
+        let result = crate::builtins::global::global_eval(
+            "function len() { return arguments.length; } len(...[])",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn e2e_typeof_null() {
+        let result = crate::builtins::global::global_eval("typeof null").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_nan_strict_equal() {
+        let result = crate::builtins::global::global_eval("NaN === NaN").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_positive_negative_zero_equal() {
+        let result = crate::builtins::global::global_eval("+0 === -0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── §1 Object literal prototype chain ───────────────────────────────
+
+    #[test]
+    fn test_object_literal_has_tostring() {
+        let result = crate::builtins::global::global_eval("({}).toString()").unwrap();
+        assert_eq!(result, JsValue::String("[object Object]".into()));
+    }
+
+    #[test]
+    fn test_object_literal_has_valueof() {
+        let result = crate::builtins::global::global_eval("typeof ({}).valueOf()").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn test_object_literal_has_hasownproperty() {
+        let result = crate::builtins::global::global_eval("({a: 1}).hasOwnProperty('a')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_object_literal_hasownproperty_missing() {
+        let result = crate::builtins::global::global_eval("({a: 1}).hasOwnProperty('b')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_object_literal_tostring_tag() {
+        // Object.prototype.toString.call(null) should classify the receiver.
+        let result = crate::builtins::global::global_eval("var o = {x: 1}; o.toString()").unwrap();
+        assert_eq!(result, JsValue::String("[object Object]".into()));
+    }
+
+    // ── §2 Property descriptor: writable / enumerable / configurable ────
+
+    #[test]
+    fn test_object_literal_property_writable() {
+        let result = crate::builtins::global::global_eval("var o = {a: 1}; o.a = 2; o.a").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_object_literal_property_enumerable() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {a: 1, b: 2}; var r = ''; for (var k in o) r += k + ','; r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,b,".into()));
+    }
+
+    #[test]
+    fn test_object_literal_property_configurable() {
+        let result =
+            crate::builtins::global::global_eval("var o = {a: 1}; delete o.a; o.a === undefined")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_object_literal_descriptor_all_true() {
+        let result = crate::builtins::global::global_eval(
+            "var d = Object.getOwnPropertyDescriptor({a: 1}, 'a'); \
+             d.writable === true && d.enumerable === true && d.configurable === true",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── §3 Frozen / sealed object store behaviour ───────────────────────
+
+    #[test]
+    fn test_frozen_object_strict_throws() {
+        let result = crate::builtins::global::global_eval(
+            "var o = Object.freeze({a: 1}); \
+             (function() { 'use strict'; try { o.a = 2; return 'no error'; } catch(e) { return e.message; } })()",
+        )
+        .unwrap();
+        match result {
+            JsValue::String(s) => assert!(
+                s.contains("read only"),
+                "Expected 'read only' in error: {s}"
+            ),
+            other => panic!("Expected string error message, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sealed_object_no_add_strict() {
+        let result = crate::builtins::global::global_eval(
+            "var o = Object.seal({a: 1}); \
+             (function() { 'use strict'; try { o.b = 2; return 'no error'; } catch(e) { return e.message; } })()",
+        )
+        .unwrap();
+        match result {
+            JsValue::String(s) => assert!(
+                s.contains("not extensible"),
+                "Expected 'not extensible' in error: {s}"
+            ),
+            other => panic!("Expected string error message, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_frozen_object_is_frozen() {
+        let result =
+            crate::builtins::global::global_eval("Object.isFrozen(Object.freeze({a: 1}))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_sealed_object_existing_prop_writable() {
+        // Sealed objects allow writing to existing writable properties.
+        let result =
+            crate::builtins::global::global_eval("var o = Object.seal({a: 1}); o.a = 99; o.a")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    // ── §4 Arguments object ─────────────────────────────────────────────
+
+    #[test]
+    fn test_arguments_length() {
+        let result = crate::builtins::global::global_eval(
+            "(function(a, b, c) { return arguments.length; })(10, 20, 30)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_arguments_indexed_access() {
+        let result = crate::builtins::global::global_eval(
+            "(function(a, b) { return arguments[0] + arguments[1]; })(3, 7)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_arguments_callee_sloppy() {
+        let result = crate::builtins::global::global_eval(
+            "(function f() { return typeof arguments.callee; })()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn test_arguments_exists_in_function() {
+        // arguments object is accessible inside regular functions
+        let result = crate::builtins::global::global_eval(
+            "(function() { return typeof arguments; })('a','b')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    // ── §5 for-in enumeration order ─────────────────────────────────────
+
+    #[test]
+    fn test_for_in_insertion_order_strings() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {b: 1, a: 2, c: 3}; var r = ''; for (var k in o) r += k + ','; r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("b,a,c,".into()));
+    }
+
+    #[test]
+    fn test_for_in_integer_indices_first() {
+        // Integer indices should come first in ascending order,
+        // then string keys in insertion order.
+        let result = crate::builtins::global::global_eval(
+            "var o = {b: 1, 2: 2, a: 3, 0: 4}; var r = ''; for (var k in o) r += k + ','; r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("0,2,b,a,".into()));
+    }
+
+    #[test]
+    fn test_for_in_skips_nonenumerable() {
+        // Object.freeze does not change enumerability, so all keys should still appear.
+        let result = crate::builtins::global::global_eval(
+            "var o = Object.freeze({x: 1, y: 2}); var r = ''; for (var k in o) r += k + ','; r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("x,y,".into()));
+    }
+
+    // ── §6 Template object frozen ───────────────────────────────────────
+
+    #[test]
+    fn test_template_object_is_frozen() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strs) { return Object.isFrozen(strs); } tag`hello`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_template_object_raw_is_frozen() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strs) { return Object.isFrozen(strs.raw); } tag`hello`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_template_object_has_raw() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strs) { return strs.raw !== undefined; } tag`hello`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_template_object_length() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strs) { return strs.length; } tag`a${1}b`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    // ── §7 Conformance round-21 ─────────────────────────────────────────
+
+    /// `typeof null` → "object"
+    #[test]
+    fn test_typeof_null_is_object() {
+        let result = crate::builtins::global::global_eval("typeof null").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    /// Template literal basic string
+    #[test]
+    fn test_template_literal_basic() {
+        let result = crate::builtins::global::global_eval("`hello world`").unwrap();
+        assert_eq!(result, JsValue::String("hello world".into()));
+    }
+
+    /// Template literal with expression
+    #[test]
+    fn test_template_literal_expression() {
+        let result = crate::builtins::global::global_eval("var x = 42; `value is ${x}`").unwrap();
+        assert_eq!(result, JsValue::String("value is 42".into()));
+    }
+
+    /// Spread in array literal
+    #[test]
+    fn test_spread_in_array_literal() {
+        let result =
+            crate::builtins::global::global_eval("var a = [1,2,3]; [...a].length").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// Object spread
+    #[test]
+    fn test_object_spread() {
+        let result =
+            crate::builtins::global::global_eval("var a = {x:1}; var b = {...a, y:2}; b.x + b.y")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// Nullish coalescing
+    #[test]
+    fn test_nullish_coalescing_null() {
+        let result = crate::builtins::global::global_eval("null ?? 42").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Nullish coalescing with non-null
+    #[test]
+    fn test_nullish_coalescing_zero() {
+        let result = crate::builtins::global::global_eval("0 ?? 42").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// Optional chaining with null
+    #[test]
+    fn test_optional_chaining_null() {
+        let result = crate::builtins::global::global_eval("var obj = null; obj?.x").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// Optional chaining with value
+    #[test]
+    fn test_optional_chaining_value() {
+        let result = crate::builtins::global::global_eval("var obj = {x: 10}; obj?.x").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// Logical assignment ||=
+    #[test]
+    fn test_logical_or_assignment() {
+        let result = crate::builtins::global::global_eval("var x = 0; x ||= 5; x").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// Logical assignment &&=
+    #[test]
+    fn test_logical_and_assignment() {
+        let result = crate::builtins::global::global_eval("var x = 1; x &&= 5; x").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// Logical assignment ??=
+    #[test]
+    fn test_nullish_assignment() {
+        let result = crate::builtins::global::global_eval("var x = null; x ??= 5; x").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// Exponentiation operator
+    #[test]
+    fn test_exponentiation() {
+        let result = crate::builtins::global::global_eval("2 ** 10").unwrap();
+        assert_eq!(result, JsValue::Smi(1024));
+    }
+
+    /// Destructuring with default values
+    #[test]
+    fn test_destructuring_default() {
+        let result = crate::builtins::global::global_eval("var {x = 10} = {}; x").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// Array destructuring
+    #[test]
+    fn test_array_destructuring_basic() {
+        let result = crate::builtins::global::global_eval("var [a, b] = [1, 2]; a + b").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// Computed property names
+    #[test]
+    fn test_computed_property_name() {
+        let result =
+            crate::builtins::global::global_eval("var key = 'x'; var obj = {[key]: 42}; obj.x")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// for...of with array
+    #[test]
+    fn test_for_of_array_sum() {
+        let result = crate::builtins::global::global_eval(
+            "var sum = 0; for (var x of [1,2,3]) { sum += x; } sum",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    /// Generator basic
+    #[test]
+    fn test_generator_basic_next() {
+        let result = crate::builtins::global::global_eval(
+            "function* gen() { yield 1; yield 2; } var g = gen(); g.next().value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// Promise.resolve returns object
+    #[test]
+    fn test_promise_resolve_type() {
+        let result = crate::builtins::global::global_eval("typeof Promise.resolve(42)").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    /// Class basic
+    #[test]
+    fn test_class_basic_method() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo { bar() { return 42; } } new Foo().bar()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+}

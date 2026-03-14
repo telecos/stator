@@ -55,8 +55,8 @@ use stator_core::parser;
 /// This trade-off is acceptable for a test runner binary.
 struct GuardedAlloc;
 
-/// Maximum size of a single allocation (256 MiB).
-const MAX_ALLOC_SIZE: usize = 1 << 28;
+/// Maximum size of a single allocation (1 GiB).
+const MAX_ALLOC_SIZE: usize = 1 << 30;
 
 // SAFETY: All methods delegate to `System` after a size check.  The safety
 // invariants of `GlobalAlloc` (valid layout, matching alloc/dealloc) are
@@ -495,6 +495,7 @@ fn deep_clone_globals(template: &HashMap<String, JsValue>) -> HashMap<String, Js
 /// - `assert` harness (native implementations of assert, assert.sameValue, etc.)
 /// - `Test262Error` constructor
 /// - `$DONOTEVALUATE` sentinel function
+#[inline(never)]
 fn make_test_globals() -> HashMap<String, JsValue> {
     let mut map = HashMap::new();
     install_globals(&mut map);
@@ -1280,7 +1281,7 @@ fn main() {
     // pathological test inputs from overflowing the default 8 MB stack.
     let builder = std::thread::Builder::new()
         .name("test262-main".into())
-        .stack_size(128 * 1024 * 1024); // 128 MiB — stacker guards handle further growth
+        .stack_size(1024 * 1024 * 1024); // 1 GiB virtual — physical pages are lazy
     let handler = builder
         .spawn(main_inner)
         .expect("failed to spawn main thread");

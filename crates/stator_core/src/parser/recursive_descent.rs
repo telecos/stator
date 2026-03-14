@@ -1200,6 +1200,9 @@ impl<'src> Parser<'src> {
         let start = self.current_span();
         self.expect(TokenKind::LeftBrace)?;
         self.class_depth += 1;
+        // Class bodies are always strict (ES2015 §10.2.1).
+        let outer_strict = self.strict_mode;
+        self.strict_mode = true;
         let mut members = Vec::new();
 
         while self.peek_kind() != TokenKind::RightBrace {
@@ -1306,6 +1309,8 @@ impl<'src> Parser<'src> {
                 let fn_start = self.current_span();
                 self.expect(TokenKind::LeftParen)?;
                 let params = self.parse_formal_params()?;
+                // Class bodies are always strict — reject duplicate params.
+                self.check_strict_duplicate_params(&params)?;
                 let outer_fn = self.function_depth;
                 let outer_it = self.iteration_depth;
                 let outer_br = self.breakable_depth;
@@ -1326,7 +1331,7 @@ impl<'src> Parser<'src> {
                     is_generator,
                     params,
                     body,
-                    is_strict: false,
+                    is_strict: true,
                 };
 
                 members.push(ClassMember::Method(MethodDef {
@@ -1364,6 +1369,7 @@ impl<'src> Parser<'src> {
         }
 
         self.class_depth -= 1;
+        self.strict_mode = outer_strict;
         let end = self.current_span();
         self.bump()?; // consume '}'
         Ok(ClassBody {
@@ -1895,6 +1901,24 @@ impl<'src> Parser<'src> {
         Ok(())
     }
 
+    /// Arrow functions, methods, getters, and setters always use
+    /// `UniqueFormalParameters` — duplicate simple names are a `SyntaxError`
+    /// regardless of strict mode.
+    fn check_unique_params(&self, params: &[Param]) -> StatorResult<()> {
+        let mut seen = std::collections::HashSet::new();
+        for param in params {
+            if let Pat::Ident(id) = &param.pat
+                && !seen.insert(&id.name)
+            {
+                return Err(self.error(&format!(
+                    "duplicate parameter name '{}' not allowed",
+                    id.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Returns `true` if `params` contains any non-simple parameter
     /// (destructuring, default value, or rest element).
     fn has_non_simple_params(params: &[Param]) -> bool {
@@ -2393,6 +2417,7 @@ impl<'src> Parser<'src> {
                     .into_iter()
                     .map(|e| self.expr_to_single_param(e))
                     .collect::<StatorResult<Vec<_>>>()?;
+                self.check_unique_params(&params)?;
                 let body = self.parse_arrow_body()?;
                 let end = self.arrow_body_loc(&body);
                 return Ok(Expr::Arrow(Box::new(ArrowExpr {
@@ -2405,6 +2430,7 @@ impl<'src> Parser<'src> {
             }
 
             let params = self.expr_to_arrow_params(lhs)?;
+            self.check_unique_params(&params)?;
             let body = self.parse_arrow_body()?;
             let end = self.arrow_body_loc(&body);
             return Ok(Expr::Arrow(Box::new(ArrowExpr {
@@ -2828,6 +2854,59 @@ impl<'src> Parser<'src> {
                         arguments: args,
                     }));
                 }
+                TokenKind::QuestionDot => {
+                    self.bump()?;
+                    match self.peek_kind() {
+                        TokenKind::LeftParen => {
+                            // `callee?.(args)`
+                            self.bump()?;
+                            let args = self.parse_call_args()?;
+                            let end = self.current_span();
+                            expr = Expr::OptionalCall(Box::new(
+                                crate::parser::ast::OptionalCallExpr {
+                                    loc: Self::merge_spans(start, end),
+                                    callee: Box::new(expr),
+                                    arguments: args,
+                                },
+                            ));
+                        }
+                        TokenKind::LeftBracket => {
+                            // `object?.[expr]`
+                            self.bump()?;
+                            let prop = self.parse_expr()?;
+                            let end = self.current_span();
+                            self.expect(TokenKind::RightBracket)?;
+                            expr = Expr::OptionalMember(Box::new(
+                                crate::parser::ast::OptionalMemberExpr {
+                                    loc: Self::merge_spans(start, end),
+                                    object: Box::new(expr),
+                                    property: crate::parser::ast::MemberProp::Computed(Box::new(
+                                        prop,
+                                    )),
+                                    is_computed: true,
+                                },
+                            ));
+                        }
+                        _ => {
+                            // `object?.property`
+                            let prop_tok = self.bump()?;
+                            let name = self.name_from_token(&prop_tok)?;
+                            let prop_ident = Ident {
+                                loc: prop_tok.span,
+                                name,
+                            };
+                            let end = prop_tok.span;
+                            expr = Expr::OptionalMember(Box::new(
+                                crate::parser::ast::OptionalMemberExpr {
+                                    loc: Self::merge_spans(start, end),
+                                    object: Box::new(expr),
+                                    property: crate::parser::ast::MemberProp::Ident(prop_ident),
+                                    is_computed: false,
+                                },
+                            ));
+                        }
+                    }
+                }
                 TokenKind::NoSubstitutionTemplate | TokenKind::TemplateHead => {
                     // Tagged template: expr`template`
                     let tpl_expr = self.parse_primary()?;
@@ -3207,6 +3286,8 @@ impl<'src> Parser<'src> {
                             let fn_start = self.current_span();
                             self.expect(TokenKind::LeftParen)?;
                             let params = self.parse_formal_params()?;
+                            // Accessors always use UniqueFormalParameters.
+                            self.check_unique_params(&params)?;
                             let outer_fn = self.function_depth;
                             let outer_it = self.iteration_depth;
                             let outer_br = self.breakable_depth;
@@ -3242,6 +3323,8 @@ impl<'src> Parser<'src> {
                             let fn_start = self.current_span();
                             self.expect(TokenKind::LeftParen)?;
                             let params = self.parse_formal_params()?;
+                            // Method definitions always use UniqueFormalParameters.
+                            self.check_unique_params(&params)?;
                             let outer_fn = self.function_depth;
                             let outer_it = self.iteration_depth;
                             let outer_br = self.breakable_depth;
@@ -3834,11 +3917,14 @@ impl<'src> Parser<'src> {
     fn expr_to_arrow_params(&self, expr: Expr) -> StatorResult<Vec<Param>> {
         match expr {
             // `x => body`  or  `(x) => body`
-            Expr::Ident(id) => Ok(vec![Param {
-                loc: id.loc,
-                pat: Pat::Ident(id),
-                default: None,
-            }]),
+            Expr::Ident(id) => {
+                self.check_strict_binding_ident(&id.name, id.loc)?;
+                Ok(vec![Param {
+                    loc: id.loc,
+                    pat: Pat::Ident(id),
+                    default: None,
+                }])
+            }
             // `(x, y) => body`
             Expr::Sequence(seq) => seq
                 .expressions
@@ -3891,11 +3977,14 @@ impl<'src> Parser<'src> {
     /// Convert a single expression to a single parameter.
     fn expr_to_single_param(&self, expr: Expr) -> StatorResult<Param> {
         match expr {
-            Expr::Ident(id) => Ok(Param {
-                loc: id.loc,
-                pat: Pat::Ident(id),
-                default: None,
-            }),
+            Expr::Ident(id) => {
+                self.check_strict_binding_ident(&id.name, id.loc)?;
+                Ok(Param {
+                    loc: id.loc,
+                    pat: Pat::Ident(id),
+                    default: None,
+                })
+            }
             Expr::Assign(assign) if assign.op == AssignOp::Assign => {
                 self.assign_expr_to_param(*assign)
             }
@@ -4050,8 +4139,9 @@ impl<'src> Parser<'src> {
             }
 
             // Member expressions are valid assignment targets in
-            // destructuring, but our Pat enum has no Member variant.
-            // Return an error for now; a future change could add one.
+            // destructuring — wrap them as Pat::Expr.
+            expr @ Expr::Member(_) => Ok(Pat::Expr(Box::new(expr))),
+
             other => {
                 let loc = other.loc();
                 Err(Self::error_at(loc, "invalid destructuring target"))
@@ -4809,7 +4899,7 @@ mod tests {
 
     // ── Arrow function tests ─────────────────────────────────────────────
 
-    use crate::parser::ast::{ArrowBody, ArrowExpr};
+    use crate::parser::ast::ArrowBody;
 
     /// Helper: parse an expression statement and return the inner `Expr`.
     fn parse_expr_stmt(src: &str) -> Expr {
@@ -6057,9 +6147,7 @@ mod tests {
     // ── Import declaration tests ─────────────────────────────────────────
 
     use crate::parser::ast::{
-        ExportDefaultDecl, ExportDefaultExpr, ExportNamedDecl, ExportSpecifier, ImportDecl,
-        ImportDefaultSpecifier, ImportNamedSpecifier, ImportNamespaceSpecifier, ImportSpecifier,
-        ModuleDecl, ModuleExportName, SourceType,
+        ExportDefaultExpr, ImportSpecifier, ModuleDecl, ModuleExportName, SourceType,
     };
 
     #[test]
@@ -7271,7 +7359,7 @@ mod tests {
         let prog = parse("function* g() { yield* other(); }").unwrap();
         if let ProgramItem::Stmt(Stmt::FnDecl(f)) = &prog.body[0] {
             assert!(f.is_generator);
-            if let Stmt::Expr(ref es) = f.body.body[0] {
+            if let Stmt::Expr(es) = &f.body.body[0] {
                 if let Expr::Yield(y) = es.expr.as_ref() {
                     assert!(y.delegate, "should be yield* delegation");
                     assert!(y.argument.is_some());
@@ -7639,5 +7727,764 @@ mod tests {
         } else {
             panic!("expected FnDecl");
         }
+    }
+
+    // ── Duplicate parameter names ────────────────────────────────────────
+
+    #[test]
+    fn test_strict_duplicate_params_error() {
+        let result = parse("'use strict'; function f(a, a) {}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_duplicate_params_fn_body_directive() {
+        let result = parse("function f(a, a) { 'use strict'; }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sloppy_duplicate_params_ok() {
+        let result = parse("function f(a, a) {}");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_duplicate_params_fn_expr() {
+        let result = parse("'use strict'; var f = function(a, a) {};");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_arrow_duplicate_params_error() {
+        // Arrow functions always reject duplicate params.
+        let result = parse("(a, a) => {}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_arrow_unique_params_ok() {
+        let result = parse("(a, b) => {}");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_class_method_duplicate_params_error() {
+        // Class bodies are always strict.
+        let result = parse("class C { m(a, a) {} }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_object_method_duplicate_params_error() {
+        let result = parse("({ m(a, a) {} })");
+        assert!(result.is_err());
+    }
+
+    // ── Assignment to eval/arguments in strict mode ──────────────────────
+
+    #[test]
+    fn test_strict_assign_eval_error() {
+        let result = parse("'use strict'; eval = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_assign_arguments_error() {
+        let result = parse("'use strict'; arguments = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sloppy_assign_eval_ok() {
+        let result = parse("eval = 1;");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_sloppy_assign_arguments_ok() {
+        let result = parse("arguments = 1;");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_prefix_increment_eval_error() {
+        let result = parse("'use strict'; ++eval;");
+        assert!(result.is_err());
+    }
+
+    // ── Octal literals in strict mode ────────────────────────────────────
+
+    #[test]
+    fn test_strict_octal_literal_error() {
+        let result = parse("'use strict'; var x = 010;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sloppy_octal_literal_ok() {
+        let result = parse("var x = 010;");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_octal_escape_in_string_error() {
+        let result = parse("'use strict'; var x = '\\012';");
+        assert!(result.is_err());
+    }
+
+    // ── Delete of unqualified identifier in strict mode ──────────────────
+
+    #[test]
+    fn test_strict_delete_identifier_error() {
+        let result = parse("'use strict'; delete x;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sloppy_delete_identifier_ok() {
+        let result = parse("delete x;");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_delete_member_ok() {
+        // Deleting a member expression is fine even in strict mode.
+        let result = parse("'use strict'; delete obj.x;");
+        assert!(result.is_ok());
+    }
+
+    // ── With statement in strict mode ────────────────────────────────────
+
+    #[test]
+    fn test_sloppy_with_ok() {
+        let result = parse("with (obj) { x; }");
+        assert!(result.is_ok());
+    }
+
+    // (test_strict_mode_with_statement_error already exists above)
+
+    // ── Duplicate __proto__ in object literal ────────────────────────────
+
+    #[test]
+    fn test_duplicate_proto_error() {
+        let result = parse("({__proto__: null, __proto__: null})");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_single_proto_ok() {
+        let result = parse("({__proto__: null})");
+        assert!(result.is_ok());
+    }
+
+    // ── const without initializer ────────────────────────────────────────
+
+    #[test]
+    fn test_const_no_init_error() {
+        let result = parse("const x;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_const_with_init_ok() {
+        let result = parse("const x = 1;");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_let_no_init_ok() {
+        let result = parse("let x;");
+        assert!(result.is_ok());
+    }
+
+    // ── Class body is always strict ──────────────────────────────────────
+
+    #[test]
+    fn test_class_body_rejects_octal() {
+        let result = parse("class C { m() { var x = 010; } }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_class_body_rejects_with() {
+        let result = parse("class C { m() { with (obj) {} } }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_class_body_rejects_delete_ident() {
+        let result = parse("class C { m() { delete x; } }");
+        assert!(result.is_err());
+    }
+
+    // ── Strict-mode eval/arguments as let/const binding ──────────────────
+
+    #[test]
+    fn test_strict_eval_binding_error() {
+        let result = parse("'use strict'; let eval = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_arguments_binding_error() {
+        let result = parse("'use strict'; let arguments = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_const_eval_binding_error() {
+        let result = parse("'use strict'; const eval = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_const_arguments_binding_error() {
+        let result = parse("'use strict'; const arguments = 1;");
+        assert!(result.is_err());
+    }
+
+    // ── Strict-mode eval/arguments as parameter names ────────────────────
+
+    #[test]
+    fn test_strict_fn_param_eval_error() {
+        let result = parse("'use strict'; function f(eval) {}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_fn_param_arguments_error() {
+        let result = parse("'use strict'; function f(arguments) {}");
+        assert!(result.is_err());
+    }
+
+    // ── Strict-mode eval/arguments as function names ─────────────────────
+
+    #[test]
+    fn test_strict_fn_name_eval_error() {
+        let result = parse("'use strict'; function eval() {}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_fn_name_arguments_error() {
+        let result = parse("'use strict'; function arguments() {}");
+        assert!(result.is_err());
+    }
+
+    // ── Strict-mode eval/arguments in arrow function params ──────────────
+
+    #[test]
+    fn test_strict_arrow_param_eval_error() {
+        let result = parse("'use strict'; (eval) => {};");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_arrow_param_arguments_error() {
+        let result = parse("'use strict'; (arguments) => {};");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_arrow_bare_eval_error() {
+        let result = parse("'use strict'; eval => {};");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_arrow_bare_arguments_error() {
+        let result = parse("'use strict'; arguments => {};");
+        assert!(result.is_err());
+    }
+
+    // ── Strict-mode with statement (single-quote directive) ──────────────
+
+    #[test]
+    fn test_strict_with_statement_error() {
+        let result = parse("'use strict'; with(obj) {}");
+        assert!(result.is_err());
+    }
+
+    // ── Strict-mode delete with preceding decl ───────────────────────────
+
+    #[test]
+    fn test_strict_delete_identifier_with_decl_error() {
+        let result = parse("'use strict'; var x = 1; delete x;");
+        assert!(result.is_err());
+    }
+
+    // ── Optional chaining ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_optional_member() {
+        let prog = parse("obj?.prop").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            assert!(matches!(es.expr.as_ref(), Expr::OptionalMember(_)));
+        } else {
+            panic!("expected OptionalMember expression");
+        }
+    }
+
+    #[test]
+    fn test_parse_optional_member_computed() {
+        let prog = parse("obj?.[0]").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::OptionalMember(m) = es.expr.as_ref() {
+                assert!(m.is_computed);
+            } else {
+                panic!("expected OptionalMember");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_optional_call() {
+        let prog = parse("fn?.()").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            assert!(matches!(es.expr.as_ref(), Expr::OptionalCall(_)));
+        } else {
+            panic!("expected OptionalCall expression");
+        }
+    }
+
+    #[test]
+    fn test_parse_optional_chain_chained() {
+        // a?.b?.c should parse as OptionalMember(OptionalMember(a, b), c)
+        let prog = parse("a?.b?.c").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::OptionalMember(outer) = es.expr.as_ref() {
+                assert!(matches!(outer.object.as_ref(), Expr::OptionalMember(_)));
+            } else {
+                panic!("expected nested OptionalMember");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    // ── Optional chaining (additional) ──────────────────────────────────────────
+
+    #[test]
+    fn test_parse_optional_member_then_call() {
+        // obj?.method() → Call(OptionalMember(obj, "method"), [])
+        let prog = parse("obj?.method()").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::Call(call) = es.expr.as_ref() {
+                assert!(
+                    matches!(call.callee.as_ref(), Expr::OptionalMember(_)),
+                    "callee should be OptionalMember"
+                );
+                assert!(call.arguments.is_empty());
+            } else {
+                panic!("expected Call expression, got {:?}", es.expr);
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_optional_member_then_call_with_args() {
+        // obj?.method(1, 2) → Call(OptionalMember(obj, "method"), [1, 2])
+        let prog = parse("obj?.method(1, 2)").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::Call(call) = es.expr.as_ref() {
+                if let Expr::OptionalMember(m) = call.callee.as_ref() {
+                    assert!(!m.is_computed);
+                    if let crate::parser::ast::MemberProp::Ident(id) = &m.property {
+                        assert_eq!(id.name, "method");
+                    } else {
+                        panic!("expected Ident property");
+                    }
+                } else {
+                    panic!("expected OptionalMember callee");
+                }
+                assert_eq!(call.arguments.len(), 2);
+            } else {
+                panic!("expected Call expression");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_optional_call_with_args() {
+        // fn?.(1, 2) → OptionalCall(fn, [1, 2])
+        let prog = parse("fn?.(1, 2)").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::OptionalCall(oc) = es.expr.as_ref() {
+                assert_eq!(oc.arguments.len(), 2);
+            } else {
+                panic!("expected OptionalCall expression");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_optional_computed_member_string_key() {
+        // obj?.["key"] → OptionalMember(obj, "key", computed=true)
+        let prog = parse(r#"obj?.["key"]"#).unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::OptionalMember(m) = es.expr.as_ref() {
+                assert!(m.is_computed);
+            } else {
+                panic!("expected OptionalMember");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    // ── For-of with destructuring (additional) ──────────────────────────────────
+
+    #[test]
+    fn test_for_of_object_destructuring() {
+        let prog = parse("for (let {x, y} of arr) {}").unwrap();
+        if let ProgramItem::Stmt(Stmt::ForOf(fo)) = &prog.body[0] {
+            if let crate::parser::ast::ForInOfLeft::VarDecl(vd) = &fo.left {
+                assert_eq!(vd.kind, VarKind::Let);
+                assert!(matches!(&vd.declarators[0].id, Pat::Object(_)));
+            } else {
+                panic!("expected VarDecl left");
+            }
+        } else {
+            panic!("expected ForOf, got {:?}", prog.body[0]);
+        }
+    }
+
+    #[test]
+    fn test_for_of_const_item() {
+        let prog = parse("for (const item of arr) { item; }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ForOf(fo)) = &prog.body[0] {
+            assert!(!fo.is_await);
+            if let crate::parser::ast::ForInOfLeft::VarDecl(vd) = &fo.left {
+                assert_eq!(vd.kind, VarKind::Const);
+                if let Pat::Ident(id) = &vd.declarators[0].id {
+                    assert_eq!(id.name, "item");
+                } else {
+                    panic!("expected Ident pattern");
+                }
+            } else {
+                panic!("expected VarDecl left");
+            }
+        } else {
+            panic!("expected ForOf");
+        }
+    }
+
+    #[test]
+    fn test_for_of_array_destructuring_detailed() {
+        // Verify the destructuring pattern structure
+        let prog = parse("for (let [a, b] of arr) {}").unwrap();
+        if let ProgramItem::Stmt(Stmt::ForOf(fo)) = &prog.body[0] {
+            if let crate::parser::ast::ForInOfLeft::VarDecl(vd) = &fo.left {
+                assert_eq!(vd.kind, VarKind::Let);
+                if let Pat::Array(ap) = &vd.declarators[0].id {
+                    assert_eq!(ap.elements.len(), 2);
+                } else {
+                    panic!("expected Array pattern");
+                }
+            } else {
+                panic!("expected VarDecl left");
+            }
+        } else {
+            panic!("expected ForOf");
+        }
+    }
+
+    // ── Class features (additional) ─────────────────────────────────────────────
+
+    #[test]
+    fn test_class_extends_with_super_call() {
+        let prog = parse("class Foo extends Bar { constructor() { super(); } }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.id.as_ref().unwrap().name, "Foo");
+            assert!(c.super_class.is_some());
+            if let Expr::Ident(sc) = c.super_class.as_deref().unwrap() {
+                assert_eq!(sc.name, "Bar");
+            } else {
+                panic!("expected Ident super class");
+            }
+            assert_eq!(c.body.body.len(), 1);
+            if let ClassMember::Method(m) = &c.body.body[0] {
+                assert_eq!(m.kind, MethodKind::Constructor);
+                // The body should contain `super()` as a call expression
+                assert!(!m.value.body.body.is_empty());
+                if let Stmt::Expr(es) = &m.value.body.body[0] {
+                    assert!(
+                        matches!(es.expr.as_ref(), Expr::Call(_)),
+                        "expected super() call"
+                    );
+                } else {
+                    panic!("expected ExprStmt in constructor body");
+                }
+            } else {
+                panic!("expected Method (constructor)");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_private_field_with_method_access() {
+        let prog = parse("class Foo { #private = 0; method() { return this.#private; } }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 2);
+            // First member: private field #private = 0
+            if let ClassMember::Property(p) = &c.body.body[0] {
+                assert!(matches!(&p.key, PropKey::Private(_)));
+                assert!(p.value.is_some());
+            } else {
+                panic!("expected Property for #private");
+            }
+            // Second member: method()
+            if let ClassMember::Method(m) = &c.body.body[1] {
+                assert_eq!(m.kind, MethodKind::Method);
+                if let PropKey::Ident(id) = &m.key {
+                    assert_eq!(id.name, "method");
+                } else {
+                    panic!("expected Ident key for method");
+                }
+            } else {
+                panic!("expected Method");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_static_method_detailed() {
+        let prog = parse("class Foo { static method() {} }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 1);
+            if let ClassMember::Method(m) = &c.body.body[0] {
+                assert!(m.is_static);
+                assert_eq!(m.kind, MethodKind::Method);
+                if let PropKey::Ident(id) = &m.key {
+                    assert_eq!(id.name, "method");
+                } else {
+                    panic!("expected Ident key");
+                }
+            } else {
+                panic!("expected Method");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_getter_setter_detailed() {
+        let prog = parse("class Foo { get prop() { return 1; } set prop(v) {} }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 2);
+            if let ClassMember::Method(getter) = &c.body.body[0] {
+                assert_eq!(getter.kind, MethodKind::Get);
+                assert!(getter.value.params.is_empty());
+            } else {
+                panic!("expected getter Method");
+            }
+            if let ClassMember::Method(setter) = &c.body.body[1] {
+                assert_eq!(setter.kind, MethodKind::Set);
+                assert_eq!(setter.value.params.len(), 1);
+            } else {
+                panic!("expected setter Method");
+            }
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    // ── Generator functions (additional) ────────────────────────────────────────
+
+    #[test]
+    fn test_generator_function_multiple_yields() {
+        let prog = parse("function* gen() { yield 1; yield 2; }").unwrap();
+        if let ProgramItem::Stmt(Stmt::FnDecl(f)) = &prog.body[0] {
+            assert!(f.is_generator, "should be generator");
+            assert!(!f.is_async, "should not be async");
+            assert_eq!(f.id.as_ref().unwrap().name, "gen");
+            assert_eq!(f.body.body.len(), 2);
+            // Both statements should be yield expressions
+            for stmt in &f.body.body {
+                if let Stmt::Expr(es) = stmt {
+                    if let Expr::Yield(y) = es.expr.as_ref() {
+                        assert!(!y.delegate, "should not be yield*");
+                        assert!(y.argument.is_some());
+                    } else {
+                        panic!("expected YieldExpr");
+                    }
+                } else {
+                    panic!("expected ExprStmt");
+                }
+            }
+        } else {
+            panic!("expected generator FnDecl");
+        }
+    }
+
+    #[test]
+    fn test_generator_yield_star_array() {
+        let prog = parse("function* gen() { yield* [1, 2]; }").unwrap();
+        if let ProgramItem::Stmt(Stmt::FnDecl(f)) = &prog.body[0] {
+            assert!(f.is_generator);
+            if let Stmt::Expr(es) = &f.body.body[0] {
+                if let Expr::Yield(y) = es.expr.as_ref() {
+                    assert!(y.delegate, "should be yield* delegation");
+                    assert!(
+                        matches!(y.argument.as_deref(), Some(Expr::Array(_))),
+                        "argument should be array literal"
+                    );
+                } else {
+                    panic!("expected YieldExpr");
+                }
+            } else {
+                panic!("expected ExprStmt");
+            }
+        } else {
+            panic!("expected generator FnDecl");
+        }
+    }
+
+    #[test]
+    fn test_generator_expression() {
+        let prog = parse("var g = function*() { yield 42; };").unwrap();
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(Expr::Fn(fe)) = vd.declarators[0].init.as_deref() {
+                assert!(fe.is_generator, "should be generator");
+                assert!(!fe.is_async);
+            } else {
+                panic!("expected generator function expression");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    // ── Async functions (additional) ────────────────────────────────────────────
+
+    #[test]
+    fn test_async_arrow_with_await() {
+        let prog = parse("var f = async () => await bar();").unwrap();
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            if let Some(Expr::Arrow(arrow)) = vd.declarators[0].init.as_deref() {
+                assert!(arrow.is_async, "should be async");
+                if let ArrowBody::Expr(body_expr) = &arrow.body {
+                    assert!(
+                        matches!(body_expr.as_ref(), Expr::Await(_)),
+                        "body should be Await expression"
+                    );
+                } else {
+                    panic!("expected expression body");
+                }
+            } else {
+                panic!("expected async arrow expression");
+            }
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_async_function_with_await_call() {
+        let prog = parse("async function foo() { await bar(); }").unwrap();
+        if let ProgramItem::Stmt(Stmt::FnDecl(fd)) = &prog.body[0] {
+            assert!(fd.is_async);
+            assert!(!fd.is_generator);
+            assert_eq!(fd.id.as_ref().unwrap().name, "foo");
+            if let Stmt::Expr(es) = &fd.body.body[0] {
+                if let Expr::Await(aw) = es.expr.as_ref() {
+                    assert!(
+                        matches!(aw.argument.as_ref(), Expr::Call(_)),
+                        "await argument should be a call"
+                    );
+                } else {
+                    panic!("expected Await expression");
+                }
+            } else {
+                panic!("expected ExprStmt");
+            }
+        } else {
+            panic!("expected async FnDecl");
+        }
+    }
+
+    // ── Nullish coalescing ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_nullish_coalescing() {
+        let prog = parse("a ?? b").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::Logical(l) = es.expr.as_ref() {
+                assert!(matches!(
+                    l.op,
+                    crate::parser::ast::LogicalOp::NullishCoalesce
+                ));
+            } else {
+                panic!("expected Logical expression");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    // ── Strict-mode rejection tests (single-quote directive) ─────────────
+
+    #[test]
+    fn test_strict_with_rejected() {
+        let src = "'use strict'; with ({}) {}";
+        let result = parse(src);
+        assert!(
+            result.is_err(),
+            "with statement should be rejected in strict mode"
+        );
+    }
+
+    #[test]
+    fn test_strict_delete_ident_rejected() {
+        let src = "'use strict'; var x = 1; delete x;";
+        let result = parse(src);
+        assert!(
+            result.is_err(),
+            "delete of unqualified identifier should be rejected in strict mode"
+        );
+    }
+
+    #[test]
+    fn test_strict_eval_binding_rejected() {
+        let src = "'use strict'; var eval = 1;";
+        let result = parse(src);
+        assert!(
+            result.is_err(),
+            "eval as binding should be rejected in strict mode"
+        );
+    }
+
+    #[test]
+    fn test_strict_duplicate_params_rejected() {
+        let src = "'use strict'; function f(a, a) {}";
+        let result = parse(src);
+        assert!(
+            result.is_err(),
+            "duplicate params should be rejected in strict mode"
+        );
+    }
+
+    #[test]
+    fn test_strict_octal_literal_rejected() {
+        let src = "'use strict'; var x = 0123;";
+        let result = parse(src);
+        assert!(
+            result.is_err(),
+            "legacy octal literals should be rejected in strict mode"
+        );
     }
 }

@@ -669,22 +669,57 @@ impl JsValue {
             Self::PlainObject(map) => {
                 // §7.1.1 step 2: check for @@toPrimitive method
                 let exotic = map.borrow().get("@@toPrimitive").cloned();
-                if let Some(JsValue::NativeFunction(f)) = exotic {
-                    let hint_str = match hint {
-                        ToPrimitiveHint::String => "string",
-                        ToPrimitiveHint::Number => "number",
-                        ToPrimitiveHint::Default => "default",
-                    };
-                    let result = f(vec![self.clone(), JsValue::String(hint_str.into())])?;
-                    if result.is_primitive() {
-                        return Ok(result);
+                let hint_str = match hint {
+                    ToPrimitiveHint::String => "string",
+                    ToPrimitiveHint::Number => "number",
+                    ToPrimitiveHint::Default => "default",
+                };
+                match exotic {
+                    Some(JsValue::NativeFunction(f)) => {
+                        let result = f(vec![self.clone(), JsValue::String(hint_str.into())])?;
+                        if result.is_primitive() {
+                            return Ok(result);
+                        }
+                        return Err(StatorError::TypeError(
+                            "Symbol.toPrimitive returned a non-primitive".into(),
+                        ));
                     }
-                    return Err(StatorError::TypeError(
-                        "Symbol.toPrimitive returned a non-primitive".into(),
-                    ));
+                    Some(JsValue::Function(ref ba)) => {
+                        let mut frame = crate::interpreter::InterpreterFrame::new(
+                            (**ba).clone(),
+                            vec![JsValue::String(hint_str.into())],
+                        );
+                        frame.context = Some(self.clone());
+                        let result = crate::interpreter::Interpreter::run(&mut frame)?;
+                        if result.is_primitive() {
+                            return Ok(result);
+                        }
+                        return Err(StatorError::TypeError(
+                            "Symbol.toPrimitive returned a non-primitive".into(),
+                        ));
+                    }
+                    _ => {}
                 }
                 ordinary_to_primitive_plain_object(map, hint)
             }
+
+            // Array — OrdinaryToPrimitive: toString produces join(","),
+            // valueOf returns the array itself (not primitive), so
+            // toString always wins regardless of hint.
+            Self::Array(items) => {
+                let parts: Vec<String> = items
+                    .borrow()
+                    .iter()
+                    .map(|v| match v {
+                        Self::Null | Self::Undefined => String::new(),
+                        other => other.to_js_string().unwrap_or_default(),
+                    })
+                    .collect();
+                Ok(JsValue::String(parts.join(",").into()))
+            }
+
+            // Error — convert to its string representation (e.g. "TypeError: msg").
+            Self::Error(e) => Ok(JsValue::String(e.to_error_string().into())),
 
             // All other object-like types: default string representation.
             _ => Ok(JsValue::String(self.default_obj_to_string().into())),
@@ -741,6 +776,19 @@ impl JsValue {
                 "Cannot convert a Symbol value to a string".to_string(),
             )),
             Self::BigInt(n) => Ok(n.to_string()),
+            // Array.prototype.toString — join elements with ",".
+            // Handles the common case directly without a ToPrimitive roundtrip.
+            Self::Array(items) => {
+                let parts: Vec<String> = items
+                    .borrow()
+                    .iter()
+                    .map(|v| match v {
+                        Self::Null | Self::Undefined => String::new(),
+                        other => other.to_js_string().unwrap_or_default(),
+                    })
+                    .collect();
+                Ok(parts.join(","))
+            }
             // Object-like types: ToPrimitive(input, string) then ToString.
             _ => {
                 let prim = self.to_primitive(ToPrimitiveHint::String)?;
@@ -957,6 +1005,15 @@ impl JsValue {
                 if matches!(borrow.get("__is_regexp__"), Some(Self::Boolean(true))) {
                     return "[object RegExp]".to_string();
                 }
+                if matches!(borrow.get("__is_date__"), Some(Self::Boolean(true))) {
+                    return "[object Date]".to_string();
+                }
+                if borrow.get("__call__").is_some() {
+                    return "[object Function]".to_string();
+                }
+                if matches!(borrow.get("__is_error__"), Some(Self::Boolean(true))) {
+                    return "[object Error]".to_string();
+                }
                 "[object Object]".to_string()
             }
             _ => "[object Object]".to_string(),
@@ -1064,6 +1121,118 @@ impl JsValue {
             _ => false,
         }
     }
+
+    /// ECMAScript §7.2.14 **IsLessThan(x, y, LeftFirst)**.
+    ///
+    /// Performs the Abstract Relational Comparison algorithm:
+    /// 1. Converts both operands to primitives via [`ToPrimitive`] with a
+    ///    `Number` hint.
+    /// 2. If **both** primitives are strings, compares them lexicographically.
+    /// 3. Otherwise converts to numeric values and compares numerically,
+    ///    including mixed `BigInt` × `Number` comparisons.
+    ///
+    /// Returns `Ok(None)` (**undefined**) when either operand is `NaN`,
+    /// `Ok(Some(true))` when `x < y`, and `Ok(Some(false))` otherwise.
+    ///
+    /// The `left_first` parameter controls evaluation order (ES spec
+    /// §7.2.14 step 1 vs step 2). Pass `true` for `<` and `<=`, `false`
+    /// for `>` and `>=`.
+    pub fn abstract_relational_comparison(
+        x: &JsValue,
+        y: &JsValue,
+        left_first: bool,
+    ) -> StatorResult<Option<bool>> {
+        // Step 1/2: ToPrimitive with hint Number.
+        let (px, py) = if left_first {
+            let px = x.to_primitive(ToPrimitiveHint::Number)?;
+            let py = y.to_primitive(ToPrimitiveHint::Number)?;
+            (px, py)
+        } else {
+            let py = y.to_primitive(ToPrimitiveHint::Number)?;
+            let px = x.to_primitive(ToPrimitiveHint::Number)?;
+            (px, py)
+        };
+
+        // Step 3: If both are strings, compare by UTF-16 code units (ES spec).
+        if let (JsValue::String(a), JsValue::String(b)) = (&px, &py) {
+            return Ok(Some(compare_utf16(a, b) == std::cmp::Ordering::Less));
+        }
+
+        // Step 4a: BigInt × String
+        if let (JsValue::BigInt(n), JsValue::String(s)) = (&px, &py) {
+            return Ok(s.trim().parse::<i128>().ok().map(|parsed| *n < parsed));
+        }
+        // Step 4b: String × BigInt
+        if let (JsValue::String(s), JsValue::BigInt(n)) = (&px, &py) {
+            return Ok(s.trim().parse::<i128>().ok().map(|parsed| parsed < *n));
+        }
+
+        // Step 4d-e: ToNumeric on both sides.
+        let nx = px.to_numeric()?;
+        let ny = py.to_numeric()?;
+
+        // Step 4f: Same numeric type.
+        match (&nx, &ny) {
+            // Number × Number
+            (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                if a.is_nan() || b.is_nan() {
+                    return Ok(None); // undefined
+                }
+                Ok(Some(a < b))
+            }
+            // BigInt × BigInt
+            (JsValue::BigInt(a), JsValue::BigInt(b)) => Ok(Some(a < b)),
+            // Step 4g-h: BigInt × Number
+            (JsValue::BigInt(a), JsValue::HeapNumber(b)) => {
+                if b.is_nan() {
+                    return Ok(None);
+                }
+                if b.is_infinite() {
+                    return Ok(Some(b.is_sign_positive()));
+                }
+                Ok(Some((*a as f64) < *b))
+            }
+            // Number × BigInt
+            (JsValue::HeapNumber(a), JsValue::BigInt(b)) => {
+                if a.is_nan() {
+                    return Ok(None);
+                }
+                if a.is_infinite() {
+                    return Ok(Some(a.is_sign_negative()));
+                }
+                Ok(Some(*a < (*b as f64)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Convenience: `x < y` using [`abstract_relational_comparison`] with
+    /// `left_first = true`.
+    ///
+    /// Returns `false` when the spec result is **undefined** (i.e. NaN
+    /// comparisons), matching the runtime semantics of the `<` operator.
+    pub fn js_less_than(x: &JsValue, y: &JsValue) -> StatorResult<bool> {
+        Ok(Self::abstract_relational_comparison(x, y, true)?.unwrap_or(false))
+    }
+
+    /// Convenience: `x > y` — equivalent to `IsLessThan(y, x, false)`.
+    pub fn js_greater_than(x: &JsValue, y: &JsValue) -> StatorResult<bool> {
+        Ok(Self::abstract_relational_comparison(y, x, false)?.unwrap_or(false))
+    }
+
+    /// Convenience: `x <= y` — equivalent to `!(y < x)`.
+    pub fn js_less_than_or_equal(x: &JsValue, y: &JsValue) -> StatorResult<bool> {
+        Ok(Self::abstract_relational_comparison(y, x, false)?
+            .map(|r| !r)
+            .unwrap_or(false))
+    }
+
+    /// Convenience: `x >= y` — equivalent to `!(x < y)`.
+    pub fn js_greater_than_or_equal(x: &JsValue, y: &JsValue) -> StatorResult<bool> {
+        Ok(Self::abstract_relational_comparison(x, y, true)?
+            .map(|r| !r)
+            .unwrap_or(false))
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1129,6 +1298,29 @@ impl Trace for JsValue {
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
+
+/// Compare two strings by their UTF-16 code units, as required by the
+/// ECMAScript specification for relational comparison of strings.
+///
+/// This differs from Rust's default `str` comparison (which is byte-level
+/// UTF-8, i.e. code-point order) only for strings containing supplementary
+/// characters (above U+FFFF), where UTF-16 surrogate pairs sort differently
+/// than their code-point order.
+fn compare_utf16(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut a_units = a.encode_utf16();
+    let mut b_units = b.encode_utf16();
+    loop {
+        match (a_units.next(), b_units.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(au), Some(bu)) => match au.cmp(&bu) {
+                std::cmp::Ordering::Equal => continue,
+                ord => return ord,
+            },
+        }
+    }
+}
 
 /// Formats an `f64` as a JavaScript number string (ECMAScript §7.1.12.1).
 ///
@@ -2883,5 +3075,710 @@ mod tests {
     #[test]
     fn test_to_numeric_symbol_error() {
         assert!(JsValue::Symbol(0).to_numeric().is_err());
+    }
+
+    // ── abstract_relational_comparison / js_less_than ────────────────────────
+
+    #[test]
+    fn test_less_than_numbers() {
+        assert!(JsValue::js_less_than(&JsValue::Smi(1), &JsValue::Smi(2)).unwrap());
+        assert!(!JsValue::js_less_than(&JsValue::Smi(2), &JsValue::Smi(1)).unwrap());
+        assert!(!JsValue::js_less_than(&JsValue::Smi(1), &JsValue::Smi(1)).unwrap());
+        assert!(
+            JsValue::js_less_than(&JsValue::HeapNumber(1.5), &JsValue::HeapNumber(2.5)).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_less_than_nan_is_false() {
+        // NaN < anything → false; anything < NaN → false
+        assert!(!JsValue::js_less_than(&JsValue::HeapNumber(f64::NAN), &JsValue::Smi(1)).unwrap());
+        assert!(!JsValue::js_less_than(&JsValue::Smi(1), &JsValue::HeapNumber(f64::NAN)).unwrap());
+        assert!(
+            !JsValue::js_less_than(
+                &JsValue::HeapNumber(f64::NAN),
+                &JsValue::HeapNumber(f64::NAN)
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_less_than_returns_undefined_for_nan() {
+        // The raw comparison returns None for NaN.
+        assert_eq!(
+            JsValue::abstract_relational_comparison(
+                &JsValue::HeapNumber(f64::NAN),
+                &JsValue::Smi(1),
+                true
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_less_than_strings_lexicographic() {
+        // String comparison is lexicographic, not numeric.
+        assert!(
+            JsValue::js_less_than(&JsValue::String("a".into()), &JsValue::String("b".into()))
+                .unwrap()
+        );
+        assert!(
+            !JsValue::js_less_than(&JsValue::String("b".into()), &JsValue::String("a".into()))
+                .unwrap()
+        );
+        // "10" < "9" is true lexicographically (digit '1' < digit '9').
+        assert!(
+            JsValue::js_less_than(&JsValue::String("10".into()), &JsValue::String("9".into()))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_less_than_string_vs_number_coercion() {
+        // "5" < 10 → 5 < 10 → true (string converted to number)
+        assert!(JsValue::js_less_than(&JsValue::String("5".into()), &JsValue::Smi(10)).unwrap());
+        // 10 < "5" → 10 < 5 → false
+        assert!(!JsValue::js_less_than(&JsValue::Smi(10), &JsValue::String("5".into())).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_boolean_coercion() {
+        // true → 1, false → 0
+        assert!(JsValue::js_less_than(&JsValue::Boolean(false), &JsValue::Boolean(true)).unwrap());
+        assert!(!JsValue::js_less_than(&JsValue::Boolean(true), &JsValue::Boolean(false)).unwrap());
+        // false (0) < 1 → true
+        assert!(JsValue::js_less_than(&JsValue::Boolean(false), &JsValue::Smi(1)).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_null_undefined() {
+        // null → 0, undefined → NaN
+        assert!(JsValue::js_less_than(&JsValue::Null, &JsValue::Smi(1)).unwrap());
+        // undefined → NaN, NaN < 1 → false
+        assert!(!JsValue::js_less_than(&JsValue::Undefined, &JsValue::Smi(1)).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_bigint() {
+        assert!(JsValue::js_less_than(&JsValue::BigInt(1), &JsValue::BigInt(2)).unwrap());
+        assert!(!JsValue::js_less_than(&JsValue::BigInt(2), &JsValue::BigInt(1)).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_bigint_vs_number() {
+        assert!(JsValue::js_less_than(&JsValue::BigInt(1), &JsValue::HeapNumber(1.5)).unwrap());
+        assert!(!JsValue::js_less_than(&JsValue::HeapNumber(2.5), &JsValue::BigInt(2)).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_bigint_vs_string() {
+        // BigInt(1) < "2" → 1 < 2 → true
+        assert!(JsValue::js_less_than(&JsValue::BigInt(1), &JsValue::String("2".into())).unwrap());
+        // "1" < BigInt(2) → 1 < 2 → true
+        assert!(JsValue::js_less_than(&JsValue::String("1".into()), &JsValue::BigInt(2)).unwrap());
+        // BigInt vs unparseable string → None → false
+        assert!(
+            !JsValue::js_less_than(&JsValue::BigInt(1), &JsValue::String("abc".into())).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_less_than_infinity() {
+        assert!(
+            JsValue::js_less_than(&JsValue::HeapNumber(f64::NEG_INFINITY), &JsValue::Smi(0))
+                .unwrap()
+        );
+        assert!(
+            !JsValue::js_less_than(&JsValue::HeapNumber(f64::INFINITY), &JsValue::Smi(0)).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_greater_than() {
+        assert!(JsValue::js_greater_than(&JsValue::Smi(2), &JsValue::Smi(1)).unwrap());
+        assert!(!JsValue::js_greater_than(&JsValue::Smi(1), &JsValue::Smi(2)).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_or_equal() {
+        assert!(JsValue::js_less_than_or_equal(&JsValue::Smi(1), &JsValue::Smi(2)).unwrap());
+        assert!(JsValue::js_less_than_or_equal(&JsValue::Smi(1), &JsValue::Smi(1)).unwrap());
+        assert!(!JsValue::js_less_than_or_equal(&JsValue::Smi(2), &JsValue::Smi(1)).unwrap());
+    }
+
+    #[test]
+    fn test_greater_than_or_equal() {
+        assert!(JsValue::js_greater_than_or_equal(&JsValue::Smi(2), &JsValue::Smi(1)).unwrap());
+        assert!(JsValue::js_greater_than_or_equal(&JsValue::Smi(1), &JsValue::Smi(1)).unwrap());
+        assert!(!JsValue::js_greater_than_or_equal(&JsValue::Smi(1), &JsValue::Smi(2)).unwrap());
+    }
+
+    #[test]
+    fn test_relational_nan_all_false() {
+        let nan = JsValue::HeapNumber(f64::NAN);
+        let one = JsValue::Smi(1);
+        // NaN makes all relational operators return false.
+        assert!(!JsValue::js_less_than(&nan, &one).unwrap());
+        assert!(!JsValue::js_greater_than(&nan, &one).unwrap());
+        assert!(!JsValue::js_less_than_or_equal(&nan, &one).unwrap());
+        assert!(!JsValue::js_greater_than_or_equal(&nan, &one).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_object_to_primitive_string_path() {
+        use crate::objects::property_map::PropertyMap;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // Create a PlainObject with valueOf returning "abc".
+        let mut map_a = PropertyMap::new();
+        let val_fn_a: Rc<dyn Fn(Vec<JsValue>) -> StatorResult<JsValue>> =
+            Rc::new(|_| Ok(JsValue::String("abc".into())));
+        map_a.insert("valueOf".to_string(), JsValue::NativeFunction(val_fn_a));
+        let obj_a = JsValue::PlainObject(Rc::new(RefCell::new(map_a)));
+
+        // Create a PlainObject with valueOf returning "xyz".
+        let mut map_b = PropertyMap::new();
+        let val_fn_b: Rc<dyn Fn(Vec<JsValue>) -> StatorResult<JsValue>> =
+            Rc::new(|_| Ok(JsValue::String("xyz".into())));
+        map_b.insert("valueOf".to_string(), JsValue::NativeFunction(val_fn_b));
+        let obj_b = JsValue::PlainObject(Rc::new(RefCell::new(map_b)));
+
+        // Both ToPrimitive to strings → lexicographic: "abc" < "xyz" → true.
+        assert!(JsValue::js_less_than(&obj_a, &obj_b).unwrap());
+        assert!(!JsValue::js_less_than(&obj_b, &obj_a).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_object_to_primitive_number_path() {
+        use crate::objects::property_map::PropertyMap;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // PlainObject with valueOf returning 10.
+        let mut map = PropertyMap::new();
+        let val_fn: Rc<dyn Fn(Vec<JsValue>) -> StatorResult<JsValue>> =
+            Rc::new(|_| Ok(JsValue::Smi(10)));
+        map.insert("valueOf".to_string(), JsValue::NativeFunction(val_fn));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+
+        // obj (→ 10) < 20 → true
+        assert!(JsValue::js_less_than(&obj, &JsValue::Smi(20)).unwrap());
+        // 5 < obj (→ 10) → true
+        assert!(JsValue::js_less_than(&JsValue::Smi(5), &obj).unwrap());
+    }
+
+    #[test]
+    fn test_less_than_object_with_toprimitive() {
+        use crate::objects::property_map::PropertyMap;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // PlainObject with @@toPrimitive returning 42.
+        let mut map = PropertyMap::new();
+        let tp_fn: Rc<dyn Fn(Vec<JsValue>) -> StatorResult<JsValue>> =
+            Rc::new(|_| Ok(JsValue::Smi(42)));
+        map.insert("@@toPrimitive".to_string(), JsValue::NativeFunction(tp_fn));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+
+        assert!(JsValue::js_less_than(&obj, &JsValue::Smi(100)).unwrap());
+        assert!(!JsValue::js_less_than(&obj, &JsValue::Smi(10)).unwrap());
+    }
+
+    // ── to_primitive: Array ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_to_primitive_array_number_hint() {
+        let items = vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)];
+        let arr = JsValue::Array(Rc::new(RefCell::new(items)));
+        let result = arr.to_primitive(ToPrimitiveHint::Number).unwrap();
+        assert_eq!(result, JsValue::String("1,2,3".into()));
+    }
+
+    #[test]
+    fn test_to_primitive_array_with_null_undefined() {
+        let items = vec![
+            JsValue::Smi(1),
+            JsValue::Null,
+            JsValue::Undefined,
+            JsValue::Smi(4),
+        ];
+        let arr = JsValue::Array(Rc::new(RefCell::new(items)));
+        let result = arr.to_primitive(ToPrimitiveHint::Default).unwrap();
+        assert_eq!(result, JsValue::String("1,,,4".into()));
+    }
+
+    #[test]
+    fn test_to_primitive_empty_array() {
+        let items: Vec<JsValue> = vec![];
+        let arr = JsValue::Array(Rc::new(RefCell::new(items)));
+        let result = arr.to_primitive(ToPrimitiveHint::Number).unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    // ── to_primitive: Error ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_to_primitive_error() {
+        let err = JsValue::Error(Rc::new(crate::builtins::error::JsError::new(
+            crate::builtins::error::ErrorKind::TypeError,
+            "test error".to_string(),
+        )));
+        let result = err.to_primitive(ToPrimitiveHint::String).unwrap();
+        if let JsValue::String(s) = result {
+            assert!(s.contains("TypeError"));
+            assert!(s.contains("test error"));
+        } else {
+            panic!("Expected string from error ToPrimitive");
+        }
+    }
+
+    // ── Symbol / BigInt TypeError conformance (ES §7.1) ─────────────────────
+
+    #[test]
+    fn test_symbol_to_number_throws() {
+        let sym = JsValue::Symbol(42);
+        assert!(sym.to_number().is_err());
+        match sym.to_number() {
+            Err(StatorError::TypeError(msg)) => {
+                assert_eq!(msg, "Cannot convert a Symbol value to a number");
+            }
+            other => panic!("Expected TypeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_symbol_to_js_string_throws() {
+        let sym = JsValue::Symbol(7);
+        assert!(sym.to_js_string().is_err());
+        match sym.to_js_string() {
+            Err(StatorError::TypeError(msg)) => {
+                assert_eq!(msg, "Cannot convert a Symbol value to a string");
+            }
+            other => panic!("Expected TypeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_symbol_to_display_string_does_not_throw() {
+        // Explicit String(sym) path — should succeed, not throw.
+        let sym = JsValue::Symbol(99);
+        let s = sym.to_display_string();
+        assert_eq!(s, "Symbol(99)");
+    }
+
+    #[test]
+    fn test_symbol_to_int32_propagates_type_error() {
+        // to_int32 delegates to to_number, which must throw for Symbol.
+        assert!(matches!(
+            JsValue::Symbol(1).to_int32(),
+            Err(StatorError::TypeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_symbol_to_uint32_propagates_type_error() {
+        assert!(matches!(
+            JsValue::Symbol(1).to_uint32(),
+            Err(StatorError::TypeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_symbol_to_integer_or_infinity_propagates_type_error() {
+        assert!(matches!(
+            JsValue::Symbol(1).to_integer_or_infinity(),
+            Err(StatorError::TypeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_symbol_to_length_propagates_type_error() {
+        assert!(matches!(
+            JsValue::Symbol(1).to_length(),
+            Err(StatorError::TypeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_bigint_to_number_throws() {
+        let big = JsValue::BigInt(123);
+        assert!(big.to_number().is_err());
+        match big.to_number() {
+            Err(StatorError::TypeError(msg)) => {
+                assert_eq!(msg, "Cannot convert a BigInt value to a number");
+            }
+            other => panic!("Expected TypeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_bigint_to_int32_propagates_type_error() {
+        assert!(matches!(
+            JsValue::BigInt(1).to_int32(),
+            Err(StatorError::TypeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_bigint_to_uint32_propagates_type_error() {
+        assert!(matches!(
+            JsValue::BigInt(1).to_uint32(),
+            Err(StatorError::TypeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_symbol_to_numeric_throws_type_error() {
+        // to_numeric → to_primitive (no-op for Symbol) → to_number → TypeError.
+        match JsValue::Symbol(5).to_numeric() {
+            Err(StatorError::TypeError(msg)) => {
+                assert_eq!(msg, "Cannot convert a Symbol value to a number");
+            }
+            other => panic!("Expected TypeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_symbol_to_boolean_is_true() {
+        // Symbols are truthy (ES §7.1.2).
+        assert!(JsValue::Symbol(0).to_boolean());
+    }
+
+    #[test]
+    fn test_symbol_is_primitive() {
+        assert!(JsValue::Symbol(1).is_primitive());
+    }
+
+    #[test]
+    fn test_symbol_to_property_key_succeeds() {
+        // ToPropertyKey on Symbol should not throw.
+        let key = JsValue::Symbol(42).to_property_key().unwrap();
+        assert_eq!(key, "Symbol(42)");
+    }
+
+    #[test]
+    fn test_bigint_to_js_string_succeeds() {
+        // BigInt → ToString should produce the decimal representation.
+        assert_eq!(JsValue::BigInt(42).to_js_string().unwrap(), "42");
+        assert_eq!(JsValue::BigInt(-1).to_js_string().unwrap(), "-1");
+        assert_eq!(JsValue::BigInt(0).to_js_string().unwrap(), "0");
+    }
+
+    #[test]
+    fn test_bigint_to_numeric_passthrough() {
+        // to_numeric on BigInt returns itself, not HeapNumber.
+        assert_eq!(
+            JsValue::BigInt(99).to_numeric().unwrap(),
+            JsValue::BigInt(99)
+        );
+    }
+
+    // ── to_number: PlainObject valueOf/toString chain ─────────────────────────
+
+    #[test]
+    fn test_to_number_plain_object_valueof_returns_number() {
+        let mut map = PropertyMap::new();
+        let f: NativeFn = Rc::new(|_| Ok(JsValue::Smi(7)));
+        map.insert("valueOf".to_string(), JsValue::NativeFunction(f));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert_eq!(obj.to_number().unwrap(), 7.0);
+    }
+
+    #[test]
+    fn test_to_number_plain_object_valueof_non_primitive_falls_to_tostring() {
+        let mut map = PropertyMap::new();
+        // valueOf returns an array (non-primitive) → skipped
+        let val_fn: NativeFn = Rc::new(|_| Ok(JsValue::new_array(vec![])));
+        map.insert("valueOf".to_string(), JsValue::NativeFunction(val_fn));
+        // toString returns "42" → used instead
+        let ts_fn: NativeFn = Rc::new(|_| Ok(JsValue::String("42".into())));
+        map.insert("toString".to_string(), JsValue::NativeFunction(ts_fn));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert_eq!(obj.to_number().unwrap(), 42.0);
+    }
+
+    #[test]
+    fn test_to_number_plain_object_both_non_primitive_gives_nan() {
+        let mut map = PropertyMap::new();
+        // Both methods return non-primitives → fallback to "[object Object]" → NaN
+        let val_fn: NativeFn = Rc::new(|_| Ok(JsValue::new_array(vec![])));
+        map.insert("valueOf".to_string(), JsValue::NativeFunction(val_fn));
+        let ts_fn: NativeFn = Rc::new(|_| Ok(JsValue::new_array(vec![])));
+        map.insert("toString".to_string(), JsValue::NativeFunction(ts_fn));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        let n = obj.to_number().unwrap();
+        assert!(n.is_nan());
+    }
+
+    #[test]
+    fn test_to_number_plain_object_tostring_only() {
+        let mut map = PropertyMap::new();
+        // No valueOf, toString returns "100"
+        let ts_fn: NativeFn = Rc::new(|_| Ok(JsValue::String("100".into())));
+        map.insert("toString".to_string(), JsValue::NativeFunction(ts_fn));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert_eq!(obj.to_number().unwrap(), 100.0);
+    }
+
+    // ── to_js_string: Array direct arm ───────────────────────────────────────
+
+    #[test]
+    fn test_to_js_string_empty_array() {
+        assert_eq!(JsValue::new_array(vec![]).to_js_string().unwrap(), "");
+    }
+
+    #[test]
+    fn test_to_js_string_array_single_element() {
+        let arr = JsValue::new_array(vec![JsValue::Smi(42)]);
+        assert_eq!(arr.to_js_string().unwrap(), "42");
+    }
+
+    #[test]
+    fn test_to_js_string_array_nested() {
+        // [[3,4]] → inner toString is "3,4" → outer join is "3,4"
+        let inner = JsValue::new_array(vec![JsValue::Smi(3), JsValue::Smi(4)]);
+        let outer = JsValue::new_array(vec![JsValue::Smi(1), JsValue::Smi(2), inner]);
+        assert_eq!(outer.to_js_string().unwrap(), "1,2,3,4");
+    }
+
+    #[test]
+    fn test_to_js_string_array_with_booleans() {
+        let arr = JsValue::new_array(vec![JsValue::Boolean(true), JsValue::Boolean(false)]);
+        assert_eq!(arr.to_js_string().unwrap(), "true,false");
+    }
+
+    #[test]
+    fn test_to_js_string_array_with_mixed_types() {
+        let arr = JsValue::new_array(vec![
+            JsValue::Smi(1),
+            JsValue::String("hello".into()),
+            JsValue::Null,
+            JsValue::Undefined,
+            JsValue::Boolean(true),
+        ]);
+        assert_eq!(arr.to_js_string().unwrap(), "1,hello,,,true");
+    }
+
+    // ── to_boolean: comprehensive edge cases ─────────────────────────────────
+
+    #[test]
+    fn test_to_boolean_empty_string_is_false() {
+        assert!(!JsValue::String("".into()).to_boolean());
+    }
+
+    #[test]
+    fn test_to_boolean_whitespace_string_is_true() {
+        // " " is non-empty → true
+        assert!(JsValue::String(" ".into()).to_boolean());
+    }
+
+    #[test]
+    fn test_to_boolean_string_zero_is_true() {
+        // "0" is non-empty → true
+        assert!(JsValue::String("0".into()).to_boolean());
+    }
+
+    #[test]
+    fn test_to_boolean_smi_negative_is_true() {
+        assert!(JsValue::Smi(-42).to_boolean());
+    }
+
+    #[test]
+    fn test_to_boolean_heap_number_neg_infinity_is_true() {
+        assert!(JsValue::HeapNumber(f64::NEG_INFINITY).to_boolean());
+    }
+
+    #[test]
+    fn test_to_boolean_bigint_negative_is_true() {
+        assert!(JsValue::BigInt(-1).to_boolean());
+    }
+
+    // ── to_int32 / to_uint32: cross-type coercion ────────────────────────────
+
+    #[test]
+    fn test_to_int32_from_string() {
+        assert_eq!(JsValue::String("42".into()).to_int32().unwrap(), 42);
+        assert_eq!(JsValue::String("".into()).to_int32().unwrap(), 0);
+        assert_eq!(JsValue::String("3.9".into()).to_int32().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_to_int32_from_boolean() {
+        assert_eq!(JsValue::Boolean(true).to_int32().unwrap(), 1);
+        assert_eq!(JsValue::Boolean(false).to_int32().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_to_uint32_from_string() {
+        assert_eq!(JsValue::String("42".into()).to_uint32().unwrap(), 42);
+        assert_eq!(JsValue::String("".into()).to_uint32().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_to_uint32_from_boolean() {
+        assert_eq!(JsValue::Boolean(true).to_uint32().unwrap(), 1);
+        assert_eq!(JsValue::Boolean(false).to_uint32().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_to_int32_large_negative() {
+        // -2^31 - 1 wraps to 2^31 - 1 = 2147483647
+        assert_eq!(
+            JsValue::HeapNumber(-2_147_483_649.0).to_int32().unwrap(),
+            2_147_483_647
+        );
+    }
+
+    #[test]
+    fn test_to_uint32_large_wrap() {
+        // 2^32 + 5 wraps to 5
+        assert_eq!(JsValue::HeapNumber(4_294_967_301.0).to_uint32().unwrap(), 5);
+    }
+
+    // ── same_value: cross-type numeric edge cases ────────────────────────────
+
+    #[test]
+    fn test_same_value_smi_vs_heap_number_equal() {
+        assert!(JsValue::Smi(42).same_value(&JsValue::HeapNumber(42.0)));
+        assert!(JsValue::HeapNumber(42.0).same_value(&JsValue::Smi(42)));
+    }
+
+    #[test]
+    fn test_same_value_smi_vs_heap_number_not_equal() {
+        assert!(!JsValue::Smi(1).same_value(&JsValue::HeapNumber(2.0)));
+        assert!(!JsValue::HeapNumber(2.0).same_value(&JsValue::Smi(1)));
+    }
+
+    #[test]
+    fn test_same_value_negative_zero_vs_negative_zero() {
+        assert!(JsValue::HeapNumber(-0.0).same_value(&JsValue::HeapNumber(-0.0)));
+    }
+
+    #[test]
+    fn test_same_value_strings() {
+        assert!(JsValue::String("abc".into()).same_value(&JsValue::String("abc".into())));
+        assert!(!JsValue::String("abc".into()).same_value(&JsValue::String("xyz".into())));
+    }
+
+    #[test]
+    fn test_same_value_different_types() {
+        assert!(!JsValue::Smi(0).same_value(&JsValue::Boolean(false)));
+        assert!(!JsValue::Smi(0).same_value(&JsValue::String("0".into())));
+        assert!(!JsValue::Null.same_value(&JsValue::Smi(0)));
+    }
+
+    // ── same_value_zero: cross-type numeric edge cases ───────────────────────
+
+    #[test]
+    fn test_same_value_zero_smi_vs_negative_zero() {
+        // SameValueZero: +0 === -0
+        assert!(JsValue::Smi(0).same_value_zero(&JsValue::HeapNumber(-0.0)));
+        assert!(JsValue::HeapNumber(-0.0).same_value_zero(&JsValue::Smi(0)));
+    }
+
+    #[test]
+    fn test_same_value_zero_negative_zero_vs_negative_zero() {
+        assert!(JsValue::HeapNumber(-0.0).same_value_zero(&JsValue::HeapNumber(-0.0)));
+    }
+
+    #[test]
+    fn test_same_value_zero_different_types() {
+        assert!(!JsValue::Smi(0).same_value_zero(&JsValue::Boolean(false)));
+        assert!(!JsValue::Smi(0).same_value_zero(&JsValue::String("0".into())));
+    }
+
+    // ── conformance round-21: additional coverage ────────────────────────────
+
+    #[test]
+    fn test_to_number_empty_string() {
+        assert_eq!(JsValue::String("".into()).to_number().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn test_to_number_whitespace() {
+        assert_eq!(JsValue::String("  ".into()).to_number().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn test_to_number_hex_string() {
+        assert_eq!(JsValue::String("0xff".into()).to_number().unwrap(), 255.0);
+    }
+
+    #[test]
+    fn test_to_string_neg_zero() {
+        assert_eq!(
+            JsValue::HeapNumber(-0.0).to_js_string().unwrap(),
+            "0".to_string()
+        );
+    }
+
+    #[test]
+    fn test_to_string_infinity() {
+        assert_eq!(
+            JsValue::HeapNumber(f64::INFINITY).to_js_string().unwrap(),
+            "Infinity".to_string()
+        );
+    }
+
+    #[test]
+    fn test_to_string_nan() {
+        assert_eq!(
+            JsValue::HeapNumber(f64::NAN).to_js_string().unwrap(),
+            "NaN".to_string()
+        );
+    }
+
+    #[test]
+    fn test_to_number_true() {
+        assert_eq!(JsValue::Boolean(true).to_number().unwrap(), 1.0);
+    }
+
+    #[test]
+    fn test_to_number_false() {
+        assert_eq!(JsValue::Boolean(false).to_number().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_plain_object_date() {
+        let mut map = PropertyMap::new();
+        map.insert("__is_date__".to_string(), JsValue::Boolean(true));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert_eq!(obj.obj_to_string_tag(), "[object Date]");
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_plain_object_callable() {
+        let mut map = PropertyMap::new();
+        let f: NativeFn = Rc::new(|_| Ok(JsValue::Undefined));
+        map.insert("__call__".to_string(), JsValue::NativeFunction(f));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert_eq!(obj.obj_to_string_tag(), "[object Function]");
+    }
+
+    #[test]
+    fn test_obj_to_string_tag_plain_object_error() {
+        let mut map = PropertyMap::new();
+        map.insert("__is_error__".to_string(), JsValue::Boolean(true));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert_eq!(obj.obj_to_string_tag(), "[object Error]");
+    }
+
+    #[test]
+    fn test_compare_utf16_ascii() {
+        assert!(
+            JsValue::js_less_than(&JsValue::String("a".into()), &JsValue::String("b".into()))
+                .unwrap()
+        );
+        assert!(
+            !JsValue::js_less_than(&JsValue::String("b".into()), &JsValue::String("a".into()))
+                .unwrap()
+        );
+        assert!(
+            !JsValue::js_less_than(&JsValue::String("a".into()), &JsValue::String("a".into()))
+                .unwrap()
+        );
     }
 }

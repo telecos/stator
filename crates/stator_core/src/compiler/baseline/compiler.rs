@@ -1074,6 +1074,7 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::GetIterator
             | Opcode::GetAsyncIterator
             | Opcode::IteratorNext
+            | Opcode::IteratorClose
             | Opcode::PushContext
             | Opcode::PopContext
             | Opcode::ForInEnumerate

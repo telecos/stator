@@ -540,13 +540,6 @@ impl<'src> Scanner<'src> {
         it.next()
     }
 
-    fn peek3(&self) -> Option<char> {
-        let mut it = self.source[self.pos..].chars();
-        it.next();
-        it.next();
-        it.next()
-    }
-
     /// Advance past the current character and update line/column tracking.
     ///
     /// `\r\n` is treated as a single line terminator; the `\n` is consumed
@@ -1653,7 +1646,7 @@ impl<'src> Scanner<'src> {
                         TokenKind::QuestionQuestion
                     }
                 } else if self.peek() == Some('.')
-                    && !matches!(self.peek3(), Some(d) if d.is_ascii_digit())
+                    && !matches!(self.peek2(), Some(d) if d.is_ascii_digit())
                 {
                     // `?.` — but NOT `?.0` (that would be `?` + `.0`)
                     self.advance();

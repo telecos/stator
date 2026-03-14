@@ -244,6 +244,15 @@ thread_local! {
     /// `detach_debugger` hide another thread's attached debugger, causing
     /// flaky breakpoint misses in parallel tests.
     static DEBUG_ATTACHED: Cell<bool> = const { Cell::new(false) };
+
+    /// Reference to the current thread's global environment.
+    ///
+    /// Set at the start of [`Interpreter::run`] so that [`proto_lookup`] can
+    /// resolve built-in constructor properties (e.g. `[].constructor === Array`)
+    /// without threading the global env through every call site.
+    #[allow(clippy::type_complexity)]
+    static CURRENT_GLOBALS: RefCell<Option<Rc<RefCell<HashMap<String, JsValue>>>>> =
+        const { RefCell::new(None) };
 }
 
 /// Attach a [`Debugger`] to the current thread's interpreter.
@@ -279,6 +288,21 @@ pub fn intern_property_key(
 /// Returns the number of strings currently interned in the thread-local table.
 pub fn interned_string_count() -> usize {
     STRING_TABLE.with(|table| table.borrow().len())
+}
+
+/// Look up a built-in constructor by name from the current global environment.
+///
+/// Used by [`proto_lookup`] to resolve the `"constructor"` property for
+/// primitive wrapper types (e.g. `[].constructor === Array`).  Returns
+/// [`JsValue::Undefined`] if no global environment is set or the name is
+/// not found.
+fn lookup_global_constructor(name: &str) -> JsValue {
+    CURRENT_GLOBALS.with(|g| {
+        g.borrow()
+            .as_ref()
+            .and_then(|globals| globals.borrow().get(name).cloned())
+            .unwrap_or(JsValue::Undefined)
+    })
 }
 
 /// Run `f` with mutable access to the currently-attached [`Debugger`], if
@@ -1130,6 +1154,10 @@ impl Interpreter {
     /// - an unimplemented opcode is encountered, or
     /// - a type error occurs during arithmetic.
     pub fn run(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
+        // Publish the global environment for proto_lookup's constructor resolution.
+        CURRENT_GLOBALS.with(|g| {
+            *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
+        });
         // Dynamically grow the native stack when headroom drops below 512 KiB.
         // Allocates a fresh 4 MiB segment via mmap/VirtualAlloc on demand,
         // preventing SIGSEGV/stack-overflow aborts on deeply recursive JS code
@@ -1681,6 +1709,10 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
 }
 #[inline(always)]
 pub(super) fn number_to_jsvalue(n: f64) -> JsValue {
+    // Preserve -0.0 as HeapNumber so SameValue(+0, -0) correctly returns false.
+    if n == 0.0 && n.is_sign_negative() {
+        return JsValue::HeapNumber(n);
+    }
     if n.is_finite() && n.fract() == 0.0 && (i32::MIN as f64..=i32::MAX as f64).contains(&n) {
         JsValue::Smi(n as i32)
     } else {
@@ -1794,151 +1826,39 @@ pub(super) fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
     }
 }
 
-/// ECMAScript §7.2.11 **Abstract Relational Comparison** (`<`).
+/// ECMAScript §7.2.14 **IsLessThan** (`<`).
 ///
-/// Returns `false` when either operand is `NaN` (consistent with IEEE 754).
-/// String operands are compared lexicographically; all other combinations
-/// convert to numbers first.
+/// Delegates to [`JsValue::abstract_relational_comparison`] which performs the
+/// full spec algorithm including ToPrimitive on objects.  Fast paths for Smi
+/// and String comparisons avoid the ToPrimitive overhead for primitives.
 pub(super) fn js_less_than(lhs: &JsValue, rhs: &JsValue) -> StatorResult<bool> {
+    // Fast paths for common types (avoid ToPrimitive overhead)
+    if let (JsValue::Smi(a), JsValue::Smi(b)) = (lhs, rhs) {
+        return Ok(a < b);
+    }
     if let (JsValue::String(a), JsValue::String(b)) = (lhs, rhs) {
         return Ok(a < b);
     }
-    // BigInt × BigInt
-    if let (JsValue::BigInt(a), JsValue::BigInt(b)) = (lhs, rhs) {
-        return Ok(a < b);
-    }
-    // BigInt × Number and Number × BigInt (mixed comparison is allowed)
-    if let (JsValue::BigInt(a), rhs_val) = (lhs, rhs) {
-        let r = rhs_val.to_number()?;
-        if r.is_nan() {
-            return Ok(false);
-        }
-        return Ok((*a as f64) < r);
-    }
-    if let (lhs_val, JsValue::BigInt(b)) = (lhs, rhs) {
-        let l = lhs_val.to_number()?;
-        if l.is_nan() {
-            return Ok(false);
-        }
-        return Ok(l < (*b as f64));
-    }
-    let l = lhs.to_number()?;
-    let r = rhs.to_number()?;
-    if l.is_nan() || r.is_nan() {
-        return Ok(false);
-    }
-    Ok(l < r)
+    // Full spec: §7.2.14 IsLessThan(x, y, true)
+    // Returns None for undefined (NaN cases) → map to false
+    Ok(JsValue::abstract_relational_comparison(lhs, rhs, true)?.unwrap_or(false))
 }
 
 /// ECMAScript §7.2.13 **Abstract Equality Comparison** (`==`).
+///
+/// Delegates to [`JsValue::is_loosely_equal`] which implements the full spec
+/// algorithm including ToPrimitive coercion for objects.
 pub(super) fn abstract_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
-    match (lhs, rhs) {
-        // Same primitive type.
-        (JsValue::Undefined, JsValue::Undefined) | (JsValue::Null, JsValue::Null) => true,
-        (JsValue::Boolean(a), JsValue::Boolean(b)) => a == b,
-        (JsValue::String(a), JsValue::String(b)) => a == b,
-        (JsValue::Symbol(a), JsValue::Symbol(b)) => a == b,
-        // BigInt × BigInt
-        (JsValue::BigInt(a), JsValue::BigInt(b)) => a == b,
-        // Numeric — covers Smi×Smi, Smi×HeapNumber, HeapNumber×HeapNumber.
-        (lhs, rhs) if lhs.is_number() && rhs.is_number() => {
-            matches!((lhs.to_number(), rhs.to_number()), (Ok(a), Ok(b)) if a == b)
-        }
-        // null == undefined.
-        (JsValue::Null, JsValue::Undefined) | (JsValue::Undefined, JsValue::Null) => true,
-        // Boolean → Number coercion (ECMAScript §7.2.13 steps 9/10).
-        (JsValue::Boolean(b), _) => abstract_eq(&JsValue::Smi(i32::from(*b)), rhs),
-        (_, JsValue::Boolean(b)) => abstract_eq(lhs, &JsValue::Smi(i32::from(*b))),
-        // BigInt × Number and Number × BigInt (mixed comparison is allowed for ==).
-        (JsValue::BigInt(a), rhs_val) if rhs_val.is_number() => {
-            if let Ok(r) = rhs_val.to_number() {
-                if r.is_nan() || r.is_infinite() {
-                    return false;
-                }
-                if r.fract() != 0.0 {
-                    return false;
-                }
-                *a == r as i128
-            } else {
-                false
-            }
-        }
-        (lhs_val, JsValue::BigInt(b)) if lhs_val.is_number() => {
-            if let Ok(l) = lhs_val.to_number() {
-                if l.is_nan() || l.is_infinite() {
-                    return false;
-                }
-                if l.fract() != 0.0 {
-                    return false;
-                }
-                l as i128 == *b
-            } else {
-                false
-            }
-        }
-        // BigInt × String: parse string as BigInt.
-        (JsValue::BigInt(a), JsValue::String(s)) => s.trim().parse::<i128>() == Ok(*a),
-        (JsValue::String(s), JsValue::BigInt(b)) => s.trim().parse::<i128>() == Ok(*b),
-        // String → Number coercion (steps 5/6).
-        (JsValue::String(s), _) if rhs.is_number() => {
-            let n = crate::objects::value::string_to_number(s);
-            abstract_eq(&JsValue::HeapNumber(n), rhs)
-        }
-        (_, JsValue::String(s)) if lhs.is_number() => {
-            let n = crate::objects::value::string_to_number(s);
-            abstract_eq(lhs, &JsValue::HeapNumber(n))
-        }
-        // Object identity — `JsValue::Object` holds a raw `*mut HeapObject`
-        // pointer; comparing the pointer values gives reference identity.
-        (JsValue::Object(a), JsValue::Object(b)) => std::ptr::eq(*a, *b),
-        // PlainObject, Array, Function identity — Rc pointer comparison.
-        (JsValue::PlainObject(a), JsValue::PlainObject(b)) => Rc::ptr_eq(a, b),
-        (JsValue::Array(a), JsValue::Array(b)) => Rc::ptr_eq(a, b),
-        (JsValue::Function(a), JsValue::Function(b)) => Rc::ptr_eq(a, b),
-        (JsValue::NativeFunction(a), JsValue::NativeFunction(b)) => Rc::ptr_eq(a, b),
-        (JsValue::Error(a), JsValue::Error(b)) => Rc::ptr_eq(a, b),
-        // Object == primitive → ToPrimitive(Object, default) then compare
-        // (ECMAScript §7.2.14 steps 12/13).
-        (lhs_val, rhs_val) if !lhs_val.is_primitive() && rhs_val.is_primitive() => {
-            match lhs_val.to_primitive(crate::objects::value::ToPrimitiveHint::Default) {
-                Ok(prim) => abstract_eq(&prim, rhs_val),
-                Err(_) => false,
-            }
-        }
-        (lhs_val, rhs_val) if lhs_val.is_primitive() && !rhs_val.is_primitive() => {
-            match rhs_val.to_primitive(crate::objects::value::ToPrimitiveHint::Default) {
-                Ok(prim) => abstract_eq(lhs_val, &prim),
-                Err(_) => false,
-            }
-        }
-        _ => false,
-    }
+    lhs.is_loosely_equal(rhs).unwrap_or(false)
 }
 
 /// ECMAScript §7.2.15 **Strict Equality Comparison** (`===`).
+///
+/// Delegates to [`JsValue::is_strictly_equal`] which handles all JsValue
+/// variants including Generator, Iterator, ArrayBuffer, TypedArray, DataView,
+/// and Context.
 pub(super) fn strict_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
-    match (lhs, rhs) {
-        (JsValue::Undefined, JsValue::Undefined) | (JsValue::Null, JsValue::Null) => true,
-        (JsValue::Boolean(a), JsValue::Boolean(b)) => a == b,
-        (JsValue::String(a), JsValue::String(b)) => a == b,
-        (JsValue::Symbol(a), JsValue::Symbol(b)) => a == b,
-        (JsValue::BigInt(a), JsValue::BigInt(b)) => a == b,
-        // Numeric — IEEE 754: NaN !== NaN is handled correctly by f64's PartialEq.
-        (JsValue::Smi(a), JsValue::Smi(b)) => a == b,
-        (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => a == b,
-        (JsValue::Smi(a), JsValue::HeapNumber(b)) => (*a as f64) == *b,
-        (JsValue::HeapNumber(a), JsValue::Smi(b)) => *a == (*b as f64),
-        // Object identity — pointer comparison for all object-like types.
-        (JsValue::Object(a), JsValue::Object(b)) => std::ptr::eq(*a, *b),
-        (JsValue::PlainObject(a), JsValue::PlainObject(b)) => Rc::ptr_eq(a, b),
-        (JsValue::Array(a), JsValue::Array(b)) => Rc::ptr_eq(a, b),
-        (JsValue::Function(a), JsValue::Function(b)) => Rc::ptr_eq(a, b),
-        (JsValue::NativeFunction(a), JsValue::NativeFunction(b)) => Rc::ptr_eq(a, b),
-        (JsValue::Error(a), JsValue::Error(b)) => Rc::ptr_eq(a, b),
-        (JsValue::Promise(a), JsValue::Promise(b)) => a == b,
-        (JsValue::Proxy(a), JsValue::Proxy(b)) => Rc::ptr_eq(a, b),
-        _ => false,
-    }
+    lhs.is_strictly_equal(rhs)
 }
 
 /// Construct a diagnostic error for an unexpected operand kind.
@@ -2315,6 +2235,15 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 Err(_) => JsValue::Undefined,
             };
         }
+        // If this PlainObject is an array literal, delegate to Array.prototype
+        // BEFORE falling through to Object.prototype methods (e.g. toString).
+        if borrow
+            .get("__is_array__")
+            .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
+        {
+            drop(borrow);
+            return array_literal_proto_lookup(obj, key);
+        }
         // Object.prototype methods available on all plain objects.
         match key {
             "hasOwnProperty" => {
@@ -2386,8 +2315,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             "constructor" => {
+                // Walk __proto__ chain to find constructor (set by finalize_ctor).
+                if let Some(proto) = borrow.get("__proto__").cloned() {
+                    drop(borrow);
+                    return proto_lookup(&proto, "constructor");
+                }
                 drop(borrow);
-                return JsValue::Undefined;
+                return lookup_global_constructor("Object");
             }
             "toString" => {
                 let obj_clone = obj.clone();
@@ -2401,15 +2335,115 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     Ok(JsValue::String(obj_clone.obj_to_string_tag().into()))
                 }));
             }
+            "valueOf" => {
+                let obj_clone = obj.clone();
+                drop(borrow);
+                return JsValue::NativeFunction(Rc::new(move |_args| Ok(obj_clone.clone())));
+            }
+            "toLocaleString" => {
+                let obj_clone = obj.clone();
+                drop(borrow);
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    let ts = proto_lookup(&obj_clone, "toString");
+                    dispatch_call_value(&ts, vec![obj_clone.clone()])
+                }));
+            }
+            "__lookupGetter__" => {
+                let map = Rc::clone(map);
+                drop(borrow);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let prop = match args.first() {
+                        Some(JsValue::String(s)) => s.to_string(),
+                        Some(v) => js_to_string(v),
+                        None => return Ok(JsValue::Undefined),
+                    };
+                    let getter_key = format!("__get_{prop}__");
+                    // Walk the prototype chain looking for the getter.
+                    let mut cur = JsValue::PlainObject(Rc::clone(&map));
+                    for _ in 0..256 {
+                        if let JsValue::PlainObject(ref m) = cur {
+                            let b = m.borrow();
+                            if let Some(g) = b.get(&getter_key) {
+                                return Ok(g.clone());
+                            }
+                            match b.get("__proto__") {
+                                Some(next) => {
+                                    let next = next.clone();
+                                    drop(b);
+                                    cur = next;
+                                    continue;
+                                }
+                                None => break,
+                            }
+                        }
+                        break;
+                    }
+                    Ok(JsValue::Undefined)
+                }));
+            }
+            "__lookupSetter__" => {
+                let map = Rc::clone(map);
+                drop(borrow);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let prop = match args.first() {
+                        Some(JsValue::String(s)) => s.to_string(),
+                        Some(v) => js_to_string(v),
+                        None => return Ok(JsValue::Undefined),
+                    };
+                    let setter_key = format!("__set_{prop}__");
+                    let mut cur = JsValue::PlainObject(Rc::clone(&map));
+                    for _ in 0..256 {
+                        if let JsValue::PlainObject(ref m) = cur {
+                            let b = m.borrow();
+                            if let Some(s) = b.get(&setter_key) {
+                                return Ok(s.clone());
+                            }
+                            match b.get("__proto__") {
+                                Some(next) => {
+                                    let next = next.clone();
+                                    drop(b);
+                                    cur = next;
+                                    continue;
+                                }
+                                None => break,
+                            }
+                        }
+                        break;
+                    }
+                    Ok(JsValue::Undefined)
+                }));
+            }
+            "__defineGetter__" => {
+                let map = Rc::clone(map);
+                drop(borrow);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let prop = match args.first() {
+                        Some(JsValue::String(s)) => s.to_string(),
+                        Some(v) => js_to_string(v),
+                        None => return Ok(JsValue::Undefined),
+                    };
+                    let getter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let getter_key = format!("__get_{prop}__");
+                    map.borrow_mut().insert(getter_key, getter);
+                    Ok(JsValue::Undefined)
+                }));
+            }
+            "__defineSetter__" => {
+                let map = Rc::clone(map);
+                drop(borrow);
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let prop = match args.first() {
+                        Some(JsValue::String(s)) => s.to_string(),
+                        Some(v) => js_to_string(v),
+                        None => return Ok(JsValue::Undefined),
+                    };
+                    let setter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let setter_key = format!("__set_{prop}__");
+                    map.borrow_mut().insert(setter_key, setter);
+                    Ok(JsValue::Undefined)
+                }));
+            }
             _ => {}
-        }
-        // If this PlainObject is an array literal, delegate to Array.prototype.
-        if borrow
-            .get("__is_array__")
-            .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
-        {
-            drop(borrow);
-            return array_literal_proto_lookup(obj, key);
         }
         // Walk __proto__ chain.
         if let Some(proto) = borrow.get("__proto__") {
@@ -2453,13 +2487,16 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toFixed" => {
                 let n = *n as f64;
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let digits = match args.first() {
-                        Some(JsValue::Smi(d)) => (*d).max(0) as usize,
-                        Some(JsValue::HeapNumber(d)) => {
-                            crate::builtins::util::clamped_f64_to_usize(*d)
-                        }
-                        _ => 0,
+                    let frac = match args.first() {
+                        Some(v) => v.to_number()?,
+                        None => 0.0,
                     };
+                    if frac.is_nan() || !(0.0..=100.0).contains(&frac) {
+                        return Err(StatorError::RangeError(
+                            "toFixed() digits argument must be between 0 and 100".into(),
+                        ));
+                    }
+                    let digits = frac as usize;
                     Ok(JsValue::String(format!("{n:.digits$}").into()))
                 }));
             }
@@ -2498,21 +2535,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             "constructor" => {
-                return JsValue::NativeFunction(Rc::new(|args| match args.first() {
-                    Some(v) => {
-                        let n = v.to_number()?;
-                        Ok(if n.fract() == 0.0 && n.abs() < i32::MAX as f64 {
-                            JsValue::Smi(n as i32)
-                        } else {
-                            JsValue::HeapNumber(n)
-                        })
-                    }
-                    None => Ok(JsValue::Smi(0)),
-                }));
+                return lookup_global_constructor("Number");
             }
             "@@toPrimitive" => {
                 let n = *n;
                 return JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Smi(n))));
+            }
+            "toLocaleString" => {
+                let n = *n;
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(n.to_string().into()))
+                }));
             }
             _ => {}
         },
@@ -2548,13 +2581,24 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "toFixed" => {
                 let n = *n;
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let digits = match args.first() {
-                        Some(JsValue::Smi(d)) => (*d).max(0) as usize,
-                        Some(JsValue::HeapNumber(d)) => {
-                            crate::builtins::util::clamped_f64_to_usize(*d)
-                        }
-                        _ => 0,
+                    let frac = match args.first() {
+                        Some(v) => v.to_number()?,
+                        None => 0.0,
                     };
+                    if frac.is_nan() || !(0.0..=100.0).contains(&frac) {
+                        return Err(StatorError::RangeError(
+                            "toFixed() digits argument must be between 0 and 100".into(),
+                        ));
+                    }
+                    let digits = frac as usize;
+                    if n.is_nan() {
+                        return Ok(JsValue::String("NaN".into()));
+                    }
+                    if n.is_infinite() {
+                        return Ok(JsValue::String(
+                            if n > 0.0 { "Infinity" } else { "-Infinity" }.into(),
+                        ));
+                    }
                     Ok(JsValue::String(format!("{n:.digits$}").into()))
                 }));
             }
@@ -2593,21 +2637,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             "constructor" => {
-                return JsValue::NativeFunction(Rc::new(|args| match args.first() {
-                    Some(v) => {
-                        let n = v.to_number()?;
-                        Ok(if n.fract() == 0.0 && n.abs() < i32::MAX as f64 {
-                            JsValue::Smi(n as i32)
-                        } else {
-                            JsValue::HeapNumber(n)
-                        })
-                    }
-                    None => Ok(JsValue::Smi(0)),
-                }));
+                return lookup_global_constructor("Number");
             }
             "@@toPrimitive" => {
                 let n = *n;
                 return JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::HeapNumber(n))));
+            }
+            "toLocaleString" => {
+                let n = *n;
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(format!("{n}").into()))
+                }));
             }
             _ => {}
         },
@@ -2623,17 +2663,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let idx = match args.first() {
-                        Some(JsValue::Smi(i)) => (*i).max(0) as usize,
-                        Some(JsValue::HeapNumber(n)) => {
-                            crate::builtins::util::clamped_f64_to_usize(*n)
-                        }
-                        _ => 0,
+                        Some(v) => v.to_number().unwrap_or(0.0) as i64,
+                        None => 0,
                     };
                     Ok(JsValue::String(
-                        s.chars()
-                            .nth(idx)
-                            .map_or(String::new(), |c| c.to_string())
-                            .into(),
+                        crate::builtins::string::string_char_at(&s, idx).into(),
                     ))
                 }));
             }
@@ -2641,88 +2675,66 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let idx = match args.first() {
-                        Some(JsValue::Smi(i)) => (*i).max(0) as usize,
-                        Some(JsValue::HeapNumber(n)) => {
-                            crate::builtins::util::clamped_f64_to_usize(*n)
-                        }
-                        _ => 0,
+                        Some(v) => v.to_number().unwrap_or(0.0) as i64,
+                        None => 0,
                     };
-                    Ok(s.chars()
-                        .nth(idx)
-                        .map_or(JsValue::HeapNumber(f64::NAN), |c| JsValue::Smi(c as i32)))
+                    let code = crate::builtins::string::string_char_code_at(&s, idx);
+                    if code.is_nan() {
+                        Ok(JsValue::HeapNumber(f64::NAN))
+                    } else {
+                        Ok(JsValue::Smi(code as i32))
+                    }
                 }));
             }
             "slice" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let len = s.len() as i32;
                     let start = match args.first() {
-                        Some(JsValue::Smi(i)) => {
-                            if *i < 0 {
-                                (len + *i).max(0) as usize
-                            } else {
-                                *i as usize
-                            }
-                        }
-                        Some(JsValue::HeapNumber(n)) => {
-                            let i = *n as i32;
-                            if i < 0 {
-                                (len + i).max(0) as usize
-                            } else {
-                                i as usize
-                            }
-                        }
-                        _ => 0,
+                        Some(v) => v.to_number().unwrap_or(0.0) as i64,
+                        None => 0,
                     };
                     let end = match args.get(1) {
-                        Some(JsValue::Smi(i)) => {
-                            if *i < 0 {
-                                (len + *i).max(0) as usize
-                            } else {
-                                *i as usize
-                            }
-                        }
-                        Some(JsValue::HeapNumber(n)) => {
-                            let i = *n as i32;
-                            if i < 0 {
-                                (len + i).max(0) as usize
-                            } else {
-                                i as usize
-                            }
-                        }
-                        _ => len as usize,
+                        Some(JsValue::Undefined) | None => None,
+                        Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
                     };
-                    if start >= end {
-                        Ok(JsValue::String(String::new().into()))
-                    } else {
-                        Ok(JsValue::String(
-                            s.chars()
-                                .skip(start)
-                                .take(end - start)
-                                .collect::<String>()
-                                .into(),
-                        ))
-                    }
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_slice(&s, start, end).into(),
+                    ))
                 }));
             }
             "includes" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let search = match args.first() {
-                        Some(JsValue::String(ss)) => ss.to_string(),
-                        _ => String::new(),
+                        Some(v) => v.to_js_string()?,
+                        None => "undefined".to_string(),
                     };
-                    Ok(JsValue::Boolean(s.contains(&search)))
+                    let pos = match args.get(1) {
+                        Some(JsValue::Undefined) | None => None,
+                        Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+                    };
+                    Ok(JsValue::Boolean(crate::builtins::string::string_includes(
+                        &s, &search, pos,
+                    )))
                 }));
             }
             "indexOf" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let search = match args.first() {
-                        Some(JsValue::String(ss)) => ss.to_string(),
-                        _ => String::new(),
+                        Some(v) => v.to_js_string()?,
+                        None => "undefined".to_string(),
                     };
-                    Ok(JsValue::Smi(s.find(&search).map_or(-1, |i| i as i32)))
+                    let pos = match args.get(1) {
+                        Some(JsValue::Undefined) | None => None,
+                        Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+                    };
+                    let result = crate::builtins::string::string_index_of(&s, &search, pos);
+                    if result <= i32::MAX as i64 {
+                        Ok(JsValue::Smi(result as i32))
+                    } else {
+                        Ok(JsValue::HeapNumber(result as f64))
+                    }
                 }));
             }
             "lastIndexOf" => {
@@ -2733,20 +2745,15 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         None => "undefined".to_string(),
                     };
                     let pos = match args.get(1) {
-                        Some(v) => {
-                            let n = v.to_number()?;
-                            if n.is_nan() {
-                                s.len()
-                            } else {
-                                (n as usize).min(s.len())
-                            }
-                        }
-                        None => s.len(),
+                        Some(JsValue::Undefined) | None => None,
+                        Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
                     };
-                    let haystack = &s[..pos.min(s.len())];
-                    Ok(JsValue::Smi(
-                        haystack.rfind(&search).map_or(-1, |i| i as i32),
-                    ))
+                    let result = crate::builtins::string::string_last_index_of(&s, &search, pos);
+                    if result >= i32::MIN as i64 && result <= i32::MAX as i64 {
+                        Ok(JsValue::Smi(result as i32))
+                    } else {
+                        Ok(JsValue::HeapNumber(result as f64))
+                    }
                 }));
             }
             "toUpperCase" => {
@@ -2834,40 +2841,48 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "startsWith" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let prefix = match args.first() {
-                        Some(JsValue::String(ss)) => ss.to_string(),
-                        _ => String::new(),
+                    let search = match args.first() {
+                        Some(v) => v.to_js_string()?,
+                        None => String::new(),
                     };
-                    Ok(JsValue::Boolean(s.starts_with(&prefix)))
+                    let pos = match args.get(1) {
+                        Some(JsValue::Undefined) | None => None,
+                        Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+                    };
+                    Ok(JsValue::Boolean(
+                        crate::builtins::string::string_starts_with(&s, &search, pos),
+                    ))
                 }));
             }
             "endsWith" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let suffix = match args.first() {
-                        Some(JsValue::String(ss)) => ss.to_string(),
-                        _ => String::new(),
+                    let search = match args.first() {
+                        Some(v) => v.to_js_string()?,
+                        None => String::new(),
                     };
-                    Ok(JsValue::Boolean(s.ends_with(&suffix)))
+                    let end = match args.get(1) {
+                        Some(JsValue::Undefined) | None => None,
+                        Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+                    };
+                    Ok(JsValue::Boolean(crate::builtins::string::string_ends_with(
+                        &s, &search, end,
+                    )))
                 }));
             }
             "repeat" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let count = match args.first() {
-                        Some(JsValue::Smi(n)) => i64::from(*n),
-                        Some(JsValue::HeapNumber(n)) => {
-                            let f = *n;
-                            if f.is_nan() || f.is_infinite() || f < 0.0 {
-                                return Err(crate::error::StatorError::RangeError(
-                                    "Invalid count value".to_string(),
-                                ));
-                            }
-                            f as i64
-                        }
-                        _ => 0,
+                    let count_f = match args.first() {
+                        Some(v) => v.to_number()?,
+                        None => 0.0,
                     };
-                    crate::builtins::string::string_repeat(&s, count)
+                    if count_f.is_nan() || count_f < 0.0 || count_f.is_infinite() {
+                        return Err(crate::error::StatorError::RangeError(
+                            "Invalid count value".into(),
+                        ));
+                    }
+                    crate::builtins::string::string_repeat(&s, count_f as i64)
                         .map(|r| JsValue::String(r.into()))
                 }));
             }
@@ -2887,8 +2902,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         _ => 0,
                     };
                     let pad_str = match args.get(1) {
-                        Some(JsValue::String(ss)) => ss.to_string(),
-                        _ => " ".to_string(),
+                        Some(JsValue::String(f)) => f.to_string(),
+                        Some(JsValue::Undefined) | None => " ".to_string(),
+                        Some(v) => js_to_string(v),
                     };
                     crate::builtins::string::string_pad_start(&s, target_len, Some(&pad_str))
                         .map(|r| JsValue::String(r.into()))
@@ -2910,8 +2926,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         _ => 0,
                     };
                     let pad_str = match args.get(1) {
-                        Some(JsValue::String(ss)) => ss.to_string(),
-                        _ => " ".to_string(),
+                        Some(JsValue::String(f)) => f.to_string(),
+                        Some(JsValue::Undefined) | None => " ".to_string(),
+                        Some(v) => js_to_string(v),
                     };
                     crate::builtins::string::string_pad_end(&s, target_len, Some(&pad_str))
                         .map(|r| JsValue::String(r.into()))
@@ -2955,28 +2972,16 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "substring" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let len = s.len();
                     let start = match args.first() {
-                        Some(JsValue::Smi(i)) => ((*i).max(0) as usize).min(len),
-                        Some(JsValue::HeapNumber(n)) => {
-                            crate::builtins::util::clamped_f64_to_usize(*n).min(len)
-                        }
-                        _ => 0,
+                        Some(v) => v.to_number().unwrap_or(0.0) as i64,
+                        None => 0,
                     };
                     let end = match args.get(1) {
-                        Some(JsValue::Smi(i)) => ((*i).max(0) as usize).min(len),
-                        Some(JsValue::HeapNumber(n)) => {
-                            crate::builtins::util::clamped_f64_to_usize(*n).min(len)
-                        }
-                        _ => len,
-                    };
-                    let (s0, s1) = if start <= end {
-                        (start, end)
-                    } else {
-                        (end, start)
+                        Some(JsValue::Undefined) | None => None,
+                        Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
                     };
                     Ok(JsValue::String(
-                        s.chars().skip(s0).take(s1 - s0).collect::<String>().into(),
+                        crate::builtins::string::string_substring(&s, start, end).into(),
                     ))
                 }));
             }
@@ -3024,20 +3029,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let idx = match args.first() {
-                        Some(JsValue::Smi(i)) => *i,
-                        Some(JsValue::HeapNumber(n)) => *n as i32,
-                        _ => 0,
+                        Some(v) => v.to_number()? as i64,
+                        None => 0,
                     };
-                    let len = s.chars().count() as i32;
-                    let actual = if idx < 0 { len + idx } else { idx };
-                    if actual < 0 || actual >= len {
-                        return Ok(JsValue::Undefined);
+                    match crate::builtins::string::string_at(&s, idx) {
+                        Some(ch) => Ok(JsValue::String(ch.into())),
+                        None => Ok(JsValue::Undefined),
                     }
-                    Ok(s.chars()
-                        .nth(actual as usize)
-                        .map_or(JsValue::Undefined, |c| {
-                            JsValue::String(c.to_string().into())
-                        }))
                 }));
             }
             "trimStart" | "trimLeft" => {
@@ -3076,15 +3074,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let idx = match args.first() {
-                        Some(JsValue::Smi(i)) => (*i).max(0) as usize,
-                        Some(JsValue::HeapNumber(n)) => {
-                            crate::builtins::util::clamped_f64_to_usize(*n)
-                        }
-                        _ => 0,
+                        Some(v) => v.to_number().unwrap_or(0.0) as i64,
+                        None => 0,
                     };
-                    Ok(s.chars()
-                        .nth(idx)
-                        .map_or(JsValue::Undefined, |c| JsValue::Smi(c as i32)))
+                    match crate::builtins::string::string_code_point_at(&s, idx) {
+                        Some(cp) => Ok(JsValue::Smi(cp as i32)),
+                        None => Ok(JsValue::Undefined),
+                    }
                 }));
             }
             "normalize" => {
@@ -3279,10 +3275,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             "constructor" => {
-                return JsValue::NativeFunction(Rc::new(|args| match args.first() {
-                    Some(v) => Ok(JsValue::String(v.to_js_string()?.into())),
-                    None => Ok(JsValue::String("".into())),
-                }));
+                return lookup_global_constructor("String");
             }
             "isWellFormed" => {
                 let s = s.clone();
@@ -3495,10 +3488,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 return JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Boolean(b))));
             }
             "constructor" => {
-                return JsValue::NativeFunction(Rc::new(|args| {
-                    let val = args.first().cloned().unwrap_or(JsValue::Undefined);
-                    Ok(JsValue::Boolean(val.to_boolean()))
-                }));
+                return lookup_global_constructor("Boolean");
             }
             "@@toPrimitive" => {
                 let b = *b;
@@ -3561,8 +3551,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 JsValue::Smi(n) => n.to_string(),
                                 JsValue::HeapNumber(n) => format!("{n}"),
                                 JsValue::Boolean(b) => b.to_string(),
-                                JsValue::Null => "null".to_string(),
-                                JsValue::Undefined => "".to_string(),
+                                JsValue::Null | JsValue::Undefined => String::new(),
                                 _ => String::new(),
                             })
                             .collect();
@@ -3580,8 +3569,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 JsValue::Smi(n) => n.to_string(),
                                 JsValue::HeapNumber(n) => format!("{n}"),
                                 JsValue::Boolean(b) => b.to_string(),
-                                JsValue::Null => "null".to_string(),
-                                JsValue::Undefined => "".to_string(),
+                                JsValue::Null | JsValue::Undefined => String::new(),
                                 _ => String::new(),
                             })
                             .collect();
@@ -3630,8 +3618,29 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let search = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let items = a.borrow();
+                        let len = items.len() as i32;
+                        let from = match args.get(1) {
+                            Some(JsValue::Smi(i)) => {
+                                if *i < 0 {
+                                    (len + *i).max(0) as usize
+                                } else {
+                                    (*i as usize).min(items.len())
+                                }
+                            }
+                            Some(JsValue::HeapNumber(n)) => {
+                                let i = *n as i32;
+                                if i < 0 {
+                                    (len + i).max(0) as usize
+                                } else {
+                                    (i as usize).min(items.len())
+                                }
+                            }
+                            _ => 0,
+                        };
+                        // SameValueZero: NaN === NaN, unlike strict equality
                         Ok(JsValue::Boolean(
-                            a.borrow().iter().any(|v| strict_eq(v, &search)),
+                            items[from..].iter().any(|v| v.same_value_zero(&search)),
                         ))
                     }));
                 }
@@ -3804,10 +3813,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let arr_val = JsValue::Array(Rc::clone(&a));
                         for (i, item) in a.borrow().iter().enumerate() {
                             let val = dispatch_call_value(
                                 &callback,
-                                vec![item.clone(), JsValue::Smi(i as i32)],
+                                vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if !val.to_boolean() {
                                 return Ok(JsValue::Boolean(false));
@@ -3820,10 +3830,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let arr_val = JsValue::Array(Rc::clone(&a));
                         for (i, item) in a.borrow().iter().enumerate() {
                             let val = dispatch_call_value(
                                 &callback,
-                                vec![item.clone(), JsValue::Smi(i as i32)],
+                                vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if val.to_boolean() {
                                 return Ok(JsValue::Boolean(true));
@@ -3856,11 +3867,35 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         };
                         fn flatten(items: &[JsValue], depth: u32, out: &mut Vec<JsValue>) {
                             for item in items {
-                                if depth > 0
-                                    && let JsValue::Array(inner) = item
-                                {
-                                    flatten(&inner.borrow(), depth - 1, out);
-                                    continue;
+                                if depth > 0 {
+                                    if let JsValue::Array(inner) = item {
+                                        flatten(&inner.borrow(), depth - 1, out);
+                                        continue;
+                                    }
+                                    // Also handle PlainObject arrays (from CreateArrayLiteral)
+                                    if let JsValue::PlainObject(map) = item {
+                                        let borrow = map.borrow();
+                                        if borrow
+                                            .get("__is_array__")
+                                            .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
+                                        {
+                                            let len = match borrow.get("length") {
+                                                Some(JsValue::Smi(n)) => *n as usize,
+                                                _ => 0,
+                                            };
+                                            let elems: Vec<JsValue> = (0..len)
+                                                .map(|i| {
+                                                    borrow
+                                                        .get(&i.to_string())
+                                                        .cloned()
+                                                        .unwrap_or(JsValue::Undefined)
+                                                })
+                                                .collect();
+                                            drop(borrow);
+                                            flatten(&elems, depth - 1, out);
+                                            continue;
+                                        }
+                                    }
                                 }
                                 out.push(item.clone());
                             }
@@ -3880,10 +3915,35 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 &callback,
                                 vec![item.clone(), JsValue::Smi(i as i32)],
                             )?;
-                            if let JsValue::Array(inner) = val {
-                                result.extend_from_slice(&inner.borrow());
-                            } else {
-                                result.push(val);
+                            match &val {
+                                JsValue::Array(inner) => {
+                                    result.extend_from_slice(&inner.borrow());
+                                }
+                                JsValue::PlainObject(map) => {
+                                    let borrow = map.borrow();
+                                    if borrow
+                                        .get("__is_array__")
+                                        .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
+                                    {
+                                        let len = match borrow.get("length") {
+                                            Some(JsValue::Smi(n)) => *n as usize,
+                                            _ => 0,
+                                        };
+                                        for idx in 0..len {
+                                            result.push(
+                                                borrow
+                                                    .get(&idx.to_string())
+                                                    .cloned()
+                                                    .unwrap_or(JsValue::Undefined),
+                                            );
+                                        }
+                                    } else {
+                                        result.push(val.clone());
+                                    }
+                                }
+                                _ => {
+                                    result.push(val);
+                                }
                             }
                         }
                         Ok(JsValue::new_array(result))
@@ -4191,7 +4251,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Ok(JsValue::Array(Rc::clone(&a)))
                     }));
                 }
-                "constructor" => return JsValue::Undefined,
+                "constructor" => return lookup_global_constructor("Array"),
                 "hasOwnProperty" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
@@ -4335,7 +4395,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let e2 = Rc::clone(e);
                 JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Error(Rc::clone(&e2)))))
             }
-            "constructor" => JsValue::Undefined,
+            "constructor" => lookup_global_constructor(e.kind.as_name()),
             "hasOwnProperty" => {
                 let e = Rc::clone(e);
                 JsValue::NativeFunction(Rc::new(move |args| {
@@ -4521,7 +4581,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     ))
                 }));
             }
-            "constructor" => return JsValue::Undefined,
+            "constructor" => return lookup_global_constructor("Function"),
             "hasOwnProperty" => {
                 let ba = Rc::clone(ba);
                 return JsValue::NativeFunction(Rc::new(move |args| {
@@ -4556,6 +4616,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "valueOf" => {
                 let obj_clone = obj.clone();
                 return JsValue::NativeFunction(Rc::new(move |_args| Ok(obj_clone.clone())));
+            }
+            "toLocaleString" => {
+                return JsValue::NativeFunction(Rc::new(|_args| {
+                    Ok(JsValue::String(
+                        "function () { [native code] }".to_string().into(),
+                    ))
+                }));
             }
             _ => {}
         }
@@ -4622,7 +4689,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     ))
                 }));
             }
-            "constructor" => return JsValue::Undefined,
+            "constructor" => return lookup_global_constructor("Function"),
             "hasOwnProperty" => {
                 return JsValue::NativeFunction(Rc::new(|args| {
                     let prop = match args.first() {
@@ -4649,6 +4716,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "valueOf" => {
                 let obj_clone = obj.clone();
                 return JsValue::NativeFunction(Rc::new(move |_args| Ok(obj_clone.clone())));
+            }
+            "toLocaleString" => {
+                return JsValue::NativeFunction(Rc::new(|_args| {
+                    Ok(JsValue::String(
+                        "function () { [native code] }".to_string().into(),
+                    ))
+                }));
             }
             _ => {}
         }
@@ -4775,6 +4849,67 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
         }
         break;
     }
+    // Object.prototype fallback — provide basic methods when the __proto__
+    // chain is exhausted without an explicit Object.prototype.
+    match key {
+        "hasOwnProperty" => {
+            let this = this_obj.clone();
+            return JsValue::NativeFunction(Rc::new(move |args| {
+                let prop = match args.first() {
+                    Some(JsValue::String(s)) => s.to_string(),
+                    Some(JsValue::Smi(n)) => n.to_string(),
+                    Some(JsValue::HeapNumber(n)) => format!("{n}"),
+                    Some(JsValue::Boolean(b)) => b.to_string(),
+                    Some(JsValue::Null) => "null".to_string(),
+                    Some(JsValue::Undefined) => "undefined".to_string(),
+                    _ => return Ok(JsValue::Boolean(false)),
+                };
+                if let JsValue::PlainObject(ref m) = this {
+                    return Ok(JsValue::Boolean(m.borrow().contains_key(&prop)));
+                }
+                Ok(JsValue::Boolean(false))
+            }));
+        }
+        "propertyIsEnumerable" => {
+            let this = this_obj.clone();
+            return JsValue::NativeFunction(Rc::new(move |args| {
+                let prop = match args.first() {
+                    Some(JsValue::String(s)) => s.to_string(),
+                    Some(JsValue::Smi(n)) => n.to_string(),
+                    _ => return Ok(JsValue::Boolean(false)),
+                };
+                if let JsValue::PlainObject(ref m) = this {
+                    return Ok(JsValue::Boolean(m.borrow().is_enumerable(&prop)));
+                }
+                Ok(JsValue::Boolean(false))
+            }));
+        }
+        "isPrototypeOf" => {
+            return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
+        }
+        "constructor" => return lookup_global_constructor("Object"),
+        "toString" => {
+            let this = this_obj.clone();
+            return JsValue::NativeFunction(Rc::new(move |args| {
+                if let Some(value) = args.first() {
+                    return Ok(JsValue::String(value.obj_to_string_tag().into()));
+                }
+                Ok(JsValue::String(this.obj_to_string_tag().into()))
+            }));
+        }
+        "valueOf" => {
+            let this = this_obj.clone();
+            return JsValue::NativeFunction(Rc::new(move |_args| Ok(this.clone())));
+        }
+        "toLocaleString" => {
+            let this = this_obj.clone();
+            return JsValue::NativeFunction(Rc::new(move |_args| {
+                let ts = proto_lookup(&this, "toString");
+                dispatch_call_value(&ts, vec![this.clone()])
+            }));
+        }
+        _ => {}
+    }
     JsValue::Undefined
 }
 
@@ -4893,6 +5028,18 @@ pub(super) fn wire_construct_prototype(result: JsValue, ctor_proto: &JsValue) ->
 }
 
 pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> {
+    // TypeError for keyed property access on null or undefined (ES §13.10.3).
+    if matches!(obj, JsValue::Null | JsValue::Undefined) {
+        let key_str = to_property_key(key).unwrap_or_default();
+        return Err(StatorError::TypeError(format!(
+            "Cannot read properties of {} (reading '{key_str}')",
+            if matches!(obj, JsValue::Null) {
+                "null"
+            } else {
+                "undefined"
+            }
+        )));
+    }
     match obj {
         JsValue::Proxy(_) => {
             let prop_name = to_property_key(key)?;
@@ -12796,5 +12943,707 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── proto_lookup: Object.prototype valueOf / toLocaleString ───────────
+
+    #[test]
+    fn test_proto_lookup_plain_object_valueof() {
+        let result =
+            crate::builtins::global::global_eval("var o = {x:1}; o.valueOf() === o").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_plain_object_tolocalestring() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; typeof o.toLocaleString() === 'string'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── proto_lookup: Number.prototype.toLocaleString ─────────────────────
+
+    #[test]
+    fn test_proto_lookup_smi_tolocalestring() {
+        let result =
+            crate::builtins::global::global_eval("var n = 42; n.toLocaleString()").unwrap();
+        assert_eq!(result, JsValue::String("42".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_heapnumber_tolocalestring() {
+        let result =
+            crate::builtins::global::global_eval("var n = 3.14; n.toLocaleString()").unwrap();
+        assert_eq!(result, JsValue::String("3.14".into()));
+    }
+
+    // ── proto_lookup: __lookupGetter__ / __lookupSetter__ ─────────────────
+
+    #[test]
+    fn test_proto_lookup_lookup_getter() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 42; } }); \
+             typeof o.__lookupGetter__('x') === 'function'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_lookup_setter() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { set: function(v) {} }); \
+             typeof o.__lookupSetter__('x') === 'function'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_lookup_getter_undefined_when_missing() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {x: 1}; o.__lookupGetter__('x') === undefined",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── proto_lookup: __defineGetter__ / __defineSetter__ ─────────────────
+
+    #[test]
+    fn test_proto_lookup_define_getter() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             o.__defineGetter__('x', function() { return 99; }); \
+             o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_proto_lookup_define_setter() {
+        // Verify __defineSetter__ installs a setter (the setter itself is callable).
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             o.__defineSetter__('x', function(v) {}); \
+             typeof o.__lookupSetter__('x') === 'function'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── proto_lookup: Function/NativeFunction toLocaleString ──────────────
+
+    #[test]
+    fn test_proto_lookup_function_tolocalestring() {
+        let result = crate::builtins::global::global_eval(
+            "function foo() {} typeof foo.toLocaleString() === 'string'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── proto_lookup_chain: Object.prototype fallback ─────────────────────
+
+    #[test]
+    fn test_proto_lookup_chain_tostring_fallback() {
+        // An object with a custom __proto__ still gets toString.
+        let result = crate::builtins::global::global_eval(
+            "var proto = {}; \
+             var o = Object.create(proto); \
+             typeof o.toString === 'function'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_chain_valueof_fallback() {
+        let result = crate::builtins::global::global_eval(
+            "var proto = {}; \
+             var o = Object.create(proto); \
+             typeof o.valueOf === 'function'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_chain_hasownproperty_fallback() {
+        let result = crate::builtins::global::global_eval(
+            "var proto = {}; \
+             var o = Object.create(proto); \
+             o.x = 1; \
+             o.hasOwnProperty('x')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // —— Comparison with ToPrimitive ————————————————
+
+    #[test]
+    fn test_js_less_than_with_valueof() {
+        let result = crate::builtins::global::global_eval(
+            "var a = { valueOf: function() { return 5; } }; a < 10",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_js_less_than_with_valueof_false() {
+        let result = crate::builtins::global::global_eval(
+            "var a = { valueOf: function() { return 15; } }; a < 10",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_js_greater_than_with_valueof() {
+        let result = crate::builtins::global::global_eval(
+            "var a = { valueOf: function() { return 15; } }; a > 10",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_abstract_eq_object_to_number() {
+        let result = crate::builtins::global::global_eval(
+            "var a = { valueOf: function() { return 42; } }; a == 42",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_abstract_eq_object_to_string() {
+        let result = crate::builtins::global::global_eval(
+            "var a = { toString: function() { return 'hello'; } }; a == 'hello'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_comparison_nan_object() {
+        let result = crate::builtins::global::global_eval(
+            "var a = { valueOf: function() { return NaN; } }; a < 10",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── Constructor property resolution tests ─────────────────────────
+
+    /// `[].constructor` resolves to a callable constructor.
+    #[test]
+    fn test_array_constructor_identity() {
+        // Verify the constructor property is a function (not undefined).
+        let typeof_ctor = crate::builtins::global::global_eval("typeof [].constructor").unwrap();
+        assert_eq!(typeof_ctor, JsValue::String("function".into()));
+        // Verify the constructor can create arrays.
+        let works =
+            crate::builtins::global::global_eval("Array.isArray([].constructor([]))").unwrap();
+        assert_eq!(works, JsValue::Boolean(true));
+    }
+
+    /// `(42).constructor` resolves to the global `Number` constructor.
+    #[test]
+    fn test_number_constructor_identity() {
+        let result = crate::builtins::global::global_eval("(42).constructor === Number").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `"hello".constructor` resolves to the global `String` constructor.
+    #[test]
+    fn test_string_constructor_identity() {
+        let result =
+            crate::builtins::global::global_eval("'hello'.constructor === String").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `true.constructor` resolves to the global `Boolean` constructor.
+    #[test]
+    fn test_boolean_constructor_identity() {
+        let result = crate::builtins::global::global_eval("true.constructor === Boolean").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `(function(){}).constructor` resolves to the global `Function` constructor.
+    #[test]
+    fn test_function_constructor_identity() {
+        let result =
+            crate::builtins::global::global_eval("(function(){}).constructor === Function")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Error `.constructor` resolves to the matching error constructor.
+    #[test]
+    fn test_error_constructor_identity() {
+        let result = crate::builtins::global::global_eval(
+            "try { null.x } catch(e) { e.constructor === TypeError }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Plain object `.constructor` resolves to `Object`.
+    #[test]
+    fn test_plain_object_constructor_identity() {
+        let result = crate::builtins::global::global_eval("({}).constructor === Object").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── TypeError on null / undefined property access ────────────────────
+
+    #[test]
+    fn test_null_property_access_throws() {
+        let result = compile_source_and_run("var x = null; x.foo");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_undefined_property_access_throws() {
+        let result = compile_source_and_run("var x = undefined; x.foo");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_null_method_call_throws() {
+        let result = compile_source_and_run("null.toString()");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_null_keyed_property_access_throws() {
+        let result = compile_source_and_run("var x = null; x['foo']");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_undefined_keyed_property_access_throws() {
+        let result = compile_source_and_run("var x = undefined; x['foo']");
+        assert!(result.is_err());
+    }
+
+    // ── proto_lookup: String method fast-path tests ──────────────────────
+
+    #[test]
+    fn test_proto_lookup_string_starts_with() {
+        let result = crate::builtins::global::global_eval("'hello'.startsWith('hel')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_starts_with_false() {
+        let result = crate::builtins::global::global_eval("'hello'.startsWith('ell')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_starts_with_position() {
+        let result = crate::builtins::global::global_eval("'hello'.startsWith('ell', 1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_ends_with() {
+        let result = crate::builtins::global::global_eval("'hello'.endsWith('llo')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_ends_with_false() {
+        let result = crate::builtins::global::global_eval("'hello'.endsWith('hel')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_ends_with_end_position() {
+        let result = crate::builtins::global::global_eval("'hello'.endsWith('hel', 3)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_repeat() {
+        let result = crate::builtins::global::global_eval("'ab'.repeat(3)").unwrap();
+        assert_eq!(result, JsValue::String("ababab".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_repeat_zero() {
+        let result = crate::builtins::global::global_eval("'ab'.repeat(0)").unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_pad_start() {
+        let result = crate::builtins::global::global_eval("'5'.padStart(3, '0')").unwrap();
+        assert_eq!(result, JsValue::String("005".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_pad_end() {
+        let result = crate::builtins::global::global_eval("'5'.padEnd(3, '0')").unwrap();
+        assert_eq!(result, JsValue::String("500".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_trim_start() {
+        let result = crate::builtins::global::global_eval("'  hello  '.trimStart()").unwrap();
+        assert_eq!(result, JsValue::String("hello  ".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_trim_end() {
+        let result = crate::builtins::global::global_eval("'  hello  '.trimEnd()").unwrap();
+        assert_eq!(result, JsValue::String("  hello".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_at_positive() {
+        let result = crate::builtins::global::global_eval("'hello'.at(1)").unwrap();
+        assert_eq!(result, JsValue::String("e".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_at_negative() {
+        let result = crate::builtins::global::global_eval("'hello'.at(-1)").unwrap();
+        assert_eq!(result, JsValue::String("o".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_at_out_of_range() {
+        let result = crate::builtins::global::global_eval("'hello'.at(10)").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_proto_lookup_string_includes_from_index() {
+        let result =
+            crate::builtins::global::global_eval("'hello world'.includes('world', 6)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_includes_from_index_miss() {
+        let result =
+            crate::builtins::global::global_eval("'hello world'.includes('hello', 1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_index_of_from_index() {
+        let result = crate::builtins::global::global_eval("'abcabc'.indexOf('bc', 2)").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_last_index_of() {
+        let result = crate::builtins::global::global_eval("'abcabc'.lastIndexOf('bc')").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_slice() {
+        let result = crate::builtins::global::global_eval("'hello'.slice(1, 4)").unwrap();
+        assert_eq!(result, JsValue::String("ell".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_slice_negative() {
+        let result = crate::builtins::global::global_eval("'hello'.slice(-3)").unwrap();
+        assert_eq!(result, JsValue::String("llo".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_substring() {
+        let result = crate::builtins::global::global_eval("'hello'.substring(1, 4)").unwrap();
+        assert_eq!(result, JsValue::String("ell".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_char_at() {
+        let result = crate::builtins::global::global_eval("'hello'.charAt(1)").unwrap();
+        assert_eq!(result, JsValue::String("e".into()));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_char_code_at() {
+        let result = crate::builtins::global::global_eval("'A'.charCodeAt(0)").unwrap();
+        assert_eq!(result, JsValue::Smi(65));
+    }
+
+    #[test]
+    fn test_proto_lookup_string_code_point_at() {
+        let result = crate::builtins::global::global_eval("'A'.codePointAt(0)").unwrap();
+        assert_eq!(result, JsValue::Smi(65));
+    }
+
+    // ── proto_lookup: Array method fast-path tests ───────────────────────
+
+    #[test]
+    fn test_proto_lookup_array_at_positive() {
+        let result = crate::builtins::global::global_eval("[10, 20, 30].at(1)").unwrap();
+        assert_eq!(result, JsValue::Smi(20));
+    }
+
+    #[test]
+    fn test_proto_lookup_array_at_negative() {
+        let result = crate::builtins::global::global_eval("[10, 20, 30].at(-1)").unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    #[test]
+    fn test_proto_lookup_array_find_last() {
+        let result = crate::builtins::global::global_eval(
+            "[1, 2, 3, 4].findLast(function(x) { return x % 2 === 0; })",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_proto_lookup_array_find_last_index() {
+        let result = crate::builtins::global::global_eval(
+            "[1, 2, 3, 4].findLastIndex(function(x) { return x % 2 === 0; })",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── proto_lookup: Object method fast-path tests ──────────────────────
+
+    #[test]
+    fn test_proto_lookup_object_has_own_property() {
+        let result =
+            crate::builtins::global::global_eval("var o = { x: 1 }; o.hasOwnProperty('x')")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proto_lookup_object_has_own_property_false() {
+        let result =
+            crate::builtins::global::global_eval("var o = { x: 1 }; o.hasOwnProperty('y')")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_proto_lookup_object_property_is_enumerable() {
+        let result =
+            crate::builtins::global::global_eval("var o = { x: 1 }; o.propertyIsEnumerable('x')")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Array join/toString null/undefined handling ─────────────────────────
+
+    #[test]
+    fn test_array_join_null_undefined() {
+        // null and undefined should produce empty strings in join/toString
+        let result =
+            crate::builtins::global::global_eval("var a = [1, null, undefined, 4]; a.join(',')")
+                .unwrap();
+        assert_eq!(result, JsValue::String("1,,,4".into()));
+    }
+
+    #[test]
+    fn test_array_tostring_null_elements() {
+        let result = crate::builtins::global::global_eval("[null, undefined].toString()").unwrap();
+        assert_eq!(result, JsValue::String(",".into()));
+    }
+
+    // ── Array.prototype.includes — SameValueZero ──────────────────────────────
+
+    #[test]
+    fn test_array_includes_nan() {
+        // SameValueZero: NaN is equal to NaN
+        let result = crate::builtins::global::global_eval("[NaN].includes(NaN)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_includes_basic() {
+        let result = crate::builtins::global::global_eval("[1,2,3].includes(2)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_includes_missing() {
+        let result = crate::builtins::global::global_eval("[1,2,3].includes(4)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_array_includes_from_index() {
+        // includes with fromIndex skips earlier elements
+        let result = crate::builtins::global::global_eval("[1,2,3].includes(1, 1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_array_includes_negative_from_index() {
+        // Negative fromIndex counts from end
+        let result = crate::builtins::global::global_eval("[1,2,3].includes(3, -1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Array.prototype.indexOf — strict equality (NaN !== NaN) ───────────────
+
+    #[test]
+    fn test_array_indexof_nan_not_found() {
+        // Strict equality: NaN !== NaN, so indexOf returns -1
+        let result = crate::builtins::global::global_eval("[NaN].indexOf(NaN)").unwrap();
+        assert_eq!(result, JsValue::Smi(-1));
+    }
+
+    #[test]
+    fn test_array_lastindexof_nan_not_found() {
+        let result = crate::builtins::global::global_eval("[NaN].lastIndexOf(NaN)").unwrap();
+        assert_eq!(result, JsValue::Smi(-1));
+    }
+
+    // ── Array.prototype.splice — returns removed elements ─────────────────────
+
+    #[test]
+    fn test_array_splice_returns_removed() {
+        let result =
+            crate::builtins::global::global_eval("var a = [1,2,3,4,5]; a.splice(1,2).join(',')")
+                .unwrap();
+        assert_eq!(result, JsValue::String("2,3".into()));
+    }
+
+    #[test]
+    fn test_array_splice_mutates_original() {
+        let result =
+            crate::builtins::global::global_eval("var a = [1,2,3,4,5]; a.splice(1,2); a.length")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── Array.prototype.every / some — third callback arg ─────────────────────
+
+    #[test]
+    fn test_array_every_short_circuits() {
+        // every returns false if any element fails the predicate
+        let result =
+            crate::builtins::global::global_eval("[1,2,3].every(function(x) { return x < 3; })")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_array_some_short_circuits() {
+        // some returns true if any element matches
+        let result =
+            crate::builtins::global::global_eval("[1,2,3].some(function(x) { return x === 2; })")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_every_basic_true() {
+        // every returns true when all elements satisfy the predicate
+        let result = crate::builtins::global::global_eval(
+            "[2,4,6].every(function(e) { return e % 2 === 0; })",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_some_basic_true() {
+        // some returns true when at least one element satisfies the predicate
+        let result =
+            crate::builtins::global::global_eval("[1,2,3].some(function(e) { return e > 2; })")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Array.prototype.fill ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_array_fill_all() {
+        let result = crate::builtins::global::global_eval("[1,2,3].fill(0).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("0,0,0".into()));
+    }
+
+    #[test]
+    fn test_array_fill_with_range() {
+        let result =
+            crate::builtins::global::global_eval("[1,2,3].fill(4, 1, 2).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("1,4,3".into()));
+    }
+
+    // ── Array.prototype.copyWithin ────────────────────────────────────────────
+
+    #[test]
+    fn test_array_copyin_basic() {
+        let result =
+            crate::builtins::global::global_eval("[1,2,3,4,5].copyWithin(0, 3).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("4,5,3,4,5".into()));
+    }
+
+    // ── Boolean.prototype fast-path tests ────────────────────────────────────
+
+    #[test]
+    fn test_boolean_to_string() {
+        let result = crate::builtins::global::global_eval("true.toString()").unwrap();
+        assert_eq!(result, JsValue::String("true".into()));
+    }
+
+    #[test]
+    fn test_boolean_value_of() {
+        let result = crate::builtins::global::global_eval("false.valueOf()").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── String.prototype fast-path edge-case tests ───────────────────────────
+
+    #[test]
+    fn test_string_at_positive() {
+        let result = crate::builtins::global::global_eval("'hello'.at(1)").unwrap();
+        assert_eq!(result, JsValue::String("e".into()));
+    }
+
+    #[test]
+    fn test_string_at_negative() {
+        let result = crate::builtins::global::global_eval("'hello'.at(-1)").unwrap();
+        assert_eq!(result, JsValue::String("o".into()));
+    }
+
+    #[test]
+    fn test_string_repeat() {
+        let result = crate::builtins::global::global_eval("'ab'.repeat(3)").unwrap();
+        assert_eq!(result, JsValue::String("ababab".into()));
+    }
+
+    #[test]
+    fn test_string_pad_start() {
+        let result = crate::builtins::global::global_eval("'5'.padStart(3, '0')").unwrap();
+        assert_eq!(result, JsValue::String("005".into()));
+    }
+
+    #[test]
+    fn test_string_pad_end() {
+        let result = crate::builtins::global::global_eval("'hi'.padEnd(5, '!')").unwrap();
+        assert_eq!(result, JsValue::String("hi!!!".into()));
+    }
+
+    #[test]
+    fn test_string_pad_start_default_space() {
+        let result = crate::builtins::global::global_eval("'x'.padStart(3)").unwrap();
+        assert_eq!(result, JsValue::String("  x".into()));
     }
 }

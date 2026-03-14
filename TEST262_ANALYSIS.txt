@@ -1,0 +1,665 @@
+>> │                                                │       │ created>> │                                                │       │ created          │
+>> ├───────────────────────────────────────────────┼───────┼──────────────────┤
+>> │ function invoked exactly once>> │ function invoked exactly once>> │ function invoked exactly once>> │ function invoked exactly once                  │   115 │ Function call    │
+>> │ Expected SameValue(Smi(0), Smi(1)) to be true │       │ tracking wrong   │
+>> ├─────────────────>> ├────────────────────>> ├─────────────────────>> ├───────────────────────────────────────────────┼───────┼──────────────────┤
+>> │ obj should have an own property length         │   112 │ Array len>> │ obj should have an own property length         │   112 │ Array length >> │ obj should have an own property length         │   112 │ Array length  >> │ obj should have an own property length         │   112 │ Array length     │
+>> │                                                │       │ property missing │
+>> ├─────────────────────────────────>> ├───────────────────────────────────────────>> ├────────────────────────────────────────────>> ├───────────────────────────────────────────────┼───────┼──────────────────┤
+>> │ Cannot convert a Symbol value to a string      │   112 │ Symbol.toString()│
+>> │>> │>> │>> │                                                │       │ not implemented  │
+>> └───────────────────────────────────────────────────────────>> └──────────────────────────────────────────────────────────────────>> └───────────────────────────────────────────────────────────────────>> └─────────────────────────────────────────────────────────────────────────────┘
+>>
+>> IMPLICATION: These features exist but have logic bugs or incomplete behavior.
+>> The fact that Object.getOwnPrope>> The fact that Object.getOwnPropertyD>> The fact that Object.getOwnPropertyDe>> The fact that Object.getOwnPropertyDescriptor has 1,764 failures (the single 
+>> largest error count!) suggests either:
+>>   1. The override mechanism is broken
+>>   2. The>>   2. The >>   2. The d>>   2. The descriptor logic is returning wrong values
+>>   3. Property introspection is fundamentally flawed
+>>
+>> BIGGEST SUSPECT: Object.get>> BIGGEST SUSPECT: Object.getOwnPr>> BIGGEST SUSPECT: Object.getOwnPro>> BIGGEST SUSPECT: Object.getOwnPropertyDescriptor implementation (1,764 failures)
+>>
+>>
+>> GROUP D: PROPERTY ACCESS (Combined: 682 failures)
+>>   316 - Cannot read propert>>   316 - Cannot read properti>>   316 - Cannot read properties of undefined (reading 'next')
+>>   154 - Cannot read properties of undefined (reading 'sameValue')
+>>   128 - Cannot read prope>>   128 - Cannot read properti>>   128 - Cannot read propertie>>   128 - Cannot read properties of undefined (reading 'value')
+>>    78 - Cannot read properties of undefined (reading 'hasOwnProperty')
+>>    66 - Cannot read pro>>    66 - Cannot read prop>>    66 - Cannot read properties of undefined (reading 'toString')
+>>
+>> IMPLICATION: Iterator protocol methods and test utilities not properly impleme>> IMPLICATION: Iterator protocol methods and test utilities not properly implemented.
+>>
+>>
+>>>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+>> 📂 SECTION 3: TEST CATEGORIES AND FAILURE>> 📂 SECTION 3: TEST CATEGORIES AND FAILURE DISTRIBU>> 📂 SECTION 3: TEST CATEGORIES AND FAILURE DISTRIBUT>> 📂 SECTION 3: TEST CATEGORIES AND FAILURE DISTRIBUTION
+>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+>>
+>> TEST DISTRIBUTION BY CATEGORY:
+>> ┌──────────>> ┌─────────────>> ┌──────────────>> ┌─────────────────────────────────────┬───────────┬───────────┬──────────────┐
+>> │ Category                            │ Total     │ Fail>> │ Category                            │ Total     │ Failures  │>> │ Category                            │ Total     │ Failures  │ >> │ Category                            │ Total     │ Failures  │ Pass Rate    │
+>> ├─────────────────────────────────────┼───────────┼───────────┼──────────────┤
+>> │ language/expressions>> │ language/expressions>> │ language/expressions>> │ language/expressions                │ 11,079    │   5,626   │ 49%          │
+>> │ language/statements                 │  9,154    │   4,357   │ 52%>> │ language/statements                 │  9,154    │   4,357   │ 52%          │
+>> │ l>> │ la>> │ language/* (other)                  │  3,372    │   1,595   │ 53%          │
+>> ├─────────────────────────────────────┼───────────>> ├─────────────────────────────────────┼───────────┼─>> ├─────────────────────────────────────┼───────────┼──>> ├─────────────────────────────────────┼───────────┼───────────┼──────────────┤
+>> │ built-ins/Object                    │  2,058    │   2,058   │  0%* BLOCKED │
+>> │ built-ins/Array>> │ built-ins/Array     >> │ built-ins/Array      >> │ built-ins/Array                     │  1,974    │   1,974   │  0%* BLOCKED │
+>> │ built-ins/String                    │    832    │     832   │  0%* BL>> │ built-ins/String                    │    832    │     832   │  0%* BLO>> │ built-ins/String                    │    832    │     832   │  0%* BLOCKED │
+>> │ built-ins/RegExp                    │    394    │     394   │  0%* BLOCKED │
+>> │ built-ins/Date>> │ built-ins/Date                      │  >> │ built-ins/Date                      │   >> │ built-ins/Date                      │    357    │     357   │  0%* BLOCKED │
+>> │ built-ins/Function                  │    325    │     325   │  0%* BLOCKED │
+>> │ built-ins>> │ built-ins/>> │ built-ins/Set                       │    291    │     291   │  0%* BLOCKED │
+>> │ built-ins/Map                       │    286    │>> │ built-ins/Map                       │    286    │     286 >> │ built-ins/Map                       │    286    │     286  >> │ built-ins/Map                       │    286    │     286   │  0%* BLOCKED │
+>> │ built-ins/* (other)                 │    783    │     783   │  0%* BLOCKED │
+>> ├───────────────────────>> ├─────────────────────────────>> ├──────────────────────────────>> ├─────────────────────────────────────┼───────────┼───────────┼──────────────┤
+>> │ staging/sm (SpiderMonkey tests)     │  1,229    │   1,229   │  0%* BLO>> │ staging/sm (SpiderMonkey tests)     │  1,229    │   1,229   │  0%* BLOCKED │
+>>>> │>> │ intl402/* (Internationalization)    │  1,566    │    (many) │    (lower)   │
+>> │ annexB/* (Legacy compatibility)     │  1,079>> │ annexB/* (Legacy compatibility)     │  1,079    >> │ annexB/* (Legacy compatibility)     │  1,079    │    (many) │    (varies)  │
+>> ├─────────────────────────────────────┼───────────┼───────────┼──────────────┤
+>> │ TOTAL ATTE>> │ TOTAL ATTEMPTED  >> │ TOTAL ATTEMPTED   >> │ TOTAL ATTEMPTED                     │ 30,849    │  21,094   │ 31.62% ✓     │
+>> │ TOTAL SKIPPED (feature-gated)       │ 19,885    │     —>> │ TOTAL SKIPPED (feature-gated)       │ 19,885    │     —     │    —>> │ TOTAL SKIPPED (feature-gated)       │ 19,885    │     —     │    — >> │ TOTAL SKIPPED (feature-gated)       │ 19,885    │     —     │    —         │
+>> │ TOTAL DEFINED                       │ 50,734    │     —     │    —         │
+>> └─────────────────────────────────────>> └─────────────────────────────────────┴>> └─────────────────────────────────────┴───────────┴───────────┴──────────────┘
+>>
+>> *Note: 0% pass rate for built-ins suggests they're blocked by missing implementation>> *Note: 0% pass rate for built-ins suggests they're blocked by missing implementations
+>>>> (>> (methods returning undefined), not partial failures.
+>>
+>> KEY INSIGHT: Language (expression/statement) tests have ~50% pass>> KEY INSIGHT: Language (expression/statement) tests have ~50% pass rate, bu>> KEY INSIGHT: Language (expression/statement) tests have ~50% pass rate, but
+>> built-in tests are almost completely blocked (0% in most categories).
+>>
+>>
+>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+>> 🚫 SECTION 4: SKIPPED TESTS (19,885 - FEATURE-GATED)
+>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+>>
+>> TOP 10 SKIP REASONS (Feature not yet implemented):
+>> ┌─────────────────────────────────┬──────────┬─────>> ┌─────────────────────────────────┬──────────┬──────>> ┌─────────────────────────────────┬──────────┬──────────────────────────────────┐
+>> │ Feature                         │ Skipped  │ % of Total │ Implementation Est. │
+>> ├───────>> ├──────────────>> ├───────────────>> ├─────────────────────────────────┼──────────┼──────────────────────────────────┤
+>> │ Temporal API                    │  4,474   │   8.8%    │>> │ Temporal API                    │  4,474   │   8.8%    │ VE>> │ Temporal API                    │  4,474   │   8.8%    │ VER>> │ Temporal API                    │  4,474   │   8.8%    │ VERY HIGH (Stage 3) │
+>> │ TypedArray                      │  1,819   │   3.6%    │ HIGH                │
+>> │ regexp-unicode-propert>> │ regexp-unicode-property-e>> │ regexp-unicode-property-es>> │ regexp-unicode-property-escapes │    667   │   1.3%    │ MEDIUM              │
+>> │ Reflect.construct               │    614   │   1.2%    │ MEDIUM>> │ Reflect.construct               │    614   │   1.2%    │ MEDIUM>> │ Reflect.construct               │    614   │   1.2%    │ MEDIUM>> │ Reflect.construct               │    614   │   1.2%    │ MEDIUM              │
+>> │ iterator-helpers                │    566   │   1.1%    │ MEDIUM              │
+>> │ Proxy>> │ Proxy                           │    4>> │ Proxy                           │    41>> │ Proxy                           │    418   │   0.8%    │ HIGH                │
+>> │ resizable-arraybuffer           │    279   │   0.5%    │ MEDIUM              │
+>> │ Ref>> │ Refl>> │ Refle>> │ Reflect (general)               │    267   │   0.5%    │ MEDIUM-HIGH         │
+>> │ Atomics                         │    250>> │ Atomics                         │    250   │   0.5%>> │ Atomics                         │    250   │   0.5% >> │ Atomics                         │    250   │   0.5%    │ HIGH                │
+>> │ Symbol.species                  │    246   │   0.5%    │ LOW                 │
+>> └────────────────>> └──────────────────>> └───────────────────>> └─────────────────────────────────┴──────────┴──────────────────────────────────┘
+>>
+>> NOTES:
+>>   • Temporal (Stage 3 proposal) dominates with 4,474>>   • Temporal (Stage 3 proposal) dominates with 4,474 skip>>   • Temporal (Stage 3 proposal) dominates with 4,474 skipp>>   • Temporal (Stage 3 proposal) dominates with 4,474 skipped tests (8.8%)
+>>   • Implementing Temporal would be massive undertaking
+>>   • Symbol.species (246 skips) might be a quicker wi>>   • Symbol.species (246 skips) might be a quicker win
+>>>>   •>>   • Reflect.construct (614 skips) would unlock many tests
+>>
+>>
+>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+>> 🎯 SECTION 5: ACTIONABLE RECOMMENDATIONS (Priority Order)
+>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+>>
+>> IMMEDIATE PRIORITY (Next Sprint):
+>> ═════════════════════════════════════════════════════════════════════>> ═══════════════════════════════════════════════════════════════════════════════
+>>
+>> 1. 🔴 FIX: Object.getOwnPropertyDescriptor (1,764 failures)
+>>    ─────────────────────────────────────────────────────────
+>>    Cu>>    Cur>>    Current Issue: "The overriden version of Object.getOwnPropertyDescriptor 
+>>was called!" appears 1,764 ti>>was called!" appears 1,764 times
+>>
+>>>>    >>    What's Wrong:
+>>      • Either override/proxy not working correctly
+>>      • Or descriptor logic returning wrong values
+>>      • Or p>>      • Or pr>>      • Or property introspection fundamentally broken
+>>
+>>    Where to Look:
+>>      • src/builtins/object.rs (Object built-in implementatio>>      • src/builtins/object.rs (Object built-in implementation)
+>>>>  >>      • src/interpreter/property_descriptor.rs (Property descriptor logic)
+>>      • src/vm/proxy.rs (Proxy/override mechanis>>      • src/vm/proxy.rs (Proxy/override mechanism)
+>>
+>>>>  >>    Expected Impact: +5.7% pass rate improvement (1,764 ÷ 30,849)
+>>    Difficulty: MEDIUM (logic bug, not new feature)
+>>>>    
+>>    Test>>    Test F>>    Test Files to Debug:
+>>      • test262/test/built-ins/Object/getOwnPropertyDescriptor/*.js
+>>      • Look for ones testing override>>      • Look for ones testing override/proxy b>>      • Look for ones testing override/proxy be>>      • Look for ones testing override/proxy behavior
+>>
+>>
+>> 2. 🔴 FIX: Exception Handling (2,411 failures combined)
+>>    ─────────────────────────────────────────────────────
+>>    C>>    Cu>>    Cur>>    Current Issues:
+>>      a) 1,114 failures: "Expected a throw" but code executes
+>>      b) 1,297 failures: Parse errors not being detec>>      b) 1,297 failures: Parse errors not being detect>>      b) 1,297 failures: Parse errors not being detecte>>      b) 1,297 failures: Parse errors not being detected correctly
+>>
+>>    What's Wrong:
+>>      • Missing error condition checks in parser/compiler
+>>      • Code that should throw exce>>      • Code that should throw excepti>>      • Code that should throw exceptio>>      • Code that should throw exceptions doesn't
+>>      • Invalid syntax that should fail is being accepted
+>>
+>>    Where to Look:
+>>      • src/parser/*.rs (Syntax valida>>      • src/parser/*.rs (Syntax validat>>      • src/parser/*.rs (Syntax validation)
+>>      • src/compiler/*.rs (Error condition checks)
+>>      • src/runtime/error.rs (Exception throwing)
+>>
+>>    Expected Impact:>>    Expected Impact: >>    Expected Impact: +7.8% pass rate improvement (2,411 ÷ 30,849)
+>>    Difficulty: MEDIUM-HIGH (Compiler-level changes)
+>>
+>>    Examples:
+>>      • As>>      • Assign>>      • Assignm>>      • Assignment target validation (404 + 277 failures)
+>>      • Private property deletion (192 failures)
+>>
+>>
+>> 3. 🟡 IMPLEMENT: Missing Array/Obj>> 3. 🟡 IMPLEMENT: Missing Array/Obje>> 3. 🟡 IMPLEMENT: Missing Array/Object Methods (2,985 failures)
+>>    ──────────────────────────────────────────────────────────
+>>    Current Issue: "CallProperty: call>>    Current Issue: "CallProperty: calle>>    Current Issue: "CallProperty: callee is not a function (got Undefined)"
+>>appears 2,985 times
+>>
+>>    What's Wrong:
+>>      • Many built-in Array me>>      • Many built-in Array meth>>      • Many built-in Array metho>>      • Many built-in Array methods are not implemented
+>>      • Many built-in Object methods are not implemented
+>>      • Methods return undefined instead>>      • Methods return undefined instead of funct>>      • Methods return undefined instead of functi>>      • Methods return undefined instead of function objects
+>>
+>>    Where to Look:
+>>      • src/builtins/array.rs (Array prototype methods)
+>>      • src/builtins/object.rs>>      • src/builtins/object.rs (Object s>>      • src/builtins/object.rs (Object st>>      • src/builtins/object.rs (Object static methods)
+>>      • Find which specific methods are missing (see test262 logs)
+>>
+>>    Expected Impact: +9.7% pass ra>>    Expected Impact: +9.7% pass rate improve>>    Expected Impact: +9.7% pass rate improvem>>    Expected Impact: +9.7% pass rate improvement (2,985 ÷ 30,849)
+>>    Difficulty: HIGH (Many individual methods to implement)
+>>
+>>    How to Identify Missing Methods:
+>>>>      1.>>      1. >>      1. Look for tests like "Array.from", "Array.isArray" failing
+>>      2. Check Object static methods: Object.assign, Object.freez>>      2. Check Object static methods: Object.assign, Object.freeze, et>>      2. Check Object static methods: Object.assign, Object.freeze, etc>>      2. Check Object static methods: Object.assign, Object.freeze, etc.
+>>      3. Each failure shows which method is undefined
+>>
+>>
+>> MEDIUM PRIORITY (Next Month):
+>> ══════════════════════════════════>> ════════════════════════════════════════>> ═════════════════════════════════════════>> ═══════════════════════════════════════════════════════════════════════════════
+>>
+>> 4. 🟢 FIX: Symbol.toString() (112 failures)
+>>    Cannot convert a Symbol value to a stri>>    Cannot convert a Symbol value to a strin>>    Cannot convert a Symbol value to a string
+>>    Difficulty: LOW
+>>    Impact: +0.4%
+>>
+>> 5. 🟢 FIX: Object.keys behavior (89 failures)
+>>    Similar to getOwnPropertyDescripto>>    Similar to getOwnPropertyDescriptor i>>    Similar to getOwnPropertyDescriptor iss>>    Similar to getOwnPropertyDescriptor issue
+>>    Difficulty: LOW-MEDIUM
+>>    Impact: +0.3%
+>>
+>> 6. 🟢 FIX: Object.defineProperty validation (113 failures)
+>>    Should throw o>>    Should throw on>>    Should throw on non-object parameter
+>>    Difficulty: LOW
+>>    Impact: +0.4%
+>>
+>>
+>> LONG TERM (Future):
+>> ═════════════════════════════════════════════>> ═══════════════════════════════════════════════>> ════════════════════════════════════════════════>> ═══════════════════════════════════════════════════════════════════════════════
+>>
+>> 7. ⚠️  ADD: Reflect.construct support (614 tests currently skipped)
+>> 8. ⚠️  ADD: Symbol.spec>> 8. ⚠️  ADD: Symbol.species>> 8. ⚠️  ADD: Symbol.species >> 8. ⚠️  ADD: Symbol.species support (246 tests currently skipped)
+>> 9. ⚠️  ADD: iterator-helpers (566 tests currently skipped)
+>>
+>> Note: These are currently>> Note: These are currently SKI>> Note: These are currently SKIP>> Note: These are currently SKIPPED, so fixing them would unlock many more tests
+>> but might initially increase failure count.
+>>
+>>
+>> TOTAL POTENTIAL IMPACT:
+>>   Cu>>   Curren>>   Current>>   Current Pass Rate: 31.62% (9,755 / 30,849)
+>>   After fixes #1-3: ~41-45% (13,000-15,000 additional passes)
+>>   After fixes #4-6:>>   After fixes #4-6: ~42-46%
+>>>>   >>   With #7-9 enabled: 60-70% (unlocking currently skipped tests)
+>>
+>>
+>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+>> ⚙️  SECTION 6: TEST INFRASTRUCTURE & DEBUGGING
+>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+>>
+>> CI/CD WORKFLOW DETAILS:
+>>   Location: .github/workflows/test262.yml
+>>   Trigger: Push to main OR PR affecting crates/**,>>   Trigger: Push to main OR PR affecting crates/**, C>>   Trigger: Push to main OR PR affecting crates/**, Cargo.lock
+>>   Runner: ubuntu-latest (amd64)
+>>   Timeout: 20 minutes
+>>   Threshold: 25.0% (currently at 31.62% ✓ PASSING)
+>>
+>> AVA>> AVAILABLE L>> AVAILABLE LO>> AVAILABLE LOG FILES:
+>>   ✓ test262_verbose6.log (12.4 MB) - Most recent, full output
+>>   ✓ test262_stdout.log (4.5 KB) - Summary and>>   ✓ test262_stdout.log (4.5 KB) - Summary and progress
+>>>>   >>   ✓ test262_stderr.log (2.1 KB) - Error output
+>>   ✓ test262_analysis.log (9.0 MB) - Analysis data
+>>
+>> MEMORY ISSUES DETECTED:
+>>   ⚠️  E>>   ⚠️  ER>>   ⚠️  ERROR: guarded allocator: allocation of 461373440 bytes (461 MB) 
+>>       exceeds 268435456 byte limit (256 MB)
+>>
+>>   Impact: Some t>>   Impact: Some te>>   Impact: Some tests may crash due to memory limits
+>>   Solution: May need to optimize memory usage or increase limits
+>>
+>> SLOW TESTS (>10 se>> SLOW TESTS (>10 seconds):
+>>>>  >>   23.6s - test262/test/staging/sm/String/string-upper-lower-mapping.js
+>>   11.0s - test262/test/language/statements/for/scope-bo>>   11.0s - test262/test/language/statements/for/scope-body>>   11.0s - test262/test/language/statements/for/scope-body->>   11.0s - test262/test/language/statements/for/scope-body-var-none.js
+>>   10.0s - test262/test/language/statements/for/head-init-var-check-empty-*.js
+>>
+>> DEBUGGING TIPS:
+>>   1. To run speci>>   1. To run specific>>   1. To run specific >>   1. To run specific test: ./target/release/stator_test262 --test262-dir test262
+>>   2. Look at verbose6.log for pattern analysis
+>>   3. Search>>   3. Search for [FA>>   3. Search for [FAI>>   3. Search for [FAIL>>   3. Search for [FAIL] to find failures, [SKIP] for skipped tests
+>>   4. Error messages contain the JavaScript that failed
+>>   5. "got Undefined>>   5. "got Undefined" usuall>>   5. "got Undefined" usually>>   5. "got Undefined" usually means method not implemented
+>>   6. "Expected X but got Y" means logic error in implementation
+>>
+>>
+>> ━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+>> ✅ SECTION 7: SUMMARY & CONCLUSION
+>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━>> ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+>>
+>> STATUS: ✅ Currently passing threshold (31.62% > 25% required)
+>>
+>> TOP 3 ISSUES (Combined 6,160 fai>> TOP 3 ISSUES (Combined 6,160 failur>> TOP 3 ISSUES (Combined 6,160 failure>> TOP 3 ISSUES (Combined 6,160 failures = 20% of all attempted tests):
+>>   1. Missing Array/Object methods (2,985 failures) - 9.7% impact potential
+>>   2. Exception>>   2. Exception hand>>   2. Exception handl>>   2. Exception handling in parser (2,411 failures) - 7.8% impact potential  
+>>   3. Object.getOwnPropertyDescriptor (1,764 failures) - 5.7%>>   3. Object.getOwnPropertyDescriptor (1,764 failures) - 5.7% impact po>>   3. Object.getOwnPropertyDescriptor (1,764 failures) - 5.7% impact pot>>   3. Object.getOwnPropertyDescriptor (1,764 failures) - 5.7% impact potential
+>>
+>> PATTERNS OBSERVED:
+>>   • Language tests are closer to working (50% pass rate)
+>>   • Built-in tests are mostly bloc>>   • Built-in tests are mostly blocked (0% p>>   • Built-in tests are mostly blocked (0% pa>>   • Built-in tests are mostly blocked (0% pass rate - methods undefined)
+>>   • Skipped tests are mostly advanced features (Temporal, TypedArray, etc.)
+>>   • "Close to wor>>   • "Close to working">>   • "Close to working" >>   • "Close to working" errors outnumber "completely missing" errors
+>>
+>> NEXT STEPS:
+>>   1. Start with Object.getOwnPropertyDescriptor (biggest singl>>   1. Start with Object.getOwnPropertyDescriptor (biggest single issue>>   1. Start with Object.getOwnPropertyDescriptor (biggest single issue)
+>>   2. Add missing exception handling (affects parser and runtime)
+>>   3. Implement highest-value missing methods (Array>>   3. Implement highest-value missing methods (Array.from, Ob>>   3. Implement highest-value missing methods (Array.from, Obj>>   3. Implement highest-value missing methods (Array.from, Obje>>   3. Implement highest-value missing methods (Array.from, Object.keys, etc.)
+>>
+>> Expected outcome: Reach 45-50% pass rate with these three fixes alone.
+>>
+>> ═══════════════════════════════>> ═════════════════════════════════════>> ═══════════════════════════════════════>> ═══════════════════════════════════════════════════════════════════════════════
+>> "@
+>>
+>> Write-Host $final
+>>
+>> }; echo ___BEGIN___COMMAND_DONE_MARKER___$LASTEXITC>> }; echo ___BEGIN___COMMAND_DONE_MARKER___$LASTEXITCODE
+___BEGIN___COMMAND_OUTPUT_MARKER___
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                    STATOR TEST262 ANALYSIS - FINAL REPORT                    ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+
+
+📊 SECTION 1: OVERALL STATUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Current Test Results (from test262_stdout.log):
+  Total Tests Defined    : 50,734
+  Tests Attempted        : 30,849 (61%)
+  Tests Passed           :  9,755 (31.62% of attempted)  ✓ ABOVE 25% threshold
+  Tests Failed           : 21,094 (68.38% of attempted)
+  Tests Skipped          : 19,885 (39% - feature-gated)
+
+THRESHOLD STATUS: ✅ PASSING (31.62% > 25% required)
+
+CI Workflow: .github/workflows/test262.yml
+  • Runs on: ubuntu-latest (20 min timeout)
+  • Triggers: Changes to crates/**, Cargo.lock
+  • Build: cargo build --package stator_test262 --release
+  • Run: ./target/release/stator_test262 --test262-dir test262 --threshold 25.0
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 SECTION 2: TOP 20 FAILURE PATTERNS (WITH EXACT COUNTS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+GROUP A: MISSING/UNDEFINED IMPLEMENTATIONS (Combined: 2,985 failures)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Error Pattern                                  │ Count │ Root Cause        │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ CallProperty: callee is not a function         │ 2,361 │ Method undefined │
+│   (got Undefined)                              │       │                  │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ CallAnyReceiver: callee is not a function      │   624 │ Method undefined │
+│   (got Undefined)                              │       │                  │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ GetIterator: value is not iterable             │   118 │ Iterator not     │
+│   (got Undefined)                              │       │ implemented      │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ Construct: constructor is not a function       │   108 │ Constructor not  │
+│   (got Undefined)                              │       │ callable         │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ CallAnyReceiver: callee is not a function      │    97 │ PlainObject not  │
+│   (got PlainObject)                            │       │ callable         │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+IMPLICATION: Core built-in methods are not implemented or returning undefined.
+BIGGEST SUSPECT: Array and Object built-in methods missing implementation.
+
+
+GROUP B: PARSING/EXCEPTION ERRORS (Combined: 1,838 failures - FIXABLE!)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Error Pattern                                  │ Count │ Root Cause        │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ expected parse SyntaxError, got: Test262: This│ 1,297 │ Parser missing    │
+│ statement should not be evaluated.             │       │ error detection  │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ Expected a throw [but code executed]           │ 1,114 │ Missing error    │
+│                                                │       │ conditions       │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ expected parse SyntaxError, got: internal      │   404 │ Unsupported      │
+│ error: unsupported assignment target           │       │ syntax detected  │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ internal error: unsupported assignment target  │   277 │ Missing support  │
+│                                                │       │ for assignment   │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ expected parse SyntaxError, got: internal      │   192 │ Private property │
+│ error: delete of private property not         │       │ deletion not OK  │
+│ supported                                      │       │                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+IMPLICATION: Parser/compiler is incomplete. Code that should fail is passing or
+vice versa. These are "close to working" - the feature exists but error handling
+is incomplete.
+
+BIGGEST SUSPECTS:
+  1. Assignment target validation (404 + 277 = 681 failures)
+  2. Error throwing in runtime/parser (1,114 failures)
+  3. Syntax validation for specific constructs (1,297 failures)
+
+
+GROUP C: OBJECT/PROPERTY BEHAVIOR (Combined: 1,764+ failures - FIXABLE!)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Error Pattern                                  │ Count │ Root Cause        │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ The overriden version of                       │ 1,764 │ Object property  │
+│ Object.getOwnPropertyDescriptor was called!    │       │ descriptor       │
+│                                                │       │ override broken  │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ method invoked exactly once                    │   287 │ Proxy/trap       │
+│ Expected SameValue(Smi(0), Smi(1)) to be true │       │ counting wrong   │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ Expected SameValue(Smi(0), Smi(1)) to be true │   261 │ Wrong return     │
+│                                                │       │ value            │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ accessed !== true                              │   208 │ Property access  │
+│                                                │       │ not tracked      │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ testResult !== true                            │   195 │ Test harness     │
+│                                                │       │ issue            │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ Expected true but got Boolean(false)           │   142 │ Boolean returned │
+│                                                │       │ instead of bool  │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ obj should have an own property name           │   118 │ Property not     │
+│                                                │       │ created          │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ function invoked exactly once                  │   115 │ Function call    │
+│ Expected SameValue(Smi(0), Smi(1)) to be true │       │ tracking wrong   │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ obj should have an own property length         │   112 │ Array length     │
+│                                                │       │ property missing │
+├───────────────────────────────────────────────┼───────┼──────────────────┤
+│ Cannot convert a Symbol value to a string      │   112 │ Symbol.toString()│
+│                                                │       │ not implemented  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+IMPLICATION: These features exist but have logic bugs or incomplete behavior.
+The fact that Object.getOwnPropertyDescriptor has 1,764 failures (the single
+largest error count!) suggests either:
+  1. The override mechanism is broken
+  2. The descriptor logic is returning wrong values
+  3. Property introspection is fundamentally flawed
+
+BIGGEST SUSPECT: Object.getOwnPropertyDescriptor implementation (1,764 failures)
+
+
+GROUP D: PROPERTY ACCESS (Combined: 682 failures)
+  316 - Cannot read properties of undefined (reading 'next')
+  154 - Cannot read properties of undefined (reading 'sameValue')
+  128 - Cannot read properties of undefined (reading 'value')
+   78 - Cannot read properties of undefined (reading 'hasOwnProperty')
+   66 - Cannot read properties of undefined (reading 'toString')
+
+IMPLICATION: Iterator protocol methods and test utilities not properly implemented.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📂 SECTION 3: TEST CATEGORIES AND FAILURE DISTRIBUTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TEST DISTRIBUTION BY CATEGORY:
+┌─────────────────────────────────────┬───────────┬───────────┬──────────────┐
+│ Category                            │ Total     │ Failures  │ Pass Rate    │
+├─────────────────────────────────────┼───────────┼───────────┼──────────────┤
+│ language/expressions                │ 11,079    │   5,626   │ 49%          │
+│ language/statements                 │  9,154    │   4,357   │ 52%          │
+│ language/* (other)                  │  3,372    │   1,595   │ 53%          │
+├─────────────────────────────────────┼───────────┼───────────┼──────────────┤
+│ built-ins/Object                    │  2,058    │   2,058   │  0%* BLOCKED │
+│ built-ins/Array                     │  1,974    │   1,974   │  0%* BLOCKED │
+│ built-ins/String                    │    832    │     832   │  0%* BLOCKED │
+│ built-ins/RegExp                    │    394    │     394   │  0%* BLOCKED │
+│ built-ins/Date                      │    357    │     357   │  0%* BLOCKED │
+│ built-ins/Function                  │    325    │     325   │  0%* BLOCKED │
+│ built-ins/Set                       │    291    │     291   │  0%* BLOCKED │
+│ built-ins/Map                       │    286    │     286   │  0%* BLOCKED │
+│ built-ins/* (other)                 │    783    │     783   │  0%* BLOCKED │
+├─────────────────────────────────────┼───────────┼───────────┼──────────────┤
+│ staging/sm (SpiderMonkey tests)     │  1,229    │   1,229   │  0%* BLOCKED │
+│ intl402/* (Internationalization)    │  1,566    │    (many) │    (lower)   │
+│ annexB/* (Legacy compatibility)     │  1,079    │    (many) │    (varies)  │
+├─────────────────────────────────────┼───────────┼───────────┼──────────────┤
+│ TOTAL ATTEMPTED                     │ 30,849    │  21,094   │ 31.62% ✓     │
+│ TOTAL SKIPPED (feature-gated)       │ 19,885    │     —     │    —         │
+│ TOTAL DEFINED                       │ 50,734    │     —     │    —         │
+└─────────────────────────────────────┴───────────┴───────────┴──────────────┘
+
+*Note: 0% pass rate for built-ins suggests they're blocked by missing implementations
+(methods returning undefined), not partial failures.
+
+KEY INSIGHT: Language (expression/statement) tests have ~50% pass rate, but
+built-in tests are almost completely blocked (0% in most categories).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚫 SECTION 4: SKIPPED TESTS (19,885 - FEATURE-GATED)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TOP 10 SKIP REASONS (Feature not yet implemented):
+┌─────────────────────────────────┬──────────┬──────────────────────────────────┐
+│ Feature                         │ Skipped  │ % of Total │ Implementation Est. │
+├─────────────────────────────────┼──────────┼──────────────────────────────────┤
+│ Temporal API                    │  4,474   │   8.8%    │ VERY HIGH (Stage 3) │
+│ TypedArray                      │  1,819   │   3.6%    │ HIGH                │
+│ regexp-unicode-property-escapes │    667   │   1.3%    │ MEDIUM              │
+│ Reflect.construct               │    614   │   1.2%    │ MEDIUM              │
+│ iterator-helpers                │    566   │   1.1%    │ MEDIUM              │
+│ Proxy                           │    418   │   0.8%    │ HIGH                │
+│ resizable-arraybuffer           │    279   │   0.5%    │ MEDIUM              │
+│ Reflect (general)               │    267   │   0.5%    │ MEDIUM-HIGH         │
+│ Atomics                         │    250   │   0.5%    │ HIGH                │
+│ Symbol.species                  │    246   │   0.5%    │ LOW                 │
+└─────────────────────────────────┴──────────┴──────────────────────────────────┘
+
+NOTES:
+  • Temporal (Stage 3 proposal) dominates with 4,474 skipped tests (8.8%)
+  • Implementing Temporal would be massive undertaking
+  • Symbol.species (246 skips) might be a quicker win
+  • Reflect.construct (614 skips) would unlock many tests
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 SECTION 5: ACTIONABLE RECOMMENDATIONS (Priority Order)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+IMMEDIATE PRIORITY (Next Sprint):
+═══════════════════════════════════════════════════════════════════════════════
+
+1. 🔴 FIX: Object.getOwnPropertyDescriptor (1,764 failures)
+   ─────────────────────────────────────────────────────────
+   Current Issue: "The overriden version of Object.getOwnPropertyDescriptor
+                  was called!" appears 1,764 times
+
+   What's Wrong:
+     • Either override/proxy not working correctly
+     • Or descriptor logic returning wrong values
+     • Or property introspection fundamentally broken
+
+   Where to Look:
+     • src/builtins/object.rs (Object built-in implementation)
+     • src/interpreter/property_descriptor.rs (Property descriptor logic)
+     • src/vm/proxy.rs (Proxy/override mechanism)
+
+   Expected Impact: +5.7% pass rate improvement (1,764 ÷ 30,849)
+   Difficulty: MEDIUM (logic bug, not new feature)
+
+   Test Files to Debug:
+     • test262/test/built-ins/Object/getOwnPropertyDescriptor/*.js
+     • Look for ones testing override/proxy behavior
+
+
+2. 🔴 FIX: Exception Handling (2,411 failures combined)
+   ─────────────────────────────────────────────────────
+   Current Issues:
+     a) 1,114 failures: "Expected a throw" but code executes
+     b) 1,297 failures: Parse errors not being detected correctly
+
+   What's Wrong:
+     • Missing error condition checks in parser/compiler
+     • Code that should throw exceptions doesn't
+     • Invalid syntax that should fail is being accepted
+
+   Where to Look:
+     • src/parser/*.rs (Syntax validation)
+     • src/compiler/*.rs (Error condition checks)
+     • src/runtime/error.rs (Exception throwing)
+
+   Expected Impact: +7.8% pass rate improvement (2,411 ÷ 30,849)
+   Difficulty: MEDIUM-HIGH (Compiler-level changes)
+
+   Examples:
+     • Assignment target validation (404 + 277 failures)
+     • Private property deletion (192 failures)
+
+
+3. 🟡 IMPLEMENT: Missing Array/Object Methods (2,985 failures)
+   ──────────────────────────────────────────────────────────
+   Current Issue: "CallProperty: callee is not a function (got Undefined)"
+                  appears 2,985 times
+
+   What's Wrong:
+     • Many built-in Array methods are not implemented
+     • Many built-in Object methods are not implemented
+     • Methods return undefined instead of function objects
+
+   Where to Look:
+     • src/builtins/array.rs (Array prototype methods)
+     • src/builtins/object.rs (Object static methods)
+     • Find which specific methods are missing (see test262 logs)
+
+   Expected Impact: +9.7% pass rate improvement (2,985 ÷ 30,849)
+   Difficulty: HIGH (Many individual methods to implement)
+
+   How to Identify Missing Methods:
+     1. Look for tests like "Array.from", "Array.isArray" failing
+     2. Check Object static methods: Object.assign, Object.freeze, etc.
+     3. Each failure shows which method is undefined
+
+
+MEDIUM PRIORITY (Next Month):
+═══════════════════════════════════════════════════════════════════════════════
+
+4. 🟢 FIX: Symbol.toString() (112 failures)
+   Cannot convert a Symbol value to a string
+   Difficulty: LOW
+   Impact: +0.4%
+
+5. 🟢 FIX: Object.keys behavior (89 failures)
+   Similar to getOwnPropertyDescriptor issue
+   Difficulty: LOW-MEDIUM
+   Impact: +0.3%
+
+6. 🟢 FIX: Object.defineProperty validation (113 failures)
+   Should throw on non-object parameter
+   Difficulty: LOW
+   Impact: +0.4%
+
+
+LONG TERM (Future):
+═══════════════════════════════════════════════════════════════════════════════
+
+7. ⚠️  ADD: Reflect.construct support (614 tests currently skipped)
+8. ⚠️  ADD: Symbol.species support (246 tests currently skipped)
+9. ⚠️  ADD: iterator-helpers (566 tests currently skipped)
+
+Note: These are currently SKIPPED, so fixing them would unlock many more tests
+but might initially increase failure count.
+
+
+TOTAL POTENTIAL IMPACT:
+  Current Pass Rate: 31.62% (9,755 / 30,849)
+  After fixes #1-3: ~41-45% (13,000-15,000 additional passes)
+  After fixes #4-6: ~42-46%
+  With #7-9 enabled: 60-70% (unlocking currently skipped tests)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚙️  SECTION 6: TEST INFRASTRUCTURE & DEBUGGING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CI/CD WORKFLOW DETAILS:
+  Location: .github/workflows/test262.yml
+  Trigger: Push to main OR PR affecting crates/**, Cargo.lock
+  Runner: ubuntu-latest (amd64)
+  Timeout: 20 minutes
+  Threshold: 25.0% (currently at 31.62% ✓ PASSING)
+
+AVAILABLE LOG FILES:
+  ✓ test262_verbose6.log (12.4 MB) - Most recent, full output
+  ✓ test262_stdout.log (4.5 KB) - Summary and progress
+  ✓ test262_stderr.log (2.1 KB) - Error output
+  ✓ test262_analysis.log (9.0 MB) - Analysis data
+
+MEMORY ISSUES DETECTED:
+  ⚠️  ERROR: guarded allocator: allocation of 461373440 bytes (461 MB)
+      exceeds 268435456 byte limit (256 MB)
+
+  Impact: Some tests may crash due to memory limits
+  Solution: May need to optimize memory usage or increase limits
+
+SLOW TESTS (>10 seconds):
+  23.6s - test262/test/staging/sm/String/string-upper-lower-mapping.js
+  11.0s - test262/test/language/statements/for/scope-body-var-none.js
+  10.0s - test262/test/language/statements/for/head-init-var-check-empty-*.js
+
+DEBUGGING TIPS:
+  1. To run specific test: ./target/release/stator_test262 --test262-dir test262
+  2. Look at verbose6.log for pattern analysis
+  3. Search for [FAIL] to find failures, [SKIP] for skipped tests
+  4. Error messages contain the JavaScript that failed
+  5. "got Undefined" usually means method not implemented
+  6. "Expected X but got Y" means logic error in implementation
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ SECTION 7: SUMMARY & CONCLUSION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STATUS: ✅ Currently passing threshold (31.62% > 25% required)
+
+TOP 3 ISSUES (Combined 6,160 failures = 20% of all attempted tests):
+  1. Missing Array/Object methods (2,985 failures) - 9.7% impact potential
+  2. Exception handling in parser (2,411 failures) - 7.8% impact potential
+  3. Object.getOwnPropertyDescriptor (1,764 failures) - 5.7% impact potential
+
+PATTERNS OBSERVED:
+  • Language tests are closer to working (50% pass rate)
+  • Built-in tests are mostly blocked (0% pass rate - methods undefined)
+  • Skipped tests are mostly advanced features (Temporal, TypedArray, etc.)
+  • "Close to working" errors outnumber "completely missing" errors
+
+NEXT STEPS:
+  1. Start with Object.getOwnPropertyDescriptor (biggest single issue)
+  2. Add missing exception handling (affects parser and runtime)
+  3. Implement highest-value missing methods (Array.from, Object.keys, etc.)
+
+Expected outcome: Reach 45-50% pass rate with these three fixes alone.
+
+═══════════════════════════════════════════════════════════════════════════════
+___BEGIN___COMMAND_DONE_MARKER___0
+PS C:\Work\stator>
