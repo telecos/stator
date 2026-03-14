@@ -54,6 +54,7 @@ jobs:
         # advanced, tail-call-optimization, globalThis.
         env:
           RUST_MIN_STACK: "33554432"   # 32 MiB for spawned threads
+          RUST_BACKTRACE: "1"
         run: |
           ./target/release/stator_test262 \
             --test262-dir test262 \
