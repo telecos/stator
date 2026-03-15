@@ -12,6 +12,7 @@ jobs:
   bench:
     name: Run benchmarks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -25,4 +26,4 @@ jobs:
           shared-key: "bench"
 
       - name: Run benchmarks
-        run: cargo bench --package stator_core
+        run: cargo bench --package stator_core -- --warm-up-time 1 --measurement-time 3 --sample-size 20
