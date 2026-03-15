@@ -3357,7 +3357,7 @@ fn handle_test_type_of(
         2 => matches!(ctx.frame.accumulator, JsValue::Symbol(_)),
         3 => matches!(ctx.frame.accumulator, JsValue::Boolean(_)),
         4 => matches!(ctx.frame.accumulator, JsValue::BigInt(_)),
-        5 => matches!(ctx.frame.accumulator, JsValue::Undefined),
+        5 => matches!(ctx.frame.accumulator, JsValue::Undefined | JsValue::TheHole),
         6 => match &ctx.frame.accumulator {
             JsValue::Function(_) | JsValue::NativeFunction(_) => true,
             JsValue::PlainObject(map) => map.borrow().get("__call__").is_some(),
@@ -4096,6 +4096,19 @@ fn handle_test_instance_of(
         return Err(err_bad_operand("TestInstanceOf", 0));
     };
     let constructor = ctx.frame.read_reg(v)?.clone();
+
+    // §7.3.21 OrdinaryHasInstance — RHS must be callable, else TypeError.
+    let rhs_callable = match &constructor {
+        JsValue::Function(_) | JsValue::NativeFunction(_) => true,
+        JsValue::PlainObject(map) => map.borrow().contains_key("__call__"),
+        JsValue::Proxy(p) => p.borrow().is_callable(),
+        _ => false,
+    };
+    if !rhs_callable {
+        return Err(StatorError::TypeError(
+            "Right-hand side of 'instanceof' is not callable".to_string(),
+        ));
+    }
 
     // §7.3.21 OrdinaryHasInstance — first check @@hasInstance
     let has_instance_fn = match &constructor {
@@ -7566,6 +7579,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// §7.3.21: `instanceof` with a non-callable RHS must throw TypeError.
+    #[test]
+    fn e2e_instanceof_non_callable_rhs_throws() {
+        let result = crate::builtins::global::global_eval("1 instanceof 42");
+        assert!(
+            result.is_err(),
+            "instanceof with non-callable RHS should throw TypeError"
+        );
+    }
+
+    /// `instanceof` with null RHS must throw TypeError.
+    #[test]
+    fn e2e_instanceof_null_rhs_throws() {
+        let result = crate::builtins::global::global_eval("({}) instanceof null");
+        assert!(
+            result.is_err(),
+            "instanceof with null RHS should throw TypeError"
+        );
+    }
+
+    /// `instanceof` with undefined RHS must throw TypeError.
+    #[test]
+    fn e2e_instanceof_undefined_rhs_throws() {
+        let result = crate::builtins::global::global_eval("({}) instanceof undefined");
+        assert!(
+            result.is_err(),
+            "instanceof with undefined RHS should throw TypeError"
+        );
     }
 
     // ── Template literal improvements ───────────────────────────────

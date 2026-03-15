@@ -8273,6 +8273,22 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
+    #[test]
+    fn test_testtypeof_undefined_for_thehole() {
+        // TestTypeOf flag=5 (undefined) on TheHole → true
+        // Consistent with TypeOf which maps TheHole → "undefined".
+        let result = run_with_acc_and_regs(
+            JsValue::TheHole,
+            &[],
+            vec![Instruction::new_unchecked(
+                Opcode::TestTypeOf,
+                vec![Operand::Flag(5)],
+            )],
+            0,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
     // ── ToNumber ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -9259,6 +9275,17 @@ mod tests {
         instrs: Vec<Instruction>,
         frame_size: u32,
     ) -> JsValue {
+        run_with_acc_and_regs_result(acc, regs, instrs, frame_size).unwrap()
+    }
+
+    /// Like [`run_with_acc_and_regs`] but returns the full `StatorResult` so
+    /// callers can assert on expected errors.
+    fn run_with_acc_and_regs_result(
+        acc: JsValue,
+        regs: &[JsValue],
+        instrs: Vec<Instruction>,
+        frame_size: u32,
+    ) -> StatorResult<JsValue> {
         let mut all = instrs;
         all.push(Instruction::new_unchecked(Opcode::Return, vec![]));
         let ba = make_bytecode(all, frame_size, 0);
@@ -9267,14 +9294,14 @@ mod tests {
         for (i, val) in regs.iter().enumerate() {
             frame.write_reg(i as u32, val.clone()).unwrap();
         }
-        Interpreter::run(&mut frame).unwrap()
+        Interpreter::run(&mut frame)
     }
 
     #[test]
-    fn test_test_instance_of_stub_returns_false() {
-        // Without prototype chain setup, TestInstanceOf returns false.
-        // acc = Smi(42), constructor in r0 = Smi(0) (not an object)
-        let result = run_with_acc_and_regs(
+    fn test_test_instance_of_non_callable_throws_type_error() {
+        // §7.3.21: RHS of instanceof must be callable, else TypeError.
+        // acc = Smi(42), constructor in r0 = Smi(0) (not callable)
+        let result = run_with_acc_and_regs_result(
             JsValue::Smi(42),
             &[JsValue::Smi(0)],
             vec![Instruction::new_unchecked(
@@ -9283,7 +9310,10 @@ mod tests {
             )],
             1,
         );
-        assert_eq!(result, JsValue::Boolean(false));
+        assert!(
+            matches!(result, Err(StatorError::TypeError(_))),
+            "instanceof with non-callable RHS should throw TypeError, got {result:?}"
+        );
     }
 
     #[test]
