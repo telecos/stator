@@ -1150,21 +1150,15 @@ impl<'src> Parser<'src> {
         self.iteration_depth = 0;
         self.breakable_depth = 0;
 
-        let mut body = Vec::new();
-        while self.peek_kind() != TokenKind::RightBrace {
-            if self.peek_kind() == TokenKind::Eof {
-                return Err(self.error("unexpected end of input inside block"));
-            }
-            body.push(self.parse_stmt()?);
-        }
-        let end = self.current_span();
-        self.bump()?; // consume '}'
+        let result = self.parse_function_body_inner(start);
 
-        // Restore enclosing depths.
+        // Restore enclosing depths — even on error.
         self.function_depth = outer_function_depth;
         self.iteration_depth = outer_iteration_depth;
         self.breakable_depth = outer_breakable_depth;
         self.labels = outer_labels;
+
+        let (body, end) = result?;
 
         Ok((
             BlockStmt {
@@ -1174,6 +1168,24 @@ impl<'src> Parser<'src> {
             is_strict,
             has_directive,
         ))
+    }
+
+    /// Inner helper so that depth restore in [`parse_function_body`] always
+    /// runs, even when the body contains a parse error.
+    fn parse_function_body_inner(
+        &mut self,
+        _start: SourceSpan,
+    ) -> StatorResult<(Vec<Stmt>, SourceSpan)> {
+        let mut body = Vec::new();
+        while self.peek_kind() != TokenKind::RightBrace {
+            if self.peek_kind() == TokenKind::Eof {
+                return Err(self.error("unexpected end of input inside block"));
+            }
+            body.push(self.parse_stmt()?);
+        }
+        let end = self.current_span();
+        self.bump()?; // consume '}'
+        Ok((body, end))
     }
 
     // ── Class parsing ──────────────────────────────────────────────────────
