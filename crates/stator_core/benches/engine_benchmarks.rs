@@ -317,25 +317,6 @@ fn bench_js_string_concat(c: &mut Criterion) {
     });
 }
 
-fn bench_js_array_push_pop(c: &mut Criterion) {
-    let source = r#"
-        var arr = [];
-        for (var i = 0; i < 50; i++) {
-            arr.push(i);
-        }
-        var sum = 0;
-        while (arr.length > 0) {
-            sum = sum + arr.pop();
-        }
-        sum;
-    "#;
-    c.bench_function("js_array_push_pop_50", |b| {
-        b.iter(|| {
-            black_box(eval_js(black_box(source)).unwrap());
-        });
-    });
-}
-
 fn bench_js_object_creation(c: &mut Criterion) {
     let source = r#"
         var last;
@@ -472,7 +453,6 @@ criterion_group! {
         bench_js_property_access,
         bench_js_function_call,
         bench_js_string_concat,
-        bench_js_array_push_pop,
         bench_js_object_creation,
         bench_js_keyed_access,
         bench_js_prototype_chain_lookup,
