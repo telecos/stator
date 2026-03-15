@@ -945,7 +945,7 @@ fn break_rc_cycles(globals: &Rc<RefCell<HashMap<String, JsValue>>>) {
 /// Clear the PropertyMap of a JsValue::PlainObject (and any nested objects)
 /// to break Rc cycles.
 fn clear_value_cycles(val: &JsValue) {
-    match val {
+    stacker::maybe_grow(64 * 1024, 512 * 1024, || match val {
         JsValue::PlainObject(map) => {
             if let Ok(mut pm) = map.try_borrow_mut() {
                 let nested: Vec<JsValue> = pm.iter().map(|(_, v)| v.clone()).collect();
@@ -967,7 +967,7 @@ fn clear_value_cycles(val: &JsValue) {
             }
         }
         _ => {}
-    }
+    });
 }
 
 /// Runs a single Test262 test and returns its outcome.
