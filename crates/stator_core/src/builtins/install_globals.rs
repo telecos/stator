@@ -1374,7 +1374,7 @@ fn make_json() -> JsValue {
 
             // §25.5.1 — apply the optional reviver function bottom-up.
             match args.get(1) {
-                Some(JsValue::NativeFunction(reviver)) => apply_js_reviver(js_val, "", reviver),
+                Some(reviver) if is_callable(reviver) => apply_js_reviver(js_val, "", reviver),
                 _ => Ok(js_val),
             }
         }),
@@ -1490,11 +1490,7 @@ fn make_json() -> JsValue {
 
 /// Walk a `JsValue` tree bottom-up, calling `reviver(key, value)` at each
 /// node — the ECMAScript `InternalizeJSONProperty` algorithm (§25.5.1.1).
-fn apply_js_reviver(
-    value: JsValue,
-    key: &str,
-    reviver: &crate::objects::value::NativeFn,
-) -> StatorResult<JsValue> {
+fn apply_js_reviver(value: JsValue, key: &str, reviver: &JsValue) -> StatorResult<JsValue> {
     let value = match value {
         JsValue::PlainObject(ref map) => {
             let keys: Vec<String> = map.borrow().keys().cloned().collect();
@@ -1519,7 +1515,10 @@ fn apply_js_reviver(
         }
         other => other,
     };
-    reviver(vec![JsValue::String(key.to_string().into()), value])
+    call_callback(
+        reviver,
+        vec![JsValue::String(key.to_string().into()), value],
+    )
 }
 
 // ── Date constructor ─────────────────────────────────────────────────────────
@@ -11994,13 +11993,13 @@ mod tests {
         let json_val = json_parse("[1, 2, 3]", None).unwrap();
         let js_val = json_value_to_js_value(&json_val);
 
-        let reviver: crate::objects::value::NativeFn = Rc::new(|args| {
+        let reviver = JsValue::NativeFunction(Rc::new(|args| {
             let val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
             match val {
                 JsValue::Smi(n) => Ok(JsValue::Smi(n * 2)),
                 other => Ok(other),
             }
-        });
+        }));
 
         let result = apply_js_reviver(js_val, "", &reviver).unwrap();
         // The top-level array itself is passed through the reviver too,
@@ -12023,7 +12022,7 @@ mod tests {
         let js_val = json_value_to_js_value(&json_val);
 
         // Remove "b" by returning undefined
-        let reviver: crate::objects::value::NativeFn = Rc::new(|args| {
+        let reviver = JsValue::NativeFunction(Rc::new(|args| {
             let key = args.first().cloned().unwrap_or(JsValue::Undefined);
             let val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
             if key == JsValue::String("b".into()) {
@@ -12031,7 +12030,7 @@ mod tests {
             } else {
                 Ok(val)
             }
-        });
+        }));
 
         let result = apply_js_reviver(js_val, "", &reviver).unwrap();
         if let JsValue::PlainObject(map) = result {
@@ -19481,7 +19480,6 @@ mod tests {
 
     /// `JSON.parse` with a reviver function.
     #[test]
-    #[ignore] // reviver callback not yet invoked by engine
     fn test_json_parse_with_reviver() {
         let result = global_eval(
             r#"
@@ -19509,7 +19507,6 @@ mod tests {
 
     /// `JSON[Symbol.toStringTag]` is `"JSON"`.
     #[test]
-    #[ignore] // Symbol.toStringTag not yet wired up
     fn test_json_to_string_tag() {
         let result = global_eval("JSON[Symbol.toStringTag]").unwrap();
         assert_eq!(result, JsValue::String("JSON".into()));
