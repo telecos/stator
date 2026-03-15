@@ -81,16 +81,14 @@ thread_local! {
 /// programs.  Keeping this below the OS thread-stack size prevents a fatal
 /// `stack overflow, aborting` abort that cannot be caught.
 ///
-/// This value is intentionally conservative.  Each recursive call to the
-/// interpreter's `run` function consumes a significant amount of native stack
-/// space (several kilobytes) due to the large opcode-dispatch match statement.
-/// Combined with `stacker::maybe_grow` in the interpreter loop (which
-/// dynamically extends the stack via `mmap` when headroom is low), a limit of
-/// 64 keeps native stack consumption safely under control while still
-/// supporting any realistic JavaScript call depth.  Test262 tests that
-/// exercise maximum recursion should receive a proper `RangeError` long before
-/// the native stack is exhausted.
-pub const MAX_CALL_STACK_DEPTH: usize = 64;
+/// The interpreter uses `stacker::maybe_grow` to dynamically extend the
+/// native stack via `mmap`/`VirtualAlloc` when headroom is low, so each
+/// recursive `Interpreter::run` call is safe from a raw stack overflow.
+/// A limit of 1024 is high enough for realistic JavaScript programs
+/// (V8 and SpiderMonkey allow similar depths) while still catching
+/// infinite-recursion bugs with a proper `RangeError` long before memory
+/// is exhausted.
+pub const MAX_CALL_STACK_DEPTH: usize = 1024;
 
 /// Push a frame name onto the thread-local call stack.
 ///
