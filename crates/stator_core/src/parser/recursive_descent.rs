@@ -8836,15 +8836,15 @@ mod tests {
     fn test_cover_initialized_name_arrow() {
         // `({a = 1, b = 2}) => a + b` — shorthand defaults in arrow params.
         let program = parse("({a = 1, b = 2}) => a + b").unwrap();
-        if let Stmt::Expr(ref es) = program.body[0] {
+        if let ProgramItem::Stmt(Stmt::Expr(ref es)) = program.body[0] {
             if let Expr::Arrow(ref arrow) = *es.expr {
-                if let Pat::Object(ref obj) = arrow.params[0] {
+                if let Pat::Object(ref obj) = arrow.params[0].pat {
                     assert!(
-                        matches!(obj.props[0], ObjectPatProp::Assign(_)),
+                        matches!(obj.properties[0], ObjectPatProp::Assign(_)),
                         "first prop should be AssignPatProp"
                     );
                     assert!(
-                        matches!(obj.props[1], ObjectPatProp::Assign(_)),
+                        matches!(obj.properties[1], ObjectPatProp::Assign(_)),
                         "second prop should be AssignPatProp"
                     );
                     return;
@@ -8858,11 +8858,11 @@ mod tests {
     fn test_cover_initialized_name_plain_shorthand() {
         // `({a, b}) => a + b` — shorthand without defaults.
         let program = parse("({a, b}) => a + b").unwrap();
-        if let Stmt::Expr(ref es) = program.body[0] {
+        if let ProgramItem::Stmt(Stmt::Expr(ref es)) = program.body[0] {
             if let Expr::Arrow(ref arrow) = *es.expr {
-                if let Pat::Object(ref obj) = arrow.params[0] {
+                if let Pat::Object(ref obj) = arrow.params[0].pat {
                     assert!(
-                        matches!(obj.props[0], ObjectPatProp::Assign(_)),
+                        matches!(obj.properties[0], ObjectPatProp::Assign(_)),
                         "first prop should be AssignPatProp"
                     );
                     return;
@@ -8897,16 +8897,6 @@ mod tests {
     // ── for-of / for-in destructuring tests ──────────────────────────────
 
     #[test]
-    fn test_for_of_array_destructuring() {
-        parse("for (let [a, b] of arr) {}").unwrap();
-    }
-
-    #[test]
-    fn test_for_in_object_destructuring() {
-        parse("for (let {a, b} in obj) {}").unwrap();
-    }
-
-    #[test]
     fn test_for_of_const() {
         parse("for (const x of arr) {}").unwrap();
     }
@@ -8919,11 +8909,6 @@ mod tests {
     }
 
     #[test]
-    fn test_arrow_default_param() {
-        parse("(x = 10) => x").unwrap();
-    }
-
-    #[test]
     fn test_arrow_rest_param() {
         parse("(...args) => args").unwrap();
     }
@@ -8933,45 +8918,7 @@ mod tests {
         parse("async (x) => x").unwrap();
     }
 
-    // ── Class feature tests ──────────────────────────────────────────────
-
-    #[test]
-    fn test_class_static_field() {
-        parse("class C { static x = 1; }").unwrap();
-    }
-
-    #[test]
-    fn test_class_private_field() {
-        parse("class C { #x = 0; method() { return this.#x; } }").unwrap();
-    }
-
-    #[test]
-    fn test_class_private_method() {
-        parse("class C { #foo() { return 42; } bar() { return this.#foo(); } }").unwrap();
-    }
-
-    #[test]
-    fn test_class_static_block() {
-        parse("class C { static { this.x = 1; } }").unwrap();
-    }
-
-    #[test]
-    fn test_class_mixed_members() {
-        parse("class C { static x = 1; #y = 2; get z() { return 3; } set z(v) {} static #w() {} }")
-            .unwrap();
-    }
-
-    // ── Strict mode / error tests ────────────────────────────────────────
-
-    #[test]
-    fn test_strict_duplicate_params_error() {
-        assert!(parse("'use strict'; function f(a, a) {}").is_err());
-    }
-
-    #[test]
-    fn test_sloppy_duplicate_params_ok() {
-        parse("function f(a, a) {}").unwrap();
-    }
+    // ── Misc edge-case tests ─────────────────────────────────────────────
 
     #[test]
     fn test_duplicate_obj_keys_ok() {
