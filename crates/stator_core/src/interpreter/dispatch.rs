@@ -3147,6 +3147,13 @@ fn handle_copy_data_properties(
                 let entries: Vec<(String, JsValue)> = s
                     .borrow()
                     .enumerable_iter()
+                    .filter(|(k, _)| {
+                        // Skip engine-internal keys: __proto__, __call__, etc.
+                        !((k.starts_with("__") && k.ends_with("__"))
+                            || k.starts_with("@@")
+                            || k.starts_with("Symbol(")
+                            || k.starts_with('.'))
+                    })
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
                 for (k, v) in entries {
@@ -4323,6 +4330,19 @@ fn handle_for_in_enumerate(
                         }
                         continue;
                     }
+                    // Skip engine-internal keys that must not appear in
+                    // for-in enumeration: __proto__, __call__, __is_array__,
+                    // Symbol()-keyed properties (for-in is string-only per
+                    // ES §14.7.5.9), @@-prefixed internal hooks, and hidden
+                    // field initializers.
+                    if (k.starts_with("__") && k.ends_with("__"))
+                        || k.starts_with("@@")
+                        || k.starts_with("Symbol(")
+                        || k.starts_with('.')
+                    {
+                        seen.insert(k.clone());
+                        continue;
+                    }
                     // Regular property: add to seen for shadowing, push if
                     // enumerable and not already seen at a higher level.
                     if seen.insert(k.clone()) && is_enumerable {
@@ -5031,7 +5051,7 @@ fn handle_lda_named_property_from_super(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(_receiver_v) = instr.operands[0] else {
         return Err(err_bad_operand("LdaNamedPropertyFromSuper", 0));
     };
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
@@ -5045,8 +5065,16 @@ fn handle_lda_named_property_from_super(
             ));
         }
     };
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
-    ctx.frame.accumulator = proto_lookup(&obj, &prop_name);
+    // The accumulator holds the lookup-start object for super property
+    // access (HomeObject.[[Prototype]]).  The lookup must begin there,
+    // NOT on `this` (the receiver), so that overridden methods on the
+    // subclass prototype are skipped.
+    let lookup_start = ctx.frame.accumulator.clone();
+    ctx.frame.accumulator = if matches!(lookup_start, JsValue::Undefined | JsValue::Null) {
+        JsValue::Undefined
+    } else {
+        proto_lookup(&lookup_start, &prop_name)
+    };
     Ok(DispatchAction::Continue)
 }
 
@@ -7340,5 +7368,257 @@ mod tests {
             matches!(result, JsValue::PlainObject(_)),
             "GetModuleNamespace should produce a PlainObject"
         );
+    }
+
+    // ── for-in prototype chain & internal key filtering ─────────────
+
+    /// for-in must enumerate inherited enumerable properties from the
+    /// prototype chain.
+    #[test]
+    fn test_for_in_prototype_chain() {
+        let result = crate::builtins::global::global_eval(
+            "function Base() {} \
+             Base.prototype.inherited = 1; \
+             var obj = new Base(); \
+             obj.own = 2; \
+             var keys = []; \
+             for (var k in obj) { keys.push(k); } \
+             keys.length",
+        )
+        .unwrap();
+        // Should enumerate both "own" and "inherited".
+        assert!(
+            matches!(result, JsValue::Smi(2)),
+            "expected 2 keys (own + inherited), got {result:?}"
+        );
+    }
+
+    /// for-in must not leak __proto__ or other internal keys.
+    #[test]
+    fn test_for_in_hides_internal_keys() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {x: 1, y: 2}; \
+             var r = ''; \
+             for (var k in o) r += k + ','; \
+             r",
+        )
+        .unwrap();
+        // Only user-visible keys, no __proto__ / __call__ etc.
+        assert_eq!(result, JsValue::String("x,y,".into()));
+    }
+
+    /// Own property should shadow an inherited property with the same name.
+    #[test]
+    fn test_for_in_shadowing() {
+        let result = crate::builtins::global::global_eval(
+            "function Base() {} \
+             Base.prototype.x = 1; \
+             var obj = new Base(); \
+             obj.x = 2; \
+             var count = 0; \
+             for (var k in obj) { if (k === 'x') count++; } \
+             count",
+        )
+        .unwrap();
+        // "x" should appear only once (own shadows inherited).
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// for-in on null/undefined produces no keys (no TypeError).
+    #[test]
+    fn test_for_in_null_undefined() {
+        let result = crate::builtins::global::global_eval(
+            "var count = 0; for (var k in null) count++; count",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    // ── Destructuring ───────────────────────────────────────────────
+
+    /// Array destructuring with defaults: missing element uses default.
+    #[test]
+    fn test_array_destructuring_with_defaults() {
+        let result =
+            crate::builtins::global::global_eval("var [a = 1, b = 2] = [10]; a * 100 + b").unwrap();
+        // a=10 (from array), b=2 (default) → 1002
+        assert_eq!(result, JsValue::Smi(1002));
+    }
+
+    /// Object destructuring with defaults.
+    #[test]
+    fn test_object_destructuring_with_defaults() {
+        let result =
+            crate::builtins::global::global_eval("var {x = 1, y = 2} = {x: 10}; x * 100 + y")
+                .unwrap();
+        // x=10 (from object), y=2 (default) → 1002
+        assert_eq!(result, JsValue::Smi(1002));
+    }
+
+    /// Nested object destructuring.
+    #[test]
+    fn test_nested_destructuring() {
+        let result =
+            crate::builtins::global::global_eval("var {a: {b}} = {a: {b: 42}}; b").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Array destructuring with rest element.
+    #[test]
+    fn test_array_destructuring_rest() {
+        let result =
+            crate::builtins::global::global_eval("var [a, ...b] = [1, 2, 3]; a * 100 + b.length")
+                .unwrap();
+        // a=1, b=[2,3] → 1*100 + 2 = 102
+        assert_eq!(result, JsValue::Smi(102));
+    }
+
+    /// Object destructuring with rest.
+    #[test]
+    fn test_object_destructuring_rest() {
+        let result = crate::builtins::global::global_eval(
+            "var {a, ...rest} = {a: 1, b: 2, c: 3}; a + rest.b + rest.c",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    // ── Class features ──────────────────────────────────────────────
+
+    /// Static methods should be accessible on the class constructor.
+    #[test]
+    fn test_class_static_method() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo { static bar() { return 99; } } Foo.bar()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    /// Class expression (not just declaration).
+    #[test]
+    fn test_class_expression() {
+        let result = crate::builtins::global::global_eval(
+            "var Foo = class { greet() { return 7; } }; new Foo().greet()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    /// Class with computed property name in method.
+    #[test]
+    fn test_class_computed_property_name() {
+        let result = crate::builtins::global::global_eval(
+            "var name = 'greet'; \
+             class Foo { [name]() { return 55; } } \
+             new Foo().greet()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(55));
+    }
+
+    /// super.method() in a derived class.
+    #[test]
+    fn test_super_method_call() {
+        let result = crate::builtins::global::global_eval(
+            "class Base { value() { return 10; } } \
+             class Child extends Base { value() { return super.value() + 5; } } \
+             new Child().value()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(15));
+    }
+
+    /// Class inheritance — instanceof works for subclass.
+    #[test]
+    fn test_class_inheritance_instanceof() {
+        let result = crate::builtins::global::global_eval(
+            "class Base {} class Child extends Base {} \
+             var c = new Child(); c instanceof Base",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Template literal improvements ───────────────────────────────
+
+    /// Tagged template receives an array of strings as first argument.
+    #[test]
+    fn test_tagged_template_strings_array() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strs) { return strs.length; } tag`a${1}b${2}c`",
+        )
+        .unwrap();
+        // Template `a${1}b${2}c` has 3 string parts: "a", "b", "c"
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// Tagged template receives expression values as extra arguments.
+    #[test]
+    fn test_tagged_template_expression_args() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strs, a, b) { return a + b; } tag`x${10}y${20}z`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    /// Template literal with object expression coerces to string.
+    #[test]
+    fn test_template_literal_with_object() {
+        let result = crate::builtins::global::global_eval(
+            "var obj = {toString: function() { return 'hello'; }}; `${obj}`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("hello".into()));
+    }
+
+    // ── Optional chaining (?.) ──────────────────────────────────────
+
+    /// Optional chaining on undefined.
+    #[test]
+    fn test_optional_chaining_undefined_obj() {
+        let result = crate::builtins::global::global_eval("var x = undefined; x?.foo").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// Optional chaining nested: a?.b?.c.
+    #[test]
+    fn test_optional_chaining_nested() {
+        let result = crate::builtins::global::global_eval("var a = {b: {c: 42}}; a?.b?.c").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Optional chaining nested with null intermediate.
+    #[test]
+    fn test_optional_chaining_nested_null() {
+        let result = crate::builtins::global::global_eval("var a = {b: null}; a?.b?.c").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// Optional chaining method call on null.
+    #[test]
+    fn test_optional_chaining_method_null() {
+        let result =
+            crate::builtins::global::global_eval("var obj = null; obj?.toString()").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// Optional chaining computed property on null.
+    #[test]
+    fn test_optional_chaining_computed_null() {
+        let result =
+            crate::builtins::global::global_eval("var obj = null; var key = 'x'; obj?.[key]")
+                .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// Optional chaining on valid object returns the property.
+    #[test]
+    fn test_optional_chaining_valid_computed() {
+        let result =
+            crate::builtins::global::global_eval("var obj = {x: 77}; var key = 'x'; obj?.[key]")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(77));
     }
 }
