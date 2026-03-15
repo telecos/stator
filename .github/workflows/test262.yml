@@ -6,11 +6,13 @@ on:
       - main
     paths:
       - 'crates/**'
+      - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/test262.yml'
   pull_request:
     paths:
       - 'crates/**'
+      - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/test262.yml'
 
@@ -56,7 +58,7 @@ jobs:
         # for-of, dynamic-import, Proxy/Reflect, WeakRef, Intl, RegExp
         # advanced, tail-call-optimization, globalThis.
         env:
-          RUST_MIN_STACK: "33554432"   # 32 MiB for spawned threads
+          RUST_MIN_STACK: "1073741824"   # 1 GiB for spawned threads
         run: |
           ulimit -s unlimited
           set +e

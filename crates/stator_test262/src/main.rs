@@ -500,60 +500,31 @@ fn deep_clone_globals(template: &HashMap<String, JsValue>) -> HashMap<String, Js
 /// - `$DONOTEVALUATE` sentinel function
 #[inline(never)]
 fn make_test_globals() -> HashMap<String, JsValue> {
-    let mut map = HashMap::new();
-    install_globals(&mut map);
+    // Force stacker to allocate a fresh heap segment for install_globals.
+    // The 2 GiB red_zone exceeds any thread stack, so stacker always
+    // switches to a 32 MiB heap-backed segment.
+    stacker::maybe_grow(
+        2_usize * 1024 * 1024 * 1024, // red_zone: 2 GiB
+        32 * 1024 * 1024,             // new segment: 32 MiB
+        || {
+            let mut map = HashMap::new();
+            install_globals(&mut map);
 
-    // Silent print — some harness files reference it.
-    map.insert(
-        "print".to_string(),
-        JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined))),
-    );
+            // Silent print — some harness files reference it.
+            map.insert(
+                "print".to_string(),
+                JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined))),
+            );
 
-    // Minimal $262 host-defined object.
-    let obj_262: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
-    obj_262.borrow_mut().insert(
-        "gc".to_string(),
-        JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined))),
-    );
-    obj_262.borrow_mut().insert(
-        "evalScript".to_string(),
-        JsValue::NativeFunction(Rc::new(|args| {
-            let code = match args.first() {
-                Some(JsValue::String(s)) => s.to_string(),
-                _ => return Ok(JsValue::Undefined),
-            };
-            let program = parser::parse(&code)?;
-            let bc = BytecodeGenerator::compile_program(&program)?;
-            let mut frame = InterpreterFrame::new(bc, vec![]);
-            Interpreter::run(&mut frame)
-        })),
-    );
-    obj_262.borrow_mut().insert(
-        "detachArrayBuffer".to_string(),
-        JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined))),
-    );
-    // $262.createRealm() — returns an object with `global` and `evalScript`.
-    obj_262.borrow_mut().insert(
-        "createRealm".to_string(),
-        JsValue::NativeFunction(Rc::new(|_args| {
-            let mut realm_globals = HashMap::new();
-            install_globals(&mut realm_globals);
-            let global_obj = {
-                let mut gm = PropertyMap::new();
-                for (k, v) in &realm_globals {
-                    gm.insert(k.clone(), v.clone());
-                }
-                Rc::new(RefCell::new(gm))
-            };
-            let global_val = JsValue::PlainObject(global_obj);
-
-            let realm_globals_rc = Rc::new(RefCell::new(realm_globals));
-            let mut realm = PropertyMap::new();
-            realm.insert("global".to_string(), global_val);
-            let rg = Rc::clone(&realm_globals_rc);
-            realm.insert(
+            // Minimal $262 host-defined object.
+            let obj_262: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+            obj_262.borrow_mut().insert(
+                "gc".to_string(),
+                JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined))),
+            );
+            obj_262.borrow_mut().insert(
                 "evalScript".to_string(),
-                JsValue::NativeFunction(Rc::new(move |args| {
+                JsValue::NativeFunction(Rc::new(|args| {
                     let code = match args.first() {
                         Some(JsValue::String(s)) => s.to_string(),
                         _ => return Ok(JsValue::Undefined),
@@ -561,104 +532,142 @@ fn make_test_globals() -> HashMap<String, JsValue> {
                     let program = parser::parse(&code)?;
                     let bc = BytecodeGenerator::compile_program(&program)?;
                     let mut frame = InterpreterFrame::new(bc, vec![]);
-                    // Populate the frame's global env with the realm's globals.
-                    {
-                        let mut env = frame.global_env.borrow_mut();
-                        for (k, v) in rg.borrow().iter() {
-                            env.insert(k.clone(), v.clone());
-                        }
-                    }
                     Interpreter::run(&mut frame)
                 })),
             );
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(realm))))
-        })),
-    );
-    obj_262
-        .borrow_mut()
-        .insert("global".to_string(), JsValue::Undefined);
-    map.insert("$262".to_string(), JsValue::PlainObject(obj_262));
+            obj_262.borrow_mut().insert(
+                "detachArrayBuffer".to_string(),
+                JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined))),
+            );
+            // $262.createRealm() — returns an object with `global` and `evalScript`.
+            obj_262.borrow_mut().insert(
+                "createRealm".to_string(),
+                JsValue::NativeFunction(Rc::new(|_args| {
+                    let mut realm_globals = HashMap::new();
+                    install_globals(&mut realm_globals);
+                    let global_obj = {
+                        let mut gm = PropertyMap::new();
+                        for (k, v) in &realm_globals {
+                            gm.insert(k.clone(), v.clone());
+                        }
+                        Rc::new(RefCell::new(gm))
+                    };
+                    let global_val = JsValue::PlainObject(global_obj);
 
-    // ── Native Test262Error constructor ──────────────────────────────────
-    let t262_proto: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
-    t262_proto.borrow_mut().insert(
-        "toString".to_string(),
-        JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::String("Test262Error".into())))),
-    );
-    let t262_proto_val = JsValue::PlainObject(t262_proto.clone());
+                    let realm_globals_rc = Rc::new(RefCell::new(realm_globals));
+                    let mut realm = PropertyMap::new();
+                    realm.insert("global".to_string(), global_val);
+                    let rg = Rc::clone(&realm_globals_rc);
+                    realm.insert(
+                        "evalScript".to_string(),
+                        JsValue::NativeFunction(Rc::new(move |args| {
+                            let code = match args.first() {
+                                Some(JsValue::String(s)) => s.to_string(),
+                                _ => return Ok(JsValue::Undefined),
+                            };
+                            let program = parser::parse(&code)?;
+                            let bc = BytecodeGenerator::compile_program(&program)?;
+                            let mut frame = InterpreterFrame::new(bc, vec![]);
+                            // Populate the frame's global env with the realm's globals.
+                            {
+                                let mut env = frame.global_env.borrow_mut();
+                                for (k, v) in rg.borrow().iter() {
+                                    env.insert(k.clone(), v.clone());
+                                }
+                            }
+                            Interpreter::run(&mut frame)
+                        })),
+                    );
+                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(realm))))
+                })),
+            );
+            obj_262
+                .borrow_mut()
+                .insert("global".to_string(), JsValue::Undefined);
+            map.insert("$262".to_string(), JsValue::PlainObject(obj_262));
 
-    let t262_ctor: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
-    let proto_for_ctor = t262_proto_val.clone();
-    t262_ctor.borrow_mut().insert(
-        "__call__".to_string(),
-        JsValue::NativeFunction(Rc::new(move |args| {
-            let msg = args.first().cloned().unwrap_or(JsValue::String("".into()));
-            let obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
-            obj.borrow_mut().insert("message".to_string(), msg);
-            obj.borrow_mut()
-                .insert("__proto__".to_string(), proto_for_ctor.clone());
-            Ok(JsValue::PlainObject(obj))
-        })),
-    );
-    t262_ctor
-        .borrow_mut()
-        .insert("prototype".to_string(), t262_proto_val.clone());
-    t262_ctor
-        .borrow_mut()
-        .insert("name".to_string(), JsValue::String("Test262Error".into()));
-    t262_ctor.borrow_mut().insert(
-        "thrower".to_string(),
-        JsValue::NativeFunction(Rc::new(|args| {
-            let msg = match args.first() {
-                Some(JsValue::String(s)) => s.to_string(),
-                _ => String::new(),
-            };
-            Err(StatorError::JsException(format!("Test262Error: {msg}")))
-        })),
-    );
-    map.insert("Test262Error".to_string(), JsValue::PlainObject(t262_ctor));
+            // ── Native Test262Error constructor ──────────────────────────────────
+            let t262_proto: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+            t262_proto.borrow_mut().insert(
+                "toString".to_string(),
+                JsValue::NativeFunction(Rc::new(|_args| {
+                    Ok(JsValue::String("Test262Error".into()))
+                })),
+            );
+            let t262_proto_val = JsValue::PlainObject(t262_proto.clone());
 
-    // $DONOTEVALUATE sentinel.
-    map.insert(
-        "$DONOTEVALUATE".to_string(),
-        JsValue::NativeFunction(Rc::new(|_| {
-            Err(StatorError::JsException(
-                "Test262: This statement should not be evaluated.".to_string(),
-            ))
-        })),
-    );
+            let t262_ctor: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+            let proto_for_ctor = t262_proto_val.clone();
+            t262_ctor.borrow_mut().insert(
+                "__call__".to_string(),
+                JsValue::NativeFunction(Rc::new(move |args| {
+                    let msg = args.first().cloned().unwrap_or(JsValue::String("".into()));
+                    let obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+                    obj.borrow_mut().insert("message".to_string(), msg);
+                    obj.borrow_mut()
+                        .insert("__proto__".to_string(), proto_for_ctor.clone());
+                    Ok(JsValue::PlainObject(obj))
+                })),
+            );
+            t262_ctor
+                .borrow_mut()
+                .insert("prototype".to_string(), t262_proto_val.clone());
+            t262_ctor
+                .borrow_mut()
+                .insert("name".to_string(), JsValue::String("Test262Error".into()));
+            t262_ctor.borrow_mut().insert(
+                "thrower".to_string(),
+                JsValue::NativeFunction(Rc::new(|args| {
+                    let msg = match args.first() {
+                        Some(JsValue::String(s)) => s.to_string(),
+                        _ => String::new(),
+                    };
+                    Err(StatorError::JsException(format!("Test262Error: {msg}")))
+                })),
+            );
+            map.insert("Test262Error".to_string(), JsValue::PlainObject(t262_ctor));
 
-    // ── Native assert harness ────────────────────────────────────────────
-    let assert_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+            // $DONOTEVALUATE sentinel.
+            map.insert(
+                "$DONOTEVALUATE".to_string(),
+                JsValue::NativeFunction(Rc::new(|_| {
+                    Err(StatorError::JsException(
+                        "Test262: This statement should not be evaluated.".to_string(),
+                    ))
+                })),
+            );
 
-    // assert(mustBeTrue, message) — base callable.
-    assert_obj.borrow_mut().insert(
-        "__call__".to_string(),
-        JsValue::NativeFunction(Rc::new(|args| {
-            let val = args.first().cloned().unwrap_or(JsValue::Undefined);
-            if val.to_boolean() {
-                return Ok(JsValue::Undefined);
-            }
-            let msg = match args.get(1) {
-                Some(JsValue::String(s)) => s.to_string(),
-                _ => format!("Expected true but got {val:?}"),
-            };
-            Err(StatorError::JsException(format!("Test262Error: {msg}")))
-        })),
-    );
+            // ── Native assert harness ────────────────────────────────────────────
+            let assert_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
 
-    // assert._isSameValue(a, b)
-    assert_obj.borrow_mut().insert(
-        "_isSameValue".to_string(),
-        JsValue::NativeFunction(Rc::new(|args| {
-            let a = args.first().cloned().unwrap_or(JsValue::Undefined);
-            let b = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-            Ok(JsValue::Boolean(js_same_value(&a, &b)))
-        })),
-    );
+            // assert(mustBeTrue, message) — base callable.
+            assert_obj.borrow_mut().insert(
+                "__call__".to_string(),
+                JsValue::NativeFunction(Rc::new(|args| {
+                    let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    if val.to_boolean() {
+                        return Ok(JsValue::Undefined);
+                    }
+                    let msg = match args.get(1) {
+                        Some(JsValue::String(s)) => s.to_string(),
+                        _ => format!("Expected true but got {val:?}"),
+                    };
+                    Err(StatorError::JsException(format!("Test262Error: {msg}")))
+                })),
+            );
 
-    // assert.sameValue(actual, expected, message)
-    assert_obj.borrow_mut().insert(
+            // assert._isSameValue(a, b)
+            assert_obj.borrow_mut().insert(
+                "_isSameValue".to_string(),
+                JsValue::NativeFunction(Rc::new(|args| {
+                    let a = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let b = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    Ok(JsValue::Boolean(js_same_value(&a, &b)))
+                })),
+            );
+
+            // assert.sameValue(actual, expected, message)
+            assert_obj.borrow_mut().insert(
         "sameValue".to_string(),
         JsValue::NativeFunction(Rc::new(|args| {
             let actual = args.first().cloned().unwrap_or(JsValue::Undefined);
@@ -676,8 +685,8 @@ fn make_test_globals() -> HashMap<String, JsValue> {
         })),
     );
 
-    // assert.notSameValue(actual, unexpected, message)
-    assert_obj.borrow_mut().insert(
+            // assert.notSameValue(actual, unexpected, message)
+            assert_obj.borrow_mut().insert(
         "notSameValue".to_string(),
         JsValue::NativeFunction(Rc::new(|args| {
             let actual = args.first().cloned().unwrap_or(JsValue::Undefined);
@@ -695,34 +704,38 @@ fn make_test_globals() -> HashMap<String, JsValue> {
         })),
     );
 
-    // assert.throws(expectedErrorConstructor, func, message)
-    assert_obj.borrow_mut().insert(
-        "throws".to_string(),
-        JsValue::NativeFunction(Rc::new(|args| {
-            let expected_ctor = args.first().cloned().unwrap_or(JsValue::Undefined);
-            let func = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-            let message = args
-                .get(2)
-                .and_then(|v| match v {
-                    JsValue::String(s) => Some(s.to_string()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "Expected a throw".to_string());
+            // assert.throws(expectedErrorConstructor, func, message)
+            assert_obj.borrow_mut().insert(
+                "throws".to_string(),
+                JsValue::NativeFunction(Rc::new(|args| {
+                    let expected_ctor = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let func = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let message = args
+                        .get(2)
+                        .and_then(|v| match v {
+                            JsValue::String(s) => Some(s.to_string()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "Expected a throw".to_string());
 
-            // Determine the expected error type name from the constructor.
-            let expected_type = match &expected_ctor {
-                JsValue::PlainObject(map) => {
-                    let borrow = map.borrow();
-                    if let Some(JsValue::String(name)) = borrow.get("name") {
-                        Some(name.to_string())
-                    } else {
-                        borrow.get("prototype").and_then(|p| {
-                            if let JsValue::PlainObject(pm) = p {
-                                pm.borrow().get("constructor").and_then(|c| {
-                                    if let JsValue::PlainObject(cm) = c {
-                                        cm.borrow().get("name").and_then(|n| {
-                                            if let JsValue::String(s) = n {
-                                                Some(s.to_string())
+                    // Determine the expected error type name from the constructor.
+                    let expected_type = match &expected_ctor {
+                        JsValue::PlainObject(map) => {
+                            let borrow = map.borrow();
+                            if let Some(JsValue::String(name)) = borrow.get("name") {
+                                Some(name.to_string())
+                            } else {
+                                borrow.get("prototype").and_then(|p| {
+                                    if let JsValue::PlainObject(pm) = p {
+                                        pm.borrow().get("constructor").and_then(|c| {
+                                            if let JsValue::PlainObject(cm) = c {
+                                                cm.borrow().get("name").and_then(|n| {
+                                                    if let JsValue::String(s) = n {
+                                                        Some(s.to_string())
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
                                             } else {
                                                 None
                                             }
@@ -731,74 +744,72 @@ fn make_test_globals() -> HashMap<String, JsValue> {
                                         None
                                     }
                                 })
-                            } else {
-                                None
                             }
-                        })
-                    }
-                }
-                JsValue::NativeFunction(_) => None,
-                _ => None,
-            };
-
-            // Invoke the function and check if it throws.
-            let result = match &func {
-                JsValue::Function(ba) => {
-                    let mut frame = InterpreterFrame::new((**ba).clone(), vec![]);
-                    Interpreter::run(&mut frame)
-                }
-                JsValue::NativeFunction(f) => f(vec![]),
-                JsValue::PlainObject(map) => {
-                    if let Some(call_fn) = map.borrow().get("__call__").cloned() {
-                        stator_core::interpreter::dispatch_call_value(&call_fn, vec![])
-                    } else {
-                        Ok(JsValue::Undefined)
-                    }
-                }
-                _ => Ok(JsValue::Undefined),
-            };
-
-            match result {
-                Err(e) => {
-                    // Verify the error type if we know the expected type.
-                    if let Some(ref exp) = expected_type {
-                        let type_matches = match (&e, exp.as_str()) {
-                            (StatorError::TypeError(_), "TypeError") => true,
-                            (StatorError::ReferenceError(_), "ReferenceError") => true,
-                            (StatorError::SyntaxError(_), "SyntaxError") => true,
-                            (StatorError::RangeError(_), "RangeError") => true,
-                            (StatorError::URIError(_), "URIError") => true,
-                            (StatorError::JsException(s), t) => s.contains(t),
-                            _ => true, // allow pass if we can't determine
-                        };
-                        if type_matches {
-                            Ok(JsValue::Undefined)
-                        } else {
-                            Err(StatorError::JsException(format!(
-                                "Test262Error: Expected {exp} but got {e}"
-                            )))
                         }
-                    } else {
-                        Ok(JsValue::Undefined)
+                        JsValue::NativeFunction(_) => None,
+                        _ => None,
+                    };
+
+                    // Invoke the function and check if it throws.
+                    let result = match &func {
+                        JsValue::Function(ba) => {
+                            let mut frame = InterpreterFrame::new((**ba).clone(), vec![]);
+                            Interpreter::run(&mut frame)
+                        }
+                        JsValue::NativeFunction(f) => f(vec![]),
+                        JsValue::PlainObject(map) => {
+                            if let Some(call_fn) = map.borrow().get("__call__").cloned() {
+                                stator_core::interpreter::dispatch_call_value(&call_fn, vec![])
+                            } else {
+                                Ok(JsValue::Undefined)
+                            }
+                        }
+                        _ => Ok(JsValue::Undefined),
+                    };
+
+                    match result {
+                        Err(e) => {
+                            // Verify the error type if we know the expected type.
+                            if let Some(ref exp) = expected_type {
+                                let type_matches = match (&e, exp.as_str()) {
+                                    (StatorError::TypeError(_), "TypeError") => true,
+                                    (StatorError::ReferenceError(_), "ReferenceError") => true,
+                                    (StatorError::SyntaxError(_), "SyntaxError") => true,
+                                    (StatorError::RangeError(_), "RangeError") => true,
+                                    (StatorError::URIError(_), "URIError") => true,
+                                    (StatorError::JsException(s), t) => s.contains(t),
+                                    _ => true, // allow pass if we can't determine
+                                };
+                                if type_matches {
+                                    Ok(JsValue::Undefined)
+                                } else {
+                                    Err(StatorError::JsException(format!(
+                                        "Test262Error: Expected {exp} but got {e}"
+                                    )))
+                                }
+                            } else {
+                                Ok(JsValue::Undefined)
+                            }
+                        }
+                        Ok(_) => Err(StatorError::TypeError(message)),
                     }
-                }
-                Ok(_) => Err(StatorError::TypeError(message)),
-            }
-        })),
-    );
+                })),
+            );
 
-    // assert._toString(value)
-    assert_obj.borrow_mut().insert(
-        "_toString".to_string(),
-        JsValue::NativeFunction(Rc::new(|args| {
-            let v = args.first().cloned().unwrap_or(JsValue::Undefined);
-            Ok(JsValue::String(format!("{v:?}").into()))
-        })),
-    );
+            // assert._toString(value)
+            assert_obj.borrow_mut().insert(
+                "_toString".to_string(),
+                JsValue::NativeFunction(Rc::new(|args| {
+                    let v = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    Ok(JsValue::String(format!("{v:?}").into()))
+                })),
+            );
 
-    map.insert("assert".to_string(), JsValue::PlainObject(assert_obj));
+            map.insert("assert".to_string(), JsValue::PlainObject(assert_obj));
 
-    map
+            map
+        },
+    )
 }
 
 /// SameValue comparison (ES2015 §7.2.10).
@@ -1286,18 +1297,12 @@ fn parse_args() -> CliArgs {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
-    // Spawn the real main on a thread with a large stack to prevent
-    // pathological test inputs from overflowing the default 8 MB stack.
-    let builder = std::thread::Builder::new()
-        .name("test262-main".into())
-        .stack_size(8 * 1024 * 1024); // 8 MiB — stacker grows dynamically beyond this
-    let handler = builder
-        .spawn(main_inner)
-        .expect("failed to spawn main thread");
-    if let Err(e) = handler.join() {
-        eprintln!("stator_test262: main thread panicked: {e:?}");
-        std::process::exit(2);
-    }
+    // Run directly on the main thread.  The CI workflow sets
+    // `ulimit -s unlimited`, which makes the main thread's stack
+    // dynamically growable — unlike pthread stacks which are fixed-size
+    // mmap regions.  This avoids the "overflowed its stack" crash that
+    // hits even with a 1 GiB fixed stack on spawned threads.
+    main_inner();
 }
 
 fn main_inner() {
