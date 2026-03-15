@@ -2676,7 +2676,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             _ => {}
         },
         JsValue::String(s) => match key {
-            "length" => return JsValue::Smi(s.len() as i32),
+            "length" => return JsValue::Smi(s.encode_utf16().count() as i32),
             "toString" | "valueOf" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |_args| {
@@ -3479,15 +3479,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             _ => {
-                // Numeric string indexing: "0", "1", … → character at index.
+                // Numeric string indexing: "0", "1", … → UTF-16 code unit at index.
                 if let Ok(idx) = key.parse::<usize>() {
-                    if idx < s.chars().count() {
-                        return JsValue::String(
-                            s.chars()
-                                .nth(idx)
-                                .map_or(String::new(), |c| c.to_string())
-                                .into(),
-                        );
+                    let utf16: Vec<u16> = s.encode_utf16().collect();
+                    if idx < utf16.len() {
+                        let ch = String::from_utf16_lossy(&utf16[idx..=idx]);
+                        return JsValue::String(ch.into());
                     }
                     return JsValue::Undefined;
                 }
@@ -5107,17 +5104,18 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
                 && &**k == "length"
                 && let JsValue::String(s) = obj
             {
-                return Ok(JsValue::Smi(s.len() as i32));
+                return Ok(JsValue::Smi(s.encode_utf16().count() as i32));
             }
             // Character-at-index
             if let Some(idx) = to_array_index(key)
                 && let JsValue::String(s) = obj
             {
-                return Ok(s
-                    .chars()
-                    .nth(idx)
-                    .map(|c| JsValue::String(c.to_string().into()))
-                    .unwrap_or(JsValue::Undefined));
+                let utf16: Vec<u16> = s.encode_utf16().collect();
+                return Ok(if idx < utf16.len() {
+                    JsValue::String(String::from_utf16_lossy(&utf16[idx..=idx]).into())
+                } else {
+                    JsValue::Undefined
+                });
             }
             // Named property — delegate to proto_lookup for method access.
             let prop_name = to_property_key(key)?;
@@ -14161,5 +14159,48 @@ mod tests {
         let b = JsValue::Boolean(true);
         let hop = proto_lookup(&b, "hasOwnProperty");
         assert!(matches!(hop, JsValue::NativeFunction(_)));
+    }
+    // ── String .length UTF-16 semantics ──────────────────────────────────────────
+
+    #[test]
+    fn test_string_length_ascii() {
+        let s = JsValue::String("abc".to_string().into());
+        assert_eq!(proto_lookup(&s, "length"), JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_string_length_bmp_accented() {
+        // All BMP characters, each is one UTF-16 code unit.
+        let s = JsValue::String("café".to_string().into());
+        assert_eq!(proto_lookup(&s, "length"), JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_string_length_surrogate_pair() {
+        // U+1D11E MUSICAL SYMBOL G CLEF encodes as a surrogate pair in UTF-16.
+        let s = JsValue::String("𝄞".to_string().into());
+        assert_eq!(proto_lookup(&s, "length"), JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_string_length_mixed_bmp_and_surrogate() {
+        // a (1) + surrogate pair (2) + b (1) = 4 UTF-16 code units
+        let s = JsValue::String("a𝄞b".to_string().into());
+        assert_eq!(proto_lookup(&s, "length"), JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_string_length_empty() {
+        let s = JsValue::String("".to_string().into());
+        assert_eq!(proto_lookup(&s, "length"), JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_keyed_load_string_length_utf16() {
+        let s = JsValue::String("𝄞".to_string().into());
+        assert_eq!(
+            keyed_load(&s, &JsValue::String("length".to_string().into())).unwrap(),
+            JsValue::Smi(2)
+        );
     }
 }
