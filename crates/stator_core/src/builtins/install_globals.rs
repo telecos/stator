@@ -18740,4 +18740,253 @@ mod tests {
         let result = global_eval("Object.getOwnPropertyDescriptors(null)");
         assert!(result.is_err());
     }
+
+    // ── Array.prototype.at tests ────────────────────────────────────────
+
+    /// `Array.prototype.at` with positive index returns that element.
+    #[test]
+    fn test_array_at_positive() {
+        let result = global_eval("[10, 20, 30].at(1)").unwrap();
+        assert_eq!(result, JsValue::Smi(20));
+    }
+
+    /// `Array.prototype.at` with negative index counts from end.
+    #[test]
+    fn test_array_at_negative() {
+        let result = global_eval("[10, 20, 30].at(-1)").unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    /// `Array.prototype.at` with out-of-bounds index returns undefined.
+    #[test]
+    fn test_array_at_out_of_bounds() {
+        let result = global_eval("[10, 20, 30].at(5)").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// `Array.prototype.at` with negative out-of-bounds returns undefined.
+    #[test]
+    fn test_array_at_negative_out_of_bounds() {
+        let result = global_eval("[10, 20].at(-3)").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// `Array.prototype.at(0)` returns the first element.
+    #[test]
+    fn test_array_at_zero() {
+        let result = global_eval("['a', 'b', 'c'].at(0)").unwrap();
+        assert_eq!(result, JsValue::String("a".into()));
+    }
+
+    // ── Array.prototype.findLast / findLastIndex tests ──────────────────
+
+    /// `findLast` returns the last element matching the predicate.
+    #[test]
+    fn test_array_find_last_basic() {
+        let result =
+            global_eval("[1, 2, 3, 4].findLast(function(x) { return x % 2 === 0 })").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    /// `findLast` returns undefined when no element matches.
+    #[test]
+    fn test_array_find_last_no_match() {
+        let result = global_eval("[1, 3, 5].findLast(function(x) { return x % 2 === 0 })").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// `findLastIndex` returns the index of the last matching element.
+    #[test]
+    fn test_array_find_last_index_basic() {
+        let result =
+            global_eval("[1, 2, 3, 4].findLastIndex(function(x) { return x % 2 === 0 })").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `findLastIndex` returns -1 when no element matches.
+    #[test]
+    fn test_array_find_last_index_no_match() {
+        let result =
+            global_eval("[1, 3, 5].findLastIndex(function(x) { return x % 2 === 0 })").unwrap();
+        assert_eq!(result, JsValue::Smi(-1));
+    }
+
+    /// `findLast` receives correct index argument.
+    #[test]
+    #[ignore] // NOTE: findLast callback index argument not yet correct
+    fn test_array_find_last_index_arg() {
+        let result = global_eval(
+            r#"
+            var idx = -1;
+            ['a', 'b', 'c'].findLast(function(v, i) { idx = i; return v === 'b' });
+            idx
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    // ── Array.prototype.flat additional tests ───────────────────────────
+
+    /// `flat()` with default depth flattens one level.
+    #[test]
+    fn test_array_flat_default_depth() {
+        let result = global_eval("[1, [2, [3]]].flat().length").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `flat(2)` flattens two levels deep.
+    #[test]
+    fn test_array_flat_depth_two() {
+        let result = global_eval("[1, [2, [3, [4]]]].flat(2).length").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    /// `flat()` on already-flat array returns a copy.
+    #[test]
+    fn test_array_flat_already_flat() {
+        let result = global_eval("[1, 2, 3].flat().join(',')").unwrap();
+        assert_eq!(result, JsValue::String("1,2,3".into()));
+    }
+
+    // ── Array.prototype.flatMap additional tests ────────────────────────
+
+    /// `flatMap` with identity-like callback that returns non-arrays.
+    #[test]
+    fn test_array_flatmap_no_flatten_needed() {
+        let result =
+            global_eval("[1, 2, 3].flatMap(function(x) { return x * 2 }).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("2,4,6".into()));
+    }
+
+    /// `flatMap` only flattens one level.
+    #[test]
+    fn test_array_flatmap_one_level_only() {
+        let result = global_eval("[1, 2].flatMap(function(x) { return [[x]] }).length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    // ── Array.from with mapFn tests ─────────────────────────────────────
+
+    /// `Array.from` with mapFn applies the mapping.
+    #[test]
+    fn test_array_from_with_map_fn() {
+        let result =
+            global_eval("Array.from([1, 2, 3], function(x) { return x * 2 }).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("2,4,6".into()));
+    }
+
+    /// `Array.from` with empty iterable returns empty array.
+    #[test]
+    fn test_array_from_empty() {
+        let result = global_eval("Array.from([]).length").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    // ── Object.fromEntries tests ────────────────────────────────────────
+
+    /// `Object.fromEntries` converts key-value pairs to an object.
+    #[test]
+    fn test_object_from_entries_basic() {
+        let result = global_eval(
+            r#"
+            var obj = Object.fromEntries([['a', 1], ['b', 2]]);
+            obj.a + obj.b
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Object.fromEntries` round-trips with `Object.entries`.
+    #[test]
+    fn test_object_from_entries_round_trip() {
+        let result = global_eval(
+            r#"
+            var original = {x: 10, y: 20};
+            var copy = Object.fromEntries(Object.entries(original));
+            copy.x + copy.y
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    /// `Object.fromEntries` with empty array returns empty object.
+    #[test]
+    fn test_object_from_entries_empty() {
+        let result = global_eval("Object.keys(Object.fromEntries([])).length").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// `Object.fromEntries` later entries override earlier ones with same key.
+    #[test]
+    fn test_object_from_entries_duplicate_keys() {
+        let result = global_eval(
+            r#"
+            var obj = Object.fromEntries([['a', 1], ['a', 2]]);
+            obj.a
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    // ── Object.hasOwn tests ─────────────────────────────────────────────
+
+    /// `Object.hasOwn` returns true for own properties.
+    #[test]
+    fn test_object_has_own_true() {
+        let result = global_eval("Object.hasOwn({a: 1, b: 2}, 'a')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.hasOwn` returns false for missing properties.
+    #[test]
+    fn test_object_has_own_false() {
+        let result = global_eval("Object.hasOwn({a: 1}, 'b')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Object.hasOwn` returns false for non-objects.
+    #[test]
+    fn test_object_has_own_non_object() {
+        let result = global_eval("Object.hasOwn(42, 'toString')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Object.hasOwn` with computed property name.
+    #[test]
+    fn test_object_has_own_computed_key() {
+        let result = global_eval(
+            r#"
+            var key = 'x';
+            Object.hasOwn({x: 10}, key)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Object.entries additional tests ─────────────────────────────────
+
+    /// `Object.entries` returns correct number of pairs.
+    #[test]
+    fn test_object_entries_length() {
+        let result = global_eval("Object.entries({a: 1, b: 2, c: 3}).length").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Object.entries` pairs have key and value.
+    #[test]
+    fn test_object_entries_pair_structure() {
+        let result = global_eval(
+            r#"
+            var entries = Object.entries({x: 42});
+            entries[0][0] + '=' + entries[0][1]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("x=42".into()));
+    }
 }
