@@ -5004,7 +5004,7 @@ fn dispatch_getter(getter: &JsValue, this: &JsValue) -> StatorResult<JsValue> {
             pop_call_frame();
             result
         }
-        JsValue::NativeFunction(f) => f(vec![]),
+        JsValue::NativeFunction(f) => f(vec![this.clone()]),
         _ => Ok(JsValue::Undefined),
     }
 }
