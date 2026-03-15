@@ -18326,7 +18326,6 @@ mod tests {
 
     /// `String.prototype.startsWith` must throw TypeError when given a RegExp.
     #[test]
-    #[ignore] // TODO: implement __is_regexp__ check in startsWith
     fn e2e_starts_with_rejects_regexp() {
         let result = global_eval("'foobar'.startsWith(/foo/)");
         assert!(result.is_err(), "Expected TypeError for RegExp argument");
@@ -18334,7 +18333,6 @@ mod tests {
 
     /// `String.prototype.endsWith` must throw TypeError when given a RegExp.
     #[test]
-    #[ignore] // TODO: implement __is_regexp__ check in endsWith
     fn e2e_ends_with_rejects_regexp() {
         let result = global_eval("'foobar'.endsWith(/bar/)");
         assert!(result.is_err(), "Expected TypeError for RegExp argument");
