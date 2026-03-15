@@ -11132,6 +11132,7 @@ fn make_disposable_stack() -> JsValue {
 /// (`undefined`, `NaN`, `Infinity`).
 #[inline(never)]
 pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
+    // Phase 1: Namespace objects & core constructors
     stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
         // ── Namespace objects ────────────────────────────────────────────────
         globals.insert("Math".into(), make_math());
@@ -11146,6 +11147,10 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         globals.insert("Object".into(), finalize_ctor(make_object(), "Object"));
         globals.insert("Array".into(), finalize_ctor(make_array(), "Array"));
         globals.insert("Symbol".into(), finalize_ctor(make_symbol(), "Symbol"));
+    });
+
+    // Phase 2: Collections & async
+    stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
         globals.insert(
             "Iterator".into(),
             finalize_ctor(make_iterator(), "Iterator"),
@@ -11175,6 +11180,10 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         globals.insert("Promise".into(), finalize_ctor(make_promise(), "Promise"));
         globals.insert("RegExp".into(), finalize_ctor(make_regexp(), "RegExp"));
         globals.insert("BigInt".into(), finalize_ctor(make_bigint(), "BigInt"));
+    });
+
+    // Phase 3: Function, Proxy, Reflect, Error, String
+    stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
         globals.insert(
             "Function".into(),
             finalize_ctor(make_function(), "Function"),
@@ -11202,14 +11211,11 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "DisposableStack".into(),
             finalize_ctor(make_disposable_stack(), "DisposableStack"),
         );
-        // ── Simple constructor-like wrappers ─────────────────────────────────
-        // NOTE: Boolean is already installed via make_boolean() above, which
-        // provides both __call__ (constructor) and prototype.  Do NOT
-        // overwrite it with a bare NativeFunction—that would lose
-        // Boolean.prototype.
         globals.insert("String".into(), finalize_ctor(make_string(), "String"));
+    });
 
-        // ── TypedArray / ArrayBuffer / DataView constructors ─────────────────
+    // Phase 4: TypedArray / ArrayBuffer / DataView constructors
+    stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
         globals.insert(
             "ArrayBuffer".into(),
             finalize_ctor(make_arraybuffer(), "ArrayBuffer"),
@@ -11295,7 +11301,10 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
                 "BigUint64Array",
             ),
         );
+    });
 
+    // Phase 5: Global constants, functions, and globalThis
+    stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
         // ── Global constants ────────────────────────────────────────────────
         globals.insert("undefined".into(), JsValue::Undefined);
         globals.insert("NaN".into(), JsValue::HeapNumber(GLOBAL_NAN));
