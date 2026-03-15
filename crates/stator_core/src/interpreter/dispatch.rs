@@ -1227,7 +1227,9 @@ fn handle_call_any_receiver(
                     );
                     restore_closure_context(&mut callee_frame, &ba);
                     push_call_frame("<anonymous>")?;
-                    let result = Interpreter::run(&mut callee_frame);
+                    let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+                        Interpreter::run(&mut callee_frame)
+                    });
                     pop_call_frame();
                     ctx.frame.accumulator = result?;
                 }
@@ -1405,7 +1407,9 @@ fn handle_call_undefined_receiver0(
                     );
                     restore_closure_context(&mut callee_frame, &ba);
                     push_call_frame("<anonymous>")?;
-                    let result = Interpreter::run(&mut callee_frame);
+                    let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+                        Interpreter::run(&mut callee_frame)
+                    });
                     pop_call_frame();
                     if ba.is_strict() {
                         match saved_this {
@@ -1501,7 +1505,9 @@ fn handle_call_undefined_receiver1(
                     );
                     restore_closure_context(&mut callee_frame, &ba);
                     push_call_frame("<anonymous>")?;
-                    let result = Interpreter::run(&mut callee_frame);
+                    let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+                        Interpreter::run(&mut callee_frame)
+                    });
                     pop_call_frame();
                     if ba.is_strict() {
                         match saved_this {
@@ -1606,7 +1612,9 @@ fn handle_call_undefined_receiver2(
                     );
                     restore_closure_context(&mut callee_frame, &ba);
                     push_call_frame("<anonymous>")?;
-                    let result = Interpreter::run(&mut callee_frame);
+                    let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+                        Interpreter::run(&mut callee_frame)
+                    });
                     pop_call_frame();
                     if ba.is_strict() {
                         match saved_this {
@@ -1702,7 +1710,9 @@ fn handle_call_property(
                     .borrow_mut()
                     .insert("this".to_string(), this_val);
                 push_call_frame("<anonymous>")?;
-                let result = Interpreter::run(&mut callee_frame);
+                let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+                    Interpreter::run(&mut callee_frame)
+                });
                 pop_call_frame();
                 ctx.frame.accumulator = result?;
             }
@@ -1849,7 +1859,9 @@ fn handle_call_with_spread(
                 );
                 restore_closure_context(&mut callee_frame, &ba);
                 push_call_frame("<anonymous>")?;
-                let result = Interpreter::run(&mut callee_frame);
+                let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+                    Interpreter::run(&mut callee_frame)
+                });
                 pop_call_frame();
                 ctx.frame.accumulator = result?;
             }
@@ -1890,7 +1902,9 @@ fn call_plain_object_function(
         InterpreterFrame::new_with_globals((**ba).clone(), args, Rc::clone(&ctx.frame.global_env));
     restore_closure_context(&mut callee_frame, ba);
     push_call_frame("<anonymous>")?;
-    let result = Interpreter::run(&mut callee_frame);
+    let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+        Interpreter::run(&mut callee_frame)
+    });
     pop_call_frame();
     ctx.frame.accumulator = result?;
     Ok(())
@@ -1946,7 +1960,9 @@ fn construct_class_from_plain_object(
 
     // 4. Run constructor body.
     push_call_frame("<anonymous>")?;
-    let result = Interpreter::run(&mut callee_frame);
+    let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+        Interpreter::run(&mut callee_frame)
+    });
     pop_call_frame();
     let val = result?;
 
@@ -1961,7 +1977,7 @@ fn construct_class_from_plain_object(
         );
         restore_closure_context(&mut init_frame, &init_ba);
         push_call_frame("<field_init>")?;
-        let _ = Interpreter::run(&mut init_frame);
+        let _ = stacker::maybe_grow(64 * 1024, 1024 * 1024, || Interpreter::run(&mut init_frame));
         pop_call_frame();
     }
 
@@ -2020,7 +2036,9 @@ fn handle_construct(
                 .borrow_mut()
                 .insert("this".to_string(), this_val.clone());
             push_call_frame("<anonymous>")?;
-            let result = Interpreter::run(&mut callee_frame);
+            let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+                Interpreter::run(&mut callee_frame)
+            });
             pop_call_frame();
             let val = result?;
             // If the constructor explicitly returns an object,
@@ -2106,7 +2124,9 @@ fn handle_construct_with_spread(
                 .borrow_mut()
                 .insert("this".to_string(), this_val.clone());
             push_call_frame("<anonymous>")?;
-            let result = Interpreter::run(&mut callee_frame);
+            let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+                Interpreter::run(&mut callee_frame)
+            });
             pop_call_frame();
             let val = result?;
             ctx.frame.accumulator = match val {
@@ -5462,7 +5482,9 @@ fn handle_construct_forward_all_args(
                 .borrow_mut()
                 .insert("this".to_string(), this_val.clone());
             push_call_frame("<anonymous>")?;
-            let result = Interpreter::run(&mut callee_frame);
+            let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+                Interpreter::run(&mut callee_frame)
+            });
             pop_call_frame();
             let val = result?;
             ctx.frame.accumulator = match val {
@@ -5610,7 +5632,9 @@ fn handle_call_direct_eval(
                     );
                     restore_closure_context(&mut callee_frame, &ba);
                     push_call_frame("<eval-fallback>")?;
-                    let result = Interpreter::run(&mut callee_frame);
+                    let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+                        Interpreter::run(&mut callee_frame)
+                    });
                     pop_call_frame();
                     ctx.frame.accumulator = result?;
                 }
