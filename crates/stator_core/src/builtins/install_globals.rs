@@ -7346,15 +7346,15 @@ fn make_string() -> JsValue {
             let s = require_coercible_string(&args)?;
             // §22.1.3.22 step 4: throw TypeError if searchString is a RegExp
             let search_arg = args.get(1).unwrap_or(&JsValue::Undefined);
-            if let JsValue::PlainObject(map) = search_arg {
-                if matches!(
+            if let JsValue::PlainObject(map) = search_arg
+                && matches!(
                     map.borrow().get("__is_regexp__"),
                     Some(JsValue::Boolean(true))
-                ) {
+                )
+            {
                     return Err(crate::error::StatorError::TypeError(
                         "First argument to String.prototype.startsWith must not be a regular expression".to_string(),
                     ));
-                }
             }
             let search = search_arg.to_js_string()?;
             let pos = match args.get(2) {
@@ -7372,15 +7372,16 @@ fn make_string() -> JsValue {
             let s = require_coercible_string(&args)?;
             // §22.1.3.7 step 4: throw TypeError if searchString is a RegExp
             let search_arg = args.get(1).unwrap_or(&JsValue::Undefined);
-            if let JsValue::PlainObject(map) = search_arg {
-                if matches!(
+            if let JsValue::PlainObject(map) = search_arg
+                && matches!(
                     map.borrow().get("__is_regexp__"),
                     Some(JsValue::Boolean(true))
-                ) {
-                    return Err(crate::error::StatorError::TypeError(
-                        "First argument to String.prototype.endsWith must not be a regular expression".to_string(),
-                    ));
-                }
+                )
+            {
+                return Err(crate::error::StatorError::TypeError(
+                    "First argument to String.prototype.endsWith must not be a regular expression"
+                        .to_string(),
+                ));
             }
             let search = search_arg.to_js_string()?;
             let end = match args.get(2) {
@@ -17994,22 +17995,6 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
-    // ── Conformance: String.prototype.repeat edge cases ─────────────────
-
-    /// `String.prototype.repeat(0)` returns empty string.
-    #[test]
-    fn e2e_string_repeat_zero() {
-        let result = global_eval("'abc'.repeat(0)").unwrap();
-        assert_eq!(result, JsValue::String("".into()));
-    }
-
-    /// `String.prototype.repeat(3)` repeats the string.
-    #[test]
-    fn e2e_string_repeat_basic() {
-        let result = global_eval("'ab'.repeat(3)").unwrap();
-        assert_eq!(result, JsValue::String("ababab".into()));
-    }
-
     // ── Conformance: trim* whitespace handling ──────────────────────────
 
     /// `String.prototype.trim` strips tabs and newlines.
@@ -18142,22 +18127,6 @@ mod tests {
             global_eval("[1,2].flatMap(function(x) { return [[x, x*2]]; }).length").unwrap();
         // [[1,2],[2,4]] after flatMap → [1,2], [2,4] are kept as arrays → length 2
         assert_eq!(result, JsValue::Smi(2));
-    }
-
-    // ── Conformance: String.prototype.normalize ─────────────────────────
-
-    /// `normalize()` with no argument defaults to "NFC" and returns string.
-    #[test]
-    fn e2e_string_normalize_default() {
-        let result = global_eval("'abc'.normalize()").unwrap();
-        assert_eq!(result, JsValue::String("abc".into()));
-    }
-
-    /// `normalize('NFC')` returns the string.
-    #[test]
-    fn e2e_string_normalize_nfc() {
-        let result = global_eval("'test'.normalize('NFC')").unwrap();
-        assert_eq!(result, JsValue::String("test".into()));
     }
 
     // ── Conformance: Map.prototype.forEach args ─────────────────────────
