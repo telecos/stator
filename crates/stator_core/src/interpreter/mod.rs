@@ -2673,10 +2673,16 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     Ok(JsValue::String(format!("{n}").into()))
                 }));
             }
+            "hasOwnProperty" | "propertyIsEnumerable" => {
+                return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
+            }
+            "isPrototypeOf" => {
+                return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
+            }
             _ => {}
         },
         JsValue::String(s) => match key {
-            "length" => return JsValue::Smi(s.len() as i32),
+            "length" => return JsValue::Smi(s.chars().count() as i32),
             "toString" | "valueOf" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |_args| {
@@ -3491,6 +3497,39 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     }
                     return JsValue::Undefined;
                 }
+                // Object.prototype methods for string primitives.
+                if key == "hasOwnProperty" {
+                    let len = s.chars().count();
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(v) => v.to_js_string().unwrap_or_default(),
+                            None => return Ok(JsValue::Boolean(false)),
+                        };
+                        if prop == "length" {
+                            return Ok(JsValue::Boolean(true));
+                        }
+                        if let Ok(idx) = prop.parse::<usize>() {
+                            return Ok(JsValue::Boolean(idx < len));
+                        }
+                        Ok(JsValue::Boolean(false))
+                    }));
+                }
+                if key == "propertyIsEnumerable" {
+                    let len = s.chars().count();
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(v) => v.to_js_string().unwrap_or_default(),
+                            None => return Ok(JsValue::Boolean(false)),
+                        };
+                        if let Ok(idx) = prop.parse::<usize>() {
+                            return Ok(JsValue::Boolean(idx < len));
+                        }
+                        Ok(JsValue::Boolean(false))
+                    }));
+                }
+                if key == "isPrototypeOf" {
+                    return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
+                }
             }
         },
         JsValue::Boolean(b) => match key {
@@ -3517,6 +3556,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "@@toPrimitive" => {
                 let b = *b;
                 return JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Boolean(b))));
+            }
+            "hasOwnProperty" | "propertyIsEnumerable" => {
+                return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
+            }
+            "isPrototypeOf" => {
+                return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
             }
             _ => {}
         },
@@ -5107,7 +5152,7 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
                 && &**k == "length"
                 && let JsValue::String(s) = obj
             {
-                return Ok(JsValue::Smi(s.len() as i32));
+                return Ok(JsValue::Smi(s.chars().count() as i32));
             }
             // Character-at-index
             if let Some(idx) = to_array_index(key)
@@ -14154,12 +14199,229 @@ mod tests {
         assert!(matches!(hop, JsValue::NativeFunction(_)));
     }
 
-    // NOTE: primitive hasOwnProperty not yet exposed via proto_lookup
     #[test]
-    #[ignore]
     fn test_boolean_has_own_property_returns_fn() {
         let b = JsValue::Boolean(true);
         let hop = proto_lookup(&b, "hasOwnProperty");
         assert!(matches!(hop, JsValue::NativeFunction(_)));
+    }
+
+    // -- Conformance: typeof ------------------------------------------------
+
+    #[test]
+    fn test_typeof_number() {
+        let r = crate::builtins::global::global_eval("typeof 42").unwrap();
+        assert_eq!(r, JsValue::String("number".into()));
+    }
+
+    #[test]
+    fn test_typeof_string() {
+        let r = crate::builtins::global::global_eval("typeof 'hello'").unwrap();
+        assert_eq!(r, JsValue::String("string".into()));
+    }
+
+    #[test]
+    fn test_typeof_boolean() {
+        let r = crate::builtins::global::global_eval("typeof true").unwrap();
+        assert_eq!(r, JsValue::String("boolean".into()));
+    }
+
+    #[test]
+    fn test_typeof_undefined() {
+        let r = crate::builtins::global::global_eval("typeof undefined").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn test_typeof_null() {
+        let r = crate::builtins::global::global_eval("typeof null").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn test_typeof_object() {
+        let r = crate::builtins::global::global_eval("typeof {}").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn test_typeof_function() {
+        let r = crate::builtins::global::global_eval("typeof function() {}").unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn test_typeof_undeclared_var() {
+        let r = crate::builtins::global::global_eval("typeof noSuchVar").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    // -- Conformance: strict equality (===) ---------------------------------
+
+    #[test]
+    fn test_strict_eq_same_type() {
+        let r = crate::builtins::global::global_eval("1 === 1").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_strict_eq_diff_type() {
+        let r = crate::builtins::global::global_eval("1 === '1'").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_strict_eq_null_undefined() {
+        let r = crate::builtins::global::global_eval("null === undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    // -- Conformance: loose equality (==) -----------------------------------
+
+    #[test]
+    fn test_loose_eq_coercion() {
+        let r = crate::builtins::global::global_eval("1 == '1'").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_loose_eq_null_undefined() {
+        let r = crate::builtins::global::global_eval("null == undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_loose_eq_null_zero() {
+        let r = crate::builtins::global::global_eval("null == 0").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    // -- Conformance: relational comparisons --------------------------------
+
+    #[test]
+    fn test_less_than() {
+        let r = crate::builtins::global::global_eval("1 < 2").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_greater_than() {
+        let r = crate::builtins::global::global_eval("2 > 1").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_less_equal() {
+        let r = crate::builtins::global::global_eval("2 <= 2").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_greater_equal() {
+        let r = crate::builtins::global::global_eval("3 >= 4").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_string_comparison() {
+        let r = crate::builtins::global::global_eval("'abc' < 'abd'").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // -- Conformance: String.length (char count, not byte count) ------------
+
+    #[test]
+    fn test_string_length_ascii() {
+        let r = crate::builtins::global::global_eval("'hello'.length").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_string_length_multibyte() {
+        let r = crate::builtins::global::global_eval("'caf\\u00e9'.length").unwrap();
+        assert_eq!(r, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_string_length_empty() {
+        let r = crate::builtins::global::global_eval("''.length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_string_bracket_access() {
+        let r = crate::builtins::global::global_eval("'abc'[1]").unwrap();
+        assert_eq!(r, JsValue::String("b".into()));
+    }
+
+    // -- Conformance: primitive hasOwnProperty ------------------------------
+
+    #[test]
+    fn test_number_has_own_property_false() {
+        let r = crate::builtins::global::global_eval("var n = 42; n.hasOwnProperty('toString')")
+            .unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_string_has_own_property_length() {
+        let r = crate::builtins::global::global_eval("var s = 'abc'; s.hasOwnProperty('length')")
+            .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_string_has_own_property_index() {
+        let r =
+            crate::builtins::global::global_eval("var s = 'abc'; s.hasOwnProperty('0')").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_string_has_own_property_out_of_range() {
+        let r =
+            crate::builtins::global::global_eval("var s = 'abc'; s.hasOwnProperty('5')").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_boolean_has_own_property_false() {
+        let r = crate::builtins::global::global_eval("var b = true; b.hasOwnProperty('toString')")
+            .unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    // -- Conformance: throw / catch -----------------------------------------
+
+    #[test]
+    fn test_throw_string_catch() {
+        let r = crate::builtins::global::global_eval(
+            "var x; try { throw 'oops'; } catch(e) { x = e; } x",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("oops".into()));
+    }
+
+    #[test]
+    fn test_throw_number_catch() {
+        let r =
+            crate::builtins::global::global_eval("var x; try { throw 99; } catch(e) { x = e; } x")
+                .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    // -- Conformance: Object.keys -------------------------------------------
+
+    #[test]
+    fn test_object_keys_basic() {
+        let r = crate::builtins::global::global_eval("var o = {a: 1, b: 2}; Object.keys(o).length")
+            .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_object_keys_values() {
+        let r = crate::builtins::global::global_eval("var o = {x: 10}; Object.keys(o)[0]").unwrap();
+        assert_eq!(r, JsValue::String("x".into()));
     }
 }
