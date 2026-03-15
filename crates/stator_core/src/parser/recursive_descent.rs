@@ -1172,10 +1172,7 @@ impl<'src> Parser<'src> {
 
     /// Inner helper so that depth restore in [`parse_function_body`] always
     /// runs, even when the body contains a parse error.
-    fn parse_function_body_inner(
-        &mut self,
-        _start: SourceSpan,
-    ) -> StatorResult<(Vec<Stmt>, SourceSpan)> {
+    fn parse_function_body_inner(&mut self, _start: Span) -> StatorResult<(Vec<Stmt>, Span)> {
         let mut body = Vec::new();
         while self.peek_kind() != TokenKind::RightBrace {
             if self.peek_kind() == TokenKind::Eof {
