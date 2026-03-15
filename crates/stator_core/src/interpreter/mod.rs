@@ -2673,6 +2673,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     Ok(JsValue::String(format!("{n}").into()))
                 }));
             }
+            "hasOwnProperty" | "propertyIsEnumerable" => {
+                return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
+            }
+            "isPrototypeOf" => {
+                return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
+            }
             _ => {}
         },
         JsValue::String(s) => match key {
@@ -3478,6 +3484,47 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     Ok(JsValue::String(s.clone()))
                 }));
             }
+            "hasOwnProperty" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let prop = match args.first() {
+                        Some(JsValue::String(p)) => p.to_string(),
+                        Some(JsValue::Smi(n)) => n.to_string(),
+                        Some(JsValue::HeapNumber(n)) => format!("{n}"),
+                        Some(JsValue::Boolean(b)) => b.to_string(),
+                        Some(JsValue::Null) => "null".to_string(),
+                        Some(JsValue::Undefined) => "undefined".to_string(),
+                        _ => return Ok(JsValue::Boolean(false)),
+                    };
+                    if prop == "length" {
+                        return Ok(JsValue::Boolean(true));
+                    }
+                    if let Ok(idx) = prop.parse::<usize>() {
+                        let len = s.encode_utf16().count();
+                        return Ok(JsValue::Boolean(idx < len));
+                    }
+                    Ok(JsValue::Boolean(false))
+                }));
+            }
+            "propertyIsEnumerable" => {
+                let s = s.clone();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let prop = match args.first() {
+                        Some(JsValue::String(p)) => p.to_string(),
+                        Some(JsValue::Smi(n)) => n.to_string(),
+                        _ => return Ok(JsValue::Boolean(false)),
+                    };
+                    // String char indices are enumerable; "length" is not.
+                    if let Ok(idx) = prop.parse::<usize>() {
+                        let len = s.encode_utf16().count();
+                        return Ok(JsValue::Boolean(idx < len));
+                    }
+                    Ok(JsValue::Boolean(false))
+                }));
+            }
+            "isPrototypeOf" => {
+                return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
+            }
             _ => {
                 // Numeric string indexing: "0", "1", … → UTF-16 code unit at index.
                 if let Ok(idx) = key.parse::<usize>() {
@@ -3514,6 +3561,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "@@toPrimitive" => {
                 let b = *b;
                 return JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Boolean(b))));
+            }
+            "hasOwnProperty" | "propertyIsEnumerable" => {
+                return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
+            }
+            "isPrototypeOf" => {
+                return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
             }
             _ => {}
         },
@@ -14134,27 +14187,21 @@ mod tests {
 
     // ── Conformance: primitive hasOwnProperty ───────────────────────────────
 
-    // NOTE: primitive hasOwnProperty not yet exposed via proto_lookup
     #[test]
-    #[ignore]
     fn test_string_has_own_property_length() {
         let s = JsValue::String("hello".into());
         let hop = proto_lookup(&s, "hasOwnProperty");
         assert!(matches!(hop, JsValue::NativeFunction(_)));
     }
 
-    // NOTE: primitive hasOwnProperty not yet exposed via proto_lookup
     #[test]
-    #[ignore]
     fn test_number_has_own_property_returns_fn() {
         let n = JsValue::Smi(42);
         let hop = proto_lookup(&n, "hasOwnProperty");
         assert!(matches!(hop, JsValue::NativeFunction(_)));
     }
 
-    // NOTE: primitive hasOwnProperty not yet exposed via proto_lookup
     #[test]
-    #[ignore]
     fn test_boolean_has_own_property_returns_fn() {
         let b = JsValue::Boolean(true);
         let hop = proto_lookup(&b, "hasOwnProperty");
