@@ -13831,4 +13831,335 @@ mod tests {
         let result = crate::builtins::global::global_eval("'x'.padStart(3)").unwrap();
         assert_eq!(result, JsValue::String("  x".into()));
     }
+
+    // ── Conformance: typeof ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_typeof_number_literal() {
+        let r = crate::builtins::global::global_eval("typeof 42").unwrap();
+        assert_eq!(r, JsValue::String("number".into()));
+    }
+
+    #[test]
+    fn test_typeof_string_literal() {
+        let r = crate::builtins::global::global_eval("typeof 'hello'").unwrap();
+        assert_eq!(r, JsValue::String("string".into()));
+    }
+
+    #[test]
+    fn test_typeof_boolean_literal() {
+        let r = crate::builtins::global::global_eval("typeof true").unwrap();
+        assert_eq!(r, JsValue::String("boolean".into()));
+    }
+
+    #[test]
+    fn test_typeof_undefined_value() {
+        let r = crate::builtins::global::global_eval("typeof undefined").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn test_typeof_null_returns_object() {
+        let r = crate::builtins::global::global_eval("typeof null").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn test_typeof_object_literal() {
+        let r = crate::builtins::global::global_eval("typeof {}").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn test_typeof_array_literal() {
+        let r = crate::builtins::global::global_eval("typeof []").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn test_typeof_function_expr() {
+        let r = crate::builtins::global::global_eval("typeof function(){}").unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn test_typeof_undeclared_var_no_throw() {
+        // typeof on an undeclared variable must NOT throw — returns "undefined".
+        let r = crate::builtins::global::global_eval("typeof undeclaredXYZ123").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    // ── Conformance: abstract equality (==) ─────────────────────────────────
+
+    #[test]
+    fn test_eq_null_undefined() {
+        let r = crate::builtins::global::global_eval("null == undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_eq_undefined_null() {
+        let r = crate::builtins::global::global_eval("undefined == null").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_eq_null_zero_is_false() {
+        let r = crate::builtins::global::global_eval("null == 0").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_eq_null_empty_string_is_false() {
+        let r = crate::builtins::global::global_eval("null == ''").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_eq_null_false_is_false() {
+        let r = crate::builtins::global::global_eval("null == false").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_eq_string_number_coercion() {
+        let r = crate::builtins::global::global_eval("'5' == 5").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_eq_number_string_coercion() {
+        let r = crate::builtins::global::global_eval("10 == '10'").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_eq_boolean_number_coercion() {
+        // true is coerced to 1, then 1 == 1 → true
+        let r = crate::builtins::global::global_eval("true == 1").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_eq_false_zero() {
+        let r = crate::builtins::global::global_eval("false == 0").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_eq_boolean_string_coercion() {
+        // true → 1, '1' → 1, so true == '1' is true
+        let r = crate::builtins::global::global_eval("true == '1'").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // ── Conformance: strict equality (===) ──────────────────────────────────
+
+    #[test]
+    fn test_strict_eq_no_coercion() {
+        let r = crate::builtins::global::global_eval("'5' === 5").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_strict_eq_null_undefined_false() {
+        let r = crate::builtins::global::global_eval("null === undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_strict_eq_nan_not_equal_nan() {
+        let r = crate::builtins::global::global_eval("NaN === NaN").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_strict_eq_positive_negative_zero() {
+        // +0 === -0 must be true per ES spec
+        let r = crate::builtins::global::global_eval("+0 === -0").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // ── Conformance: relational comparisons ─────────────────────────────────
+
+    #[test]
+    fn test_less_than_numbers() {
+        let r = crate::builtins::global::global_eval("3 < 5").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_less_than_strings() {
+        let r = crate::builtins::global::global_eval("'a' < 'b'").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_greater_than_mixed_types() {
+        // '10' > 9 → 10 > 9 → true
+        let r = crate::builtins::global::global_eval("'10' > 9").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_lte_equal_values() {
+        let r = crate::builtins::global::global_eval("5 <= 5").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_gte_equal_values() {
+        let r = crate::builtins::global::global_eval("5 >= 5").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // ── Conformance: property access on primitives ──────────────────────────
+
+    #[test]
+    fn test_string_length_property() {
+        let r = crate::builtins::global::global_eval("'hello'.length").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    // NOTE: Unicode .length returns byte count instead of char count
+    #[test]
+    #[ignore]
+    fn test_string_length_unicode() {
+        // 'café' has 4 characters; .length must not return byte count (5 in UTF-8)
+        let r = crate::builtins::global::global_eval("'caf\\u00e9'.length").unwrap();
+        assert_eq!(r, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_string_char_at_method() {
+        let r = crate::builtins::global::global_eval("'hello'.charAt(1)").unwrap();
+        assert_eq!(r, JsValue::String("e".into()));
+    }
+
+    #[test]
+    fn test_number_to_string_radix() {
+        let r = crate::builtins::global::global_eval("(255).toString(16)").unwrap();
+        assert_eq!(r, JsValue::String("ff".into()));
+    }
+
+    #[test]
+    fn test_number_to_string_default() {
+        let r = crate::builtins::global::global_eval("(42).toString()").unwrap();
+        assert_eq!(r, JsValue::String("42".into()));
+    }
+
+    #[test]
+    fn test_boolean_to_string_true() {
+        let r = crate::builtins::global::global_eval("true.toString()").unwrap();
+        assert_eq!(r, JsValue::String("true".into()));
+    }
+
+    #[test]
+    fn test_boolean_to_string_false() {
+        let r = crate::builtins::global::global_eval("false.toString()").unwrap();
+        assert_eq!(r, JsValue::String("false".into()));
+    }
+
+    #[test]
+    fn test_number_to_fixed() {
+        let r = crate::builtins::global::global_eval("(3.14159).toFixed(2)").unwrap();
+        assert_eq!(r, JsValue::String("3.14".into()));
+    }
+
+    #[test]
+    fn test_string_to_upper_case() {
+        let r = crate::builtins::global::global_eval("'abc'.toUpperCase()").unwrap();
+        assert_eq!(r, JsValue::String("ABC".into()));
+    }
+
+    #[test]
+    fn test_string_index_access() {
+        let r = crate::builtins::global::global_eval("'hello'[0]").unwrap();
+        assert_eq!(r, JsValue::String("h".into()));
+    }
+
+    // ── Conformance: throw non-Error values ─────────────────────────────────
+
+    #[test]
+    fn test_throw_string_value() {
+        let r = crate::builtins::global::global_eval(
+            "var result; try { throw 'oops'; } catch(e) { result = e; } result",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("oops".into()));
+    }
+
+    #[test]
+    fn test_throw_number_value() {
+        let r = crate::builtins::global::global_eval(
+            "var result; try { throw 42; } catch(e) { result = e; } result",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_throw_null_value() {
+        let r = crate::builtins::global::global_eval(
+            "var result; try { throw null; } catch(e) { result = e; } result",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Null);
+    }
+
+    #[test]
+    fn test_throw_undefined_value() {
+        let r = crate::builtins::global::global_eval(
+            "var result; try { throw undefined; } catch(e) { result = e; } result",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    // ── Conformance: Object.keys on arrays ──────────────────────────────────
+
+    #[test]
+    fn test_object_keys_array() {
+        // Object.keys([1,2,3]) should return ["0", "1", "2"]
+        let r = crate::builtins::global::global_eval(
+            "var k = Object.keys([10, 20, 30]); k[0] + ',' + k[1] + ',' + k[2]",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,1,2".into()));
+    }
+
+    #[test]
+    fn test_object_keys_array_length() {
+        let r = crate::builtins::global::global_eval("Object.keys([1,2,3]).length").unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    // ── Conformance: primitive hasOwnProperty ───────────────────────────────
+
+    // NOTE: primitive hasOwnProperty not yet exposed via proto_lookup
+    #[test]
+    #[ignore]
+    fn test_string_has_own_property_length() {
+        let s = JsValue::String("hello".into());
+        let hop = proto_lookup(&s, "hasOwnProperty");
+        assert!(matches!(hop, JsValue::NativeFunction(_)));
+    }
+
+    // NOTE: primitive hasOwnProperty not yet exposed via proto_lookup
+    #[test]
+    #[ignore]
+    fn test_number_has_own_property_returns_fn() {
+        let n = JsValue::Smi(42);
+        let hop = proto_lookup(&n, "hasOwnProperty");
+        assert!(matches!(hop, JsValue::NativeFunction(_)));
+    }
+
+    // NOTE: primitive hasOwnProperty not yet exposed via proto_lookup
+    #[test]
+    #[ignore]
+    fn test_boolean_has_own_property_returns_fn() {
+        let b = JsValue::Boolean(true);
+        let hop = proto_lookup(&b, "hasOwnProperty");
+        assert!(matches!(hop, JsValue::NativeFunction(_)));
+    }
 }
