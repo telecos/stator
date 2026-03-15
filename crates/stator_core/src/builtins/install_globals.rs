@@ -18003,6 +18003,148 @@ mod tests {
         assert_eq!(result, JsValue::Smi(3));
     }
 
+    // ── Math.fround / clz32 / imul / hypot tests ───────────────────────
+
+    /// `Math.fround(1.337)` returns the nearest float32 value.
+    #[test]
+    fn test_math_fround_basic() {
+        let result = global_eval("Math.fround(1.337)").unwrap();
+        if let JsValue::HeapNumber(n) = result {
+            let expected = 1.337f64 as f32 as f64;
+            assert!(
+                (n - expected).abs() < 1e-10,
+                "expected ~{expected}, got {n}"
+            );
+        } else {
+            panic!("expected HeapNumber, got {result:?}");
+        }
+    }
+
+    /// `Math.fround(0)` returns 0.
+    #[test]
+    fn test_math_fround_zero() {
+        let result = global_eval("Math.fround(0)").unwrap();
+        if let JsValue::HeapNumber(n) = result {
+            assert_eq!(n, 0.0);
+        } else {
+            panic!("expected HeapNumber, got {result:?}");
+        }
+    }
+
+    /// `Math.clz32(1)` returns 31 (one leading zero bit after the sign).
+    #[test]
+    fn test_math_clz32_one() {
+        let result = global_eval("Math.clz32(1)").unwrap();
+        assert_eq!(result, JsValue::Smi(31));
+    }
+
+    /// `Math.clz32(0)` returns 32.
+    #[test]
+    fn test_math_clz32_zero() {
+        let result = global_eval("Math.clz32(0)").unwrap();
+        assert_eq!(result, JsValue::Smi(32));
+    }
+
+    /// `Math.imul(2, 4)` returns 8.
+    #[test]
+    fn test_math_imul_basic() {
+        let result = global_eval("Math.imul(2, 4)").unwrap();
+        assert_eq!(result, JsValue::Smi(8));
+    }
+
+    /// `Math.imul(-1, 8)` returns -8.
+    #[test]
+    fn test_math_imul_negative() {
+        let result = global_eval("Math.imul(-1, 8)").unwrap();
+        assert_eq!(result, JsValue::Smi(-8));
+    }
+
+    /// `Math.hypot(3, 4)` returns 5.
+    #[test]
+    fn test_math_hypot_basic() {
+        let result = global_eval("Math.hypot(3, 4)").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// `Math.hypot()` with no args returns 0.
+    #[test]
+    fn test_math_hypot_no_args() {
+        let result = global_eval("Math.hypot()").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    // ── Number.prototype.valueOf / toPrecision / toExponential tests ────
+
+    /// `(42).valueOf()` returns 42.
+    #[test]
+    fn e2e_number_value_of() {
+        let result = global_eval("(42).valueOf()").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `(3.14).valueOf()` returns 3.14.
+    #[test]
+    fn e2e_number_value_of_float() {
+        let result = global_eval("(3.14).valueOf()").unwrap();
+        assert_eq!(result, JsValue::HeapNumber(3.14));
+    }
+
+    /// `(123.456).toPrecision(5)` returns "123.46".
+    #[test]
+    fn e2e_number_to_precision_basic() {
+        let result = global_eval("(123.456).toPrecision(5)").unwrap();
+        assert_eq!(result, JsValue::String("123.46".into()));
+    }
+
+    /// `(0.00123).toPrecision(2)` returns "0.0012".
+    #[test]
+    fn e2e_number_to_precision_small() {
+        let result = global_eval("(0.00123).toPrecision(2)").unwrap();
+        assert_eq!(result, JsValue::String("0.0012".into()));
+    }
+
+    /// `toPrecision()` with no argument returns toString.
+    #[test]
+    fn e2e_number_to_precision_no_arg() {
+        let result = global_eval("(3.14).toPrecision()").unwrap();
+        assert_eq!(result, JsValue::String("3.14".into()));
+    }
+
+    /// `toPrecision(0)` throws RangeError.
+    #[test]
+    fn e2e_number_to_precision_range_error() {
+        let result = global_eval("(1).toPrecision(0)");
+        assert!(result.is_err());
+    }
+
+    /// `(12345).toExponential(2)` returns exponential notation.
+    #[test]
+    fn e2e_number_to_exponential_basic() {
+        let result = global_eval("(12345).toExponential(2)").unwrap();
+        if let JsValue::String(s) = &result {
+            assert!(
+                s.contains('e') || s.contains('E'),
+                "expected exponential notation, got {s}"
+            );
+        } else {
+            panic!("expected String, got {result:?}");
+        }
+    }
+
+    /// `(0).toExponential()` returns exponential notation for zero.
+    #[test]
+    fn e2e_number_to_exponential_zero() {
+        let result = global_eval("(0).toExponential()").unwrap();
+        if let JsValue::String(s) = &result {
+            assert!(
+                s.contains('e') || s.contains('E'),
+                "expected exponential notation, got {s}"
+            );
+        } else {
+            panic!("expected String, got {result:?}");
+        }
+    }
+
     // ── String.prototype.replaceAll edge cases ──────────────────────────
 
     /// `replaceAll` replaces all occurrences of a plain string.
