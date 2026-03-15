@@ -1719,16 +1719,15 @@ fn make_date() -> JsValue {
     props.make_all_non_enumerable();
     let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
     // §20.4.3.3 Date.prototype.constructor
-    if let JsValue::PlainObject(ref ctor_map) = ctor {
-        if let Some(JsValue::PlainObject(ref proto_map)) =
+    if let JsValue::PlainObject(ref ctor_map) = ctor
+        && let Some(JsValue::PlainObject(ref proto_map)) =
             ctor_map.borrow().get("prototype").cloned()
-        {
-            proto_map.borrow_mut().insert_with_attrs(
-                "constructor".into(),
-                ctor.clone(),
-                PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
-            );
-        }
+    {
+        proto_map.borrow_mut().insert_with_attrs(
+            "constructor".into(),
+            ctor.clone(),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        );
     }
     ctor
 }
