@@ -177,6 +177,31 @@ pub fn symbol_description(id: u64) -> Option<String> {
     REGISTRY.with(|r| r.borrow().descriptions.get(&id).cloned().flatten())
 }
 
+/// Map a well-known symbol ID to its internal `@@name` property key.
+///
+/// Returns `None` for user-created symbols that have no canonical `@@`
+/// property key.
+pub fn well_known_symbol_to_key(id: u64) -> Option<&'static str> {
+    match id {
+        SYMBOL_ITERATOR => Some("@@iterator"),
+        SYMBOL_TO_PRIMITIVE => Some("@@toPrimitive"),
+        SYMBOL_HAS_INSTANCE => Some("@@hasInstance"),
+        SYMBOL_TO_STRING_TAG => Some("@@toStringTag"),
+        SYMBOL_IS_CONCAT_SPREADABLE => Some("@@isConcatSpreadable"),
+        SYMBOL_SPECIES => Some("@@species"),
+        SYMBOL_MATCH => Some("@@match"),
+        SYMBOL_REPLACE => Some("@@replace"),
+        SYMBOL_SEARCH => Some("@@search"),
+        SYMBOL_SPLIT => Some("@@split"),
+        SYMBOL_UNSCOPABLES => Some("@@unscopables"),
+        SYMBOL_ASYNC_ITERATOR => Some("@@asyncIterator"),
+        SYMBOL_MATCH_ALL => Some("@@matchAll"),
+        SYMBOL_DISPOSE => Some("@@dispose"),
+        SYMBOL_ASYNC_DISPOSE => Some("@@asyncDispose"),
+        _ => None,
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────

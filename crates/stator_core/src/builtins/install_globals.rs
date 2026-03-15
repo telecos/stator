@@ -430,9 +430,7 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
                 let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
                 let snapshot = set_values(&inner.borrow());
                 for v in snapshot {
-                    if let JsValue::NativeFunction(f) = &cb {
-                        f(vec![v.clone(), v])?;
-                    }
+                    call_callback(&cb, vec![v.clone(), v])?;
                 }
                 Ok(JsValue::Undefined)
             }),
@@ -1374,7 +1372,7 @@ fn make_json() -> JsValue {
 
             // §25.5.1 — apply the optional reviver function bottom-up.
             match args.get(1) {
-                Some(JsValue::NativeFunction(reviver)) => apply_js_reviver(js_val, "", reviver),
+                Some(reviver) if is_callable(reviver) => apply_js_reviver(js_val, "", reviver),
                 _ => Ok(js_val),
             }
         }),
@@ -1490,11 +1488,7 @@ fn make_json() -> JsValue {
 
 /// Walk a `JsValue` tree bottom-up, calling `reviver(key, value)` at each
 /// node — the ECMAScript `InternalizeJSONProperty` algorithm (§25.5.1.1).
-fn apply_js_reviver(
-    value: JsValue,
-    key: &str,
-    reviver: &crate::objects::value::NativeFn,
-) -> StatorResult<JsValue> {
+fn apply_js_reviver(value: JsValue, key: &str, reviver: &JsValue) -> StatorResult<JsValue> {
     let value = match value {
         JsValue::PlainObject(ref map) => {
             let keys: Vec<String> = map.borrow().keys().cloned().collect();
@@ -1519,7 +1513,10 @@ fn apply_js_reviver(
         }
         other => other,
     };
-    reviver(vec![JsValue::String(key.to_string().into()), value])
+    call_callback(
+        reviver,
+        vec![JsValue::String(key.to_string().into()), value],
+    )
 }
 
 // ── Date constructor ─────────────────────────────────────────────────────────
@@ -5890,14 +5887,11 @@ fn make_map_builtin() -> JsValue {
                                 let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
                                 let snapshot = map_entries(&inner.borrow());
                                 for (k, v) in snapshot {
-                                    if let JsValue::NativeFunction(f) = &cb {
-                                        // §24.1.3.5: callback receives (value, key, map)
-                                        f(vec![
-                                            v,
-                                            k,
-                                            JsValue::PlainObject(Rc::clone(&self_ref_fe)),
-                                        ])?;
-                                    }
+                                    // §24.1.3.5: callback receives (value, key, map)
+                                    call_callback(
+                                        &cb,
+                                        vec![v, k, JsValue::PlainObject(Rc::clone(&self_ref_fe))],
+                                    )?;
                                 }
                                 Ok(JsValue::Undefined)
                             }),
@@ -6084,9 +6078,7 @@ fn make_map_builtin() -> JsValue {
                             let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
                             let snapshot = map_entries(&inner.borrow());
                             for (k, v) in snapshot {
-                                if let JsValue::NativeFunction(f) = &cb {
-                                    f(vec![v, k])?;
-                                }
+                                call_callback(&cb, vec![v, k])?;
                             }
                             Ok(JsValue::Undefined)
                         }),
@@ -6249,14 +6241,15 @@ fn make_set_builtin() -> JsValue {
                                 let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
                                 let snapshot = set_values(&inner.borrow());
                                 for v in snapshot {
-                                    if let JsValue::NativeFunction(f) = &cb {
-                                        // §24.2.3.4: callback receives (value, value, set)
-                                        f(vec![
+                                    // §24.2.3.4: callback receives (value, value, set)
+                                    call_callback(
+                                        &cb,
+                                        vec![
                                             v.clone(),
                                             v,
                                             JsValue::PlainObject(Rc::clone(&self_ref_fe)),
-                                        ])?;
-                                    }
+                                        ],
+                                    )?;
                                 }
                                 Ok(JsValue::Undefined)
                             }),
@@ -11994,13 +11987,13 @@ mod tests {
         let json_val = json_parse("[1, 2, 3]", None).unwrap();
         let js_val = json_value_to_js_value(&json_val);
 
-        let reviver: crate::objects::value::NativeFn = Rc::new(|args| {
+        let reviver = JsValue::NativeFunction(Rc::new(|args| {
             let val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
             match val {
                 JsValue::Smi(n) => Ok(JsValue::Smi(n * 2)),
                 other => Ok(other),
             }
-        });
+        }));
 
         let result = apply_js_reviver(js_val, "", &reviver).unwrap();
         // The top-level array itself is passed through the reviver too,
@@ -12023,7 +12016,7 @@ mod tests {
         let js_val = json_value_to_js_value(&json_val);
 
         // Remove "b" by returning undefined
-        let reviver: crate::objects::value::NativeFn = Rc::new(|args| {
+        let reviver = JsValue::NativeFunction(Rc::new(|args| {
             let key = args.first().cloned().unwrap_or(JsValue::Undefined);
             let val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
             if key == JsValue::String("b".into()) {
@@ -12031,7 +12024,7 @@ mod tests {
             } else {
                 Ok(val)
             }
-        });
+        }));
 
         let result = apply_js_reviver(js_val, "", &reviver).unwrap();
         if let JsValue::PlainObject(map) = result {
@@ -18332,18 +18325,16 @@ mod tests {
     // ── Conformance: startsWith/endsWith reject RegExp ──────────────────
 
     /// `String.prototype.startsWith` must throw TypeError when given a RegExp.
-    // NOTE: RegExp __is_regexp__ flag not yet set by RegExp constructor
     #[test]
-    #[ignore]
+    #[ignore] // TODO: implement __is_regexp__ check in startsWith
     fn e2e_starts_with_rejects_regexp() {
         let result = global_eval("'foobar'.startsWith(/foo/)");
         assert!(result.is_err(), "Expected TypeError for RegExp argument");
     }
 
     /// `String.prototype.endsWith` must throw TypeError when given a RegExp.
-    // NOTE: RegExp __is_regexp__ flag not yet set by RegExp constructor
     #[test]
-    #[ignore]
+    #[ignore] // TODO: implement __is_regexp__ check in endsWith
     fn e2e_ends_with_rejects_regexp() {
         let result = global_eval("'foobar'.endsWith(/bar/)");
         assert!(result.is_err(), "Expected TypeError for RegExp argument");
@@ -18502,9 +18493,8 @@ mod tests {
     /// `Map.prototype.forEach` callback receives `(value, key, map)`.
     /// We verify the third argument is the map by checking it has a `get`
     /// method (i.e., it is the Map instance).
-    // NOTE: Map forEach 3-arg callback not yet fully wired
     #[test]
-    #[ignore]
+    #[ignore] // TODO: Map forEach needs 3-arg callback via call_callback
     fn e2e_map_foreach_three_args() {
         // The callback checks that three arguments are received.
         let result = global_eval(
@@ -18516,9 +18506,8 @@ mod tests {
     }
 
     /// `Map.prototype.forEach` calls with correct (value, key) order.
-    // NOTE: Map forEach arg ordering not yet fully wired
     #[test]
-    #[ignore]
+    #[ignore] // TODO: callback closure context not preserved through call_callback/dispatch_call_value
     fn e2e_map_foreach_value_key_order() {
         let result = global_eval(
             "var out = ''; var m = new Map([['x', 42]]); \
@@ -18533,9 +18522,8 @@ mod tests {
     /// `Set.prototype.forEach` callback receives `(value, value, set)`.
     /// We verify the third argument is the set by checking it has an `add`
     /// method.
-    // NOTE: Set forEach 3-arg callback not yet fully wired
     #[test]
-    #[ignore]
+    #[ignore] // TODO: callback closure context not preserved through call_callback/dispatch_call_value
     fn e2e_set_foreach_three_args() {
         let result = global_eval(
             "var count = 0; var s = new Set([10]); \
@@ -19106,7 +19094,7 @@ mod tests {
 
     /// `findLast` receives correct index argument.
     #[test]
-    #[ignore] // NOTE: findLast callback index argument not yet correct
+    #[ignore] // TODO: callback closure context not preserved through call_callback/dispatch_call_value
     fn test_array_find_last_index_arg() {
         let result = global_eval(
             r#"
@@ -19481,7 +19469,6 @@ mod tests {
 
     /// `JSON.parse` with a reviver function.
     #[test]
-    #[ignore] // reviver callback not yet invoked by engine
     fn test_json_parse_with_reviver() {
         let result = global_eval(
             r#"
@@ -19509,7 +19496,6 @@ mod tests {
 
     /// `JSON[Symbol.toStringTag]` is `"JSON"`.
     #[test]
-    #[ignore] // Symbol.toStringTag not yet wired up
     fn test_json_to_string_tag() {
         let result = global_eval("JSON[Symbol.toStringTag]").unwrap();
         assert_eq!(result, JsValue::String("JSON".into()));
