@@ -31,3 +31,16 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 stacker = "0.1"
 tungstenite = "0.28"
+
+# Prevent LLVM from creating enormous stack frames in install_globals.
+# At higher opt-levels the inliner/optimizer folds dozens of temporaries
+# into gigantic frames.  opt-level 1 keeps frames manageable while the
+# main thread runs with `ulimit -s unlimited` (growable stack).
+[profile.release.package.stator_test262]
+opt-level = 1
+[profile.release.package.stator_core]
+opt-level = 1
+
+# Prevent LTO from recombining the per-crate builds.
+[profile.release]
+lto = false
