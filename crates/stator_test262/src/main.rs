@@ -1355,9 +1355,7 @@ fn main_inner() {
     // Build the template globals once.  Each test clones this template so
     // that per-test mutations don't leak across tests while avoiding the
     // heavy cost of re-running `install_globals` for every test.
-    eprintln!("stator_test262: [debug] about to call make_test_globals …");
     let template_globals = make_test_globals();
-    eprintln!("stator_test262: [debug] make_test_globals done, starting tests …");
 
     // ── Run each test ─────────────────────────────────────────────────────────
     for (idx, path) in test_files.iter().enumerate() {

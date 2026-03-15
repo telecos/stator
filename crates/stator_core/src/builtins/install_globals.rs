@@ -11134,29 +11134,18 @@ fn make_disposable_stack() -> JsValue {
 pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
     stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
         // ── Namespace objects ────────────────────────────────────────────────
-        eprintln!("  install_globals: Math");
         globals.insert("Math".into(), make_math());
-        eprintln!("  install_globals: console");
         globals.insert("console".into(), make_console());
-        eprintln!("  install_globals: JSON");
         globals.insert("JSON".into(), make_json());
-        eprintln!("  install_globals: Intl");
         globals.insert("Intl".into(), make_intl());
 
         // ── Constructor / namespace objects ──────────────────────────────────
-        eprintln!("  install_globals: Number");
         globals.insert("Number".into(), finalize_ctor(make_number(), "Number"));
-        eprintln!("  install_globals: Boolean");
         globals.insert("Boolean".into(), finalize_ctor(make_boolean(), "Boolean"));
-        eprintln!("  install_globals: Date");
         globals.insert("Date".into(), finalize_ctor(make_date(), "Date"));
-        eprintln!("  install_globals: Object");
         globals.insert("Object".into(), finalize_ctor(make_object(), "Object"));
-        eprintln!("  install_globals: Array");
         globals.insert("Array".into(), finalize_ctor(make_array(), "Array"));
-        eprintln!("  install_globals: Symbol");
         globals.insert("Symbol".into(), finalize_ctor(make_symbol(), "Symbol"));
-        eprintln!("  install_globals: Iterator+");
         globals.insert(
             "Iterator".into(),
             finalize_ctor(make_iterator(), "Iterator"),
@@ -11184,7 +11173,6 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             finalize_ctor(make_finalization_registry_builtin(), "FinalizationRegistry"),
         );
         globals.insert("Promise".into(), finalize_ctor(make_promise(), "Promise"));
-        eprintln!("  install_globals: RegExp");
         globals.insert("RegExp".into(), finalize_ctor(make_regexp(), "RegExp"));
         globals.insert("BigInt".into(), finalize_ctor(make_bigint(), "BigInt"));
         globals.insert(
@@ -11193,8 +11181,6 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         );
         globals.insert("Proxy".into(), finalize_ctor(make_proxy(), "Proxy"));
         globals.insert("Reflect".into(), make_reflect());
-        eprintln!("  install_globals: Atomics+SharedArrayBuffer");
-
         // ── Atomics / SharedArrayBuffer ─────────────────────────────────────
         globals.insert("Atomics".into(), make_atomics());
         globals.insert(
@@ -11209,17 +11195,13 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         );
 
         // ── Error constructors ────────────────────────────────────────────────
-        eprintln!("  install_globals: errors");
         install_error_constructors(globals);
 
         // ── Explicit resource management ────────────────────────────────────
-        eprintln!("  install_globals: DisposableStack");
         globals.insert(
             "DisposableStack".into(),
             finalize_ctor(make_disposable_stack(), "DisposableStack"),
         );
-        eprintln!("  install_globals: String+TypedArrays");
-
         // ── Simple constructor-like wrappers ─────────────────────────────────
         // NOTE: Boolean is already installed via make_boolean() above, which
         // provides both __call__ (constructor) and prototype.  Do NOT
@@ -11546,7 +11528,6 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             .borrow_mut()
             .insert("globalThis".into(), JsValue::PlainObject(Rc::clone(&inner)));
         globals.insert("globalThis".into(), JsValue::PlainObject(inner));
-        eprintln!("  install_globals: done");
     });
 }
 
