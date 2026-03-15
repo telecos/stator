@@ -11132,7 +11132,20 @@ fn make_disposable_stack() -> JsValue {
 /// (`undefined`, `NaN`, `Infinity`).
 #[inline(never)]
 pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
-    // Phase 1: Namespace objects & core constructors
+    install_globals_phase1(globals);
+    std::hint::black_box(&*globals);
+    install_globals_phase2(globals);
+    std::hint::black_box(&*globals);
+    install_globals_phase3(globals);
+    std::hint::black_box(&*globals);
+    install_globals_phase4(globals);
+    std::hint::black_box(&*globals);
+    install_globals_phase5(globals);
+}
+
+/// Phase 1: Math, console, JSON, Intl, Number, Boolean, Date, Object, Array, Symbol.
+#[inline(never)]
+fn install_globals_phase1(globals: &mut HashMap<String, JsValue>) {
     stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
         // ── Namespace objects ────────────────────────────────────────────────
         globals.insert("Math".into(), make_math());
@@ -11148,8 +11161,11 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         globals.insert("Array".into(), finalize_ctor(make_array(), "Array"));
         globals.insert("Symbol".into(), finalize_ctor(make_symbol(), "Symbol"));
     });
+}
 
-    // Phase 2: Collections & async
+/// Phase 2: Iterator, AsyncIterator, Map, Set, WeakMap, WeakSet, WeakRef, FinalizationRegistry, Promise, RegExp, BigInt.
+#[inline(never)]
+fn install_globals_phase2(globals: &mut HashMap<String, JsValue>) {
     stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
         globals.insert(
             "Iterator".into(),
@@ -11181,8 +11197,11 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         globals.insert("RegExp".into(), finalize_ctor(make_regexp(), "RegExp"));
         globals.insert("BigInt".into(), finalize_ctor(make_bigint(), "BigInt"));
     });
+}
 
-    // Phase 3: Function, Proxy, Reflect, Error, String
+/// Phase 3: Function, Proxy, Reflect, Atomics, SharedArrayBuffer, ShadowRealm, Error constructors, DisposableStack, String.
+#[inline(never)]
+fn install_globals_phase3(globals: &mut HashMap<String, JsValue>) {
     stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
         globals.insert(
             "Function".into(),
@@ -11213,8 +11232,11 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         );
         globals.insert("String".into(), finalize_ctor(make_string(), "String"));
     });
+}
 
-    // Phase 4: TypedArray / ArrayBuffer / DataView constructors
+/// Phase 4: ArrayBuffer, DataView, all TypedArray constructors.
+#[inline(never)]
+fn install_globals_phase4(globals: &mut HashMap<String, JsValue>) {
     stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
         globals.insert(
             "ArrayBuffer".into(),
@@ -11302,8 +11324,11 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             ),
         );
     });
+}
 
-    // Phase 5: Global constants, functions, and globalThis
+/// Phase 5: Global constants, global functions, and globalThis.
+#[inline(never)]
+fn install_globals_phase5(globals: &mut HashMap<String, JsValue>) {
     stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
         // ── Global constants ────────────────────────────────────────────────
         globals.insert("undefined".into(), JsValue::Undefined);
