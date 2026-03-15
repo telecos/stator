@@ -22,6 +22,14 @@ use std::rc::Rc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
+/// CI-friendly Criterion configuration with reduced samples to avoid timeouts.
+fn ci_config() -> Criterion {
+    Criterion::default()
+        .warm_up_time(std::time::Duration::from_secs(1))
+        .measurement_time(std::time::Duration::from_secs(3))
+        .sample_size(20)
+}
+
 use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_core::error::StatorResult;
 use stator_core::gc::handle::HandleScope;
@@ -424,45 +432,53 @@ fn bench_js_closure_capture(c: &mut Criterion) {
 // Benchmark groups
 // ===========================================================================
 
-criterion_group!(
-    infra_benches,
-    bench_heap_allocate,
-    bench_heap_allocate_burst,
-    bench_tagged_smi_round_trip,
-    bench_tagged_heap_ptr_round_trip,
-    bench_handle_scope_create_destroy,
-    bench_handle_scope_create_locals,
-);
+criterion_group! {
+    name = infra_benches;
+    config = ci_config();
+    targets =
+        bench_heap_allocate,
+        bench_heap_allocate_burst,
+        bench_tagged_smi_round_trip,
+        bench_tagged_heap_ptr_round_trip,
+        bench_handle_scope_create_destroy,
+        bench_handle_scope_create_locals,
+}
 
-criterion_group!(
-    property_map_benches,
-    bench_property_map_insert,
-    bench_property_map_lookup_hit,
-    bench_property_map_lookup_miss,
-    bench_property_map_integer_index_insert,
-    bench_property_map_shape_offset,
-);
+criterion_group! {
+    name = property_map_benches;
+    config = ci_config();
+    targets =
+        bench_property_map_insert,
+        bench_property_map_lookup_hit,
+        bench_property_map_lookup_miss,
+        bench_property_map_integer_index_insert,
+        bench_property_map_shape_offset,
+}
 
-criterion_group!(
-    jsvalue_benches,
-    bench_jsvalue_clone_smi,
-    bench_jsvalue_clone_string,
-    bench_jsvalue_clone_plain_object,
-    bench_jsvalue_clone_array,
-);
+criterion_group! {
+    name = jsvalue_benches;
+    config = ci_config();
+    targets =
+        bench_jsvalue_clone_smi,
+        bench_jsvalue_clone_string,
+        bench_jsvalue_clone_plain_object,
+        bench_jsvalue_clone_array,
+}
 
-criterion_group!(
-    js_benches,
-    bench_js_property_access,
-    bench_js_function_call,
-    bench_js_string_concat,
-    bench_js_array_push_pop,
-    bench_js_object_creation,
-    bench_js_keyed_access,
-    bench_js_prototype_chain_lookup,
-    bench_js_arithmetic_loop,
-    bench_js_closure_capture,
-);
+criterion_group! {
+    name = js_benches;
+    config = ci_config();
+    targets =
+        bench_js_property_access,
+        bench_js_function_call,
+        bench_js_string_concat,
+        bench_js_array_push_pop,
+        bench_js_object_creation,
+        bench_js_keyed_access,
+        bench_js_prototype_chain_lookup,
+        bench_js_arithmetic_loop,
+        bench_js_closure_capture,
+}
 
 criterion_main!(
     infra_benches,
