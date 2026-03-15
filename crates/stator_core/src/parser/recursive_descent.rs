@@ -2955,6 +2955,33 @@ impl<'src> Parser<'src> {
                                 },
                             ));
                         }
+                        TokenKind::PrivateIdentifier => {
+                            // `object?.#field`
+                            let prop_tok = self.bump()?;
+                            let name = match prop_tok.value {
+                                TokenValue::Str(s) => s,
+                                _ => {
+                                    return Err(Self::error_at(
+                                        prop_tok.span,
+                                        "invalid private name token",
+                                    ));
+                                }
+                            };
+                            let end = prop_tok.span;
+                            expr = Expr::OptionalMember(Box::new(
+                                crate::parser::ast::OptionalMemberExpr {
+                                    loc: Self::merge_spans(start, end),
+                                    object: Box::new(expr),
+                                    property: crate::parser::ast::MemberProp::Private(
+                                        PrivateIdent {
+                                            loc: prop_tok.span,
+                                            name,
+                                        },
+                                    ),
+                                    is_computed: false,
+                                },
+                            ));
+                        }
                         _ => {
                             // `object?.property`
                             let prop_tok = self.bump()?;
@@ -7251,6 +7278,40 @@ mod tests {
         let prog = parse("class C { #x; check(o) { return #x in o; } }").unwrap();
         if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
             assert_eq!(c.body.body.len(), 2);
+        } else {
+            panic!("expected ClassDecl");
+        }
+    }
+
+    #[test]
+    fn test_class_private_optional_chain() {
+        // `obj?.#field` should produce OptionalMember with MemberProp::Private.
+        let prog = parse("class C { #x; m(o) { return o?.#x; } }").unwrap();
+        if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
+            assert_eq!(c.body.body.len(), 2);
+            if let ClassMember::Method(m) = &c.body.body[1] {
+                if let Stmt::Return(ret) = &m.value.body.body[0] {
+                    if let Some(arg) = &ret.argument {
+                        if let Expr::OptionalMember(om) = arg.as_ref() {
+                            assert!(
+                                matches!(
+                                    &om.property,
+                                    crate::parser::ast::MemberProp::Private(p) if p.name == "x"
+                                ),
+                                "expected MemberProp::Private(\"x\")"
+                            );
+                        } else {
+                            panic!("expected OptionalMember expression");
+                        }
+                    } else {
+                        panic!("expected return argument");
+                    }
+                } else {
+                    panic!("expected return statement");
+                }
+            } else {
+                panic!("expected Method");
+            }
         } else {
             panic!("expected ClassDecl");
         }
