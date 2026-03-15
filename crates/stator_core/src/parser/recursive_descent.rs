@@ -93,6 +93,9 @@ pub struct Parser<'src> {
     /// is saved/restored when entering a parenthesised sub-expression so
     /// that `a ?? (b || c)` remains legal.
     in_nullish_coalesce: bool,
+    /// Label stack for validating break/continue targets.
+    /// Each entry is (label_name, is_iteration_label).
+    labels: Vec<(String, bool)>,
 }
 
 impl<'src> Parser<'src> {
@@ -113,6 +116,7 @@ impl<'src> Parser<'src> {
             iteration_depth: 0,
             breakable_depth: 0,
             in_nullish_coalesce: false,
+            labels: Vec::new(),
         })
     }
 
@@ -410,7 +414,16 @@ impl<'src> Parser<'src> {
                 if self.peek_kind() == TokenKind::Colon {
                     self.bump()?; // consume ':'
                     let label = self.ident_from_token(&id_tok)?;
-                    let body = self.parse_stmt()?;
+                    // Track label for break/continue validation.
+                    // Peek whether the labelled body is an iteration stmt.
+                    let is_iteration = matches!(
+                        self.peek_kind(),
+                        TokenKind::For | TokenKind::While | TokenKind::Do
+                    );
+                    self.labels.push((label.name.clone(), is_iteration));
+                    let body = self.parse_stmt();
+                    self.labels.pop();
+                    let body = body?;
                     // Strict mode: labelled function declarations are a SyntaxError.
                     if self.strict_mode && matches!(body, Stmt::FnDecl(_)) {
                         return Err(Self::error_at(
@@ -877,6 +890,12 @@ impl<'src> Parser<'src> {
                 "break statement not inside a loop or switch",
             ));
         }
+        // `break label` — validate the label exists.
+        if let Some(ref lbl) = label
+            && !self.labels.iter().any(|(n, _)| n == &lbl.name)
+        {
+            return Err(Self::error_at(lbl.loc, "undefined label"));
+        }
         let end = label.as_ref().map(|l| l.loc).unwrap_or(start);
         self.consume_semicolon()?;
         Ok(Stmt::Break(BreakStmt {
@@ -902,6 +921,19 @@ impl<'src> Parser<'src> {
                 start,
                 "continue statement not inside a loop",
             ));
+        }
+        // `continue label` — validate the label exists and is on an iteration.
+        if let Some(ref lbl) = label {
+            match self.labels.iter().find(|(n, _)| n == &lbl.name) {
+                None => return Err(Self::error_at(lbl.loc, "undefined label")),
+                Some((_, false)) => {
+                    return Err(Self::error_at(
+                        lbl.loc,
+                        "continue label is not on an iteration statement",
+                    ));
+                }
+                Some((_, true)) => {}
+            }
         }
         let end = label.as_ref().map(|l| l.loc).unwrap_or(start);
         self.consume_semicolon()?;
@@ -1113,24 +1145,20 @@ impl<'src> Parser<'src> {
         let outer_function_depth = self.function_depth;
         let outer_iteration_depth = self.iteration_depth;
         let outer_breakable_depth = self.breakable_depth;
+        let outer_labels = std::mem::take(&mut self.labels);
         self.function_depth = 1;
         self.iteration_depth = 0;
         self.breakable_depth = 0;
 
-        let mut body = Vec::new();
-        while self.peek_kind() != TokenKind::RightBrace {
-            if self.peek_kind() == TokenKind::Eof {
-                return Err(self.error("unexpected end of input inside block"));
-            }
-            body.push(self.parse_stmt()?);
-        }
-        let end = self.current_span();
-        self.bump()?; // consume '}'
+        let result = self.parse_function_body_inner(start);
 
-        // Restore enclosing depths.
+        // Restore enclosing depths — even on error.
         self.function_depth = outer_function_depth;
         self.iteration_depth = outer_iteration_depth;
         self.breakable_depth = outer_breakable_depth;
+        self.labels = outer_labels;
+
+        let (body, end) = result?;
 
         Ok((
             BlockStmt {
@@ -1140,6 +1168,21 @@ impl<'src> Parser<'src> {
             is_strict,
             has_directive,
         ))
+    }
+
+    /// Inner helper so that depth restore in [`parse_function_body`] always
+    /// runs, even when the body contains a parse error.
+    fn parse_function_body_inner(&mut self, _start: Span) -> StatorResult<(Vec<Stmt>, Span)> {
+        let mut body = Vec::new();
+        while self.peek_kind() != TokenKind::RightBrace {
+            if self.peek_kind() == TokenKind::Eof {
+                return Err(self.error("unexpected end of input inside block"));
+            }
+            body.push(self.parse_stmt()?);
+        }
+        let end = self.current_span();
+        self.bump()?; // consume '}'
+        Ok((body, end))
     }
 
     // ── Class parsing ──────────────────────────────────────────────────────
@@ -1320,6 +1363,7 @@ impl<'src> Parser<'src> {
                 let outer_fn = self.function_depth;
                 let outer_it = self.iteration_depth;
                 let outer_br = self.breakable_depth;
+                let outer_labels = std::mem::take(&mut self.labels);
                 self.function_depth = 1;
                 self.iteration_depth = 0;
                 self.breakable_depth = 0;
@@ -1327,6 +1371,7 @@ impl<'src> Parser<'src> {
                 self.function_depth = outer_fn;
                 self.iteration_depth = outer_it;
                 self.breakable_depth = outer_br;
+                self.labels = outer_labels;
                 let body = body?;
                 let fn_end = body.loc;
 
@@ -3398,6 +3443,7 @@ impl<'src> Parser<'src> {
                             let outer_fn = self.function_depth;
                             let outer_it = self.iteration_depth;
                             let outer_br = self.breakable_depth;
+                            let outer_labels = std::mem::take(&mut self.labels);
                             self.function_depth = 1;
                             self.iteration_depth = 0;
                             self.breakable_depth = 0;
@@ -3405,6 +3451,7 @@ impl<'src> Parser<'src> {
                             self.function_depth = outer_fn;
                             self.iteration_depth = outer_it;
                             self.breakable_depth = outer_br;
+                            self.labels = outer_labels;
                             let body = body?;
                             let fn_end = body.loc;
                             let fn_expr = FnExpr {
@@ -3435,6 +3482,7 @@ impl<'src> Parser<'src> {
                             let outer_fn = self.function_depth;
                             let outer_it = self.iteration_depth;
                             let outer_br = self.breakable_depth;
+                            let outer_labels = std::mem::take(&mut self.labels);
                             self.function_depth = 1;
                             self.iteration_depth = 0;
                             self.breakable_depth = 0;
@@ -3442,6 +3490,7 @@ impl<'src> Parser<'src> {
                             self.function_depth = outer_fn;
                             self.iteration_depth = outer_it;
                             self.breakable_depth = outer_br;
+                            self.labels = outer_labels;
                             let body = body?;
                             let fn_end = body.loc;
                             PropValue::Method(FnExpr {
@@ -3989,6 +4038,7 @@ impl<'src> Parser<'src> {
             let outer_function_depth = self.function_depth;
             let outer_iteration_depth = self.iteration_depth;
             let outer_breakable_depth = self.breakable_depth;
+            let outer_labels = std::mem::take(&mut self.labels);
             self.function_depth = 1;
             self.iteration_depth = 0;
             self.breakable_depth = 0;
@@ -3996,6 +4046,7 @@ impl<'src> Parser<'src> {
             self.function_depth = outer_function_depth;
             self.iteration_depth = outer_iteration_depth;
             self.breakable_depth = outer_breakable_depth;
+            self.labels = outer_labels;
             Ok(ArrowBody::Block(block?))
         } else {
             Ok(ArrowBody::Expr(Box::new(self.parse_assignment_expr()?)))
@@ -4283,6 +4334,22 @@ impl<'src> Parser<'src> {
                     }
                 }
                 PropValue::Value(expr) => {
+                    // CoverInitializedName: `{ a = 1 }` was parsed as
+                    // `{ a: (a = 1) }`. Detect when the key ident matches
+                    // the LHS of the assignment and produce AssignPatProp.
+                    if let Expr::Assign(ref assign) = *expr
+                        && let PropKey::Ident(ref key_id) = p.key
+                        && let AssignTarget::Expr(ref lhs) = assign.left
+                        && let Expr::Ident(ref lhs_id) = **lhs
+                        && key_id.name == lhs_id.name
+                        && assign.op == AssignOp::Assign
+                    {
+                        return Ok(ObjectPatProp::Assign(AssignPatProp {
+                            loc: p.loc,
+                            key: key_id.clone(),
+                            value: Some(assign.right.clone()),
+                        }));
+                    }
                     // `{ key: value }` → key-value pattern.
                     let pat = self.expr_to_pat(*expr)?;
                     Ok(ObjectPatProp::KeyValue(KeyValuePatProp {
@@ -8774,5 +8841,163 @@ mod tests {
             parse("x++ ** 2").is_ok(),
             "x++ ** y should be allowed (postfix)"
         );
+    }
+
+    // ── Label validation tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_label_for_break() {
+        parse("outer: for (;;) { break outer; }").unwrap();
+    }
+
+    #[test]
+    fn test_label_block_break() {
+        parse("block: { break block; }").unwrap();
+    }
+
+    #[test]
+    fn test_label_nested_break_outer() {
+        parse("outer: for (;;) { for (;;) { break outer; } }").unwrap();
+    }
+
+    #[test]
+    fn test_label_break_undefined() {
+        assert!(parse("for (;;) { break nonexistent; }").is_err());
+    }
+
+    #[test]
+    fn test_label_continue_undefined() {
+        assert!(parse("for (;;) { continue nonexistent; }").is_err());
+    }
+
+    #[test]
+    fn test_label_continue_non_iteration() {
+        assert!(parse("block: { for (;;) { continue block; } }").is_err());
+    }
+
+    #[test]
+    fn test_label_across_function_boundary() {
+        assert!(parse("outer: for (;;) { (function() { break outer; })(); }").is_err());
+    }
+
+    #[test]
+    fn test_label_across_arrow_boundary() {
+        assert!(parse("outer: for (;;) { (() => { break outer; })(); }").is_err());
+    }
+
+    #[test]
+    fn test_label_continue_on_iteration_ok() {
+        parse("loop1: for (;;) { continue loop1; }").unwrap();
+    }
+
+    #[test]
+    fn test_label_continue_on_while_ok() {
+        parse("loop1: while (true) { continue loop1; }").unwrap();
+    }
+
+    #[test]
+    fn test_label_continue_on_do_while_ok() {
+        parse("loop1: do { continue loop1; } while (true)").unwrap();
+    }
+
+    // ── CoverInitializedName tests ───────────────────────────────────────
+
+    #[test]
+    fn test_cover_initialized_name_arrow() {
+        // `({a = 1, b = 2}) => a + b` — shorthand defaults in arrow params.
+        let program = parse("({a = 1, b = 2}) => a + b").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(ref es)) = program.body[0] {
+            if let Expr::Arrow(ref arrow) = *es.expr {
+                if let Pat::Object(ref obj) = arrow.params[0].pat {
+                    assert!(
+                        matches!(obj.properties[0], ObjectPatProp::Assign(_)),
+                        "first prop should be AssignPatProp"
+                    );
+                    assert!(
+                        matches!(obj.properties[1], ObjectPatProp::Assign(_)),
+                        "second prop should be AssignPatProp"
+                    );
+                    return;
+                }
+            }
+        }
+        panic!("unexpected AST shape");
+    }
+
+    #[test]
+    fn test_cover_initialized_name_plain_shorthand() {
+        // `({a, b}) => a + b` — shorthand without defaults.
+        let program = parse("({a, b}) => a + b").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(ref es)) = program.body[0] {
+            if let Expr::Arrow(ref arrow) = *es.expr {
+                if let Pat::Object(ref obj) = arrow.params[0].pat {
+                    assert!(
+                        matches!(obj.properties[0], ObjectPatProp::Assign(_)),
+                        "first prop should be AssignPatProp"
+                    );
+                    return;
+                }
+            }
+        }
+        panic!("unexpected AST shape");
+    }
+
+    // ── Destructuring edge-case tests ────────────────────────────────────
+
+    #[test]
+    fn test_destructuring_defaults_in_params() {
+        parse("function f({a = 1, b = 2}) {}").unwrap();
+    }
+
+    #[test]
+    fn test_destructuring_nested_in_params() {
+        parse("function f({a: {b, c}}) {}").unwrap();
+    }
+
+    #[test]
+    fn test_destructuring_computed_property() {
+        parse("let {[key]: value} = obj").unwrap();
+    }
+
+    #[test]
+    fn test_destructuring_rename_with_default() {
+        parse("let {a: b = 1} = obj").unwrap();
+    }
+
+    // ── for-of / for-in destructuring tests ──────────────────────────────
+
+    #[test]
+    fn test_for_of_const() {
+        parse("for (const x of arr) {}").unwrap();
+    }
+
+    // ── Arrow function edge-case tests ───────────────────────────────────
+
+    #[test]
+    fn test_arrow_destructuring_obj_params() {
+        parse("({x, y}) => x + y").unwrap();
+    }
+
+    #[test]
+    #[ignore] // NOTE: rest-only arrow params not yet supported
+    fn test_arrow_rest_param() {
+        parse("(...args) => args").unwrap();
+    }
+
+    #[test]
+    fn test_arrow_async_expression_body() {
+        parse("async (x) => x").unwrap();
+    }
+
+    // ── Misc edge-case tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_duplicate_obj_keys_ok() {
+        parse("var x = {a: 1, a: 2}").unwrap();
+    }
+
+    #[test]
+    fn test_for_of_let_simple() {
+        parse("for (let x of [1, 2]) {}").unwrap();
     }
 }
