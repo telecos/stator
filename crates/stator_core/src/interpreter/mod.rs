@@ -4176,11 +4176,15 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
-                        for (i, v) in a.borrow().iter().enumerate().rev() {
-                            let result =
-                                dispatch_call_value(&cb, vec![v.clone(), JsValue::Smi(i as i32)])?;
+                        let arr_val = JsValue::Array(Rc::clone(&a));
+                        let snapshot: Vec<JsValue> = a.borrow().clone();
+                        for i in (0..snapshot.len()).rev() {
+                            let result = dispatch_call_value(
+                                &cb,
+                                vec![snapshot[i].clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                            )?;
                             if to_boolean_val(&result) {
-                                return Ok(v.clone());
+                                return Ok(snapshot[i].clone());
                             }
                         }
                         Ok(JsValue::Undefined)
@@ -4190,9 +4194,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let cb = args.first().cloned().unwrap_or(JsValue::Undefined);
-                        for (i, v) in a.borrow().iter().enumerate().rev() {
-                            let result =
-                                dispatch_call_value(&cb, vec![v.clone(), JsValue::Smi(i as i32)])?;
+                        let arr_val = JsValue::Array(Rc::clone(&a));
+                        let snapshot: Vec<JsValue> = a.borrow().clone();
+                        for i in (0..snapshot.len()).rev() {
+                            let result = dispatch_call_value(
+                                &cb,
+                                vec![snapshot[i].clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                            )?;
                             if to_boolean_val(&result) {
                                 return Ok(JsValue::Smi(i as i32));
                             }
@@ -5048,7 +5056,18 @@ pub fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult
     match callee {
         JsValue::Function(ba) => {
             push_call_frame("<anonymous>")?;
-            let mut frame = InterpreterFrame::new((**ba).clone(), args);
+            // Prefer the caller's global environment (stored in the
+            // thread-local by Interpreter::run) so that callbacks can
+            // read/write variables declared in the calling scope.
+            let caller_globals = CURRENT_GLOBALS.with(|g| g.borrow().as_ref().map(Rc::clone));
+            let mut frame = if let Some(globals) = caller_globals {
+                InterpreterFrame::new_with_globals((**ba).clone(), args, globals)
+            } else {
+                InterpreterFrame::new((**ba).clone(), args)
+            };
+            // Restore the closure's captured context so that free
+            // variables resolve through the enclosing scope chain.
+            restore_closure_context(&mut frame, ba);
             let result = Interpreter::run(&mut frame);
             pop_call_frame();
             result

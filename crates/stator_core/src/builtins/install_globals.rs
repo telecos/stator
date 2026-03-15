@@ -260,6 +260,40 @@ fn call_callback(cb: &JsValue, args: Vec<JsValue>) -> StatorResult<JsValue> {
     dispatch_call_value(cb, args)
 }
 
+/// Extract elements from an array-like JsValue.
+///
+/// Handles both `JsValue::Array` (used by builtins) and
+/// `JsValue::PlainObject` with `__is_array__` (produced by array
+/// literals in bytecode).  Returns an empty Vec for non-array values.
+fn extract_array_items(val: &JsValue) -> Vec<JsValue> {
+    match val {
+        JsValue::Array(arr) => arr.borrow().clone(),
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            if !borrow
+                .get("__is_array__")
+                .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
+            {
+                return Vec::new();
+            }
+            let len = match borrow.get("length") {
+                Some(JsValue::Smi(n)) => (*n).max(0) as usize,
+                Some(JsValue::HeapNumber(n)) => *n as usize,
+                _ => 0,
+            };
+            (0..len)
+                .map(|i| {
+                    borrow
+                        .get(&i.to_string())
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined)
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// ECMAScript §7.2.1 RequireObjectCoercible — throws TypeError for null/undefined.
 fn require_object_coercible(val: &JsValue) -> StatorResult<()> {
     match val {
@@ -5788,18 +5822,23 @@ fn make_map_builtin() -> JsValue {
         props.insert(
             "__call__".into(),
             native(|args| {
-                let m = if let Some(JsValue::Array(arr)) = args.first() {
-                    let mut pairs = Vec::new();
-                    for item in arr.borrow().iter() {
-                        if let JsValue::Array(pair) = item {
-                            let k = pair.borrow().first().cloned().unwrap_or(JsValue::Undefined);
-                            let v = pair.borrow().get(1).cloned().unwrap_or(JsValue::Undefined);
-                            pairs.push((k, v));
+                let m = match args.first() {
+                    Some(arg) => {
+                        let items = extract_array_items(arg);
+                        if items.is_empty() {
+                            map_new()
+                        } else {
+                            let mut pairs = Vec::new();
+                            for item in &items {
+                                let pair_items = extract_array_items(item);
+                                let k = pair_items.first().cloned().unwrap_or(JsValue::Undefined);
+                                let v = pair_items.get(1).cloned().unwrap_or(JsValue::Undefined);
+                                pairs.push((k, v));
+                            }
+                            map_from_iterable(pairs)
                         }
                     }
-                    map_from_iterable(pairs)
-                } else {
-                    map_new()
+                    None => map_new(),
                 };
                 // Store the JsMap in a RefCell so prototype methods can mutate it.
                 let inner = Rc::new(RefCell::new(m));
@@ -6164,10 +6203,16 @@ fn make_set_builtin() -> JsValue {
         props.insert(
             "__call__".into(),
             native(|args| {
-                let s = if let Some(JsValue::Array(arr)) = args.first() {
-                    set_from_iterable(arr.borrow().clone())
-                } else {
-                    set_new()
+                let s = match args.first() {
+                    Some(arg) => {
+                        let items = extract_array_items(arg);
+                        if items.is_empty() {
+                            set_new()
+                        } else {
+                            set_from_iterable(items)
+                        }
+                    }
+                    None => set_new(),
                 };
                 let inner = Rc::new(RefCell::new(s));
                 let obj_rc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
@@ -18494,7 +18539,7 @@ mod tests {
     /// We verify the third argument is the map by checking it has a `get`
     /// method (i.e., it is the Map instance).
     #[test]
-    #[ignore] // TODO: Map forEach needs 3-arg callback via call_callback
+
     fn e2e_map_foreach_three_args() {
         // The callback checks that three arguments are received.
         let result = global_eval(
@@ -18507,7 +18552,6 @@ mod tests {
 
     /// `Map.prototype.forEach` calls with correct (value, key) order.
     #[test]
-    #[ignore] // TODO: callback closure context not preserved through call_callback/dispatch_call_value
     fn e2e_map_foreach_value_key_order() {
         let result = global_eval(
             "var out = ''; var m = new Map([['x', 42]]); \
@@ -18523,7 +18567,6 @@ mod tests {
     /// We verify the third argument is the set by checking it has an `add`
     /// method.
     #[test]
-    #[ignore] // TODO: callback closure context not preserved through call_callback/dispatch_call_value
     fn e2e_set_foreach_three_args() {
         let result = global_eval(
             "var count = 0; var s = new Set([10]); \
@@ -19094,7 +19137,6 @@ mod tests {
 
     /// `findLast` receives correct index argument.
     #[test]
-    #[ignore] // TODO: callback closure context not preserved through call_callback/dispatch_call_value
     fn test_array_find_last_index_arg() {
         let result = global_eval(
             r#"
