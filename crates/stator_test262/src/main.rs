@@ -17,7 +17,6 @@
 //!   --verbose              Print every individual test outcome
 //! ```
 
-use stacker;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
