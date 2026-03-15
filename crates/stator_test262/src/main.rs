@@ -1290,7 +1290,7 @@ fn main() {
     // pathological test inputs from overflowing the default 8 MB stack.
     let builder = std::thread::Builder::new()
         .name("test262-main".into())
-        .stack_size(1024 * 1024 * 1024); // 1 GiB virtual — physical pages are lazy
+        .stack_size(8 * 1024 * 1024); // 8 MiB — stacker grows dynamically beyond this
     let handler = builder
         .spawn(main_inner)
         .expect("failed to spawn main thread");
