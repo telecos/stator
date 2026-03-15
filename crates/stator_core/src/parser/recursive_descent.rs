@@ -4301,20 +4301,18 @@ impl<'src> Parser<'src> {
                     // CoverInitializedName: `{ a = 1 }` was parsed as
                     // `{ a: (a = 1) }`. Detect when the key ident matches
                     // the LHS of the assignment and produce AssignPatProp.
-                    if let Expr::Assign(ref assign) = *expr {
-                        if let PropKey::Ident(ref key_id) = p.key {
-                            if let AssignTarget::Expr(ref lhs) = assign.left {
-                                if let Expr::Ident(ref lhs_id) = **lhs {
-                                    if key_id.name == lhs_id.name && assign.op == AssignOp::Assign {
-                                        return Ok(ObjectPatProp::Assign(AssignPatProp {
-                                            loc: p.loc,
-                                            key: key_id.clone(),
-                                            value: Some(assign.right.clone()),
-                                        }));
-                                    }
-                                }
-                            }
-                        }
+                    if let Expr::Assign(ref assign) = *expr
+                        && let PropKey::Ident(ref key_id) = p.key
+                        && let AssignTarget::Expr(ref lhs) = assign.left
+                        && let Expr::Ident(ref lhs_id) = **lhs
+                        && key_id.name == lhs_id.name
+                        && assign.op == AssignOp::Assign
+                    {
+                        return Ok(ObjectPatProp::Assign(AssignPatProp {
+                            loc: p.loc,
+                            key: key_id.clone(),
+                            value: Some(assign.right.clone()),
+                        }));
                     }
                     // `{ key: value }` → key-value pattern.
                     let pat = self.expr_to_pat(*expr)?;
