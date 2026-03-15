@@ -5609,7 +5609,7 @@ fn handle_call_direct_eval(
                         Rc::clone(&ctx.frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, &ba);
-                    let _ = push_call_frame("<eval-fallback>");
+                    push_call_frame("<eval-fallback>")?;
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
                     ctx.frame.accumulator = result?;
