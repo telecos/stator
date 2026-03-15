@@ -4309,7 +4309,7 @@ impl<'src> Parser<'src> {
                                         return Ok(ObjectPatProp::Assign(AssignPatProp {
                                             loc: p.loc,
                                             key: key_id.clone(),
-                                            value: Some(*assign.right.clone()),
+                                            value: Some(assign.right.clone()),
                                         }));
                                     }
                                 }
