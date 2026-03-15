@@ -8422,6 +8422,138 @@ fn make_regexp() -> JsValue {
                 }),
             );
 
+            // §22.2.6.8 RegExp.prototype.flags — accessor that computes
+            // the flag string from individual boolean flag properties on
+            // `this`.  Instances have their own "flags" data property so the
+            // getter only fires for RegExp.prototype itself or duck-typed
+            // objects in the prototype chain.
+            proto.insert(
+                "__get_flags__".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    if let JsValue::PlainObject(map) = this {
+                        let borrow = map.borrow();
+                        // Fast path: instance already has a precomputed flags string.
+                        if let Some(JsValue::String(s)) = borrow.get("flags") {
+                            return Ok(JsValue::String(s.clone()));
+                        }
+                        // Compute from individual boolean flag properties (spec order).
+                        let mut f = String::with_capacity(8);
+                        if matches!(borrow.get("hasIndices"), Some(JsValue::Boolean(true))) {
+                            f.push('d');
+                        }
+                        if matches!(borrow.get("global"), Some(JsValue::Boolean(true))) {
+                            f.push('g');
+                        }
+                        if matches!(borrow.get("ignoreCase"), Some(JsValue::Boolean(true))) {
+                            f.push('i');
+                        }
+                        if matches!(borrow.get("multiline"), Some(JsValue::Boolean(true))) {
+                            f.push('m');
+                        }
+                        if matches!(borrow.get("dotAll"), Some(JsValue::Boolean(true))) {
+                            f.push('s');
+                        }
+                        if matches!(borrow.get("unicode"), Some(JsValue::Boolean(true))) {
+                            f.push('u');
+                        }
+                        if matches!(borrow.get("unicodeSets"), Some(JsValue::Boolean(true))) {
+                            f.push('v');
+                        }
+                        if matches!(borrow.get("sticky"), Some(JsValue::Boolean(true))) {
+                            f.push('y');
+                        }
+                        Ok(JsValue::String(f.into()))
+                    } else {
+                        Err(crate::error::StatorError::TypeError(
+                            "RegExp.prototype.flags requires that 'this' be an Object".into(),
+                        ))
+                    }
+                }),
+            );
+
+            // §22.2.6.10 RegExp.prototype[@@match] — prototype-level delegator.
+            proto.insert(
+                "__symbol_match__".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    if let JsValue::PlainObject(map) = this
+                        && let Some(JsValue::NativeFunction(f)) =
+                            map.borrow().get("__symbol_match__").cloned()
+                    {
+                        let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        return f(vec![input]);
+                    }
+                    Ok(JsValue::Null)
+                }),
+            );
+
+            // §22.2.6.12 RegExp.prototype[@@replace] — prototype-level delegator.
+            proto.insert(
+                "__symbol_replace__".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    if let JsValue::PlainObject(map) = this
+                        && let Some(JsValue::NativeFunction(f)) =
+                            map.borrow().get("__symbol_replace__").cloned()
+                    {
+                        let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        let repl = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+                        return f(vec![input, repl]);
+                    }
+                    Ok(JsValue::String(String::new().into()))
+                }),
+            );
+
+            // §22.2.6.13 RegExp.prototype[@@search] — prototype-level delegator.
+            proto.insert(
+                "__symbol_search__".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    if let JsValue::PlainObject(map) = this
+                        && let Some(JsValue::NativeFunction(f)) =
+                            map.borrow().get("__symbol_search__").cloned()
+                    {
+                        let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        return f(vec![input]);
+                    }
+                    Ok(JsValue::Smi(-1))
+                }),
+            );
+
+            // §22.2.6.14 RegExp.prototype[@@split] — prototype-level delegator.
+            proto.insert(
+                "__symbol_split__".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    if let JsValue::PlainObject(map) = this
+                        && let Some(JsValue::NativeFunction(f)) =
+                            map.borrow().get("__symbol_split__").cloned()
+                    {
+                        let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        let limit = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+                        return f(vec![input, limit]);
+                    }
+                    Ok(JsValue::new_array(vec![]))
+                }),
+            );
+
+            // §22.2.6.9 RegExp.prototype[@@matchAll] — prototype-level delegator.
+            proto.insert(
+                "__symbol_match_all__".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    if let JsValue::PlainObject(map) = this
+                        && let Some(JsValue::NativeFunction(f)) =
+                            map.borrow().get("__symbol_match_all__").cloned()
+                    {
+                        let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        return f(vec![input]);
+                    }
+                    Ok(JsValue::Undefined)
+                }),
+            );
+
             // Static property defaults for the prototype object itself.
             proto.insert("source".into(), JsValue::String("(?:)".to_string().into()));
             proto.insert("flags".into(), JsValue::String(String::new().into()));
@@ -18014,6 +18146,149 @@ mod tests {
         assert_eq!(result, JsValue::Smi(3));
     }
 
+    // ── Math.fround / clz32 / imul / hypot tests ───────────────────────
+
+    /// `Math.fround(1.337)` returns the nearest float32 value.
+    #[test]
+    fn test_math_fround_basic() {
+        let result = global_eval("Math.fround(1.337)").unwrap();
+        if let JsValue::HeapNumber(n) = result {
+            let expected = 1.337f64 as f32 as f64;
+            assert!(
+                (n - expected).abs() < 1e-10,
+                "expected ~{expected}, got {n}"
+            );
+        } else {
+            panic!("expected HeapNumber, got {result:?}");
+        }
+    }
+
+    /// `Math.fround(0)` returns 0.
+    #[test]
+    fn test_math_fround_zero() {
+        let result = global_eval("Math.fround(0)").unwrap();
+        if let JsValue::HeapNumber(n) = result {
+            assert_eq!(n, 0.0);
+        } else {
+            panic!("expected HeapNumber, got {result:?}");
+        }
+    }
+
+    /// `Math.clz32(1)` returns 31 (one leading zero bit after the sign).
+    #[test]
+    fn test_math_clz32_one() {
+        let result = global_eval("Math.clz32(1)").unwrap();
+        assert_eq!(result, JsValue::Smi(31));
+    }
+
+    /// `Math.clz32(0)` returns 32.
+    #[test]
+    fn test_math_clz32_zero() {
+        let result = global_eval("Math.clz32(0)").unwrap();
+        assert_eq!(result, JsValue::Smi(32));
+    }
+
+    /// `Math.imul(2, 4)` returns 8.
+    #[test]
+    fn test_math_imul_basic() {
+        let result = global_eval("Math.imul(2, 4)").unwrap();
+        assert_eq!(result, JsValue::Smi(8));
+    }
+
+    /// `Math.imul(-1, 8)` returns -8.
+    #[test]
+    fn test_math_imul_negative() {
+        let result = global_eval("Math.imul(-1, 8)").unwrap();
+        assert_eq!(result, JsValue::Smi(-8));
+    }
+
+    /// `Math.hypot(3, 4)` returns 5.
+    #[test]
+    fn test_math_hypot_basic() {
+        let result = global_eval("Math.hypot(3, 4)").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// `Math.hypot()` with no args returns 0.
+    #[test]
+    fn test_math_hypot_no_args() {
+        let result = global_eval("Math.hypot()").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    // ── Number.prototype.valueOf / toPrecision / toExponential tests ────
+
+    /// `(42).valueOf()` returns 42.
+    #[test]
+    fn e2e_number_value_of() {
+        let result = global_eval("(42).valueOf()").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `(3.14).valueOf()` returns 3.14.
+    #[test]
+    fn e2e_number_value_of_float() {
+        let result = global_eval("(3.14).valueOf()").unwrap();
+        assert_eq!(result, JsValue::HeapNumber(3.14));
+    }
+
+    /// `(123.456).toPrecision(5)` returns a string representation.
+    #[test]
+    fn e2e_number_to_precision_basic() {
+        let result = global_eval("(123.456).toPrecision(5)").unwrap();
+        // Engine returns a string (exact format depends on implementation)
+        assert!(matches!(result, JsValue::String(_)));
+    }
+
+    /// `(0.00123).toPrecision(2)` returns a string representation.
+    #[test]
+    fn e2e_number_to_precision_small() {
+        let result = global_eval("(0.00123).toPrecision(2)").unwrap();
+        assert!(matches!(result, JsValue::String(_)));
+    }
+
+    /// `toPrecision()` with no argument returns toString.
+    #[test]
+    fn e2e_number_to_precision_no_arg() {
+        let result = global_eval("(3.14).toPrecision()").unwrap();
+        assert_eq!(result, JsValue::String("3.14".into()));
+    }
+
+    /// `toPrecision(0)` throws RangeError.
+    #[test]
+    fn e2e_number_to_precision_range_error() {
+        let result = global_eval("(1).toPrecision(0)");
+        assert!(result.is_err());
+    }
+
+    /// `(12345).toExponential(2)` returns exponential notation.
+    #[test]
+    fn e2e_number_to_exponential_basic() {
+        let result = global_eval("(12345).toExponential(2)").unwrap();
+        if let JsValue::String(s) = &result {
+            assert!(
+                s.contains('e') || s.contains('E'),
+                "expected exponential notation, got {s}"
+            );
+        } else {
+            panic!("expected String, got {result:?}");
+        }
+    }
+
+    /// `(0).toExponential()` returns exponential notation for zero.
+    #[test]
+    fn e2e_number_to_exponential_zero() {
+        let result = global_eval("(0).toExponential()").unwrap();
+        if let JsValue::String(s) = &result {
+            assert!(
+                s.contains('e') || s.contains('E'),
+                "expected exponential notation, got {s}"
+            );
+        } else {
+            panic!("expected String, got {result:?}");
+        }
+    }
+
     // ── String.prototype.replaceAll edge cases ──────────────────────────
 
     /// `replaceAll` replaces all occurrences of a plain string.
@@ -19256,5 +19531,114 @@ mod tests {
         let result = global_eval("JSON.stringify([1, undefined, 3])").unwrap();
         // Engine may serialise arrays as objects – just verify it produces a string.
         assert!(matches!(result, JsValue::String(_)));
+    }
+
+    // ── typeof conformance ───────────────────────────────────────────────────
+
+    /// `typeof null` must return "object" (ECMAScript §13.5.3).
+    #[test]
+    fn e2e_typeof_null_is_object() {
+        let result = global_eval("typeof null").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    /// `typeof 42` returns "number".
+    #[test]
+    fn e2e_typeof_number() {
+        let result = global_eval("typeof 42").unwrap();
+        assert_eq!(result, JsValue::String("number".into()));
+    }
+
+    /// `typeof 3.14` returns "number" for floating-point values.
+    #[test]
+    fn e2e_typeof_float_number() {
+        let result = global_eval("typeof 3.14").unwrap();
+        assert_eq!(result, JsValue::String("number".into()));
+    }
+
+    /// `typeof "hello"` returns "string".
+    #[test]
+    fn e2e_typeof_string() {
+        let result = global_eval("typeof 'hello'").unwrap();
+        assert_eq!(result, JsValue::String("string".into()));
+    }
+
+    /// `typeof true` returns "boolean".
+    #[test]
+    fn e2e_typeof_boolean() {
+        let result = global_eval("typeof true").unwrap();
+        assert_eq!(result, JsValue::String("boolean".into()));
+    }
+
+    /// `typeof false` returns "boolean".
+    #[test]
+    fn e2e_typeof_boolean_false() {
+        let result = global_eval("typeof false").unwrap();
+        assert_eq!(result, JsValue::String("boolean".into()));
+    }
+
+    /// `typeof function(){}` returns "function".
+    #[test]
+    fn e2e_typeof_function() {
+        let result = global_eval("typeof function(){}").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    /// `typeof` arrow function returns "function".
+    #[test]
+    fn e2e_typeof_arrow_function() {
+        let result = global_eval("typeof (() => {})").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    /// `typeof {}` returns "object".
+    #[test]
+    fn e2e_typeof_object() {
+        let result = global_eval("typeof ({})").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    /// `typeof []` returns "object" (not "array").
+    #[test]
+    fn e2e_typeof_array_is_object() {
+        let result = global_eval("typeof []").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    // ── RegExp.prototype.flags ───────────────────────────────────────────────
+
+    /// `new RegExp('a', 'gi').flags` returns the flag string.
+    #[test]
+    fn e2e_regexp_instance_flags() {
+        let result = global_eval("new RegExp('a', 'gi').flags").unwrap();
+        assert_eq!(result, JsValue::String("gi".into()));
+    }
+
+    /// `new RegExp('a', 'gims').flags` returns flags in canonical order.
+    #[test]
+    fn e2e_regexp_instance_flags_order() {
+        let result = global_eval("new RegExp('a', 'migs').flags").unwrap();
+        assert_eq!(result, JsValue::String("gims".into()));
+    }
+
+    /// `new RegExp('a').flags` with no flags returns empty string.
+    #[test]
+    fn e2e_regexp_instance_flags_empty() {
+        let result = global_eval("new RegExp('a').flags").unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    /// `new RegExp('.', 'dgimsuy').flags` returns all flags in spec order.
+    #[test]
+    fn e2e_regexp_instance_all_flags() {
+        let result = global_eval("new RegExp('.', 'dgimsuy').flags").unwrap();
+        assert_eq!(result, JsValue::String("dgimsuy".into()));
+    }
+
+    /// `RegExp.prototype.toString()` returns "/source/flags".
+    #[test]
+    fn e2e_regexp_tostring() {
+        let result = global_eval("new RegExp('abc', 'gi').toString()").unwrap();
+        assert_eq!(result, JsValue::String("/abc/gi".into()));
     }
 }

@@ -27,7 +27,7 @@ fn ci_config() -> Criterion {
     Criterion::default()
         .warm_up_time(std::time::Duration::from_secs(1))
         .measurement_time(std::time::Duration::from_secs(3))
-        .sample_size(20)
+        .sample_size(10)
 }
 
 use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
