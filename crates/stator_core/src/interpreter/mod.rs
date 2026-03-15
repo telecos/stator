@@ -2218,11 +2218,18 @@ pub(super) fn to_array_index(key: &JsValue) -> Option<usize> {
 
 /// Convert a [`JsValue`] to a property key string.
 ///
-/// ECMAScript §7.1.19 ToPropertyKey — Symbols are not yet supported so all
-/// values are coerced to strings via [`JsValue::to_js_string`].
+/// ECMAScript §7.1.19 ToPropertyKey — well-known symbols are mapped to
+/// their internal `@@name` property keys so that computed access like
+/// `obj[Symbol.toStringTag]` resolves to the `"@@toStringTag"` slot.
 pub(super) fn to_property_key(key: &JsValue) -> StatorResult<String> {
     match key {
-        JsValue::Symbol(id) => Ok(format!("Symbol({id})")),
+        JsValue::Symbol(id) => {
+            if let Some(k) = crate::builtins::symbol::well_known_symbol_to_key(*id) {
+                Ok(k.to_string())
+            } else {
+                Ok(format!("Symbol({id})"))
+            }
+        }
         _ => key.to_js_string(),
     }
 }
@@ -14072,9 +14079,8 @@ mod tests {
         assert_eq!(r, JsValue::Smi(5));
     }
 
-    // NOTE: Unicode .length returns byte count instead of char count
     #[test]
-    #[ignore]
+    #[ignore] // TODO: parser does not handle \\uXXXX unicode escape sequences in string literals
     fn test_string_length_unicode() {
         // 'café' has 4 characters; .length must not return byte count (5 in UTF-8)
         let r = crate::builtins::global::global_eval("'caf\\u00e9'.length").unwrap();
