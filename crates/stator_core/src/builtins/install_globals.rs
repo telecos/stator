@@ -3174,29 +3174,36 @@ fn make_object() -> JsValue {
                     "Cannot convert undefined or null to object".into(),
                 ));
             }
-            if let JsValue::PlainObject(map) = obj {
-                let keys: Vec<JsValue> = map
-                    .borrow()
-                    .keys()
-                    .filter(|k| !k.starts_with("__"))
-                    .map(|k| JsValue::String(k.clone().into()))
-                    .collect();
-                Ok(JsValue::new_array(keys))
-            } else if let JsValue::Array(items) = obj {
-                let len = items.borrow().len();
-                let mut keys: Vec<JsValue> = (0..len)
-                    .map(|i| JsValue::String(i.to_string().into()))
-                    .collect();
-                keys.push(JsValue::String("length".into()));
-                Ok(JsValue::new_array(keys))
-            } else if let JsValue::String(s) = obj {
-                let mut keys: Vec<JsValue> = (0..s.len())
-                    .map(|i| JsValue::String(i.to_string().into()))
-                    .collect();
-                keys.push(JsValue::String("length".into()));
-                Ok(JsValue::new_array(keys))
-            } else {
-                Ok(JsValue::new_array(vec![]))
+            match obj {
+                JsValue::PlainObject(map) => {
+                    let keys: Vec<JsValue> = map
+                        .borrow()
+                        .keys()
+                        .filter(|k| !k.starts_with("__"))
+                        .map(|k| JsValue::String(k.clone().into()))
+                        .collect();
+                    Ok(JsValue::new_array(keys))
+                }
+                JsValue::Array(items) => {
+                    let len = items.borrow().len();
+                    let mut keys: Vec<JsValue> = (0..len)
+                        .map(|i| JsValue::String(i.to_string().into()))
+                        .collect();
+                    keys.push(JsValue::String("length".into()));
+                    Ok(JsValue::new_array(keys))
+                }
+                JsValue::Function(_) => Ok(JsValue::new_array(vec![
+                    JsValue::String("length".into()),
+                    JsValue::String("name".into()),
+                ])),
+                JsValue::String(s) => {
+                    let mut keys: Vec<JsValue> = (0..s.len())
+                        .map(|i| JsValue::String(i.to_string().into()))
+                        .collect();
+                    keys.push(JsValue::String("length".into()));
+                    Ok(JsValue::new_array(keys))
+                }
+                _ => Ok(JsValue::new_array(vec![])),
             }
         }),
     );
@@ -3691,8 +3698,15 @@ fn make_object() -> JsValue {
     // ── Object.getOwnPropertySymbols(obj) ────────────────────────────────
     props.insert(
         "getOwnPropertySymbols".into(),
-        native(|_args| {
-            // PlainObject has no symbol-keyed properties.
+        builtin_fn("getOwnPropertySymbols", 1, |args| {
+            let obj = args.first().unwrap_or(&JsValue::Undefined);
+            // §20.1.2.9 step 1: throw TypeError for null/undefined.
+            if matches!(obj, JsValue::Null | JsValue::Undefined) {
+                return Err(StatorError::TypeError(
+                    "Cannot convert undefined or null to object".into(),
+                ));
+            }
+            // PropertyMap uses string keys; no symbol-keyed properties exist yet.
             Ok(JsValue::new_array(vec![]))
         }),
     );
@@ -18222,5 +18236,451 @@ mod tests {
     fn e2e_promise_any_exists() {
         let result = global_eval("typeof Promise.any").unwrap();
         assert_eq!(result, JsValue::String("function".into()));
+    }
+    // ── Missing builtins: Object.getOwnPropertyDescriptor extended ──────
+
+    /// `Object.getOwnPropertyDescriptor` returns all four data descriptor fields.
+    #[test]
+    fn test_gopd_all_data_fields() {
+        let result = global_eval(
+            r#"
+            var obj = { x: 42 };
+            var d = Object.getOwnPropertyDescriptor(obj, "x");
+            String(d.value) + "," + String(d.writable) + "," +
+            String(d.enumerable) + "," + String(d.configurable)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("42,true,true,true".into()));
+    }
+
+    /// `Object.getOwnPropertyDescriptor` reflects defineProperty attributes.
+    #[test]
+    fn test_gopd_non_writable() {
+        let result = global_eval(
+            r#"
+            var obj = {};
+            Object.defineProperty(obj, "x", { value: 1, writable: false, enumerable: false, configurable: true });
+            var d = Object.getOwnPropertyDescriptor(obj, "x");
+            String(d.writable) + "," + String(d.enumerable) + "," + String(d.configurable)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("false,false,true".into()));
+    }
+
+    /// `Object.getOwnPropertyDescriptor` returns accessor descriptor for get/set.
+    #[test]
+    fn test_gopd_accessor() {
+        let result = global_eval(
+            r#"
+            var obj = {};
+            Object.defineProperty(obj, "x", { get: function() { return 1; }, enumerable: true, configurable: true });
+            var d = Object.getOwnPropertyDescriptor(obj, "x");
+            typeof d.get === "function" && d.value === undefined && d.enumerable === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.getOwnPropertyDescriptor` on array index.
+    #[test]
+    fn test_gopd_array_index() {
+        let result = global_eval(
+            r#"
+            var d = Object.getOwnPropertyDescriptor([10, 20], "1");
+            d.value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(20));
+    }
+
+    /// `Object.getOwnPropertyDescriptor` on array length.
+    #[test]
+    fn test_gopd_array_length() {
+        let result = global_eval(
+            r#"
+            var d = Object.getOwnPropertyDescriptor([1, 2, 3], "length");
+            d.value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Object.getOwnPropertyDescriptor` on string index.
+    #[test]
+    fn test_gopd_string_index() {
+        let result = global_eval(
+            r#"
+            var d = Object.getOwnPropertyDescriptor("abc", "1");
+            d.value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("b".into()));
+    }
+
+    /// `Object.getOwnPropertyDescriptor` throws for null.
+    #[test]
+    fn test_gopd_null_throws() {
+        let result = global_eval("Object.getOwnPropertyDescriptor(null, 'x')");
+        assert!(result.is_err());
+    }
+
+    /// `Object.defineProperties` returns the target object.
+    #[test]
+    fn test_define_properties_returns_target() {
+        let result = global_eval(
+            r#"
+            var obj = {};
+            var ret = Object.defineProperties(obj, { a: { value: 10 } });
+            ret.a
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// `Object.defineProperties` throws for non-object target.
+    #[test]
+    fn test_define_properties_non_object_throws() {
+        let result = global_eval("Object.defineProperties(42, {})");
+        assert!(result.is_err());
+    }
+
+    /// `Object.defineProperties` sets attribute flags correctly.
+    #[test]
+    fn test_define_properties_attributes() {
+        let result = global_eval(
+            r#"
+            var obj = {};
+            Object.defineProperties(obj, {
+                x: { value: 1, writable: false, enumerable: true, configurable: false }
+            });
+            var d = Object.getOwnPropertyDescriptor(obj, "x");
+            String(d.writable) + "," + String(d.enumerable) + "," + String(d.configurable)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("false,true,false".into()));
+    }
+
+    /// `Object.getOwnPropertyNames` includes non-enumerable properties.
+    #[test]
+    fn test_gopn_includes_non_enumerable() {
+        let result = global_eval(
+            r#"
+            var obj = {};
+            Object.defineProperty(obj, "hidden", { value: 1, enumerable: false });
+            Object.getOwnPropertyNames(obj).length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `Object.getOwnPropertyNames` on an array includes indices and length.
+    #[test]
+    fn test_gopn_array() {
+        let result = global_eval("Object.getOwnPropertyNames([1, 2]).length").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Object.getOwnPropertyNames` throws for null.
+    #[test]
+    fn test_gopn_null_throws() {
+        let result = global_eval("Object.getOwnPropertyNames(null)");
+        assert!(result.is_err());
+    }
+
+    /// `Object.getOwnPropertySymbols` returns an empty array for plain objects.
+    #[test]
+    fn test_gops_empty_for_plain() {
+        let result = global_eval("Object.getOwnPropertySymbols({a: 1}).length").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// `Object.getOwnPropertySymbols` returns an array.
+    #[test]
+    fn test_gops_returns_array() {
+        let result = global_eval("Array.isArray(Object.getOwnPropertySymbols({}))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.getOwnPropertySymbols` throws for null.
+    #[test]
+    fn test_gops_null_throws() {
+        let result = global_eval("Object.getOwnPropertySymbols(null)");
+        assert!(result.is_err());
+    }
+
+    /// `Object.preventExtensions` prevents adding new properties.
+    #[test]
+    fn test_prevent_extensions_blocks_add() {
+        let result = global_eval(
+            r#"
+            var obj = { a: 1 };
+            Object.preventExtensions(obj);
+            obj.b = 2;
+            obj.b
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// `Object.preventExtensions` still allows modifying existing properties.
+    #[test]
+    fn test_prevent_extensions_allows_modify() {
+        let result = global_eval(
+            r#"
+            var obj = { a: 1 };
+            Object.preventExtensions(obj);
+            obj.a = 99;
+            obj.a
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    /// `Object.preventExtensions` on non-object returns the argument.
+    #[test]
+    fn test_prevent_extensions_non_object() {
+        let result = global_eval("Object.preventExtensions(42)").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `Object.isExtensible` returns false after `preventExtensions`.
+    #[test]
+    fn test_is_extensible_after_prevent() {
+        let result = global_eval(
+            r#"
+            var obj = {};
+            Object.preventExtensions(obj);
+            Object.isExtensible(obj)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Object.seal` makes properties non-configurable.
+    #[test]
+    fn test_seal_non_configurable() {
+        let result = global_eval(
+            r#"
+            var obj = { x: 1 };
+            Object.seal(obj);
+            var d = Object.getOwnPropertyDescriptor(obj, "x");
+            d.configurable
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Object.seal` preserves writable flag.
+    #[test]
+    fn test_seal_preserves_writable() {
+        let result = global_eval(
+            r#"
+            var obj = { x: 1 };
+            Object.seal(obj);
+            var d = Object.getOwnPropertyDescriptor(obj, "x");
+            d.writable
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.isSealed` returns true after seal.
+    #[test]
+    fn test_is_sealed_after_seal() {
+        let result = global_eval(
+            r#"
+            var obj = { a: 1 };
+            Object.seal(obj);
+            Object.isSealed(obj)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.seal` on non-object returns the argument.
+    #[test]
+    fn test_seal_non_object() {
+        let result = global_eval("Object.seal('hello')").unwrap();
+        assert_eq!(result, JsValue::String("hello".into()));
+    }
+
+    /// `Object.freeze` makes properties non-writable and non-configurable.
+    #[test]
+    fn test_freeze_non_writable_non_configurable() {
+        let result = global_eval(
+            r#"
+            var obj = { x: 5 };
+            Object.freeze(obj);
+            var d = Object.getOwnPropertyDescriptor(obj, "x");
+            String(d.writable) + "," + String(d.configurable)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("false,false".into()));
+    }
+
+    /// `Object.freeze` prevents value changes.
+    #[test]
+    fn test_freeze_prevents_value_change() {
+        let result = global_eval(
+            r#"
+            var obj = { x: 5 };
+            Object.freeze(obj);
+            obj.x = 100;
+            obj.x
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// `Object.isFrozen` returns true after freeze.
+    #[test]
+    fn test_is_frozen_after_freeze() {
+        let result = global_eval(
+            r#"
+            var obj = { a: 1 };
+            Object.freeze(obj);
+            Object.isFrozen(obj)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.isFrozen` returns false for extensible object.
+    #[test]
+    fn test_is_frozen_false_for_extensible() {
+        let result = global_eval("Object.isFrozen({ a: 1 })").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Object.isSealed` returns false for extensible object.
+    #[test]
+    fn test_is_sealed_false_for_extensible() {
+        let result = global_eval("Object.isSealed({ a: 1 })").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Object.isFrozen` returns true for empty non-extensible object.
+    #[test]
+    fn test_is_frozen_empty_non_extensible() {
+        let result = global_eval(
+            r#"
+            var obj = {};
+            Object.preventExtensions(obj);
+            Object.isFrozen(obj)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.isSealed` returns true for empty non-extensible object.
+    #[test]
+    fn test_is_sealed_empty_non_extensible() {
+        let result = global_eval(
+            r#"
+            var obj = {};
+            Object.preventExtensions(obj);
+            Object.isSealed(obj)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.freeze` on defineProperty rejects value change.
+    #[test]
+    fn test_freeze_rejects_define_property() {
+        let result =
+            global_eval("var o = Object.freeze({}); Object.defineProperty(o, 'x', { value: 1 })");
+        assert!(result.is_err());
+    }
+
+    /// `Array.isArray` returns false for undefined.
+    #[test]
+    fn test_array_is_array_undefined() {
+        let result = global_eval("Array.isArray(undefined)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Array.isArray` returns false for null.
+    #[test]
+    fn test_array_is_array_null() {
+        let result = global_eval("Array.isArray(null)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Array.isArray` returns false for a string.
+    #[test]
+    fn test_array_is_array_string() {
+        let result = global_eval(r#"Array.isArray('hello')"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Array.isArray` returns true for empty array.
+    #[test]
+    fn test_array_is_array_empty() {
+        let result = global_eval("Array.isArray([])").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Array.isArray` returns true for `new Array()`.
+    #[test]
+    fn test_array_is_array_new_array() {
+        let result = global_eval("Array.isArray(new Array())").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.getOwnPropertyDescriptors` returns descriptors for all properties.
+    #[test]
+    fn test_gopds_all_props() {
+        let result = global_eval(
+            r#"
+            var obj = { a: 1, b: 2 };
+            var descs = Object.getOwnPropertyDescriptors(obj);
+            descs.a.value + descs.b.value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Object.getOwnPropertyDescriptors` preserves attributes.
+    #[test]
+    fn test_gopds_preserves_attrs() {
+        let result = global_eval(
+            r#"
+            var obj = {};
+            Object.defineProperty(obj, "x", { value: 5, writable: false, enumerable: true, configurable: false });
+            var descs = Object.getOwnPropertyDescriptors(obj);
+            String(descs.x.writable) + "," + String(descs.x.enumerable) + "," + String(descs.x.configurable)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("false,true,false".into()));
+    }
+
+    /// `Object.getOwnPropertyDescriptors` throws for null.
+    #[test]
+    fn test_gopds_null_throws() {
+        let result = global_eval("Object.getOwnPropertyDescriptors(null)");
+        assert!(result.is_err());
     }
 }
