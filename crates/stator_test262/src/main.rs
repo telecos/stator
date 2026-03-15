@@ -441,7 +441,7 @@ fn is_skipped_path(rel_path: &str) -> bool {
 /// so that prototype cycles (e.g. `Object → prototype → constructor →
 /// Object`) are broken instead of recursed into infinitely.
 fn deep_clone_value(v: &JsValue, visited: &mut HashMap<usize, JsValue>) -> JsValue {
-    match v {
+    stacker::maybe_grow(64 * 1024, 512 * 1024, || match v {
         JsValue::PlainObject(rc) => {
             let ptr = Rc::as_ptr(rc) as usize;
             if let Some(existing) = visited.get(&ptr) {
@@ -480,7 +480,7 @@ fn deep_clone_value(v: &JsValue, visited: &mut HashMap<usize, JsValue>) -> JsVal
             placeholder
         }
         other => other.clone(),
-    }
+    })
 }
 
 /// Deep-clone a globals `HashMap` so that every `PlainObject` / `Array`
@@ -873,7 +873,7 @@ fn execute_source(
     // Each test execution gets a generous stack guarantee so that
     // pathological inputs (deep regex, deep eval chains) cannot
     // overflow the main thread stack across 53k+ tests.
-    stacker::maybe_grow(512 * 1024, 16 * 1024 * 1024, || {
+    stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
         execute_source_inner(source, harness_prefix, template_globals)
     })
 }
@@ -945,7 +945,7 @@ fn break_rc_cycles(globals: &Rc<RefCell<HashMap<String, JsValue>>>) {
 /// Clear the PropertyMap of a JsValue::PlainObject (and any nested objects)
 /// to break Rc cycles.
 fn clear_value_cycles(val: &JsValue) {
-    match val {
+    stacker::maybe_grow(64 * 1024, 512 * 1024, || match val {
         JsValue::PlainObject(map) => {
             if let Ok(mut pm) = map.try_borrow_mut() {
                 let nested: Vec<JsValue> = pm.iter().map(|(_, v)| v.clone()).collect();
@@ -967,7 +967,7 @@ fn clear_value_cycles(val: &JsValue) {
             }
         }
         _ => {}
-    }
+    });
 }
 
 /// Runs a single Test262 test and returns its outcome.

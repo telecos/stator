@@ -2334,7 +2334,7 @@ fn make_boolean() -> JsValue {
 
 #[inline(never)]
 fn make_number() -> JsValue {
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         let mut props = PropertyMap::new();
 
         // Number(value) — type conversion when called as a function
@@ -2641,7 +2641,7 @@ fn make_number() -> JsValue {
 /// Build the `Object` constructor/namespace object.
 #[inline(never)]
 fn make_object() -> JsValue {
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         let mut props = PropertyMap::new();
 
         // Object(value) — type conversion / wrapping when called as a function or constructor.
@@ -3974,7 +3974,7 @@ fn make_object() -> JsValue {
 /// - `prototype` — an object with all `Array.prototype.*` methods.
 #[inline(never)]
 fn make_array() -> JsValue {
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         let mut props = PropertyMap::new();
 
         // ── Static methods ──────────────────────────────────────────────────
@@ -5784,7 +5784,7 @@ fn make_async_iterator() -> JsValue {
 /// `values`, `entries`, `size`).
 #[inline(never)]
 fn make_map_builtin() -> JsValue {
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         let mut props = PropertyMap::new();
 
         // ── Constructor: new Map() / new Map(iterable) ───────────────────────
@@ -6165,7 +6165,7 @@ fn make_map_builtin() -> JsValue {
 /// `entries`, `size`).
 #[inline(never)]
 fn make_set_builtin() -> JsValue {
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         let mut props = PropertyMap::new();
 
         // ── Constructor: new Set() / new Set(iterable) ───────────────────────
@@ -7020,7 +7020,7 @@ fn make_finalization_registry_builtin() -> JsValue {
 ///   `Symbol.hasInstance`, `name`, and `length`.
 #[inline(never)]
 fn make_function() -> JsValue {
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         let mut props = PropertyMap::new();
 
         // ── Constructor: new Function(…args, body) ──────────────────────────
@@ -7185,7 +7185,7 @@ fn make_function() -> JsValue {
 /// - `prototype` — an object with all `String.prototype.*` methods.
 #[inline(never)]
 fn make_string() -> JsValue {
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         let mut props = PropertyMap::new();
 
         // ── Callable: String(value) ─────────────────────────────────────────
@@ -8042,7 +8042,7 @@ fn make_string() -> JsValue {
 /// `allSettled`, `any`, `race`, `withResolvers`) are available as properties.
 #[inline(never)]
 fn make_promise() -> JsValue {
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         use crate::builtins::promise::{
             MicrotaskQueue, install_active_microtask_queue, promise_all, promise_all_settled,
             promise_any, promise_catch, promise_finally, promise_new, promise_race, promise_reject,
@@ -8304,7 +8304,7 @@ fn make_promise() -> JsValue {
 /// Build the `RegExp` constructor.
 #[inline(never)]
 fn make_regexp() -> JsValue {
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         let mut props = PropertyMap::new();
 
         // Callable: new RegExp(pattern, flags)
@@ -8762,7 +8762,7 @@ fn make_supported_locales_of() -> JsValue {
 /// `compare` / `select`) method.
 #[inline(never)]
 fn make_intl() -> JsValue {
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         let mut ns = PropertyMap::new();
 
         // ── Intl.NumberFormat ────────────────────────────────────────────────
@@ -9257,7 +9257,7 @@ fn make_intl() -> JsValue {
 /// `Proxy.revocable(target, handler)` as a static method.
 #[inline(never)]
 fn make_proxy() -> JsValue {
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         let mut props = PropertyMap::new();
 
         // Proxy as a constructor: new Proxy(target, handler)
@@ -9487,7 +9487,7 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
 /// Build the `Reflect` namespace object with all 13 static methods.
 #[inline(never)]
 fn make_reflect() -> JsValue {
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         let mut props = PropertyMap::new();
 
         props.insert(
@@ -11041,7 +11041,7 @@ fn make_atomics() -> JsValue {
 /// `[Symbol.dispose]()` methods in reverse order when `.dispose()` is called.
 #[inline(never)]
 fn make_disposable_stack() -> JsValue {
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         native(|_args| {
             let resources: Rc<RefCell<Vec<JsValue>>> = Rc::new(RefCell::new(Vec::new()));
             let disposed: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
@@ -11132,7 +11132,7 @@ fn make_disposable_stack() -> JsValue {
 /// (`undefined`, `NaN`, `Infinity`).
 #[inline(never)]
 pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
+    stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
         // ── Namespace objects ────────────────────────────────────────────────
         globals.insert("Math".into(), make_math());
         globals.insert("console".into(), make_console());
@@ -11181,7 +11181,6 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         );
         globals.insert("Proxy".into(), finalize_ctor(make_proxy(), "Proxy"));
         globals.insert("Reflect".into(), make_reflect());
-
         // ── Atomics / SharedArrayBuffer ─────────────────────────────────────
         globals.insert("Atomics".into(), make_atomics());
         globals.insert(
@@ -11203,7 +11202,6 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "DisposableStack".into(),
             finalize_ctor(make_disposable_stack(), "DisposableStack"),
         );
-
         // ── Simple constructor-like wrappers ─────────────────────────────────
         // NOTE: Boolean is already installed via make_boolean() above, which
         // provides both __call__ (constructor) and prototype.  Do NOT

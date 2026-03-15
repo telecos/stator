@@ -328,10 +328,12 @@ impl<'src> Parser<'src> {
     // ── Statements ───────────────────────────────────────────────────────────
 
     fn parse_stmt(&mut self) -> StatorResult<Stmt> {
-        self.enter()?;
-        let result = self.parse_stmt_inner();
-        self.leave();
-        result
+        stacker::maybe_grow(32 * 1024, 512 * 1024, || {
+            self.enter()?;
+            let result = self.parse_stmt_inner();
+            self.leave();
+            result
+        })
     }
 
     fn parse_stmt_inner(&mut self) -> StatorResult<Stmt> {
@@ -2300,10 +2302,12 @@ impl<'src> Parser<'src> {
     /// Also handles arrow function expressions, which have assignment-level
     /// precedence: `x => x + 1`, `(x, y) => x + y`, `() => 42`.
     fn parse_assignment_expr(&mut self) -> StatorResult<Expr> {
-        self.enter()?;
-        let result = self.parse_assignment_expr_inner();
-        self.leave();
-        result
+        stacker::maybe_grow(32 * 1024, 512 * 1024, || {
+            self.enter()?;
+            let result = self.parse_assignment_expr_inner();
+            self.leave();
+            result
+        })
     }
 
     fn parse_assignment_expr_inner(&mut self) -> StatorResult<Expr> {

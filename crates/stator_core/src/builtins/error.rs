@@ -88,7 +88,7 @@ thread_local! {
 /// (V8 and SpiderMonkey allow similar depths) while still catching
 /// infinite-recursion bugs with a proper `RangeError` long before memory
 /// is exhausted.
-pub const MAX_CALL_STACK_DEPTH: usize = 1024;
+pub const MAX_CALL_STACK_DEPTH: usize = 128;
 
 /// Push a frame name onto the thread-local call stack.
 ///

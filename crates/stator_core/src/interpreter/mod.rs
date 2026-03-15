@@ -1172,10 +1172,10 @@ impl Interpreter {
             *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
         });
         // Dynamically grow the native stack when headroom drops below 512 KiB.
-        // Allocates a fresh 4 MiB segment via mmap/VirtualAlloc on demand,
-        // preventing SIGSEGV/stack-overflow aborts on deeply recursive JS code
-        // (e.g. Test262 JSON.parse nesting tests, regex compilation).
-        stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
+        // Provide moderate stack growth for the interpreter loop.
+        // Per-call recursion guards live in dispatch.rs (1 MiB each);
+        // this inner guard covers the run() frame itself (~256 KiB).
+        stacker::maybe_grow(64 * 1024, 256 * 1024, || {
             // Outer loop: re-entered when a TailCall opcode rewrites the frame
             // with a new bytecode array (proper tail-call trampoline).
             'tail_call: loop {
