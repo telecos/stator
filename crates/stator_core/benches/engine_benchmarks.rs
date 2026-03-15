@@ -290,12 +290,12 @@ fn bench_js_function_call(c: &mut Criterion) {
     let source = r#"
         function add(a, b) { return a + b; }
         var result = 0;
-        for (var i = 0; i < 1000; i++) {
+        for (var i = 0; i < 100; i++) {
             result = add(result, 1);
         }
         result;
     "#;
-    c.bench_function("js_function_call_1000", |b| {
+    c.bench_function("js_function_call_100", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
         });
@@ -320,7 +320,7 @@ fn bench_js_string_concat(c: &mut Criterion) {
 fn bench_js_array_push_pop(c: &mut Criterion) {
     let source = r#"
         var arr = [];
-        for (var i = 0; i < 1000; i++) {
+        for (var i = 0; i < 50; i++) {
             arr.push(i);
         }
         var sum = 0;
@@ -329,7 +329,7 @@ fn bench_js_array_push_pop(c: &mut Criterion) {
         }
         sum;
     "#;
-    c.bench_function("js_array_push_pop_1000", |b| {
+    c.bench_function("js_array_push_pop_50", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
         });
@@ -339,12 +339,12 @@ fn bench_js_array_push_pop(c: &mut Criterion) {
 fn bench_js_object_creation(c: &mut Criterion) {
     let source = r#"
         var last;
-        for (var i = 0; i < 500; i++) {
+        for (var i = 0; i < 100; i++) {
             last = { x: i, y: i + 1, z: i + 2 };
         }
         last.x + last.y + last.z;
     "#;
-    c.bench_function("js_object_creation_500", |b| {
+    c.bench_function("js_object_creation_100", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
         });
@@ -354,16 +354,16 @@ fn bench_js_object_creation(c: &mut Criterion) {
 fn bench_js_keyed_access(c: &mut Criterion) {
     let source = r#"
         var obj = {};
-        for (var i = 0; i < 200; i++) {
+        for (var i = 0; i < 50; i++) {
             obj["key_" + i] = i;
         }
         var sum = 0;
-        for (var i = 0; i < 200; i++) {
+        for (var i = 0; i < 50; i++) {
             sum = sum + obj["key_" + i];
         }
         sum;
     "#;
-    c.bench_function("js_keyed_property_access_200", |b| {
+    c.bench_function("js_keyed_property_access_50", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
         });
@@ -381,12 +381,12 @@ fn bench_js_prototype_chain_lookup(c: &mut Criterion) {
         Leaf.prototype = new Mid();
         var obj = new Leaf();
         var sum = 0;
-        for (var i = 0; i < 1000; i++) {
+        for (var i = 0; i < 100; i++) {
             sum = sum + obj.x;
         }
         sum;
     "#;
-    c.bench_function("js_prototype_chain_lookup_1000", |b| {
+    c.bench_function("js_prototype_chain_lookup_100", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
         });
@@ -396,12 +396,12 @@ fn bench_js_prototype_chain_lookup(c: &mut Criterion) {
 fn bench_js_arithmetic_loop(c: &mut Criterion) {
     let source = r#"
         var n = 0;
-        for (var i = 0; i < 10000; i++) {
+        for (var i = 0; i < 1000; i++) {
             n = (n + i) | 0;
         }
         n;
     "#;
-    c.bench_function("js_arithmetic_loop_10000", |b| {
+    c.bench_function("js_arithmetic_loop_1000", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
         });
@@ -416,12 +416,12 @@ fn bench_js_closure_capture(c: &mut Criterion) {
         }
         var counter = make_counter();
         var result = 0;
-        for (var i = 0; i < 1000; i++) {
+        for (var i = 0; i < 100; i++) {
             result = counter();
         }
         result;
     "#;
-    c.bench_function("js_closure_capture_1000", |b| {
+    c.bench_function("js_closure_capture_100", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
         });
