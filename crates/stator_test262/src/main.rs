@@ -1290,7 +1290,7 @@ fn main() {
     // pathological test inputs from overflowing the default 8 MB stack.
     let builder = std::thread::Builder::new()
         .name("test262-main".into())
-        .stack_size(256 * 1024 * 1024); // 256 MiB — generous for init + stacker grows as needed
+        .stack_size(1024 * 1024 * 1024); // 1 GiB virtual — physical pages are lazy
     let handler = builder
         .spawn(main_inner)
         .expect("failed to spawn main thread");
@@ -1356,6 +1356,7 @@ fn main_inner() {
     // that per-test mutations don't leak across tests while avoiding the
     // heavy cost of re-running `install_globals` for every test.
     let template_globals = make_test_globals();
+    eprintln!("stator_test262: globals ready, starting test loop …");
 
     // ── Run each test ─────────────────────────────────────────────────────────
     for (idx, path) in test_files.iter().enumerate() {
@@ -1413,6 +1414,9 @@ fn main_inner() {
         };
 
         // ── Execute and record outcome ────────────────────────────────────────
+        if idx < 5 {
+            eprintln!("stator_test262: [debug] test #{idx}: {rel_path}");
+        }
         let test_start = std::time::Instant::now();
         match run_test(&source, &harness_prefix, &meta, &template_globals) {
             TestOutcome::Pass => {

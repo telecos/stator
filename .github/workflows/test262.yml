@@ -58,6 +58,7 @@ jobs:
         env:
           RUST_MIN_STACK: "33554432"   # 32 MiB for spawned threads
         run: |
+          ulimit -s unlimited
           ./target/release/stator_test262 \
             --test262-dir test262 \
             --threshold 25.0
