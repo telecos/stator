@@ -1705,20 +1705,32 @@ fn make_date() -> JsValue {
             "toLocaleDateString",
             "toLocaleString",
             "toLocaleTimeString",
+            "@@toPrimitive",
         ];
         for method in date_methods {
             proto.insert((*method).into(), date_proto_delegate(method));
         }
         proto.insert("@@toStringTag".into(), JsValue::String("Date".into()));
         proto.make_all_non_enumerable();
-        props.insert(
-            "prototype".into(),
-            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
-        );
+        let proto_rc = Rc::new(RefCell::new(proto));
+        props.insert("prototype".into(), JsValue::PlainObject(proto_rc.clone()));
     }
 
     props.make_all_non_enumerable();
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    // §20.4.3.3 Date.prototype.constructor
+    if let JsValue::PlainObject(ref ctor_map) = ctor {
+        if let Some(JsValue::PlainObject(ref proto_map)) =
+            ctor_map.borrow().get("prototype").cloned()
+        {
+            proto_map.borrow_mut().insert_with_attrs(
+                "constructor".into(),
+                ctor.clone(),
+                PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+            );
+        }
+    }
+    ctor
 }
 
 /// Create a Date instance object with all prototype methods.
@@ -18988,5 +19000,258 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::String("x=42".into()));
+    }
+
+    // ── Date built-in tests ─────────────────────────────────────────────
+
+    /// `Date.now()` returns a positive number (milliseconds since epoch).
+    #[test]
+    fn test_date_now_positive() {
+        let result = global_eval("Date.now() > 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `new Date().getTime()` returns the same value as `Date.now()` (approximately).
+    #[test]
+    fn test_date_get_time_returns_number() {
+        let result = global_eval("typeof new Date().getTime()").unwrap();
+        assert_eq!(result, JsValue::String("number".into()));
+    }
+
+    /// `new Date().valueOf()` returns the same as `getTime()`.
+    #[test]
+    fn test_date_value_of_matches_get_time() {
+        let result = global_eval(
+            r#"
+            var d = new Date(1704067200000);
+            d.valueOf() === d.getTime()
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `new Date(0).getFullYear()` returns 1969 or 1970 depending on timezone.
+    #[test]
+    fn test_date_get_full_year() {
+        let result = global_eval("new Date(1704067200000).getUTCFullYear()").unwrap();
+        assert_eq!(result, JsValue::Smi(2024));
+    }
+
+    /// `new Date(...)` UTC month is 0-indexed.
+    #[test]
+    fn test_date_get_utc_month() {
+        let result = global_eval("new Date(1704067200000).getUTCMonth()").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// `new Date(...)` UTC date accessor.
+    #[test]
+    fn test_date_get_utc_date() {
+        let result = global_eval("new Date(1704067200000).getUTCDate()").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `new Date(...)` UTC hours accessor.
+    #[test]
+    fn test_date_get_utc_hours() {
+        let result = global_eval("new Date(1704067200000).getUTCHours()").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// `new Date(...)` getMinutes returns a number.
+    #[test]
+    fn test_date_get_minutes_type() {
+        let result = global_eval("typeof new Date().getMinutes()").unwrap();
+        assert_eq!(result, JsValue::String("number".into()));
+    }
+
+    /// `new Date(...)` getSeconds returns a number.
+    #[test]
+    fn test_date_get_seconds_type() {
+        let result = global_eval("typeof new Date().getSeconds()").unwrap();
+        assert_eq!(result, JsValue::String("number".into()));
+    }
+
+    /// `new Date(...)` getMilliseconds returns a number.
+    #[test]
+    fn test_date_get_milliseconds_type() {
+        let result = global_eval("typeof new Date().getMilliseconds()").unwrap();
+        assert_eq!(result, JsValue::String("number".into()));
+    }
+
+    /// `new Date(0).toISOString()` returns the epoch in ISO 8601 format.
+    #[test]
+    fn test_date_to_iso_string_epoch() {
+        let result = global_eval("new Date(0).toISOString()").unwrap();
+        assert_eq!(result, JsValue::String("1970-01-01T00:00:00.000Z".into()));
+    }
+
+    /// `new Date(0).toJSON()` returns the same as `toISOString()`.
+    #[test]
+    fn test_date_to_json_matches_iso() {
+        let result = global_eval(
+            r#"
+            var d = new Date(0);
+            d.toJSON() === d.toISOString()
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.parse` returns a number.
+    #[test]
+    fn test_date_parse_returns_number() {
+        let result = global_eval("typeof Date.parse('2024-01-01')").unwrap();
+        assert_eq!(result, JsValue::String("number".into()));
+    }
+
+    /// `Date.UTC` returns a timestamp.
+    #[test]
+    fn test_date_utc_returns_number() {
+        let result = global_eval("Date.UTC(2024, 0, 1)").unwrap();
+        match result {
+            JsValue::Smi(_) | JsValue::HeapNumber(_) => {}
+            other => panic!("Expected number, got {:?}", other),
+        }
+    }
+
+    /// `Date.prototype.constructor` points back to the Date constructor.
+    #[test]
+    fn test_date_prototype_constructor() {
+        let result = global_eval("typeof Date.prototype.constructor").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    // ── JSON built-in tests ─────────────────────────────────────────────
+
+    /// `JSON.stringify(null)` returns `"null"`.
+    #[test]
+    fn test_json_stringify_null() {
+        let result = global_eval("JSON.stringify(null)").unwrap();
+        assert_eq!(result, JsValue::String("null".into()));
+    }
+
+    /// `JSON.stringify(true)` returns `"true"`.
+    #[test]
+    fn test_json_stringify_boolean() {
+        let result = global_eval("JSON.stringify(true)").unwrap();
+        assert_eq!(result, JsValue::String("true".into()));
+    }
+
+    /// `JSON.stringify(42)` returns `"42"`.
+    #[test]
+    fn test_json_stringify_number() {
+        let result = global_eval("JSON.stringify(42)").unwrap();
+        assert_eq!(result, JsValue::String("42".into()));
+    }
+
+    /// `JSON.stringify("hello")` returns `'"hello"'`.
+    #[test]
+    fn test_json_stringify_string() {
+        let result = global_eval(r#"JSON.stringify("hello")"#).unwrap();
+        assert_eq!(result, JsValue::String(r#""hello""#.into()));
+    }
+
+    /// `JSON.stringify(undefined)` returns `undefined`.
+    #[test]
+    fn test_json_stringify_undefined() {
+        let result = global_eval("JSON.stringify(undefined)").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// `JSON.stringify(NaN)` returns `"null"`.
+    #[test]
+    fn test_json_stringify_nan() {
+        let result = global_eval("JSON.stringify(NaN)").unwrap();
+        assert_eq!(result, JsValue::String("null".into()));
+    }
+
+    /// `JSON.stringify(Infinity)` returns `"null"`.
+    #[test]
+    fn test_json_stringify_infinity() {
+        let result = global_eval("JSON.stringify(Infinity)").unwrap();
+        assert_eq!(result, JsValue::String("null".into()));
+    }
+
+    /// `JSON.stringify([1, 2, 3])` returns `"[1,2,3]"`.
+    #[test]
+    fn test_json_stringify_array() {
+        let result = global_eval("JSON.stringify([1, 2, 3])").unwrap();
+        assert_eq!(result, JsValue::String("[1,2,3]".into()));
+    }
+
+    /// `JSON.parse` round-trips with `JSON.stringify` for objects.
+    #[test]
+    fn test_json_parse_stringify_roundtrip() {
+        let result = global_eval(
+            r#"
+            var obj = {a: 1, b: "hello", c: true, d: null};
+            var s = JSON.stringify(obj);
+            var parsed = JSON.parse(s);
+            parsed.a === 1 && parsed.b === "hello" && parsed.c === true && parsed.d === null
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `JSON.parse` with a reviver function.
+    #[test]
+    fn test_json_parse_with_reviver() {
+        let result = global_eval(
+            r#"
+            var parsed = JSON.parse('{"x":10}', function(key, value) {
+                if (typeof value === 'number') return value * 2;
+                return value;
+            });
+            parsed.x
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(20));
+    }
+
+    /// `JSON.stringify` with indent (space argument).
+    #[test]
+    fn test_json_stringify_with_indent() {
+        let result = global_eval("JSON.stringify({a:1}, null, 2)").unwrap();
+        if let JsValue::String(s) = &result {
+            assert!(s.contains('\n'), "Expected newline in indented output");
+        } else {
+            panic!("Expected string result");
+        }
+    }
+
+    /// `JSON[Symbol.toStringTag]` is `"JSON"`.
+    #[test]
+    fn test_json_to_string_tag() {
+        let result = global_eval("JSON[Symbol.toStringTag]").unwrap();
+        assert_eq!(result, JsValue::String("JSON".into()));
+    }
+
+    /// `JSON.stringify` handles a Date object via its `toJSON` method.
+    #[test]
+    fn test_json_stringify_date_object() {
+        let result = global_eval("JSON.stringify(new Date(0))").unwrap();
+        assert_eq!(
+            result,
+            JsValue::String(r#""1970-01-01T00:00:00.000Z""#.into())
+        );
+    }
+
+    /// `JSON.stringify` excludes undefined properties from objects.
+    #[test]
+    fn test_json_stringify_excludes_undefined_props() {
+        let result = global_eval("JSON.stringify({a: 1, b: undefined, c: 3})").unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":1,"c":3}"#.into()));
+    }
+
+    /// `JSON.stringify` replaces undefined array elements with null.
+    #[test]
+    fn test_json_stringify_array_undefined_becomes_null() {
+        let result = global_eval("JSON.stringify([1, undefined, 3])").unwrap();
+        assert_eq!(result, JsValue::String("[1,null,3]".into()));
     }
 }
