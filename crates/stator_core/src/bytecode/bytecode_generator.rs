@@ -192,9 +192,11 @@ struct FunctionCompiler {
     /// labeled statements.  `continue_label` is `Some` only when the
     /// labeled body is a loop.
     label_map: HashMap<String, (Option<usize>, usize)>,
-    /// When set, the next loop compiler that runs will patch the
-    /// `label_map` entry for this label name with its continue-label.
-    pending_label_name: Option<String>,
+    /// Labels whose bodies ultimately target the next loop compiler that runs.
+    ///
+    /// This supports nested labels around a single iteration statement:
+    /// `outer: inner: for (...) { continue outer; }`.
+    pending_label_names: Vec<String>,
     /// Number of formal parameters.
     param_count: u32,
     /// Ordered list of feedback slot kinds allocated during compilation.
@@ -260,6 +262,8 @@ struct FunctionCompiler {
     /// and `OptionalCall` compilation jump to this label instead of
     /// handling the nullish short-circuit locally.
     optional_chain_null_label: Option<usize>,
+    /// Nesting depth of active `with` statements.
+    with_depth: usize,
 }
 
 impl FunctionCompiler {
@@ -286,7 +290,7 @@ impl FunctionCompiler {
             labels: Vec::new(),
             loop_stack: Vec::new(),
             label_map: HashMap::new(),
-            pending_label_name: None,
+            pending_label_names: Vec::new(),
             param_count,
             slot_kinds: Vec::new(),
             handler_table: Vec::new(),
@@ -304,6 +308,7 @@ impl FunctionCompiler {
             for_of_iter_regs: HashMap::new(),
             finally_stack: Vec::new(),
             optional_chain_null_label: None,
+            with_depth: 0,
         };
         // Register simple ident params in the scope immediately; complex
         // patterns are handled by `emit_param_prologue`.
@@ -855,14 +860,24 @@ impl FunctionCompiler {
         self.labels[label_id].bound_at = Some(self.instructions.len());
     }
 
-    /// If a labeled statement is pending, patch its `label_map` entry with
-    /// the loop's `continue_label`.  Called by each loop compiler right
-    /// after it determines its continue target.
-    fn patch_pending_label(&mut self, continue_label: usize) {
-        if let Some(name) = self.pending_label_name.take()
-            && let Some(entry) = self.label_map.get_mut(&name)
-        {
-            entry.0 = Some(continue_label);
+    /// Patch all labels pending on the next loop with the loop's
+    /// `continue_label`. Called by each loop compiler right after it
+    /// determines its continue target.
+    fn patch_pending_labels(&mut self, continue_label: usize) {
+        for name in self.pending_label_names.drain(..) {
+            if let Some(entry) = self.label_map.get_mut(&name) {
+                entry.0 = Some(continue_label);
+            }
+        }
+    }
+
+    fn stmt_is_iteration_target(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::While(_) | Stmt::DoWhile(_) | Stmt::For(_) | Stmt::ForIn(_) | Stmt::ForOf(_) => {
+                true
+            }
+            Stmt::Labeled(s) => Self::stmt_is_iteration_target(&s.body),
+            _ => false,
         }
     }
 
@@ -1294,8 +1309,9 @@ impl FunctionCompiler {
 
     /// Compile a `with (expr) stmt` statement.
     ///
-    /// Emits `ToObject` + `PushContext` before the body and `PopContext` after
-    /// so the interpreter's context chain includes the with-object.
+    /// Emits `ToObject` + `CreateWithContext` + `PushContext` before the body
+    /// and `PopContext` after so unresolved identifiers consult the with-object
+    /// before the global environment.
     fn compile_with(&mut self, s: &crate::parser::ast::WithStmt) -> StatorResult<()> {
         // Evaluate the object expression into the accumulator.
         self.compile_expr(&s.object)?;
@@ -1306,7 +1322,11 @@ impl FunctionCompiler {
             Opcode::ToObject,
             vec![to_reg_op(obj_reg)],
         ));
-        self.emit_ldar(obj_reg);
+        let scope_idx = self.add_string("with");
+        self.emit(Instruction::new_unchecked(
+            Opcode::CreateWithContext,
+            vec![to_reg_op(obj_reg), Operand::ConstantPoolIdx(scope_idx)],
+        ));
 
         // Push a new with-context; save the old context in ctx_reg.
         let ctx_reg = self.allocator.allocate_temporary();
@@ -1317,7 +1337,9 @@ impl FunctionCompiler {
 
         // Compile the body inside a fresh scope.
         self.push_scope();
+        self.with_depth += 1;
         self.compile_stmt(&s.body)?;
+        self.with_depth -= 1;
         self.pop_scope();
 
         // Restore the previous context.
@@ -1900,7 +1922,7 @@ impl FunctionCompiler {
             labels: Vec::new(),
             loop_stack: Vec::new(),
             label_map: HashMap::new(),
-            pending_label_name: None,
+            pending_label_names: Vec::new(),
             param_count: 1,
             slot_kinds: Vec::new(),
             handler_table: Vec::new(),
@@ -1918,6 +1940,7 @@ impl FunctionCompiler {
             for_of_iter_regs: HashMap::new(),
             finally_stack: Vec::new(),
             optional_chain_null_label: None,
+            with_depth: 0,
         };
 
         let this_reg = Register::parameter(0);
@@ -2063,7 +2086,7 @@ impl FunctionCompiler {
         let loop_start = self.new_label();
         let loop_end = self.new_label();
 
-        self.patch_pending_label(loop_start);
+        self.patch_pending_labels(loop_start);
         self.loop_stack.push((loop_start, loop_end));
 
         self.bind_label(loop_start);
@@ -2084,7 +2107,7 @@ impl FunctionCompiler {
         // continue target is the condition check, placed after body
         let cond_label = self.new_label();
 
-        self.patch_pending_label(cond_label);
+        self.patch_pending_labels(cond_label);
         self.loop_stack.push((cond_label, loop_end));
 
         self.bind_label(loop_start);
@@ -2117,7 +2140,7 @@ impl FunctionCompiler {
             }
         }
 
-        self.patch_pending_label(continue_label);
+        self.patch_pending_labels(continue_label);
         self.loop_stack.push((continue_label, loop_end));
 
         self.bind_label(loop_start);
@@ -2285,10 +2308,9 @@ impl FunctionCompiler {
     /// Compile a labeled statement (`label: body`).
     ///
     /// A break-label is always created so that `break label` can exit the
-    /// labeled statement.  If the body is a loop (`While`, `DoWhile`,
-    /// `For`, `ForIn`, or `ForOf`), the loop compiler patches the
-    /// `label_map` entry with the real continue-label via
-    /// `pending_label_name`.
+    /// labeled statement. If the labeled body eventually targets an
+    /// iteration statement, the loop compiler patches the label entry with
+    /// the real continue-label.
     fn compile_labeled(&mut self, s: &crate::parser::ast::LabeledStmt) -> StatorResult<()> {
         let name = s.label.name.clone();
         if self.label_map.contains_key(&name) {
@@ -2298,25 +2320,20 @@ impl FunctionCompiler {
         }
 
         let break_label = self.new_label();
-        let is_loop = matches!(
-            *s.body,
-            Stmt::While(_) | Stmt::DoWhile(_) | Stmt::For(_) | Stmt::ForIn(_) | Stmt::ForOf(_)
-        );
+        let is_loop = Self::stmt_is_iteration_target(&s.body);
 
         // Pre-populate label_map so that `break label` works during body
-        // compilation.  continue_label starts as None and is patched by
-        // the loop compiler when `pending_label_name` is set.
+        // compilation. continue_label starts as None and is patched by
+        // the loop compiler when the label is pending on the next loop.
         self.label_map.insert(name.clone(), (None, break_label));
 
         if is_loop {
-            self.pending_label_name = Some(name.clone());
+            self.pending_label_names.push(name.clone());
         }
 
         self.compile_stmt(&s.body)?;
 
-        // Clear pending_label_name in case the body was not a recognized
-        // loop (shouldn't happen if is_loop matched, but be safe).
-        self.pending_label_name = None;
+        self.pending_label_names.retain(|pending| pending != &name);
 
         self.label_map.remove(&name);
         self.bind_label(break_label);
@@ -2778,8 +2795,9 @@ impl FunctionCompiler {
 
     /// Load a variable by name.
     ///
-    /// If the name is in the scope chain, emit `Ldar`.  Otherwise assume it is
-    /// a global and emit `LdaGlobal`.
+    /// If the name is in the scope chain, emit `Ldar`. Otherwise unresolved
+    /// names inside `with` use dynamic lookup; all other unresolved names are
+    /// treated as globals.
     fn compile_ident_load(&mut self, name: &str) {
         if let Some(binding) = self.lookup_var(name) {
             self.emit_ldar(binding.reg);
@@ -2792,11 +2810,18 @@ impl FunctionCompiler {
             }
         } else {
             let name_idx = self.add_string(name);
-            let slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
-            self.emit(Instruction::new_unchecked(
-                Opcode::LdaGlobal,
-                vec![Operand::ConstantPoolIdx(name_idx), slot],
-            ));
+            if self.with_depth > 0 {
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaLookupSlot,
+                    vec![Operand::ConstantPoolIdx(name_idx)],
+                ));
+            } else {
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaGlobal,
+                    vec![Operand::ConstantPoolIdx(name_idx), slot],
+                ));
+            }
         }
     }
 
@@ -2820,11 +2845,18 @@ impl FunctionCompiler {
             }
         } else {
             let name_idx = self.add_string(name);
-            let slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
-            self.emit(Instruction::new_unchecked(
-                Opcode::LdaGlobalInsideTypeof,
-                vec![Operand::ConstantPoolIdx(name_idx), slot],
-            ));
+            if self.with_depth > 0 {
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaLookupSlotInsideTypeof,
+                    vec![Operand::ConstantPoolIdx(name_idx)],
+                ));
+            } else {
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaGlobalInsideTypeof,
+                    vec![Operand::ConstantPoolIdx(name_idx), slot],
+                ));
+            }
         }
     }
 
@@ -2860,11 +2892,18 @@ impl FunctionCompiler {
             }
         } else {
             let name_idx = self.add_string(name);
-            let slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
-            self.emit(Instruction::new_unchecked(
-                Opcode::StaGlobal,
-                vec![Operand::ConstantPoolIdx(name_idx), slot],
-            ));
+            if self.with_depth > 0 {
+                self.emit(Instruction::new_unchecked(
+                    Opcode::StaLookupSlot,
+                    vec![Operand::ConstantPoolIdx(name_idx), Operand::Flag(0)],
+                ));
+            } else {
+                let slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::StaGlobal,
+                    vec![Operand::ConstantPoolIdx(name_idx), slot],
+                ));
+            }
         }
         Ok(())
     }
@@ -5238,7 +5277,7 @@ impl FunctionCompiler {
         // Loop labels.
         let loop_lbl = self.new_label();
         let break_lbl = self.new_label();
-        self.patch_pending_label(loop_lbl);
+        self.patch_pending_labels(loop_lbl);
         self.loop_stack.push((loop_lbl, break_lbl));
 
         // Bind loop start.
@@ -5443,7 +5482,7 @@ impl FunctionCompiler {
         // Loop labels.
         let loop_lbl = self.new_label();
         let break_lbl = self.new_label();
-        self.patch_pending_label(loop_lbl);
+        self.patch_pending_labels(loop_lbl);
         self.loop_stack.push((loop_lbl, break_lbl));
         self.for_of_iter_regs.insert(break_lbl, iter_reg);
 
