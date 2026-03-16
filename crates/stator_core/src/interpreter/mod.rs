@@ -2308,18 +2308,10 @@ pub(super) fn to_array_index(key: &JsValue) -> Option<usize> {
 
 /// Convert a [`JsValue`] to a property key string.
 ///
-/// ECMAScript §7.1.19 ToPropertyKey — well-known symbols are mapped to
-/// their internal `@@name` property keys so that computed access like
-/// `obj[Symbol.toStringTag]` resolves to the `"@@toStringTag"` slot.
+/// ECMAScript §7.1.19 ToPropertyKey.
 pub(super) fn to_property_key(key: &JsValue) -> StatorResult<String> {
     match key {
-        JsValue::Symbol(id) => {
-            if let Some(k) = crate::builtins::symbol::well_known_symbol_to_key(*id) {
-                Ok(k.to_string())
-            } else {
-                Ok(format!("Symbol({id})"))
-            }
-        }
+        JsValue::Symbol(id) => Ok(crate::builtins::symbol::symbol_to_property_key(*id)),
         _ => key.to_js_string(),
     }
 }

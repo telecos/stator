@@ -3378,7 +3378,7 @@ fn make_object() -> JsValue {
                     ));
                 }
 
-                let key = prop.to_js_string()?;
+                let key = prop.to_property_key()?;
 
                 // §20.1.2.4 step 3: descriptor must be an object.
                 if descriptor.is_primitive() {
@@ -3413,7 +3413,7 @@ fn make_object() -> JsValue {
                 }
                 let prop = args.get(1).unwrap_or(&JsValue::Undefined);
 
-                let key = prop.to_js_string()?;
+                let key = prop.to_property_key()?;
 
                 // Helper to build a data descriptor.
                 fn data_desc(
@@ -4217,8 +4217,17 @@ fn make_object() -> JsValue {
                         "Cannot convert undefined or null to object".into(),
                     ));
                 }
-                // PropertyMap uses string keys; no symbol-keyed properties exist yet.
-                Ok(JsValue::new_array(vec![]))
+                if let JsValue::PlainObject(map) = obj {
+                    let symbols = map
+                        .borrow()
+                        .own_symbol_keys()
+                        .into_iter()
+                        .map(JsValue::Symbol)
+                        .collect();
+                    Ok(JsValue::new_array(symbols))
+                } else {
+                    Ok(JsValue::new_array(vec![]))
+                }
             }),
         );
 
@@ -4231,7 +4240,7 @@ fn make_object() -> JsValue {
             native(|args| {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 let key = args.get(1).unwrap_or(&JsValue::Undefined);
-                let prop = key.to_js_string()?;
+                let prop = key.to_property_key()?;
                 match this {
                     JsValue::PlainObject(map) => {
                         let has = map.borrow().contains_key(&prop) && prop != "__proto__";
@@ -4275,7 +4284,7 @@ fn make_object() -> JsValue {
             native(|args| {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 let key = args.get(1).unwrap_or(&JsValue::Undefined);
-                let prop = key.to_js_string()?;
+                let prop = key.to_property_key()?;
                 match this {
                     JsValue::PlainObject(map) => {
                         let borrow = map.borrow();
@@ -4294,7 +4303,7 @@ fn make_object() -> JsValue {
             native(|args| {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 let key = args.get(1).unwrap_or(&JsValue::Undefined);
-                let prop = key.to_js_string()?;
+                let prop = key.to_property_key()?;
                 let getter_key = format!("__getter_{prop}__");
                 if let JsValue::PlainObject(map) = this {
                     if let Some(g) = map.borrow().get(&getter_key) {
@@ -4324,7 +4333,7 @@ fn make_object() -> JsValue {
             native(|args| {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 let key = args.get(1).unwrap_or(&JsValue::Undefined);
-                let prop = key.to_js_string()?;
+                let prop = key.to_property_key()?;
                 let setter_key = format!("__setter_{prop}__");
                 if let JsValue::PlainObject(map) = this {
                     if let Some(s) = map.borrow().get(&setter_key) {
@@ -4355,7 +4364,7 @@ fn make_object() -> JsValue {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 let key = args.get(1).unwrap_or(&JsValue::Undefined);
                 let getter = args.get(2).cloned().unwrap_or(JsValue::Undefined);
-                let prop = key.to_js_string()?;
+                let prop = key.to_property_key()?;
                 if let JsValue::PlainObject(map) = this {
                     map.borrow_mut()
                         .insert(format!("__getter_{prop}__"), getter);
@@ -4371,7 +4380,7 @@ fn make_object() -> JsValue {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 let key = args.get(1).unwrap_or(&JsValue::Undefined);
                 let setter = args.get(2).cloned().unwrap_or(JsValue::Undefined);
-                let prop = key.to_js_string()?;
+                let prop = key.to_property_key()?;
                 if let JsValue::PlainObject(map) = this {
                     map.borrow_mut()
                         .insert(format!("__setter_{prop}__"), setter);
@@ -13493,6 +13502,254 @@ mod tests {
         assert_eq!(result, JsValue::String("iter".into()));
     }
 
+    #[test]
+    fn e2e_symbol_key_distinct_from_string_key() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("x");
+            var obj = {};
+            obj[s] = 1;
+            obj[s.toString()] = 2;
+            obj[s] === 1 && obj[s.toString()] === 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_symbol_key_distinct_from_description_key() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("token");
+            var obj = {};
+            obj[s] = 1;
+            obj["token"] = 2;
+            obj[s] === 1 && obj["token"] === 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_object_get_own_property_symbols_returns_user_symbol() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("only");
+            var obj = {};
+            obj[s] = 1;
+            var syms = Object.getOwnPropertySymbols(obj);
+            syms.length === 1 && syms[0] === s
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_object_get_own_property_symbols_preserves_insertion_order() {
+        let result = global_eval(
+            r#"
+            var a = Symbol("a");
+            var b = Symbol("b");
+            var obj = {};
+            obj[b] = 2;
+            obj[a] = 1;
+            var syms = Object.getOwnPropertySymbols(obj);
+            syms.length === 2 && syms[0] === b && syms[1] === a
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_object_get_own_property_symbols_includes_well_known_symbol_keys() {
+        let result = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.toStringTag] = "Tagged";
+            var syms = Object.getOwnPropertySymbols(obj);
+            syms.length === 1 && syms[0] === Symbol.toStringTag
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_symbol_keys_excluded_from_object_keys() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("hidden");
+            var obj = { visible: 1 };
+            obj[s] = 2;
+            Object.keys(obj).length === 1 && Object.keys(obj)[0] === "visible"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_symbol_keys_excluded_from_for_in() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("hidden");
+            var obj = { visible: 1 };
+            obj[s] = 2;
+            var seen = [];
+            for (var key in obj) seen.push(key);
+            seen.length === 1 && seen[0] === "visible"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_object_define_property_accepts_symbol_key() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("dp");
+            var obj = {};
+            Object.defineProperty(obj, s, { value: 7, enumerable: true });
+            obj[s] === 7 && Object.getOwnPropertySymbols(obj)[0] === s
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_object_get_own_property_descriptor_accepts_symbol_key() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("desc");
+            var obj = {};
+            Object.defineProperty(obj, s, { value: 11, enumerable: true, configurable: true });
+            Object.getOwnPropertyDescriptor(obj, s).value === 11
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_has_own_property_accepts_symbol_key() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("own");
+            var obj = {};
+            obj[s] = 1;
+            Object.prototype.hasOwnProperty.call(obj, s)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_property_is_enumerable_accepts_symbol_key() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("enum");
+            var obj = {};
+            Object.defineProperty(obj, s, { value: 1, enumerable: true });
+            Object.prototype.propertyIsEnumerable.call(obj, s)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_symbol_to_primitive_number_hint() {
+        let result = global_eval(
+            r#"
+            var hint;
+            var obj = { [Symbol.toPrimitive](h) { hint = h; return 7; } };
+            Number(obj) === 7 && hint === "number"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_symbol_to_primitive_string_hint() {
+        let result = global_eval(
+            r#"
+            var hint;
+            var obj = { [Symbol.toPrimitive](h) { hint = h; return "value"; } };
+            String(obj) === "value" && hint === "string"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_symbol_to_primitive_default_hint() {
+        let result = global_eval(
+            r#"
+            var hint;
+            var obj = { [Symbol.toPrimitive](h) { hint = h; return "default"; } };
+            obj + "" === "default" && hint === "default"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_symbol_to_primitive_non_primitive_throws() {
+        let result = global_eval(
+            r#"
+            var obj = { [Symbol.toPrimitive]() { return {}; } };
+            try { Number(obj); false; } catch (e) { e instanceof TypeError; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_symbol_to_string_tag_custom_object() {
+        let result = global_eval(
+            r#"
+            var obj = { [Symbol.toStringTag]: "Foo" };
+            Object.prototype.toString.call(obj)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("[object Foo]".into()));
+    }
+
+    #[test]
+    fn e2e_symbol_to_string_tag_not_listed_in_object_keys() {
+        let result = global_eval(
+            r#"
+            var obj = { [Symbol.toStringTag]: "Foo", visible: 1 };
+            Object.keys(obj).length === 1 && Object.keys(obj)[0] === "visible"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_symbol_key_for_non_symbol_throws() {
+        let result = global_eval(
+            r#"
+            try { Symbol.keyFor("nope"); false; } catch (e) { e instanceof TypeError; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
     // ── Symbol.for / Symbol.keyFor e2e tests ────────────────────────────
 
     /// `Symbol.for("x") !== Symbol("x")` — registry symbols ≠ non-registry.
@@ -19231,6 +19488,40 @@ mod tests {
     }
 
     #[test]
+    fn test_array_concat_default_object_is_not_spreadable() {
+        let result = global_eval(
+            "var obj = {0: 'a', length: 1}; \
+             var out = [].concat(obj); \
+             out.length === 1 && out[0] === obj",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_concat_false_is_concat_spreadable_on_object() {
+        let result = global_eval(
+            "var obj = {0: 'a', length: 1}; \
+             obj[Symbol.isConcatSpreadable] = false; \
+             var out = [].concat(obj); \
+             out.length === 1 && out[0] === obj",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_concat_true_is_concat_spreadable_on_array() {
+        let result = global_eval(
+            "var arr = [1, 2]; \
+             arr[Symbol.isConcatSpreadable] = true; \
+             [].concat(arr).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1,2".into()));
+    }
+
+    #[test]
     fn test_array_length_shrink_truncates_elements() {
         let result = global_eval(
             "var a = [1,2,3]; \
@@ -22414,18 +22705,16 @@ mod tests {
     /// Replace with function replacer — receives (match, offset, string).
     #[test]
     fn e2e_replace_function_replacer() {
-        let r = global_eval(
-            "'hello'.replace('ll', function(m, off, s) { return off.toString(); })",
-        )
-        .unwrap();
+        let r =
+            global_eval("'hello'.replace('ll', function(m, off, s) { return off.toString(); })")
+                .unwrap();
         assert_eq!(r, JsValue::String("he2o".into()));
     }
 
     /// Replace with function replacer — match not found returns original.
     #[test]
     fn e2e_replace_fn_replacer_no_match() {
-        let r =
-            global_eval("'hello'.replace('xyz', function(m) { return 'Z'; })").unwrap();
+        let r = global_eval("'hello'.replace('xyz', function(m) { return 'Z'; })").unwrap();
         assert_eq!(r, JsValue::String("hello".into()));
     }
 
@@ -22446,10 +22735,9 @@ mod tests {
     /// replaceAll with function replacer.
     #[test]
     fn e2e_replace_all_fn_replacer() {
-        let r = global_eval(
-            "'abab'.replaceAll('a', function(m, off, s) { return off.toString(); })",
-        )
-        .unwrap();
+        let r =
+            global_eval("'abab'.replaceAll('a', function(m, off, s) { return off.toString(); })")
+                .unwrap();
         assert_eq!(r, JsValue::String("0b2b".into()));
     }
 

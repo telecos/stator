@@ -923,18 +923,13 @@ impl JsValue {
     /// ECMAScript §7.1.19 **ToPropertyKey**.
     ///
     /// Converts via [`to_primitive`][Self::to_primitive] with a `String` hint,
-    /// then returns the string representation.  Well-known symbols are mapped
-    /// to their `@@name` property key; user symbols use `"Symbol(<id>)"`.
+    /// then returns the string representation. Symbols are encoded using the
+    /// engine's internal symbol-property-key format so they remain distinct
+    /// from user-visible string keys.
     pub fn to_property_key(&self) -> StatorResult<String> {
         let key = self.to_primitive(ToPrimitiveHint::String)?;
         match key {
-            Self::Symbol(id) => {
-                if let Some(k) = crate::builtins::symbol::well_known_symbol_to_key(id) {
-                    Ok(k.to_string())
-                } else {
-                    Ok(format!("Symbol({id})"))
-                }
-            }
+            Self::Symbol(id) => Ok(crate::builtins::symbol::symbol_to_property_key(id)),
             other => other.to_js_string(),
         }
     }
@@ -2524,8 +2519,10 @@ mod tests {
 
     #[test]
     fn test_to_property_key_symbol() {
-        // Well-known Symbol.match (id=7) → "@@match"
-        assert_eq!(JsValue::Symbol(7).to_property_key().unwrap(), "@@match");
+        assert_eq!(
+            JsValue::Symbol(7).to_property_key().unwrap(),
+            crate::builtins::symbol::symbol_to_property_key(7)
+        );
     }
 
     #[test]
@@ -3468,7 +3465,7 @@ mod tests {
     fn test_symbol_to_property_key_succeeds() {
         // ToPropertyKey on Symbol should not throw.
         let key = JsValue::Symbol(42).to_property_key().unwrap();
-        assert_eq!(key, "Symbol(42)");
+        assert_eq!(key, crate::builtins::symbol::symbol_to_property_key(42));
     }
 
     #[test]

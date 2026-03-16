@@ -57,6 +57,8 @@ pub const SYMBOL_ASYNC_DISPOSE: u64 = 15;
 
 /// First ID available for user-created symbols (everything below is reserved).
 const FIRST_USER_SYMBOL_ID: u64 = 100;
+/// Internal prefix used to store user-created symbol property keys.
+const USER_SYMBOL_KEY_PREFIX: &str = "\u{0}sym:";
 
 /// Global atomic counter for generating unique symbol IDs.
 static NEXT_SYMBOL_ID: AtomicU64 = AtomicU64::new(FIRST_USER_SYMBOL_ID);
@@ -177,6 +179,26 @@ pub fn symbol_description(id: u64) -> Option<String> {
     REGISTRY.with(|r| r.borrow().descriptions.get(&id).cloned().flatten())
 }
 
+/// Encode a symbol as the internal property key used by object storage.
+pub fn symbol_to_property_key(id: u64) -> String {
+    well_known_symbol_to_key(id)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{USER_SYMBOL_KEY_PREFIX}{id}"))
+}
+
+/// Decode an internal property key back to a symbol identifier.
+pub fn property_key_to_symbol(key: &str) -> Option<u64> {
+    well_known_symbol_from_key(key).or_else(|| {
+        key.strip_prefix(USER_SYMBOL_KEY_PREFIX)
+            .and_then(|id| id.parse::<u64>().ok())
+    })
+}
+
+/// Returns `true` when `key` is the internal representation of a symbol key.
+pub fn is_symbol_property_key(key: &str) -> bool {
+    property_key_to_symbol(key).is_some()
+}
+
 /// Map a well-known symbol ID to its internal `@@name` property key.
 ///
 /// Returns `None` for user-created symbols that have no canonical `@@`
@@ -198,6 +220,28 @@ pub fn well_known_symbol_to_key(id: u64) -> Option<&'static str> {
         SYMBOL_MATCH_ALL => Some("@@matchAll"),
         SYMBOL_DISPOSE => Some("@@dispose"),
         SYMBOL_ASYNC_DISPOSE => Some("@@asyncDispose"),
+        _ => None,
+    }
+}
+
+/// Map an internal `@@name` property key back to its well-known symbol ID.
+pub fn well_known_symbol_from_key(key: &str) -> Option<u64> {
+    match key {
+        "@@iterator" => Some(SYMBOL_ITERATOR),
+        "@@toPrimitive" => Some(SYMBOL_TO_PRIMITIVE),
+        "@@hasInstance" => Some(SYMBOL_HAS_INSTANCE),
+        "@@toStringTag" => Some(SYMBOL_TO_STRING_TAG),
+        "@@isConcatSpreadable" => Some(SYMBOL_IS_CONCAT_SPREADABLE),
+        "@@species" => Some(SYMBOL_SPECIES),
+        "@@match" => Some(SYMBOL_MATCH),
+        "@@replace" => Some(SYMBOL_REPLACE),
+        "@@search" => Some(SYMBOL_SEARCH),
+        "@@split" => Some(SYMBOL_SPLIT),
+        "@@unscopables" => Some(SYMBOL_UNSCOPABLES),
+        "@@asyncIterator" => Some(SYMBOL_ASYNC_ITERATOR),
+        "@@matchAll" => Some(SYMBOL_MATCH_ALL),
+        "@@dispose" => Some(SYMBOL_DISPOSE),
+        "@@asyncDispose" => Some(SYMBOL_ASYNC_DISPOSE),
         _ => None,
     }
 }
@@ -358,5 +402,18 @@ mod tests {
     fn symbol_create_empty_description() {
         let id = symbol_create(Some("".into()));
         assert_eq!(symbol_description(id), Some("".into()));
+    }
+
+    #[test]
+    fn user_symbol_property_key_round_trips() {
+        let key = symbol_to_property_key(1234);
+        assert_eq!(property_key_to_symbol(&key), Some(1234));
+    }
+
+    #[test]
+    fn well_known_symbol_property_key_round_trips() {
+        let key = symbol_to_property_key(SYMBOL_TO_STRING_TAG);
+        assert_eq!(key, "@@toStringTag");
+        assert_eq!(property_key_to_symbol(&key), Some(SYMBOL_TO_STRING_TAG));
     }
 }

@@ -28,6 +28,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::builtins::symbol::{is_symbol_property_key, property_key_to_symbol};
 use crate::objects::map::PropertyAttributes;
 use crate::objects::value::JsValue;
 
@@ -568,7 +569,9 @@ impl PropertyMap {
         self.keys
             .iter()
             .zip(self.attrs.iter())
-            .filter(|(_, a)| a.contains(PropertyAttributes::ENUMERABLE))
+            .filter(|(k, a)| {
+                a.contains(PropertyAttributes::ENUMERABLE) && !is_symbol_property_key(k)
+            })
             .map(|(k, _)| k)
     }
 
@@ -579,7 +582,9 @@ impl PropertyMap {
             .iter()
             .zip(self.values.iter())
             .zip(self.attrs.iter())
-            .filter(|((_, _), a)| a.contains(PropertyAttributes::ENUMERABLE))
+            .filter(|((k, _), a)| {
+                a.contains(PropertyAttributes::ENUMERABLE) && !is_symbol_property_key(k)
+            })
             .map(|((k, v), _)| (k, v))
     }
 
@@ -590,6 +595,14 @@ impl PropertyMap {
             .zip(self.values.iter())
             .zip(self.attrs.iter())
             .map(|((k, v), a)| (k, v, *a))
+    }
+
+    /// Returns the own symbol-keyed property identifiers in insertion order.
+    pub fn own_symbol_keys(&self) -> Vec<u64> {
+        self.keys
+            .iter()
+            .filter_map(|key| property_key_to_symbol(key))
+            .collect()
     }
 
     /// Mark all properties as non-writable and non-configurable, and prevent
@@ -759,6 +772,28 @@ mod tests {
         assert_eq!(entries[0].0, "a");
         assert_eq!(entries[0].1, &JsValue::Smi(1));
         assert_eq!(entries[0].2, PropertyAttributes::WRITABLE);
+    }
+
+    #[test]
+    fn test_enumerable_keys_skip_symbol_keys() {
+        let mut pm = PropertyMap::new();
+        pm.insert("visible".to_string(), JsValue::Smi(1));
+        pm.insert(
+            crate::builtins::symbol::symbol_to_property_key(123),
+            JsValue::Smi(2),
+        );
+        let keys: Vec<&str> = pm.enumerable_keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["visible"]);
+    }
+
+    #[test]
+    fn test_own_symbol_keys_returns_symbols() {
+        let mut pm = PropertyMap::new();
+        pm.insert(
+            crate::builtins::symbol::symbol_to_property_key(321),
+            JsValue::Boolean(true),
+        );
+        assert_eq!(pm.own_symbol_keys(), vec![321]);
     }
 
     #[test]
