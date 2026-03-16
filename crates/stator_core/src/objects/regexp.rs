@@ -165,7 +165,11 @@ pub struct RegExpMatch {
     /// Numbered capture groups (1-indexed; the outer `Vec` is 0-indexed).
     pub captures: Vec<Option<String>>,
     /// Named capture groups (`name → value`).
-    pub named_groups: HashMap<String, String>,
+    ///
+    /// All named groups defined in the pattern are present.  Groups that did
+    /// not participate in the match have a `None` value (surfaced as
+    /// `undefined` in JavaScript).
+    pub named_groups: HashMap<String, Option<String>>,
     /// Byte offset of the match start in the input string.
     pub index: usize,
     /// The input string against which the pattern was matched.
@@ -637,9 +641,9 @@ fn build_match(input: &str, mat: &regress::Match, has_indices: bool) -> RegExpMa
         .map(|cap| cap.as_ref().map(|r| input[r.clone()].to_string()))
         .collect();
 
-    let named_groups: HashMap<String, String> = mat
+    let named_groups: HashMap<String, Option<String>> = mat
         .named_groups()
-        .filter_map(|(name, range)| range.map(|r| (name.to_string(), input[r].to_string())))
+        .map(|(name, range)| (name.to_string(), range.map(|r| input[r].to_string())))
         .collect();
 
     let indices = if has_indices {
@@ -700,7 +704,7 @@ fn apply_replacement(replacement: &str, m: &RegExpMatch, input: &str) -> String 
                     // Named capture: $<name>
                     if let Some(end) = replacement[i + 2..].find('>') {
                         let name = &replacement[i + 2..i + 2 + end];
-                        if let Some(val) = m.named_groups.get(name) {
+                        if let Some(Some(val)) = m.named_groups.get(name) {
                             out.push_str(val);
                         }
                         i += 2 + end + 1; // skip $<name>
@@ -908,9 +912,18 @@ mod tests {
         let re = JsRegExp::new(r"(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})", "u").unwrap();
         let m = re.exec("today is 2024-07-15 ok").unwrap();
         assert_eq!(m.matched, "2024-07-15");
-        assert_eq!(m.named_groups.get("year").map(String::as_str), Some("2024"));
-        assert_eq!(m.named_groups.get("month").map(String::as_str), Some("07"));
-        assert_eq!(m.named_groups.get("day").map(String::as_str), Some("15"));
+        assert_eq!(
+            m.named_groups.get("year").and_then(|v| v.as_deref()),
+            Some("2024")
+        );
+        assert_eq!(
+            m.named_groups.get("month").and_then(|v| v.as_deref()),
+            Some("07")
+        );
+        assert_eq!(
+            m.named_groups.get("day").and_then(|v| v.as_deref()),
+            Some("15")
+        );
     }
 
     #[test]

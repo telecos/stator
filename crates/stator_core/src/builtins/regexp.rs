@@ -417,13 +417,20 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
     props.insert("index".into(), JsValue::Smi(m.index as i32));
     props.insert("input".into(), JsValue::String(m.input.clone().into()));
 
-    // groups
+    // groups — null-prototype object (Object.create(null) per spec)
     if m.named_groups.is_empty() {
         props.insert("groups".into(), JsValue::Undefined);
     } else {
         let mut groups = PropertyMap::new();
+        groups.insert("__proto__".into(), JsValue::Null);
         for (k, v) in &m.named_groups {
-            groups.insert(k.clone(), JsValue::String(v.clone().into()));
+            groups.insert(
+                k.clone(),
+                match v {
+                    Some(s) => JsValue::String(s.clone().into()),
+                    None => JsValue::Undefined,
+                },
+            );
         }
         props.insert(
             "groups".into(),
