@@ -1822,6 +1822,13 @@ fn expand_spread_args(raw_args: Vec<JsValue>) -> Vec<JsValue> {
                         } else {
                             out.push(arg.clone());
                         }
+                    } else if map.borrow().contains_key("next") {
+                        // Raw iterator object (has "next" but no @@iterator).
+                        if let Ok(items) = collect_from_plain_object_iterator(arg, map) {
+                            out.extend(items);
+                        } else {
+                            out.push(arg.clone());
+                        }
                     } else {
                         out.push(arg.clone());
                     }
@@ -3212,10 +3219,7 @@ fn handle_iterator_close(
                     let result =
                         dispatch_call_with_this(f, iter.clone(), vec![JsValue::Undefined])?;
                     // §7.4.6 step 7: If the result is not an object, throw TypeError.
-                    if !matches!(
-                        result,
-                        JsValue::PlainObject(_) | JsValue::Array(_) | JsValue::Object(_)
-                    ) {
+                    if !result.is_object_like() {
                         return Err(StatorError::TypeError(
                             "Iterator .return() result is not an object".into(),
                         ));
@@ -3229,10 +3233,7 @@ fn handle_iterator_close(
                         iter.clone(),
                         vec![JsValue::Undefined],
                     )?;
-                    if !matches!(
-                        result,
-                        JsValue::PlainObject(_) | JsValue::Array(_) | JsValue::Object(_)
-                    ) {
+                    if !result.is_object_like() {
                         return Err(StatorError::TypeError(
                             "Iterator .return() result is not an object".into(),
                         ));
