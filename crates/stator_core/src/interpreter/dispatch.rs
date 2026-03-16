@@ -1255,7 +1255,7 @@ fn handle_call_any_receiver(
                 }
                 Some(JsValue::Function(ba)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                    call_plain_object_function(ctx, &ba, args)?;
+                    call_plain_object_function(ctx, &ba, map, args)?;
                 }
                 _ => {
                     return Err(StatorError::TypeError(
@@ -1734,7 +1734,7 @@ fn handle_call_property(
                     ctx.frame.accumulator = f(args)?;
                 }
                 Some(JsValue::Function(ba)) => {
-                    call_plain_object_function(ctx, &ba, args)?;
+                    call_plain_object_function(ctx, &ba, map, args)?;
                 }
                 _ => {
                     return Err(StatorError::TypeError(
@@ -1937,11 +1937,50 @@ fn handle_call_with_spread(
 fn call_plain_object_function(
     ctx: &mut DispatchContext,
     ba: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
+    map: &Rc<RefCell<PropertyMap>>,
     args: Vec<JsValue>,
 ) -> StatorResult<()> {
+    let is_class_constructor = matches!(
+        map.borrow().get(".class_constructor"),
+        Some(JsValue::Boolean(true))
+    );
+    if is_class_constructor {
+        let pending_this = ctx
+            .frame
+            .global_env
+            .borrow()
+            .get(".class_pending_this")
+            .cloned();
+        match pending_this {
+            Some(pending_this) => {
+                let current_this = ctx
+                    .frame
+                    .global_env
+                    .borrow()
+                    .get("this")
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined);
+                if current_this != JsValue::TheHole {
+                    return Err(StatorError::ReferenceError(
+                        "Super constructor may only be called once".into(),
+                    ));
+                }
+                ctx.frame
+                    .global_env
+                    .borrow_mut()
+                    .insert("this".to_string(), pending_this);
+            }
+            None => {
+                return Err(StatorError::TypeError(
+                    "Class constructor cannot be invoked without 'new'".into(),
+                ));
+            }
+        }
+    }
     let mut callee_frame =
         InterpreterFrame::new_with_globals((**ba).clone(), args, Rc::clone(&ctx.frame.global_env));
     restore_closure_context(&mut callee_frame, ba);
+    callee_frame.new_target = ctx.frame.new_target.clone();
     push_call_frame("<anonymous>")?;
     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
         Interpreter::run(&mut callee_frame)
@@ -1984,10 +2023,6 @@ fn construct_class_from_plain_object(
         InterpreterFrame::new_with_globals((**ba).clone(), args, Rc::clone(&ctx.frame.global_env));
     restore_closure_context(&mut callee_frame, ba);
     callee_frame.new_target = JsValue::PlainObject(Rc::clone(class_map));
-    callee_frame
-        .global_env
-        .borrow_mut()
-        .insert("this".to_string(), this_val.clone());
 
     // 3. Expose parent constructor as "super" for `super()` calls.
     if let Some(parent) = class_map.borrow().get("__proto__").cloned()
@@ -1996,7 +2031,20 @@ fn construct_class_from_plain_object(
         callee_frame
             .global_env
             .borrow_mut()
+            .insert(".class_pending_this".to_string(), this_val.clone());
+        callee_frame
+            .global_env
+            .borrow_mut()
+            .insert("this".to_string(), JsValue::TheHole);
+        callee_frame
+            .global_env
+            .borrow_mut()
             .insert("super".to_string(), parent);
+    } else {
+        callee_frame
+            .global_env
+            .borrow_mut()
+            .insert("this".to_string(), this_val.clone());
     }
 
     // 4. Run constructor body.
@@ -2021,6 +2069,11 @@ fn construct_class_from_plain_object(
         let _ = stacker::maybe_grow(64 * 1024, 1024 * 1024, || Interpreter::run(&mut init_frame));
         pop_call_frame();
     }
+
+    ctx.frame
+        .global_env
+        .borrow_mut()
+        .remove(".class_pending_this");
 
     // 6. If constructor returns an object, use it; else use `this`.
     ctx.frame.accumulator = match val {
@@ -2477,6 +2530,11 @@ fn handle_lda_global(
         .get(name.as_ref())
         .cloned()
         .unwrap_or(JsValue::Undefined);
+    if name.as_ref() == "this" && ctx.frame.accumulator == JsValue::TheHole {
+        return Err(StatorError::ReferenceError(
+            "Must call super constructor in derived class before accessing 'this'".into(),
+        ));
+    }
     Ok(DispatchAction::Continue)
 }
 
@@ -5787,6 +5845,9 @@ fn handle_create_class(
         "__call__".to_string(),
         JsValue::Function(Rc::clone(&ctor_ba_rc)),
     );
+    class_obj
+        .borrow_mut()
+        .insert(".class_constructor".to_string(), JsValue::Boolean(true));
 
     // 4. Create the prototype object.
     let proto: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
@@ -7652,10 +7713,36 @@ mod tests {
         assert_eq!(result, JsValue::Smi(55));
     }
 
-    /// super.method() in a derived class.
-    // NOTE: super method resolution not yet fully implemented
     #[test]
-    #[ignore]
+    fn test_class_decl_basics() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo { constructor(x) { this.x = x; } } \
+             typeof Foo === 'function' && Foo.prototype.constructor === Foo && new Foo(7).x === 7",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_class_decl_tdz() {
+        let result = crate::builtins::global::global_eval(
+            "try { Foo; class Foo {} } catch (e) { e instanceof ReferenceError }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_class_body_is_strict() {
+        let result = crate::builtins::global::global_eval("class Foo { method() { delete x; } }");
+        assert!(
+            result.is_err(),
+            "class methods should compile in strict mode"
+        );
+    }
+
+    /// super.method() in a derived class.
+    #[test]
     fn test_super_method_call() {
         let result = crate::builtins::global::global_eval(
             "class Base { value() { return 10; } } \
@@ -7672,6 +7759,71 @@ mod tests {
         let result = crate::builtins::global::global_eval(
             "class Base {} class Child extends Base {} \
              var c = new Child(); c instanceof Base",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_class_inheritance_prototype_chain() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo {} \
+             class Bar extends Foo {} \
+             (Bar.__proto__ === Foo) && \
+             (Bar.prototype.__proto__ === Foo.prototype) && \
+             !(Bar.prototype instanceof Foo) && \
+             (new Bar() instanceof Foo)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_class_static_and_instance_fields() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo { static x = 42; y = 7; } \
+             var a = new Foo(); \
+             var b = new Foo(); \
+             Foo.x === 42 && a.y === 7 && b.y === 7 && Foo.prototype.y === undefined",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_class_expression_name_not_visible_outside() {
+        let result =
+            crate::builtins::global::global_eval("var Foo = class Bar {}; typeof Bar").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn test_class_constructor_requires_new() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo {} \
+             try { Foo(); false; } catch (e) { e instanceof TypeError }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_derived_class_requires_super_before_this() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo {} \
+             class Bar extends Foo { constructor() { this.x = 1; super(); } } \
+             try { new Bar(); false; } catch (e) { e instanceof ReferenceError }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_derived_class_cannot_call_super_twice() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo {} \
+             class Bar extends Foo { constructor() { super(); super(); } } \
+             try { new Bar(); false; } catch (e) { e instanceof ReferenceError }",
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));

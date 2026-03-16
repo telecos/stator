@@ -1120,8 +1120,8 @@ impl FunctionCompiler {
     fn collect_lexical_names(stmts: &[Stmt]) -> Vec<(String, bool)> {
         let mut names = Vec::new();
         for stmt in stmts {
-            if let Stmt::VarDecl(decl) = stmt {
-                match decl.kind {
+            match stmt {
+                Stmt::VarDecl(decl) => match decl.kind {
                     VarKind::Let | VarKind::Const => {
                         let is_const = decl.kind == VarKind::Const;
                         for d in &decl.declarators {
@@ -1133,7 +1133,13 @@ impl FunctionCompiler {
                         }
                     }
                     _ => {}
+                },
+                Stmt::ClassDecl(decl) => {
+                    if let Some(id) = &decl.id {
+                        names.push((id.name.clone(), false));
+                    }
                 }
+                _ => {}
             }
         }
         names
@@ -1455,8 +1461,12 @@ impl FunctionCompiler {
         self.compile_class(decl.id.as_ref(), decl.super_class.as_deref(), &decl.body)?;
         // Bind the class name in the current scope.
         if let Some(id) = &decl.id {
-            let reg = self.define_local(&id.name);
+            let reg = self
+                .lookup_var(&id.name)
+                .map(|binding| binding.reg)
+                .unwrap_or_else(|| self.define_local(&id.name));
             self.emit_star(reg);
+            self.mark_initialized(&id.name);
             // Top-level class declarations are also stored as globals.
             if self.is_program {
                 let name_idx = self.add_string(&id.name);
@@ -1490,6 +1500,9 @@ impl FunctionCompiler {
     ) -> StatorResult<()> {
         use crate::parser::ast::{ClassMember, MethodKind};
 
+        let outer_strict = self.is_strict;
+        self.is_strict = true;
+
         // 1. Evaluate superclass (or load undefined) into a register.
         let super_reg = self.allocator.allocate_temporary();
         if let Some(sc) = super_class {
@@ -1510,14 +1523,14 @@ impl FunctionCompiler {
                 &ctor.value.body,
                 false,
                 false,
-                self.is_strict,
+                ctor.value.is_strict,
             )?
         } else {
             let empty_body = BlockStmt {
                 loc: body.loc,
                 body: vec![],
             };
-            compile_function(&[], &empty_body, false, false, self.is_strict)?
+            compile_function(&[], &empty_body, false, false, true)?
         };
         let ctor_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(ctor_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
@@ -1594,6 +1607,7 @@ impl FunctionCompiler {
             .release_temporary(super_reg)
             .map_err(|e| StatorError::Internal(e.to_string()))?;
 
+        self.is_strict = outer_strict;
         Ok(())
     }
 
@@ -1874,7 +1888,7 @@ impl FunctionCompiler {
             module_variables: HashMap::new(),
             next_module_cell: 0,
             in_tail_position: false,
-            is_strict: false,
+            is_strict: true,
             using_vars: vec![Vec::new()],
             for_of_iter_regs: HashMap::new(),
         };
@@ -3235,6 +3249,11 @@ impl FunctionCompiler {
 
     /// Compile a member expression (`obj.prop` or `obj[key]`) as an r-value.
     fn compile_member(&mut self, m: &crate::parser::ast::MemberExpr) -> StatorResult<()> {
+        if let Expr::Ident(id) = m.object.as_ref()
+            && id.name == "super"
+        {
+            return self.compile_super_member_load(m);
+        }
         self.compile_expr(&m.object)?;
         let obj_reg = self.allocator.allocate_temporary();
         self.emit_star(obj_reg);
@@ -3268,6 +3287,81 @@ impl FunctionCompiler {
         }
         self.allocator
             .release_temporary(obj_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    fn compile_super_member_load(
+        &mut self,
+        m: &crate::parser::ast::MemberExpr,
+    ) -> StatorResult<()> {
+        let recv_reg = self.allocator.allocate_temporary();
+        let this_name_idx = self.add_string("this");
+        let this_slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
+        self.emit(Instruction::new_unchecked(
+            Opcode::LdaGlobal,
+            vec![Operand::ConstantPoolIdx(this_name_idx), this_slot],
+        ));
+        self.emit_star(recv_reg);
+
+        self.compile_expr(&m.object)?;
+        let super_reg = self.allocator.allocate_temporary();
+        self.emit_star(super_reg);
+
+        let proto_name_idx = self.add_string("prototype");
+        let proto_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+        self.emit(Instruction::new_unchecked(
+            Opcode::LdaNamedProperty,
+            vec![
+                to_reg_op(super_reg),
+                Operand::ConstantPoolIdx(proto_name_idx),
+                proto_slot,
+            ],
+        ));
+
+        match &m.property {
+            crate::parser::ast::MemberProp::Ident(id) => {
+                let name_idx = self.add_string(&id.name);
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaNamedPropertyFromSuper,
+                    vec![
+                        to_reg_op(recv_reg),
+                        Operand::ConstantPoolIdx(name_idx),
+                        slot,
+                    ],
+                ));
+            }
+            crate::parser::ast::MemberProp::Private(id) => {
+                let name_idx = self.add_string(&format!("#{}", id.name));
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaNamedPropertyFromSuper,
+                    vec![
+                        to_reg_op(recv_reg),
+                        Operand::ConstantPoolIdx(name_idx),
+                        slot,
+                    ],
+                ));
+            }
+            crate::parser::ast::MemberProp::Computed(_) => {
+                self.allocator
+                    .release_temporary(super_reg)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+                self.allocator
+                    .release_temporary(recv_reg)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+                return Err(StatorError::SyntaxError(
+                    "computed super property access is not yet supported".into(),
+                ));
+            }
+        }
+
+        self.allocator
+            .release_temporary(super_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        self.allocator
+            .release_temporary(recv_reg)
             .map_err(|e| StatorError::Internal(e.to_string()))?;
         Ok(())
     }
@@ -3530,6 +3624,11 @@ impl FunctionCompiler {
         m: &crate::parser::ast::MemberExpr,
         args: &[Expr],
     ) -> StatorResult<()> {
+        if let Expr::Ident(id) = m.object.as_ref()
+            && id.name == "super"
+        {
+            return self.compile_super_method_call(m, args);
+        }
         // Consume tail-position flag — method calls in tail position are not
         // optimised (the receiver binding requires a full frame), so we clear
         // it to prevent inner expressions from being incorrectly marked.
@@ -3623,6 +3722,125 @@ impl FunctionCompiler {
         }
         self.allocator
             .release_temporary(callee_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        self.allocator
+            .release_temporary(recv_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    fn compile_super_method_call(
+        &mut self,
+        m: &crate::parser::ast::MemberExpr,
+        args: &[Expr],
+    ) -> StatorResult<()> {
+        self.in_tail_position = false;
+
+        let recv_reg = self.allocator.allocate_temporary();
+        let this_name_idx = self.add_string("this");
+        let this_slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
+        self.emit(Instruction::new_unchecked(
+            Opcode::LdaGlobal,
+            vec![Operand::ConstantPoolIdx(this_name_idx), this_slot],
+        ));
+        self.emit_star(recv_reg);
+
+        self.compile_expr(&m.object)?;
+        let super_reg = self.allocator.allocate_temporary();
+        self.emit_star(super_reg);
+
+        let proto_name_idx = self.add_string("prototype");
+        let proto_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+        self.emit(Instruction::new_unchecked(
+            Opcode::LdaNamedProperty,
+            vec![
+                to_reg_op(super_reg),
+                Operand::ConstantPoolIdx(proto_name_idx),
+                proto_slot,
+            ],
+        ));
+
+        match &m.property {
+            crate::parser::ast::MemberProp::Ident(id) => {
+                let name_idx = self.add_string(&id.name);
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaNamedPropertyFromSuper,
+                    vec![
+                        to_reg_op(recv_reg),
+                        Operand::ConstantPoolIdx(name_idx),
+                        slot,
+                    ],
+                ));
+            }
+            crate::parser::ast::MemberProp::Private(id) => {
+                let name_idx = self.add_string(&format!("#{}", id.name));
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaNamedPropertyFromSuper,
+                    vec![
+                        to_reg_op(recv_reg),
+                        Operand::ConstantPoolIdx(name_idx),
+                        slot,
+                    ],
+                ));
+            }
+            crate::parser::ast::MemberProp::Computed(_) => {
+                self.allocator
+                    .release_temporary(super_reg)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+                self.allocator
+                    .release_temporary(recv_reg)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+                return Err(StatorError::SyntaxError(
+                    "computed super method access is not yet supported".into(),
+                ));
+            }
+        }
+        let callee_reg = self.allocator.allocate_temporary();
+        self.emit_star(callee_reg);
+
+        let has_spread = args.iter().any(|a| matches!(a, Expr::Spread(_)));
+        if has_spread {
+            let arr_reg = self.compile_arguments_as_array(args)?;
+            let slot = self.alloc_slot(FeedbackSlotKind::Call);
+            self.emit(Instruction::new_unchecked(
+                Opcode::CallWithSpread,
+                vec![
+                    to_reg_op(callee_reg),
+                    to_reg_op(arr_reg),
+                    Operand::RegisterCount(1),
+                    slot,
+                ],
+            ));
+            self.allocator
+                .release_temporary(arr_reg)
+                .map_err(|e| StatorError::Internal(e.to_string()))?;
+        } else {
+            let arg_regs = self.compile_arguments(args)?;
+            let arg_count = arg_regs.len() as u32;
+            let slot = self.alloc_slot(FeedbackSlotKind::Call);
+            self.emit(Instruction::new_unchecked(
+                Opcode::CallProperty,
+                vec![
+                    to_reg_op(callee_reg),
+                    to_reg_op(recv_reg),
+                    Operand::RegisterCount(arg_count),
+                    slot,
+                ],
+            ));
+            for r in arg_regs.into_iter().rev() {
+                self.allocator
+                    .release_temporary(r)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+            }
+        }
+
+        self.allocator
+            .release_temporary(callee_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        self.allocator
+            .release_temporary(super_reg)
             .map_err(|e| StatorError::Internal(e.to_string()))?;
         self.allocator
             .release_temporary(recv_reg)
