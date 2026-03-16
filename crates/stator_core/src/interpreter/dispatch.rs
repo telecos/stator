@@ -2195,6 +2195,13 @@ fn handle_construct(
             ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
         }
         JsValue::PlainObject(ref map) => {
+            // Objects marked with `__no_construct__` (e.g. Symbol) are
+            // callable but must not be used with `new`.
+            if map.borrow().get("__no_construct__").is_some() {
+                return Err(StatorError::TypeError(
+                    "Symbol is not a constructor".to_string(),
+                ));
+            }
             let call_val = map.borrow().get("__call__").cloned();
             match call_val {
                 Some(JsValue::NativeFunction(f)) => {
@@ -2280,6 +2287,11 @@ fn handle_construct_with_spread(
             ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
         }
         JsValue::PlainObject(ref map) => {
+            if map.borrow().get("__no_construct__").is_some() {
+                return Err(StatorError::TypeError(
+                    "Symbol is not a constructor".to_string(),
+                ));
+            }
             let call_val = map.borrow().get("__call__").cloned();
             match call_val {
                 Some(JsValue::NativeFunction(f)) => {
@@ -5753,6 +5765,11 @@ fn handle_construct_forward_all_args(
             ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
         }
         JsValue::PlainObject(ref map) => {
+            if map.borrow().get("__no_construct__").is_some() {
+                return Err(StatorError::TypeError(
+                    "Symbol is not a constructor".to_string(),
+                ));
+            }
             let call_val = map.borrow().get("__call__").cloned();
             match call_val {
                 Some(JsValue::NativeFunction(f)) => {
