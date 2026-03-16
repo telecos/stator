@@ -29858,4 +29858,208 @@ mod tests {
         let r = global_eval("[] == 0").unwrap();
         assert_eq!(r, JsValue::Boolean(true));
     }
+
+    fn e2e_define_property_data_to_accessor_updates_descriptor_shape() {
+        let result = global_eval(
+            "var o = { x: 1 }; \
+             Object.defineProperty(o, 'x', { get: function() { return 42; }, configurable: true }); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             d.value === undefined && d.writable === undefined && typeof d.get === 'function'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_own_data_property_shadows_prototype_getter() {
+        let result = global_eval(
+            "var p = { get x() { return 1; } }; \
+             var o = Object.create(p); \
+             Object.defineProperty(o, 'x', { value: 42, writable: true, configurable: true }); \
+             o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_own_data_property_blocks_prototype_getter_this_access() {
+        let result = global_eval(
+            "var p = { get x() { return this.y; } }; \
+             var o = Object.create(p); \
+             o.y = 1; \
+             Object.defineProperty(o, 'x', { value: 42, writable: true, configurable: true }); \
+             o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_class_child_inherits_getter() {
+        let result = global_eval(
+            "class Parent { get x() { return this.y; } } \
+             class Child extends Parent {} \
+             var c = new Child(); \
+             c.y = 42; \
+             c.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_class_child_inherits_setter() {
+        let result = global_eval(
+            "class Parent { set x(v) { this.y = v; } } \
+             class Child extends Parent {} \
+             var c = new Child(); \
+             c.x = 42; \
+             c.y",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_class_inherited_accessor_round_trip() {
+        let result = global_eval(
+            "class Parent { \
+                get x() { return this._x; } \
+                set x(v) { this._x = v; } \
+             } \
+             class Child extends Parent {} \
+             var c = new Child(); \
+             c.x = 42; \
+             c.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_object_create_descriptor_getter() {
+        let result = global_eval(
+            "var o = Object.create({}, { \
+                x: { get: function() { return 42; }, configurable: true } \
+             }); \
+             o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_object_create_descriptor_setter() {
+        let result = global_eval(
+            "var o = Object.create({}, { \
+                x: { set: function(v) { this.y = v; }, configurable: true } \
+             }); \
+             o.x = 42; \
+             o.y",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_object_create_descriptor_getter_and_setter() {
+        let result = global_eval(
+            "var o = Object.create({}, { \
+                x: { \
+                    get: function() { return this._x; }, \
+                    set: function(v) { this._x = v; }, \
+                    configurable: true \
+                } \
+             }); \
+             o.x = 42; \
+             o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_object_create_null_proto_descriptor_getter() {
+        let result = global_eval(
+            "var o = Object.create(null, { \
+                x: { get: function() { return 42; }, configurable: true } \
+             }); \
+             o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_throwing_getter_propagates_string() {
+        let result = global_eval(
+            "var o = { get x() { throw 'boom'; } }; \
+             try { o.x; 'no'; } catch (e) { e; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("boom".into()));
+    }
+
+    #[test]
+    fn e2e_throwing_inherited_getter_propagates() {
+        let result = global_eval(
+            "var p = { get x() { throw 'boom'; } }; \
+             var o = Object.create(p); \
+             try { o.x; 'no'; } catch (e) { e; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("boom".into()));
+    }
+
+    #[test]
+    fn e2e_configurable_accessor_replace_getter_with_setter() {
+        let result = global_eval(
+            "var seen = 0; \
+             var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 1; }, configurable: true }); \
+             Object.defineProperty(o, 'x', { get: undefined, set: function(v) { seen = v; } }); \
+             o.x = 42; \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             seen === 42 && d.get === undefined && typeof d.set === 'function'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_configurable_accessor_replace_setter_with_getter() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { set: function(v) { this._x = v; }, configurable: true }); \
+             Object.defineProperty(o, 'x', { set: undefined, get: function() { return 42; } }); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             o.x === 42 && d.set === undefined && typeof d.get === 'function'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_getter_overrides_existing_data_value_after_redefinition() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 1, writable: true, configurable: true }); \
+             Object.defineProperty(o, 'x', { get: function() { return 42; }, configurable: true }); \
+             o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_inherited_setter_assignment_returns_stored_value() {
+        let result = global_eval(
+            "var p = { set x(v) { this.y = v; } }; \
+             var o = Object.create(p); \
+             (o.x = 42) === 42 && o.y === 42",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
 }
