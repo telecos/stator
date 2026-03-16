@@ -9369,45 +9369,6 @@ fn make_promise() -> JsValue {
                 "resolve".into(),
                 native(move |args| {
                     let val = args.first().cloned().unwrap_or(JsValue::Undefined);
-                    // Idempotence: return the same promise if already a Promise.
-                    if val.is_promise() {
-                        return Ok(val);
-                    }
-                    // Thenable unwrapping: if value is an object with a `.then` method,
-                    // call it to adopt its state.
-                    if let JsValue::PlainObject(ref obj) = val {
-                        let then_fn = obj.borrow().get("then").cloned();
-                        if let Some(JsValue::NativeFunction(f)) = then_fn {
-                            let q2 = q.clone();
-                            let p = promise_new(
-                                move |resolve_box, reject_box| {
-                                    let resolve_box = Rc::new(RefCell::new(Some(resolve_box)));
-                                    let reject_box = Rc::new(RefCell::new(Some(reject_box)));
-                                    let resolve_fn = JsValue::NativeFunction(Rc::new({
-                                        let rb = Rc::clone(&resolve_box);
-                                        move |a: Vec<JsValue>| {
-                                            if let Some(f) = rb.borrow_mut().take() {
-                                                f(a.first().cloned().unwrap_or(JsValue::Undefined));
-                                            }
-                                            Ok(JsValue::Undefined)
-                                        }
-                                    }));
-                                    let reject_fn = JsValue::NativeFunction(Rc::new({
-                                        let rb = Rc::clone(&reject_box);
-                                        move |a: Vec<JsValue>| {
-                                            if let Some(f) = rb.borrow_mut().take() {
-                                                f(a.first().cloned().unwrap_or(JsValue::Undefined));
-                                            }
-                                            Ok(JsValue::Undefined)
-                                        }
-                                    }));
-                                    let _ = f(vec![resolve_fn, reject_fn]);
-                                },
-                                &q2,
-                            );
-                            return Ok(JsValue::Promise(p));
-                        }
-                    }
                     Ok(JsValue::Promise(promise_resolve(val, &q)))
                 }),
             );
