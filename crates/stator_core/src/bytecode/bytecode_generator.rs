@@ -5282,6 +5282,7 @@ impl FunctionCompiler {
     ///   ForInNext r_obj, r_index, r_keys, slot ; acc = keys[index]
     ///   Star r_key                             ; bind loop variable
     ///   <body>
+    /// continue_target:                         ; `continue` jumps here
     ///   ForInStep r_index                      ; acc = index + 1
     ///   Star r_index
     ///   JumpLoop loop_start
@@ -5325,8 +5326,13 @@ impl FunctionCompiler {
         // Evaluate the right-hand (object) expression → acc.
         self.compile_expr(&stmt.right)?;
 
-        // Store the object in a temporary.
-        let r_obj = self.allocator.allocate_temporary();
+        // Store the object in a local register.  We use `new_local()`
+        // rather than `allocate_temporary()` because
+        // `compile_binding_pattern` (called for destructuring loop
+        // variables) also calls `new_local()` internally, which would
+        // shift `local_count` and break the LIFO invariant required by
+        // temporary release.
+        let r_obj = self.allocator.new_local();
         self.emit_star(r_obj);
 
         // ForInEnumerate r_obj → acc = array of enumerable keys.
@@ -5337,7 +5343,7 @@ impl FunctionCompiler {
         ));
 
         // Save keys array.
-        let r_keys = self.allocator.allocate_temporary();
+        let r_keys = self.allocator.new_local();
         self.emit_star(r_keys);
 
         // ForInPrepare r_keys, slot → acc = length.
@@ -5348,19 +5354,22 @@ impl FunctionCompiler {
         ));
 
         // Save length.
-        let r_length = self.allocator.allocate_temporary();
+        let r_length = self.allocator.new_local();
         self.emit_star(r_length);
 
         // index = 0.
         self.emit(Instruction::new_unchecked(Opcode::LdaZero, vec![]));
-        let r_index = self.allocator.allocate_temporary();
+        let r_index = self.allocator.new_local();
         self.emit_star(r_index);
 
-        // Loop labels.
+        // Loop labels.  The continue target (`continue_lbl`) is bound just
+        // before ForInStep so that `continue` properly increments the index
+        // before re-checking the loop condition.
         let loop_lbl = self.new_label();
+        let continue_lbl = self.new_label();
         let break_lbl = self.new_label();
         self.patch_pending_labels(loop_lbl);
-        self.loop_stack.push((loop_lbl, break_lbl));
+        self.loop_stack.push((continue_lbl, break_lbl));
 
         // Bind loop start.
         self.bind_label(loop_lbl);
@@ -5421,17 +5430,10 @@ impl FunctionCompiler {
                     self.emit_star(binding.reg);
                 }
                 pat => {
-                    // Destructuring: store key in a temporary, then unpack.
-                    // Must use allocate_temporary (not new_local) because
-                    // r_obj/r_keys/r_length/r_index temporaries are still
-                    // live — new_local would shift local_count and corrupt
-                    // the temporary release logic.
-                    let scratch = self.allocator.allocate_temporary();
+                    // Destructuring: store key in a scratch local, then unpack.
+                    let scratch = self.allocator.new_local();
                     self.emit_star(scratch);
                     self.compile_binding_pattern(pat, scratch, BindingMode::Assign)?;
-                    self.allocator
-                        .release_temporary(scratch)
-                        .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
             },
             ForInOfLeft::Expr(expr) => {
@@ -5443,6 +5445,10 @@ impl FunctionCompiler {
 
         // Compile the loop body.
         self.compile_stmt(&stmt.body)?;
+
+        // Bind the continue target so `continue` jumps here (before
+        // the index increment), not to loop_lbl (which would skip it).
+        self.bind_label(continue_lbl);
 
         // ForInStep r_index → acc = index + 1.
         self.emit(Instruction::new_unchecked(
@@ -5459,20 +5465,6 @@ impl FunctionCompiler {
 
         self.loop_stack.pop();
         self.pop_scope();
-
-        // Release temporaries in reverse allocation order.
-        self.allocator
-            .release_temporary(r_index)
-            .map_err(|e| StatorError::Internal(e.to_string()))?;
-        self.allocator
-            .release_temporary(r_length)
-            .map_err(|e| StatorError::Internal(e.to_string()))?;
-        self.allocator
-            .release_temporary(r_keys)
-            .map_err(|e| StatorError::Internal(e.to_string()))?;
-        self.allocator
-            .release_temporary(r_obj)
-            .map_err(|e| StatorError::Internal(e.to_string()))?;
 
         // Suppress the unused-variable warning for the ForIn feedback slots.
         let _ = (enum_slot, prepare_slot, next_slot);
@@ -5536,8 +5528,8 @@ impl FunctionCompiler {
         // Evaluate the right-hand (iterable) expression → acc.
         self.compile_expr(&stmt.right)?;
 
-        // Store iterable in a temporary register for GetIterator, then release.
-        let iterable_reg = self.allocator.allocate_temporary();
+        // Store iterable in a scratch local for GetIterator.
+        let iterable_reg = self.allocator.new_local();
         self.emit_star(iterable_reg);
         let op = if stmt.is_await {
             Opcode::GetAsyncIterator
@@ -5550,16 +5542,17 @@ impl FunctionCompiler {
             op,
             vec![to_reg_op(iterable_reg), load_slot, call_slot],
         ));
-        self.allocator
-            .release_temporary(iterable_reg)
-            .map_err(|e| StatorError::Internal(e.to_string()))?;
 
-        // Save iterator in a temporary register.
-        let iter_reg = self.allocator.allocate_temporary();
+        // Save iterator in a local register.  We use `new_local()` rather
+        // than `allocate_temporary()` because `compile_binding_pattern`
+        // (called for destructuring loop variables) also calls `new_local()`
+        // internally, which would shift `local_count` and break the LIFO
+        // invariant required by temporary release.
+        let iter_reg = self.allocator.new_local();
         self.emit_star(iter_reg);
 
         // Allocate value-output register for IteratorNext.
-        let val_reg = self.allocator.allocate_temporary();
+        let val_reg = self.allocator.new_local();
 
         // Loop labels.
         let loop_lbl = self.new_label();
@@ -5618,18 +5611,11 @@ impl FunctionCompiler {
                     self.emit_star(binding.reg);
                 }
                 pat => {
-                    // Destructuring: store value in a temporary, then unpack.
-                    // Must use allocate_temporary (not new_local) because
-                    // iter_reg and val_reg temporaries are still live — calling
-                    // new_local would shift local_count and corrupt the
-                    // temporary release logic.
-                    let scratch = self.allocator.allocate_temporary();
+                    // Destructuring: store value in a scratch local, then unpack.
+                    let scratch = self.allocator.new_local();
                     self.emit_ldar(val_reg);
                     self.emit_star(scratch);
                     self.compile_binding_pattern(pat, scratch, BindingMode::Assign)?;
-                    self.allocator
-                        .release_temporary(scratch)
-                        .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
             },
             ForInOfLeft::Expr(expr) => {
@@ -5691,15 +5677,6 @@ impl FunctionCompiler {
         self.loop_stack.pop();
         self.for_of_iter_regs.remove(&break_lbl);
         self.pop_scope();
-
-        // Release temporaries in reverse allocation order (val_reg was allocated
-        // after iter_reg, so it must be released first).
-        self.allocator
-            .release_temporary(val_reg)
-            .map_err(|e| StatorError::Internal(e.to_string()))?;
-        self.allocator
-            .release_temporary(iter_reg)
-            .map_err(|e| StatorError::Internal(e.to_string()))?;
 
         Ok(())
     }
@@ -10783,5 +10760,242 @@ mod tests {
     fn test_delete_non_reference_returns_true() {
         let result = crate::builtins::global::global_eval("delete 42").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Deep destructuring conformance tests ─────────────────────────────
+
+    // 1. Nested object destructuring
+    #[test]
+    fn test_nested_object_destructuring() {
+        let result = eval_to_value("var {a: {b}} = {a: {b: 1}}; b");
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_nested_object_destructuring_deep() {
+        let result = eval_to_value("var {a: {b: {c}}} = {a: {b: {c: 42}}}; c");
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    // 2. Nested array destructuring
+    #[test]
+    fn test_nested_array_destructuring() {
+        let result = eval_to_value("var [[a, b], [c]] = [[1, 2], [3]]; a + b + c");
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn test_nested_array_destructuring_deep() {
+        let result = eval_to_value("var [[[x]]] = [[[99]]]; x");
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    // 3. Mixed destructuring: object containing array
+    #[test]
+    fn test_mixed_destructuring_obj_array() {
+        let result = eval_to_value("var {a: [b, c]} = {a: [1, 2]}; b + c");
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // 3b. Mixed destructuring: array containing object
+    #[test]
+    fn test_mixed_destructuring_array_obj() {
+        let result = eval_to_value("var [{x}, {y}] = [{x: 10}, {y: 20}]; x + y");
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    // 4. Computed property in destructuring
+    #[test]
+    fn test_computed_property_destructuring() {
+        let result = eval_to_value(r#"var key = "x"; var {[key]: val} = {x: 42}; val"#);
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_computed_property_destructuring_number() {
+        let result = eval_to_value("var {[0]: first} = {0: 'hello'}; first");
+        assert_eq!(result, JsValue::String("hello".into()));
+    }
+
+    // 5. Default values in object destructuring
+    #[test]
+    fn test_default_value_object_missing_key() {
+        let result = eval_to_value("var {a = 1} = {}; a");
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_default_value_object_key_present() {
+        let result = eval_to_value("var {a = 1} = {a: 5}; a");
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    // 5b. Default values in array destructuring
+    #[test]
+    fn test_default_value_array_short() {
+        let result = eval_to_value("var [a = 1] = []; a");
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_default_value_array_present() {
+        let result = eval_to_value("var [a = 1] = [9]; a");
+        assert_eq!(result, JsValue::Smi(9));
+    }
+
+    // 6. Default with undefined (not null)
+    #[test]
+    fn test_default_triggers_on_undefined() {
+        let result = eval_to_value("var {a = 1} = {a: undefined}; a");
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_default_does_not_trigger_on_null() {
+        let result = eval_to_value("var {a = 1} = {a: null}; a");
+        assert_eq!(result, JsValue::Null);
+    }
+
+    #[test]
+    fn test_default_array_undefined_element() {
+        let result = eval_to_value("var [a = 10] = [undefined]; a");
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    // 7. Rest in object destructuring
+    #[test]
+    fn test_object_rest_destructuring() {
+        let result = eval_to_value("var {a, ...rest} = {a: 1, b: 2, c: 3}; rest.b + rest.c");
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_object_rest_excludes_extracted() {
+        let result = eval_to_value("var {a, ...rest} = {a: 1, b: 2, c: 3}; rest.a === undefined");
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // 7b. Rest in array destructuring
+    #[test]
+    fn test_array_rest_destructuring() {
+        let result = eval_to_value("var [a, ...rest] = [1, 2, 3]; rest[0] + rest[1]");
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    // 8. Destructuring in for-of
+    #[test]
+    fn test_for_of_object_destructuring_e2e() {
+        let result = eval_to_value(
+            "var sum = 0; for (var {x, y} of [{x:1,y:2},{x:3,y:4}]) sum += x + y; sum",
+        );
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_for_of_array_destructuring_e2e() {
+        let result =
+            eval_to_value("var sum = 0; for (var [a, b] of [[1,2],[3,4]]) sum += a + b; sum");
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_for_of_nested_destructuring() {
+        let result =
+            eval_to_value("var r = 0; for (var {a: {b}} of [{a:{b:10}},{a:{b:20}}]) r += b; r");
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    // 9. Destructuring function parameters
+    #[test]
+    fn test_function_param_object_destructuring_e2e() {
+        let result = eval_to_value("function f({a, b}) { return a + b; } f({a: 3, b: 7})");
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_function_param_array_destructuring_e2e() {
+        let result = eval_to_value("function f([a, b]) { return a * b; } f([3, 4])");
+        assert_eq!(result, JsValue::Smi(12));
+    }
+
+    #[test]
+    fn test_function_param_nested_destructuring() {
+        let result = eval_to_value("function f({a: [x, y]}) { return x + y; } f({a: [5, 6]})");
+        assert_eq!(result, JsValue::Smi(11));
+    }
+
+    #[test]
+    fn test_function_param_default_value() {
+        let result = eval_to_value("function f({a = 10}) { return a; } f({})");
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    // 10. Assignment destructuring (not declaration)
+    #[test]
+    fn test_assignment_destructuring_object() {
+        let result = eval_to_value("var a, b; ({a, b} = {a: 10, b: 20}); a + b");
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    #[test]
+    fn test_assignment_destructuring_array() {
+        let result = eval_to_value("var x, y; [x, y] = [100, 200]; x + y");
+        assert_eq!(result, JsValue::Smi(300));
+    }
+
+    #[test]
+    fn test_assignment_destructuring_nested() {
+        let result = eval_to_value("var a, b; ({a, b} = {a: {x: 1}, b: 2}); a.x + b");
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // Additional edge cases
+    #[test]
+    fn test_destructuring_with_rename_and_default() {
+        let result = eval_to_value("var {a: x = 5} = {}; x");
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_destructuring_with_rename_and_default_present() {
+        let result = eval_to_value("var {a: x = 5} = {a: 42}; x");
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_destructuring_let_binding() {
+        let result = eval_to_value("let {a, b} = {a: 1, b: 2}; a + b");
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_destructuring_const_binding() {
+        let result = eval_to_value("const [a, b] = [10, 20]; a + b");
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    #[test]
+    fn test_destructuring_swap() {
+        let result = eval_to_value("var a = 1, b = 2; [a, b] = [b, a]; a * 10 + b");
+        assert_eq!(result, JsValue::Smi(21));
+    }
+
+    #[test]
+    fn test_destructuring_skip_elements() {
+        let result = eval_to_value("var [,, third] = [1, 2, 3]; third");
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_destructuring_string_iterable() {
+        let result = eval_to_value(r#"var [a, b, c] = "xyz"; a + b + c"#);
+        assert_eq!(result, JsValue::String("xyz".into()));
+    }
+
+    #[test]
+    fn test_for_of_destructuring_with_let() {
+        let result =
+            eval_to_value("var sum = 0; for (let {v} of [{v:1},{v:2},{v:3}]) sum += v; sum");
+        assert_eq!(result, JsValue::Smi(6));
     }
 }
