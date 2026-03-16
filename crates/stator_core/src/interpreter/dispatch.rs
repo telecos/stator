@@ -5782,8 +5782,9 @@ fn handle_define_getter_property(
     if let JsValue::PlainObject(ref map) = obj {
         // Store getter as __get_<name>__ — the property access handler
         // checks for this convention when loading.
+        // Use insert_builtin to ensure the internal key is non-enumerable.
         map.borrow_mut()
-            .insert(format!("__get_{prop_name}__"), getter);
+            .insert_builtin(format!("__get_{prop_name}__"), getter);
     }
     Ok(DispatchAction::Continue)
 }
@@ -5811,7 +5812,7 @@ fn handle_define_setter_property(
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     if let JsValue::PlainObject(ref map) = obj {
         map.borrow_mut()
-            .insert(format!("__set_{prop_name}__"), setter);
+            .insert_builtin(format!("__set_{prop_name}__"), setter);
     }
     Ok(DispatchAction::Continue)
 }
@@ -5833,7 +5834,7 @@ fn handle_define_keyed_getter_property(
     let key_str = to_property_key(&key)?;
     if let JsValue::PlainObject(ref map) = obj {
         map.borrow_mut()
-            .insert(format!("__get_{key_str}__"), getter);
+            .insert_builtin(format!("__get_{key_str}__"), getter);
     }
     Ok(DispatchAction::Continue)
 }
@@ -5855,7 +5856,7 @@ fn handle_define_keyed_setter_property(
     let key_str = to_property_key(&key)?;
     if let JsValue::PlainObject(ref map) = obj {
         map.borrow_mut()
-            .insert(format!("__set_{key_str}__"), setter);
+            .insert_builtin(format!("__set_{key_str}__"), setter);
     }
     Ok(DispatchAction::Continue)
 }

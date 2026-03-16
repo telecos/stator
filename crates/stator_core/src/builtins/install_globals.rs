@@ -2637,6 +2637,16 @@ fn make_number() -> JsValue {
 
 /// Build the `Object` constructor/namespace object.
 #[inline(never)]
+/// Returns `true` for property‐map keys that are internal implementation
+/// details (`__proto__`, `__is_array__`, `__get_<name>__`, `__set_<name>__`)
+/// and should never be visible to user-land JavaScript code.
+fn is_internal_key(k: &str) -> bool {
+    k == "__proto__"
+        || k == "__is_array__"
+        || (k.starts_with("__get_") && k.ends_with("__"))
+        || (k.starts_with("__set_") && k.ends_with("__"))
+}
+
 fn make_object() -> JsValue {
     stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         let mut props = PropertyMap::new();
@@ -2686,7 +2696,7 @@ fn make_object() -> JsValue {
                     } else {
                         let keys: Vec<JsValue> = borrow
                             .enumerable_keys()
-                            .filter(|k| !k.starts_with("__"))
+                            .filter(|k| !is_internal_key(k))
                             .map(|k| JsValue::String(k.clone().into()))
                             .collect();
                         Ok(JsValue::new_array(keys))
@@ -2698,7 +2708,7 @@ fn make_object() -> JsValue {
                         .collect();
                     Ok(JsValue::new_array(keys))
                 } else if let JsValue::String(s) = val {
-                    let keys: Vec<JsValue> = (0..s.len())
+                    let keys: Vec<JsValue> = (0..s.chars().count())
                         .map(|i| JsValue::String(i.to_string().into()))
                         .collect();
                     Ok(JsValue::new_array(keys))
@@ -2731,13 +2741,19 @@ fn make_object() -> JsValue {
                     } else {
                         let values: Vec<JsValue> = borrow
                             .enumerable_keys()
-                            .filter(|k| !k.starts_with("__"))
+                            .filter(|k| !is_internal_key(k))
                             .filter_map(|k| borrow.get(k).cloned())
                             .collect();
                         Ok(JsValue::new_array(values))
                     }
                 } else if let JsValue::Array(items) = val {
                     let values = items.borrow().clone();
+                    Ok(JsValue::new_array(values))
+                } else if let JsValue::String(s) = val {
+                    let values: Vec<JsValue> = s
+                        .chars()
+                        .map(|ch| JsValue::String(ch.to_string().into()))
+                        .collect();
                     Ok(JsValue::new_array(values))
                 } else {
                     Ok(JsValue::new_array(vec![]))
@@ -2775,7 +2791,7 @@ fn make_object() -> JsValue {
                     } else {
                         let entries: Vec<JsValue> = borrow
                             .enumerable_keys()
-                            .filter(|k| !k.starts_with("__"))
+                            .filter(|k| !is_internal_key(k))
                             .filter_map(|k| {
                                 borrow.get(k).cloned().map(|v| {
                                     JsValue::new_array(vec![JsValue::String(k.clone().into()), v])
@@ -2797,19 +2813,21 @@ fn make_object() -> JsValue {
                         })
                         .collect();
                     Ok(JsValue::new_array(entries))
+                } else if let JsValue::String(s) = val {
+                    let entries: Vec<JsValue> = s
+                        .chars()
+                        .enumerate()
+                        .map(|(i, ch)| {
+                            JsValue::new_array(vec![
+                                JsValue::String(i.to_string().into()),
+                                JsValue::String(ch.to_string().into()),
+                            ])
+                        })
+                        .collect();
+                    Ok(JsValue::new_array(entries))
                 } else {
                     Ok(JsValue::new_array(vec![]))
                 }
-            }),
-        );
-
-        // ── Object.is(x, y) — SameValue comparison (ECMAScript §19.1.2.10) ──
-        props.insert(
-            "is".into(),
-            builtin_fn("is", 2, |args| {
-                let x = args.first().unwrap_or(&JsValue::Undefined);
-                let y = args.get(1).unwrap_or(&JsValue::Undefined);
-                Ok(JsValue::Boolean(x.same_value(y)))
             }),
         );
 
@@ -3171,7 +3189,7 @@ fn make_object() -> JsValue {
                         let entries: Vec<(String, JsValue)> = desc_map
                             .borrow()
                             .iter()
-                            .filter(|(k, _)| !k.starts_with("__"))
+                            .filter(|(k, _)| !is_internal_key(k))
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect();
                         for (key, desc_val) in &entries {
@@ -3206,7 +3224,7 @@ fn make_object() -> JsValue {
                         let keys: Vec<JsValue> = map
                             .borrow()
                             .keys()
-                            .filter(|k| !k.starts_with("__"))
+                            .filter(|k| !is_internal_key(k))
                             .map(|k| JsValue::String(k.clone().into()))
                             .collect();
                         Ok(JsValue::new_array(keys))
@@ -3224,7 +3242,7 @@ fn make_object() -> JsValue {
                         JsValue::String("name".into()),
                     ])),
                     JsValue::String(s) => {
-                        let mut keys: Vec<JsValue> = (0..s.len())
+                        let mut keys: Vec<JsValue> = (0..s.chars().count())
                             .map(|i| JsValue::String(i.to_string().into()))
                             .collect();
                         keys.push(JsValue::String("length".into()));
@@ -3247,6 +3265,9 @@ fn make_object() -> JsValue {
                             JsValue::PlainObject(src_map) => {
                                 let src = src_map.borrow();
                                 for k in src.enumerable_keys() {
+                                    if is_internal_key(k) {
+                                        continue;
+                                    }
                                     if let Some(v) = src.get(k) {
                                         target_map.borrow_mut().insert(k.clone(), v.clone());
                                     }
@@ -3354,7 +3375,7 @@ fn make_object() -> JsValue {
                     let entries: Vec<(String, JsValue)> = desc_obj
                         .borrow()
                         .iter()
-                        .filter(|(k, _)| !k.starts_with("__"))
+                        .filter(|(k, _)| !is_internal_key(k))
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
                     for (key, desc_val) in &entries {
@@ -3416,6 +3437,19 @@ fn make_object() -> JsValue {
             "fromEntries".into(),
             builtin_fn("fromEntries", 1, |args| {
                 let iterable = args.first().unwrap_or(&JsValue::Undefined);
+                // §20.1.2.6 step 1: require an iterable argument.
+                if matches!(
+                    iterable,
+                    JsValue::Null
+                        | JsValue::Undefined
+                        | JsValue::Boolean(_)
+                        | JsValue::Smi(_)
+                        | JsValue::HeapNumber(_)
+                ) {
+                    return Err(StatorError::TypeError(
+                        "Object.fromEntries requires an iterable argument".into(),
+                    ));
+                }
                 let mut result = PropertyMap::new();
 
                 let entries_to_process: Vec<JsValue> = match iterable {
@@ -3468,9 +3502,9 @@ fn make_object() -> JsValue {
                 let key = prop.to_js_string()?;
 
                 match obj {
-                    JsValue::PlainObject(map) => {
-                        Ok(JsValue::Boolean(map.borrow().contains_key(&key)))
-                    }
+                    JsValue::PlainObject(map) => Ok(JsValue::Boolean(
+                        map.borrow().contains_key(&key) && !is_internal_key(&key),
+                    )),
                     _ => Ok(JsValue::Boolean(false)),
                 }
             }),
@@ -3636,10 +3670,10 @@ fn make_object() -> JsValue {
                 if let JsValue::PlainObject(map) = obj {
                     let mut result = PropertyMap::new();
                     let borrow = map.borrow();
-                    // Collect visible property names first (skip dunder internals).
+                    // Collect visible property names first (skip internal keys).
                     let visible_keys: Vec<String> = borrow
                         .keys()
-                        .filter(|k| !k.starts_with("__"))
+                        .filter(|k| !is_internal_key(k))
                         .cloned()
                         .collect();
                     // Also collect accessor property names from __get_*__ / __set_*__
@@ -3753,7 +3787,7 @@ fn make_object() -> JsValue {
                 let prop = key.to_js_string()?;
                 match this {
                     JsValue::PlainObject(map) => {
-                        let has = map.borrow().contains_key(&prop) && prop != "__proto__";
+                        let has = map.borrow().contains_key(&prop) && !is_internal_key(&prop);
                         Ok(JsValue::Boolean(has))
                     }
                     _ => Ok(JsValue::Boolean(false)),
@@ -3798,7 +3832,7 @@ fn make_object() -> JsValue {
                 match this {
                     JsValue::PlainObject(map) => {
                         let borrow = map.borrow();
-                        let exists = borrow.contains_key(&prop) && prop != "__proto__";
+                        let exists = borrow.contains_key(&prop) && !is_internal_key(&prop);
                         let enumerable = exists && borrow.is_enumerable(&prop);
                         Ok(JsValue::Boolean(enumerable))
                     }
@@ -19633,5 +19667,186 @@ mod tests {
     fn e2e_regexp_tostring() {
         let result = global_eval("new RegExp('abc', 'gi').toString()").unwrap();
         assert_eq!(result, JsValue::String("/abc/gi".into()));
+    }
+
+    // ── Object static methods & property descriptor tests ───────────────────
+
+    /// `Object.values("abc")` → ["a", "b", "c"]
+    #[test]
+    fn e2e_object_values_string() {
+        let result = global_eval("Object.values('abc').length").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+        let result = global_eval("Object.values('abc')[0]").unwrap();
+        assert_eq!(result, JsValue::String("a".into()));
+    }
+
+    /// `Object.entries("ab")` → [["0","a"],["1","b"]]
+    #[test]
+    fn e2e_object_entries_string() {
+        let result = global_eval("Object.entries('ab').length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+        let result = global_eval("Object.entries('ab')[0][0]").unwrap();
+        assert_eq!(result, JsValue::String("0".into()));
+        let result = global_eval("Object.entries('ab')[0][1]").unwrap();
+        assert_eq!(result, JsValue::String("a".into()));
+    }
+
+    /// `Object.keys("ab")` → ["0","1"]
+    #[test]
+    fn e2e_object_keys_string_chars() {
+        let result = global_eval("Object.keys('ab').length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `Object.fromEntries(null)` throws TypeError
+    #[test]
+    fn e2e_object_from_entries_null_throws() {
+        let result = global_eval("Object.fromEntries(null)");
+        assert!(result.is_err());
+    }
+
+    /// `Object.fromEntries(undefined)` throws TypeError
+    #[test]
+    fn e2e_object_from_entries_undefined_throws() {
+        let result = global_eval("Object.fromEntries(undefined)");
+        assert!(result.is_err());
+    }
+
+    /// `Object.fromEntries(42)` throws TypeError
+    #[test]
+    fn e2e_object_from_entries_number_throws() {
+        let result = global_eval("Object.fromEntries(42)");
+        assert!(result.is_err());
+    }
+
+    /// `Object.fromEntries([["a",1]])` → {a: 1}
+    #[test]
+    fn e2e_object_from_entries_basic() {
+        let result = global_eval("Object.fromEntries([['a',1]]).a").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `Object.hasOwn({x:1}, "x")` → true
+    #[test]
+    fn e2e_object_has_own_basic() {
+        let result = global_eval("Object.hasOwn({x:1}, 'x')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.hasOwn({}, "__proto__")` → false (internal key hidden)
+    #[test]
+    fn e2e_object_has_own_proto_hidden() {
+        let result = global_eval("Object.hasOwn({}, '__proto__')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Object.is(NaN, NaN)` → true
+    #[test]
+    fn e2e_object_is_nan() {
+        let result = global_eval("Object.is(NaN, NaN)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.is(0, -0)` → false
+    #[test]
+    fn e2e_object_is_plus_minus_zero() {
+        let result = global_eval("Object.is(0, -0)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Object.keys({a:1,b:2})` returns own enumerable keys
+    #[test]
+    fn e2e_object_keys_basic() {
+        let result = global_eval("Object.keys({a:1,b:2}).length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `Object.values({a:1,b:2})` returns own enumerable values
+    #[test]
+    fn e2e_object_values_basic() {
+        let result = global_eval("Object.values({a:1,b:2}).length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `Object.entries({a:1})` returns [[key,value]] pairs
+    #[test]
+    fn e2e_object_entries_basic() {
+        let result = global_eval("Object.entries({a:1})[0][0]").unwrap();
+        assert_eq!(result, JsValue::String("a".into()));
+    }
+
+    /// `Object.assign({}, {a:1})` copies properties
+    #[test]
+    fn e2e_object_assign_basic() {
+        let result = global_eval("Object.assign({}, {a:1}).a").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `Object.freeze` makes object immutable
+    #[test]
+    fn e2e_object_freeze_is_frozen() {
+        let result = global_eval("var o = {x:1}; Object.freeze(o); Object.isFrozen(o)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.seal` prevents property addition/deletion
+    #[test]
+    fn e2e_object_seal_is_sealed() {
+        let result = global_eval("var o = {x:1}; Object.seal(o); Object.isSealed(o)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.getOwnPropertyDescriptor` returns descriptor object
+    #[test]
+    fn e2e_object_get_own_prop_desc() {
+        let result = global_eval("Object.getOwnPropertyDescriptor({a:1}, 'a').value").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `Object.defineProperty` defines property with descriptor
+    #[test]
+    fn e2e_object_define_property() {
+        let result = global_eval(
+            "var o = {}; Object.defineProperty(o, 'x', {value:42, writable:true}); o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `Object.create(null)` creates object with no prototype
+    #[test]
+    fn e2e_object_create_null() {
+        let result = global_eval("Object.getPrototypeOf(Object.create(null))").unwrap();
+        assert_eq!(result, JsValue::Null);
+    }
+
+    /// `Object.getPrototypeOf` / `Object.setPrototypeOf`
+    #[test]
+    fn e2e_object_proto_ops() {
+        let result =
+            global_eval("var p = {x:1}; var o = Object.create(p); Object.getPrototypeOf(o) === p")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.getOwnPropertyNames` includes non-enumerable props
+    #[test]
+    fn e2e_object_get_own_property_names() {
+        let result = global_eval("Object.getOwnPropertyNames({a:1,b:2}).length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `is_internal_key` helper correctly identifies internal keys
+    #[test]
+    fn test_is_internal_key() {
+        assert!(is_internal_key("__proto__"));
+        assert!(is_internal_key("__is_array__"));
+        assert!(is_internal_key("__get_foo__"));
+        assert!(is_internal_key("__set_bar__"));
+        // User keys starting with __ should NOT be internal
+        assert!(!is_internal_key("__test"));
+        assert!(!is_internal_key("__dirname"));
+        assert!(!is_internal_key("__filename"));
+        assert!(!is_internal_key("normal_key"));
     }
 }
