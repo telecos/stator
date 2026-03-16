@@ -1114,9 +1114,14 @@ fn js_value_to_json_inner(
             let keys = proxy_own_keys(&proxy.borrow())?;
             let mut entries: Vec<(String, JsonValue)> = Vec::new();
             for key in keys {
-                let val = proxy_get(&proxy.borrow(), &key)?;
+                let key_str = match &key {
+                    JsValue::String(s) => s.to_string(),
+                    JsValue::Smi(n) => n.to_string(),
+                    _ => continue,
+                };
+                let val = proxy_get(&proxy.borrow(), &key_str)?;
                 if let Some(jv) = js_value_to_json_inner(&val, seen)? {
-                    entries.push((key, jv));
+                    entries.push((key_str, jv));
                 }
             }
             seen.remove(&ptr);

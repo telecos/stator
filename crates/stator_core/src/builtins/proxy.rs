@@ -52,10 +52,10 @@ use crate::objects::value::JsValue;
 
 // ── Type aliases for trap closures ────────────────────────────────────────────
 
-/// Trap for `[[Get]](target, key)`.
-pub type GetTrap = Box<dyn Fn(&JsObject, &str) -> StatorResult<JsValue>>;
-/// Trap for `[[Set]](target, key, value)` → boolean.
-pub type SetTrap = Box<dyn Fn(&mut JsObject, &str, JsValue) -> StatorResult<bool>>;
+/// Trap for `[[Get]](target, key, receiver)`.
+pub type GetTrap = Box<dyn Fn(&JsObject, &str, &JsValue) -> StatorResult<JsValue>>;
+/// Trap for `[[Set]](target, key, value, receiver)` → boolean.
+pub type SetTrap = Box<dyn Fn(&mut JsObject, &str, JsValue, &JsValue) -> StatorResult<bool>>;
 /// Trap for `[[Has]](target, key)` → boolean.
 pub type HasTrap = Box<dyn Fn(&JsObject, &str) -> StatorResult<bool>>;
 /// Trap for `[[Delete]](target, key)` → boolean.
@@ -76,7 +76,7 @@ pub type IsExtensibleTrap = Box<dyn Fn(&JsObject) -> StatorResult<bool>>;
 /// Trap for `[[PreventExtensions]](target)` → boolean.
 pub type PreventExtensionsTrap = Box<dyn Fn(&mut JsObject) -> StatorResult<bool>>;
 /// Trap for `[[OwnPropertyKeys]](target)` → keys.
-pub type OwnKeysTrap = Box<dyn Fn(&JsObject) -> StatorResult<Vec<String>>>;
+pub type OwnKeysTrap = Box<dyn Fn(&JsObject) -> StatorResult<Vec<JsValue>>>;
 /// Trap for `[[Call]](thisArg, args)` → value.
 pub type ApplyTrap = Box<dyn Fn(JsValue, Vec<JsValue>) -> StatorResult<JsValue>>;
 /// Trap for `[[Construct]](args)` → object.
@@ -294,9 +294,18 @@ impl JsProxy {
 /// assert_eq!(proxy_get(&proxy, "x").unwrap(), JsValue::Smi(3));
 /// ```
 pub fn proxy_get(proxy: &JsProxy, key: &str) -> StatorResult<JsValue> {
+    proxy_get_with_receiver(proxy, key, &JsValue::Undefined)
+}
+
+/// ECMAScript §10.5.8 `[[Get]]` for Proxy with an explicit receiver.
+pub fn proxy_get_with_receiver(
+    proxy: &JsProxy,
+    key: &str,
+    receiver: &JsValue,
+) -> StatorResult<JsValue> {
     proxy.check_revoked()?;
     let trap_result = if let Some(trap) = &proxy.handler.get {
-        trap(&proxy.target, key)?
+        trap(&proxy.target, key, receiver)?
     } else {
         proxy.target.get_property(key)
     };
@@ -335,9 +344,19 @@ pub fn proxy_get(proxy: &JsProxy, key: &str) -> StatorResult<JsValue> {
 /// assert_eq!(proxy_get(&proxy, "y").unwrap(), JsValue::Smi(7));
 /// ```
 pub fn proxy_set(proxy: &mut JsProxy, key: &str, value: JsValue) -> StatorResult<bool> {
+    proxy_set_with_receiver(proxy, key, value, &JsValue::Undefined)
+}
+
+/// ECMAScript §10.5.9 `[[Set]]` for Proxy with an explicit receiver.
+pub fn proxy_set_with_receiver(
+    proxy: &mut JsProxy,
+    key: &str,
+    value: JsValue,
+    receiver: &JsValue,
+) -> StatorResult<bool> {
     proxy.check_revoked()?;
     if let Some(trap) = &proxy.handler.set {
-        let result = trap(&mut proxy.target, key, value.clone())?;
+        let result = trap(&mut proxy.target, key, value.clone(), receiver)?;
         // Invariant §10.5.9 step 11: if the target property is non-configurable
         // and non-writable, the trap must not successfully set a different value.
         if result
@@ -549,14 +568,32 @@ pub fn proxy_get_own_property_descriptor(
     };
     // Invariant §10.5.5 step 16: if the trap says undefined but the target has
     // a non-configurable property, that is a violation.
-    if result.is_none()
-        && let Some((_, attrs)) = proxy.target.get_own_property_descriptor(key)
-        && !attrs.contains(PropertyAttributes::CONFIGURABLE)
-    {
-        return Err(StatorError::TypeError(format!(
-            "Proxy getOwnPropertyDescriptor trap returned undefined \
-             for non-configurable property '{key}'"
-        )));
+    let target_desc = proxy.target.get_own_property_descriptor(key);
+    if result.is_none() {
+        if let Some((_, attrs)) = &target_desc
+            && (!attrs.contains(PropertyAttributes::CONFIGURABLE) || !proxy.target.is_extensible())
+        {
+            return Err(StatorError::TypeError(format!(
+                "Proxy getOwnPropertyDescriptor trap returned undefined \
+                 for incompatible property '{key}'"
+            )));
+        }
+    } else if let Some((_, trap_attrs)) = &result {
+        if let Some((_, target_attrs)) = target_desc {
+            if !target_attrs.contains(PropertyAttributes::CONFIGURABLE)
+                && trap_attrs.contains(PropertyAttributes::CONFIGURABLE)
+            {
+                return Err(StatorError::TypeError(format!(
+                    "Proxy getOwnPropertyDescriptor trap reported incompatible \
+                     descriptor for non-configurable property '{key}'"
+                )));
+            }
+        } else if !proxy.target.is_extensible() {
+            return Err(StatorError::TypeError(format!(
+                "Proxy getOwnPropertyDescriptor trap reported a new property \
+                 '{key}' on a non-extensible target"
+            )));
+        }
     }
     Ok(result)
 }
@@ -749,26 +786,46 @@ pub fn proxy_prevent_extensions(proxy: &mut JsProxy) -> StatorResult<bool> {
 /// let keys = proxy_own_keys(&proxy).unwrap();
 /// assert!(keys.contains(&"a".to_string()));
 /// ```
-pub fn proxy_own_keys(proxy: &JsProxy) -> StatorResult<Vec<String>> {
+pub fn proxy_own_keys(proxy: &JsProxy) -> StatorResult<Vec<JsValue>> {
     proxy.check_revoked()?;
     let result = if let Some(trap) = &proxy.handler.own_keys {
         trap(&proxy.target)?
     } else {
-        return Ok(proxy.target.own_property_keys());
+        return Ok(proxy
+            .target
+            .own_property_keys()
+            .into_iter()
+            .map(|key| JsValue::String(key.into()))
+            .collect());
     };
+
+    let normalize_key = |value: &JsValue| -> StatorResult<String> {
+        match value {
+            JsValue::String(s) => Ok(s.to_string()),
+            JsValue::Symbol(id) => Ok(crate::builtins::symbol::symbol_to_property_key(*id)),
+            _ => Err(StatorError::TypeError(
+                "Proxy ownKeys trap must return only strings or symbols".to_string(),
+            )),
+        }
+    };
+
+    let normalized_result: Vec<String> = result
+        .iter()
+        .map(normalize_key)
+        .collect::<StatorResult<Vec<_>>>()?;
     // Invariant §10.5.11 step 26/27: when target is non-extensible, result must
     // exactly cover all target own keys.
     if !proxy.target.is_extensible() {
         let target_keys = proxy.target.own_property_keys();
         for tk in &target_keys {
-            if !result.contains(tk) {
+            if !normalized_result.contains(tk) {
                 return Err(StatorError::TypeError(format!(
                     "Proxy ownKeys trap omitted existing own key '{tk}' \
                      on a non-extensible target"
                 )));
             }
         }
-        for rk in &result {
+        for rk in &normalized_result {
             if !target_keys.contains(rk) {
                 return Err(StatorError::TypeError(format!(
                     "Proxy ownKeys trap added extra key '{rk}' \
@@ -933,7 +990,7 @@ mod tests {
     #[test]
     fn test_proxy_get_trap_overrides() {
         let mut handler = ProxyHandler::default();
-        handler.get = Some(Box::new(|_t, _k| Ok(JsValue::Smi(99))));
+        handler.get = Some(Box::new(|_t, _k, _r| Ok(JsValue::Smi(99))));
         let proxy = proxy_new(JsObject::new(), handler);
         assert_eq!(proxy_get(&proxy, "anything").unwrap(), JsValue::Smi(99));
     }
@@ -947,7 +1004,7 @@ mod tests {
             .define_own_property("ro", JsValue::Smi(1), PropertyAttributes::empty())
             .unwrap();
         let mut handler = ProxyHandler::default();
-        handler.get = Some(Box::new(|_t, _k| Ok(JsValue::Smi(2))));
+        handler.get = Some(Box::new(|_t, _k, _r| Ok(JsValue::Smi(2))));
         let proxy = proxy_new(target, handler);
         assert!(matches!(
             proxy_get(&proxy, "ro"),
@@ -962,7 +1019,7 @@ mod tests {
             .define_own_property("ro", JsValue::Smi(1), PropertyAttributes::empty())
             .unwrap();
         let mut handler = ProxyHandler::default();
-        handler.get = Some(Box::new(|_t, _k| Ok(JsValue::Smi(1))));
+        handler.get = Some(Box::new(|_t, _k, _r| Ok(JsValue::Smi(1))));
         let proxy = proxy_new(target, handler);
         assert_eq!(proxy_get(&proxy, "ro").unwrap(), JsValue::Smi(1));
     }
@@ -979,7 +1036,7 @@ mod tests {
     #[test]
     fn test_proxy_set_trap_overrides() {
         let mut handler = ProxyHandler::default();
-        handler.set = Some(Box::new(|_t, _k, _v| Ok(false)));
+        handler.set = Some(Box::new(|_t, _k, _v, _r| Ok(false)));
         let mut proxy = proxy_new(JsObject::new(), handler);
         assert!(!proxy_set(&mut proxy, "z", JsValue::Smi(1)).unwrap());
     }
@@ -991,7 +1048,7 @@ mod tests {
             .define_own_property("ro", JsValue::Smi(1), PropertyAttributes::empty())
             .unwrap();
         let mut handler = ProxyHandler::default();
-        handler.set = Some(Box::new(|_t, _k, _v| Ok(true)));
+        handler.set = Some(Box::new(|_t, _k, _v, _r| Ok(true)));
         let mut proxy = proxy_new(target, handler);
         assert!(matches!(
             proxy_set(&mut proxy, "ro", JsValue::Smi(2)),
@@ -1006,7 +1063,7 @@ mod tests {
             .define_own_property("ro", JsValue::Smi(1), PropertyAttributes::empty())
             .unwrap();
         let mut handler = ProxyHandler::default();
-        handler.set = Some(Box::new(|_t, _k, _v| Ok(true)));
+        handler.set = Some(Box::new(|_t, _k, _v, _r| Ok(true)));
         let mut proxy = proxy_new(target, handler);
         assert!(proxy_set(&mut proxy, "ro", JsValue::Smi(1)).unwrap());
     }
@@ -1329,7 +1386,7 @@ mod tests {
         target.set_property("a", JsValue::Smi(1)).unwrap();
         let proxy = proxy_new(target, ProxyHandler::default());
         let keys = proxy_own_keys(&proxy).unwrap();
-        assert!(keys.contains(&"a".to_string()));
+        assert!(keys.contains(&JsValue::String("a".into())));
     }
 
     #[test]
@@ -1350,7 +1407,12 @@ mod tests {
         let mut target = target_with("a", JsValue::Smi(1));
         target.prevent_extensions();
         let mut handler = ProxyHandler::default();
-        handler.own_keys = Some(Box::new(|_t| Ok(vec!["a".to_string(), "b".to_string()])));
+        handler.own_keys = Some(Box::new(|_t| {
+            Ok(vec![
+                JsValue::String("a".into()),
+                JsValue::String("b".into()),
+            ])
+        }));
         let proxy = proxy_new(target, handler);
         assert!(matches!(
             proxy_own_keys(&proxy),

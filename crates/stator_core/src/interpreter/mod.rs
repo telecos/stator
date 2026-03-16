@@ -173,7 +173,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use crate::builtins::error::{pop_call_frame, push_call_frame};
-use crate::builtins::proxy::{proxy_get, proxy_set};
+use crate::builtins::proxy::{proxy_apply, proxy_get_with_receiver, proxy_set_with_receiver};
 use crate::builtins::symbol::symbol_description;
 use crate::bytecode::bytecode_array::{
     BytecodeArray, ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD,
@@ -4839,7 +4839,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
     }
     // Handle JsValue::Proxy — delegate to the proxy get trap.
     if let JsValue::Proxy(p) = obj {
-        return proxy_get(&p.borrow(), key).unwrap_or(JsValue::Undefined);
+        return proxy_get_with_receiver(&p.borrow(), key, obj).unwrap_or(JsValue::Undefined);
     }
     // Handle JsValue::Symbol — expose description, toString, valueOf.
     if let JsValue::Symbol(id) = obj {
@@ -5691,6 +5691,7 @@ pub fn dispatch_call_with_this(
                 Err(StatorError::TypeError("object is not a function".into()))
             }
         }
+        JsValue::Proxy(proxy) => proxy_apply(&mut proxy.borrow_mut(), this_val, args),
         _ => Err(StatorError::TypeError("value is not a function".into())),
     }
 }
@@ -5810,7 +5811,7 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
     match obj {
         JsValue::Proxy(p) => {
             let prop_name = to_property_key(key)?;
-            let _ = proxy_set(&mut p.borrow_mut(), &prop_name, value)?;
+            let _ = proxy_set_with_receiver(&mut p.borrow_mut(), &prop_name, value, obj)?;
         }
         JsValue::PlainObject(map) => {
             let prop_name = to_property_key(key)?;
