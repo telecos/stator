@@ -457,11 +457,25 @@ impl FunctionCompiler {
                 }
             },
             Pat::Object(obj_pat) => {
+                // Check whether we need to track excluded keys for a rest
+                // element (e.g. `{a, ...rest} = obj` → rest must omit `a`).
+                let has_rest = obj_pat
+                    .properties
+                    .iter()
+                    .any(|p| matches!(p, ObjectPatProp::Rest(_)));
+
+                // Accumulated excluded-key info for the rest element.
+                let mut excluded_static_keys: Vec<String> = Vec::new();
+                let mut excluded_computed_regs: Vec<Register> = Vec::new();
+
                 for prop in &obj_pat.properties {
                     match prop {
                         ObjectPatProp::KeyValue(kv) => {
                             match &kv.key {
                                 crate::parser::ast::PropKey::Ident(id) => {
+                                    if has_rest {
+                                        excluded_static_keys.push(id.name.clone());
+                                    }
                                     let name_idx = self.add_string(&id.name);
                                     let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
                                     self.emit(Instruction::new_unchecked(
@@ -474,6 +488,9 @@ impl FunctionCompiler {
                                     ));
                                 }
                                 crate::parser::ast::PropKey::Str(s) => {
+                                    if has_rest {
+                                        excluded_static_keys.push(s.value.clone());
+                                    }
                                     let name_idx = self.add_string(&s.value);
                                     let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
                                     self.emit(Instruction::new_unchecked(
@@ -486,6 +503,9 @@ impl FunctionCompiler {
                                     ));
                                 }
                                 crate::parser::ast::PropKey::Num(n) => {
+                                    if has_rest {
+                                        excluded_static_keys.push(n.value.to_string());
+                                    }
                                     let name_idx = self.add_string(&n.value.to_string());
                                     let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
                                     self.emit(Instruction::new_unchecked(
@@ -499,6 +519,13 @@ impl FunctionCompiler {
                                 }
                                 crate::parser::ast::PropKey::Computed(expr) => {
                                     self.compile_expr(expr)?;
+                                    if has_rest {
+                                        // Save the computed key so we can
+                                        // exclude it from the rest object.
+                                        let key_reg = self.allocator.new_local();
+                                        self.emit_star(key_reg);
+                                        excluded_computed_regs.push(key_reg);
+                                    }
                                     let slot = self.alloc_slot(FeedbackSlotKind::KeyedLoadProperty);
                                     self.emit(Instruction::new_unchecked(
                                         Opcode::LdaKeyedProperty,
@@ -506,6 +533,9 @@ impl FunctionCompiler {
                                     ));
                                 }
                                 crate::parser::ast::PropKey::Private(id) => {
+                                    if has_rest {
+                                        excluded_static_keys.push(format!("#{}", id.name));
+                                    }
                                     let name_idx = self.add_string(&format!("#{}", id.name));
                                     let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
                                     self.emit(Instruction::new_unchecked(
@@ -523,6 +553,9 @@ impl FunctionCompiler {
                             self.compile_binding_pattern(&kv.value, scratch, mode)?;
                         }
                         ObjectPatProp::Assign(assign_prop) => {
+                            if has_rest {
+                                excluded_static_keys.push(assign_prop.key.name.clone());
+                            }
                             let name_idx = self.add_string(&assign_prop.key.name);
                             let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
                             self.emit(Instruction::new_unchecked(
@@ -566,9 +599,9 @@ impl FunctionCompiler {
                             }
                         }
                         ObjectPatProp::Rest(rest) => {
-                            // Create a new object, copy all source properties, then
-                            // bind to the rest pattern.  (Simplified — does not
-                            // exclude already-destructured keys.)
+                            // Create a new object, copy all source properties,
+                            // then remove the already-destructured keys so the
+                            // rest object only contains the remaining ones.
                             self.emit(Instruction::new_unchecked(
                                 Opcode::CreateEmptyObjectLiteral,
                                 vec![],
@@ -579,6 +612,29 @@ impl FunctionCompiler {
                                 Opcode::CopyDataProperties,
                                 vec![to_reg_op(rest_reg), to_reg_op(source_reg)],
                             ));
+
+                            // Delete static keys that were already extracted.
+                            for key in &excluded_static_keys {
+                                let key_idx = self.add_string(key);
+                                self.emit(Instruction::new_unchecked(
+                                    Opcode::LdaConstant,
+                                    vec![Operand::ConstantPoolIdx(key_idx)],
+                                ));
+                                self.emit(Instruction::new_unchecked(
+                                    Opcode::DeletePropertySloppy,
+                                    vec![to_reg_op(rest_reg)],
+                                ));
+                            }
+
+                            // Delete computed keys saved in registers.
+                            for &key_reg in &excluded_computed_regs {
+                                self.emit_ldar(key_reg);
+                                self.emit(Instruction::new_unchecked(
+                                    Opcode::DeletePropertySloppy,
+                                    vec![to_reg_op(rest_reg)],
+                                ));
+                            }
+
                             self.compile_binding_pattern(&rest.argument, rest_reg, mode)?;
                         }
                     }
