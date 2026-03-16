@@ -2539,7 +2539,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             drop(borrow);
             return match dispatch_getter(&getter, obj) {
                 Ok(v) => v,
-                Err(_) => JsValue::Undefined,
+                Err(err) => {
+                    capture_accessor_error(err);
+                    JsValue::Undefined
+                }
             };
         }
         if let Some(val) = borrow.get(key) {
@@ -5380,7 +5383,10 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
                 drop(borrow);
                 return match dispatch_getter(&getter, this_obj) {
                     Ok(v) => v,
-                    Err(_) => JsValue::Undefined,
+                    Err(err) => {
+                        capture_accessor_error(err);
+                        JsValue::Undefined
+                    }
                 };
             }
             if let Some(val) = borrow.get(key) {
@@ -5459,6 +5465,15 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
     JsValue::Undefined
 }
 
+fn capture_accessor_error(err: StatorError) {
+    if matches!(err, StatorError::JsException(_)) {
+        return;
+    }
+    if let Some(val) = stator_error_to_js_value(&err) {
+        set_pending_exception(val);
+    }
+}
+
 /// Invoke a getter accessor function.
 ///
 /// The getter may be a `JsValue::Function` (bytecode) or
@@ -5478,6 +5493,31 @@ fn dispatch_getter(getter: &JsValue, this: &JsValue) -> StatorResult<JsValue> {
     }
 }
 
+pub(super) fn lookup_inherited_accessor(obj: &JsValue, key: &str) -> Option<(JsValue, JsValue)> {
+    let mut current = get_object_prototype(obj);
+    for _ in 0..256 {
+        let JsValue::PlainObject(map) = current? else {
+            return None;
+        };
+        let borrow = map.borrow();
+        let getter_key = format!("__get_{key}__");
+        let setter_key = format!("__set_{key}__");
+        let getter = borrow.get(&getter_key).cloned();
+        let setter = borrow.get(&setter_key).cloned();
+        if getter.is_some() || setter.is_some() {
+            return Some((
+                getter.unwrap_or(JsValue::Undefined),
+                setter.unwrap_or(JsValue::Undefined),
+            ));
+        }
+        if borrow.contains_key(key) {
+            return None;
+        }
+        current = borrow.get("__proto__").cloned();
+    }
+    None
+}
+
 /// Invoke a setter accessor function with the given value.
 pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) -> StatorResult<()> {
     match setter {
@@ -5491,7 +5531,7 @@ pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) ->
             Ok(())
         }
         JsValue::NativeFunction(f) => {
-            f(vec![val])?;
+            f(vec![this.clone(), val])?;
             Ok(())
         }
         _ => Ok(()),
@@ -5638,11 +5678,19 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
     match obj {
         JsValue::Proxy(_) => {
             let prop_name = to_property_key(key)?;
-            Ok(proto_lookup(obj, &prop_name))
+            let value = proto_lookup(obj, &prop_name);
+            if let Some(thrown) = take_pending_exception() {
+                return Err(StatorError::JsException(error_message_from_value(&thrown)));
+            }
+            Ok(value)
         }
         JsValue::PlainObject(_map) => {
             let prop_name = to_property_key(key)?;
-            Ok(proto_lookup(obj, &prop_name))
+            let value = proto_lookup(obj, &prop_name);
+            if let Some(thrown) = take_pending_exception() {
+                return Err(StatorError::JsException(error_message_from_value(&thrown)));
+            }
+            Ok(value)
         }
         JsValue::Array(items) => {
             // "length" property
@@ -5661,7 +5709,11 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
             }
             // Named property — delegate to proto_lookup for method access.
             let prop_name = to_property_key(key)?;
-            Ok(proto_lookup(obj, &prop_name))
+            let value = proto_lookup(obj, &prop_name);
+            if let Some(thrown) = take_pending_exception() {
+                return Err(StatorError::JsException(error_message_from_value(&thrown)));
+            }
+            Ok(value)
         }
         JsValue::String(_) => {
             // "length" property
@@ -5684,12 +5736,20 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
             }
             // Named property — delegate to proto_lookup for method access.
             let prop_name = to_property_key(key)?;
-            Ok(proto_lookup(obj, &prop_name))
+            let value = proto_lookup(obj, &prop_name);
+            if let Some(thrown) = take_pending_exception() {
+                return Err(StatorError::JsException(error_message_from_value(&thrown)));
+            }
+            Ok(value)
         }
         _ => {
             // For any other type, try proto_lookup for method access.
             let prop_name = to_property_key(key)?;
-            Ok(proto_lookup(obj, &prop_name))
+            let value = proto_lookup(obj, &prop_name);
+            if let Some(thrown) = take_pending_exception() {
+                return Err(StatorError::JsException(error_message_from_value(&thrown)));
+            }
+            Ok(value)
         }
     }
 }
@@ -5733,6 +5793,17 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
                 }
                 if has_getter {
                     // Getter-only accessor: silently ignore store (sloppy).
+                    return Ok(());
+                }
+            }
+            if !map.borrow().contains_key(&prop_name)
+                && let Some((getter, setter)) = lookup_inherited_accessor(obj, &prop_name)
+            {
+                if !matches!(setter, JsValue::Undefined) {
+                    dispatch_setter(&setter, obj, value)?;
+                    return Ok(());
+                }
+                if !matches!(getter, JsValue::Undefined) {
                     return Ok(());
                 }
             }

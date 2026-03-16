@@ -19,11 +19,11 @@ use super::{
     constant_pool_jump_delta, constant_to_value, decode_string_constant, dispatch_call_property,
     dispatch_call_value, dispatch_call_with_this, dispatch_setter, err_bad_operand,
     error_message_from_value, extract_context, find_handler, fn_props_set, has_prototype_in_chain,
-    is_js_receiver, js_add, js_less_than, keyed_load, keyed_store, maybe_compile_baseline,
-    maybe_compile_maglev, maybe_compile_turbofan, number_to_jsvalue, plain_object_to_array_items,
-    proto_lookup, resolve_jump, restore_closure_context, set_pending_exception, strict_eq,
-    to_array_index, to_bigint, to_property_key, try_execute_best_jit, walk_context_chain,
-    wire_construct_prototype,
+    is_js_receiver, js_add, js_less_than, keyed_load, keyed_store, lookup_inherited_accessor,
+    maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, number_to_jsvalue,
+    plain_object_to_array_items, proto_lookup, resolve_jump, restore_closure_context,
+    set_pending_exception, strict_eq, take_pending_exception, to_array_index, to_bigint,
+    to_property_key, try_execute_best_jit, walk_context_chain, wire_construct_prototype,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{proxy_delete_property, proxy_has, proxy_set};
@@ -2691,6 +2691,9 @@ fn handle_lda_named_property(
         )));
     }
     let result = proto_lookup(&obj, &prop_name);
+    if let Some(thrown) = take_pending_exception() {
+        return Err(StatorError::JsException(error_message_from_value(&thrown)));
+    }
     // ── Populate shape IC for own-property hits on PlainObject ───────────
     // Skip caching when the property has an accessor (__get_<key>__)
     // because the IC fast-path would return the placeholder data value
@@ -2820,6 +2823,22 @@ fn handle_sta_named_property(
                     )));
                 }
                 return Ok(DispatchAction::Continue);
+            }
+            if !map.borrow().contains_key(prop_name.as_ref())
+                && let Some((getter, setter)) = lookup_inherited_accessor(&obj, &prop_name)
+            {
+                if !matches!(setter, JsValue::Undefined) {
+                    dispatch_setter(&setter, &obj, val)?;
+                    return Ok(DispatchAction::Continue);
+                }
+                if !matches!(getter, JsValue::Undefined) {
+                    if ctx.frame.bytecode_array.is_strict() {
+                        return Err(StatorError::TypeError(format!(
+                            "Cannot set property {prop_name} which has only a getter"
+                        )));
+                    }
+                    return Ok(DispatchAction::Continue);
+                }
             }
             let pm = map.borrow();
             // Existing non-writable property: TypeError in strict mode, silently ignore in sloppy.
