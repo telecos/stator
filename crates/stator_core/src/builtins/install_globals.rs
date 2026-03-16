@@ -1608,7 +1608,7 @@ fn make_console() -> JsValue {
 
     props.insert(
         "log".into(),
-        native(|args: Vec<JsValue>| {
+        builtin_fn("log", 0, |args: Vec<JsValue>| {
             let parts: Vec<String> = args.iter().map(|a| a.to_display_string()).collect();
             println!("{}", parts.join(" "));
             Ok(JsValue::Undefined)
@@ -1616,7 +1616,7 @@ fn make_console() -> JsValue {
     );
     props.insert(
         "warn".into(),
-        native(|args: Vec<JsValue>| {
+        builtin_fn("warn", 0, |args: Vec<JsValue>| {
             let parts: Vec<String> = args.iter().map(|a| a.to_display_string()).collect();
             eprintln!("{}", parts.join(" "));
             Ok(JsValue::Undefined)
@@ -1624,7 +1624,7 @@ fn make_console() -> JsValue {
     );
     props.insert(
         "error".into(),
-        native(|args: Vec<JsValue>| {
+        builtin_fn("error", 0, |args: Vec<JsValue>| {
             let parts: Vec<String> = args.iter().map(|a| a.to_display_string()).collect();
             eprintln!("{}", parts.join(" "));
             Ok(JsValue::Undefined)
@@ -1632,7 +1632,7 @@ fn make_console() -> JsValue {
     );
     props.insert(
         "info".into(),
-        native(|args: Vec<JsValue>| {
+        builtin_fn("info", 0, |args: Vec<JsValue>| {
             let parts: Vec<String> = args.iter().map(|a| a.to_display_string()).collect();
             println!("{}", parts.join(" "));
             Ok(JsValue::Undefined)
@@ -2919,7 +2919,7 @@ fn make_number() -> JsValue {
         // Number.isNaN — does NOT coerce (unlike global isNaN)
         props.insert(
             "isNaN".into(),
-            native(|args| {
+            builtin_fn("isNaN", 1, |args| {
                 let val = args.first().unwrap_or(&JsValue::Undefined);
                 let result = match val {
                     JsValue::HeapNumber(n) => n.is_nan(),
@@ -2931,7 +2931,7 @@ fn make_number() -> JsValue {
         // Number.isFinite — does NOT coerce
         props.insert(
             "isFinite".into(),
-            native(|args| {
+            builtin_fn("isFinite", 1, |args| {
                 let val = args.first().unwrap_or(&JsValue::Undefined);
                 let result = match val {
                     JsValue::Smi(_) => true,
@@ -2972,7 +2972,7 @@ fn make_number() -> JsValue {
         // Number.parseInt
         props.insert(
             "parseInt".into(),
-            native(|args| {
+            builtin_fn("parseInt", 2, |args| {
                 let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                 let radix = if args.len() > 1 {
                     let r = args[1].to_number()?;
@@ -2990,7 +2990,7 @@ fn make_number() -> JsValue {
         // Number.parseFloat
         props.insert(
             "parseFloat".into(),
-            native(|args| {
+            builtin_fn("parseFloat", 1, |args| {
                 let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                 Ok(num(global_parse_float(&s)))
             }),
@@ -4717,7 +4717,7 @@ fn make_object() -> JsValue {
         // ECMAScript §20.1.3.6 — returns "[object X]" classification.
         obj_proto.insert(
             "toString".into(),
-            native(|args| {
+            builtin_fn("toString", 0, |args| {
                 // When called via .call(value), args[0] is the value.
                 if let Some(value) = args.first() {
                     return Ok(JsValue::String(value.obj_to_string_tag().into()));
@@ -12737,7 +12737,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         // ── Global functions ────────────────────────────────────────────────
         globals.insert(
             "parseInt".into(),
-            native(|args| {
+            builtin_fn("parseInt", 2, |args| {
                 let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                 let radix = if args.len() > 1 {
                     let r = args[1].to_number()?;
@@ -12754,49 +12754,49 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         );
         globals.insert(
             "parseFloat".into(),
-            native(|args| {
+            builtin_fn("parseFloat", 1, |args| {
                 let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                 Ok(num(global_parse_float(&s)))
             }),
         );
         globals.insert(
             "isNaN".into(),
-            native(|args| {
+            builtin_fn("isNaN", 1, |args| {
                 let n = args.first().unwrap_or(&JsValue::Undefined).to_number()?;
                 Ok(JsValue::Boolean(global_is_nan(n)))
             }),
         );
         globals.insert(
             "isFinite".into(),
-            native(|args| {
+            builtin_fn("isFinite", 1, |args| {
                 let n = args.first().unwrap_or(&JsValue::Undefined).to_number()?;
                 Ok(JsValue::Boolean(global_is_finite(n)))
             }),
         );
         globals.insert(
             "encodeURI".into(),
-            native(|args| {
+            builtin_fn("encodeURI", 1, |args| {
                 let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                 Ok(JsValue::String(global_encode_uri(&s).into()))
             }),
         );
         globals.insert(
             "decodeURI".into(),
-            native(|args| {
+            builtin_fn("decodeURI", 1, |args| {
                 let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                 Ok(JsValue::String(global_decode_uri(&s)?.into()))
             }),
         );
         globals.insert(
             "encodeURIComponent".into(),
-            native(|args| {
+            builtin_fn("encodeURIComponent", 1, |args| {
                 let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                 Ok(JsValue::String(global_encode_uri_component(&s).into()))
             }),
         );
         globals.insert(
             "decodeURIComponent".into(),
-            native(|args| {
+            builtin_fn("decodeURIComponent", 1, |args| {
                 let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                 Ok(JsValue::String(global_decode_uri_component(&s)?.into()))
             }),
@@ -12954,10 +12954,14 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             inner_props.insert(k.clone(), v.clone());
         }
         let inner = Rc::new(RefCell::new(inner_props));
-        inner
-            .borrow_mut()
-            .insert("globalThis".into(), JsValue::PlainObject(Rc::clone(&inner)));
-        globals.insert("globalThis".into(), JsValue::PlainObject(inner));
+        let global_object = JsValue::PlainObject(Rc::clone(&inner));
+        {
+            let mut inner_borrow = inner.borrow_mut();
+            inner_borrow.insert("globalThis".into(), global_object.clone());
+            inner_borrow.insert("this".into(), global_object.clone());
+        }
+        globals.insert("globalThis".into(), global_object.clone());
+        globals.insert("this".into(), global_object);
     });
 }
 
@@ -15129,6 +15133,181 @@ mod tests {
         } else {
             panic!("globalThis should be a PlainObject");
         }
+    }
+
+    #[test]
+    fn e2e_global_this_matches_top_level_this() {
+        let result = global_eval("globalThis === this").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_global_this_sees_declared_global_binding() {
+        let result =
+            global_eval("var conformanceGlobal = 9; globalThis.conformanceGlobal").unwrap();
+        assert_eq!(result, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn e2e_global_binding_sees_global_this_assignment() {
+        let result =
+            global_eval("globalThis.conformanceAssigned = 7; conformanceAssigned").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_global_this_reuses_global_function_identity() {
+        let result = global_eval("globalThis.parseInt === parseInt").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_global_is_nan_coerces_strings() {
+        let result = global_eval("isNaN('wat')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_number_is_nan_does_not_coerce_strings() {
+        let result = global_eval("Number.isNaN('wat')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_global_is_finite_coerces_strings() {
+        let result = global_eval("isFinite('42')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_number_is_finite_does_not_coerce_strings() {
+        let result = global_eval("Number.isFinite('42')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_parse_int_trims_leading_whitespace() {
+        let result = global_eval("parseInt('   42')").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_parse_int_honors_radix() {
+        let result = global_eval("parseInt('11', 2)").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_parse_int_stops_at_invalid_suffix() {
+        let result = global_eval("parseInt('15px', 10)").unwrap();
+        assert_eq!(result, JsValue::Smi(15));
+    }
+
+    #[test]
+    fn e2e_parse_float_trims_leading_whitespace() {
+        let result = global_eval("parseFloat('  -3.5')").unwrap();
+        assert_eq!(result, JsValue::HeapNumber(-3.5));
+    }
+
+    #[test]
+    fn e2e_parse_float_stops_at_invalid_suffix() {
+        let result = global_eval("parseFloat('3.14xyz')").unwrap();
+        assert_eq!(result, JsValue::HeapNumber(3.14));
+    }
+
+    #[test]
+    fn e2e_encode_uri_preserves_reserved_delimiters() {
+        let result = global_eval("encodeURI('https://example.com/a b?x=1&y=2#hash')").unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("https://example.com/a%20b?x=1&y=2#hash".into())
+        );
+    }
+
+    #[test]
+    fn e2e_encode_uri_component_encodes_reserved_delimiters() {
+        let result = global_eval("encodeURIComponent('a b?x=1&y=2')").unwrap();
+        assert_eq!(result, JsValue::String("a%20b%3Fx%3D1%26y%3D2".into()));
+    }
+
+    #[test]
+    fn e2e_decode_uri_decodes_basic_sequences() {
+        let result = global_eval("decodeURI('hello%20world')").unwrap();
+        assert_eq!(result, JsValue::String("hello world".into()));
+    }
+
+    #[test]
+    fn e2e_decode_uri_component_decodes_reserved_sequences() {
+        let result = global_eval("decodeURIComponent('a%3Db%26c%3Dd')").unwrap();
+        assert_eq!(result, JsValue::String("a=b&c=d".into()));
+    }
+
+    #[test]
+    fn e2e_decode_uri_throws_uri_error_on_invalid_input() {
+        let result =
+            global_eval("try { decodeURI('%E0%A4%A'); 'no'; } catch (e) { e.name; }").unwrap();
+        assert_eq!(result, JsValue::String("URIError".into()));
+    }
+
+    #[test]
+    fn e2e_decode_uri_component_throws_uri_error_on_invalid_input() {
+        let result =
+            global_eval("try { decodeURIComponent('%GG'); 'no'; } catch (e) { e.name; }").unwrap();
+        assert_eq!(result, JsValue::String("URIError".into()));
+    }
+
+    #[test]
+    fn e2e_object_to_string_uses_symbol_to_string_tag() {
+        let result =
+            global_eval("var tagged = { [Symbol.toStringTag]: 'Tagged' }; Object.prototype.toString.call(tagged)")
+                .unwrap();
+        assert_eq!(result, JsValue::String("[object Tagged]".into()));
+    }
+
+    #[test]
+    fn e2e_error_stack_is_string() {
+        let result = global_eval("typeof new Error('boom').stack").unwrap();
+        assert_eq!(result, JsValue::String("string".into()));
+    }
+
+    #[test]
+    fn e2e_console_log_does_not_throw() {
+        let result = global_eval("try { console.log('ok'); true; } catch (e) { false; }").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_parse_int_builtin_name_and_length() {
+        let result = global_eval("parseInt.name + ':' + parseInt.length").unwrap();
+        assert_eq!(result, JsValue::String("parseInt:2".into()));
+    }
+
+    #[test]
+    fn e2e_number_is_nan_builtin_name_and_length() {
+        let result = global_eval("Number.isNaN.name + ':' + Number.isNaN.length").unwrap();
+        assert_eq!(result, JsValue::String("isNaN:1".into()));
+    }
+
+    #[test]
+    fn e2e_object_to_string_builtin_name_and_length() {
+        let result =
+            global_eval("Object.prototype.toString.name + ':' + Object.prototype.toString.length")
+                .unwrap();
+        assert_eq!(result, JsValue::String("toString:0".into()));
+    }
+
+    #[test]
+    fn e2e_error_to_string_builtin_name_and_length() {
+        let result =
+            global_eval("Error.prototype.toString.name + ':' + Error.prototype.toString.length")
+                .unwrap();
+        assert_eq!(result, JsValue::String("toString:0".into()));
+    }
+
+    #[test]
+    fn e2e_console_log_builtin_name_and_length() {
+        let result = global_eval("console.log.name + ':' + console.log.length").unwrap();
+        assert_eq!(result, JsValue::String("log:0".into()));
     }
 
     // ── Map constructor tests ────────────────────────────────────────────────
