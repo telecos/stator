@@ -129,7 +129,7 @@ pub fn global_is_finite(value: f64) -> bool {
 /// assert!(global_parse_int("xyz", 10).is_nan());
 /// assert!(global_parse_int("", 10).is_nan());
 /// ```
-pub fn global_parse_int(string: &str, radix: u32) -> f64 {
+pub fn global_parse_int(string: &str, radix: i32) -> f64 {
     number_parse_int(string, radix)
 }
 

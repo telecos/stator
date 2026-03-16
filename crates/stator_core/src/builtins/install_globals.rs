@@ -3903,7 +3903,7 @@ fn make_number() -> JsValue {
                     if r.is_nan() || r == 0.0 {
                         0
                     } else {
-                        r.floor() as u32
+                        r.floor() as i32
                     }
                 } else {
                     0
@@ -13743,7 +13743,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
                     if r.is_nan() || r == 0.0 {
                         0
                     } else {
-                        r.floor() as u32
+                        r.floor() as i32
                     }
                 } else {
                     0

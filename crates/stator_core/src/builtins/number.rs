@@ -14,7 +14,10 @@
 //!
 //! * ECMAScript 2025 Language Specification §21.1 — *The Number Constructor*
 
+use num_bigint::BigUint;
+
 use crate::error::{StatorError, StatorResult};
+use crate::objects::value::number_to_string;
 
 // ── Constants (ECMAScript §21.1.2) ────────────────────────────────────────────
 
@@ -145,8 +148,8 @@ pub fn number_is_safe_integer(value: f64) -> bool {
 /// assert_eq!(number_parse_int("10", 2), 2.0);
 /// assert!(number_parse_int("xyz", 10).is_nan());
 /// ```
-pub fn number_parse_int(string: &str, radix: u32) -> f64 {
-    let s = string.trim();
+pub fn number_parse_int(string: &str, radix: i32) -> f64 {
+    let s = string.trim_start();
     if s.is_empty() {
         return f64::NAN;
     }
@@ -173,7 +176,7 @@ pub fn number_parse_int(string: &str, radix: u32) -> f64 {
         } else if !(2..=36).contains(&radix) {
             return f64::NAN;
         } else {
-            (radix, s)
+            (radix as u32, s)
         };
 
     // Consume the longest valid prefix.
@@ -187,13 +190,11 @@ pub fn number_parse_int(string: &str, radix: u32) -> f64 {
     }
 
     // Parse using u64 to cover the full safe-integer range, then convert.
-    match u64::from_str_radix(&valid, effective_radix) {
-        Ok(n) => {
-            let f = n as f64;
-            if negative { -f } else { f }
-        }
-        Err(_) => f64::NAN,
-    }
+    let parsed = u64::from_str_radix(&valid, effective_radix)
+        .map(|n| n as f64)
+        .unwrap_or_else(|_| parse_int_digits(&valid, effective_radix));
+
+    if negative { -parsed } else { parsed }
 }
 
 /// ECMAScript §21.1.2.7 `Number.parseFloat(string)`.
@@ -321,9 +322,62 @@ pub fn number_to_fixed(value: f64, digits: u32) -> StatorResult<String> {
     }
     // Per spec §21.1.3.3: values >= 1e21 return ToString(value).
     if value.abs() >= 1e21 {
-        return Ok(format!("{value}"));
+        return Ok(number_to_string(value));
     }
-    Ok(format!("{:.prec$}", value, prec = digits as usize))
+    let rounded = round_to_fixed_integer(value.abs(), digits);
+    let magnitude = format_fixed_digits(rounded, digits);
+    if value.is_sign_negative() && value != 0.0 {
+        Ok(format!("-{magnitude}"))
+    } else {
+        Ok(magnitude)
+    }
+}
+
+fn parse_int_digits(digits: &str, radix: u32) -> f64 {
+    let base = f64::from(radix);
+    digits
+        .chars()
+        .try_fold(0.0_f64, |acc, ch| {
+            let digit = ch.to_digit(radix)?;
+            Some(acc.mul_add(base, f64::from(digit)))
+        })
+        .unwrap_or(f64::NAN)
+}
+
+fn round_to_fixed_integer(value: f64, digits: u32) -> BigUint {
+    let bits = value.to_bits();
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
+    let fraction_bits = bits & ((1_u64 << 52) - 1);
+    let (mantissa, exponent) = if exponent_bits == 0 {
+        (fraction_bits, -1074)
+    } else {
+        ((1_u64 << 52) | fraction_bits, exponent_bits - 1075)
+    };
+
+    let scaled_numerator = BigUint::from(mantissa) * BigUint::from(5_u8).pow(digits);
+    let binary_shift = exponent + digits as i32;
+    if binary_shift >= 0 {
+        scaled_numerator << binary_shift as usize
+    } else {
+        let denominator = BigUint::from(1_u8) << (-binary_shift as usize);
+        ((&scaled_numerator << 1) + &denominator) / (denominator << 1)
+    }
+}
+
+fn format_fixed_digits(integer: BigUint, digits: u32) -> String {
+    let mut text = integer.to_str_radix(10);
+    if digits == 0 {
+        return text;
+    }
+
+    let fraction_len = digits as usize;
+    if text.len() <= fraction_len {
+        let padding = "0".repeat(fraction_len + 1 - text.len());
+        text = format!("{padding}{text}");
+    }
+    let split = text.len() - fraction_len;
+    text.insert(split, '.');
+    text
 }
 
 // ── Number.prototype.toPrecision ──────────────────────────────────────────────
@@ -694,6 +748,19 @@ mod tests {
         assert_eq!(number_parse_int("12abc", 10), 12.0);
     }
 
+    #[test]
+    fn test_parse_int_invalid_radix() {
+        assert!(number_parse_int("10", 1).is_nan());
+        assert!(number_parse_int("10", 37).is_nan());
+    }
+
+    #[test]
+    fn test_parse_int_default_radix_cases() {
+        assert_eq!(number_parse_int("10", 0), 10.0);
+        assert_eq!(number_parse_int("0x10", 0), 16.0);
+        assert_eq!(number_parse_int("077", 0), 77.0);
+    }
+
     // ── number_parse_float ───────────────────────────────────────────────────
 
     #[test]
@@ -730,6 +797,7 @@ mod tests {
         assert_eq!(number_to_fixed(3.14159, 2).unwrap(), "3.14");
         assert_eq!(number_to_fixed(1.0, 0).unwrap(), "1");
         assert_eq!(number_to_fixed(1.005, 2).unwrap(), "1.00");
+        assert_eq!(number_to_fixed(0.615, 2).unwrap(), "0.62");
     }
 
     #[test]
@@ -895,6 +963,8 @@ mod tests {
     #[test]
     fn test_to_fixed_zero_digits() {
         assert_eq!(number_to_fixed(1.5, 0).unwrap(), "2");
+        assert_eq!(number_to_fixed(2.5, 0).unwrap(), "3");
+        assert_eq!(number_to_fixed(-2.5, 0).unwrap(), "-3");
     }
 
     #[test]
