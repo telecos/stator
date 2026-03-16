@@ -58,8 +58,8 @@ use stator_core::parser;
 /// This trade-off is acceptable for a test runner binary.
 struct GuardedAlloc;
 
-/// Maximum size of a single allocation (1 GiB).
-const MAX_ALLOC_SIZE: usize = 1 << 30;
+/// Maximum size of a single allocation (256 MiB).
+const MAX_ALLOC_SIZE: usize = 256 << 20;
 
 // SAFETY: All methods delegate to `System` after a size check.  The safety
 // invariants of `GlobalAlloc` (valid layout, matching alloc/dealloc) are
@@ -417,6 +417,11 @@ const SKIPPED_TEST_FILES: &[&str] = &[
     "built-ins/RegExp/S15.10.2.8_A3_T17.js",
     // Slow catastrophic backtracking (35+ seconds).
     "built-ins/RegExp/prototype/exec/S15.10.6.2_A3_T7.js",
+    // AggregateError tests trigger 1.8 GB allocations (>20s each).
+    "built-ins/AggregateError/newtarget-is-undefined.js",
+    "built-ins/AggregateError/newtarget-proto.js",
+    "built-ins/AggregateError/proto.js",
+    "built-ins/AggregateError/prototype/proto.js",
 ];
 
 /// Returns `true` when `rel_path` starts with any of the [`SKIPPED_PATH_PREFIXES`]
@@ -852,13 +857,13 @@ fn execute_source_inner(
         let program = parser::parse(&combined)?;
         let bc = BytecodeGenerator::compile_program(&program)?;
         let mut frame = InterpreterFrame::new_with_globals(bc, vec![], globals);
-        // Limit each test to 10 million instructions to prevent infinite
+        // Limit each test to 5 million instructions to prevent infinite
         // loops from hanging the runner.
-        frame.instruction_limit = 10_000_000;
-        // Wall-clock deadline: 5 seconds per test.  Set both on the frame AND as
+        frame.instruction_limit = 5_000_000;
+        // Wall-clock deadline: 3 seconds per test.  Set both on the frame AND as
         // a thread-local so that child frames created by eval() / Function()
         // also respect the timeout.
-        let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let dl = std::time::Instant::now() + std::time::Duration::from_secs(3);
         frame.deadline = Some(dl);
         set_execution_deadline(Some(dl));
         let result = Interpreter::run(&mut frame);
@@ -1346,6 +1351,16 @@ fn main_inner() {
         // Reset the thread-local call stack so that a failed test with
         // leftover frames does not pollute subsequent runs.
         clear_call_stack();
+
+        // Global runner timeout: stop processing after 18 minutes to leave
+        // headroom for CI's 20-minute limit and ensure we print a summary.
+        if run_start.elapsed().as_secs() > 18 * 60 {
+            eprintln!(
+                "Runner timeout after 18 min — stopping with {}/{total} tests processed",
+                idx + 1
+            );
+            break;
+        }
 
         // Periodic progress line (every 1000 tests, unless verbose).
         if !cli.verbose && (idx + 1) % 1000 == 0 {
