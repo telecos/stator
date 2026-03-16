@@ -17,12 +17,12 @@ use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
     PropertyIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, concat_rc_strs,
     constant_pool_jump_delta, constant_to_value, decode_string_constant, dispatch_call_property,
-    dispatch_call_with_this, dispatch_setter, err_bad_operand, error_message_from_value,
-    extract_context, find_handler, fn_props_set, is_js_receiver, js_add, js_less_than, keyed_load,
-    keyed_store, maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan,
-    number_to_jsvalue, plain_object_to_array_items, proto_lookup, resolve_jump,
-    restore_closure_context, set_pending_exception, strict_eq, to_array_index, to_bigint,
-    to_property_key, try_execute_best_jit, walk_context_chain, wire_construct_prototype,
+    dispatch_call_value, dispatch_call_with_this, dispatch_setter, err_bad_operand,
+    error_message_from_value, extract_context, find_handler, fn_props_set, is_js_receiver, js_add,
+    js_less_than, keyed_load, keyed_store, maybe_compile_baseline, maybe_compile_maglev,
+    maybe_compile_turbofan, number_to_jsvalue, plain_object_to_array_items, proto_lookup,
+    resolve_jump, restore_closure_context, set_pending_exception, strict_eq, to_array_index,
+    to_bigint, to_property_key, try_execute_best_jit, walk_context_chain, wire_construct_prototype,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{proxy_delete_property, proxy_has, proxy_set};
@@ -4155,15 +4155,31 @@ fn handle_test_instance_of(
     let has_instance_fn = match &constructor {
         JsValue::PlainObject(map) => map.borrow().get("@@hasInstance").cloned(),
         JsValue::NativeFunction(_) | JsValue::Function(_) => {
-            // Check global scope for @@hasInstance on the constructor
-            None
+            // Look up @@hasInstance via the prototype chain (e.g.
+            // Function.prototype[@@hasInstance]).
+            let v = proto_lookup(&constructor, "@@hasInstance");
+            if matches!(v, JsValue::Undefined) {
+                None
+            } else {
+                Some(v)
+            }
         }
         _ => None,
     };
-    if let Some(JsValue::NativeFunction(f)) = has_instance_fn {
-        let result = f(vec![ctx.frame.accumulator.clone()])?;
-        ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
-        return Ok(DispatchAction::Continue);
+    if let Some(ref hi) = has_instance_fn {
+        match hi {
+            JsValue::NativeFunction(f) => {
+                let result = f(vec![ctx.frame.accumulator.clone()])?;
+                ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
+                return Ok(DispatchAction::Continue);
+            }
+            JsValue::Function(_) | JsValue::PlainObject(_) => {
+                let result = dispatch_call_value(hi, vec![ctx.frame.accumulator.clone()])?;
+                ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
+                return Ok(DispatchAction::Continue);
+            }
+            _ => {}
+        }
     }
 
     // ── Built-in type checks via constructor identity ──────────────
@@ -4252,7 +4268,7 @@ fn handle_test_instance_of(
     // Obtain the constructor's "prototype" property.
     let ctor_proto = match &constructor {
         JsValue::PlainObject(map) => map.borrow().get("prototype").cloned(),
-        JsValue::Function(_) => {
+        JsValue::Function(_) | JsValue::NativeFunction(_) => {
             let v = proto_lookup(&constructor, "prototype");
             if matches!(v, JsValue::Undefined) {
                 None
@@ -8124,5 +8140,301 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::String("a-b-c".into()));
+    }
+
+    // ── typeof conformance ──────────────────────────────────────────────
+
+    #[test]
+    fn e2e_typeof_null_is_object() {
+        let result = crate::builtins::global::global_eval("typeof null").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_undefined() {
+        let result = crate::builtins::global::global_eval("typeof undefined").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_boolean() {
+        let result = crate::builtins::global::global_eval("typeof true").unwrap();
+        assert_eq!(result, JsValue::String("boolean".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_number() {
+        let result = crate::builtins::global::global_eval("typeof 42").unwrap();
+        assert_eq!(result, JsValue::String("number".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_string() {
+        let result = crate::builtins::global::global_eval("typeof 'hello'").unwrap();
+        assert_eq!(result, JsValue::String("string".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_symbol() {
+        let result = crate::builtins::global::global_eval("typeof Symbol()").unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_bigint() {
+        let result = crate::builtins::global::global_eval("typeof BigInt(1)").unwrap();
+        assert_eq!(result, JsValue::String("bigint".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_function() {
+        let result = crate::builtins::global::global_eval("typeof function() {}").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_arrow_function() {
+        let result = crate::builtins::global::global_eval("typeof (() => {})").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_object() {
+        let result = crate::builtins::global::global_eval("typeof {}").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_array() {
+        let result = crate::builtins::global::global_eval("typeof []").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_undeclared_var() {
+        // typeof on an undeclared variable must NOT throw ReferenceError.
+        let result = crate::builtins::global::global_eval("typeof someUndeclaredVariable").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_typeof_bound_function() {
+        let result =
+            crate::builtins::global::global_eval("function f() {} typeof f.bind(null)").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    // ── instanceof conformance ──────────────────────────────────────────
+
+    #[test]
+    fn e2e_instanceof_error() {
+        let result =
+            crate::builtins::global::global_eval("new Error('x') instanceof Error").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_instanceof_typeerror_is_error() {
+        // TypeError instance should also be instanceof Error.
+        let result =
+            crate::builtins::global::global_eval("new TypeError('x') instanceof Error").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_instanceof_typeerror() {
+        let result =
+            crate::builtins::global::global_eval("new TypeError('x') instanceof TypeError")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_instanceof_rangeerror() {
+        let result =
+            crate::builtins::global::global_eval("new RangeError('x') instanceof RangeError")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_instanceof_rangeerror_is_error() {
+        let result =
+            crate::builtins::global::global_eval("new RangeError('x') instanceof Error").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_instanceof_not_callable_throws() {
+        let result = crate::builtins::global::global_eval("1 instanceof 2");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn e2e_instanceof_custom_has_instance() {
+        let result = crate::builtins::global::global_eval(
+            "var obj = { [Symbol.hasInstance](v) { return v === 42; } }; 42 instanceof obj",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Error conformance ───────────────────────────────────────────────
+
+    #[test]
+    fn e2e_new_error_message_empty() {
+        // new Error() should have message === "" (empty string, not undefined).
+        let result = crate::builtins::global::global_eval("new Error().message").unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    #[test]
+    fn e2e_new_typeerror_message_empty() {
+        let result = crate::builtins::global::global_eval("new TypeError().message").unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    #[test]
+    fn e2e_new_error_message_string() {
+        let result = crate::builtins::global::global_eval("new Error('hello').message").unwrap();
+        assert_eq!(result, JsValue::String("hello".into()));
+    }
+
+    #[test]
+    fn e2e_error_name() {
+        let result = crate::builtins::global::global_eval("new Error().name").unwrap();
+        assert_eq!(result, JsValue::String("Error".into()));
+    }
+
+    #[test]
+    fn e2e_typeerror_name() {
+        let result = crate::builtins::global::global_eval("new TypeError().name").unwrap();
+        assert_eq!(result, JsValue::String("TypeError".into()));
+    }
+
+    #[test]
+    fn e2e_error_stack_is_string() {
+        let result = crate::builtins::global::global_eval("typeof new Error().stack").unwrap();
+        assert_eq!(result, JsValue::String("string".into()));
+    }
+
+    #[test]
+    fn e2e_error_tostring_with_message() {
+        let result = crate::builtins::global::global_eval("new Error('msg').toString()").unwrap();
+        assert_eq!(result, JsValue::String("Error: msg".into()));
+    }
+
+    #[test]
+    fn e2e_error_tostring_without_message() {
+        let result = crate::builtins::global::global_eval("new Error().toString()").unwrap();
+        assert_eq!(result, JsValue::String("Error".into()));
+    }
+
+    #[test]
+    fn e2e_typeerror_tostring() {
+        let result =
+            crate::builtins::global::global_eval("new TypeError('bad').toString()").unwrap();
+        assert_eq!(result, JsValue::String("TypeError: bad".into()));
+    }
+
+    #[test]
+    fn e2e_error_constructor_identity() {
+        let result =
+            crate::builtins::global::global_eval("new Error('msg').constructor === Error").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_typeerror_constructor_identity() {
+        let result =
+            crate::builtins::global::global_eval("new TypeError('msg').constructor === TypeError")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_error_subclass_prototype_chain() {
+        // TypeError.prototype should inherit from Error.prototype.
+        let result = crate::builtins::global::global_eval(
+            "TypeError.prototype instanceof Error \
+             || Object.getPrototypeOf(TypeError.prototype) === Error.prototype",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── throw / catch conformance ───────────────────────────────────────
+
+    #[test]
+    fn e2e_throw_number() {
+        let result =
+            crate::builtins::global::global_eval("var r; try { throw 42; } catch(e) { r = e; } r")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_throw_string() {
+        let result = crate::builtins::global::global_eval(
+            "var r; try { throw 'oops'; } catch(e) { r = e; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("oops".into()));
+    }
+
+    #[test]
+    fn e2e_throw_boolean() {
+        let result = crate::builtins::global::global_eval(
+            "var r; try { throw false; } catch(e) { r = e; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_throw_null() {
+        let result = crate::builtins::global::global_eval(
+            "var r; try { throw null; } catch(e) { r = e; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Null);
+    }
+
+    #[test]
+    fn e2e_throw_undefined() {
+        let result = crate::builtins::global::global_eval(
+            "var r; try { throw undefined; } catch(e) { r = e; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_throw_error_object() {
+        let result = crate::builtins::global::global_eval(
+            "var r; try { throw new TypeError('msg'); } catch(e) { r = e.message; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("msg".into()));
+    }
+
+    #[test]
+    fn e2e_engine_error_caught_as_error_object() {
+        // Engine-thrown TypeError (e.g. calling null) should be caught as
+        // a proper Error object with correct kind and message.
+        let result = crate::builtins::global::global_eval(
+            "var r; try { null(); } catch(e) { r = e instanceof TypeError; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_throw_object_literal() {
+        let result = crate::builtins::global::global_eval(
+            "var r; try { throw { code: 42 }; } catch(e) { r = e.code; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
     }
 }
