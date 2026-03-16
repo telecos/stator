@@ -318,6 +318,47 @@ fn lookup_global_constructor(name: &str) -> JsValue {
     })
 }
 
+pub(super) fn sync_global_object_property(
+    env: &mut HashMap<String, JsValue>,
+    name: &str,
+    value: &JsValue,
+) {
+    if let Some(JsValue::PlainObject(global_this)) = env.get("globalThis").cloned() {
+        global_this
+            .borrow_mut()
+            .insert(name.to_string(), value.clone());
+    }
+}
+
+fn current_global_this_object() -> Option<Rc<RefCell<PropertyMap>>> {
+    CURRENT_GLOBALS.with(|g| {
+        g.borrow().as_ref().and_then(
+            |globals| match globals.borrow().get("globalThis").cloned() {
+                Some(JsValue::PlainObject(global_this)) => Some(global_this),
+                _ => None,
+            },
+        )
+    })
+}
+
+pub(super) fn sync_current_global_object_store(obj: &JsValue, name: &str, value: &JsValue) -> bool {
+    let Some(global_this) = current_global_this_object() else {
+        return false;
+    };
+    let JsValue::PlainObject(target) = obj else {
+        return false;
+    };
+    if !Rc::ptr_eq(target, &global_this) {
+        return false;
+    }
+    CURRENT_GLOBALS.with(|g| {
+        if let Some(globals) = g.borrow().as_ref() {
+            globals.borrow_mut().insert(name.to_string(), value.clone());
+        }
+    });
+    true
+}
+
 /// Run `f` with mutable access to the currently-attached [`Debugger`], if
 /// any, and return its result wrapped in `Some`.  Returns `None` when no
 /// debugger is attached.
@@ -5457,7 +5498,7 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
                     return Ok(());
                 }
             }
-            map.borrow_mut().insert(prop_name, value);
+            map.borrow_mut().insert(prop_name.clone(), value.clone());
             // If this is an array-like PlainObject, update "length".
             if let Some(idx) = to_array_index(key) {
                 let new_len = (idx + 1) as i32;
@@ -5471,6 +5512,7 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
                         .insert("length".to_string(), JsValue::Smi(new_len));
                 }
             }
+            let _ = sync_current_global_object_store(obj, &prop_name, &value);
         }
         JsValue::Function(ba) => {
             let prop_name = to_property_key(key)?;
