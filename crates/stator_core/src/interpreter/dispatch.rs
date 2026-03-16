@@ -5240,6 +5240,13 @@ fn handle_get_template_object(
     let cache_key = ctx.byte_offsets[ctx.frame.pc - 1] as u32;
     if let Some(cached) = ctx.frame.template_cache.get(&cache_key) {
         ctx.frame.accumulator = cached.clone();
+    } else if let Some(cached) = ctx
+        .frame
+        .bytecode_array
+        .get_cached_template_object(cache_key)
+    {
+        ctx.frame.template_cache.insert(cache_key, cached.clone());
+        ctx.frame.accumulator = cached;
     } else {
         let entry = ctx
             .frame
@@ -5259,6 +5266,9 @@ fn handle_get_template_object(
             }
             map.borrow_mut().freeze();
         }
+        ctx.frame
+            .bytecode_array
+            .cache_template_object(cache_key, tpl_val.clone());
         ctx.frame.template_cache.insert(cache_key, tpl_val.clone());
         ctx.frame.accumulator = tpl_val;
     }
@@ -7327,6 +7337,141 @@ mod tests {
     fn test_template_literal_expression() {
         let result = crate::builtins::global::global_eval("var x = 42; `value is ${x}`").unwrap();
         assert_eq!(result, JsValue::String("value is 42".into()));
+    }
+
+    #[test]
+    fn test_template_literal_nested() {
+        let result =
+            crate::builtins::global::global_eval("var name = 'Ada'; `outer ${`inner ${name}`}`")
+                .unwrap();
+        assert_eq!(result, JsValue::String("outer inner Ada".into()));
+    }
+
+    #[test]
+    fn test_template_literal_multiline() {
+        let source = concat!("`line1", "\r\n", "line2`");
+        let result = crate::builtins::global::global_eval(source).unwrap();
+        assert_eq!(result, JsValue::String("line1\r\nline2".into()));
+    }
+
+    #[test]
+    fn test_template_literal_expression_evaluation() {
+        let result =
+            crate::builtins::global::global_eval("var a = 2; var b = 3; `${a * (b + 4)}`").unwrap();
+        assert_eq!(result, JsValue::String("14".into()));
+    }
+
+    #[test]
+    fn test_template_literal_empty() {
+        let result = crate::builtins::global::global_eval("``").unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    #[test]
+    fn test_template_literal_only_expression() {
+        let result = crate::builtins::global::global_eval("var x = 7; `${x}`").unwrap();
+        assert_eq!(result, JsValue::String("7".into()));
+    }
+
+    #[test]
+    fn test_template_literal_consecutive_expressions() {
+        let result =
+            crate::builtins::global::global_eval("var a = 1; var b = 2; var c = 3; `${a}${b}${c}`")
+                .unwrap();
+        assert_eq!(result, JsValue::String("123".into()));
+    }
+
+    #[test]
+    fn test_tagged_template_receives_strings_and_values() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strings, a, b) { return strings[0] + '|' + strings[1] + '|' + strings[2] + '|' + a + '|' + b; } tag`a${10}b${20}c`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a|b|c|10|20".into()));
+    }
+
+    #[test]
+    fn test_tagged_template_preserves_this_binding() {
+        let result = crate::builtins::global::global_eval(
+            "var obj = { prefix: 'ok', tag(strings, value) { return this.prefix + ':' + strings[0] + value + strings[1]; } }; obj.tag`x${5}y`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("ok:x5y".into()));
+    }
+
+    #[test]
+    fn test_tagged_template_cooked_escape_decoding() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strings) { return strings[0] === '\r\n'; } tag`\\r\n`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_tagged_template_raw_escape_preservation() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strings) { return strings.raw[0] === '\\\\r\n'; } tag`\\r\n`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_tagged_template_invalid_escape_yields_undefined_cooked() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strings) { return strings[0] === undefined; } tag`\\u{GG}`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_tagged_template_invalid_escape_preserves_raw_text() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strings) { return strings.raw[0] === '\\\\u{GG}'; } tag`\\u{GG}`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_tagged_template_caches_strings_object_identity() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strings) { return strings; } function get() { return tag`same`; } get() === get()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_tagged_template_caches_raw_object_identity() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strings) { return strings.raw; } function get() { return tag`same`; } get() === get()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_tagged_template_distinguishes_different_sites() {
+        let result = crate::builtins::global::global_eval(
+            "function tag(strings) { return strings; } function first() { return tag`same`; } function second() { return tag`same`; } first() === second()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_string_raw_template_preserves_backslash_n() {
+        let result = crate::builtins::global::global_eval("String.raw`\\r\n`").unwrap();
+        assert_eq!(result, JsValue::String("\\r\n".into()));
+    }
+
+    #[test]
+    fn test_untagged_template_invalid_escape_is_syntax_error() {
+        let result = crate::builtins::global::global_eval("`\\u{GG}`");
+        assert!(result.is_err());
     }
 
     /// Spread in array literal

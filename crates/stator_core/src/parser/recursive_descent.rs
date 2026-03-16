@@ -2297,6 +2297,111 @@ impl<'src> Parser<'src> {
         Ok(first)
     }
 
+    /// Build a template element from raw scanner text.
+    fn template_element_from_raw(
+        &self,
+        loc: Span,
+        raw: String,
+        tail: bool,
+        allow_invalid_escapes: bool,
+    ) -> StatorResult<TemplateElement> {
+        let cooked = cook_template_raw(&raw);
+        if !allow_invalid_escapes && cooked.is_none() {
+            return Err(Self::error_at(
+                loc,
+                "invalid escape sequence in untagged template literal",
+            ));
+        }
+        Ok(TemplateElement {
+            loc,
+            cooked,
+            raw,
+            tail,
+        })
+    }
+
+    /// Parse a template literal, optionally allowing invalid cooked escapes.
+    fn parse_template_literal(&mut self, allow_invalid_escapes: bool) -> StatorResult<Expr> {
+        match self.peek_kind() {
+            TokenKind::NoSubstitutionTemplate => {
+                let tok = self.bump()?;
+                let raw = match tok.value {
+                    TokenValue::Str(s) => s,
+                    _ => String::new(),
+                };
+                Ok(Expr::Template(Box::new(TemplateLit {
+                    loc: tok.span,
+                    quasis: vec![self.template_element_from_raw(
+                        tok.span,
+                        raw,
+                        true,
+                        allow_invalid_escapes,
+                    )?],
+                    expressions: vec![],
+                })))
+            }
+            TokenKind::TemplateHead => {
+                let start = self.current_span();
+                let head_tok = self.bump()?;
+                let head_raw = match head_tok.value {
+                    TokenValue::Str(s) => s,
+                    _ => String::new(),
+                };
+                let mut quasis = vec![self.template_element_from_raw(
+                    head_tok.span,
+                    head_raw,
+                    false,
+                    allow_invalid_escapes,
+                )?];
+                let mut expressions = Vec::new();
+
+                loop {
+                    expressions.push(self.parse_expr()?);
+                    match self.peek_kind() {
+                        TokenKind::TemplateMiddle => {
+                            let mid_tok = self.bump()?;
+                            let mid_raw = match mid_tok.value {
+                                TokenValue::Str(s) => s,
+                                _ => String::new(),
+                            };
+                            quasis.push(self.template_element_from_raw(
+                                mid_tok.span,
+                                mid_raw,
+                                false,
+                                allow_invalid_escapes,
+                            )?);
+                        }
+                        TokenKind::TemplateTail => {
+                            let tail_tok = self.bump()?;
+                            let tail_raw = match tail_tok.value {
+                                TokenValue::Str(s) => s,
+                                _ => String::new(),
+                            };
+                            quasis.push(self.template_element_from_raw(
+                                tail_tok.span,
+                                tail_raw,
+                                true,
+                                allow_invalid_escapes,
+                            )?);
+                            break;
+                        }
+                        _ => {
+                            return Err(self.error("expected template continuation"));
+                        }
+                    }
+                }
+
+                let end = quasis.last().map(|q| q.loc).unwrap_or(start);
+                Ok(Expr::Template(Box::new(TemplateLit {
+                    loc: Self::merge_spans(start, end),
+                    quasis,
+                    expressions,
+                })))
+            }
+            _ => Err(self.error("expected template literal")),
+        }
+    }
+
     /// Parse an assignment expression (right-associative).
     ///
     /// Also handles arrow function expressions, which have assignment-level
@@ -3060,7 +3165,7 @@ impl<'src> Parser<'src> {
                         );
                     }
                     // Tagged template: expr`template`
-                    let tpl_expr = self.parse_primary()?;
+                    let tpl_expr = self.parse_template_literal(true)?;
                     let quasi = match tpl_expr {
                         Expr::Template(t) => *t,
                         _ => unreachable!("template token must produce Expr::Template"),
@@ -3787,82 +3892,8 @@ impl<'src> Parser<'src> {
                 }
             }
             TokenKind::Class => self.parse_class_expr(),
-            TokenKind::NoSubstitutionTemplate => {
-                let tok = self.bump()?;
-                let raw = match tok.value {
-                    TokenValue::Str(s) => s,
-                    _ => String::new(),
-                };
-                Ok(Expr::Template(Box::new(TemplateLit {
-                    loc: tok.span,
-                    quasis: vec![TemplateElement {
-                        loc: tok.span,
-                        cooked: cook_template_raw(&raw),
-                        raw,
-                        tail: true,
-                    }],
-                    expressions: vec![],
-                })))
-            }
-            TokenKind::TemplateHead => {
-                let start = self.current_span();
-                let head_tok = self.bump()?;
-                let head_raw = match head_tok.value {
-                    TokenValue::Str(s) => s,
-                    _ => String::new(),
-                };
-                let mut quasis = vec![TemplateElement {
-                    loc: head_tok.span,
-                    cooked: cook_template_raw(&head_raw),
-                    raw: head_raw,
-                    tail: false,
-                }];
-                let mut expressions = Vec::new();
-
-                loop {
-                    expressions.push(self.parse_expr()?);
-                    // After the expression the scanner automatically produces
-                    // TemplateMiddle or TemplateTail when it sees `}`.
-                    match self.peek_kind() {
-                        TokenKind::TemplateMiddle => {
-                            let mid_tok = self.bump()?;
-                            let mid_raw = match mid_tok.value {
-                                TokenValue::Str(s) => s,
-                                _ => String::new(),
-                            };
-                            quasis.push(TemplateElement {
-                                loc: mid_tok.span,
-                                cooked: cook_template_raw(&mid_raw),
-                                raw: mid_raw,
-                                tail: false,
-                            });
-                        }
-                        TokenKind::TemplateTail => {
-                            let tail_tok = self.bump()?;
-                            let tail_raw = match tail_tok.value {
-                                TokenValue::Str(s) => s,
-                                _ => String::new(),
-                            };
-                            quasis.push(TemplateElement {
-                                loc: tail_tok.span,
-                                cooked: cook_template_raw(&tail_raw),
-                                raw: tail_raw,
-                                tail: true,
-                            });
-                            break;
-                        }
-                        _ => {
-                            return Err(self.error("expected template continuation"));
-                        }
-                    }
-                }
-
-                let end = quasis.last().map(|q| q.loc).unwrap_or(start);
-                Ok(Expr::Template(Box::new(TemplateLit {
-                    loc: Self::merge_spans(start, end),
-                    quasis,
-                    expressions,
-                })))
+            TokenKind::NoSubstitutionTemplate | TokenKind::TemplateHead => {
+                self.parse_template_literal(false)
             }
             // Contextual keywords used as identifiers in expression context.
             kind if self.is_contextual_keyword_identifier(kind) => {
@@ -6693,7 +6724,7 @@ mod tests {
 
     #[test]
     fn test_mixed_imports_and_statements() {
-        let prog = parse("import x from \"mod\";\nvar a = 1;\nexport const b = 2;").unwrap();
+        let prog = parse("import x from \"mod\";\r\nvar a = 1;\r\nexport const b = 2;").unwrap();
         assert_eq!(prog.source_type, SourceType::Module);
         assert_eq!(prog.body.len(), 3);
         assert!(matches!(

@@ -39,6 +39,7 @@
 //! ```
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,7 +48,7 @@ use crate::bytecode::bytecodes::{self, Instruction};
 use crate::bytecode::feedback::FeedbackMetadata;
 use crate::compiler::turbofan::TurbofanCompiledCode;
 use crate::error::StatorResult;
-use crate::objects::value::JsContext;
+use crate::objects::value::{JsContext, JsValue};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HandlerTableEntry
@@ -278,6 +279,13 @@ pub struct BytecodeArray {
     /// been scheduled so that only one background thread is spawned per
     /// function.
     turbofan_compile_started: Arc<AtomicBool>,
+    /// Shared cache of template objects created by `GetTemplateObject`.
+    ///
+    /// ECMAScript requires each template site to reuse the same frozen strings
+    /// object across evaluations in the same realm. Sharing this cache across
+    /// cloned [`BytecodeArray`] values gives every invocation of the same
+    /// compiled function access to the same template objects.
+    template_object_cache: Rc<RefCell<HashMap<u32, JsValue>>>,
     /// Captured closure context set by `CreateClosure`.
     ///
     /// When a function is created as a closure, this holds the enclosing
@@ -289,9 +297,9 @@ pub struct BytecodeArray {
 
 impl PartialEq for BytecodeArray {
     /// Two [`BytecodeArray`]s are equal when their static bytecode and metadata
-    /// are identical.  The tiering state (`invocation_count`, `jit_code`,
-    /// `maglev_jit_code`, `turbofan_jit_code`) is intentionally excluded from
-    /// the comparison.
+    /// are identical.  The runtime state (`invocation_count`, `jit_code`,
+    /// `maglev_jit_code`, `turbofan_jit_code`, `template_object_cache`) is
+    /// intentionally excluded from the comparison.
     fn eq(&self, other: &Self) -> bool {
         self.bytecodes == other.bytecodes
             && self.constant_pool == other.constant_pool
@@ -350,8 +358,24 @@ impl BytecodeArray {
             maglev_compile_started: Arc::new(AtomicBool::new(false)),
             turbofan_jit_code: Arc::new(Mutex::new(None)),
             turbofan_compile_started: Arc::new(AtomicBool::new(false)),
+            template_object_cache: Rc::new(RefCell::new(HashMap::new())),
             closure_context: None,
         }
+    }
+
+    /// Return the cached template object for the given bytecode offset, if any.
+    pub fn get_cached_template_object(&self, bytecode_offset: u32) -> Option<JsValue> {
+        self.template_object_cache
+            .borrow()
+            .get(&bytecode_offset)
+            .cloned()
+    }
+
+    /// Cache a template object for the given bytecode offset.
+    pub fn cache_template_object(&self, bytecode_offset: u32, template_object: JsValue) {
+        self.template_object_cache
+            .borrow_mut()
+            .insert(bytecode_offset, template_object);
     }
 
     /// Mark this [`BytecodeArray`] as belonging to a generator function.
