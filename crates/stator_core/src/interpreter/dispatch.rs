@@ -2037,7 +2037,7 @@ fn construct_class_from_plain_object(
     callee_frame.new_target = JsValue::PlainObject(Rc::clone(class_map));
 
     // 3. Expose parent constructor as "super" for `super()` calls.
-    if let Some(parent) = class_map.borrow().get("__proto__").cloned()
+    let is_derived = if let Some(parent) = class_map.borrow().get("__proto__").cloned()
         && !matches!(parent, JsValue::Undefined | JsValue::Null)
     {
         callee_frame
@@ -2052,14 +2052,45 @@ fn construct_class_from_plain_object(
             .global_env
             .borrow_mut()
             .insert("super".to_string(), parent);
+        true
     } else {
         callee_frame
             .global_env
             .borrow_mut()
             .insert("this".to_string(), this_val.clone());
+        false
+    };
+
+    // Helper closure: run the field initializer on the given `this` value.
+    let run_field_init = |env: &Rc<RefCell<std::collections::HashMap<String, JsValue>>>,
+                          this: &JsValue|
+     -> StatorResult<()> {
+        if let Some(JsValue::Function(init_ba)) =
+            class_map.borrow().get(".class_field_initializer").cloned()
+        {
+            let mut init_frame = InterpreterFrame::new_with_globals(
+                (*init_ba).clone(),
+                vec![this.clone()],
+                Rc::clone(env),
+            );
+            restore_closure_context(&mut init_frame, &init_ba);
+            push_call_frame("<field_init>")?;
+            let _ =
+                stacker::maybe_grow(64 * 1024, 1024 * 1024, || Interpreter::run(&mut init_frame));
+            pop_call_frame();
+        }
+        Ok(())
+    };
+
+    // 4. For base classes, fields are initialized before the constructor
+    //    body runs (ES §15.7.14).  For derived classes, field
+    //    initialization is deferred until after the constructor (which
+    //    calls super()) so that `this` is available.
+    if !is_derived {
+        run_field_init(&ctx.frame.global_env, &this_val)?;
     }
 
-    // 4. Run constructor body.
+    // 5. Run constructor body.
     push_call_frame("<anonymous>")?;
     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
         Interpreter::run(&mut callee_frame)
@@ -2067,19 +2098,16 @@ fn construct_class_from_plain_object(
     pop_call_frame();
     let val = result?;
 
-    // 5. Run field initializer if present.
-    if let Some(JsValue::Function(init_ba)) =
-        class_map.borrow().get(".class_field_initializer").cloned()
-    {
-        let mut init_frame = InterpreterFrame::new_with_globals(
-            (*init_ba).clone(),
-            vec![this_val.clone()],
-            Rc::clone(&ctx.frame.global_env),
-        );
-        restore_closure_context(&mut init_frame, &init_ba);
-        push_call_frame("<field_init>")?;
-        let _ = stacker::maybe_grow(64 * 1024, 1024 * 1024, || Interpreter::run(&mut init_frame));
-        pop_call_frame();
+    // 6. For derived classes, run field initializer after the constructor.
+    if is_derived {
+        // After `super()`, `this` is the constructed value.
+        let derived_this = callee_frame
+            .global_env
+            .borrow()
+            .get("this")
+            .cloned()
+            .unwrap_or(this_val.clone());
+        run_field_init(&ctx.frame.global_env, &derived_this)?;
     }
 
     ctx.frame
@@ -2087,7 +2115,7 @@ fn construct_class_from_plain_object(
         .borrow_mut()
         .remove(".class_pending_this");
 
-    // 6. If constructor returns an object, use it; else use `this`.
+    // 7. If constructor returns an object, use it; else use `this`.
     ctx.frame.accumulator = match val {
         JsValue::PlainObject(_) | JsValue::Object(_) => val,
         _ => this_val,
@@ -4479,11 +4507,12 @@ fn handle_for_in_enumerate(
                     // Skip engine-internal keys that must not appear in
                     // for-in enumeration: __proto__, __call__, __is_array__,
                     // Symbol()-keyed properties (for-in is string-only per
-                    // ES §14.7.5.9), @@-prefixed internal hooks, and hidden
-                    // field initializers.
+                    // ES §14.7.5.9), @@-prefixed internal hooks, hidden
+                    // field initializers, and private fields (#name).
                     if (k.starts_with("__") && k.ends_with("__"))
                         || crate::builtins::symbol::is_symbol_property_key(k)
                         || k.starts_with('.')
+                        || k.starts_with('#')
                     {
                         seen.insert(k.clone());
                         continue;
@@ -8684,40 +8713,40 @@ mod tests {
         assert_eq!(result, JsValue::Smi(2));
     }
 
-    // ── typeof conformance ──────────────────────────────────────────────
+    // ── typeof conformance (for-in section) ────────────────────────────
 
     #[test]
-    fn e2e_typeof_null_is_object() {
+    fn e2e_typeof_null_is_object_forin() {
         let result = crate::builtins::global::global_eval("typeof null").unwrap();
         assert_eq!(result, JsValue::String("object".into()));
     }
 
     #[test]
-    fn e2e_typeof_undefined() {
+    fn e2e_typeof_undefined_forin() {
         let result = crate::builtins::global::global_eval("typeof undefined").unwrap();
         assert_eq!(result, JsValue::String("undefined".into()));
     }
 
     #[test]
-    fn e2e_typeof_boolean() {
+    fn e2e_typeof_boolean_forin() {
         let result = crate::builtins::global::global_eval("typeof true").unwrap();
         assert_eq!(result, JsValue::String("boolean".into()));
     }
 
     #[test]
-    fn e2e_typeof_number() {
+    fn e2e_typeof_number_forin() {
         let result = crate::builtins::global::global_eval("typeof 42").unwrap();
         assert_eq!(result, JsValue::String("number".into()));
     }
 
     #[test]
-    fn e2e_typeof_string() {
+    fn e2e_typeof_string_forin() {
         let result = crate::builtins::global::global_eval("typeof 'hello'").unwrap();
         assert_eq!(result, JsValue::String("string".into()));
     }
 
     #[test]
-    fn e2e_typeof_symbol() {
+    fn e2e_typeof_symbol_forin() {
         let result = crate::builtins::global::global_eval("typeof Symbol()").unwrap();
         assert_eq!(result, JsValue::String("symbol".into()));
     }

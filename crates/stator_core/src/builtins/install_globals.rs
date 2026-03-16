@@ -3370,7 +3370,7 @@ fn make_object() -> JsValue {
                                 }
                                 continue;
                             }
-                            if k.starts_with("__") {
+                            if k.starts_with("__") || k.starts_with('#') {
                                 continue;
                             }
                             if seen.insert(k.clone()) {
@@ -3438,7 +3438,7 @@ fn make_object() -> JsValue {
                                 }
                                 continue;
                             }
-                            if k.starts_with("__") {
+                            if k.starts_with("__") || k.starts_with('#') {
                                 continue;
                             }
                             if seen.insert(k.clone()) {
@@ -3509,7 +3509,7 @@ fn make_object() -> JsValue {
                                 }
                                 continue;
                             }
-                            if k.starts_with("__") {
+                            if k.starts_with("__") || k.starts_with('#') {
                                 continue;
                             }
                             if seen.insert(k.clone()) {
@@ -4039,7 +4039,7 @@ fn make_object() -> JsValue {
                                 }
                                 continue;
                             }
-                            if k.starts_with("__") {
+                            if k.starts_with("__") || k.starts_with('#') {
                                 continue;
                             }
                             if seen.insert(k.clone()) {
@@ -26705,5 +26705,145 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::String("a=1,b=2".into()));
+    }
+
+    // ── Private class fields / methods conformance ───────────────────────
+
+    /// Basic private instance field with initializer.
+    #[test]
+    fn e2e_private_field_basic() {
+        let r = global_eval(
+            "class Foo { #x = 42; getX() { return this.#x; } } \
+             new Foo().getX()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Private field defaults to undefined when no initializer is given.
+    #[test]
+    fn e2e_private_field_default_undefined() {
+        let r = global_eval(
+            "class Foo { #x; getX() { return this.#x; } } \
+             new Foo().getX()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    /// Private field can be mutated via a setter method.
+    #[test]
+    fn e2e_private_field_setter() {
+        let r = global_eval(
+            "class Foo { #x = 0; setX(v) { this.#x = v; } getX() { return this.#x; } } \
+             let f = new Foo(); f.setX(99); f.getX()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    /// Multiple private fields on the same class.
+    #[test]
+    fn e2e_private_field_multiple() {
+        let r = global_eval(
+            "class Point { #x = 1; #y = 2; sum() { return this.#x + this.#y; } } \
+             new Point().sum()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// Each instance gets its own private field value.
+    #[test]
+    fn e2e_private_field_per_instance() {
+        let r = global_eval(
+            "class C { #v; constructor(v) { this.#v = v; } get() { return this.#v; } } \
+             let a = new C(10); let b = new C(20); a.get() + b.get()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(30));
+    }
+
+    /// Private method returning a constant.
+    #[test]
+    fn e2e_private_method_basic() {
+        let r = global_eval(
+            "class Foo { #secret() { return 42; } reveal() { return this.#secret(); } } \
+             new Foo().reveal()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Private method accessing a private field.
+    #[test]
+    fn e2e_private_method_accesses_field() {
+        let r = global_eval(
+            "class Foo { #x = 10; #double() { return this.#x * 2; } run() { return this.#double(); } } \
+             new Foo().run()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(20));
+    }
+
+    /// Static private field.
+    #[test]
+    fn e2e_private_static_field() {
+        let r = global_eval(
+            "class Counter { \
+               static #count = 0; \
+               constructor() { Counter.#count++; } \
+               static getCount() { return Counter.#count; } \
+             } \
+             new Counter(); new Counter(); new Counter(); \
+             Counter.getCount()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// `#field in obj` — brand check returns true for instances.
+    #[test]
+    fn e2e_private_in_operator_true() {
+        let r = global_eval(
+            "class Foo { #x = 1; static has(o) { return #x in o; } } \
+             Foo.has(new Foo())",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `#field in obj` — brand check returns false for non-instances.
+    #[test]
+    fn e2e_private_in_operator_false() {
+        let r = global_eval(
+            "class Foo { #x = 1; static has(o) { return #x in o; } } \
+             Foo.has({})",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Private field not visible via public property enumeration.
+    #[test]
+    fn e2e_private_field_not_enumerable() {
+        let r = global_eval(
+            "class Foo { #x = 1; y = 2; } \
+             let keys = Object.keys(new Foo()); \
+             keys.length",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// Private field with expression initializer.
+    #[test]
+    fn e2e_private_field_expr_initializer() {
+        let r = global_eval(
+            "class Foo { #x = 3 + 4; getX() { return this.#x; } } \
+             new Foo().getX()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(7));
     }
 }
