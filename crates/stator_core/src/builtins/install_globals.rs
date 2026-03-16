@@ -240,6 +240,133 @@ fn to_array_like_elements(val: &JsValue) -> (Vec<JsValue>, usize) {
     }
 }
 
+/// Return the spec-visible `length` of an array-like value.
+fn array_like_length(val: &JsValue) -> StatorResult<usize> {
+    match val {
+        JsValue::Array(items) => Ok(items.borrow().len()),
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            let len = borrow
+                .get("length")
+                .map(JsValue::to_length)
+                .transpose()?
+                .unwrap_or(0);
+            Ok(len.min(usize::MAX as u64) as usize)
+        }
+        _ => Ok(0),
+    }
+}
+
+/// Return whether an array-like value has an own indexed property at `index`.
+fn array_like_has_index(val: &JsValue, index: usize) -> bool {
+    match val {
+        JsValue::Array(items) => index < items.borrow().len(),
+        JsValue::PlainObject(map) => map.borrow().contains_key(&index.to_string()),
+        _ => false,
+    }
+}
+
+/// Read an indexed property from an array-like value.
+fn array_like_get_index(val: &JsValue, index: usize) -> JsValue {
+    match val {
+        JsValue::Array(items) => items
+            .borrow()
+            .get(index)
+            .cloned()
+            .unwrap_or(JsValue::Undefined),
+        JsValue::PlainObject(map) => map
+            .borrow()
+            .get(&index.to_string())
+            .cloned()
+            .unwrap_or(JsValue::Undefined),
+        _ => JsValue::Undefined,
+    }
+}
+
+/// Write an indexed property to an array-like value.
+fn array_like_set_index(val: &JsValue, index: usize, value: JsValue) {
+    match val {
+        JsValue::Array(items) => {
+            let mut borrow = items.borrow_mut();
+            if index >= borrow.len() {
+                borrow.resize(index + 1, JsValue::Undefined);
+            }
+            borrow[index] = value;
+        }
+        JsValue::PlainObject(map) => {
+            let mut borrow = map.borrow_mut();
+            borrow.insert(index.to_string(), value);
+            let new_len = index + 1;
+            let current_len = borrow
+                .get("length")
+                .and_then(|v| v.to_length().ok())
+                .unwrap_or(0)
+                .min(usize::MAX as u64) as usize;
+            if new_len > current_len {
+                borrow.insert("length".to_string(), JsValue::Smi(new_len as i32));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Delete an indexed property from an array-like value.
+fn array_like_delete_index(val: &JsValue, index: usize) {
+    match val {
+        JsValue::Array(items) => {
+            let mut borrow = items.borrow_mut();
+            if index < borrow.len() {
+                borrow[index] = JsValue::Undefined;
+            }
+        }
+        JsValue::PlainObject(map) => {
+            map.borrow_mut().remove(&index.to_string());
+        }
+        _ => {}
+    }
+}
+
+/// Set the `length` of an array-like value, truncating indexed properties when
+/// the new length is smaller.
+fn array_like_set_length(val: &JsValue, new_len: usize) {
+    match val {
+        JsValue::Array(items) => {
+            let mut borrow = items.borrow_mut();
+            if new_len < borrow.len() {
+                borrow.truncate(new_len);
+            } else {
+                borrow.resize(new_len, JsValue::Undefined);
+            }
+        }
+        JsValue::PlainObject(map) => {
+            let mut borrow = map.borrow_mut();
+            let current_len = borrow
+                .get("length")
+                .and_then(|v| v.to_length().ok())
+                .unwrap_or(0)
+                .min(usize::MAX as u64) as usize;
+            if new_len < current_len {
+                for index in new_len..current_len {
+                    borrow.remove(&index.to_string());
+                }
+            }
+            borrow.insert("length".to_string(), JsValue::Smi(new_len as i32));
+        }
+        _ => {}
+    }
+}
+
+/// Apply a hole-aware indexed layout back onto an array-like value.
+fn apply_array_like_slots(target: &JsValue, slots: &[Option<JsValue>]) {
+    array_like_set_length(target, slots.len());
+    for (index, slot) in slots.iter().enumerate() {
+        match slot {
+            Some(value) => array_like_set_index(target, index, value.clone()),
+            None => array_like_delete_index(target, index),
+        }
+    }
+}
+
 /// Check whether a value is a JavaScript array — either a native
 /// `JsValue::Array` or a `PlainObject` carrying the `__is_array__` marker.
 fn is_js_array(val: &JsValue) -> bool {
@@ -258,6 +385,15 @@ fn is_js_array(val: &JsValue) -> bool {
 /// native built-in implementations and user-defined JS callbacks.
 fn call_callback(cb: &JsValue, args: Vec<JsValue>) -> StatorResult<JsValue> {
     dispatch_call_value(cb, args)
+}
+
+/// Invoke a callback with an explicit `this` binding.
+fn call_callback_with_this(
+    cb: &JsValue,
+    this_arg: JsValue,
+    args: Vec<JsValue>,
+) -> StatorResult<JsValue> {
+    dispatch_call_with_this(cb, this_arg, args)
 }
 
 /// ECMAScript §7.2.1 RequireObjectCoercible — throws TypeError for null/undefined.
@@ -300,10 +436,13 @@ fn is_callable(val: &JsValue) -> bool {
 /// other objects are spreadable only when `@@isConcatSpreadable` is `true`.
 fn is_concat_spreadable(value: &JsValue) -> bool {
     match value {
-        JsValue::PlainObject(map) => match map.borrow().get("@@isConcatSpreadable").cloned() {
-            Some(v) => v.to_boolean(),
-            None => false,
-        },
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            match borrow.get("@@isConcatSpreadable").cloned() {
+                Some(v) => v.to_boolean(),
+                None => matches!(borrow.get("__is_array__"), Some(JsValue::Boolean(true))),
+            }
+        }
         JsValue::Array(items) => {
             // If the array was wrapped in an object with @@isConcatSpreadable,
             // we can't see it here.  Bare arrays are always spreadable unless
@@ -365,6 +504,47 @@ fn array_species_create(original: &JsValue, length: usize) -> StatorResult<Optio
         Err(StatorError::TypeError(
             "Species constructor is not callable".into(),
         ))
+    }
+}
+
+/// ECMAScript `ToIntegerOrInfinity` index normalization for forward searches.
+fn normalize_from_index(len: usize, from: Option<&JsValue>) -> StatorResult<usize> {
+    let from = match from {
+        Some(value) => value.to_integer_or_infinity()?,
+        None => 0.0,
+    };
+    if from == f64::INFINITY {
+        Ok(len)
+    } else if from == f64::NEG_INFINITY {
+        Ok(0)
+    } else if from < 0.0 {
+        Ok(((len as f64) + from).max(0.0) as usize)
+    } else {
+        Ok(from.min(len as f64) as usize)
+    }
+}
+
+/// ECMAScript `ToIntegerOrInfinity` index normalization for reverse searches.
+fn normalize_last_from_index(len: usize, from: Option<&JsValue>) -> StatorResult<Option<usize>> {
+    if len == 0 {
+        return Ok(None);
+    }
+    let from = match from {
+        Some(value) => value.to_integer_or_infinity()?,
+        None => (len - 1) as f64,
+    };
+    if from == f64::NEG_INFINITY {
+        return Ok(None);
+    }
+    let index = if from < 0.0 {
+        (len as f64) + from
+    } else {
+        from.min((len - 1) as f64)
+    };
+    if index < 0.0 {
+        Ok(None)
+    } else {
+        Ok(Some(index as usize))
     }
 }
 
@@ -4459,6 +4639,16 @@ fn make_array() -> JsValue {
         // `Array.prototype.push(arr, x)` at the bytecode level.
 
         let mut proto = PropertyMap::new();
+        proto.insert_with_attrs(
+            "length".into(),
+            JsValue::Smi(0),
+            PropertyAttributes::WRITABLE,
+        );
+        proto.insert_with_attrs(
+            "__is_array__".into(),
+            JsValue::Boolean(true),
+            PropertyAttributes::empty(),
+        );
 
         // push(...items)
         proto.insert(
@@ -4549,18 +4739,15 @@ fn make_array() -> JsValue {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let search = args.get(1).unwrap_or(&JsValue::Undefined);
-                let (elements, _) = to_array_like_elements(arr);
-                let len = elements.len() as i64;
-                let from = args
-                    .get(2)
-                    .unwrap_or(&JsValue::Smi(0))
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
-                let start = if from < 0 { (len + from).max(0) } else { from } as usize;
+                let len = array_like_length(arr)?;
+                let start = normalize_from_index(len, args.get(2))?;
                 // §23.1.3.14 uses Strict Equality (===) — NaN !== NaN, +0 === -0,
                 // and Smi/HeapNumber cross-type comparison must work.
-                for (i, v) in elements.iter().enumerate().skip(start) {
-                    if v.is_strictly_equal(search) {
+                for i in start..len {
+                    if !array_like_has_index(arr, i) {
+                        continue;
+                    }
+                    if array_like_get_index(arr, i).is_strictly_equal(search) {
                         return Ok(JsValue::Smi(i as i32));
                     }
                 }
@@ -4575,24 +4762,14 @@ fn make_array() -> JsValue {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let search = args.get(1).unwrap_or(&JsValue::Undefined);
-                let (elements, _) = to_array_like_elements(arr);
-                let len = elements.len() as i64;
-                if len == 0 {
+                let len = array_like_length(arr)?;
+                let Some(start) = normalize_last_from_index(len, args.get(2))? else {
                     return Ok(JsValue::Smi(-1));
-                }
-                let from = args
-                    .get(2)
-                    .map(|v| v.to_number().unwrap_or((len - 1) as f64) as i64)
-                    .unwrap_or(len - 1);
-                let start = if from < 0 {
-                    (len + from).max(0) as usize
-                } else {
-                    from.min(len - 1) as usize
                 };
                 // §23.1.3.17 uses Strict Equality (===).
                 for i in (0..=start).rev() {
-                    if let Some(v) = elements.get(i)
-                        && v.is_strictly_equal(search)
+                    if array_like_has_index(arr, i)
+                        && array_like_get_index(arr, i).is_strictly_equal(search)
                     {
                         return Ok(JsValue::Smi(i as i32));
                     }
@@ -4608,17 +4785,11 @@ fn make_array() -> JsValue {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let search = args.get(1).unwrap_or(&JsValue::Undefined);
-                let (elements, _) = to_array_like_elements(arr);
-                let len = elements.len() as i64;
-                let from = args
-                    .get(2)
-                    .unwrap_or(&JsValue::Smi(0))
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
-                let start = if from < 0 { (len + from).max(0) } else { from } as usize;
+                let len = array_like_length(arr)?;
+                let start = normalize_from_index(len, args.get(2))?;
                 // §23.1.3.13 uses SameValueZero — NaN equals NaN, +0 equals -0.
-                for v in elements.iter().skip(start) {
-                    if v.same_value_zero(search) {
+                for i in start..len {
+                    if array_like_get_index(arr, i).same_value_zero(search) {
                         return Ok(JsValue::Boolean(true));
                     }
                 }
@@ -4654,36 +4825,15 @@ fn make_array() -> JsValue {
             builtin_fn("concat", 1, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                let mut result: Vec<JsValue> = if let JsValue::Array(items) = arr {
-                    items.borrow().clone()
-                } else {
-                    Vec::new()
-                };
-                for other in args.iter().skip(1) {
-                    if is_concat_spreadable(other) {
-                        match other {
-                            JsValue::Array(items) => {
-                                result.extend(items.borrow().iter().cloned());
-                            }
-                            JsValue::PlainObject(map) => {
-                                let borrow = map.borrow();
-                                let len = borrow
-                                    .get("length")
-                                    .and_then(|v| v.to_number().ok())
-                                    .unwrap_or(0.0)
-                                    as usize;
-                                for i in 0..len {
-                                    if let Some(v) = borrow.get(&i.to_string()) {
-                                        result.push(v.clone());
-                                    } else {
-                                        result.push(JsValue::Undefined);
-                                    }
-                                }
-                            }
-                            _ => result.push(other.clone()),
+                let mut result = Vec::new();
+                for value in std::iter::once(arr).chain(args.iter().skip(1)) {
+                    if is_concat_spreadable(value) {
+                        let len = array_like_length(value)?;
+                        for i in 0..len {
+                            result.push(array_like_get_index(value, i));
                         }
                     } else {
-                        result.push(other.clone());
+                        result.push(value.clone());
                     }
                 }
                 Ok(JsValue::new_array(result))
@@ -4747,34 +4897,80 @@ fn make_array() -> JsValue {
             builtin_fn("sort", 1, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                if let JsValue::Array(items) = arr {
-                    let cmp_fn = args.get(1).cloned();
-                    let use_comparator = matches!(&cmp_fn, Some(v) if is_callable(v));
-                    let mut v = items.borrow().clone();
-                    if use_comparator {
-                        let cmp_val = cmp_fn.unwrap();
-                        v.sort_by(|a, b| {
-                            let result = call_callback(&cmp_val, vec![a.clone(), b.clone()])
-                                .unwrap_or(JsValue::Smi(0));
-                            let n = match result {
-                                JsValue::Smi(n) => n as f64,
-                                JsValue::HeapNumber(n) => n,
-                                _ => 0.0,
-                            };
-                            n.partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                    } else {
-                        v.sort_by(|a, b| {
-                            let sa = a.to_js_string().unwrap_or_default();
-                            let sb = b.to_js_string().unwrap_or_default();
-                            sa.cmp(&sb)
-                        });
-                    }
-                    *items.borrow_mut() = v;
-                    Ok(arr.clone())
-                } else {
-                    Ok(JsValue::Undefined)
+                let cmp_fn = args.get(1).cloned();
+                if let Some(cb) = &cmp_fn
+                    && !cb.is_undefined()
+                    && !is_callable(cb)
+                {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.sort comparator must be callable".into(),
+                    ));
                 }
+                let len = array_like_length(arr)?;
+                let mut defined = Vec::new();
+                let mut undefined_count = 0usize;
+                for index in 0..len {
+                    if !array_like_has_index(arr, index) {
+                        continue;
+                    }
+                    let value = array_like_get_index(arr, index);
+                    if value.is_undefined() {
+                        undefined_count += 1;
+                    } else {
+                        defined.push((index, value));
+                    }
+                }
+                if let Some(cb) = cmp_fn.filter(|v| !v.is_undefined()) {
+                    let mut sort_err: Option<StatorError> = None;
+                    defined.sort_by(|(_, a), (_, b)| {
+                        if sort_err.is_some() {
+                            return std::cmp::Ordering::Equal;
+                        }
+                        match call_callback_with_this(
+                            &cb,
+                            JsValue::Undefined,
+                            vec![a.clone(), b.clone()],
+                        ) {
+                            Ok(result) => match result.to_number() {
+                                Ok(number) => number
+                                    .partial_cmp(&0.0)
+                                    .unwrap_or(std::cmp::Ordering::Equal),
+                                Err(err) => {
+                                    sort_err = Some(err);
+                                    std::cmp::Ordering::Equal
+                                }
+                            },
+                            Err(err) => {
+                                sort_err = Some(err);
+                                std::cmp::Ordering::Equal
+                            }
+                        }
+                    });
+                    if let Some(err) = sort_err {
+                        return Err(err);
+                    }
+                } else {
+                    let mut sortable = Vec::with_capacity(defined.len());
+                    for (index, value) in defined {
+                        let key = value.to_js_string()?;
+                        sortable.push((index, value, key));
+                    }
+                    sortable.sort_by(|(_, _, a_key), (_, _, b_key)| a_key.cmp(b_key));
+                    defined = sortable
+                        .into_iter()
+                        .map(|(index, value, _)| (index, value))
+                        .collect();
+                }
+                let defined_count = defined.len();
+                let mut slots = vec![None; len];
+                for (slot_index, (_, value)) in defined.into_iter().enumerate() {
+                    slots[slot_index] = Some(value);
+                }
+                for slot in slots.iter_mut().skip(defined_count).take(undefined_count) {
+                    *slot = Some(JsValue::Undefined);
+                }
+                apply_array_like_slots(arr, &slots);
+                Ok(arr.clone())
             }),
         );
 
@@ -4957,39 +5153,58 @@ fn make_array() -> JsValue {
             builtin_fn("splice", 2, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                if let JsValue::Array(items) = arr {
-                    let len = items.borrow().len() as i64;
-                    let start = args
-                        .get(1)
-                        .unwrap_or(&JsValue::Smi(0))
-                        .to_number()
-                        .unwrap_or(0.0) as i64;
-                    let s = if start < 0 {
-                        (len + start).max(0)
-                    } else {
-                        start.min(len)
-                    } as usize;
-                    let max_del = (len - s as i64).max(0) as usize;
-                    let del = args
-                        .get(2)
-                        .map(|v| {
-                            crate::builtins::util::clamped_f64_to_usize(
-                                v.to_number().unwrap_or(max_del as f64),
-                            )
-                            .min(max_del)
-                        })
-                        .unwrap_or(max_del);
-                    let new_items = if args.len() > 3 { &args[3..] } else { &[] };
-                    let deleted: Vec<JsValue> = items.borrow()[s..s + del].to_vec();
-                    let mut v: Vec<JsValue> = items.borrow()[..s].to_vec();
-                    v.extend_from_slice(new_items);
-                    v.extend_from_slice(&items.borrow()[s + del..]);
-                    *items.borrow_mut() = v;
-                    // Return the deleted elements as an array.
-                    Ok(JsValue::new_array(deleted))
+                let len = array_like_length(arr)?;
+                let start = args
+                    .get(1)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_integer_or_infinity()?;
+                let s = if start == f64::NEG_INFINITY {
+                    0
+                } else if start < 0.0 {
+                    ((len as f64) + start).max(0.0) as usize
                 } else {
-                    Ok(JsValue::new_array(Vec::new()))
+                    start.min(len as f64) as usize
+                };
+                let max_del = len.saturating_sub(s);
+                let del = match args.get(2) {
+                    None => max_del,
+                    Some(value) => {
+                        let delete_count = value.to_integer_or_infinity()?;
+                        if delete_count <= 0.0 {
+                            0
+                        } else if delete_count.is_infinite() {
+                            max_del
+                        } else {
+                            (delete_count as usize).min(max_del)
+                        }
+                    }
+                };
+                let new_items = if args.len() > 3 { &args[3..] } else { &[] };
+                let mut deleted = Vec::with_capacity(del);
+                for index in s..(s + del) {
+                    deleted.push(array_like_get_index(arr, index));
                 }
+                let mut slots =
+                    Vec::with_capacity(s + new_items.len() + len.saturating_sub(s + del));
+                for index in 0..s {
+                    if array_like_has_index(arr, index) {
+                        slots.push(Some(array_like_get_index(arr, index)));
+                    } else {
+                        slots.push(None);
+                    }
+                }
+                for item in new_items {
+                    slots.push(Some(item.clone()));
+                }
+                for index in (s + del)..len {
+                    if array_like_has_index(arr, index) {
+                        slots.push(Some(array_like_get_index(arr, index)));
+                    } else {
+                        slots.push(None);
+                    }
+                }
+                apply_array_like_slots(arr, &slots);
+                Ok(JsValue::new_array(deleted))
             }),
         );
 
@@ -5025,16 +5240,27 @@ fn make_array() -> JsValue {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (elements, _) = to_array_like_elements(arr);
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.filter callback must be callable".into(),
+                    ));
+                }
+                let len = array_like_length(arr)?;
+                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let arr_val = arr.clone();
                 let mut result = Vec::new();
-                for (i, item) in elements.iter().enumerate() {
-                    let keep = call_callback(
+                for i in 0..len {
+                    if !array_like_has_index(arr, i) {
+                        continue;
+                    }
+                    let item = array_like_get_index(arr, i);
+                    let keep = call_callback_with_this(
                         &cb,
+                        this_arg.clone(),
                         vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                     )?;
                     if keep.to_boolean() {
-                        result.push(item.clone());
+                        result.push(item);
                     }
                 }
                 Ok(JsValue::new_array(result))
@@ -5048,21 +5274,41 @@ fn make_array() -> JsValue {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (elements, _) = to_array_like_elements(arr);
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.reduce callback must be callable".into(),
+                    ));
+                }
+                let len = array_like_length(arr)?;
                 let (mut acc, start) = if let Some(init) = args.get(2) {
                     (init.clone(), 0usize)
                 } else {
-                    if elements.is_empty() {
+                    let mut first_present = None;
+                    for i in 0..len {
+                        if array_like_has_index(arr, i) {
+                            first_present = Some(i);
+                            break;
+                        }
+                    }
+                    let Some(first_present) = first_present else {
                         return Err(StatorError::TypeError(
                             "Reduce of empty array with no initial value".into(),
                         ));
-                    }
-                    (elements[0].clone(), 1)
+                    };
+                    (array_like_get_index(arr, first_present), first_present + 1)
                 };
-                for (i, item) in elements.iter().enumerate().skip(start) {
+                for i in start..len {
+                    if !array_like_has_index(arr, i) {
+                        continue;
+                    }
                     acc = call_callback(
                         &cb,
-                        vec![acc, item.clone(), JsValue::Smi(i as i32), arr.clone()],
+                        vec![
+                            acc,
+                            array_like_get_index(arr, i),
+                            JsValue::Smi(i as i32),
+                            arr.clone(),
+                        ],
                     )?;
                 }
                 Ok(acc)
@@ -5076,23 +5322,38 @@ fn make_array() -> JsValue {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (elements, _) = to_array_like_elements(arr);
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.reduceRight callback must be callable".into(),
+                    ));
+                }
+                let len = array_like_length(arr)?;
                 let (mut acc, end_exclusive) = if let Some(init) = args.get(2) {
-                    (init.clone(), elements.len())
+                    (init.clone(), len)
                 } else {
-                    if elements.is_empty() {
+                    let mut last_present = None;
+                    for i in (0..len).rev() {
+                        if array_like_has_index(arr, i) {
+                            last_present = Some(i);
+                            break;
+                        }
+                    }
+                    let Some(last_present) = last_present else {
                         return Err(StatorError::TypeError(
                             "Reduce of empty array with no initial value".into(),
                         ));
-                    }
-                    (elements[elements.len() - 1].clone(), elements.len() - 1)
+                    };
+                    (array_like_get_index(arr, last_present), last_present)
                 };
                 for i in (0..end_exclusive).rev() {
+                    if !array_like_has_index(arr, i) {
+                        continue;
+                    }
                     acc = call_callback(
                         &cb,
                         vec![
                             acc,
-                            elements[i].clone(),
+                            array_like_get_index(arr, i),
                             JsValue::Smi(i as i32),
                             arr.clone(),
                         ],
@@ -5128,15 +5389,23 @@ fn make_array() -> JsValue {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (elements, _) = to_array_like_elements(arr);
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.find callback must be callable".into(),
+                    ));
+                }
+                let len = array_like_length(arr)?;
+                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let arr_val = arr.clone();
-                for (i, item) in elements.iter().enumerate() {
-                    let v = call_callback(
+                for i in 0..len {
+                    let item = array_like_get_index(arr, i);
+                    let v = call_callback_with_this(
                         &cb,
+                        this_arg.clone(),
                         vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                     )?;
                     if v.to_boolean() {
-                        return Ok(item.clone());
+                        return Ok(item);
                     }
                 }
                 Ok(JsValue::Undefined)
@@ -5150,12 +5419,23 @@ fn make_array() -> JsValue {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (elements, _) = to_array_like_elements(arr);
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.findIndex callback must be callable".into(),
+                    ));
+                }
+                let len = array_like_length(arr)?;
+                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let arr_val = arr.clone();
-                for (i, item) in elements.iter().enumerate() {
-                    let v = call_callback(
+                for i in 0..len {
+                    let v = call_callback_with_this(
                         &cb,
-                        vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                        this_arg.clone(),
+                        vec![
+                            array_like_get_index(arr, i),
+                            JsValue::Smi(i as i32),
+                            arr_val.clone(),
+                        ],
                     )?;
                     if v.to_boolean() {
                         return Ok(JsValue::Smi(i as i32));
@@ -5216,12 +5496,26 @@ fn make_array() -> JsValue {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (elements, _) = to_array_like_elements(arr);
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.some callback must be callable".into(),
+                    ));
+                }
+                let len = array_like_length(arr)?;
+                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let arr_val = arr.clone();
-                for (i, item) in elements.iter().enumerate() {
-                    let v = call_callback(
+                for i in 0..len {
+                    if !array_like_has_index(arr, i) {
+                        continue;
+                    }
+                    let v = call_callback_with_this(
                         &cb,
-                        vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                        this_arg.clone(),
+                        vec![
+                            array_like_get_index(arr, i),
+                            JsValue::Smi(i as i32),
+                            arr_val.clone(),
+                        ],
                     )?;
                     if v.to_boolean() {
                         return Ok(JsValue::Boolean(true));
@@ -5238,12 +5532,26 @@ fn make_array() -> JsValue {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (elements, _) = to_array_like_elements(arr);
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.every callback must be callable".into(),
+                    ));
+                }
+                let len = array_like_length(arr)?;
+                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let arr_val = arr.clone();
-                for (i, item) in elements.iter().enumerate() {
-                    let v = call_callback(
+                for i in 0..len {
+                    if !array_like_has_index(arr, i) {
+                        continue;
+                    }
+                    let v = call_callback_with_this(
                         &cb,
-                        vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                        this_arg.clone(),
+                        vec![
+                            array_like_get_index(arr, i),
+                            JsValue::Smi(i as i32),
+                            arr_val.clone(),
+                        ],
                     )?;
                     if !v.to_boolean() {
                         return Ok(JsValue::Boolean(false));
@@ -12445,6 +12753,30 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(false));
     }
 
+    #[test]
+    fn e2e_array_is_array_true_for_literal() {
+        let result = global_eval("Array.isArray([])").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_array_is_array_true_for_constructor() {
+        let result = global_eval("Array.isArray(new Array())").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_array_is_array_false_for_plain_object() {
+        let result = global_eval("Array.isArray({})").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_array_is_array_true_for_array_prototype() {
+        let result = global_eval("Array.isArray(Array.prototype)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
     /// `Number.isInteger(5)` → true
     #[test]
     fn e2e_number_is_integer() {
@@ -18161,6 +18493,42 @@ mod tests {
         assert_eq!(result, JsValue::Smi(3));
     }
 
+    #[test]
+    fn test_array_sort_uses_string_comparison_by_default() {
+        let result = global_eval("var a = [10, 2, 1]; a.sort(); a.join(',')").unwrap();
+        assert_eq!(result, JsValue::String("1,10,2".into()));
+    }
+
+    #[test]
+    fn test_array_sort_is_stable_when_comparator_returns_zero() {
+        let result = global_eval(
+            "var a = [{k:'a'}, {k:'b'}, {k:'c'}]; a.sort(function() { return 0; }); \
+             a[0].k + a[1].k + a[2].k",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("abc".into()));
+    }
+
+    #[test]
+    fn test_array_sort_preserves_sparse_holes() {
+        let result = global_eval(
+            "var a = [, 'b', 'a']; a.sort(); a[0] === 'a' && a[1] === 'b' && !(2 in a)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_sort_handles_non_array_objects_with_length() {
+        let result = global_eval(
+            "var o = {0: 'b', 2: 'a', length: 3}; \
+             Array.prototype.sort.call(o); \
+             o[0] === 'a' && o[1] === 'b' && !(2 in o) && o.length === 3",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
     // ── Array.prototype.fill mutation tests ─────────────────────────────
 
     /// `fill` mutates the original array.
@@ -18205,6 +18573,34 @@ mod tests {
     fn test_array_splice_insert() {
         let result = global_eval("var a = [1,2,3]; a.splice(1, 0, 10, 20); a[1]").unwrap();
         assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_array_splice_returns_deleted_array_and_shifts() {
+        let result = global_eval(
+            "var a = [1,2,3,4]; var d = a.splice(1, 2); \
+             d.length === 2 && d[0] === 2 && d[1] === 3 && a.join(',') === '1,4'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_splice_negative_start_and_insert_updates_length() {
+        let result = global_eval(
+            "var a = [1,2,3,4]; a.splice(-2, 1, 9, 8); a.join(',') === '1,2,9,8,4' && a.length === 5",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_splice_without_delete_count_removes_to_end() {
+        let result = global_eval(
+            "var a = [1,2,3,4]; var d = a.splice(2); d.join(',') === '3,4' && a.length === 2",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 
     // ── Array.prototype.copyWithin mutation tests ───────────────────────
@@ -18269,6 +18665,18 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
+    #[test]
+    fn test_includes_finds_undefined_in_hole() {
+        let result = global_eval("var a = []; a.length = 1; a.includes(undefined)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_includes_honors_infinite_from_index() {
+        let result = global_eval("[1, 2, 3].includes(1, Infinity)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
     /// `includes` returns false when element is not present.
     #[test]
     fn test_includes_not_found() {
@@ -18286,18 +18694,25 @@ mod tests {
     }
 
     /// `indexOf` with negative fromIndex counts from end.
-    /// NOTE: negative fromIndex support not yet implemented.
-    // #[test]
-    // fn test_indexof_negative_from_index() {
-    //     let result = global_eval("[1, 2, 3, 1].indexOf(1, -2)").unwrap();
-    //     assert_eq!(result, JsValue::Smi(3));
-    // }
+    #[test]
+    fn test_indexof_negative_from_index() {
+        let result = global_eval("[1, 2, 1, 3].indexOf(1, -2)").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
 
     /// `indexOf` returns first occurrence.
     #[test]
     fn test_indexof_first_occurrence() {
         let result = global_eval("[1, 2, 1, 3].indexOf(1)").unwrap();
         assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_indexof_skips_sparse_holes() {
+        let result =
+            global_eval("var a = []; a[1] = undefined; a.length = 3; a.indexOf(undefined)")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
     }
 
     // ── Array.prototype.lastIndexOf strict equality tests ───────────────
@@ -18323,35 +18738,71 @@ mod tests {
         assert_eq!(result, JsValue::Smi(-1));
     }
 
+    #[test]
+    fn test_lastindexof_negative_from_index_and_holes() {
+        let result = global_eval(
+            "var a = []; a[1] = undefined; a[3] = undefined; a.length = 4; \
+             a.lastIndexOf(undefined, -2)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
     // ── Array.prototype.reduce / reduceRight edge cases ─────────────────
 
     /// `reduce` on empty array with no initial value throws TypeError.
-    /// NOTE: empty-array reduce TypeError not yet implemented.
-    // #[test]
-    // fn test_reduce_empty_throws() {
-    //     let result = global_eval("[].reduce(function(a, b) { return a + b })");
-    //     assert!(
-    //         result.is_err(),
-    //         "Expected TypeError for reduce of empty array"
-    //     );
-    // }
+    #[test]
+    fn test_reduce_empty_throws() {
+        let result = global_eval("[].reduce(function(a, b) { return a + b })");
+        assert!(
+            result.is_err(),
+            "Expected TypeError for reduce of empty array"
+        );
+    }
 
     /// `reduceRight` on empty array with no initial value throws TypeError.
-    /// NOTE: empty-array reduceRight TypeError not yet implemented.
-    // #[test]
-    // fn test_reduce_right_empty_throws() {
-    //     let result = global_eval("[].reduceRight(function(a, b) { return a + b })");
-    //     assert!(
-    //         result.is_err(),
-    //         "Expected TypeError for reduceRight of empty array"
-    //     );
-    // }
+    #[test]
+    fn test_reduce_right_empty_throws() {
+        let result = global_eval("[].reduceRight(function(a, b) { return a + b })");
+        assert!(
+            result.is_err(),
+            "Expected TypeError for reduceRight of empty array"
+        );
+    }
 
     /// `reduce` with initial value on empty array returns initial value.
     #[test]
     fn test_reduce_empty_with_initial() {
         let result = global_eval("[].reduce(function(a, b) { return a + b }, 42)").unwrap();
         assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_reduce_skips_holes_and_passes_callback_arguments() {
+        let result = global_eval(
+            "var seen = []; \
+             var sum = [,1,,2].reduce(function(acc, value, index, array) { \
+               seen.push(index + ':' + value + ':' + (array.length === 4)); \
+               return acc + value; \
+             }, 0); \
+             sum === 3 && seen.join('|') === '1:1:true|3:2:true'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_reduce_right_skips_holes_and_passes_callback_arguments() {
+        let result = global_eval(
+            "var seen = []; \
+             var sum = [,1,,2].reduceRight(function(acc, value, index, array) { \
+               seen.push(index + ':' + value + ':' + (array.length === 4)); \
+               return acc + value; \
+             }, 0); \
+             sum === 3 && seen.join('|') === '3:2:true|1:1:true'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 
     // ── Array.prototype.every / some edge cases ─────────────────────────
@@ -18368,6 +18819,135 @@ mod tests {
     fn test_some_empty() {
         let result = global_eval("[].some(function(x) { return true })").unwrap();
         assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_every_skips_holes_and_uses_this_arg() {
+        let result = global_eval(
+            "var arr = [1,,2]; \
+             var seen = []; \
+             var ctx = { min: 0 }; \
+             var ok = arr.every(function(value, index, array) { \
+               seen.push(index + ':' + (array === arr) + ':' + (this === ctx)); \
+               return value > this.min; \
+             }, ctx); \
+             ok && seen.join('|') === '0:true:true|2:true:true'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_some_skips_holes_and_uses_this_arg() {
+        let result = global_eval(
+            "var arr = [,1,3]; \
+             var seen = []; \
+             var ctx = { target: 3 }; \
+             var ok = arr.some(function(value, index, array) { \
+               seen.push(index + ':' + (array === arr) + ':' + (this === ctx)); \
+               return value === this.target; \
+             }, ctx); \
+             ok && seen.join('|') === '1:true:true|2:true:true'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_filter_skips_holes_and_uses_this_arg() {
+        let result = global_eval(
+            "var arr = [1,,3]; \
+             var ctx = { threshold: 2 }; \
+             var out = arr.filter(function(value, index, array) { \
+               return value >= this.threshold && array === arr; \
+             }, ctx); \
+             out.length === 1 && out[0] === 3",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_find_visits_holes_and_uses_this_arg() {
+        let result = global_eval(
+            "var arr = [,2]; \
+             var seen = []; \
+             var ctx = { target: undefined }; \
+             var value = arr.find(function(element, index, array) { \
+               seen.push(index + ':' + (element === undefined) + ':' + (array === arr) + ':' + (this === ctx)); \
+               return index === 0 && element === this.target; \
+             }, ctx); \
+             value === undefined && seen[0] === '0:true:true:true'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_find_index_visits_holes_and_uses_this_arg() {
+        let result = global_eval(
+            "var arr = [,2]; \
+             var seen = []; \
+             var ctx = { target: undefined }; \
+             var index = arr.findIndex(function(element, idx, array) { \
+               seen.push(idx + ':' + (element === undefined) + ':' + (array === arr) + ':' + (this === ctx)); \
+               return idx === 0 && element === this.target; \
+             }, ctx); \
+             index === 0 && seen[0] === '0:true:true:true'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_concat_spreads_arrays_and_appends_scalars() {
+        let result = global_eval("[1].concat([2], 3).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("1,2,3".into()));
+    }
+
+    #[test]
+    fn test_array_concat_respects_symbol_is_concat_spreadable_on_object() {
+        let result = global_eval(
+            "var spread = {0: 'a', 1: 'b', length: 2}; \
+             spread[Symbol.isConcatSpreadable] = true; \
+             [].concat(spread).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,b".into()));
+    }
+
+    #[test]
+    fn test_array_concat_respects_false_is_concat_spreadable_on_array() {
+        let result = global_eval(
+            "var arr = [1, 2]; \
+             arr[Symbol.isConcatSpreadable] = false; \
+             var out = [].concat(arr); \
+             out.length === 1 && out[0] === arr",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_length_shrink_truncates_elements() {
+        let result = global_eval(
+            "var a = [1,2,3]; \
+             a.length = 1; \
+             a.length === 1 && a[0] === 1 && !(1 in a) && !(2 in a)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_length_grow_creates_sparse_slots() {
+        let result = global_eval(
+            "var a = [1]; \
+             a.length = 3; \
+             a.length === 3 && a[0] === 1 && !(1 in a) && !(2 in a)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 
     // ── Array.prototype.flat / flatMap tests ────────────────────────────

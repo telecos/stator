@@ -5393,14 +5393,45 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
                     return Ok(());
                 }
             }
+            {
+                let pm = map.borrow();
+                let is_array = matches!(pm.get("__is_array__"), Some(JsValue::Boolean(true)));
+                if is_array && prop_name == "length" {
+                    drop(pm);
+                    let new_len = value.to_number()?;
+                    let new_len_u32 = new_len as u32;
+                    if (new_len_u32 as f64) != new_len
+                        || new_len < 0.0
+                        || !new_len.is_finite()
+                        || new_len_u32 > i32::MAX as u32
+                    {
+                        return Err(StatorError::RangeError("Invalid array length".to_string()));
+                    }
+                    let mut pm = map.borrow_mut();
+                    let current_len = pm
+                        .get("length")
+                        .and_then(|v| v.to_number().ok())
+                        .unwrap_or(0.0)
+                        .max(0.0) as usize;
+                    let new_len = new_len_u32 as usize;
+                    if new_len < current_len {
+                        for idx in new_len..current_len {
+                            pm.remove(&idx.to_string());
+                        }
+                    }
+                    pm.insert("length".to_string(), JsValue::Smi(new_len_u32 as i32));
+                    return Ok(());
+                }
+            }
             map.borrow_mut().insert(prop_name, value);
             // If this is an array-like PlainObject, update "length".
             if let Some(idx) = to_array_index(key) {
                 let new_len = (idx + 1) as i32;
-                let cur_len = match map.borrow().get("length") {
-                    Some(JsValue::Smi(n)) => *n,
-                    _ => return Ok(()),
-                };
+                let cur_len = map
+                    .borrow()
+                    .get("length")
+                    .and_then(|v| v.to_number().ok())
+                    .unwrap_or(0.0) as i32;
                 if new_len > cur_len {
                     map.borrow_mut()
                         .insert("length".to_string(), JsValue::Smi(new_len));
