@@ -542,4 +542,96 @@ mod tests {
             panic!("expected Data");
         }
     }
+
+    // ── to_object produces correct shape ─────────────────────────────────
+
+    #[test]
+    fn test_data_descriptor_to_object_has_all_keys() {
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(42),
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        };
+        let obj = desc.to_object();
+        if let JsValue::PlainObject(map) = obj {
+            let borrow = map.borrow();
+            assert!(borrow.contains_key("value"), "must have 'value'");
+            assert!(borrow.contains_key("writable"), "must have 'writable'");
+            assert!(borrow.contains_key("enumerable"), "must have 'enumerable'");
+            assert!(
+                borrow.contains_key("configurable"),
+                "must have 'configurable'"
+            );
+            // Accessor fields must NOT be present on data descriptor.
+            assert!(!borrow.contains_key("get"), "data desc must not have 'get'");
+            assert!(!borrow.contains_key("set"), "data desc must not have 'set'");
+        } else {
+            panic!("expected PlainObject");
+        }
+    }
+
+    #[test]
+    fn test_accessor_descriptor_to_object_has_all_keys() {
+        let desc = FullPropertyDescriptor::Accessor {
+            get: JsValue::Undefined,
+            set: JsValue::Undefined,
+            enumerable: true,
+            configurable: false,
+        };
+        let obj = desc.to_object();
+        if let JsValue::PlainObject(map) = obj {
+            let borrow = map.borrow();
+            assert!(borrow.contains_key("get"), "must have 'get'");
+            assert!(borrow.contains_key("set"), "must have 'set'");
+            assert!(borrow.contains_key("enumerable"), "must have 'enumerable'");
+            assert!(
+                borrow.contains_key("configurable"),
+                "must have 'configurable'"
+            );
+            // Data fields must NOT be present on accessor descriptor.
+            assert!(
+                !borrow.contains_key("value"),
+                "accessor desc must not have 'value'"
+            );
+            assert!(
+                !borrow.contains_key("writable"),
+                "accessor desc must not have 'writable'"
+            );
+        } else {
+            panic!("expected PlainObject");
+        }
+    }
+
+    // ── validate_against: data→accessor conversion on non-configurable ──
+
+    #[test]
+    fn test_validate_configurable_allows_all() {
+        // Configurable property allows any change.
+        let desc = FullPropertyDescriptor::Accessor {
+            get: JsValue::Undefined,
+            set: JsValue::Undefined,
+            enumerable: true,
+            configurable: true,
+        };
+        let current = PropertyAttributes::CONFIGURABLE | PropertyAttributes::WRITABLE;
+        assert!(desc.validate_against("p", current).is_ok());
+    }
+
+    #[test]
+    fn test_validate_same_writable_false_on_non_configurable_ok() {
+        // Setting writable:false when already false + non-configurable is a no-op.
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        };
+        // Already non-writable, non-configurable.
+        let current = PropertyAttributes::empty();
+        assert!(
+            desc.validate_against("p", current).is_ok(),
+            "narrowing writable (false→false) on non-configurable should succeed"
+        );
+    }
 }

@@ -2945,30 +2945,45 @@ fn make_object() -> JsValue {
             let has_set = desc.contains_key("set");
 
             // Validate non-configurable invariants.
+            // Accessor properties are stored as `__get_X__`/`__set_X__` keys, so
+            // we must check those when the regular key `X` has been removed.
             {
                 let borrow = map.borrow();
-                if borrow.contains_key(key) {
-                    let currently_configurable = borrow.is_configurable(key);
+                let getter_key = format!("__get_{key}__");
+                let setter_key = format!("__set_{key}__");
+                let is_existing_accessor =
+                    borrow.contains_key(&getter_key) || borrow.contains_key(&setter_key);
+                let property_exists = borrow.contains_key(key) || is_existing_accessor;
+
+                if property_exists {
+                    // Resolve configurability from the correct backing key.
+                    let currently_configurable = if borrow.contains_key(key) {
+                        borrow.is_configurable(key)
+                    } else if borrow.contains_key(&getter_key) {
+                        borrow.is_configurable(&getter_key)
+                    } else {
+                        borrow.is_configurable(&setter_key)
+                    };
+
                     if !currently_configurable {
-                        let getter_key = format!("__get_{key}__");
-                        let setter_key = format!("__set_{key}__");
-                        let is_accessor =
-                            borrow.contains_key(&getter_key) || borrow.contains_key(&setter_key);
-                        if (has_get || has_set) && !is_accessor {
+                        // §10.1.6.3 step 6: cannot convert data↔accessor.
+                        if (has_get || has_set) && !is_existing_accessor {
                             return Err(crate::error::StatorError::TypeError(format!(
                                 "Cannot redefine property: {key}"
                             )));
                         }
                         if !has_get
                             && !has_set
-                            && is_accessor
+                            && is_existing_accessor
                             && (desc.contains_key("value") || desc.contains_key("writable"))
                         {
                             return Err(crate::error::StatorError::TypeError(format!(
                                 "Cannot redefine property: {key}"
                             )));
                         }
-                        if !is_accessor
+                        // §10.1.6.3 step 7: non-configurable, non-writable data
+                        // property cannot be made writable.
+                        if !is_existing_accessor
                             && !borrow.is_writable(key)
                             && desc.get("writable").is_some_and(|v| v.to_boolean())
                         {
@@ -2976,8 +2991,9 @@ fn make_object() -> JsValue {
                                 "Cannot redefine property: {key}"
                             )));
                         }
-                        // Cannot change value of non-writable, non-configurable property.
-                        if !is_accessor
+                        // Cannot change value of non-writable, non-configurable
+                        // data property.
+                        if !is_existing_accessor
                             && !borrow.is_writable(key)
                             && desc
                                 .get("value")
@@ -2990,20 +3006,58 @@ fn make_object() -> JsValue {
                                 "Cannot redefine property: {key}"
                             )));
                         }
-                        // Cannot change enumerable of non-configurable property.
+                        // §10.1.6.3 step 4b: cannot change enumerable of
+                        // non-configurable property.
                         if desc.contains_key("enumerable") {
                             let new_e = desc.get("enumerable").is_some_and(|v| v.to_boolean());
-                            if new_e != borrow.is_enumerable(key) {
+                            let current_e = if borrow.contains_key(key) {
+                                borrow.is_enumerable(key)
+                            } else if borrow.contains_key(&getter_key) {
+                                borrow.is_enumerable(&getter_key)
+                            } else {
+                                borrow.is_enumerable(&setter_key)
+                            };
+                            if new_e != current_e {
                                 return Err(crate::error::StatorError::TypeError(format!(
                                     "Cannot redefine property: {key}"
                                 )));
                             }
                         }
-                        // Cannot change configurable from false to true.
+                        // §10.1.6.3 step 4a: cannot change configurable false→true.
                         if desc.get("configurable").is_some_and(|v| v.to_boolean()) {
                             return Err(crate::error::StatorError::TypeError(format!(
                                 "Cannot redefine property: {key}"
                             )));
+                        }
+                        // §10.1.6.3 step 8: non-configurable accessor — cannot
+                        // change getter or setter.
+                        if is_existing_accessor && (has_get || has_set) {
+                            if has_get {
+                                let new_get =
+                                    desc.get("get").cloned().unwrap_or(JsValue::Undefined);
+                                let cur_get = borrow
+                                    .get(&getter_key)
+                                    .cloned()
+                                    .unwrap_or(JsValue::Undefined);
+                                if !new_get.same_value(&cur_get) {
+                                    return Err(crate::error::StatorError::TypeError(format!(
+                                        "Cannot redefine property: {key}"
+                                    )));
+                                }
+                            }
+                            if has_set {
+                                let new_set =
+                                    desc.get("set").cloned().unwrap_or(JsValue::Undefined);
+                                let cur_set = borrow
+                                    .get(&setter_key)
+                                    .cloned()
+                                    .unwrap_or(JsValue::Undefined);
+                                if !new_set.same_value(&cur_set) {
+                                    return Err(crate::error::StatorError::TypeError(format!(
+                                        "Cannot redefine property: {key}"
+                                    )));
+                                }
+                            }
                         }
                     }
                 }
@@ -3697,6 +3751,26 @@ fn make_object() -> JsValue {
             builtin_fn("setPrototypeOf", 2, |args| {
                 let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
                 let proto = args.get(1).unwrap_or(&JsValue::Undefined).clone();
+                // §20.1.2.21 step 1: RequireObjectCoercible(O).
+                if matches!(&obj, JsValue::Null | JsValue::Undefined) {
+                    return Err(StatorError::TypeError(
+                        "Cannot convert undefined or null to object".to_string(),
+                    ));
+                }
+                // §20.1.2.21 step 2: proto must be Object or null.
+                if !matches!(
+                    &proto,
+                    JsValue::Null
+                        | JsValue::PlainObject(_)
+                        | JsValue::Function(_)
+                        | JsValue::NativeFunction(_)
+                        | JsValue::Array(_)
+                ) {
+                    return Err(StatorError::TypeError(
+                        "Object prototype may only be an Object or null".to_string(),
+                    ));
+                }
+                // §20.1.2.21 step 3: if O is not Object, return O.
                 if let JsValue::PlainObject(map) = &obj {
                     // Non-extensible objects: TypeError unless prototype is unchanged.
                     if !map.borrow().extensible {
@@ -20282,5 +20356,727 @@ mod tests {
     fn test_map_returns_array_for_native() {
         let result = global_eval("[1,2,3].map(function(x) { return x * 2; }).join(',')").unwrap();
         assert_eq!(result, JsValue::String("2,4,6".into()));
+    }
+
+    // ── Conformance: defineProperty non-configurable accessor guards ────
+
+    /// Redefining a non-configurable accessor with a different getter must
+    /// throw TypeError (§10.1.6.3 step 8a).
+    #[test]
+    fn e2e_define_property_non_configurable_accessor_redefine_getter() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 1; }, configurable: false }); \
+             Object.defineProperty(o, 'x', { get: function() { return 2; } })",
+        );
+        assert!(
+            result.is_err(),
+            "Expected TypeError for changing getter on non-configurable accessor"
+        );
+    }
+
+    /// Redefining a non-configurable accessor with a different setter must
+    /// throw TypeError (§10.1.6.3 step 8b).
+    #[test]
+    fn e2e_define_property_non_configurable_accessor_redefine_setter() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { set: function(v) {}, configurable: false }); \
+             Object.defineProperty(o, 'x', { set: function(v) {} })",
+        );
+        assert!(
+            result.is_err(),
+            "Expected TypeError for changing setter on non-configurable accessor"
+        );
+    }
+
+    /// Converting a non-configurable accessor to a data property must
+    /// throw TypeError (§10.1.6.3 step 6).
+    #[test]
+    fn e2e_define_property_non_configurable_accessor_to_data() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 1; }, configurable: false }); \
+             Object.defineProperty(o, 'x', { value: 42 })",
+        );
+        assert!(
+            result.is_err(),
+            "Expected TypeError for accessor→data on non-configurable"
+        );
+    }
+
+    /// Changing enumerable on a non-configurable accessor must throw
+    /// TypeError (§10.1.6.3 step 4b).
+    #[test]
+    fn e2e_define_property_non_configurable_accessor_change_enumerable() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 1; }, configurable: false }); \
+             Object.defineProperty(o, 'x', { enumerable: true })",
+        );
+        assert!(
+            result.is_err(),
+            "Expected TypeError for changing enumerable on non-configurable accessor"
+        );
+    }
+
+    /// Setting configurable:true on a non-configurable accessor must throw
+    /// TypeError (§10.1.6.3 step 4a).
+    #[test]
+    fn e2e_define_property_non_configurable_accessor_reconfigure() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 1; }, configurable: false }); \
+             Object.defineProperty(o, 'x', { configurable: true })",
+        );
+        assert!(
+            result.is_err(),
+            "Expected TypeError for configurable false→true on non-configurable accessor"
+        );
+    }
+
+    // ── Conformance: Object.setPrototypeOf validation ───────────────────
+
+    /// `Object.setPrototypeOf(obj, 42)` must throw TypeError because 42
+    /// is not Object and not null (§20.1.2.21 step 2).
+    #[test]
+    fn e2e_set_prototype_of_non_object_proto() {
+        let result = global_eval("var o = {}; Object.setPrototypeOf(o, 42)");
+        assert!(
+            result.is_err(),
+            "Expected TypeError for non-object, non-null proto"
+        );
+    }
+
+    /// `Object.setPrototypeOf(null, {})` must throw TypeError because
+    /// null is not coercible (§20.1.2.21 step 1).
+    #[test]
+    fn e2e_set_prototype_of_null_target() {
+        let result = global_eval("Object.setPrototypeOf(null, {})");
+        assert!(result.is_err(), "Expected TypeError for null target");
+    }
+
+    /// `Object.setPrototypeOf(obj, undefined)` must throw TypeError
+    /// because undefined is not Object or null (§20.1.2.21 step 2).
+    #[test]
+    fn e2e_set_prototype_of_undefined_proto() {
+        let result = global_eval("var o = {}; Object.setPrototypeOf(o, undefined)");
+        assert!(result.is_err(), "Expected TypeError for undefined proto");
+    }
+
+    /// `Object.setPrototypeOf(obj, null)` should succeed and remove
+    /// the prototype.
+    #[test]
+    fn e2e_set_prototype_of_null_proto() {
+        let result =
+            global_eval("var o = {}; Object.setPrototypeOf(o, null); Object.getPrototypeOf(o)")
+                .unwrap();
+        assert_eq!(result, JsValue::Null);
+    }
+
+    // ── Conformance: Object.setPrototypeOf cycle detection ──────────────
+
+    /// Circular prototype chain must throw TypeError.
+    #[test]
+    fn e2e_set_prototype_of_cycle() {
+        let result = global_eval(
+            "var a = {}; var b = {}; \
+             Object.setPrototypeOf(a, b); \
+             Object.setPrototypeOf(b, a)",
+        );
+        assert!(
+            result.is_err(),
+            "Expected TypeError for circular prototype chain"
+        );
+    }
+
+    /// Setting prototype to self must throw TypeError.
+    #[test]
+    fn e2e_set_prototype_of_self() {
+        let result = global_eval("var a = {}; Object.setPrototypeOf(a, a)");
+        assert!(
+            result.is_err(),
+            "Expected TypeError for self-referencing prototype"
+        );
+    }
+
+    /// Setting same prototype again succeeds (no-op).
+    #[test]
+    fn e2e_set_prototype_of_same_proto() {
+        let result = global_eval(
+            "var p = {}; var o = Object.create(p); \
+             Object.setPrototypeOf(o, p); \
+             Object.getPrototypeOf(o) === p",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Non-extensible object: cannot change prototype.
+    #[test]
+    fn e2e_set_prototype_of_non_extensible() {
+        let result = global_eval(
+            "var o = {}; Object.preventExtensions(o); \
+             Object.setPrototypeOf(o, {})",
+        );
+        assert!(
+            result.is_err(),
+            "Expected TypeError for changing prototype on non-extensible"
+        );
+    }
+
+    // ── Conformance: Object.getPrototypeOf ──────────────────────────────
+
+    /// `Object.getPrototypeOf({})` should return Object.prototype (not null).
+    #[test]
+    fn e2e_get_prototype_of_plain_object() {
+        let result = global_eval("Object.getPrototypeOf({}) !== null").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.getPrototypeOf(Object.create(null))` returns null.
+    #[test]
+    fn e2e_get_prototype_of_null_proto() {
+        let result = global_eval("Object.getPrototypeOf(Object.create(null))").unwrap();
+        assert_eq!(result, JsValue::Null);
+    }
+
+    /// getPrototypeOf with null throws TypeError.
+    #[test]
+    fn e2e_get_prototype_of_null_throws() {
+        let result = global_eval("Object.getPrototypeOf(null)");
+        assert!(result.is_err(), "Expected TypeError for null argument");
+    }
+
+    /// getPrototypeOf with undefined throws TypeError.
+    #[test]
+    fn e2e_get_prototype_of_undefined_throws() {
+        let result = global_eval("Object.getPrototypeOf(undefined)");
+        assert!(result.is_err(), "Expected TypeError for undefined argument");
+    }
+
+    // ── Conformance: Object.defineProperty data property ────────────────
+
+    /// `Object.defineProperty` creates a non-writable data property.
+    #[test]
+    fn e2e_define_property_data_non_writable() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 42, writable: false, enumerable: true, configurable: true }); \
+             o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Redefining a non-configurable property must throw.
+    #[test]
+    fn e2e_define_property_non_configurable_redefine() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 1, writable: false, configurable: false }); \
+             Object.defineProperty(o, 'x', { value: 2 })",
+        );
+        assert!(
+            result.is_err(),
+            "Expected TypeError redefining non-configurable property"
+        );
+    }
+
+    /// Narrowing writable true→false on non-configurable is allowed.
+    #[test]
+    fn e2e_define_property_narrow_writable() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 1, writable: true, configurable: false }); \
+             Object.defineProperty(o, 'x', { writable: false }); \
+             var desc = Object.getOwnPropertyDescriptor(o, 'x'); \
+             desc.writable",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// Widening writable false→true on non-configurable must throw.
+    #[test]
+    fn e2e_define_property_widen_writable_throws() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 1, writable: false, configurable: false }); \
+             Object.defineProperty(o, 'x', { writable: true })",
+        );
+        assert!(
+            result.is_err(),
+            "Expected TypeError for widening writable on non-configurable"
+        );
+    }
+
+    /// Converting data→accessor on non-configurable throws.
+    #[test]
+    fn e2e_define_property_data_to_accessor_non_configurable() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 1, configurable: false }); \
+             Object.defineProperty(o, 'x', { get: function() { return 2; } })",
+        );
+        assert!(
+            result.is_err(),
+            "Expected TypeError for data→accessor on non-configurable"
+        );
+    }
+
+    /// Converting data→accessor on configurable succeeds.
+    #[test]
+    fn e2e_define_property_data_to_accessor_configurable() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 1, configurable: true }); \
+             Object.defineProperty(o, 'x', { get: function() { return 99; } }); \
+             o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    /// configurable false→true on non-configurable data throws.
+    #[test]
+    fn e2e_define_property_configurable_false_to_true() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 1, configurable: false }); \
+             Object.defineProperty(o, 'x', { configurable: true })",
+        );
+        assert!(
+            result.is_err(),
+            "Expected TypeError for configurable false→true"
+        );
+    }
+
+    // ── Conformance: Object.defineProperties ────────────────────────────
+
+    /// `Object.defineProperties` defines multiple properties at once.
+    #[test]
+    fn e2e_define_properties_basic() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperties(o, { \
+                 a: { value: 1, enumerable: true, writable: true, configurable: true }, \
+                 b: { value: 2, enumerable: true, writable: true, configurable: true } \
+             }); \
+             o.a + o.b",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Object.defineProperties` on non-object throws TypeError.
+    #[test]
+    fn e2e_define_properties_non_object() {
+        let result = global_eval("Object.defineProperties(42, { x: { value: 1 } })");
+        assert!(result.is_err(), "Expected TypeError for non-object target");
+    }
+
+    // ── Conformance: Object.getOwnPropertyDescriptor ────────────────────
+
+    /// Returns correct data descriptor shape.
+    #[test]
+    fn e2e_get_own_property_descriptor_data() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 42, writable: true, enumerable: false, configurable: true }); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             d.value === 42 && d.writable === true && d.enumerable === false && d.configurable === true",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Returns correct accessor descriptor shape.
+    #[test]
+    fn e2e_get_own_property_descriptor_accessor() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 1; }, enumerable: true, configurable: true }); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             typeof d.get === 'function' && d.enumerable === true && d.configurable === true",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Nonexistent property returns undefined.
+    #[test]
+    fn e2e_get_own_property_descriptor_missing() {
+        let result = global_eval("Object.getOwnPropertyDescriptor({}, 'nope')").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// Accessor descriptor should not have value/writable.
+    #[test]
+    fn e2e_get_own_property_descriptor_accessor_no_value() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 1; }, configurable: true }); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             d.value === undefined && d.writable === undefined",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Conformance: Object.create ──────────────────────────────────────
+
+    /// `Object.create(null)` produces an object with no prototype.
+    #[test]
+    fn e2e_object_create_null() {
+        let result = global_eval("var o = Object.create(null); Object.getPrototypeOf(o)").unwrap();
+        assert_eq!(result, JsValue::Null);
+    }
+
+    /// `Object.create(proto)` sets prototype chain.
+    #[test]
+    fn e2e_object_create_with_proto() {
+        let result = global_eval("var p = { x: 42 }; var o = Object.create(p); o.x").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `Object.create(proto, descriptors)` with property descriptors.
+    #[test]
+    fn e2e_object_create_with_descriptors() {
+        let result = global_eval(
+            "var p = {}; \
+             var o = Object.create(p, { \
+                 x: { value: 10, enumerable: true, writable: true, configurable: true }, \
+                 y: { value: 20, enumerable: true, writable: true, configurable: true } \
+             }); \
+             o.x + o.y",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    /// `Object.create(undefined)` throws TypeError.
+    #[test]
+    fn e2e_object_create_undefined_throws() {
+        let result = global_eval("Object.create(undefined)");
+        assert!(result.is_err(), "Expected TypeError for undefined proto");
+    }
+
+    /// `Object.create(42)` throws TypeError (non-object proto).
+    #[test]
+    fn e2e_object_create_number_throws() {
+        let result = global_eval("Object.create(42)");
+        assert!(result.is_err(), "Expected TypeError for numeric proto");
+    }
+
+    // ── Conformance: hasOwnProperty ─────────────────────────────────────
+
+    /// Own property returns true.
+    #[test]
+    fn e2e_has_own_property_own() {
+        let result = global_eval("var o = { x: 1 }; o.hasOwnProperty('x')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Inherited property returns false.
+    #[test]
+    fn e2e_has_own_property_inherited() {
+        let result =
+            global_eval("var p = { x: 1 }; var o = Object.create(p); o.hasOwnProperty('x')")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// Missing property returns false.
+    #[test]
+    fn e2e_has_own_property_missing() {
+        let result = global_eval("var o = {}; o.hasOwnProperty('nope')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── Conformance: propertyIsEnumerable ────────────────────────────────
+
+    /// Enumerable own property returns true.
+    #[test]
+    fn e2e_property_is_enumerable_own() {
+        let result = global_eval("var o = { x: 1 }; o.propertyIsEnumerable('x')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Non-enumerable own property returns false.
+    #[test]
+    fn e2e_property_is_enumerable_non_enum() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 1, enumerable: false }); \
+             o.propertyIsEnumerable('x')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// Inherited property returns false (only checks own).
+    #[test]
+    fn e2e_property_is_enumerable_inherited() {
+        let result =
+            global_eval("var p = { x: 1 }; var o = Object.create(p); o.propertyIsEnumerable('x')")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── Conformance: for-in enumeration ─────────────────────────────────
+
+    /// for-in enumerates own enumerable string properties.
+    #[test]
+    fn e2e_for_in_own_enumerable() {
+        let result = global_eval(
+            "var o = { a: 1, b: 2, c: 3 }; \
+             var keys = []; \
+             for (var k in o) { keys.push(k); } \
+             keys.join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,b,c".into()));
+    }
+
+    /// for-in skips non-enumerable properties.
+    #[test]
+    fn e2e_for_in_skips_non_enumerable() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'a', { value: 1, enumerable: true, writable: true, configurable: true }); \
+             Object.defineProperty(o, 'b', { value: 2, enumerable: false, writable: true, configurable: true }); \
+             Object.defineProperty(o, 'c', { value: 3, enumerable: true, writable: true, configurable: true }); \
+             var keys = []; \
+             for (var k in o) { keys.push(k); } \
+             keys.join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,c".into()));
+    }
+
+    /// for-in enumerates inherited enumerable properties.
+    #[test]
+    fn e2e_for_in_inherited() {
+        let result = global_eval(
+            "var p = { x: 1 }; \
+             var o = Object.create(p); \
+             o.y = 2; \
+             var keys = []; \
+             for (var k in o) { keys.push(k); } \
+             keys.join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("y,x".into()));
+    }
+
+    /// for-in own property shadows inherited with same name.
+    #[test]
+    fn e2e_for_in_shadowing() {
+        let result = global_eval(
+            "var p = { a: 1, b: 2 }; \
+             var o = Object.create(p); \
+             o.a = 10; \
+             var keys = []; \
+             for (var k in o) { keys.push(k); } \
+             keys.join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,b".into()));
+    }
+
+    /// Non-enumerable own property shadows inherited enumerable one.
+    #[test]
+    fn e2e_for_in_non_enumerable_shadow() {
+        let result = global_eval(
+            "var p = { x: 1 }; \
+             var o = Object.create(p); \
+             Object.defineProperty(o, 'x', { value: 2, enumerable: false }); \
+             var keys = []; \
+             for (var k in o) { keys.push(k); } \
+             keys.length",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// for-in integer indices come first in ascending order.
+    #[test]
+    fn e2e_for_in_integer_indices_first() {
+        let result = global_eval(
+            "var o = {}; o.b = 1; o['2'] = 2; o.a = 3; o['0'] = 4; \
+             var keys = []; \
+             for (var k in o) { keys.push(k); } \
+             keys.join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("0,2,b,a".into()));
+    }
+
+    /// for-in on null/undefined is a no-op.
+    #[test]
+    fn e2e_for_in_null_noop() {
+        let result = global_eval(
+            "var count = 0; \
+             for (var k in null) { count++; } \
+             count",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// for-in on empty object produces no iterations.
+    #[test]
+    fn e2e_for_in_empty() {
+        let result = global_eval(
+            "var count = 0; \
+             for (var k in {}) { count++; } \
+             count",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    // ── Conformance: Object.keys / Object.values / Object.entries ───────
+
+    /// Object.keys returns only own enumerable string keys.
+    #[test]
+    fn e2e_object_keys_only_own_enumerable() {
+        let result = global_eval(
+            "var p = { inherited: 1 }; \
+             var o = Object.create(p); \
+             o.own = 2; \
+             Object.defineProperty(o, 'hidden', { value: 3, enumerable: false }); \
+             Object.keys(o).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("own".into()));
+    }
+
+    // ── Conformance: Object.assign ──────────────────────────────────────
+
+    /// Object.assign copies enumerable own properties.
+    #[test]
+    fn e2e_object_assign_basic() {
+        let result =
+            global_eval("var t = {}; Object.assign(t, { a: 1 }, { b: 2 }); t.a + t.b").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── Conformance: Object.freeze / Object.seal ────────────────────────
+
+    /// Frozen object: assignment to existing property is silently ignored.
+    #[test]
+    fn e2e_object_freeze_no_write() {
+        let result = global_eval("var o = { x: 1 }; Object.freeze(o); o.x = 99; o.x").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// Object.isFrozen returns true after freeze.
+    #[test]
+    fn e2e_object_is_frozen() {
+        let result = global_eval("var o = { x: 1 }; Object.freeze(o); Object.isFrozen(o)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Object.isSealed returns true after seal.
+    #[test]
+    fn e2e_object_is_sealed() {
+        let result = global_eval("var o = { x: 1 }; Object.seal(o); Object.isSealed(o)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Conformance: Object.is ──────────────────────────────────────────
+
+    /// `Object.is(NaN, NaN)` returns true.
+    #[test]
+    fn e2e_object_is_nan() {
+        let result = global_eval("Object.is(NaN, NaN)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.is(0, -0)` returns false.
+    #[test]
+    fn e2e_object_is_zero_neg_zero() {
+        let result = global_eval("Object.is(0, -0)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── Conformance: Object.getOwnPropertyNames ─────────────────────────
+
+    /// Returns all own property names (including non-enumerable).
+    #[test]
+    fn e2e_get_own_property_names() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'a', { value: 1, enumerable: true }); \
+             Object.defineProperty(o, 'b', { value: 2, enumerable: false }); \
+             Object.getOwnPropertyNames(o).length",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    // ── Conformance: Object.hasOwn ──────────────────────────────────────
+
+    /// Object.hasOwn checks own properties.
+    #[test]
+    fn e2e_object_has_own() {
+        let result = global_eval("var o = { x: 1 }; Object.hasOwn(o, 'x')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Object.hasOwn returns false for inherited.
+    #[test]
+    fn e2e_object_has_own_inherited() {
+        let result =
+            global_eval("var p = { x: 1 }; var o = Object.create(p); Object.hasOwn(o, 'x')")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── Conformance: prototype chain property access ────────────────────
+
+    /// Property access walks the prototype chain.
+    #[test]
+    fn e2e_prototype_chain_access() {
+        let result = global_eval(
+            "var gp = { z: 100 }; \
+             var p = Object.create(gp); \
+             p.y = 50; \
+             var o = Object.create(p); \
+             o.x = 10; \
+             o.x + o.y + o.z",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(160));
+    }
+
+    /// 'in' operator checks prototype chain.
+    #[test]
+    fn e2e_in_operator_prototype() {
+        let result = global_eval("var p = { x: 1 }; var o = Object.create(p); 'x' in o").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// 'in' operator returns false for missing key.
+    #[test]
+    fn e2e_in_operator_missing() {
+        let result = global_eval("var o = { x: 1 }; 'y' in o").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── Conformance: Object.getOwnPropertyDescriptors ───────────────────
+
+    /// Returns descriptors for all own properties.
+    #[test]
+    fn e2e_get_own_property_descriptors() {
+        let result = global_eval(
+            "var o = { a: 1, b: 2 }; \
+             var ds = Object.getOwnPropertyDescriptors(o); \
+             ds.a.value + ds.b.value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
     }
 }
