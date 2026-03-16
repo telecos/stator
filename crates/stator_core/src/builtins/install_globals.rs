@@ -21223,6 +21223,206 @@ mod tests {
         let result = global_eval("typeof Promise.any").unwrap();
         assert_eq!(result, JsValue::String("function".into()));
     }
+
+    // ── Promise.any conformance ─────────────────────────────────────────
+
+    /// `Promise.any` resolves with the first fulfilled value.
+    #[test]
+    fn e2e_promise_any_first_fulfilled() {
+        let result = global_eval(
+            r#"
+            var result;
+            Promise.any([
+                Promise.reject(0),
+                Promise.resolve(42),
+                Promise.resolve(99)
+            ]).then(function(v) { result = v; });
+            result
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `Promise.any` rejects with AggregateError when all reject.
+    #[test]
+    fn e2e_promise_any_all_reject() {
+        let result = global_eval(
+            r#"
+            var name;
+            Promise.any([
+                Promise.reject(1),
+                Promise.reject(2)
+            ]).catch(function(e) { name = e.name; });
+            name
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("AggregateError".into()));
+    }
+
+    /// `Promise.any` with empty array rejects with AggregateError.
+    #[test]
+    fn e2e_promise_any_empty_rejects() {
+        let result = global_eval(
+            r#"
+            var name;
+            Promise.any([]).catch(function(e) { name = e.name; });
+            name
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("AggregateError".into()));
+    }
+
+    /// `Promise.any` AggregateError has correct message.
+    #[test]
+    fn e2e_promise_any_aggregate_error_message() {
+        let result = global_eval(
+            r#"
+            var msg;
+            Promise.any([Promise.reject(1)]).catch(function(e) { msg = e.message; });
+            msg
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("All promises were rejected".into()));
+    }
+
+    // ── Promise.race conformance ────────────────────────────────────────
+
+    /// `Promise.race` resolves with the first settled (fulfilled).
+    #[test]
+    fn e2e_promise_race_first_fulfilled() {
+        let result = global_eval(
+            r#"
+            var result;
+            Promise.race([
+                Promise.resolve(10),
+                Promise.resolve(20)
+            ]).then(function(v) { result = v; });
+            result
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// `Promise.race` rejects with first rejection when it settles first.
+    #[test]
+    fn e2e_promise_race_first_rejected() {
+        let result = global_eval(
+            r#"
+            var reason;
+            Promise.race([
+                Promise.reject("err"),
+                Promise.resolve(1)
+            ]).catch(function(r) { reason = r; });
+            reason
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("err".into()));
+    }
+
+    // ── Promise.all edge cases ──────────────────────────────────────────
+
+    /// `Promise.all` with non-promise values treats them as resolved.
+    #[test]
+    fn e2e_promise_all_non_promise_values() {
+        let result = global_eval(
+            r#"
+            var result;
+            Promise.all([1, 2, 3]).then(function(arr) { result = arr.length; });
+            result
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Promise.all` with empty array resolves with empty array.
+    #[test]
+    fn e2e_promise_all_empty_resolves() {
+        let result = global_eval(
+            r#"
+            var result;
+            Promise.all([]).then(function(arr) { result = arr.length; });
+            result
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    // ── Promise.prototype.finally conformance ───────────────────────────
+
+    /// `Promise.prototype.finally` runs on resolve and passes through value.
+    #[test]
+    fn e2e_promise_finally_resolve_passthrough() {
+        let result = global_eval(
+            r#"
+            var finallyRan = false;
+            var result;
+            Promise.resolve(42).finally(function() { finallyRan = true; }).then(function(v) { result = v; });
+            finallyRan && result === 42
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Promise.prototype.finally` runs on reject and passes through reason.
+    #[test]
+    fn e2e_promise_finally_reject_passthrough() {
+        let result = global_eval(
+            r#"
+            var finallyRan = false;
+            var reason;
+            Promise.reject("err").finally(function() { finallyRan = true; }).catch(function(r) { reason = r; });
+            finallyRan && reason === "err"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Promise constructor edge cases ──────────────────────────────────
+
+    /// Calling resolve multiple times: only first counts.
+    #[test]
+    fn e2e_promise_constructor_resolve_once() {
+        let result = global_eval(
+            r#"
+            var result;
+            new Promise(function(resolve, reject) {
+                resolve(1);
+                resolve(2);
+            }).then(function(v) { result = v; });
+            result
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// Calling resolve then reject: only first (resolve) counts.
+    #[test]
+    fn e2e_promise_constructor_resolve_then_reject() {
+        let result = global_eval(
+            r#"
+            var result;
+            var caught = false;
+            new Promise(function(resolve, reject) {
+                resolve(1);
+                reject("err");
+            }).then(function(v) { result = v; }).catch(function() { caught = true; });
+            result === 1 && !caught
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
     // ── Missing builtins: Object.getOwnPropertyDescriptor extended ──────
 
     /// `Object.getOwnPropertyDescriptor` returns all four data descriptor fields.

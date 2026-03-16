@@ -30,6 +30,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use crate::builtins::error::JsError;
 use crate::error::StatorError;
 use crate::interpreter::dispatch_call_with_this;
 use crate::objects::property_map::PropertyMap;
@@ -849,14 +850,17 @@ fn settle_all_settled(
 ///
 /// Returns a promise that:
 /// - Resolves with the first fulfillment value.
-/// - Rejects with a [`JsValue::Array`] of all rejection reasons (in input
-///   order) when **all** input promises have rejected.
+/// - Rejects with a [`JsValue::Error`] (`AggregateError`) wrapping all
+///   rejection reasons (in input order) when **all** input promises have
+///   rejected.
 ///
-/// An empty input rejects immediately with an empty array.
+/// An empty input rejects immediately with an `AggregateError` containing an
+/// empty errors list.
 pub fn promise_any(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromise {
     let count = promises.len();
     if count == 0 {
-        return promise_reject(JsValue::new_array(Vec::new()), queue);
+        let agg = JsError::new_aggregate(Vec::new(), "All promises were rejected".to_string());
+        return promise_reject(JsValue::Error(Rc::new(agg)), queue);
     }
 
     let errors: Rc<RefCell<Vec<Option<JsValue>>>> = Rc::new(RefCell::new(vec![None; count]));
@@ -882,13 +886,13 @@ pub fn promise_any(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromis
             let mut rem = remaining_r.borrow_mut();
             *rem -= 1;
             if *rem == 0 {
-                // SAFETY: all `count` slots have been written before `rem` reaches 0.
                 let all: Vec<JsValue> = errors_r
                     .borrow()
                     .iter()
                     .map(|e| e.clone().expect("slot filled by preceding reaction"))
                     .collect();
-                p_result_r.reject(JsValue::new_array(all), &q_r);
+                let agg = JsError::new_aggregate(all, "All promises were rejected".to_string());
+                p_result_r.reject(JsValue::Error(Rc::new(agg)), &q_r);
             }
             Err(r)
         }) as PromiseHandler);
@@ -1484,10 +1488,24 @@ mod tests {
         );
         queue.drain();
         assert!(p.is_rejected());
-        if let Some(JsValue::Array(arr)) = p.reason() {
-            assert_eq!(*arr.borrow(), vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        if let Some(JsValue::Error(err)) = p.reason() {
+            assert_eq!(err.name(), "AggregateError");
+            assert_eq!(err.errors, vec![JsValue::Smi(1), JsValue::Smi(2)]);
         } else {
-            panic!("expected Array reason");
+            panic!("expected AggregateError reason");
+        }
+    }
+
+    #[test]
+    fn test_promise_any_empty_rejects_with_aggregate_error() {
+        let queue = MicrotaskQueue::new();
+        let p = promise_any(vec![], &queue);
+        assert!(p.is_rejected());
+        if let Some(JsValue::Error(err)) = p.reason() {
+            assert_eq!(err.name(), "AggregateError");
+            assert!(err.errors.is_empty());
+        } else {
+            panic!("expected AggregateError reason");
         }
     }
 
@@ -1674,5 +1692,145 @@ mod tests {
         let p2 = promise_resolve(JsValue::Smi(1), &queue);
         assert_eq!(p1, p1_clone);
         assert_ne!(p1, p2);
+    }
+
+    // ── Edge cases: Promise.race ─────────────────────────────────────────────
+
+    #[test]
+    fn test_promise_race_empty_stays_pending() {
+        let queue = MicrotaskQueue::new();
+        let p = promise_race(vec![], &queue);
+        queue.drain();
+        assert!(p.is_pending());
+    }
+
+    #[test]
+    fn test_promise_race_reject_wins_when_first() {
+        let queue = MicrotaskQueue::new();
+        let p = promise_race(
+            vec![
+                promise_reject(JsValue::Smi(99), &queue),
+                promise_resolve(JsValue::Smi(1), &queue),
+            ],
+            &queue,
+        );
+        queue.drain();
+        assert!(p.is_rejected());
+        assert_eq!(p.reason(), Some(JsValue::Smi(99)));
+    }
+
+    // ── Edge cases: Promise.any ──────────────────────────────────────────────
+
+    #[test]
+    fn test_promise_any_single_fulfilled() {
+        let queue = MicrotaskQueue::new();
+        let p = promise_any(vec![promise_resolve(JsValue::Smi(42), &queue)], &queue);
+        queue.drain();
+        assert!(p.is_fulfilled());
+        assert_eq!(p.value(), Some(JsValue::Smi(42)));
+    }
+
+    #[test]
+    fn test_promise_any_aggregate_error_message() {
+        let queue = MicrotaskQueue::new();
+        let p = promise_any(vec![promise_reject(JsValue::Smi(1), &queue)], &queue);
+        queue.drain();
+        if let Some(JsValue::Error(err)) = p.reason() {
+            assert_eq!(err.message(), "All promises were rejected");
+        } else {
+            panic!("expected AggregateError");
+        }
+    }
+
+    // ── Edge cases: Promise constructor ──────────────────────────────────────
+
+    #[test]
+    fn test_promise_new_resolve_then_reject_only_first_counts() {
+        let queue = MicrotaskQueue::new();
+        let resolve_fn: Rc<RefCell<Option<Box<dyn FnOnce(JsValue)>>>> = Rc::new(RefCell::new(None));
+        let reject_fn: Rc<RefCell<Option<Box<dyn FnOnce(JsValue)>>>> = Rc::new(RefCell::new(None));
+        let rf = Rc::clone(&resolve_fn);
+        let rj = Rc::clone(&reject_fn);
+        let p = promise_new(
+            move |resolve, reject| {
+                *rf.borrow_mut() = Some(resolve);
+                *rj.borrow_mut() = Some(reject);
+            },
+            &queue,
+        );
+        // Call resolve first
+        if let Some(f) = resolve_fn.borrow_mut().take() {
+            f(JsValue::Smi(1));
+        }
+        // Call reject second — should be ignored
+        if let Some(f) = reject_fn.borrow_mut().take() {
+            f(JsValue::Smi(2));
+        }
+        queue.drain();
+        assert!(p.is_fulfilled());
+        assert_eq!(p.value(), Some(JsValue::Smi(1)));
+    }
+
+    #[test]
+    fn test_promise_new_reject_then_resolve_only_first_counts() {
+        let queue = MicrotaskQueue::new();
+        let resolve_fn: Rc<RefCell<Option<Box<dyn FnOnce(JsValue)>>>> = Rc::new(RefCell::new(None));
+        let reject_fn: Rc<RefCell<Option<Box<dyn FnOnce(JsValue)>>>> = Rc::new(RefCell::new(None));
+        let rf = Rc::clone(&resolve_fn);
+        let rj = Rc::clone(&reject_fn);
+        let p = promise_new(
+            move |resolve, reject| {
+                *rf.borrow_mut() = Some(resolve);
+                *rj.borrow_mut() = Some(reject);
+            },
+            &queue,
+        );
+        // Call reject first
+        if let Some(f) = reject_fn.borrow_mut().take() {
+            f(JsValue::String("error".into()));
+        }
+        // Call resolve second — should be ignored
+        if let Some(f) = resolve_fn.borrow_mut().take() {
+            f(JsValue::Smi(1));
+        }
+        queue.drain();
+        assert!(p.is_rejected());
+        assert_eq!(p.reason(), Some(JsValue::String("error".into())));
+    }
+
+    // ── Edge cases: Promise.finally passthrough ─────────────────────────────
+
+    #[test]
+    fn test_promise_finally_passes_through_fulfilled_value() {
+        let queue = MicrotaskQueue::new();
+        let p = promise_resolve(JsValue::Smi(42), &queue);
+        let p2 = promise_finally(&p, Box::new(|| Ok(())), &queue);
+        queue.drain();
+        assert!(p2.is_fulfilled());
+        assert_eq!(p2.value(), Some(JsValue::Smi(42)));
+    }
+
+    #[test]
+    fn test_promise_finally_passes_through_rejected_reason() {
+        let queue = MicrotaskQueue::new();
+        let p = promise_reject(JsValue::String("fail".into()), &queue);
+        let p2 = promise_finally(&p, Box::new(|| Ok(())), &queue);
+        queue.drain();
+        assert!(p2.is_rejected());
+        assert_eq!(p2.reason(), Some(JsValue::String("fail".into())));
+    }
+
+    // ── Edge cases: Promise.all with mixed values ───────────────────────────
+
+    #[test]
+    fn test_promise_all_single_element() {
+        let queue = MicrotaskQueue::new();
+        let p = promise_all(vec![promise_resolve(JsValue::Smi(7), &queue)], &queue);
+        queue.drain();
+        if let Some(JsValue::Array(arr)) = p.value() {
+            assert_eq!(*arr.borrow(), vec![JsValue::Smi(7)]);
+        } else {
+            panic!("expected Array");
+        }
     }
 }
