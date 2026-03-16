@@ -251,6 +251,11 @@ struct FunctionCompiler {
     /// for-of loop, we emit [`Opcode::IteratorClose`] for the iterator
     /// register before jumping to the break target.
     for_of_iter_regs: HashMap<usize, Register>,
+    /// Stack of finally blocks that must be inlined before an abrupt
+    /// completion (return / break / continue) can exit the enclosing
+    /// `try` body.  Each entry is a reference to the AST `BlockStmt`
+    /// that must be compiled inline.
+    finally_stack: Vec<crate::parser::ast::BlockStmt>,
 }
 
 impl FunctionCompiler {
@@ -293,6 +298,7 @@ impl FunctionCompiler {
             is_strict: false,
             using_vars: vec![Vec::new()],
             for_of_iter_regs: HashMap::new(),
+            finally_stack: Vec::new(),
         };
         // Register simple ident params in the scope immediately; complex
         // patterns are handled by `emit_param_prologue`.
@@ -804,6 +810,20 @@ impl FunctionCompiler {
         let idx = self.constant_pool.len() as u32;
         self.constant_pool.push(entry);
         idx
+    }
+
+    // ── Finally inlining ────────────────────────────────────────────────────
+
+    /// Inline all pending finally blocks.  Called before an abrupt
+    /// completion (return / break / continue) so that every enclosing
+    /// `try-finally` has its finally body executed before control
+    /// transfers away.
+    fn inline_pending_finally_blocks(&mut self) -> StatorResult<()> {
+        let blocks: Vec<_> = self.finally_stack.clone();
+        for block in blocks.iter().rev() {
+            self.compile_block(block)?;
+        }
+        Ok(())
     }
 
     // ── Feedback slots ───────────────────────────────────────────────────────
@@ -1891,6 +1911,7 @@ impl FunctionCompiler {
             is_strict: true,
             using_vars: vec![Vec::new()],
             for_of_iter_regs: HashMap::new(),
+            finally_stack: Vec::new(),
         };
 
         let this_reg = Register::parameter(0);
@@ -2120,9 +2141,9 @@ impl FunctionCompiler {
     /// Compile a `return [argument]` statement.
     fn compile_return(&mut self, s: &crate::parser::ast::ReturnStmt) -> StatorResult<()> {
         if let Some(arg) = &s.argument {
-            // Mark expressions in return position as tail calls so that
-            // compile_call / compile_conditional can emit TailCall opcodes.
-            self.in_tail_position = true;
+            // Disable tail calls when inside a finally scope — the finally
+            // block must run before the frame is replaced.
+            self.in_tail_position = self.finally_stack.is_empty();
             self.compile_expr(arg)?;
             self.in_tail_position = false;
         } else {
@@ -2141,6 +2162,17 @@ impl FunctionCompiler {
                 vec![to_reg_op(iter_reg)],
             ));
         }
+        // Inline pending finally blocks before the actual return so that
+        // `try { return 1; } finally { … }` executes the finally body.
+        if !self.finally_stack.is_empty() {
+            let save_reg = self.allocator.allocate_temporary();
+            self.emit_star(save_reg);
+            self.inline_pending_finally_blocks()?;
+            self.emit_ldar(save_reg);
+            self.allocator
+                .release_temporary(save_reg)
+                .map_err(|e| StatorError::Internal(e.to_string()))?;
+        }
         self.emit(Instruction::new_unchecked(Opcode::Return, vec![]));
         Ok(())
     }
@@ -2150,6 +2182,8 @@ impl FunctionCompiler {
     /// Labeled breaks look up the target in `label_map`; unlabeled breaks
     /// use the innermost `loop_stack` entry.
     fn compile_break(&mut self, s: &crate::parser::ast::BreakStmt) -> StatorResult<()> {
+        // Inline pending finally blocks before the jump.
+        self.inline_pending_finally_blocks()?;
         if let Some(label) = &s.label {
             let (_, break_label) = *self.label_map.get(&label.name).ok_or_else(|| {
                 StatorError::SyntaxError(format!("undefined label '{}'", label.name))
@@ -2199,6 +2233,8 @@ impl FunctionCompiler {
     /// `IteratorClose` for each intervening for-of iterator (excluding the
     /// target loop itself, since we are continuing it, not exiting it).
     fn compile_continue(&mut self, s: &crate::parser::ast::ContinueStmt) -> StatorResult<()> {
+        // Inline pending finally blocks before the jump.
+        self.inline_pending_finally_blocks()?;
         if let Some(label) = &s.label {
             let (continue_label, break_label) =
                 *self.label_map.get(&label.name).ok_or_else(|| {
@@ -2308,7 +2344,7 @@ impl FunctionCompiler {
                     Opcode::TestEqualStrict,
                     vec![to_reg_op(disc_reg), slot],
                 ));
-                self.emit_jump(Opcode::JumpIfToBooleanTrue, case_labels[i]);
+                self.emit_jump(Opcode::JumpIfTrue, case_labels[i]);
             } else {
                 default_label = Some(case_labels[i]);
             }
@@ -2323,6 +2359,10 @@ impl FunctionCompiler {
 
         self.loop_stack.push((end_label, break_label));
 
+        // Open a block scope for the switch body so that `let`/`const`
+        // declarations in case clauses are properly scoped.
+        self.push_scope();
+
         // Emit case bodies.
         for (i, case) in s.cases.iter().enumerate() {
             self.bind_label(case_labels[i]);
@@ -2331,6 +2371,7 @@ impl FunctionCompiler {
             }
         }
 
+        self.pop_scope();
         self.loop_stack.pop();
 
         self.bind_label(end_label);
@@ -2388,10 +2429,22 @@ impl FunctionCompiler {
     /// [after_ex_handler] ...
     /// ```
     fn compile_try(&mut self, s: &crate::parser::ast::TryStmt) -> StatorResult<()> {
+        // Push the finalizer onto the finally stack so that return / break /
+        // continue inside the try body inline the finally block before the
+        // abrupt completion.
+        if let Some(finalizer) = &s.finalizer {
+            self.finally_stack.push(finalizer.clone());
+        }
+
         let try_start = self.instructions.len() as u32;
 
         // Compile try block.
         self.compile_block(&s.block)?;
+
+        // Pop the finalizer — normal-path finally is compiled explicitly below.
+        if s.finalizer.is_some() {
+            self.finally_stack.pop();
+        }
 
         let try_end = self.instructions.len() as u32;
 
@@ -10075,5 +10128,277 @@ mod tests {
         let result =
             crate::builtins::global::global_eval("var r; { const c = 100; r = c; } r").unwrap();
         assert_eq!(result, JsValue::Smi(100));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // E2E conformance: switch, labels, try/catch/finally, operators
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ── switch statement ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_switch_strict_comparison() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 'no'; switch(1) { case '1': r = 'loose'; break; case 1: r = 'strict'; break; } r",
+        ).unwrap();
+        assert_eq!(result, JsValue::String("strict".into()));
+    }
+
+    #[test]
+    fn test_switch_fallthrough_chain() {
+        let result = crate::builtins::global::global_eval(
+            "var x = 0; switch(2) { case 1: x += 1; case 2: x += 10; case 3: x += 100; } x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(110));
+    }
+
+    #[test]
+    fn test_switch_default_in_middle() {
+        let result = crate::builtins::global::global_eval(
+            "var x = 0; switch(99) { case 1: x = 1; break; default: x = 50; case 2: x += 10; } x",
+        )
+        .unwrap();
+        // 99 → default (x = 50) → falls through to case 2 (x = 60)
+        assert_eq!(result, JsValue::Smi(60));
+    }
+
+    #[test]
+    fn test_switch_first_match_wins() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 'none'; switch(1) { case 1: r = 'first'; break; case 1: r = 'second'; break; } r",
+        ).unwrap();
+        assert_eq!(result, JsValue::String("first".into()));
+    }
+
+    #[test]
+    fn test_switch_block_scoping_let() {
+        let result = crate::builtins::global::global_eval(
+            "var r; switch(1) { case 1: let v = 42; r = v; break; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_switch_on_string() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; switch('hello') { case 'hello': r = 1; break; case 'world': r = 2; break; } r",
+        ).unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_switch_no_match_no_default() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 99; switch(5) { case 1: r = 1; break; case 2: r = 2; break; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    // ── labeled statements ───────────────────────────────────────────────
+
+    #[test]
+    fn test_label_break_block() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 1; myLabel: { r = 2; break myLabel; r = 3; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_labeled_continue_for_skips() {
+        let result = crate::builtins::global::global_eval(
+            "var s = 0; outer: for (var i = 0; i < 3; i++) { for (var j = 0; j < 3; j++) { if (j === 1) continue outer; s++; } } s",
+        ).unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_nested_labels_break_outer() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; a: { b: { r = 1; break a; r = 2; } r = 3; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_labeled_for_break() {
+        let result = crate::builtins::global::global_eval(
+            "var s = 0; loop: for (var i = 0; i < 10; i++) { if (i === 3) break loop; s += i; } s",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── try / catch / finally ────────────────────────────────────────────
+
+    #[test]
+    fn test_finally_always_runs_normal() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; try { r = 1; } finally { r += 10; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(11));
+    }
+
+    #[test]
+    fn test_finally_runs_on_return() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; (function() { try { r = 1; return; } finally { r = 99; } })(); r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_catch_binding_optional() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; try { throw 'oops'; } catch { r = 1; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_finally_overrides_return() {
+        let result = crate::builtins::global::global_eval(
+            "(function() { try { return 1; } finally { return 2; } })()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_nested_try_catch_inner_outer() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; try { try { throw 'inner'; } catch(e) { r = 1; throw 'outer'; } } catch(e2) { r += 10; } r",
+        ).unwrap();
+        assert_eq!(result, JsValue::Smi(11));
+    }
+
+    #[test]
+    fn test_try_finally_exception_propagates() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; try { try { throw 'err'; } finally { r = 5; } } catch(e) { r += 10; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(15));
+    }
+
+    #[test]
+    fn test_try_in_loop_with_break() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; for (var i = 0; i < 5; i++) { try { if (i === 2) break; r += 1; } finally { r += 10; } } r",
+        ).unwrap();
+        // i=0: r=1, finally r=11; i=1: r=12, finally r=22; i=2: break, finally r=32
+        assert_eq!(result, JsValue::Smi(32));
+    }
+
+    #[test]
+    fn test_try_in_loop_with_continue() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; for (var i = 0; i < 3; i++) { try { if (i === 1) continue; r += 1; } finally { r += 10; } } r",
+        ).unwrap();
+        // i=0: r=1, finally r=11; i=1: continue, finally r=21; i=2: r=22, finally r=32
+        assert_eq!(result, JsValue::Smi(32));
+    }
+
+    // ── comma operator ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_comma_evaluates_all_returns_last() {
+        let result =
+            crate::builtins::global::global_eval("var a = 0; var b = (a = 1, a = 2, a + 10); b")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(12));
+    }
+
+    #[test]
+    fn test_comma_side_effects() {
+        let result = crate::builtins::global::global_eval("var x = 0; (x++, x++, x++); x").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── conditional (ternary) ────────────────────────────────────────────
+
+    #[test]
+    fn test_ternary_true_branch() {
+        let result = crate::builtins::global::global_eval("true ? 1 : 2").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_ternary_false_branch() {
+        let result = crate::builtins::global::global_eval("false ? 1 : 2").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_ternary_deeply_nested() {
+        let result = crate::builtins::global::global_eval(
+            "var x = 7; x > 10 ? 'big' : x > 5 ? 'mid' : 'small'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("mid".into()));
+    }
+
+    #[test]
+    fn test_ternary_short_circuit() {
+        let result =
+            crate::builtins::global::global_eval("var x = 0; true ? (x = 1) : (x = 2); x").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    // ── void operator ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_void_returns_undefined() {
+        let result = crate::builtins::global::global_eval("void 0").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_void_evaluates_argument() {
+        let result = crate::builtins::global::global_eval("var x = 0; void (x = 5); x").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_void_expression() {
+        let result = crate::builtins::global::global_eval("void (1 + 2)").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    // ── delete operator ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_delete_property_returns_true() {
+        let result =
+            crate::builtins::global::global_eval("var obj = {a: 1}; delete obj.a").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_delete_removes_property() {
+        let result =
+            crate::builtins::global::global_eval("var obj = {a: 1, b: 2}; delete obj.a; obj.a")
+                .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_delete_non_existent_returns_true() {
+        let result = crate::builtins::global::global_eval("var obj = {}; delete obj.nope").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_delete_non_reference_returns_true() {
+        let result = crate::builtins::global::global_eval("delete 42").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 }
