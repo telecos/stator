@@ -130,7 +130,7 @@ use crate::interpreter::{dispatch_call_value, dispatch_call_with_this};
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
-use crate::objects::value::{JsValue, NativeIterator};
+use crate::objects::value::{JsValue, NativeIterator, number_to_string};
 use std::collections::HashSet;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1602,20 +1602,316 @@ fn json_value_to_js_value(jv: &crate::builtins::json::JsonValue) -> JsValue {
     }
 }
 
-/// A boxed replacer function for `JSON.stringify`.
-type JsonReplacerFn = Box<
-    dyn Fn(
-        &str,
-        &crate::builtins::json::JsonValue,
-    ) -> StatorResult<Option<crate::builtins::json::JsonValue>>,
->;
+/// Return the JSON string representation of `s`.
+fn json_stringify_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\x08' => out.push_str("\\b"),
+            '\x0C' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(&mut out, "\\u{:04X}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Resolve `JSON.stringify` indentation from the `space` argument.
+fn json_stringify_indent(space: Option<&JsValue>) -> String {
+    const MAX_GAP: usize = 10;
+
+    match space {
+        Some(JsValue::Smi(n)) => " "
+            .repeat((*n).max(0) as usize)
+            .chars()
+            .take(MAX_GAP)
+            .collect(),
+        Some(JsValue::HeapNumber(n)) => {
+            let count = n.clamp(0.0, MAX_GAP as f64).trunc() as usize;
+            " ".repeat(count)
+        }
+        Some(JsValue::String(s)) => s.chars().take(MAX_GAP).collect(),
+        _ => String::new(),
+    }
+}
+
+/// Collect the property allow-list from a replacer array.
+fn json_stringify_property_list(replacer: Option<&JsValue>) -> Vec<String> {
+    let Some(replacer) = replacer else {
+        return Vec::new();
+    };
+
+    let (elements, _) = to_array_like_elements(replacer);
+    let mut properties = Vec::new();
+    for element in elements {
+        let property = match element {
+            JsValue::String(s) => Some(s.to_string()),
+            JsValue::Smi(n) => Some(n.to_string()),
+            JsValue::HeapNumber(n) if n.is_finite() => Some(number_to_string(n)),
+            _ => None,
+        };
+        if let Some(property) = property
+            && !properties.iter().any(|existing| existing == &property)
+        {
+            properties.push(property);
+        }
+    }
+    properties
+}
+
+/// Read a JSON-visible property from `holder`.
+fn json_get_property(holder: &JsValue, key: &str) -> JsValue {
+    match holder {
+        JsValue::Array(items) => key
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| items.borrow().get(index).cloned())
+            .unwrap_or(JsValue::Undefined),
+        JsValue::PlainObject(map) => map.borrow().get(key).cloned().unwrap_or(JsValue::Undefined),
+        _ => JsValue::Undefined,
+    }
+}
+
+/// Return a stable identity key for circular JSON detection.
+fn json_identity_key(value: &JsValue) -> Option<usize> {
+    match value {
+        JsValue::Array(items) => Some(Rc::as_ptr(items) as usize),
+        JsValue::PlainObject(map) => Some(Rc::as_ptr(map) as usize),
+        JsValue::Object(ptr) => Some(*ptr as usize),
+        _ => None,
+    }
+}
+
+/// Return the callable `toJSON` method for `value`, if present.
+fn json_get_to_json(value: &JsValue) -> Option<JsValue> {
+    match value {
+        JsValue::PlainObject(map) => map.borrow().get("toJSON").cloned().filter(is_callable),
+        _ => None,
+    }
+}
+
+/// Serialize a property using the ECMAScript `JSON.stringify` algorithm.
+fn json_serialize_property(
+    holder: &JsValue,
+    key: &str,
+    replacer_fn: Option<&JsValue>,
+    property_list: Option<&[String]>,
+    indent: &str,
+    depth: usize,
+    in_progress: &mut HashSet<usize>,
+) -> StatorResult<Option<String>> {
+    let mut value = json_get_property(holder, key);
+
+    if let Some(to_json) = json_get_to_json(&value) {
+        value = call_callback_with_this(
+            &to_json,
+            value.clone(),
+            vec![JsValue::String(key.to_string().into())],
+        )?;
+    }
+
+    if let Some(replacer_fn) = replacer_fn {
+        value = call_callback_with_this(
+            replacer_fn,
+            holder.clone(),
+            vec![JsValue::String(key.to_string().into()), value],
+        )?;
+    }
+
+    json_serialize_value(
+        &value,
+        replacer_fn,
+        property_list,
+        indent,
+        depth,
+        in_progress,
+    )
+}
+
+/// Serialize a JavaScript value to a JSON string fragment.
+fn json_serialize_value(
+    value: &JsValue,
+    replacer_fn: Option<&JsValue>,
+    property_list: Option<&[String]>,
+    indent: &str,
+    depth: usize,
+    in_progress: &mut HashSet<usize>,
+) -> StatorResult<Option<String>> {
+    match value {
+        JsValue::Undefined
+        | JsValue::TheHole
+        | JsValue::Symbol(_)
+        | JsValue::Function(_)
+        | JsValue::NativeFunction(_)
+        | JsValue::Generator(_)
+        | JsValue::Iterator(_)
+        | JsValue::Error(_)
+        | JsValue::Promise(_)
+        | JsValue::Context(_)
+        | JsValue::Proxy(_)
+        | JsValue::ArrayBuffer(_)
+        | JsValue::TypedArray(_)
+        | JsValue::DataView(_) => Ok(None),
+        JsValue::Null => Ok(Some("null".to_string())),
+        JsValue::Boolean(b) => Ok(Some(if *b { "true" } else { "false" }.to_string())),
+        JsValue::Smi(n) => Ok(Some(n.to_string())),
+        JsValue::HeapNumber(n) => Ok(Some(if n.is_finite() {
+            number_to_string(*n)
+        } else {
+            "null".to_string()
+        })),
+        JsValue::String(s) => Ok(Some(json_stringify_string(s))),
+        JsValue::BigInt(_) => Err(StatorError::TypeError(
+            "Do not know how to serialize a BigInt".to_string(),
+        )),
+        JsValue::Array(items) => {
+            let Some(identity) = json_identity_key(value) else {
+                unreachable!("arrays must have an identity key");
+            };
+            if !in_progress.insert(identity) {
+                return Err(StatorError::TypeError(
+                    "Converting circular structure to JSON".to_string(),
+                ));
+            }
+
+            let result = (|| {
+                let len = items.borrow().len();
+                if len == 0 {
+                    return Ok(Some("[]".to_string()));
+                }
+
+                let holder = JsValue::Array(Rc::clone(items));
+                let use_indent = !indent.is_empty();
+                let inner_indent = indent.repeat(depth + 1);
+                let outer_indent = indent.repeat(depth);
+                let mut parts = Vec::with_capacity(len);
+
+                for index in 0..len {
+                    let item = json_serialize_property(
+                        &holder,
+                        &index.to_string(),
+                        replacer_fn,
+                        property_list,
+                        indent,
+                        depth + 1,
+                        in_progress,
+                    )?;
+                    parts.push(item.unwrap_or_else(|| "null".to_string()));
+                }
+
+                if use_indent {
+                    let joined = parts.join(&format!(",\n{inner_indent}"));
+                    Ok(Some(format!("[\n{inner_indent}{joined}\n{outer_indent}]")))
+                } else {
+                    Ok(Some(format!("[{}]", parts.join(","))))
+                }
+            })();
+
+            in_progress.remove(&identity);
+            result
+        }
+        JsValue::PlainObject(map) => {
+            let Some(identity) = json_identity_key(value) else {
+                unreachable!("plain objects must have an identity key");
+            };
+            if !in_progress.insert(identity) {
+                return Err(StatorError::TypeError(
+                    "Converting circular structure to JSON".to_string(),
+                ));
+            }
+
+            let result = (|| {
+                let holder = JsValue::PlainObject(Rc::clone(map));
+                let use_indent = !indent.is_empty();
+                let inner_indent = indent.repeat(depth + 1);
+                let outer_indent = indent.repeat(depth);
+                let keys: Vec<String> = if let Some(property_list) = property_list {
+                    property_list.to_vec()
+                } else {
+                    map.borrow().enumerable_keys().cloned().collect()
+                };
+
+                let mut parts = Vec::new();
+                for key in keys {
+                    let item = json_serialize_property(
+                        &holder,
+                        &key,
+                        replacer_fn,
+                        property_list,
+                        indent,
+                        depth + 1,
+                        in_progress,
+                    )?;
+                    if let Some(item) = item {
+                        let key = json_stringify_string(&key);
+                        if use_indent {
+                            parts.push(format!("{key}: {item}"));
+                        } else {
+                            parts.push(format!("{key}:{item}"));
+                        }
+                    }
+                }
+
+                if parts.is_empty() {
+                    Ok(Some("{}".to_string()))
+                } else if use_indent {
+                    let joined = parts.join(&format!(",\n{inner_indent}"));
+                    Ok(Some(format!(
+                        "{{\n{inner_indent}{joined}\n{outer_indent}}}"
+                    )))
+                } else {
+                    Ok(Some(format!("{{{}}}", parts.join(","))))
+                }
+            })();
+
+            in_progress.remove(&identity);
+            result
+        }
+        JsValue::Object(_) => Ok(Some("{}".to_string())),
+    }
+}
+
+/// Stringify a JavaScript value using ECMAScript `JSON.stringify`.
+fn json_stringify_runtime(
+    value: &JsValue,
+    replacer: Option<&JsValue>,
+    space: Option<&JsValue>,
+) -> StatorResult<Option<String>> {
+    let replacer_fn = replacer.filter(|candidate| is_callable(candidate));
+    let property_list_storage = json_stringify_property_list(replacer);
+    let property_list =
+        (!property_list_storage.is_empty()).then_some(property_list_storage.as_slice());
+    let indent = json_stringify_indent(space);
+
+    let mut wrapper = PropertyMap::new();
+    wrapper.insert(String::new(), value.clone());
+    let wrapper = JsValue::PlainObject(Rc::new(RefCell::new(wrapper)));
+    let mut in_progress = HashSet::new();
+
+    json_serialize_property(
+        &wrapper,
+        "",
+        replacer_fn,
+        property_list,
+        &indent,
+        0,
+        &mut in_progress,
+    )
+}
 
 /// Build the `JSON` namespace object.
 #[inline(never)]
 fn make_json() -> JsValue {
-    use crate::builtins::json::{
-        JsonReplacer, JsonSpace, JsonValue, js_value_to_json, json_parse, json_stringify_js_value,
-    };
+    use crate::builtins::json::json_parse;
 
     let mut props = PropertyMap::new();
 
@@ -1628,7 +1924,12 @@ fn make_json() -> JsValue {
 
             // §25.5.1 — apply the optional reviver function bottom-up.
             match args.get(1) {
-                Some(reviver) if is_callable(reviver) => apply_js_reviver(js_val, "", reviver),
+                Some(reviver) if is_callable(reviver) => {
+                    let mut wrapper = PropertyMap::new();
+                    wrapper.insert(String::new(), js_val);
+                    let wrapper = JsValue::PlainObject(Rc::new(RefCell::new(wrapper)));
+                    apply_js_reviver(&wrapper, "", reviver)
+                }
                 _ => Ok(js_val),
             }
         }),
@@ -1638,62 +1939,7 @@ fn make_json() -> JsValue {
         native(|args| {
             let val = args.first().unwrap_or(&JsValue::Undefined);
 
-            // Build optional replacer function closure from the second argument.
-            let repl_fn_closure: Option<JsonReplacerFn> = match args.get(1) {
-                Some(JsValue::NativeFunction(f)) => {
-                    let f = f.clone();
-                    Some(Box::new(
-                        move |key: &str, val: &JsonValue| -> StatorResult<Option<JsonValue>> {
-                            let js_key = JsValue::String(key.to_string().into());
-                            let js_val = json_value_to_js_value(val);
-                            let result = f(vec![js_key, js_val])?;
-                            match result {
-                                JsValue::Undefined => Ok(None),
-                                other => match js_value_to_json(&other)? {
-                                    Some(jv) => Ok(Some(jv)),
-                                    None => Ok(None),
-                                },
-                            }
-                        },
-                    ))
-                }
-                _ => None,
-            };
-
-            // Build optional replacer array from the second argument.
-            let repl_strings: Vec<String> = match args.get(1) {
-                Some(JsValue::Array(items)) => items
-                    .borrow()
-                    .iter()
-                    .filter_map(|v| {
-                        if let JsValue::String(s) = v {
-                            Some(s.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
-
-            // Assemble the JsonReplacer enum.
-            let replacer: Option<JsonReplacer<'_>> = if let Some(ref f) = repl_fn_closure {
-                Some(JsonReplacer::Function(f.as_ref()))
-            } else if matches!(args.get(1), Some(JsValue::Array(_))) {
-                Some(JsonReplacer::Array(repl_strings))
-            } else {
-                None
-            };
-
-            // Build optional space from the third argument.
-            let space: Option<JsonSpace> = match args.get(2) {
-                Some(JsValue::Smi(n)) => Some(JsonSpace::Count((*n).max(0) as u32)),
-                Some(JsValue::HeapNumber(n)) => Some(JsonSpace::Count(n.clamp(0.0, 10.0) as u32)),
-                Some(JsValue::String(s)) => Some(JsonSpace::Str(s.to_string())),
-                _ => None,
-            };
-
-            match json_stringify_js_value(val, replacer.as_ref(), space.as_ref())? {
+            match json_stringify_runtime(val, args.get(1), args.get(2))? {
                 Some(s) => Ok(JsValue::String(s.into())),
                 None => Ok(JsValue::Undefined),
             }
@@ -1744,33 +1990,36 @@ fn make_json() -> JsValue {
 
 /// Walk a `JsValue` tree bottom-up, calling `reviver(key, value)` at each
 /// node — the ECMAScript `InternalizeJSONProperty` algorithm (§25.5.1.1).
-fn apply_js_reviver(value: JsValue, key: &str, reviver: &JsValue) -> StatorResult<JsValue> {
+fn apply_js_reviver(holder: &JsValue, key: &str, reviver: &JsValue) -> StatorResult<JsValue> {
+    let value = json_get_property(holder, key);
     let value = match value {
-        JsValue::PlainObject(ref map) => {
+        JsValue::PlainObject(map) => {
             let keys: Vec<String> = map.borrow().keys().cloned().collect();
-            for k in keys {
-                let child = map.borrow().get(&k).cloned().unwrap_or(JsValue::Undefined);
-                let new_child = apply_js_reviver(child, &k, reviver)?;
-                if matches!(new_child, JsValue::Undefined) {
-                    map.borrow_mut().remove(&k);
+            let object = JsValue::PlainObject(Rc::clone(&map));
+            for property in keys {
+                let revived = apply_js_reviver(&object, &property, reviver)?;
+                if revived.is_undefined() {
+                    map.borrow_mut().remove(&property);
                 } else {
-                    map.borrow_mut().insert(k, new_child);
+                    map.borrow_mut().insert(property, revived);
                 }
             }
-            value
+            object
         }
-        JsValue::Array(ref items) => {
-            let mut new_items = Vec::with_capacity(items.borrow().len());
-            for (i, item) in items.borrow().iter().enumerate() {
-                let new_item = apply_js_reviver(item.clone(), &i.to_string(), reviver)?;
-                new_items.push(new_item);
+        JsValue::Array(items) => {
+            let array = JsValue::Array(Rc::clone(&items));
+            let len = items.borrow().len();
+            for index in 0..len {
+                let revived = apply_js_reviver(&array, &index.to_string(), reviver)?;
+                items.borrow_mut()[index] = revived;
             }
-            JsValue::new_array(new_items)
+            array
         }
         other => other,
     };
-    call_callback(
+    call_callback_with_this(
         reviver,
+        holder.clone(),
         vec![JsValue::String(key.to_string().into()), value],
     )
 }
@@ -13093,7 +13342,10 @@ mod tests {
             }
         }));
 
-        let result = apply_js_reviver(js_val, "", &reviver).unwrap();
+        let mut wrapper = PropertyMap::new();
+        wrapper.insert(String::new(), js_val);
+        let wrapper = JsValue::PlainObject(Rc::new(RefCell::new(wrapper)));
+        let result = apply_js_reviver(&wrapper, "", &reviver).unwrap();
         // The top-level array itself is passed through the reviver too,
         // so the result should be the array (reviver returns it unchanged).
         if let JsValue::Array(arr) = result {
@@ -13124,7 +13376,10 @@ mod tests {
             }
         }));
 
-        let result = apply_js_reviver(js_val, "", &reviver).unwrap();
+        let mut wrapper = PropertyMap::new();
+        wrapper.insert(String::new(), js_val);
+        let wrapper = JsValue::PlainObject(Rc::new(RefCell::new(wrapper)));
+        let result = apply_js_reviver(&wrapper, "", &reviver).unwrap();
         if let JsValue::PlainObject(map) = result {
             let m = map.borrow();
             assert!(m.contains_key("a"));
@@ -20896,6 +21151,264 @@ mod tests {
         let result = global_eval("JSON.stringify([1, undefined, 3])").unwrap();
         // Engine may serialise arrays as objects – just verify it produces a string.
         assert!(matches!(result, JsValue::String(_)));
+    }
+
+    #[test]
+    fn e2e_json_stringify_calls_user_to_json() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({
+                a: 1,
+                toJSON: function() {
+                    return { b: this.a + 1 };
+                }
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"b":2}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_passes_key_to_to_json() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({
+                outer: {
+                    toJSON: function(key) {
+                        return key;
+                    }
+                }
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"outer":"outer"}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_transforms_nested_values() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({ a: 1, b: { c: 2 } }, function(key, value) {
+                if (typeof value === "number") return value + 10;
+                return value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":11,"b":{"c":12}}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_uses_holder_as_this() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({ a: 2 }, function(key, value) {
+                if (key === "a") return this.a + value;
+                return value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":4}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_can_replace_root() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({ a: 1 }, function(key, value) {
+                if (key === "") return { b: value.a + 1 };
+                return value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"b":2}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_array_filters_and_orders_properties() {
+        let result = global_eval(r#"JSON.stringify({ a: 1, b: 2, c: 3 }, ["c", "a"])"#).unwrap();
+        assert_eq!(result, JsValue::String(r#"{"c":3,"a":1}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_array_coerces_numeric_entries() {
+        let result =
+            global_eval(r#"JSON.stringify({ "0": "zero", "1": "one", x: 3 }, [1, "x"])"#).unwrap();
+        assert_eq!(result, JsValue::String(r#"{"1":"one","x":3}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_array_does_not_filter_array_elements() {
+        let result = global_eval(r#"JSON.stringify([1, 2, 3], ["0"])"#).unwrap();
+        assert_eq!(result, JsValue::String("[1,2,3]".into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_space_number_formats_nested_objects() {
+        let result = global_eval("JSON.stringify({ a: { b: 1 } }, null, 2)").unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("{\n  \"a\": {\n    \"b\": 1\n  }\n}".into())
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_space_string_is_clamped_to_ten_characters() {
+        let result = global_eval(r#"JSON.stringify({ a: 1 }, null, "abcdefghijk")"#).unwrap();
+        assert_eq!(result, JsValue::String("{\nabcdefghij\"a\": 1\n}".into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_omits_undefined_and_function_object_properties() {
+        let result =
+            global_eval("JSON.stringify({ a: 1, b: undefined, c: function() {}, d: 4 })").unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":1,"d":4}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_array_undefined_and_function_become_null() {
+        let result = global_eval("JSON.stringify([1, undefined, function() {}, 4])").unwrap();
+        assert_eq!(result, JsValue::String("[1,null,null,4]".into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_nested_nan_and_infinity_become_null() {
+        let result = global_eval("JSON.stringify({ a: NaN, b: [Infinity, -Infinity] })").unwrap();
+        assert_eq!(
+            result,
+            JsValue::String(r#"{"a":null,"b":[null,null]}"#.into())
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_circular_object_throws_type_error() {
+        let result = global_eval(
+            r#"
+            var obj = {};
+            obj.self = obj;
+            JSON.stringify(obj)
+            "#,
+        );
+        assert!(matches!(result, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn e2e_json_stringify_circular_array_throws_type_error() {
+        let result = global_eval(
+            r#"
+            var arr = [];
+            arr.push(arr);
+            JSON.stringify(arr)
+            "#,
+        );
+        assert!(matches!(result, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn e2e_json_stringify_escapes_quotes_backslashes_and_controls() {
+        let result = global_eval(r#"JSON.stringify({ s: "quote\"\slash\\line\n\t\b" })"#).unwrap();
+        assert_eq!(
+            result,
+            JsValue::String(r#"{"s":"quote\"\slash\\line\n\t\b"}"#.into())
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_updates_nested_numbers() {
+        let result = global_eval(
+            r#"
+            JSON.parse('{"a":[1,{"b":2}]}', function(key, value) {
+                if (typeof value === "number") return value * 2;
+                return value;
+            }).a[1].b
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_deletes_object_property() {
+        let result = global_eval(
+            r#"
+            var parsed = JSON.parse('{"a":1,"b":2}', function(key, value) {
+                if (key === "b") return undefined;
+                return value;
+            });
+            parsed.b === undefined && JSON.stringify(parsed) === '{"a":1}'
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_array_undefined_stringifies_as_null() {
+        let result = global_eval(
+            r#"
+            var parsed = JSON.parse('[1,2,3]', function(key, value) {
+                if (key === "1") return undefined;
+                return value;
+            });
+            parsed[1] === undefined && JSON.stringify(parsed) === '[1,null,3]'
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_uses_holder_as_this() {
+        let result = global_eval(
+            r#"
+            JSON.parse('{"a":2}', function(key, value) {
+                if (key === "a") return this.a + value;
+                return value;
+            }).a
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn e2e_json_parse_invalid_trailing_comma_is_syntax_error() {
+        let result = global_eval(r#"JSON.parse("{\"a\":1,}")"#);
+        assert!(matches!(result, Err(StatorError::SyntaxError(_))));
+    }
+
+    #[test]
+    fn e2e_json_parse_invalid_unicode_escape_is_syntax_error() {
+        let result = global_eval(r#"JSON.parse("\"\u00ZZ\"")"#);
+        assert!(matches!(result, Err(StatorError::SyntaxError(_))));
+    }
+
+    #[test]
+    fn e2e_json_parse_nested_objects_and_arrays() {
+        let result = global_eval(
+            r#"
+            var parsed = JSON.parse('{"a":[{"b":true},null,3]}');
+            parsed.a[0].b === true && parsed.a[1] === null && parsed.a[2] === 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_json_parse_unicode_surrogate_pair() {
+        let result = global_eval(r#"JSON.parse("\"\uD83D\uDE00\"")"#).unwrap();
+        assert_eq!(result, JsValue::String("😀".into()));
+    }
+
+    #[test]
+    fn e2e_json_parse_unicode_basic_escape() {
+        let result = global_eval(r#"JSON.parse("\"\u0041\"")"#).unwrap();
+        assert_eq!(result, JsValue::String("A".into()));
     }
 
     // ── typeof conformance ───────────────────────────────────────────────────
