@@ -4417,8 +4417,23 @@ impl FunctionCompiler {
 
     /// Compile a function expression.
     fn compile_fn_expr(&mut self, f: &FnExpr) -> StatorResult<()> {
-        let func_array =
-            compile_function(&f.params, &f.body, f.is_generator, f.is_async, f.is_strict)?;
+        // ES §15.2.4: named function expressions make their own name
+        // visible as a read-only binding inside the function body.
+        let self_name = f.id.as_ref().map(|id| id.name.as_str());
+        let func_array = compile_function_inner(
+            &f.params,
+            &f.body,
+            f.is_generator,
+            f.is_async,
+            f.is_strict,
+            false,
+            self_name,
+        )?;
+        let func_array = if let Some(name) = self_name {
+            func_array.with_function_name(name)
+        } else {
+            func_array
+        };
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
@@ -4431,9 +4446,19 @@ impl FunctionCompiler {
     /// Compile a function expression and set an inferred name on the
     /// resulting [`BytecodeArray`].
     fn compile_fn_expr_named(&mut self, f: &FnExpr, name: &str) -> StatorResult<()> {
-        let func_array =
-            compile_function(&f.params, &f.body, f.is_generator, f.is_async, f.is_strict)?
-                .with_function_name(name);
+        // If the function has its own id, use it for the self-reference;
+        // the `name` parameter is only the inferred external name.
+        let self_name = f.id.as_ref().map(|id| id.name.as_str());
+        let func_array = compile_function_inner(
+            &f.params,
+            &f.body,
+            f.is_generator,
+            f.is_async,
+            f.is_strict,
+            false,
+            self_name,
+        )?
+        .with_function_name(name);
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
@@ -4461,9 +4486,16 @@ impl FunctionCompiler {
                 }
             }
         };
-        let func_array =
-            compile_function_inner(&a.params, &body_block, false, a.is_async, a.is_strict, true)?
-                .with_arrow_flag(true);
+        let func_array = compile_function_inner(
+            &a.params,
+            &body_block,
+            false,
+            a.is_async,
+            a.is_strict,
+            true,
+            None,
+        )?
+        .with_arrow_flag(true);
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         // Flag(1) marks this as an arrow function (no .prototype property).
@@ -6060,11 +6092,13 @@ fn compile_function(
     is_async: bool,
     is_strict: bool,
 ) -> StatorResult<BytecodeArray> {
-    compile_function_inner(params, body, is_generator, is_async, is_strict, false)
+    compile_function_inner(params, body, is_generator, is_async, is_strict, false, None)
 }
 
 /// Core function compiler.  `is_arrow` controls whether an `arguments`
 /// binding is emitted (arrow functions inherit the enclosing `arguments`).
+/// `self_name` enables named function expression scoping — the name is
+/// bound inside the function body as a read-only self-reference.
 fn compile_function_inner(
     params: &[crate::parser::ast::Param],
     body: &BlockStmt,
@@ -6072,6 +6106,7 @@ fn compile_function_inner(
     is_async: bool,
     is_strict: bool,
     is_arrow: bool,
+    self_name: Option<&str>,
 ) -> StatorResult<BytecodeArray> {
     let mut compiler = FunctionCompiler::new(params)?;
     compiler.is_generator = is_generator;
@@ -6103,6 +6138,19 @@ fn compile_function_inner(
         compiler.emit_star(args_reg);
     }
 
+    // Named function expression self-reference: allocate a register so the
+    // function body can reference the function by its own name (ES §15.2.4).
+    // The register is initialised to `undefined` here; the interpreter
+    // writes the actual function value at call time.
+    let self_name_reg = if let Some(name) = self_name {
+        let reg = compiler.define_local(name);
+        compiler.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+        compiler.emit_star(reg);
+        Some(reg)
+    } else {
+        None
+    };
+
     // Hoist `var` declarations to the function scope (initialised to
     // `undefined`) so that reads before the declaration returns `undefined`
     // instead of throwing.
@@ -6120,7 +6168,11 @@ fn compile_function_inner(
             compiler.compile_stmt(stmt)?;
         }
     }
-    compiler.finalize()
+    let mut ba = compiler.finalize()?;
+    if let Some(reg) = self_name_reg {
+        ba = ba.with_self_name_register(reg.0);
+    }
+    Ok(ba)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
