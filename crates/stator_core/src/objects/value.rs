@@ -707,8 +707,11 @@ impl JsValue {
             // valueOf returns the array itself (not primitive), so
             // toString always wins regardless of hint.
             Self::Array(items) => {
-                let parts: Vec<String> = items
-                    .borrow()
+                // Clone elements before iterating so the RefCell borrow is
+                // released before any recursive `to_js_string()` call that
+                // might re-borrow the same array.
+                let snapshot: Vec<JsValue> = items.borrow().clone();
+                let parts: Vec<String> = snapshot
                     .iter()
                     .map(|v| match v {
                         Self::Null | Self::Undefined => String::new(),
@@ -779,8 +782,10 @@ impl JsValue {
             // Array.prototype.toString — join elements with ",".
             // Handles the common case directly without a ToPrimitive roundtrip.
             Self::Array(items) => {
-                let parts: Vec<String> = items
-                    .borrow()
+                // Clone elements before iterating so the RefCell borrow is
+                // released before any recursive `to_js_string()` call.
+                let snapshot: Vec<JsValue> = items.borrow().clone();
+                let parts: Vec<String> = snapshot
                     .iter()
                     .map(|v| match v {
                         Self::Null | Self::Undefined => String::new(),
