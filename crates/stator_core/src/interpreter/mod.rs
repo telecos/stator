@@ -4586,12 +4586,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "cause" => e.cause().cloned().unwrap_or(JsValue::Undefined),
             "errors" => {
                 if e.kind == crate::builtins::error::ErrorKind::AggregateError {
-                    JsValue::new_array(
-                        e.errors
-                            .iter()
-                            .map(|ie| JsValue::Error(Rc::clone(ie)))
-                            .collect(),
-                    )
+                    JsValue::new_array(e.errors.clone())
                 } else {
                     JsValue::Undefined
                 }
@@ -11268,17 +11263,20 @@ mod tests {
     fn test_proto_lookup_aggregate_error_errors_property() {
         use crate::builtins::error::{ErrorKind, JsError};
 
-        let inner1 = Rc::new(JsError::new(ErrorKind::TypeError, "bad type".to_string()));
-        let inner2 = Rc::new(JsError::new(
+        let inner1 = JsValue::Error(Rc::new(JsError::new(
+            ErrorKind::TypeError,
+            "bad type".to_string(),
+        )));
+        let inner2 = JsValue::Error(Rc::new(JsError::new(
             ErrorKind::RangeError,
             "out of range".to_string(),
-        ));
+        )));
         let agg = JsValue::Error(Rc::new(JsError::new_aggregate(
             vec![inner1.clone(), inner2.clone()],
             "multiple failures".to_string(),
         )));
 
-        // errors property should be an Array of Error values.
+        // errors property should be an Array of the original values.
         if let JsValue::Array(arr) = proto_lookup(&agg, "errors") {
             assert_eq!(arr.borrow().len(), 2);
             assert!(

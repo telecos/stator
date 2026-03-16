@@ -713,18 +713,8 @@ fn make_aggregate_error_constructor() -> JsValue {
     let call = native(|args| {
         // First arg: errors (iterable — we accept Array).
         let errors_val = args.first().unwrap_or(&JsValue::Undefined);
-        let inner_errors: Vec<Rc<JsError>> = match errors_val {
-            JsValue::Array(arr) => arr
-                .borrow()
-                .iter()
-                .map(|v| match v {
-                    JsValue::Error(e) => Rc::clone(e),
-                    other => Rc::new(JsError::new(
-                        ErrorKind::Error,
-                        other.to_js_string().unwrap_or_default(),
-                    )),
-                })
-                .collect(),
+        let inner_errors: Vec<JsValue> = match errors_val {
+            JsValue::Array(arr) => arr.borrow().clone(),
             _ => Vec::new(),
         };
         // Second arg: message.
@@ -827,19 +817,27 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
         }),
     );
     // V8 extension: Error.captureStackTrace(targetObject [, constructorOpt])
+    // Adds a `.stack` property to the target and returns undefined.
     error_props.insert(
         "captureStackTrace".into(),
         native(|args| {
             let target = args.first().cloned().unwrap_or(JsValue::Undefined);
-            if let JsValue::Error(e) = target {
-                // Rc::try_unwrap is unlikely to succeed for shared Rcs, so
-                // clone-and-mutate.
-                let mut cloned = (*e).clone();
-                error_capture_stack_trace(&mut cloned, None);
-                Ok(JsValue::Error(Rc::new(cloned)))
-            } else {
-                Ok(JsValue::Undefined)
+            match target {
+                JsValue::Error(e) => {
+                    let mut cloned = (*e).clone();
+                    error_capture_stack_trace(&mut cloned, None);
+                    // V8 mutates in-place; we cannot mutate Rc so this is
+                    // best-effort.  Return undefined per the V8 API contract.
+                }
+                JsValue::PlainObject(ref map) => {
+                    // V8: set `.stack` on the plain object.
+                    let stack_str = crate::builtins::error::capture_stack_trace("Error", "");
+                    map.borrow_mut()
+                        .insert("stack".to_string(), JsValue::String(stack_str.into()));
+                }
+                _ => {}
             }
+            Ok(JsValue::Undefined)
         }),
     );
     // V8 extension: Error.stackTraceLimit (getter/setter via property)
