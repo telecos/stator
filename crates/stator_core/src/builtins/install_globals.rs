@@ -7394,7 +7394,19 @@ fn make_string() -> JsValue {
             "includes".into(),
             native(|args| {
                 let s = require_coercible_string(&args)?;
-                let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+                // §22.1.3.7 step 4: throw TypeError if searchString is a RegExp
+                let search_arg = args.get(1).unwrap_or(&JsValue::Undefined);
+                if let JsValue::PlainObject(map) = search_arg
+                    && matches!(
+                        map.borrow().get("__is_regexp__"),
+                        Some(JsValue::Boolean(true))
+                    )
+                {
+                    return Err(crate::error::StatorError::TypeError(
+                        "First argument to String.prototype.includes must not be a regular expression".to_string(),
+                    ));
+                }
+                let search = search_arg.to_js_string()?;
                 let pos = match args.get(2) {
                     Some(JsValue::Undefined) | None => None,
                     Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
