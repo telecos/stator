@@ -4488,8 +4488,7 @@ fn handle_for_in_enumerate(
                     // ES §14.7.5.9), @@-prefixed internal hooks, and hidden
                     // field initializers.
                     if (k.starts_with("__") && k.ends_with("__"))
-                        || k.starts_with("@@")
-                        || k.starts_with("Symbol(")
+                        || crate::builtins::symbol::is_symbol_property_key(k)
                         || k.starts_with('.')
                     {
                         seen.insert(k.clone());
@@ -8516,6 +8515,33 @@ mod tests {
     fn e2e_instanceof_custom_has_instance() {
         let result = crate::builtins::global::global_eval(
             "var obj = { [Symbol.hasInstance](v) { return v === 42; } }; 42 instanceof obj",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_instanceof_class_symbol_has_instance_true() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo { static [Symbol.hasInstance](x) { return x === 1; } } 1 instanceof Foo",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_instanceof_class_symbol_has_instance_false() {
+        let result = crate::builtins::global::global_eval(
+            "class Foo { static [Symbol.hasInstance](x) { return x === 1; } } 2 instanceof Foo",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_instanceof_function_symbol_has_instance_true() {
+        let result = crate::builtins::global::global_eval(
+            "function Foo() {} Foo[Symbol.hasInstance] = function(x) { return x && x.tag === 1; }; ({ tag: 1 }) instanceof Foo",
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
