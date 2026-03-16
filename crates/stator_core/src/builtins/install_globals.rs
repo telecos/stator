@@ -19781,7 +19781,7 @@ mod tests {
 
     /// `Object.seal` preserves writability but removes configurability.
     #[test]
-    fn test_seal_preserves_writable() {
+    fn test_seal_preserves_writable_removes_configurable() {
         let result = global_eval(
             "var o = {a: 1}; Object.seal(o); \
              var d = Object.getOwnPropertyDescriptor(o, 'a'); \
