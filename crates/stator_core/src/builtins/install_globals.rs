@@ -129,7 +129,10 @@ use crate::builtins::typed_array::{
 };
 use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new, weak_ref_new_plain};
 use crate::error::{StatorError, StatorResult};
-use crate::interpreter::{dispatch_call_value, dispatch_call_with_this};
+use crate::interpreter::{
+    current_global_env, dispatch_call_value, dispatch_call_with_this, get_object_prototype,
+    has_prototype_in_chain,
+};
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
@@ -857,6 +860,56 @@ fn error_prototype_to_string(this: &JsValue) -> StatorResult<JsValue> {
 /// Build a NativeFunction that constructs a `JsValue::Error` of the given `ErrorKind`.
 ///
 /// Supports the ES2022 options parameter: `new Error(message, { cause })`.
+fn current_derived_constructor_this() -> Option<Rc<RefCell<PropertyMap>>> {
+    let globals = current_global_env()?;
+    let borrow = globals.borrow();
+    if !borrow.contains_key(".class_pending_this") {
+        return None;
+    }
+    match borrow.get("this") {
+        Some(JsValue::PlainObject(map)) => Some(Rc::clone(map)),
+        _ => None,
+    }
+}
+
+fn initialize_error_plain_object(
+    target: &Rc<RefCell<PropertyMap>>,
+    kind: ErrorKind,
+    message: &str,
+    cause: Option<JsValue>,
+    errors: Option<Vec<JsValue>>,
+) -> JsValue {
+    let stack_name = match kind {
+        ErrorKind::AggregateError => "AggregateError",
+        _ => kind.as_name(),
+    };
+    let mut borrow = target.borrow_mut();
+    borrow.insert(
+        "message".into(),
+        JsValue::String(message.to_string().into()),
+    );
+    borrow.insert(
+        "stack".into(),
+        JsValue::String(crate::builtins::error::capture_stack_trace(stack_name, message).into()),
+    );
+    if let Some(cause) = cause {
+        borrow.insert("cause".into(), cause);
+    }
+    if let Some(errors) = errors {
+        borrow.insert("errors".into(), JsValue::new_array(errors));
+    }
+    drop(borrow);
+    JsValue::PlainObject(Rc::clone(target))
+}
+
+fn error_instanceof(value: &JsValue, prototype: &JsValue, kind: Option<ErrorKind>) -> bool {
+    match (value, kind) {
+        (JsValue::Error(_), None) => true,
+        (JsValue::Error(err), Some(kind)) if err.kind == kind => true,
+        _ => has_prototype_in_chain(value, prototype),
+    }
+}
+
 #[inline(never)]
 fn make_error_constructor(kind: ErrorKind) -> JsValue {
     native(move |args| {
@@ -864,9 +917,14 @@ fn make_error_constructor(kind: ErrorKind) -> JsValue {
             Some(JsValue::Undefined) | None => String::new(),
             Some(v) => v.to_js_string()?,
         };
+        let cause = extract_cause(args.get(1));
+        if let Some(this_obj) = current_derived_constructor_this() {
+            return Ok(initialize_error_plain_object(
+                &this_obj, kind, &message, cause, None,
+            ));
+        }
         let mut err = JsError::new(kind, message);
-        // ES2022: extract `cause` from the optional second options argument.
-        err.cause = extract_cause(args.get(1));
+        err.cause = cause;
         Ok(JsValue::Error(Rc::new(err)))
     })
 }
@@ -888,45 +946,43 @@ fn make_error_constructor_object(
     error_ctor: &JsValue,
 ) -> JsValue {
     let mut props = PropertyMap::new();
+    let mut proto = PropertyMap::new();
+    proto.insert(
+        "name".into(),
+        JsValue::String(kind.as_name().to_string().into()),
+    );
+    proto.insert("message".into(), JsValue::String(String::new().into()));
+    proto.insert(
+        "toString".into(),
+        native(move |args| {
+            let this = args.first().unwrap_or(&JsValue::Undefined);
+            error_prototype_to_string(this)
+        }),
+    );
+    proto.insert("__proto__".into(), error_proto.clone());
+    proto.make_all_non_enumerable();
+    let err_proto_rc = Rc::new(RefCell::new(proto));
+    let err_proto_val = JsValue::PlainObject(err_proto_rc.clone());
+
     props.insert("__call__".into(), make_error_constructor(kind));
     props.insert(
         "name".into(),
         JsValue::String(kind.as_name().to_string().into()),
     );
-    props.insert(
-        "@@hasInstance".into(),
+    props.insert("@@hasInstance".into(), {
+        let proto_for_instanceof = err_proto_val.clone();
         native(move |args| {
             let val = args.first().unwrap_or(&JsValue::Undefined);
-            match val {
-                JsValue::Error(e) => Ok(JsValue::Boolean(e.kind == kind)),
-                _ => Ok(JsValue::Boolean(false)),
-            }
-        }),
-    );
+            Ok(JsValue::Boolean(error_instanceof(
+                val,
+                &proto_for_instanceof,
+                Some(kind),
+            )))
+        })
+    });
     // §20.5.6.1 NativeError.__proto__ → Error (constructor chain)
     props.insert("__proto__".into(), error_ctor.clone());
-    // ── Subtype prototype ───────────────────────────────────────────────
-    let err_proto_rc = {
-        let mut proto = PropertyMap::new();
-        proto.insert(
-            "name".into(),
-            JsValue::String(kind.as_name().to_string().into()),
-        );
-        proto.insert("message".into(), JsValue::String(String::new().into()));
-        proto.insert(
-            "toString".into(),
-            native(move |args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                error_prototype_to_string(this)
-            }),
-        );
-        // §20.5.6.2 NativeError.prototype.__proto__ → Error.prototype
-        proto.insert("__proto__".into(), error_proto.clone());
-        proto.make_all_non_enumerable();
-        let proto_rc = Rc::new(RefCell::new(proto));
-        props.insert("prototype".into(), JsValue::PlainObject(proto_rc.clone()));
-        proto_rc
-    };
+    props.insert("prototype".into(), err_proto_val);
     props.make_all_non_enumerable();
     let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
     // §20.5.6.2 NativeError.prototype.constructor
@@ -959,22 +1015,46 @@ fn extract_cause(options: Option<&JsValue>) -> Option<JsValue> {
 #[inline(never)]
 fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue) -> JsValue {
     let call = native(|args| {
-        // First arg: errors (iterable — we accept Array).
+        // First arg: errors (iterable / array-like).
         let errors_val = args.first().unwrap_or(&JsValue::Undefined);
-        let inner_errors: Vec<JsValue> = match errors_val {
-            JsValue::Array(arr) => arr.borrow().clone(),
-            _ => Vec::new(),
-        };
+        let (inner_errors, _) = to_array_like_elements(errors_val);
         // Second arg: message.
         let message = match args.get(1) {
             Some(JsValue::Undefined) | None => String::new(),
             Some(v) => v.to_js_string()?,
         };
+        let cause = extract_cause(args.get(2));
+        if let Some(this_obj) = current_derived_constructor_this() {
+            return Ok(initialize_error_plain_object(
+                &this_obj,
+                ErrorKind::AggregateError,
+                &message,
+                cause,
+                Some(inner_errors),
+            ));
+        }
         let mut err = JsError::new_aggregate(inner_errors, message);
-        // Third arg: optional options object with `cause`.
-        err.cause = extract_cause(args.get(2));
+        err.cause = cause;
         Ok(JsValue::Error(Rc::new(err)))
     });
+
+    let mut proto = PropertyMap::new();
+    proto.insert(
+        "name".into(),
+        JsValue::String("AggregateError".to_string().into()),
+    );
+    proto.insert("message".into(), JsValue::String(String::new().into()));
+    proto.insert(
+        "toString".into(),
+        native(|args| {
+            let this = args.first().unwrap_or(&JsValue::Undefined);
+            error_prototype_to_string(this)
+        }),
+    );
+    proto.insert("__proto__".into(), error_proto.clone());
+    proto.make_all_non_enumerable();
+    let proto_rc = Rc::new(RefCell::new(proto));
+    let proto_val = JsValue::PlainObject(proto_rc.clone());
 
     let mut props = PropertyMap::new();
     props.insert("__call__".into(), call);
@@ -982,40 +1062,19 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
         "name".into(),
         JsValue::String("AggregateError".to_string().into()),
     );
-    props.insert(
-        "@@hasInstance".into(),
-        native(|args| {
+    props.insert("@@hasInstance".into(), {
+        let proto_for_instanceof = proto_val.clone();
+        native(move |args| {
             let val = args.first().unwrap_or(&JsValue::Undefined);
-            match val {
-                JsValue::Error(e) => Ok(JsValue::Boolean(e.kind == ErrorKind::AggregateError)),
-                _ => Ok(JsValue::Boolean(false)),
-            }
-        }),
-    );
-    // §20.5.6.1 AggregateError.__proto__ → Error
+            Ok(JsValue::Boolean(error_instanceof(
+                val,
+                &proto_for_instanceof,
+                Some(ErrorKind::AggregateError),
+            )))
+        })
+    });
     props.insert("__proto__".into(), error_ctor.clone());
-
-    // ── AggregateError.prototype ────────────────────────────────────────
-    let proto_rc = {
-        let mut proto = PropertyMap::new();
-        proto.insert(
-            "name".into(),
-            JsValue::String("AggregateError".to_string().into()),
-        );
-        proto.insert("message".into(), JsValue::String(String::new().into()));
-        proto.insert(
-            "toString".into(),
-            native(|args| {
-                let this = args.first().unwrap_or(&JsValue::Undefined);
-                error_prototype_to_string(this)
-            }),
-        );
-        // §20.5.6.2 AggregateError.prototype.__proto__ → Error.prototype
-        proto.insert("__proto__".into(), error_proto.clone());
-        proto.make_all_non_enumerable();
-        Rc::new(RefCell::new(proto))
-    };
-    props.insert("prototype".into(), JsValue::PlainObject(proto_rc.clone()));
+    props.insert("prototype".into(), proto_val);
     props.make_all_non_enumerable();
     let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
 
@@ -1060,14 +1119,6 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
     let mut error_props = PropertyMap::new();
     error_props.insert("__call__".into(), make_error_constructor(ErrorKind::Error));
     error_props.insert("name".into(), JsValue::String("Error".into()));
-    // @@hasInstance: `x instanceof Error` returns true for all error kinds.
-    error_props.insert(
-        "@@hasInstance".into(),
-        native(|args| {
-            let val = args.first().unwrap_or(&JsValue::Undefined);
-            Ok(JsValue::Boolean(matches!(val, JsValue::Error(_))))
-        }),
-    );
     // V8 extension: Error.captureStackTrace(targetObject [, constructorOpt])
     // Adds a `.stack` property to the target and returns undefined.
     error_props.insert(
@@ -1124,6 +1175,17 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
         proto.make_all_non_enumerable();
         Rc::new(RefCell::new(proto))
     };
+    error_props.insert("@@hasInstance".into(), {
+        let error_proto_for_instanceof = JsValue::PlainObject(error_proto_rc.clone());
+        native(move |args| {
+            let val = args.first().unwrap_or(&JsValue::Undefined);
+            Ok(JsValue::Boolean(error_instanceof(
+                val,
+                &error_proto_for_instanceof,
+                None,
+            )))
+        })
+    });
     error_props.insert(
         "prototype".into(),
         JsValue::PlainObject(error_proto_rc.clone()),
@@ -4266,6 +4328,7 @@ fn make_object() -> JsValue {
                             None => Ok(JsValue::Null),
                         }
                     }
+                    JsValue::Error(_) => Ok(get_object_prototype(obj).unwrap_or(JsValue::Null)),
                     _ => Ok(JsValue::Null),
                 }
             }),
@@ -4303,15 +4366,7 @@ fn make_object() -> JsValue {
                         let current_proto = map.borrow().get("__proto__").cloned();
                         let same = match (&current_proto, &proto) {
                             (None, JsValue::Null) => true,
-                            (Some(cur), _) => {
-                                if let JsValue::PlainObject(cur_map) = cur
-                                    && let JsValue::PlainObject(new_map) = &proto
-                                {
-                                    Rc::ptr_eq(cur_map, new_map)
-                                } else {
-                                    false
-                                }
-                            }
+                            (Some(cur), _) => cur == &proto,
                             _ => false,
                         };
                         if !same {
@@ -4321,24 +4376,10 @@ fn make_object() -> JsValue {
                         }
                     }
                     // Cycle detection: walk the new proto chain and check for obj.
-                    if let JsValue::PlainObject(_) = &proto {
-                        let mut current = proto.clone();
-                        for _ in 0..256 {
-                            if let JsValue::PlainObject(cur_map) = &current {
-                                if Rc::ptr_eq(cur_map, map) {
-                                    return Err(StatorError::TypeError(
-                                        "Cyclic __proto__ value".to_string(),
-                                    ));
-                                }
-                                let next = cur_map.borrow().get("__proto__").cloned();
-                                match next {
-                                    Some(v) => current = v,
-                                    None => break,
-                                }
-                            } else {
-                                break;
-                            }
-                        }
+                    if let JsValue::PlainObject(_) = &proto
+                        && has_prototype_in_chain(&proto, &JsValue::PlainObject(Rc::clone(map)))
+                    {
+                        return Err(StatorError::TypeError("Cyclic __proto__ value".to_string()));
                     }
                     match &proto {
                         JsValue::Null => {
@@ -4347,6 +4388,12 @@ fn make_object() -> JsValue {
                         _ => {
                             map.borrow_mut().insert("__proto__".to_string(), proto);
                         }
+                    }
+                } else if let JsValue::Error(e) = &obj {
+                    if matches!(proto, JsValue::Null) {
+                        e.props.borrow_mut().remove("__proto__");
+                    } else {
+                        e.props.borrow_mut().insert("__proto__".to_string(), proto);
                     }
                 }
                 Ok(obj)
@@ -17520,6 +17567,236 @@ mod tests {
     fn e2e_error_stack_trace_limit_exists() {
         let result = global_eval("typeof Error.stackTraceLimit").unwrap();
         assert_eq!(result, JsValue::String("number".into()));
+    }
+
+    #[test]
+    fn e2e_new_error_instanceof_error() {
+        let result = global_eval("new Error('msg') instanceof Error").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_new_type_error_instanceof_type_error_and_error() {
+        let result = global_eval(
+            "new TypeError('msg') instanceof TypeError && new TypeError('msg') instanceof Error",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_error_get_prototype_of_builtin_error() {
+        let result =
+            global_eval("Object.getPrototypeOf(new Error('msg')) === Error.prototype").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_custom_error_subclass_instanceof_chain() {
+        let result = global_eval(
+            "class MyError extends Error {} \
+             let err = new MyError('boom'); \
+             err instanceof MyError && err instanceof Error",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_custom_error_subclass_prototype_chain() {
+        let result = global_eval(
+            "class MyError extends Error {} \
+             let err = new MyError('boom'); \
+             Object.getPrototypeOf(err) === MyError.prototype && \
+             Object.getPrototypeOf(MyError.prototype) === Error.prototype && \
+             Object.getPrototypeOf(MyError) === Error",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_custom_error_subclass_message() {
+        let result = global_eval(
+            "class MyError extends Error {} \
+             new MyError('boom').message",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("boom".into()));
+    }
+
+    #[test]
+    fn e2e_custom_error_subclass_stack() {
+        let result = global_eval(
+            "class MyError extends Error {} \
+             typeof new MyError('boom').stack",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("string".into()));
+    }
+
+    #[test]
+    fn e2e_custom_error_subclass_inherits_prototype_methods() {
+        let result = global_eval(
+            "class MyError extends Error { marker() { return 7; } } \
+             new MyError('boom').marker()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_custom_error_subclass_cause() {
+        let result = global_eval(
+            "class MyError extends Error { constructor(msg, cause) { super(msg, { cause }); } } \
+             new MyError('boom', 42).cause",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_error_cause_property() {
+        let result = global_eval("new Error('boom', { cause: 99 }).cause").unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn e2e_error_capture_stack_trace_adds_stack() {
+        let result = global_eval(
+            "let target = {}; \
+             Error.captureStackTrace(target); \
+             typeof target.stack",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("string".into()));
+    }
+
+    #[test]
+    fn e2e_error_capture_stack_trace_respects_existing_target_fields() {
+        let result = global_eval(
+            "let target = { name: 'CustomError', message: 'boom' }; \
+             Error.captureStackTrace(target); \
+             typeof target.stack === 'string' && target.name === 'CustomError'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_aggregate_error_instanceof_chain() {
+        let result =
+            global_eval("new AggregateError([1, 2], 'boom') instanceof AggregateError && new AggregateError([1, 2], 'boom') instanceof Error")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_aggregate_error_errors_are_iterable() {
+        let result = global_eval(
+            "let agg = new AggregateError([1, 2, 3], 'boom'); \
+             let total = 0; \
+             for (const item of agg.errors) { total = total + item; } \
+             total",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_aggregate_error_errors_support_spread() {
+        let result = global_eval(
+            "let agg = new AggregateError([1, 2], 'boom'); \
+             [...agg.errors].length",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_aggregate_error_cause_property() {
+        let result = global_eval("new AggregateError([1], 'boom', { cause: 5 }).cause").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_aggregate_error_preserves_error_values() {
+        let result = global_eval(
+            "let inner = new Error('inner'); \
+             let agg = new AggregateError([inner], 'boom'); \
+             agg.errors[0] === inner",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_throw_number_catch_binding() {
+        let result =
+            global_eval("let result; try { throw 42; } catch (e) { result = e; } result").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_throw_string_catch_binding() {
+        let result =
+            global_eval("let result; try { throw 'boom'; } catch (e) { result = e; } result")
+                .unwrap();
+        assert_eq!(result, JsValue::String("boom".into()));
+    }
+
+    #[test]
+    fn e2e_throw_null_catch_binding() {
+        let result =
+            global_eval("let result; try { throw null; } catch (e) { result = e; } result")
+                .unwrap();
+        assert_eq!(result, JsValue::Null);
+    }
+
+    #[test]
+    fn e2e_optional_catch_binding() {
+        let result =
+            global_eval("let result = 0; try { throw 1; } catch { result = 7; } result").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_rethrow_preserves_original_object() {
+        let result = global_eval(
+            "let original = { marker: 1 }; \
+             let same = false; \
+             try { throw original; } catch (e) { \
+                 try { throw e; } catch (f) { same = f === original; } \
+             } \
+             same",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_rethrow_preserves_null() {
+        let result = global_eval(
+            "let value = 1; \
+             try { throw null; } catch (e) { \
+                 try { throw e; } catch (f) { value = f === null; } \
+             } \
+             value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_parse_time_syntax_error_invalid_if() {
+        let result = global_eval("if (");
+        assert!(matches!(result, Err(StatorError::SyntaxError(_))));
+    }
+
+    #[test]
+    fn e2e_parse_time_syntax_error_throw_newline() {
+        let result = global_eval("throw\n1");
+        assert!(matches!(result, Err(StatorError::SyntaxError(_))));
     }
 
     /// `new.target` is the constructor when called via `new`.
