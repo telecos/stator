@@ -64,7 +64,7 @@ use crate::builtins::iterator::{
     async_iterator_reduce, async_iterator_some, async_iterator_take, async_iterator_to_array,
     iterator_drop, iterator_every, iterator_filter, iterator_find, iterator_flat_map,
     iterator_for_each, iterator_from, iterator_map, iterator_reduce, iterator_some, iterator_take,
-    iterator_to_array,
+    iterator_to_array, iterator_to_vec,
 };
 use crate::builtins::map::{
     MapIteratorKind, map_clear, map_create_iterator, map_delete, map_entries, map_from_iterable,
@@ -551,6 +551,80 @@ fn normalize_last_from_index(len: usize, from: Option<&JsValue>) -> StatorResult
         Ok(None)
     } else {
         Ok(Some(index as usize))
+    }
+}
+
+/// ECMAScript `ToIntegerOrInfinity` index normalization for `.at(...)`.
+fn normalize_at_index(len: usize, index: Option<&JsValue>) -> StatorResult<Option<usize>> {
+    let index = match index {
+        Some(value) => value.to_integer_or_infinity()?,
+        None => 0.0,
+    };
+    if index == f64::INFINITY {
+        return Ok(None);
+    }
+    let len_f = len as f64;
+    let actual = if index < 0.0 { len_f + index } else { index };
+    if actual < 0.0 || actual >= len_f {
+        Ok(None)
+    } else {
+        Ok(Some(actual as usize))
+    }
+}
+
+/// Collect values from supported iterable forms used by built-ins.
+fn collect_iterable_values(iterable: &JsValue) -> StatorResult<Vec<JsValue>> {
+    match iterable {
+        JsValue::Array(arr) => Ok(arr.borrow().clone()),
+        JsValue::Iterator(_) | JsValue::Generator(_) => iterator_to_vec(iterable),
+        JsValue::PlainObject(_) if is_js_array(iterable) => Ok(to_array_like_elements(iterable).0),
+        JsValue::PlainObject(map) => {
+            let iter_method = {
+                let borrow = map.borrow();
+                borrow
+                    .get("@@iterator")
+                    .or_else(|| borrow.get("entries"))
+                    .cloned()
+                    .filter(is_callable)
+            };
+            match iter_method {
+                Some(method) => {
+                    let iterator = dispatch_call_with_this(&method, iterable.clone(), vec![])?;
+                    iterator_to_vec(&iterator)
+                }
+                None => Err(StatorError::TypeError("value is not iterable".into())),
+            }
+        }
+        _ => Err(StatorError::TypeError("value is not iterable".into())),
+    }
+}
+
+/// Extract a `[key, value]` pair from an Object.fromEntries iterator value.
+fn from_entries_pair(entry: &JsValue) -> StatorResult<(String, JsValue)> {
+    match entry {
+        JsValue::Array(pair) => {
+            let pair = pair.borrow();
+            let key = pair
+                .first()
+                .cloned()
+                .unwrap_or(JsValue::Undefined)
+                .to_js_string()?;
+            let value = pair.get(1).cloned().unwrap_or(JsValue::Undefined);
+            Ok((key, value))
+        }
+        JsValue::PlainObject(obj) => {
+            let borrow = obj.borrow();
+            let key = borrow
+                .get("0")
+                .cloned()
+                .unwrap_or(JsValue::Undefined)
+                .to_js_string()?;
+            let value = borrow.get("1").cloned().unwrap_or(JsValue::Undefined);
+            Ok((key, value))
+        }
+        _ => Err(StatorError::TypeError(
+            "Object.fromEntries: iterator value is not an entry object".into(),
+        )),
     }
 }
 
@@ -4179,7 +4253,6 @@ fn make_object() -> JsValue {
             "fromEntries".into(),
             builtin_fn("fromEntries", 1, |args| {
                 let iterable = args.first().unwrap_or(&JsValue::Undefined);
-                // §20.1.2.6 step 1: require iterable argument.
                 if matches!(iterable, JsValue::Null | JsValue::Undefined) {
                     return Err(StatorError::TypeError(
                         "Cannot convert undefined or null to object".into(),
@@ -4187,41 +4260,8 @@ fn make_object() -> JsValue {
                 }
                 let mut result = PropertyMap::new();
 
-                let entries_to_process: Vec<JsValue> = match iterable {
-                    JsValue::Array(arr) => arr.borrow().clone(),
-                    JsValue::PlainObject(map) => {
-                        let borrow = map.borrow();
-                        if borrow.get("__is_array__").is_some() {
-                            let len = match borrow.get("length") {
-                                Some(JsValue::Smi(n)) => *n as usize,
-                                _ => 0,
-                            };
-                            (0..len)
-                                .filter_map(|i| borrow.get(&i.to_string()).cloned())
-                                .collect()
-                        } else {
-                            vec![]
-                        }
-                    }
-                    _ => vec![],
-                };
-                for entry in &entries_to_process {
-                    let (key, val) = match entry {
-                        JsValue::Array(pair) if pair.borrow().len() >= 2 => {
-                            (pair.borrow()[0].to_js_string()?, pair.borrow()[1].clone())
-                        }
-                        JsValue::PlainObject(obj) => {
-                            let borrow = obj.borrow();
-                            let k = borrow
-                                .get("0")
-                                .cloned()
-                                .unwrap_or(JsValue::Undefined)
-                                .to_js_string()?;
-                            let v = borrow.get("1").cloned().unwrap_or(JsValue::Undefined);
-                            (k, v)
-                        }
-                        _ => continue,
-                    };
+                for entry in collect_iterable_values(iterable)? {
+                    let (key, val) = from_entries_pair(&entry)?;
                     result.insert(key, val);
                 }
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
@@ -4245,6 +4285,15 @@ fn make_object() -> JsValue {
                             Ok(JsValue::Boolean(true))
                         } else if let Ok(idx) = key.parse::<usize>() {
                             Ok(JsValue::Boolean(idx < items.borrow().len()))
+                        } else {
+                            Ok(JsValue::Boolean(false))
+                        }
+                    }
+                    JsValue::String(s) => {
+                        if key == "length" {
+                            Ok(JsValue::Boolean(true))
+                        } else if let Ok(idx) = key.parse::<usize>() {
+                            Ok(JsValue::Boolean(idx < s.chars().count()))
                         } else {
                             Ok(JsValue::Boolean(false))
                         }
@@ -5380,21 +5429,10 @@ fn make_array() -> JsValue {
             builtin_fn("at", 1, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                if let JsValue::Array(items) = arr {
-                    let index = args
-                        .get(1)
-                        .unwrap_or(&JsValue::Smi(0))
-                        .to_number()
-                        .unwrap_or(0.0) as i64;
-                    let len = items.borrow().len() as i64;
-                    let actual = if index < 0 { len + index } else { index };
-                    if actual < 0 || actual >= len {
-                        Ok(JsValue::Undefined)
-                    } else {
-                        Ok(items.borrow()[actual as usize].clone())
-                    }
-                } else {
-                    Ok(JsValue::Undefined)
+                let len = array_like_length(arr)?;
+                match normalize_at_index(len, args.get(1))? {
+                    Some(index) => Ok(array_like_get_index(arr, index)),
+                    None => Ok(JsValue::Undefined),
                 }
             }),
         );
@@ -5811,15 +5849,26 @@ fn make_array() -> JsValue {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (elements, _) = to_array_like_elements(arr);
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.findLast callback must be callable".into(),
+                    ));
+                }
+                let len = array_like_length(arr)?;
+                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let arr_val = arr.clone();
-                for i in (0..elements.len()).rev() {
-                    let v = call_callback(
+                for i in (0..len).rev() {
+                    let v = call_callback_with_this(
                         &cb,
-                        vec![elements[i].clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                        this_arg.clone(),
+                        vec![
+                            array_like_get_index(arr, i),
+                            JsValue::Smi(i as i32),
+                            arr_val.clone(),
+                        ],
                     )?;
                     if v.to_boolean() {
-                        return Ok(elements[i].clone());
+                        return Ok(array_like_get_index(arr, i));
                     }
                 }
                 Ok(JsValue::Undefined)
@@ -5833,12 +5882,23 @@ fn make_array() -> JsValue {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (elements, _) = to_array_like_elements(arr);
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.findLastIndex callback must be callable".into(),
+                    ));
+                }
+                let len = array_like_length(arr)?;
+                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let arr_val = arr.clone();
-                for i in (0..elements.len()).rev() {
-                    let v = call_callback(
+                for i in (0..len).rev() {
+                    let v = call_callback_with_this(
                         &cb,
-                        vec![elements[i].clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                        this_arg.clone(),
+                        vec![
+                            array_like_get_index(arr, i),
+                            JsValue::Smi(i as i32),
+                            arr_val.clone(),
+                        ],
                     )?;
                     if v.to_boolean() {
                         return Ok(JsValue::Smi(i as i32));
@@ -9044,8 +9104,7 @@ fn make_string() -> JsValue {
                 let idx = args
                     .get(1)
                     .unwrap_or(&JsValue::Undefined)
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
+                    .to_integer_or_infinity()? as i64;
                 match string_at(&s, idx) {
                     Some(ch) => Ok(JsValue::String(ch.into())),
                     None => Ok(JsValue::Undefined),
@@ -22137,6 +22196,14 @@ mod tests {
         assert_eq!(result, JsValue::String("a".into()));
     }
 
+    /// `Array.prototype.at` works on generic array-like objects.
+    #[test]
+    fn test_array_at_array_like_negative() {
+        let result =
+            global_eval("Array.prototype.at.call({0: 'x', 1: 'y', length: 2}, -1)").unwrap();
+        assert_eq!(result, JsValue::String("y".into()));
+    }
+
     // ── Array.prototype.findLast / findLastIndex tests ──────────────────
 
     /// `findLast` returns the last element matching the predicate.
@@ -22182,6 +22249,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `findLast` binds the supplied `thisArg`.
+    #[test]
+    fn test_array_find_last_this_arg() {
+        let result = global_eval(
+            r#"
+            [1, 2, 3, 4].findLast(function(v) { return v === this.target; }, { target: 2 })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `findLastIndex` binds the supplied `thisArg`.
+    #[test]
+    fn test_array_find_last_index_this_arg() {
+        let result = global_eval(
+            r#"
+            [1, 2, 3, 2].findLastIndex(function(v) { return v === this.target; }, { target: 2 })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
     }
 
     // ── Array.prototype.flat additional tests ───────────────────────────
@@ -22290,6 +22381,37 @@ mod tests {
         assert_eq!(result, JsValue::Smi(2));
     }
 
+    /// `Object.fromEntries` consumes Map iterables.
+    #[test]
+    fn test_object_from_entries_map() {
+        let result = global_eval(
+            r#"
+            var map = new Map([['a', 1], ['b', 2]]);
+            var obj = Object.fromEntries(map);
+            obj.a + obj.b
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Object.fromEntries` consumes generator iterables.
+    #[test]
+    fn test_object_from_entries_generator() {
+        let result = global_eval(
+            r#"
+            function* pairs() {
+                yield ['x', 1];
+                yield ['y', 4];
+            }
+            var obj = Object.fromEntries(pairs());
+            obj.x + obj.y
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
     // ── Object.hasOwn tests ─────────────────────────────────────────────
 
     /// `Object.hasOwn` returns true for own properties.
@@ -22324,6 +22446,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.hasOwn` recognizes string indexed properties.
+    #[test]
+    fn test_object_has_own_string_index() {
+        let result = global_eval("Object.hasOwn('abc', '1')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.hasOwn` recognizes string length.
+    #[test]
+    fn test_object_has_own_string_length() {
+        let result = global_eval("Object.hasOwn('abc', 'length')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `structuredClone` copies nested plain objects and arrays.
+    #[test]
+    fn test_structured_clone_nested_values() {
+        let result = global_eval(
+            r#"
+            var original = { nested: { value: 1 }, items: [1, 2] };
+            var clone = structuredClone(original);
+            clone.nested.value = 9;
+            clone.items[0] = 7;
+            original.nested.value + original.items[0] + clone.nested.value + clone.items[0]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(18));
     }
 
     // ── Object.entries additional tests ─────────────────────────────────
