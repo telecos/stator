@@ -43,32 +43,44 @@ use stator_core::parser;
 /// larger than [`MAX_ALLOC_SIZE`].  This prevents pathological Test262 inputs
 /// (e.g. `new Array(2**53)`) from OOM-killing the CI runner.
 ///
-/// When an oversized allocation is requested, we **panic** rather than
-/// returning `null_mut`.  Returning null triggers Rust's default OOM handler
-/// which **aborts** the process, bypassing `catch_unwind`.  Panicking lets
-/// the test runner's `catch_unwind` wrapper recover gracefully and move on
-/// to the next test.
+/// When an oversized allocation is detected, we **panic** so that the test
+/// runner's `catch_unwind` can recover.  A thread-local recursion guard
+/// prevents the double-panic scenario: if the panic handler itself needs to
+/// allocate (for formatting), the recursive `alloc` call falls through to the
+/// system allocator regardless of size.
 ///
 /// # Safety
 ///
-/// Panicking inside `GlobalAlloc::alloc` is technically UB because the
-/// allocator may be invoked during unwinding.  In practice, only the
-/// oversized allocation panics — small allocations made during unwind
-/// (formatting, vec growth, etc.) pass through to `System` and succeed.
-/// This trade-off is acceptable for a test runner binary.
+/// Panicking inside `GlobalAlloc::alloc` is technically UB per the Rust
+/// reference.  The recursion guard makes this safe *in practice*: the only
+/// oversized panic happens once, and all subsequent allocations during
+/// unwind — even large ones — are delegated to `System` without panicking.
 struct GuardedAlloc;
 
 /// Maximum size of a single allocation (256 MiB).
 const MAX_ALLOC_SIZE: usize = 256 << 20;
 
+thread_local! {
+    /// Set to `true` while we are panicking from an oversized allocation.
+    /// When `true`, all subsequent allocations pass through to `System`
+    /// to avoid recursive panics during unwind.
+    static ALLOC_GUARD_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
 // SAFETY: All methods delegate to `System` after a size check.  The safety
 // invariants of `GlobalAlloc` (valid layout, matching alloc/dealloc) are
-// upheld by the inner `System` allocator.
+// upheld by the inner `System` allocator.  The recursion guard ensures we
+// never panic more than once per test execution.
 unsafe impl GlobalAlloc for GuardedAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if layout.size() > MAX_ALLOC_SIZE {
-            // Panic instead of returning null so that `catch_unwind` in the
-            // test runner can recover.  See struct-level docs for rationale.
+            // Check (and set) the recursion guard.  If it's already active,
+            // we're inside a panic unwind — just delegate to System.
+            let already_active = ALLOC_GUARD_ACTIVE.with(|g| g.replace(true));
+            if already_active {
+                return unsafe { System.alloc(layout) };
+            }
+            // First oversized allocation — panic so catch_unwind can recover.
             panic!(
                 "guarded allocator: allocation of {} bytes exceeds {} byte limit",
                 layout.size(),
@@ -81,6 +93,12 @@ unsafe impl GlobalAlloc for GuardedAlloc {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
+}
+
+/// Reset the allocator recursion guard.  Must be called after each test's
+/// `catch_unwind` returns so the next test can trigger the guard again.
+fn reset_alloc_guard() {
+    ALLOC_GUARD_ACTIVE.with(|g| g.set(false));
 }
 
 #[global_allocator]
@@ -1027,6 +1045,9 @@ fn run_test(
     if let Some(ref mut g) = async_globals {
         g.clear();
     }
+
+    // Reset the allocator recursion guard so the next test can trigger it.
+    reset_alloc_guard();
 
     let exec = match result {
         Ok(r) => ExecResult::from_result(r),
