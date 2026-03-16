@@ -1778,7 +1778,41 @@ fn expand_spread_args(raw_args: Vec<JsValue>) -> Vec<JsValue> {
                         );
                     }
                 } else {
-                    out.push(arg.clone());
+                    // Check for @@iterator (iterable protocol) on plain objects.
+                    let iter_fn = map_ref.get("@@iterator").cloned().or_else(|| {
+                        let sym_key =
+                            format!("Symbol({})", crate::builtins::symbol::SYMBOL_ITERATOR);
+                        map_ref.get(&sym_key).cloned()
+                    });
+                    drop(map_ref);
+                    if let Some(ref f) = iter_fn {
+                        if let Ok(iter_obj) = dispatch_call_with_this(f, arg.clone(), vec![]) {
+                            match iter_obj {
+                                JsValue::Iterator(ni) => {
+                                    while let Some(v) = ni.borrow_mut().next_item() {
+                                        out.push(v);
+                                    }
+                                }
+                                JsValue::Generator(gs) => loop {
+                                    match Interpreter::run_generator_step(&gs, JsValue::Undefined) {
+                                        Ok(GeneratorStep::Yield(v)) => out.push(v),
+                                        Ok(GeneratorStep::Return(v)) => {
+                                            if !matches!(v, JsValue::Undefined) {
+                                                out.push(v);
+                                            }
+                                            break;
+                                        }
+                                        Err(_) => break,
+                                    }
+                                },
+                                _ => out.push(arg.clone()),
+                            }
+                        } else {
+                            out.push(arg.clone());
+                        }
+                    } else {
+                        out.push(arg.clone());
+                    }
                 }
             }
             // String spread: expand each character.
@@ -7732,5 +7766,195 @@ mod tests {
             crate::builtins::global::global_eval("var obj = {x: 77}; var key = 'x'; obj?.[key]")
                 .unwrap();
         assert_eq!(result, JsValue::Smi(77));
+    }
+
+    // ── Iterator protocol conformance tests ─────────────────────────────
+
+    /// for-of over an array collects all elements.
+    #[test]
+    fn e2e_for_of_array_collect() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; for (var x of [10, 20, 30]) r += x; r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(60));
+    }
+
+    /// for-of over a string iterates Unicode code points, not bytes.
+    #[test]
+    fn e2e_for_of_string_unicode() {
+        let result = crate::builtins::global::global_eval(
+            "var r = []; for (var c of 'a\\u{1F600}b') r.push(c); r.length",
+        )
+        .unwrap();
+        // 'a' + '😀' + 'b' = 3 code points (emoji is one element)
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// Array.prototype.keys() returns an iterator of indices.
+    #[test]
+    fn e2e_array_keys_iterator() {
+        let result = crate::builtins::global::global_eval(
+            "var r = []; for (var k of ['a','b','c'].keys()) r.push(k); r.join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("0,1,2".into()));
+    }
+
+    /// Array.prototype.values() returns an iterator of values.
+    #[test]
+    fn e2e_array_values_iterator() {
+        let result = crate::builtins::global::global_eval(
+            "var r = []; for (var v of ['x','y'].values()) r.push(v); r.join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("x,y".into()));
+    }
+
+    /// Array.prototype.entries() returns [index, value] pairs.
+    #[test]
+    fn e2e_array_entries_iterator() {
+        let result = crate::builtins::global::global_eval(
+            "var r = []; for (var e of ['a','b'].entries()) r.push(e[0] + ':' + e[1]); r.join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("0:a,1:b".into()));
+    }
+
+    /// Spread array into function call.
+    #[test]
+    fn e2e_spread_array_in_call() {
+        let result = crate::builtins::global::global_eval(
+            "function f(a,b,c) { return a * 100 + b * 10 + c; } f(...[1,2,3])",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(123));
+    }
+
+    /// Spread string into array.
+    #[test]
+    fn e2e_spread_string_into_array() {
+        let result =
+            crate::builtins::global::global_eval("var a = [...'abc']; a.join('-')").unwrap();
+        assert_eq!(result, JsValue::String("a-b-c".into()));
+    }
+
+    /// for-of with break exits early and only iterates once.
+    #[test]
+    fn e2e_for_of_break_early_exit() {
+        let result = crate::builtins::global::global_eval(
+            "var r = []; for (var x of [1,2,3,4]) { r.push(x); if (x === 2) break; } r.join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1,2".into()));
+    }
+
+    /// for-of with return inside a function exits the function.
+    #[test]
+    fn e2e_for_of_return_exits_function() {
+        let result = crate::builtins::global::global_eval(
+            "function f() { for (var x of [1,2,3]) { if (x === 2) return x; } return 0; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// Generator as iterable in for-of.
+    #[test]
+    fn e2e_for_of_generator() {
+        let result = crate::builtins::global::global_eval(
+            "function* gen() { yield 10; yield 20; yield 30; }\
+             var r = 0; for (var x of gen()) r += x; r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(60));
+    }
+
+    /// Spread generator into array.
+    #[test]
+    fn e2e_spread_generator_into_array() {
+        let result = crate::builtins::global::global_eval(
+            "function* gen() { yield 1; yield 2; yield 3; } var a = [...gen()]; a.join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1,2,3".into()));
+    }
+
+    /// Iterator .next() returns {value, done} objects.
+    #[test]
+    fn e2e_iterator_next_protocol() {
+        let result = crate::builtins::global::global_eval(
+            "var arr = [42]; var iter = arr.values(); var r = iter.next(); r.value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Iterator .next() returns done:true when exhausted.
+    #[test]
+    fn e2e_iterator_next_done() {
+        let result = crate::builtins::global::global_eval(
+            "var iter = [1].values(); iter.next(); var r = iter.next(); r.done",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// for-of with const binding.
+    #[test]
+    fn e2e_for_of_const_binding() {
+        let result =
+            crate::builtins::global::global_eval("var r = ''; for (const ch of 'hi') r += ch; r")
+                .unwrap();
+        assert_eq!(result, JsValue::String("hi".into()));
+    }
+
+    /// for-of with let binding.
+    #[test]
+    fn e2e_for_of_let_binding() {
+        let result =
+            crate::builtins::global::global_eval("var r = 0; for (let n of [1,2,3]) r += n; r")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    /// for-of with destructuring.
+    #[test]
+    fn e2e_for_of_destructuring() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; var pairs = [[1,2],[3,4]]; for (var [a, b] of pairs) r += a + b; r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// Nested for-of loops.
+    #[test]
+    fn e2e_for_of_nested() {
+        let result = crate::builtins::global::global_eval(
+            "var r = ''; for (var a of [1,2]) for (var b of ['x','y']) r += a + b + ','; r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1x,1y,2x,2y,".into()));
+    }
+
+    /// arguments object is iterable with for-of.
+    #[test]
+    fn e2e_for_of_arguments() {
+        let result = crate::builtins::global::global_eval(
+            "function f() { var r = 0; for (var x of arguments) r += x; return r; } f(1,2,3)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    /// Spread arguments object.
+    #[test]
+    fn e2e_spread_arguments() {
+        let result = crate::builtins::global::global_eval(
+            "function f() { return [...arguments].join('-'); } f('a','b','c')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a-b-c".into()));
     }
 }
