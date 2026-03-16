@@ -2834,6 +2834,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "includes" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
+                    // §22.1.3.7 step 4: throw TypeError if searchString is a RegExp
+                    if let Some(JsValue::PlainObject(re_obj)) = args.first()
+                        && re_obj.borrow().get("__is_regexp__") == Some(&JsValue::Boolean(true))
+                    {
+                        return Err(crate::error::StatorError::TypeError(
+                            "First argument to String.prototype.includes must not be a regular expression".to_string(),
+                        ));
+                    }
                     let search = match args.first() {
                         Some(v) => v.to_js_string()?,
                         None => "undefined".to_string(),
