@@ -347,7 +347,7 @@ fn fn_props_key(ba: &Rc<BytecodeArray>) -> usize {
 }
 
 /// Store a named property on a `Function` value's side-table entry.
-fn fn_props_set(ba: &Rc<BytecodeArray>, name: String, val: JsValue) {
+pub(crate) fn fn_props_set(ba: &Rc<BytecodeArray>, name: String, val: JsValue) {
     FUNCTION_PROPS.with(|fp| {
         let mut table = fp.borrow_mut();
         let map = table

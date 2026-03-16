@@ -15581,6 +15581,200 @@ mod tests {
         assert_eq!(result, JsValue::String("function".into()));
     }
 
+    #[test]
+    fn e2e_eval_empty_string_returns_undefined() {
+        let result = global_eval("eval('')").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_eval_invalid_code_throws_syntax_error() {
+        let result = global_eval("eval('function (')").unwrap_err();
+        assert!(matches!(result, StatorError::SyntaxError(_)));
+    }
+
+    #[test]
+    fn e2e_eval_direct_reads_local_scope() {
+        let result = global_eval("function outer(x) { return eval('x + 1'); } outer(4)").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_eval_direct_updates_local_binding() {
+        let result =
+            global_eval("function outer() { var x = 1; eval('x = 7'); return x; } outer()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_eval_indirect_uses_global_scope() {
+        let result = global_eval(
+            "var x = 10; function outer() { var x = 1; return (0, eval)('x'); } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_function_constructor_basic() {
+        let result = global_eval("new Function('a', 'b', 'return a + b')(2, 3)").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_function_constructor_uses_global_scope() {
+        let result = global_eval(
+            "var x = 9; function outer() { var x = 1; return new Function('return x')(); } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn e2e_function_constructor_no_args() {
+        let result = global_eval("typeof new Function()").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn e2e_function_constructor_invalid_body_throws_syntax_error() {
+        let result = global_eval("new Function('return {')").unwrap_err();
+        assert!(matches!(result, StatorError::SyntaxError(_)));
+    }
+
+    #[test]
+    fn e2e_function_prototype_call() {
+        let result =
+            global_eval("function add(a, b) { return a + b; } add.call(null, 4, 6)").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_function_prototype_apply() {
+        let result =
+            global_eval("function add(a, b) { return a + b; } add.apply(null, [4, 6])").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_function_prototype_bind() {
+        let result =
+            global_eval("function add(a, b) { return a + b; } add.bind(null, 4)(6)").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_function_prototype_constructor() {
+        let result = global_eval("Function.prototype.constructor === Function").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_function_prototype_to_string() {
+        let result = global_eval("function foo() {} foo.toString()").unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("function foo() { [native code] }".into())
+        );
+    }
+
+    #[test]
+    fn e2e_function_constructor_to_string() {
+        let result = global_eval("new Function('a', 'b', 'return a + b').toString()").unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("function anonymous(a,b\n) {\nreturn a + b\n}".into())
+        );
+    }
+
+    #[test]
+    fn e2e_function_name_named() {
+        let result = global_eval("function named() {} named.name").unwrap();
+        assert_eq!(result, JsValue::String("named".into()));
+    }
+
+    #[test]
+    fn e2e_function_name_anonymous() {
+        let result = global_eval("(function() {}).name").unwrap();
+        assert_eq!(result, JsValue::String(String::new().into()));
+    }
+
+    #[test]
+    fn e2e_function_name_bound() {
+        let result = global_eval("function named() {} named.bind(null).name").unwrap();
+        assert_eq!(result, JsValue::String("bound named".into()));
+    }
+
+    #[test]
+    fn e2e_function_name_computed_property() {
+        let result =
+            global_eval("var key = 'answer'; ({ [key]: function() {} })[key].name").unwrap();
+        assert_eq!(result, JsValue::String("answer".into()));
+    }
+
+    #[test]
+    fn e2e_function_name_named_expression_not_overridden() {
+        let result =
+            global_eval("var key = 'answer'; ({ [key]: function explicit() {} })[key].name")
+                .unwrap();
+        assert_eq!(result, JsValue::String("explicit".into()));
+    }
+
+    #[test]
+    fn e2e_function_length_constructor() {
+        let result = global_eval("Function.length").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_function_length_counts_formals() {
+        let result = global_eval("function add(a, b, c) {} add.length").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_function_length_stops_before_default() {
+        let result =
+            global_eval("function withDefault(a, b = 1, c) {} withDefault.length").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_function_length_stops_before_rest() {
+        let result = global_eval("function withRest(a, ...rest) {} withRest.length").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_bound_function_length_reduces_bound_args() {
+        let result = global_eval("function add(a, b, c) {} add.bind(null, 1).length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_arguments_callee_sloppy_mode() {
+        let result =
+            global_eval("function outer() { return arguments.callee === outer; } outer()").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_arguments_callee_strict_mode_throws() {
+        let result =
+            global_eval("function outer() { 'use strict'; return arguments.callee; } outer()")
+                .unwrap_err();
+        assert!(matches!(result, StatorError::TypeError(_)));
+    }
+
+    #[test]
+    fn e2e_arguments_callee_strict_mode_computed_throws() {
+        let result =
+            global_eval("function outer() { 'use strict'; return arguments['callee']; } outer()")
+                .unwrap_err();
+        assert!(matches!(result, StatorError::TypeError(_)));
+    }
+
     // ── BigInt tests ────────────────────────────────────────────────────────
 
     // -- Literal parsing --
