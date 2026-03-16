@@ -2571,7 +2571,6 @@ fn json_serialize_value(
         | JsValue::Error(_)
         | JsValue::Promise(_)
         | JsValue::Context(_)
-        | JsValue::Proxy(_)
         | JsValue::ArrayBuffer(_)
         | JsValue::TypedArray(_)
         | JsValue::DataView(_) => Ok(None),
@@ -2587,6 +2586,67 @@ fn json_serialize_value(
         JsValue::BigInt(_) => Err(StatorError::TypeError(
             "Do not know how to serialize a BigInt".to_string(),
         )),
+        // §25.5.2: Proxy objects are serialized through their traps, like
+        // regular objects.  We read ownKeys via the trap, then get each
+        // property through the get trap, producing the same output as a
+        // PlainObject with those enumerable properties.
+        JsValue::Proxy(proxy) => {
+            let identity = Rc::as_ptr(proxy) as usize;
+            if !in_progress.insert(identity) {
+                return Err(StatorError::TypeError(
+                    "Converting circular structure to JSON".to_string(),
+                ));
+            }
+
+            let result = (|| {
+                let keys = proxy_own_keys(&proxy.borrow())?;
+                let use_indent = !indent.is_empty();
+                let inner_indent = indent.repeat(depth + 1);
+                let outer_indent = indent.repeat(depth);
+
+                let keys = if let Some(property_list) = property_list {
+                    property_list.to_vec()
+                } else {
+                    keys
+                };
+
+                let mut parts = Vec::new();
+                for key in keys {
+                    let prop_val = proxy_get(&proxy.borrow(), &key)?;
+                    // Build a temporary holder for json_serialize_value.
+                    let child = json_serialize_value(
+                        &prop_val,
+                        replacer_fn,
+                        None,
+                        indent,
+                        depth + 1,
+                        in_progress,
+                    )?;
+                    if let Some(item) = child {
+                        let key_str = json_stringify_string(&key);
+                        if use_indent {
+                            parts.push(format!("{key_str}: {item}"));
+                        } else {
+                            parts.push(format!("{key_str}:{item}"));
+                        }
+                    }
+                }
+
+                if parts.is_empty() {
+                    Ok(Some("{}".to_string()))
+                } else if use_indent {
+                    let joined = parts.join(&format!(",\n{inner_indent}"));
+                    Ok(Some(format!(
+                        "{{\n{inner_indent}{joined}\n{outer_indent}}}"
+                    )))
+                } else {
+                    Ok(Some(format!("{{{}}}", parts.join(","))))
+                }
+            })();
+
+            in_progress.remove(&identity);
+            result
+        }
         JsValue::Array(items) => {
             let Some(identity) = json_identity_key(value) else {
                 unreachable!("arrays must have an identity key");
@@ -30061,5 +30121,299 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── JSON deep edge-case tests ───────────────────────────────────────────
+
+    // 1. JSON.parse reviver — walks all properties, transforms values
+    #[test]
+    fn e2e_json_parse_reviver_transforms_values() {
+        let result = global_eval(
+            r#"JSON.stringify(JSON.parse('{"a":1,"b":2}', function(k, v) {
+                return typeof v === "number" ? v * 10 : v;
+            }))"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":10,"b":20}"#.into()));
+    }
+
+    // 2. JSON.parse reviver — deletes properties by returning undefined
+    #[test]
+    fn e2e_json_parse_reviver_deletes_properties() {
+        let result = global_eval(
+            r#"JSON.stringify(JSON.parse('{"a":1,"b":2,"c":3}', function(k, v) {
+                if (k === "b") return undefined;
+                return v;
+            }))"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":1,"c":3}"#.into()));
+    }
+
+    // 3. JSON.parse reviver — receives correct key/value for nested objects
+    #[test]
+    fn e2e_json_parse_reviver_nested_object() {
+        let result = global_eval(
+            r#"var keys = [];
+            JSON.parse('{"a":{"b":1}}', function(k, v) { if (k !== "") keys.push(k); return v; });
+            keys.join(",")"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("b,a".into()));
+    }
+
+    // 4. JSON.parse with Unicode escapes — \u0041 → "A"
+    #[test]
+    fn e2e_json_parse_unicode_escape() {
+        let result = global_eval(r#"JSON.parse('"\\u0041\\u0042\\u0043"')"#).unwrap();
+        assert_eq!(result, JsValue::String("ABC".into()));
+    }
+
+    // 5. JSON.parse with Unicode escape — non-ASCII \u00E9 → é
+    #[test]
+    fn e2e_json_parse_unicode_escape_non_ascii() {
+        let result = global_eval(r#"JSON.parse('"caf\\u00E9"')"#).unwrap();
+        assert_eq!(result, JsValue::String("café".into()));
+    }
+
+    // 6. JSON.parse error handling — invalid JSON throws SyntaxError
+    #[test]
+    fn e2e_json_parse_invalid_json_syntax_error() {
+        let result = global_eval(r#"JSON.parse("{invalid}")"#);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), StatorError::SyntaxError(_)));
+    }
+
+    // 7. JSON.parse error handling — trailing comma is invalid
+    #[test]
+    fn e2e_json_parse_trailing_comma_error() {
+        let result = global_eval(r#"JSON.parse("[1,2,3,]")"#);
+        assert!(result.is_err());
+    }
+
+    // 8. JSON.parse error handling — empty input
+    #[test]
+    fn e2e_json_parse_empty_input_error() {
+        let result = global_eval(r#"JSON.parse("")"#);
+        assert!(result.is_err());
+    }
+
+    // 9. JSON.stringify replacer array — only include listed keys
+    #[test]
+    fn e2e_json_stringify_replacer_array() {
+        let result = global_eval(r#"JSON.stringify({a: 1, b: 2, c: 3}, ["a", "c"])"#).unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":1,"c":3}"#.into()));
+    }
+
+    // 10. JSON.stringify replacer function — transform values
+    #[test]
+    fn e2e_json_stringify_replacer_function() {
+        let result = global_eval(
+            r#"JSON.stringify({a: 1, b: "hello", c: true}, function(k, v) {
+                if (typeof v === "number") return v * 2;
+                return v;
+            })"#,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::String(r#"{"a":2,"b":"hello","c":true}"#.into())
+        );
+    }
+
+    // 11. JSON.stringify replacer function — omit properties by returning undefined
+    #[test]
+    fn e2e_json_stringify_replacer_fn_omits() {
+        let result = global_eval(
+            r#"JSON.stringify({a: 1, b: 2, c: 3}, function(k, v) {
+                if (k === "b") return undefined;
+                return v;
+            })"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":1,"c":3}"#.into()));
+    }
+
+    // 12. JSON.stringify space parameter — number indent
+    #[test]
+    fn e2e_json_stringify_space_number() {
+        let result = global_eval(r#"JSON.stringify({a: 1}, null, 2)"#).unwrap();
+        assert_eq!(result, JsValue::String("{\n  \"a\": 1\n}".into()));
+    }
+
+    // 13. JSON.stringify space parameter — string prefix
+    #[test]
+    fn e2e_json_stringify_space_string() {
+        let result = global_eval(r#"JSON.stringify({a: 1}, null, "\t")"#).unwrap();
+        assert_eq!(result, JsValue::String("{\n\t\"a\": 1\n}".into()));
+    }
+
+    // 14. JSON.stringify toJSON — custom serialization method
+    #[test]
+    fn e2e_json_stringify_to_json_method() {
+        let result = global_eval(
+            r#"var obj = { val: 42, toJSON: function() { return "custom:" + this.val; } };
+            JSON.stringify(obj)"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#""custom:42""#.into()));
+    }
+
+    // 15. JSON.stringify special values — undefined omitted in objects
+    #[test]
+    fn e2e_json_stringify_undefined_in_object() {
+        let result = global_eval(r#"JSON.stringify({a: 1, b: undefined, c: 3})"#).unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":1,"c":3}"#.into()));
+    }
+
+    // 16. JSON.stringify special values — undefined becomes null in arrays
+    #[test]
+    fn e2e_json_stringify_undefined_in_array() {
+        let result = global_eval(r#"JSON.stringify([1, undefined, 3])"#).unwrap();
+        assert_eq!(result, JsValue::String("[1,null,3]".into()));
+    }
+
+    // 17. JSON.stringify special values — Infinity → null
+    #[test]
+    fn e2e_json_stringify_infinity_to_null() {
+        let result = global_eval(r#"JSON.stringify(Infinity)"#).unwrap();
+        assert_eq!(result, JsValue::String("null".into()));
+    }
+
+    // 18. JSON.stringify special values — NaN → null
+    #[test]
+    fn e2e_json_stringify_nan_to_null() {
+        let result = global_eval(r#"JSON.stringify(NaN)"#).unwrap();
+        assert_eq!(result, JsValue::String("null".into()));
+    }
+
+    // 19. JSON.stringify special values — -Infinity → null
+    #[test]
+    fn e2e_json_stringify_neg_infinity_to_null() {
+        let result = global_eval(r#"JSON.stringify(-Infinity)"#).unwrap();
+        assert_eq!(result, JsValue::String("null".into()));
+    }
+
+    // 20. JSON.stringify special values — function omitted from object
+    #[test]
+    fn e2e_json_stringify_function_omitted() {
+        let result = global_eval(r#"JSON.stringify({a: 1, b: function() {}, c: 3})"#).unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":1,"c":3}"#.into()));
+    }
+
+    // 21. JSON round-trip — parse(stringify(x)) for objects
+    #[test]
+    fn e2e_json_round_trip_object() {
+        let result = global_eval(
+            r#"var obj = {a: 1, b: "hello", c: true, d: null};
+            JSON.stringify(JSON.parse(JSON.stringify(obj))) === JSON.stringify(obj)"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // 22. JSON round-trip — parse(stringify(x)) for arrays
+    #[test]
+    fn e2e_json_round_trip_array() {
+        let result = global_eval(
+            r#"var arr = [1, "two", true, null, [5, 6]];
+            JSON.stringify(JSON.parse(JSON.stringify(arr))) === JSON.stringify(arr)"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // 23. JSON round-trip — parse(stringify(x)) for nested objects
+    #[test]
+    fn e2e_json_round_trip_nested() {
+        let result = global_eval(
+            r#"var obj = {a: {b: {c: 42}}};
+            JSON.parse(JSON.stringify(obj)).a.b.c"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    // 24. JSON.stringify with Proxy — should serialize through proxy traps
+    #[test]
+    fn e2e_json_stringify_proxy() {
+        let result = global_eval(
+            r#"var target = {a: 1, b: 2};
+            var proxy = new Proxy(target, {});
+            JSON.stringify(proxy)"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":1,"b":2}"#.into()));
+    }
+
+    // 25. JSON.stringify with Proxy — get trap intercepts values
+    #[test]
+    fn e2e_json_stringify_proxy_get_trap() {
+        let result = global_eval(
+            r#"var target = {a: 1, b: 2};
+            var proxy = new Proxy(target, {
+                get: function(t, k) { return t[k] * 10; }
+            });
+            JSON.stringify(proxy)"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":10,"b":20}"#.into()));
+    }
+
+    // 26. JSON.parse — deeply nested valid JSON
+    #[test]
+    fn e2e_json_parse_deeply_nested() {
+        let result = global_eval(r#"JSON.parse('{"a":{"b":{"c":[1,2,3]}}}').a.b.c[1]"#).unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    // 27. JSON.stringify — empty object and array
+    #[test]
+    fn e2e_json_stringify_empty_containers() {
+        let result = global_eval(r#"JSON.stringify({}) + "|" + JSON.stringify([])"#).unwrap();
+        assert_eq!(result, JsValue::String("{}|[]".into()));
+    }
+
+    // 28. JSON.stringify — null value
+    #[test]
+    fn e2e_json_stringify_null() {
+        let result = global_eval(r#"JSON.stringify(null)"#).unwrap();
+        assert_eq!(result, JsValue::String("null".into()));
+    }
+
+    // 29. JSON.stringify — boolean values
+    #[test]
+    fn e2e_json_stringify_booleans() {
+        let result = global_eval(r#"JSON.stringify(true) + "|" + JSON.stringify(false)"#).unwrap();
+        assert_eq!(result, JsValue::String("true|false".into()));
+    }
+
+    // 30. JSON.stringify — string escaping of special characters
+    #[test]
+    fn e2e_json_stringify_string_escaping() {
+        let result = global_eval(r#"JSON.stringify("hello\nworld")"#).unwrap();
+        assert_eq!(result, JsValue::String(r#""hello\nworld""#.into()));
+    }
+
+    // 31. JSON.stringify — top-level undefined returns undefined
+    #[test]
+    fn e2e_json_stringify_undefined_returns_undefined() {
+        let result = global_eval(r#"JSON.stringify(undefined)"#).unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    // 32. JSON.parse — surrogate pair emoji
+    #[test]
+    fn e2e_json_parse_surrogate_pair() {
+        let result = global_eval(r#"JSON.parse('"\\uD83D\\uDE00"')"#).unwrap();
+        assert_eq!(result, JsValue::String("😀".into()));
+    }
+
+    // 33. JSON.stringify space parameter clamped to 10
+    #[test]
+    fn e2e_json_stringify_space_clamped_to_10() {
+        let result = global_eval(r#"JSON.stringify({a: 1}, null, 20)"#).unwrap();
+        // 10 spaces max
+        assert_eq!(result, JsValue::String("{\n          \"a\": 1\n}".into()));
     }
 }

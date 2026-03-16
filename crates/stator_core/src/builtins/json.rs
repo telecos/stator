@@ -40,6 +40,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use crate::builtins::proxy::{proxy_get, proxy_own_keys};
 use crate::error::{StatorError, StatorResult};
 use crate::objects::value::JsValue;
 
@@ -1037,7 +1038,6 @@ fn js_value_to_json_inner(
         | JsValue::Error(_)
         | JsValue::Promise(_)
         | JsValue::Context(_)
-        | JsValue::Proxy(_)
         | JsValue::ArrayBuffer(_)
         | JsValue::TypedArray(_)
         | JsValue::DataView(_) => Ok(None),
@@ -1097,6 +1097,26 @@ fn js_value_to_json_inner(
             for (k, v) in map.borrow().enumerable_iter() {
                 if let Some(jv) = js_value_to_json_inner(v, seen)? {
                     entries.push((k.clone(), jv));
+                }
+            }
+            seen.remove(&ptr);
+            Ok(Some(JsonValue::Object(Rc::new(RefCell::new(entries)))))
+        }
+        // §25.5.2: Proxy objects are serialized through their traps.
+        JsValue::Proxy(proxy) => {
+            let ptr = Rc::as_ptr(proxy) as usize;
+            if seen.contains(&ptr) {
+                return Err(StatorError::TypeError(
+                    "Converting circular structure to JSON".to_string(),
+                ));
+            }
+            seen.insert(ptr);
+            let keys = proxy_own_keys(&proxy.borrow())?;
+            let mut entries: Vec<(String, JsonValue)> = Vec::new();
+            for key in keys {
+                let val = proxy_get(&proxy.borrow(), &key)?;
+                if let Some(jv) = js_value_to_json_inner(&val, seen)? {
+                    entries.push((key, jv));
                 }
             }
             seen.remove(&ptr);
