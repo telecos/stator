@@ -5788,14 +5788,14 @@ fn make_map_builtin() -> JsValue {
         props.insert(
             "__call__".into(),
             native(|args| {
-                let m = if let Some(JsValue::Array(arr)) = args.first() {
+                let m = if args.first().is_some_and(is_js_array) {
+                    let (elements, _) = to_array_like_elements(args.first().unwrap());
                     let mut pairs = Vec::new();
-                    for item in arr.borrow().iter() {
-                        if let JsValue::Array(pair) = item {
-                            let k = pair.borrow().first().cloned().unwrap_or(JsValue::Undefined);
-                            let v = pair.borrow().get(1).cloned().unwrap_or(JsValue::Undefined);
-                            pairs.push((k, v));
-                        }
+                    for item in &elements {
+                        let (pair_elems, _) = to_array_like_elements(item);
+                        let k = pair_elems.first().cloned().unwrap_or(JsValue::Undefined);
+                        let v = pair_elems.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        pairs.push((k, v));
                     }
                     map_from_iterable(pairs)
                 } else {
@@ -6164,8 +6164,9 @@ fn make_set_builtin() -> JsValue {
         props.insert(
             "__call__".into(),
             native(|args| {
-                let s = if let Some(JsValue::Array(arr)) = args.first() {
-                    set_from_iterable(arr.borrow().clone())
+                let s = if args.first().is_some_and(is_js_array) {
+                    let (elements, _) = to_array_like_elements(args.first().unwrap());
+                    set_from_iterable(elements)
                 } else {
                     set_new()
                 };
@@ -18492,7 +18493,6 @@ mod tests {
     /// We verify the third argument is the map by checking it has a `get`
     /// method (i.e., it is the Map instance).
     #[test]
-    #[ignore] // TODO: Map forEach needs 3-arg callback via call_callback
     fn e2e_map_foreach_three_args() {
         // The callback checks that three arguments are received.
         let result = global_eval(
@@ -18505,7 +18505,6 @@ mod tests {
 
     /// `Map.prototype.forEach` calls with correct (value, key) order.
     #[test]
-    #[ignore] // TODO: callback closure context not preserved through call_callback/dispatch_call_value
     fn e2e_map_foreach_value_key_order() {
         let result = global_eval(
             "var out = ''; var m = new Map([['x', 42]]); \
@@ -18521,7 +18520,6 @@ mod tests {
     /// We verify the third argument is the set by checking it has an `add`
     /// method.
     #[test]
-    #[ignore] // TODO: callback closure context not preserved through call_callback/dispatch_call_value
     fn e2e_set_foreach_three_args() {
         let result = global_eval(
             "var count = 0; var s = new Set([10]); \
@@ -19092,7 +19090,6 @@ mod tests {
 
     /// `findLast` receives correct index argument.
     #[test]
-    #[ignore] // TODO: callback closure context not preserved through call_callback/dispatch_call_value
     fn test_array_find_last_index_arg() {
         let result = global_eval(
             r#"

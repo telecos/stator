@@ -5157,7 +5157,12 @@ pub fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult
     match callee {
         JsValue::Function(ba) => {
             push_call_frame("<anonymous>")?;
-            let mut frame = InterpreterFrame::new((**ba).clone(), args);
+            let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
+                InterpreterFrame::new_with_globals((**ba).clone(), args, globals)
+            } else {
+                InterpreterFrame::new((**ba).clone(), args)
+            };
+            restore_closure_context(&mut frame, ba);
             let result = Interpreter::run(&mut frame);
             pop_call_frame();
             result
@@ -5187,7 +5192,12 @@ pub fn dispatch_call_with_this(
     match callee {
         JsValue::Function(ba) => {
             push_call_frame("<anonymous>")?;
-            let mut frame = InterpreterFrame::new((**ba).clone(), args);
+            let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
+                InterpreterFrame::new_with_globals((**ba).clone(), args, globals)
+            } else {
+                InterpreterFrame::new((**ba).clone(), args)
+            };
+            restore_closure_context(&mut frame, ba);
             frame
                 .global_env
                 .borrow_mut()
