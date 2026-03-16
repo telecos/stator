@@ -49,15 +49,12 @@ use stator_core::parser;
 /// failed.  This avoids panicking inside `GlobalAlloc::alloc()`, which is
 /// undefined behavior per the Rust reference.
 ///
-/// For truly catastrophic allocations (>[`HARD_LIMIT_SIZE`]), the allocator
-/// returns `null` which causes Rust's OOM handler to abort the process.
+/// We always delegate to `System` regardless of size — the OS/OOM-killer
+/// handles truly catastrophic allocations.
 struct GuardedAlloc;
 
 /// Soft limit: allocations above this set the exceeded flag (512 MiB).
 const MAX_ALLOC_SIZE: usize = 512 << 20;
-
-/// Hard limit: allocations above this return null → process abort (2 GiB).
-const HARD_LIMIT_SIZE: usize = 2 << 30;
 
 thread_local! {
     /// Set to `true` when an oversized allocation is detected.
@@ -67,16 +64,12 @@ thread_local! {
 
 // SAFETY: All methods delegate to `System`.  The safety invariants of
 // `GlobalAlloc` (valid layout, matching alloc/dealloc) are upheld by the
-// inner `System` allocator.  We never panic — oversized allocations either
-// set a flag or return null.
+// inner `System` allocator.  We never panic and never return null —
+// oversized allocations just set a flag.
 unsafe impl GlobalAlloc for GuardedAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if layout.size() > HARD_LIMIT_SIZE {
-            // Catastrophic allocation — return null to trigger OOM abort.
-            return std::ptr::null_mut();
-        }
         if layout.size() > MAX_ALLOC_SIZE {
-            // Oversized but survivable — set flag so the runner can fail this test.
+            // Oversized — set flag so the runner can fail this test.
             ALLOC_EXCEEDED.with(|g| g.set(true));
         }
         unsafe { System.alloc(layout) }
