@@ -1057,12 +1057,12 @@ mod tests {
     }
 
     #[test]
-    fn test_to_string_radix_hex() {
+    fn test_to_string_radix_hex_v2() {
         assert_eq!(number_to_string_radix(255.0, 16).unwrap(), "ff");
     }
 
     #[test]
-    fn test_to_string_radix_binary() {
+    fn test_to_string_radix_binary_v2() {
         assert_eq!(number_to_string_radix(10.0, 2).unwrap(), "1010");
     }
 

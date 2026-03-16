@@ -22912,7 +22912,7 @@ mod tests {
 
     /// `Object.create(null)` produces an object with no prototype.
     #[test]
-    fn e2e_object_create_null() {
+    fn e2e_object_create_null_v2() {
         let result = global_eval("var o = Object.create(null); Object.getPrototypeOf(o)").unwrap();
         assert_eq!(result, JsValue::Null);
     }
@@ -23385,14 +23385,14 @@ mod tests {
 
     /// Object.isFrozen returns true after freeze.
     #[test]
-    fn e2e_object_is_frozen() {
+    fn e2e_object_is_frozen_v2() {
         let result = global_eval("var o = { x: 1 }; Object.freeze(o); Object.isFrozen(o)").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
 
     /// Object.isSealed returns true after seal.
     #[test]
-    fn e2e_object_is_sealed() {
+    fn e2e_object_is_sealed_v2() {
         let result = global_eval("var o = { x: 1 }; Object.seal(o); Object.isSealed(o)").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
@@ -23401,14 +23401,14 @@ mod tests {
 
     /// `Object.is(NaN, NaN)` returns true.
     #[test]
-    fn e2e_object_is_nan() {
+    fn e2e_object_is_nan_v2() {
         let result = global_eval("Object.is(NaN, NaN)").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
 
     /// `Object.is(0, -0)` returns false.
     #[test]
-    fn e2e_object_is_zero_neg_zero() {
+    fn e2e_object_is_zero_neg_zero_v2() {
         let result = global_eval("Object.is(0, -0)").unwrap();
         assert_eq!(result, JsValue::Boolean(false));
     }
@@ -23439,7 +23439,7 @@ mod tests {
 
     /// Object.hasOwn returns false for inherited.
     #[test]
-    fn e2e_object_has_own_inherited() {
+    fn e2e_object_has_own_inherited_v2() {
         let result =
             global_eval("var p = { x: 1 }; var o = Object.create(p); Object.hasOwn(o, 'x')")
                 .unwrap();

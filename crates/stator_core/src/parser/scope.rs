@@ -1124,6 +1124,9 @@ impl Analyzer {
                     self.visit_expr(arg);
                 }
             }
+            Expr::OptionalChain(inner) => {
+                self.visit_expr(inner);
+            }
             Expr::New(n) => {
                 self.visit_expr(&n.callee);
                 for arg in &n.arguments {

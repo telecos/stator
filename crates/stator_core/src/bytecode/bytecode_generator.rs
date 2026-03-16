@@ -256,6 +256,10 @@ struct FunctionCompiler {
     /// `try` body.  Each entry is a reference to the AST `BlockStmt`
     /// that must be compiled inline.
     finally_stack: Vec<crate::parser::ast::BlockStmt>,
+    /// When set, the current optional chain's null label.  `OptionalMember`
+    /// and `OptionalCall` compilation jump to this label instead of
+    /// handling the nullish short-circuit locally.
+    optional_chain_null_label: Option<usize>,
 }
 
 impl FunctionCompiler {
@@ -299,6 +303,7 @@ impl FunctionCompiler {
             using_vars: vec![Vec::new()],
             for_of_iter_regs: HashMap::new(),
             finally_stack: Vec::new(),
+            optional_chain_null_label: None,
         };
         // Register simple ident params in the scope immediately; complex
         // patterns are handled by `emit_param_prologue`.
@@ -1912,6 +1917,7 @@ impl FunctionCompiler {
             using_vars: vec![Vec::new()],
             for_of_iter_regs: HashMap::new(),
             finally_stack: Vec::new(),
+            optional_chain_null_label: None,
         };
 
         let this_reg = Register::parameter(0);
@@ -2712,6 +2718,7 @@ impl FunctionCompiler {
                 // ── Member / call ─────────────────────────────────────────────
                 Expr::Member(m) => self.compile_member(m),
                 Expr::OptionalMember(m) => self.compile_optional_member(m),
+                Expr::OptionalChain(inner) => self.compile_optional_chain(inner),
                 Expr::Call(c) => self.compile_call(c),
                 Expr::OptionalCall(c) => self.compile_optional_call(c),
                 Expr::New(n) => self.compile_new(n),
@@ -2941,6 +2948,11 @@ impl FunctionCompiler {
                         self.allocator
                             .release_temporary(obj_reg)
                             .map_err(|e| StatorError::Internal(e.to_string()))?;
+                    }
+                    // `delete obj?.prop` — short-circuit to `true` when
+                    // the base is nullish; otherwise delete normally.
+                    Expr::OptionalChain(inner) => {
+                        self.compile_delete_optional_chain(inner)?;
                     }
                     Expr::Ident(_) if self.is_strict => {
                         // In strict mode, `delete x` on an unqualified
@@ -3424,18 +3436,50 @@ impl FunctionCompiler {
         &mut self,
         m: &crate::parser::ast::OptionalMemberExpr,
     ) -> StatorResult<()> {
-        let null_label = self.new_label();
-        let end_label = self.new_label();
-
         self.compile_expr(&m.object)?;
         let obj_reg = self.allocator.allocate_temporary();
         self.emit_star(obj_reg);
 
-        // If the object is null or undefined, short-circuit to undefined.
+        // If the object is null or undefined, short-circuit.
         self.emit_ldar(obj_reg);
-        self.emit_jump(Opcode::JumpIfUndefinedOrNull, null_label);
 
-        match &m.property {
+        if let Some(chain_label) = self.optional_chain_null_label {
+            // Inside an OptionalChain — jump to the shared null-label.
+            self.emit_jump(Opcode::JumpIfUndefinedOrNull, chain_label);
+
+            self.emit_optional_member_property(obj_reg, &m.property)?;
+
+            self.allocator
+                .release_temporary(obj_reg)
+                .map_err(|e| StatorError::Internal(e.to_string()))?;
+        } else {
+            // Standalone `?.` (no OptionalChain wrapper — shouldn't happen
+            // after the parser change, but keep as a fallback).
+            let null_label = self.new_label();
+            let end_label = self.new_label();
+            self.emit_jump(Opcode::JumpIfUndefinedOrNull, null_label);
+
+            self.emit_optional_member_property(obj_reg, &m.property)?;
+
+            self.emit_jump(Opcode::Jump, end_label);
+            self.bind_label(null_label);
+            self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+            self.bind_label(end_label);
+
+            self.allocator
+                .release_temporary(obj_reg)
+                .map_err(|e| StatorError::Internal(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Emit the property access for an optional member expression.
+    fn emit_optional_member_property(
+        &mut self,
+        obj_reg: Register,
+        property: &crate::parser::ast::MemberProp,
+    ) -> StatorResult<()> {
+        match property {
             crate::parser::ast::MemberProp::Ident(id) => {
                 let name_idx = self.add_string(&id.name);
                 let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
@@ -3461,15 +3505,97 @@ impl FunctionCompiler {
                 ));
             }
         }
-        self.emit_jump(Opcode::Jump, end_label);
+        Ok(())
+    }
 
+    /// Compile an entire optional-chain expression.
+    ///
+    /// Sets up a shared null-label so that every `OptionalMember` /
+    /// `OptionalCall` inside the chain jumps to the same short-circuit
+    /// point, producing `undefined` for the whole chain.
+    fn compile_optional_chain(&mut self, inner: &Expr) -> StatorResult<()> {
+        let null_label = self.new_label();
+        let end_label = self.new_label();
+
+        let saved = self.optional_chain_null_label;
+        self.optional_chain_null_label = Some(null_label);
+
+        self.compile_expr(inner)?;
+
+        self.optional_chain_null_label = saved;
+
+        self.emit_jump(Opcode::Jump, end_label);
         self.bind_label(null_label);
         self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
         self.bind_label(end_label);
+        Ok(())
+    }
 
-        self.allocator
-            .release_temporary(obj_reg)
-            .map_err(|e| StatorError::Internal(e.to_string()))?;
+    /// Compile `delete obj?.prop` — short-circuit to `true` when
+    /// the base is nullish; otherwise delete normally.
+    fn compile_delete_optional_chain(&mut self, inner: &Expr) -> StatorResult<()> {
+        // Unwrap one layer: inner should be an OptionalMember.
+        // For more complex chains (delete a?.b.c), we only support
+        // the direct OptionalMember case (delete a?.b).
+        match inner {
+            Expr::OptionalMember(m) => {
+                self.compile_expr(&m.object)?;
+                let obj_reg = self.allocator.allocate_temporary();
+                self.emit_star(obj_reg);
+
+                let null_label = self.new_label();
+                let end_label = self.new_label();
+
+                self.emit_ldar(obj_reg);
+                self.emit_jump(Opcode::JumpIfUndefinedOrNull, null_label);
+
+                // Object is not nullish — delete the property.
+                match &m.property {
+                    crate::parser::ast::MemberProp::Computed(key) => {
+                        self.compile_expr(key)?;
+                    }
+                    crate::parser::ast::MemberProp::Ident(id) => {
+                        let idx = self.add_string(&id.name);
+                        self.emit(Instruction::new_unchecked(
+                            Opcode::LdaConstant,
+                            vec![Operand::ConstantPoolIdx(idx)],
+                        ));
+                    }
+                    crate::parser::ast::MemberProp::Private(name) => {
+                        return Err(StatorError::SyntaxError(format!(
+                            "private fields can not be deleted (field #{})",
+                            name.name
+                        )));
+                    }
+                }
+                let delete_op = if self.is_strict {
+                    Opcode::DeletePropertyStrict
+                } else {
+                    Opcode::DeletePropertySloppy
+                };
+                self.emit(Instruction::new_unchecked(
+                    delete_op,
+                    vec![to_reg_op(obj_reg)],
+                ));
+                self.emit_jump(Opcode::Jump, end_label);
+
+                // Object is nullish — result is `true`.
+                self.bind_label(null_label);
+                self.emit(Instruction::new_unchecked(Opcode::LdaTrue, vec![]));
+                self.bind_label(end_label);
+
+                self.allocator
+                    .release_temporary(obj_reg)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+            }
+            _ => {
+                // For other shapes (e.g. `delete a?.b.c`), evaluate the
+                // chain (which may short-circuit to undefined) and then
+                // return `true` since deleting a non-reference is `true`.
+                self.compile_optional_chain(inner)?;
+                self.emit(Instruction::new_unchecked(Opcode::LdaTrue, vec![]));
+            }
+        }
         Ok(())
     }
 
@@ -3542,6 +3668,12 @@ impl FunctionCompiler {
             // Propagate tail position into method call compilation.
             self.in_tail_position = is_tail;
             return self.compile_method_call(m, &c.arguments);
+        }
+
+        // Check for optional method call: `obj?.method(args)`.
+        // The parser produces `Call(OptionalMember(obj, method), args)`.
+        if let Expr::OptionalMember(m) = c.callee.as_ref() {
+            return self.compile_optional_method_call(m, &c.arguments);
         }
 
         // Detect direct eval: `eval(args)` where the callee is the bare
@@ -3646,24 +3778,38 @@ impl FunctionCompiler {
         let callee_reg = self.allocator.allocate_temporary();
         self.emit_star(callee_reg);
 
-        let null_label = self.new_label();
-        let end_label = self.new_label();
-
         self.emit_ldar(callee_reg);
-        self.emit_jump(Opcode::JumpIfUndefinedOrNull, null_label);
 
-        let arg_regs = self.compile_arguments(&c.arguments)?;
-        self.emit_call_any_receiver(callee_reg, &arg_regs)?;
-        for r in arg_regs.into_iter().rev() {
-            self.allocator
-                .release_temporary(r)
-                .map_err(|e| StatorError::Internal(e.to_string()))?;
+        if let Some(chain_label) = self.optional_chain_null_label {
+            // Inside an OptionalChain — jump to the shared null-label.
+            self.emit_jump(Opcode::JumpIfUndefinedOrNull, chain_label);
+
+            let arg_regs = self.compile_arguments(&c.arguments)?;
+            self.emit_call_any_receiver(callee_reg, &arg_regs)?;
+            for r in arg_regs.into_iter().rev() {
+                self.allocator
+                    .release_temporary(r)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+            }
+        } else {
+            // Standalone (fallback).
+            let null_label = self.new_label();
+            let end_label = self.new_label();
+            self.emit_jump(Opcode::JumpIfUndefinedOrNull, null_label);
+
+            let arg_regs = self.compile_arguments(&c.arguments)?;
+            self.emit_call_any_receiver(callee_reg, &arg_regs)?;
+            for r in arg_regs.into_iter().rev() {
+                self.allocator
+                    .release_temporary(r)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+            }
+            self.emit_jump(Opcode::Jump, end_label);
+
+            self.bind_label(null_label);
+            self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+            self.bind_label(end_label);
         }
-        self.emit_jump(Opcode::Jump, end_label);
-
-        self.bind_label(null_label);
-        self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
-        self.bind_label(end_label);
 
         self.allocator
             .release_temporary(callee_reg)
@@ -3773,6 +3919,75 @@ impl FunctionCompiler {
                     .map_err(|e| StatorError::Internal(e.to_string()))?;
             }
         }
+        self.allocator
+            .release_temporary(callee_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        self.allocator
+            .release_temporary(recv_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Compile `obj?.method(args)` — optional method call with correct receiver.
+    ///
+    /// Inside an `OptionalChain`, the nullish check jumps to the chain's
+    /// null-label.  Otherwise we handle it locally.
+    fn compile_optional_method_call(
+        &mut self,
+        m: &crate::parser::ast::OptionalMemberExpr,
+        args: &[Expr],
+    ) -> StatorResult<()> {
+        self.in_tail_position = false;
+
+        // Compile the receiver (object).
+        self.compile_expr(&m.object)?;
+        let recv_reg = self.allocator.allocate_temporary();
+        self.emit_star(recv_reg);
+
+        // Nullish check on receiver.
+        self.emit_ldar(recv_reg);
+        let (use_chain, local_null, local_end) =
+            if let Some(chain_label) = self.optional_chain_null_label {
+                self.emit_jump(Opcode::JumpIfUndefinedOrNull, chain_label);
+                (true, 0, 0) // labels unused
+            } else {
+                let nl = self.new_label();
+                let el = self.new_label();
+                self.emit_jump(Opcode::JumpIfUndefinedOrNull, nl);
+                (false, nl, el)
+            };
+
+        // Load the method function from the non-null receiver.
+        self.emit_optional_member_property(recv_reg, &m.property)?;
+        let callee_reg = self.allocator.allocate_temporary();
+        self.emit_star(callee_reg);
+
+        // Call with receiver.
+        let arg_regs = self.compile_arguments(args)?;
+        let arg_count = arg_regs.len() as u32;
+        let slot = self.alloc_slot(FeedbackSlotKind::Call);
+        self.emit(Instruction::new_unchecked(
+            Opcode::CallProperty,
+            vec![
+                to_reg_op(callee_reg),
+                to_reg_op(recv_reg),
+                Operand::RegisterCount(arg_count),
+                slot,
+            ],
+        ));
+        for r in arg_regs.into_iter().rev() {
+            self.allocator
+                .release_temporary(r)
+                .map_err(|e| StatorError::Internal(e.to_string()))?;
+        }
+
+        if !use_chain {
+            self.emit_jump(Opcode::Jump, local_end);
+            self.bind_label(local_null);
+            self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+            self.bind_label(local_end);
+        }
+
         self.allocator
             .release_temporary(callee_reg)
             .map_err(|e| StatorError::Internal(e.to_string()))?;
