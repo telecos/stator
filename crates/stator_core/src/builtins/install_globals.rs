@@ -17064,7 +17064,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_bigint_literal_zero() {
+    fn e2e_bigint_literal_zero_hex() {
         let result = global_eval("0n").unwrap();
         assert_eq!(result, JsValue::BigInt(0));
     }
@@ -17533,7 +17533,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_bigint_strict_eq_number_false() {
+    fn e2e_bigint_strict_eq_number_false_dup() {
         let result = global_eval("1n === 1").unwrap();
         assert_eq!(result, JsValue::Boolean(false));
     }
@@ -28498,7 +28498,7 @@ mod tests {
 
     /// `Array.prototype.flat` with Infinity depth.
     #[test]
-    fn e2e_array_flat_infinity() {
+    fn e2e_array_flat_infinity_deep() {
         let r = global_eval("[1, [2, [3, [4, [5]]]]].flat(Infinity).join(',')").unwrap();
         assert_eq!(r, JsValue::String("1,2,3,4,5".into()));
     }
@@ -28925,7 +28925,7 @@ mod tests {
 
     /// Error.prototype.name is "Error".
     #[test]
-    fn e2e_error_name_property() {
+    fn e2e_error_name_property_builtin() {
         let r = global_eval("new Error('x').name").unwrap();
         assert_eq!(r, JsValue::String("Error".into()));
     }
@@ -28959,7 +28959,7 @@ mod tests {
 
     /// Error.prototype.toString returns "ErrorName: message".
     #[test]
-    fn e2e_error_to_string() {
+    fn e2e_error_to_string_builtin() {
         let r = global_eval(r#"new Error("fail").toString()"#).unwrap();
         assert_eq!(r, JsValue::String("Error: fail".into()));
     }
