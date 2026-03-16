@@ -4961,6 +4961,78 @@ fn handle_sta_named_own_property(
     Ok(DispatchAction::Continue)
 }
 
+fn with_object_is_unscopable(obj: &JsValue, name: &str) -> bool {
+    match proto_lookup(obj, "@@unscopables") {
+        JsValue::PlainObject(map) => matches!(map.borrow().get(name), Some(JsValue::Boolean(true))),
+        _ => false,
+    }
+}
+
+fn plain_object_has_property(map: &Rc<RefCell<PropertyMap>>, name: &str) -> bool {
+    let proto = {
+        let borrow = map.borrow();
+        if borrow.contains_key(name) {
+            return true;
+        }
+        borrow.get("__proto__").cloned()
+    };
+    proto.is_some_and(|value| with_object_has_binding(&value, name))
+}
+
+fn with_object_has_binding(obj: &JsValue, name: &str) -> bool {
+    if with_object_is_unscopable(obj, name) {
+        return false;
+    }
+    match obj {
+        JsValue::PlainObject(map) => {
+            plain_object_has_property(map, name)
+                || !matches!(proto_lookup(obj, name), JsValue::Undefined)
+        }
+        _ => !matches!(proto_lookup(obj, name), JsValue::Undefined),
+    }
+}
+
+fn lookup_with_binding(context: &Option<JsValue>, name: &str) -> Option<JsValue> {
+    let Some(JsValue::Context(root)) = context else {
+        return None;
+    };
+    let mut current = Some(Rc::clone(root));
+    while let Some(ctx_rc) = current {
+        let (object, parent) = {
+            let borrow = ctx_rc.borrow();
+            (borrow.slots.first().cloned(), borrow.parent.clone())
+        };
+        if let Some(object) = object
+            && with_object_has_binding(&object, name)
+        {
+            return Some(proto_lookup(&object, name));
+        }
+        current = parent;
+    }
+    None
+}
+
+fn store_with_binding(context: &Option<JsValue>, name: &str, value: &JsValue) -> bool {
+    let Some(JsValue::Context(root)) = context else {
+        return false;
+    };
+    let mut current = Some(Rc::clone(root));
+    while let Some(ctx_rc) = current {
+        let (object, parent) = {
+            let borrow = ctx_rc.borrow();
+            (borrow.slots.first().cloned(), borrow.parent.clone())
+        };
+        if let Some(JsValue::PlainObject(map)) = object
+            && with_object_has_binding(&JsValue::PlainObject(Rc::clone(&map)), name)
+        {
+            map.borrow_mut().insert(name.to_string(), value.clone());
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
 fn handle_sta_lookup_slot(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -4977,6 +5049,9 @@ fn handle_sta_lookup_slot(
         }
     };
     let val = ctx.frame.accumulator.clone();
+    if store_with_binding(&ctx.frame.context, &name, &val) {
+        return Ok(DispatchAction::Continue);
+    }
     let mut env = ctx.frame.global_env.borrow_mut();
     // Strict mode: assigning to an undeclared variable is a ReferenceError.
     if ctx.frame.bytecode_array.is_strict() && !env.contains_key(&name) {
@@ -5003,12 +5078,16 @@ fn handle_lda_lookup_slot(
             ));
         }
     };
-    ctx.frame.accumulator = match ctx.frame.global_env.borrow().get(&name) {
-        Some(v) => v.clone(),
-        None => {
-            return Err(StatorError::ReferenceError(format!(
-                "{name} is not defined"
-            )));
+    ctx.frame.accumulator = if let Some(value) = lookup_with_binding(&ctx.frame.context, &name) {
+        value
+    } else {
+        match ctx.frame.global_env.borrow().get(&name) {
+            Some(v) => v.clone(),
+            None => {
+                return Err(StatorError::ReferenceError(format!(
+                    "{name} is not defined"
+                )));
+            }
         }
     };
     Ok(DispatchAction::Continue)
@@ -5029,12 +5108,8 @@ fn handle_lda_lookup_slot_inside_typeof(
             ));
         }
     };
-    ctx.frame.accumulator = ctx
-        .frame
-        .global_env
-        .borrow()
-        .get(&name)
-        .cloned()
+    ctx.frame.accumulator = lookup_with_binding(&ctx.frame.context, &name)
+        .or_else(|| ctx.frame.global_env.borrow().get(&name).cloned())
         .unwrap_or(JsValue::Undefined);
     Ok(DispatchAction::Continue)
 }

@@ -156,6 +156,31 @@ impl<'src> Parser<'src> {
         self.current.span
     }
 
+    /// Whether the upcoming labeled body ultimately targets an iteration
+    /// statement, allowing `continue <label>` through nested labels.
+    fn labeled_body_is_iteration(&self) -> bool {
+        let mut scanner = self.scanner.clone();
+        let mut tok = self.current.clone();
+        loop {
+            match tok.kind {
+                TokenKind::For | TokenKind::While | TokenKind::Do => return true,
+                TokenKind::Identifier => {
+                    let Ok(colon) = Self::next_significant(&mut scanner) else {
+                        return false;
+                    };
+                    if colon.kind != TokenKind::Colon {
+                        return false;
+                    }
+                    let Ok(next_tok) = Self::next_significant(&mut scanner) else {
+                        return false;
+                    };
+                    tok = next_tok;
+                }
+                _ => return false,
+            }
+        }
+    }
+
     /// Advance past the current token, returning it.
     fn bump(&mut self) -> StatorResult<Token> {
         let next = Self::next_significant(&mut self.scanner)?;
@@ -416,12 +441,9 @@ impl<'src> Parser<'src> {
                 if self.peek_kind() == TokenKind::Colon {
                     self.bump()?; // consume ':'
                     let label = self.ident_from_token(&id_tok)?;
-                    // Track label for break/continue validation.
-                    // Peek whether the labelled body is an iteration stmt.
-                    let is_iteration = matches!(
-                        self.peek_kind(),
-                        TokenKind::For | TokenKind::While | TokenKind::Do
-                    );
+                    // Track label for break/continue validation, including
+                    // nested labels wrapped around a loop.
+                    let is_iteration = self.labeled_body_is_iteration();
                     self.labels.push((label.name.clone(), is_iteration));
                     let body = self.parse_stmt();
                     self.labels.pop();

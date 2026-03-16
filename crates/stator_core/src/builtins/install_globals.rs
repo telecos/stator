@@ -13344,6 +13344,80 @@ mod tests {
         assert_eq!(result, JsValue::Smi(42));
     }
 
+    #[test]
+    fn e2e_with_statement_reads_object_binding() {
+        let result = global_eval("var obj = { prop: 42 }; with (obj) { prop }").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_with_statement_strict_mode_is_syntax_error() {
+        let result = global_eval("\"use strict\"; with ({ prop: 1 }) { prop }").unwrap_err();
+        assert!(matches!(result, StatorError::SyntaxError(_)));
+    }
+
+    #[test]
+    fn e2e_labelled_block_break_exits_block() {
+        let result =
+            global_eval("var value = 0; label: { value = 1; break label; value = 2; } value")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_nested_labels_continue_outer_loop() {
+        let result = global_eval(
+            "var hits = 0; outer: inner: for (var i = 0; i < 3; i++) { hits = hits + 1; continue outer; } hits",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_comma_operator_returns_last_value() {
+        let result = global_eval("(1, 2, 3)").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_comma_operator_in_for_headers() {
+        let result = global_eval(
+            "var total = 0; for (var i = 0, j = 0; i < 3; i++, j = j + 2) { total = total + j; } total",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_asi_return_newline_returns_undefined() {
+        let result = global_eval("(function () { return\n1; })()").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_asi_throw_newline_is_syntax_error() {
+        let result = global_eval("(function () { throw\n1; })()").unwrap_err();
+        assert!(matches!(result, StatorError::SyntaxError(_)));
+    }
+
+    #[test]
+    fn e2e_asi_break_newline_label_is_syntax_error() {
+        let result = global_eval("label: { break\nlabel; }").unwrap_err();
+        assert!(matches!(result, StatorError::SyntaxError(_)));
+    }
+
+    #[test]
+    fn e2e_empty_statements_are_valid() {
+        let result = global_eval(";;; 7").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_debugger_statement_is_noop() {
+        let result = global_eval("debugger; 7").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
     // ── JSON Phase 2: stringify with space ──────────────────────────────────
 
     #[test]
