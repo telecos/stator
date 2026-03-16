@@ -5893,28 +5893,66 @@ fn handle_lda_enumerated_keyed_property(
     Ok(DispatchAction::Continue)
 }
 
-/// `TestPrivateBrand <obj_reg>`
+/// `TestPrivateBrand <obj_reg> <brand_reg>`
 ///
-/// Checks whether the object in `obj_reg` has the private brand of the
-/// current class.  For now, we always succeed (brand checking is a
-/// runtime validation for private fields).
+/// Checks whether the object in `obj_reg` has the private brand stored
+/// in `brand_reg`.  Sets the accumulator to `Boolean(true)` when the
+/// brand is found, `Boolean(false)` otherwise.  Throws `TypeError` when
+/// the target is not an object.
 fn handle_test_private_brand(
-    _ctx: &mut DispatchContext,
-    _instr: &Instruction,
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    // TODO: full brand checking once private field storage is available.
-    // For now, pass — this allows class code to proceed without errors.
+    let Operand::Register(obj_v) = instr.operands[0] else {
+        return Err(err_bad_operand("TestPrivateBrand", 0));
+    };
+    let Operand::Register(brand_v) = instr.operands[1] else {
+        return Err(err_bad_operand("TestPrivateBrand", 1));
+    };
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let brand = ctx.frame.read_reg(brand_v)?.clone();
+    let brand_key = to_property_key(&brand)?;
+
+    if !is_js_receiver(&obj) {
+        return Err(StatorError::TypeError(format!(
+            "Cannot use 'in' operator to search for private field '{brand_key}' in non-object",
+        )));
+    }
+
+    let has_brand = match &obj {
+        JsValue::PlainObject(map) => map.borrow().contains_key(&brand_key),
+        _ => false,
+    };
+    ctx.frame.accumulator = JsValue::Boolean(has_brand);
     Ok(DispatchAction::Continue)
 }
 
 /// `DefinePrivateBrand <obj_reg>`
 ///
-/// Brands the object so that subsequent `TestPrivateBrand` calls will
-/// succeed.  Currently a no-op stub.
+/// Brands the object in `obj_reg` with the brand identifier currently
+/// in the accumulator so that subsequent `TestPrivateBrand` calls on
+/// the same object will succeed for that brand.
 fn handle_define_private_brand(
-    _ctx: &mut DispatchContext,
-    _instr: &Instruction,
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
+    let Operand::Register(obj_v) = instr.operands[0] else {
+        return Err(err_bad_operand("DefinePrivateBrand", 0));
+    };
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let brand = ctx.frame.accumulator.clone();
+    let brand_key = to_property_key(&brand)?;
+
+    match &obj {
+        JsValue::PlainObject(map) => {
+            map.borrow_mut().insert(brand_key, JsValue::Boolean(true));
+        }
+        _ => {
+            return Err(StatorError::TypeError(
+                "Cannot define private brand on non-object".into(),
+            ));
+        }
+    }
     Ok(DispatchAction::Continue)
 }
 
