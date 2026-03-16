@@ -457,13 +457,13 @@ pub fn number_to_exponential(value: f64, fraction_digits: u32) -> StatorResult<S
 
     // Use Rust's `{:.Ne}` format and then rewrite the exponent to ECMAScript style.
     let raw = format!("{:.prec$e}", value, prec = fraction_digits as usize);
-    Ok(reformat_exponential(&raw))
+    Ok(number_reformat_exponential(&raw))
 }
 
 /// Converts Rust's `{:e}` output (e.g. `"1.23e5"`) to ECMAScript exponential
 /// notation (e.g. `"1.23e+5"`).  The exponent is always preceded by a sign and
 /// has no leading zeros beyond what is necessary.
-fn reformat_exponential(s: &str) -> String {
+pub fn number_reformat_exponential(s: &str) -> String {
     if let Some(pos) = s.find('e') {
         let mantissa = &s[..pos];
         let exp_str = &s[pos + 1..];
@@ -789,6 +789,240 @@ mod tests {
     #[test]
     fn test_to_exponential_zero() {
         assert_eq!(number_to_exponential(0.0, 2).unwrap(), "0.00e+0");
+    }
+
+    // ── Number() type conversion (via string_to_number / to_number) ──────
+
+    #[test]
+    fn test_number_conversion_empty_string() {
+        // Number("") → 0
+        assert_eq!(
+            crate::objects::value::JsValue::String("".into())
+                .to_number()
+                .unwrap(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn test_number_conversion_whitespace_string() {
+        // Number("  ") → 0
+        assert_eq!(
+            crate::objects::value::JsValue::String("  ".into())
+                .to_number()
+                .unwrap(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn test_number_conversion_null() {
+        // Number(null) → 0
+        assert_eq!(
+            crate::objects::value::JsValue::Null.to_number().unwrap(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn test_number_conversion_undefined() {
+        // Number(undefined) → NaN
+        assert!(
+            crate::objects::value::JsValue::Undefined
+                .to_number()
+                .unwrap()
+                .is_nan()
+        );
+    }
+
+    #[test]
+    fn test_number_conversion_true() {
+        // Number(true) → 1
+        assert_eq!(
+            crate::objects::value::JsValue::Boolean(true)
+                .to_number()
+                .unwrap(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn test_number_conversion_false() {
+        // Number(false) → 0
+        assert_eq!(
+            crate::objects::value::JsValue::Boolean(false)
+                .to_number()
+                .unwrap(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn test_number_conversion_hex() {
+        // Number("0x1A") → 26
+        assert_eq!(
+            crate::objects::value::JsValue::String("0x1A".into())
+                .to_number()
+                .unwrap(),
+            26.0
+        );
+    }
+
+    #[test]
+    fn test_number_conversion_octal() {
+        // Number("0o17") → 15
+        assert_eq!(
+            crate::objects::value::JsValue::String("0o17".into())
+                .to_number()
+                .unwrap(),
+            15.0
+        );
+    }
+
+    #[test]
+    fn test_number_conversion_binary() {
+        // Number("0b11") → 3
+        assert_eq!(
+            crate::objects::value::JsValue::String("0b11".into())
+                .to_number()
+                .unwrap(),
+            3.0
+        );
+    }
+
+    // ── Number.prototype.toFixed edge cases ─────────────────────────────
+
+    #[test]
+    fn test_to_fixed_zero_digits() {
+        assert_eq!(number_to_fixed(1.5, 0).unwrap(), "2");
+    }
+
+    #[test]
+    fn test_to_fixed_negative_zero() {
+        // (-0).toFixed(1) → "0.0"
+        assert_eq!(number_to_fixed(-0.0, 1).unwrap(), "0.0");
+    }
+
+    // ── Number.prototype.toPrecision edge cases ─────────────────────────
+
+    #[test]
+    fn test_to_precision_small_fraction() {
+        assert_eq!(number_to_precision(0.000123, 2).unwrap(), "0.00012");
+    }
+
+    #[test]
+    fn test_to_precision_integer() {
+        assert_eq!(number_to_precision(100.0, 1).unwrap(), "1e+2");
+    }
+
+    #[test]
+    fn test_to_precision_large_integer() {
+        assert_eq!(number_to_precision(1000.0, 4).unwrap(), "1000");
+    }
+
+    // ── Number.prototype.toString(radix) ────────────────────────────────
+
+    #[test]
+    fn test_to_string_radix_hex() {
+        assert_eq!(number_to_string_radix(255.0, 16).unwrap(), "ff");
+    }
+
+    #[test]
+    fn test_to_string_radix_binary() {
+        assert_eq!(number_to_string_radix(10.0, 2).unwrap(), "1010");
+    }
+
+    #[test]
+    fn test_to_string_radix_base36() {
+        assert_eq!(number_to_string_radix(35.0, 36).unwrap(), "z");
+    }
+
+    #[test]
+    fn test_to_string_radix_nan() {
+        assert_eq!(number_to_string_radix(f64::NAN, 16).unwrap(), "NaN");
+    }
+
+    #[test]
+    fn test_to_string_radix_infinity() {
+        assert_eq!(
+            number_to_string_radix(f64::INFINITY, 16).unwrap(),
+            "Infinity"
+        );
+    }
+
+    #[test]
+    fn test_to_string_radix_negative_infinity() {
+        assert_eq!(
+            number_to_string_radix(f64::NEG_INFINITY, 2).unwrap(),
+            "-Infinity"
+        );
+    }
+
+    #[test]
+    fn test_to_string_radix_invalid() {
+        assert!(number_to_string_radix(1.0, 1).is_err());
+        assert!(number_to_string_radix(1.0, 37).is_err());
+    }
+
+    // ── Number constants ────────────────────────────────────────────────
+
+    #[test]
+    fn test_number_epsilon() {
+        assert_eq!(NUMBER_EPSILON, f64::EPSILON);
+    }
+
+    #[test]
+    fn test_number_max_value() {
+        assert_eq!(NUMBER_MAX_VALUE, f64::MAX);
+    }
+
+    #[test]
+    fn test_number_min_value() {
+        assert_eq!(NUMBER_MIN_VALUE, 5e-324);
+    }
+
+    #[test]
+    fn test_number_positive_infinity() {
+        assert_eq!(NUMBER_POSITIVE_INFINITY, f64::INFINITY);
+    }
+
+    #[test]
+    fn test_number_negative_infinity() {
+        assert_eq!(NUMBER_NEGATIVE_INFINITY, f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_number_nan_is_nan() {
+        assert!(NUMBER_NAN.is_nan());
+    }
+
+    // ── parseInt edge cases ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_int_leading_whitespace() {
+        assert_eq!(number_parse_int("  42", 10), 42.0);
+    }
+
+    #[test]
+    fn test_parse_int_plus_sign() {
+        assert_eq!(number_parse_int("+10", 10), 10.0);
+    }
+
+    #[test]
+    fn test_parse_int_hex_0x_prefix_radix_16() {
+        assert_eq!(number_parse_int("0xFF", 16), 255.0);
+    }
+
+    // ── parseFloat edge cases ───────────────────────────────────────────
+
+    #[test]
+    fn test_parse_float_leading_whitespace() {
+        assert_eq!(number_parse_float("  3.14"), 3.14);
+    }
+
+    #[test]
+    fn test_parse_float_plus_sign() {
+        assert_eq!(number_parse_float("+2.5"), 2.5);
     }
 
     #[test]
