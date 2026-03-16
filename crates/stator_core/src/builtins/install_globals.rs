@@ -240,6 +240,47 @@ fn to_array_like_elements(val: &JsValue) -> (Vec<JsValue>, usize) {
     }
 }
 
+/// Extract raw template segments for `String.raw`.
+fn string_raw_segments(raw: &JsValue) -> StatorResult<Vec<String>> {
+    match raw {
+        JsValue::Undefined | JsValue::Null => Err(StatorError::TypeError(
+            "String.raw requires a template object with a raw property".into(),
+        )),
+        JsValue::String(s) => Ok(crate::builtins::string::encode_utf16(s)
+            .into_iter()
+            .map(|unit| crate::builtins::string::decode_utf16(&[unit]))
+            .collect()),
+        JsValue::Array(items) => Ok(items
+            .borrow()
+            .iter()
+            .map(JsValue::to_js_string)
+            .collect::<StatorResult<Vec<_>>>()?),
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            let len = borrow
+                .get("length")
+                .map(JsValue::to_length)
+                .transpose()?
+                .unwrap_or(0)
+                .min(usize::MAX as u64) as usize;
+            let values: Vec<JsValue> = (0..len)
+                .map(|i| {
+                    borrow
+                        .get(&i.to_string())
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined)
+                })
+                .collect();
+            drop(borrow);
+            values
+                .iter()
+                .map(JsValue::to_js_string)
+                .collect::<StatorResult<Vec<_>>>()
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
 /// Return the spec-visible `length` of an array-like value.
 fn array_like_length(val: &JsValue) -> StatorResult<usize> {
     match val {
@@ -8051,10 +8092,21 @@ fn make_string() -> JsValue {
         props.insert(
             "fromCodePoint".into(),
             native(|args| {
-                let codes: Vec<u32> = args
-                    .iter()
-                    .map(|a| a.to_number().unwrap_or(0.0) as u32)
-                    .collect();
+                let mut codes = Vec::with_capacity(args.len());
+                for value in args {
+                    let code_point = value.to_number()?;
+                    let integer = if code_point.is_nan() {
+                        0.0
+                    } else {
+                        code_point.trunc()
+                    };
+                    if !code_point.is_finite() || integer != code_point {
+                        return Err(StatorError::RangeError(format!(
+                            "Invalid code point {code_point}"
+                        )));
+                    }
+                    codes.push(integer as u32);
+                }
                 Ok(JsValue::String(string_from_code_point(&codes)?.into()))
             }),
         );
@@ -8065,28 +8117,14 @@ fn make_string() -> JsValue {
             native(|args| {
                 // First arg is the template object with a `raw` property.
                 let template = args.first().unwrap_or(&JsValue::Undefined);
-                let raw_array = match template {
+                let raw_value = match template {
                     JsValue::PlainObject(map) => {
                         let borrowed = map.borrow();
-                        borrowed.get("raw").cloned()
+                        borrowed.get("raw").cloned().unwrap_or(JsValue::Undefined)
                     }
-                    _ => None,
+                    _ => JsValue::Undefined,
                 };
-                let raw_strings: Vec<String> = match &raw_array {
-                    Some(JsValue::Array(arr)) => arr
-                        .borrow()
-                        .iter()
-                        .map(|v| v.to_js_string().unwrap_or_default())
-                        .collect(),
-                    Some(val @ JsValue::PlainObject(_)) => {
-                        let (elements, _) = to_array_like_elements(val);
-                        elements
-                            .iter()
-                            .map(|v| v.to_js_string().unwrap_or_default())
-                            .collect()
-                    }
-                    _ => Vec::new(),
-                };
+                let raw_strings = string_raw_segments(&raw_value)?;
                 let subs: Vec<String> = args
                     .iter()
                     .skip(1)
@@ -22414,18 +22452,16 @@ mod tests {
     /// Replace with function replacer — receives (match, offset, string).
     #[test]
     fn e2e_replace_function_replacer() {
-        let r = global_eval(
-            "'hello'.replace('ll', function(m, off, s) { return off.toString(); })",
-        )
-        .unwrap();
+        let r =
+            global_eval("'hello'.replace('ll', function(m, off, s) { return off.toString(); })")
+                .unwrap();
         assert_eq!(r, JsValue::String("he2o".into()));
     }
 
     /// Replace with function replacer — match not found returns original.
     #[test]
     fn e2e_replace_fn_replacer_no_match() {
-        let r =
-            global_eval("'hello'.replace('xyz', function(m) { return 'Z'; })").unwrap();
+        let r = global_eval("'hello'.replace('xyz', function(m) { return 'Z'; })").unwrap();
         assert_eq!(r, JsValue::String("hello".into()));
     }
 
@@ -22446,10 +22482,9 @@ mod tests {
     /// replaceAll with function replacer.
     #[test]
     fn e2e_replace_all_fn_replacer() {
-        let r = global_eval(
-            "'abab'.replaceAll('a', function(m, off, s) { return off.toString(); })",
-        )
-        .unwrap();
+        let r =
+            global_eval("'abab'.replaceAll('a', function(m, off, s) { return off.toString(); })")
+                .unwrap();
         assert_eq!(r, JsValue::String("0b2b".into()));
     }
 
@@ -22627,5 +22662,186 @@ mod tests {
     fn e2e_substring_same_args_edge() {
         let r = global_eval("'hello'.substring(2, 2)").unwrap();
         assert_eq!(r, JsValue::String("".into()));
+    }
+
+    // ── String method edge-case conformance e2e tests ────────────────────
+
+    #[test]
+    fn e2e_string_replace_all_plain_string_replaces_every_match() {
+        let result = global_eval("'banana'.replaceAll('na', 'X')").unwrap();
+        assert_eq!(result, JsValue::String("baXX".into()));
+    }
+
+    #[test]
+    fn e2e_string_replace_all_non_global_regexp_throws() {
+        let result =
+            global_eval("try { 'a1b2'.replaceAll(/\\d/, 'x'); 'no' } catch (e) { 'yes' }").unwrap();
+        assert_eq!(result, JsValue::String("yes".into()));
+    }
+
+    #[test]
+    fn e2e_string_replace_all_global_regexp_succeeds() {
+        let result = global_eval("'a1b2'.replaceAll(/\\d/g, 'x')").unwrap();
+        assert_eq!(result, JsValue::String("axbx".into()));
+    }
+
+    #[test]
+    fn e2e_string_replace_all_empty_search_wraps_string() {
+        let result = global_eval("'ab'.replaceAll('', '-')").unwrap();
+        assert_eq!(result, JsValue::String("-a-b-".into()));
+    }
+
+    #[test]
+    fn e2e_string_pad_start_truncates_custom_fill() {
+        let result = global_eval("'x'.padStart(5, 'ab')").unwrap();
+        assert_eq!(result, JsValue::String("ababx".into()));
+    }
+
+    #[test]
+    fn e2e_string_pad_start_empty_fill_returns_original() {
+        let result = global_eval("'x'.padStart(5, '')").unwrap();
+        assert_eq!(result, JsValue::String("x".into()));
+    }
+
+    #[test]
+    fn e2e_string_pad_end_truncates_custom_fill() {
+        let result = global_eval("'x'.padEnd(5, 'ab')").unwrap();
+        assert_eq!(result, JsValue::String("xabab".into()));
+    }
+
+    #[test]
+    fn e2e_string_pad_end_defaults_to_space() {
+        let result = global_eval("'x'.padEnd(3)").unwrap();
+        assert_eq!(result, JsValue::String("x  ".into()));
+    }
+
+    #[test]
+    fn e2e_string_trim_handles_unicode_whitespace() {
+        let result = global_eval("'\\uFEFF\\u00A0trim\\u3000'.trim()").unwrap();
+        assert_eq!(result, JsValue::String("trim".into()));
+    }
+
+    #[test]
+    fn e2e_string_trim_start_handles_unicode_whitespace() {
+        let result = global_eval("'\\uFEFF\\u3000trim\\u3000'.trimStart()").unwrap();
+        assert_eq!(result, JsValue::String("trim\u{3000}".into()));
+    }
+
+    #[test]
+    fn e2e_string_trim_end_handles_unicode_whitespace() {
+        let result = global_eval("'\\u3000trim\\uFEFF\\u00A0'.trimEnd()").unwrap();
+        assert_eq!(result, JsValue::String("\u{3000}trim".into()));
+    }
+
+    #[test]
+    fn e2e_string_starts_with_honors_position() {
+        let result = global_eval("'abcabc'.startsWith('abc', 3)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_string_starts_with_negative_position_clamps_to_zero() {
+        let result = global_eval("'abc'.startsWith('a', -5)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_string_ends_with_honors_end_position() {
+        let result = global_eval("'abcabc'.endsWith('abc', 3)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_string_ends_with_negative_end_position_clamps_to_zero() {
+        let result = global_eval("'abc'.endsWith('', -2)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_string_normalize_nfc_recomposes() {
+        let result = global_eval("'e\\u0301'.normalize('NFC') === '\\u00E9'").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_string_normalize_nfd_decomposes() {
+        let result = global_eval("'caf\\u00E9'.normalize('NFD').length").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_string_normalize_nfkc_compatibility_composes() {
+        let result = global_eval("'\\uFB01'.normalize('NFKC')").unwrap();
+        assert_eq!(result, JsValue::String("fi".into()));
+    }
+
+    #[test]
+    fn e2e_string_normalize_nfkd_compatibility_decomposes() {
+        let result = global_eval("'\\u2163'.normalize('NFKD')").unwrap();
+        assert_eq!(result, JsValue::String("IV".into()));
+    }
+
+    #[test]
+    fn e2e_string_search_with_regexp() {
+        let result = global_eval("'abc123'.search(/\\d+/)").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_string_search_with_string_pattern_treated_as_regexp() {
+        let result = global_eval("'abc123'.search('\\\\d+')").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_string_search_with_plain_string_pattern() {
+        let result = global_eval("'abc'.search('b')").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_string_raw_supports_array_like_raw_object() {
+        let result =
+            global_eval("String.raw({ raw: { 0: 'a', 1: 'b', 2: 'c', length: 3 } }, 1, 2)")
+                .unwrap();
+        assert_eq!(result, JsValue::String("a1b2c".into()));
+    }
+
+    #[test]
+    fn e2e_string_raw_supports_string_raw_value() {
+        let result = global_eval("String.raw({ raw: 'ab' }, 1)").unwrap();
+        assert_eq!(result, JsValue::String("a1b".into()));
+    }
+
+    #[test]
+    fn e2e_string_raw_missing_raw_throws() {
+        let result = global_eval("try { String.raw({}); 'no' } catch (e) { 'yes' }").unwrap();
+        assert_eq!(result, JsValue::String("yes".into()));
+    }
+
+    #[test]
+    fn e2e_string_from_code_point_supports_supplementary_plane() {
+        let result = global_eval("String.fromCodePoint(128578)").unwrap();
+        assert_eq!(result, JsValue::String("🙂".into()));
+    }
+
+    #[test]
+    fn e2e_string_from_code_point_supports_multiple_values() {
+        let result = global_eval("String.fromCodePoint(65, 128578, 66)").unwrap();
+        assert_eq!(result, JsValue::String("A🙂B".into()));
+    }
+
+    #[test]
+    fn e2e_string_from_code_point_rejects_non_integer() {
+        let result =
+            global_eval("try { String.fromCodePoint(65.5); 'no' } catch (e) { 'yes' }").unwrap();
+        assert_eq!(result, JsValue::String("yes".into()));
+    }
+
+    #[test]
+    fn e2e_string_from_code_point_rejects_negative_value() {
+        let result =
+            global_eval("try { String.fromCodePoint(-1); 'no' } catch (e) { 'yes' }").unwrap();
+        assert_eq!(result, JsValue::String("yes".into()));
     }
 }

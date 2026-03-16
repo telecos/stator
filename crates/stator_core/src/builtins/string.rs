@@ -24,6 +24,7 @@
 //! * ECMAScript 2025 Language Specification §22.1 — *The String Constructor*
 
 use crate::error::{StatorError, StatorResult};
+use unicode_normalization::UnicodeNormalization;
 
 /// Maximum string length in UTF-16 code units (~256 MiB), matching V8's limit.
 pub const MAX_STRING_LEN: usize = 1 << 28;
@@ -50,6 +51,29 @@ fn clamp_index(index: i64, len: usize) -> usize {
     } else {
         index.min(len) as usize
     }
+}
+
+/// Returns whether `ch` is an ECMAScript WhiteSpace or LineTerminator code point.
+fn is_ecmascript_trim_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0009}'
+            | '\u{000A}'
+            | '\u{000B}'
+            | '\u{000C}'
+            | '\u{000D}'
+            | '\u{0020}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'
+            ..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
+    )
 }
 
 // UTF-16 surrogate range boundaries (Unicode §3.8).
@@ -496,8 +520,8 @@ pub fn string_to_lower_case(s: &str) -> String {
 
 /// ECMAScript §22.1.3.31 `String.prototype.trim()`.
 ///
-/// Returns a new string with leading and trailing ASCII white-space and
-/// Unicode line terminator / white-space characters stripped.
+/// Returns a new string with leading and trailing ECMAScript WhiteSpace and
+/// LineTerminator code points stripped.
 ///
 /// # Examples
 ///
@@ -508,7 +532,7 @@ pub fn string_to_lower_case(s: &str) -> String {
 /// assert_eq!(string_trim("\t\nhello\r\n"), "hello");
 /// ```
 pub fn string_trim(s: &str) -> String {
-    s.trim().to_string()
+    s.trim_matches(is_ecmascript_trim_whitespace).to_string()
 }
 
 /// ECMAScript §22.1.3.32 `String.prototype.trimStart()`.
@@ -523,7 +547,8 @@ pub fn string_trim(s: &str) -> String {
 /// assert_eq!(string_trim_start("  hello  "), "hello  ");
 /// ```
 pub fn string_trim_start(s: &str) -> String {
-    s.trim_start().to_string()
+    s.trim_start_matches(is_ecmascript_trim_whitespace)
+        .to_string()
 }
 
 /// ECMAScript §22.1.3.33 `String.prototype.trimEnd()`.
@@ -538,7 +563,8 @@ pub fn string_trim_start(s: &str) -> String {
 /// assert_eq!(string_trim_end("  hello  "), "  hello");
 /// ```
 pub fn string_trim_end(s: &str) -> String {
-    s.trim_end().to_string()
+    s.trim_end_matches(is_ecmascript_trim_whitespace)
+        .to_string()
 }
 
 // ── split ─────────────────────────────────────────────────────────────────────
@@ -870,16 +896,6 @@ pub fn string_at(s: &str, index: i64) -> Option<String> {
 /// Returns a Unicode Normalization Form of `s`.  Accepted values for `form`
 /// are `"NFC"` (default), `"NFD"`, `"NFKC"`, and `"NFKD"`.
 ///
-/// # Current limitation
-///
-/// Full canonical decomposition / composition requires tables that are not
-/// bundled in this build.  For ASCII-only strings all four forms are identical,
-/// so those return the input unchanged.  For non-ASCII strings the current
-/// implementation returns the input string as-is (which is a valid NFC
-/// representation for all strings produced by Rust literals and most common
-/// inputs).  A future version should integrate a crate such as
-/// `unicode-normalization` to provide a complete implementation.
-///
 /// # Errors
 ///
 /// Returns [`StatorError::RangeError`] if `form` is not one of the four
@@ -896,7 +912,10 @@ pub fn string_at(s: &str, index: i64) -> Option<String> {
 /// ```
 pub fn string_normalize(s: &str, form: Option<&str>) -> StatorResult<String> {
     match form.unwrap_or("NFC") {
-        "NFC" | "NFD" | "NFKC" | "NFKD" => Ok(s.to_string()),
+        "NFC" => Ok(s.nfc().collect()),
+        "NFD" => Ok(s.nfd().collect()),
+        "NFKC" => Ok(s.nfkc().collect()),
+        "NFKD" => Ok(s.nfkd().collect()),
         f => Err(StatorError::RangeError(format!(
             "The normalization form should be one of NFC, NFD, NFKC, or NFKD; got \"{f}\""
         ))),
@@ -1660,6 +1679,11 @@ mod tests {
         assert_eq!(string_trim(""), "");
     }
 
+    #[test]
+    fn test_trim_removes_bom_and_nbsp() {
+        assert_eq!(string_trim("\u{FEFF}\u{00A0}hello\u{3000}"), "hello");
+    }
+
     // ── string_split ─────────────────────────────────────────────────────────
 
     #[test]
@@ -1893,6 +1917,16 @@ mod tests {
         for form in &["NFC", "NFD", "NFKC", "NFKD"] {
             assert!(string_normalize("hello", Some(form)).is_ok());
         }
+    }
+
+    #[test]
+    fn test_normalize_nfd_decomposes_combining_marks() {
+        assert_eq!(string_normalize("é", Some("NFD")).unwrap(), "e\u{0301}");
+    }
+
+    #[test]
+    fn test_normalize_nfkc_applies_compatibility_mappings() {
+        assert_eq!(string_normalize("ﬁ", Some("NFKC")).unwrap(), "fi");
     }
 
     #[test]
