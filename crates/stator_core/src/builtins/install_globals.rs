@@ -316,6 +316,58 @@ fn is_concat_spreadable(value: &JsValue) -> bool {
     }
 }
 
+/// ECMAScript §9.4.2.3 ArraySpeciesCreate(originalArray, length).
+///
+/// Determines which constructor to use when Array methods like `slice` or
+/// `map` need to create a new array.  For plain `JsValue::Array` values
+/// this always falls back to the default `Array` constructor (returns
+/// `None`).  For `PlainObject`-based arrays (subclasses) it inspects
+/// `this.constructor[@@species]` and, if callable, invokes it with
+/// `[length]` to produce the result.
+fn array_species_create(original: &JsValue, length: usize) -> StatorResult<Option<JsValue>> {
+    // Only PlainObject arrays can carry a custom `constructor`.
+    let map = match original {
+        JsValue::PlainObject(m) => m,
+        _ => return Ok(None),
+    };
+    let ctor = {
+        let borrow = map.borrow();
+        match borrow.get("constructor").cloned() {
+            Some(c) if !c.is_undefined() => c,
+            _ => return Ok(None),
+        }
+    };
+    // §9.4.2.3 step 6: Get species from constructor.
+    let species = match &ctor {
+        JsValue::PlainObject(ctor_map) => {
+            let borrow = ctor_map.borrow();
+            // Check for the @@species getter first.
+            if let Some(getter) = borrow.get("__get_@@species__").cloned() {
+                drop(borrow);
+                dispatch_call_value(&getter, vec![ctor.clone()])?
+            } else if let Some(v) = borrow.get("@@species").cloned() {
+                v
+            } else {
+                return Ok(None);
+            }
+        }
+        _ => return Ok(None),
+    };
+    // §9.4.2.3 step 7: if species is null or undefined, fall back.
+    if species.is_undefined() || matches!(species, JsValue::Null) {
+        return Ok(None);
+    }
+    // §9.4.2.3 step 9: construct using species.
+    if is_callable(&species) {
+        let result = dispatch_call_value(&species, vec![JsValue::Smi(length as i32)])?;
+        Ok(Some(result))
+    } else {
+        Err(StatorError::TypeError(
+            "Species constructor is not callable".into(),
+        ))
+    }
+}
+
 /// If `value` is a RegExp `PlainObject` (has `__is_regexp__`), invoke the
 /// given `__symbol_*__` method with the supplied arguments and return the
 /// result.  Otherwise return `None` so the caller can fall through to the
@@ -4498,31 +4550,33 @@ fn make_array() -> JsValue {
             builtin_fn("slice", 2, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                if let JsValue::Array(items) = arr {
-                    let len = items.borrow().len() as i64;
-                    let start = args
-                        .get(1)
-                        .unwrap_or(&JsValue::Smi(0))
-                        .to_number()
-                        .unwrap_or(0.0) as i64;
-                    let end = args
-                        .get(2)
-                        .map(|v| v.to_number().unwrap_or(len as f64) as i64)
-                        .unwrap_or(len);
-                    let s = if start < 0 {
-                        (len + start).max(0)
-                    } else {
-                        start.min(len)
-                    } as usize;
-                    let e = if end < 0 {
-                        (len + end).max(0)
-                    } else {
-                        end.min(len)
-                    } as usize;
-                    Ok(JsValue::new_array(items.borrow()[s..e].to_vec()))
+                let (elements, len) = to_array_like_elements(arr);
+                let len = len as i64;
+                let start = args
+                    .get(1)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let end = args
+                    .get(2)
+                    .map(|v| v.to_number().unwrap_or(len as f64) as i64)
+                    .unwrap_or(len);
+                let s = if start < 0 {
+                    (len + start).max(0)
                 } else {
-                    Ok(JsValue::new_array(Vec::new()))
+                    start.min(len)
+                } as usize;
+                let e = if end < 0 {
+                    (len + end).max(0)
+                } else {
+                    end.min(len)
+                } as usize;
+                let sliced: Vec<JsValue> = elements[s..e].to_vec();
+                // §23.1.3.25 ArraySpeciesCreate
+                if let Some(result) = array_species_create(arr, sliced.len())? {
+                    return Ok(result);
                 }
+                Ok(JsValue::new_array(sliced))
             }),
         );
 
@@ -4809,6 +4863,10 @@ fn make_array() -> JsValue {
                         vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
                     )?;
                     result.push(mapped);
+                }
+                // §23.1.3.20 ArraySpeciesCreate
+                if let Some(species_result) = array_species_create(arr, result.len())? {
+                    return Ok(species_result);
                 }
                 Ok(JsValue::new_array(result))
             }),
@@ -5366,6 +5424,12 @@ fn make_array() -> JsValue {
                 }
                 Ok(JsValue::Array(Rc::new(RefCell::new(args))))
             }),
+        );
+
+        // §23.1.2.5 get Array[@@species] — returns `this`.
+        props.insert(
+            "__get_@@species__".into(),
+            native(|args| Ok(args.first().cloned().unwrap_or(JsValue::Undefined))),
         );
 
         props.make_all_non_enumerable();
@@ -6238,6 +6302,12 @@ fn make_map_builtin() -> JsValue {
             map_proto_rc
         };
 
+        // §24.1.2.2 get Map[@@species] — returns `this`.
+        props.insert(
+            "__get_@@species__".into(),
+            native(|args| Ok(args.first().cloned().unwrap_or(JsValue::Undefined))),
+        );
+
         props.make_all_non_enumerable();
         let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
         // §24.1.3.1 Map.prototype.constructor
@@ -6567,6 +6637,12 @@ fn make_set_builtin() -> JsValue {
             );
             set_proto_rc_inner
         };
+
+        // §24.2.2.2 get Set[@@species] — returns `this`.
+        props.insert(
+            "__get_@@species__".into(),
+            native(|args| Ok(args.first().cloned().unwrap_or(JsValue::Undefined))),
+        );
 
         props.make_all_non_enumerable();
         let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
@@ -8403,6 +8479,12 @@ fn make_promise() -> JsValue {
             );
         }
 
+        // §27.2.4.7 get Promise[@@species] — returns `this`.
+        props.insert(
+            "__get_@@species__".into(),
+            native(|args| Ok(args.first().cloned().unwrap_or(JsValue::Undefined))),
+        );
+
         props.make_all_non_enumerable();
         JsValue::PlainObject(Rc::new(RefCell::new(props)))
     })
@@ -8685,6 +8767,12 @@ fn make_regexp() -> JsValue {
             );
             re_proto_rc
         };
+
+        // §22.2.5.2 get RegExp[@@species] — returns `this`.
+        props.insert(
+            "__get_@@species__".into(),
+            native(|args| Ok(args.first().cloned().unwrap_or(JsValue::Undefined))),
+        );
 
         props.make_all_non_enumerable();
         let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
@@ -9829,6 +9917,12 @@ fn make_arraybuffer() -> JsValue {
         }),
     );
 
+    // §25.1.4.3 get ArrayBuffer[@@species] — returns `this`.
+    props.insert(
+        "__get_@@species__".into(),
+        native(|args| Ok(args.first().cloned().unwrap_or(JsValue::Undefined))),
+    );
+
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
@@ -10128,6 +10222,12 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
             let inner = Rc::new(RefCell::new(ta));
             Ok(make_typed_array_instance(kind, inner))
         }),
+    );
+
+    // §23.2.2.2 get %TypedArray%[@@species] — returns `this`.
+    props.insert(
+        "__get_@@species__".into(),
+        native(|args| Ok(args.first().cloned().unwrap_or(JsValue::Undefined))),
     );
 
     props.make_all_non_enumerable();
@@ -19989,5 +20089,77 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::String("error".into()));
+    }
+
+    // ── Symbol.species tests ─────────────────────────────────────────────
+
+    /// `Array[Symbol.species]` is `Array` itself.
+    #[test]
+    fn test_array_species_returns_constructor() {
+        let result = global_eval("Array[Symbol.species] === Array").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Map[Symbol.species]` is `Map` itself.
+    #[test]
+    fn test_map_species_returns_constructor() {
+        let result = global_eval("Map[Symbol.species] === Map").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Set[Symbol.species]` is `Set` itself.
+    #[test]
+    fn test_set_species_returns_constructor() {
+        let result = global_eval("Set[Symbol.species] === Set").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Promise[Symbol.species]` is `Promise` itself.
+    #[test]
+    fn test_promise_species_returns_constructor() {
+        let result = global_eval("Promise[Symbol.species] === Promise").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `RegExp[Symbol.species]` is `RegExp` itself.
+    #[test]
+    fn test_regexp_species_returns_constructor() {
+        let result = global_eval("RegExp[Symbol.species] === RegExp").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `ArrayBuffer[Symbol.species]` is `ArrayBuffer` itself.
+    #[test]
+    fn test_arraybuffer_species_returns_constructor() {
+        let result = global_eval("ArrayBuffer[Symbol.species] === ArrayBuffer").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Int32Array[Symbol.species]` is `Int32Array` itself.
+    #[test]
+    fn test_typed_array_species_returns_constructor() {
+        let result = global_eval("Int32Array[Symbol.species] === Int32Array").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `typeof Array[Symbol.species]` is `"function"` (it's the constructor).
+    #[test]
+    fn test_array_species_type() {
+        let result = global_eval("typeof Array[Symbol.species]").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    /// `Array.prototype.slice` returns a plain Array for native arrays.
+    #[test]
+    fn test_slice_returns_array_for_native() {
+        let result = global_eval("[1,2,3].slice(1).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("2,3".into()));
+    }
+
+    /// `Array.prototype.map` returns a plain Array for native arrays.
+    #[test]
+    fn test_map_returns_array_for_native() {
+        let result = global_eval("[1,2,3].map(function(x) { return x * 2; }).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("2,4,6".into()));
     }
 }
