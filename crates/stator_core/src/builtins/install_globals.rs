@@ -5788,7 +5788,7 @@ fn make_map_builtin() -> JsValue {
         props.insert(
             "__call__".into(),
             native(|args| {
-                let m = if args.first().is_some_and(|v| is_js_array(v)) {
+                let m = if args.first().is_some_and(is_js_array) {
                     let (elements, _) = to_array_like_elements(args.first().unwrap());
                     let mut pairs = Vec::new();
                     for item in &elements {
@@ -6164,7 +6164,7 @@ fn make_set_builtin() -> JsValue {
         props.insert(
             "__call__".into(),
             native(|args| {
-                let s = if args.first().is_some_and(|v| is_js_array(v)) {
+                let s = if args.first().is_some_and(is_js_array) {
                     let (elements, _) = to_array_like_elements(args.first().unwrap());
                     set_from_iterable(elements)
                 } else {
