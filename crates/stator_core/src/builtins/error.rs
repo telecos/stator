@@ -31,7 +31,6 @@
 //! `Error.captureStackTrace` / `Error.stackTraceLimit` API.
 
 use std::cell::RefCell;
-use std::rc::Rc;
 
 use crate::error::{StatorError, StatorResult};
 use crate::objects::property_map::PropertyMap;
@@ -276,7 +275,10 @@ pub struct JsError {
     /// The formatted stack trace string (captured at construction time).
     pub stack: String,
     /// Inner errors for `AggregateError` (empty for all other kinds).
-    pub errors: Vec<Rc<JsError>>,
+    ///
+    /// Per §20.5.7.1 the values are stored as-is from the iterable argument,
+    /// so arbitrary [`JsValue`]s are kept rather than wrapping in `JsError`.
+    pub errors: Vec<JsValue>,
     /// The ES2022 `cause` property — the underlying reason for this error.
     ///
     /// Set when the constructor receives an options object with a `cause`
@@ -320,19 +322,23 @@ impl JsError {
 
     /// Create a new `AggregateError` wrapping `errors` with the given message.
     ///
+    /// The `errors` values are stored as-is per §20.5.7.1 — they do not need
+    /// to be `JsError` instances.
+    ///
     /// # Examples
     ///
     /// ```
     /// use std::rc::Rc;
     /// use stator_core::builtins::error::{JsError, ErrorKind};
+    /// use stator_core::objects::value::JsValue;
     ///
-    /// let e1 = Rc::new(JsError::new(ErrorKind::TypeError, "bad type".to_string()));
-    /// let e2 = Rc::new(JsError::new(ErrorKind::RangeError, "out of range".to_string()));
+    /// let e1 = JsValue::Error(Rc::new(JsError::new(ErrorKind::TypeError, "bad type".to_string())));
+    /// let e2 = JsValue::Smi(42);
     /// let agg = JsError::new_aggregate(vec![e1, e2], "All promises rejected".to_string());
     /// assert_eq!(agg.name(), "AggregateError");
     /// assert_eq!(agg.errors.len(), 2);
     /// ```
-    pub fn new_aggregate(errors: Vec<Rc<Self>>, message: String) -> Self {
+    pub fn new_aggregate(errors: Vec<JsValue>, message: String) -> Self {
         let stack = capture_stack_trace("AggregateError", &message);
         Self {
             kind: ErrorKind::AggregateError,
@@ -507,12 +513,13 @@ pub fn eval_error_new(message: String) -> JsError {
 /// ```
 /// use std::rc::Rc;
 /// use stator_core::builtins::error::{aggregate_error_new, type_error_new, ErrorKind};
-/// let inner = Rc::new(type_error_new("bad type".to_string()));
+/// use stator_core::objects::value::JsValue;
+/// let inner = JsValue::Error(Rc::new(type_error_new("bad type".to_string())));
 /// let e = aggregate_error_new(vec![inner], "All promises rejected".to_string());
 /// assert_eq!(e.kind, ErrorKind::AggregateError);
 /// assert_eq!(e.errors.len(), 1);
 /// ```
-pub fn aggregate_error_new(errors: Vec<Rc<JsError>>, message: String) -> JsError {
+pub fn aggregate_error_new(errors: Vec<JsValue>, message: String) -> JsError {
     JsError::new_aggregate(errors, message)
 }
 
@@ -523,6 +530,7 @@ pub fn aggregate_error_new(errors: Vec<Rc<JsError>>, message: String) -> JsError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
 
     // ── ErrorKind ────────────────────────────────────────────────────────────
 
@@ -594,8 +602,8 @@ mod tests {
 
     #[test]
     fn test_aggregate_error_new() {
-        let e1 = Rc::new(type_error_new("bad type".to_string()));
-        let e2 = Rc::new(range_error_new("out of range".to_string()));
+        let e1 = JsValue::Error(Rc::new(type_error_new("bad type".to_string())));
+        let e2 = JsValue::Error(Rc::new(range_error_new("out of range".to_string())));
         let agg = aggregate_error_new(
             vec![e1.clone(), e2.clone()],
             "multiple failures".to_string(),
@@ -604,8 +612,8 @@ mod tests {
         assert_eq!(agg.message(), "multiple failures");
         assert_eq!(agg.name(), "AggregateError");
         assert_eq!(agg.errors.len(), 2);
-        assert_eq!(agg.errors[0].kind, ErrorKind::TypeError);
-        assert_eq!(agg.errors[1].kind, ErrorKind::RangeError);
+        assert!(matches!(&agg.errors[0], JsValue::Error(e) if e.kind == ErrorKind::TypeError));
+        assert!(matches!(&agg.errors[1], JsValue::Error(e) if e.kind == ErrorKind::RangeError));
     }
 
     // ── to_error_string ──────────────────────────────────────────────────────
