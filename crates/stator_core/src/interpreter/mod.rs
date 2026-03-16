@@ -1716,16 +1716,25 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
                 Some('0') if !matches!(chars.peek(), Some('0'..='9')) => {
                     out.push('\0');
                 }
-                Some('0'..='7') => {
-                    // Legacy octal escape — collect up to 3 octal digits
-                    // (the first digit was already consumed by `chars.next()`
-                    // above, but we don't have it in a binding for the
-                    // range pattern arm; re-derive from the match).
-                    // We handle this in the catch-all below for simplicity.
-                    // Actually, we already consumed the digit; just push it
-                    // as an identity escape (non-strict mode tolerance).
-                    // Full octal decoding is rarely needed and the scanner
-                    // already rejects these in strict mode.
+                Some(d @ '0'..='7') => {
+                    // Legacy octal escape — collect up to 3 octal digits.
+                    // The first digit was already consumed by `chars.next()`.
+                    let mut val = (d as u32) - ('0' as u32);
+                    // A leading 0-3 allows up to two more digits (three total);
+                    // a leading 4-7 allows one more digit (two total).
+                    let max_extra = if d <= '3' { 2 } else { 1 };
+                    for _ in 0..max_extra {
+                        match chars.peek() {
+                            Some(&od) if ('0'..='7').contains(&od) => {
+                                val = val * 8 + (od as u32 - '0' as u32);
+                                chars.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                    if let Some(ch) = char::from_u32(val) {
+                        out.push(ch);
+                    }
                 }
                 Some('x') => {
                     // \xHH — two hex digits

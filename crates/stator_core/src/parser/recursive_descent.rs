@@ -40,7 +40,7 @@ use crate::parser::ast::{
     UnaryExpr, UnaryOp, UpdateExpr, UpdateOp, VarDecl, VarDeclarator, VarKind, WhileStmt, WithStmt,
     YieldExpr,
 };
-use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue};
+use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue, cook_template_raw};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Parser
@@ -3797,8 +3797,8 @@ impl<'src> Parser<'src> {
                     loc: tok.span,
                     quasis: vec![TemplateElement {
                         loc: tok.span,
-                        raw: raw.clone(),
-                        cooked: Some(raw),
+                        cooked: cook_template_raw(&raw),
+                        raw,
                         tail: true,
                     }],
                     expressions: vec![],
@@ -3813,8 +3813,8 @@ impl<'src> Parser<'src> {
                 };
                 let mut quasis = vec![TemplateElement {
                     loc: head_tok.span,
-                    raw: head_raw.clone(),
-                    cooked: Some(head_raw),
+                    cooked: cook_template_raw(&head_raw),
+                    raw: head_raw,
                     tail: false,
                 }];
                 let mut expressions = Vec::new();
@@ -3832,8 +3832,8 @@ impl<'src> Parser<'src> {
                             };
                             quasis.push(TemplateElement {
                                 loc: mid_tok.span,
-                                raw: mid_raw.clone(),
-                                cooked: Some(mid_raw),
+                                cooked: cook_template_raw(&mid_raw),
+                                raw: mid_raw,
                                 tail: false,
                             });
                         }
@@ -3845,8 +3845,8 @@ impl<'src> Parser<'src> {
                             };
                             quasis.push(TemplateElement {
                                 loc: tail_tok.span,
-                                raw: tail_raw.clone(),
-                                cooked: Some(tail_raw),
+                                cooked: cook_template_raw(&tail_raw),
+                                raw: tail_raw,
                                 tail: true,
                             });
                             break;
