@@ -2361,6 +2361,15 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Some(JsValue::Undefined) => "undefined".to_string(),
                         _ => return Ok(JsValue::Boolean(false)),
                     };
+                    // Filter internal implementation keys that are not real
+                    // own properties from the user's perspective.
+                    if prop == "__proto__"
+                        || prop == "__is_array__"
+                        || (prop.starts_with("__get_") && prop.ends_with("__"))
+                        || (prop.starts_with("__set_") && prop.ends_with("__"))
+                    {
+                        return Ok(JsValue::Boolean(false));
+                    }
                     Ok(JsValue::Boolean(map.borrow().contains_key(&prop)))
                 }));
             }

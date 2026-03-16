@@ -3416,6 +3416,12 @@ fn make_object() -> JsValue {
             "fromEntries".into(),
             builtin_fn("fromEntries", 1, |args| {
                 let iterable = args.first().unwrap_or(&JsValue::Undefined);
+                // §20.1.2.6 step 1: require iterable argument.
+                if matches!(iterable, JsValue::Null | JsValue::Undefined) {
+                    return Err(StatorError::TypeError(
+                        "Cannot convert undefined or null to object".into(),
+                    ));
+                }
                 let mut result = PropertyMap::new();
 
                 let entries_to_process: Vec<JsValue> = match iterable {
