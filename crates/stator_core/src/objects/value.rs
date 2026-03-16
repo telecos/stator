@@ -1342,7 +1342,7 @@ fn compare_utf16(a: &str, b: &str) -> std::cmp::Ordering {
 /// notation with an explicit `+` sign on positive exponents (e.g. `"1e+21"`).
 /// All other finite values use the shortest decimal representation via Rust's
 /// `Display` formatting.
-fn number_to_string(n: f64) -> String {
+pub(crate) fn number_to_string(n: f64) -> String {
     if n.is_nan() {
         return "NaN".to_string();
     }
@@ -3792,5 +3792,334 @@ mod tests {
             !JsValue::js_less_than(&JsValue::String("a".into()), &JsValue::String("a".into()))
                 .unwrap()
         );
+    }
+
+    // ── number_to_string edge cases ──────────────────────────────────────
+
+    #[test]
+    fn test_number_to_string_negative_zero() {
+        assert_eq!(number_to_string(-0.0), "0");
+    }
+
+    #[test]
+    fn test_number_to_string_positive_zero() {
+        assert_eq!(number_to_string(0.0), "0");
+    }
+
+    #[test]
+    fn test_number_to_string_nan() {
+        assert_eq!(number_to_string(f64::NAN), "NaN");
+    }
+
+    #[test]
+    fn test_number_to_string_infinity() {
+        assert_eq!(number_to_string(f64::INFINITY), "Infinity");
+        assert_eq!(number_to_string(f64::NEG_INFINITY), "-Infinity");
+    }
+
+    #[test]
+    fn test_number_to_string_large_exponent() {
+        assert_eq!(number_to_string(1e21), "1e+21");
+    }
+
+    #[test]
+    fn test_number_to_string_small_exponent() {
+        assert_eq!(number_to_string(5e-7), "5e-7");
+    }
+
+    // ── string_to_number edge cases ──────────────────────────────────────
+
+    #[test]
+    fn test_string_to_number_empty_is_zero() {
+        assert_eq!(string_to_number(""), 0.0);
+    }
+
+    #[test]
+    fn test_string_to_number_whitespace_is_zero() {
+        assert_eq!(string_to_number("   "), 0.0);
+    }
+
+    #[test]
+    fn test_string_to_number_hex() {
+        assert_eq!(string_to_number("0xff"), 255.0);
+        assert_eq!(string_to_number("0xFF"), 255.0);
+    }
+
+    #[test]
+    fn test_string_to_number_octal() {
+        assert_eq!(string_to_number("0o77"), 63.0);
+    }
+
+    #[test]
+    fn test_string_to_number_binary() {
+        assert_eq!(string_to_number("0b1010"), 10.0);
+    }
+
+    #[test]
+    fn test_string_to_number_infinity_variants() {
+        assert_eq!(string_to_number("Infinity"), f64::INFINITY);
+        assert_eq!(string_to_number("+Infinity"), f64::INFINITY);
+        assert_eq!(string_to_number("-Infinity"), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_string_to_number_leading_whitespace() {
+        assert_eq!(string_to_number("  42  "), 42.0);
+    }
+
+    #[test]
+    fn test_string_to_number_nan_cases() {
+        assert!(string_to_number("hello").is_nan());
+        assert!(string_to_number("0x").is_nan());
+        assert!(string_to_number("0xG").is_nan());
+    }
+
+    // ── to_js_string (ToString) edge cases ───────────────────────────────
+
+    #[test]
+    fn test_to_js_string_null() {
+        assert_eq!(JsValue::Null.to_js_string().unwrap(), "null");
+    }
+
+    #[test]
+    fn test_to_js_string_undefined() {
+        assert_eq!(JsValue::Undefined.to_js_string().unwrap(), "undefined");
+    }
+
+    #[test]
+    fn test_to_js_string_negative_zero() {
+        assert_eq!(JsValue::HeapNumber(-0.0).to_js_string().unwrap(), "0");
+    }
+
+    #[test]
+    fn test_to_js_string_symbol_throws() {
+        assert!(JsValue::Symbol(42).to_js_string().is_err());
+    }
+
+    #[test]
+    fn test_to_js_string_bigint() {
+        assert_eq!(JsValue::BigInt(123).to_js_string().unwrap(), "123");
+    }
+
+    // ── to_number (ToNumber) edge cases ──────────────────────────────────
+
+    #[test]
+    fn test_to_number_null_is_zero() {
+        assert_eq!(JsValue::Null.to_number().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn test_to_number_undefined_is_nan() {
+        assert!(JsValue::Undefined.to_number().unwrap().is_nan());
+    }
+
+    #[test]
+    fn test_to_number_true_is_one() {
+        assert_eq!(JsValue::Boolean(true).to_number().unwrap(), 1.0);
+    }
+
+    #[test]
+    fn test_to_number_false_is_zero() {
+        assert_eq!(JsValue::Boolean(false).to_number().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn test_to_number_empty_string_is_zero() {
+        assert_eq!(JsValue::String("".into()).to_number().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn test_to_number_symbol_throws() {
+        assert!(JsValue::Symbol(1).to_number().is_err());
+    }
+
+    #[test]
+    fn test_to_number_bigint_throws() {
+        assert!(JsValue::BigInt(1).to_number().is_err());
+    }
+
+    // ── is_loosely_equal (==) edge cases ─────────────────────────────────
+
+    #[test]
+    fn test_loose_eq_null_undefined() {
+        assert!(JsValue::Null.is_loosely_equal(&JsValue::Undefined).unwrap());
+        assert!(JsValue::Undefined.is_loosely_equal(&JsValue::Null).unwrap());
+    }
+
+    #[test]
+    fn test_loose_eq_null_not_zero() {
+        assert!(!JsValue::Null.is_loosely_equal(&JsValue::Smi(0)).unwrap());
+    }
+
+    #[test]
+    fn test_loose_eq_null_not_empty_string() {
+        assert!(
+            !JsValue::Null
+                .is_loosely_equal(&JsValue::String("".into()))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_loose_eq_null_not_false() {
+        assert!(
+            !JsValue::Null
+                .is_loosely_equal(&JsValue::Boolean(false))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_loose_eq_number_string_coercion() {
+        // 1 == "1" → true (string coerced to number)
+        assert!(
+            JsValue::Smi(1)
+                .is_loosely_equal(&JsValue::String("1".into()))
+                .unwrap()
+        );
+        // 0 == "" → true (empty string coerced to 0)
+        assert!(
+            JsValue::Smi(0)
+                .is_loosely_equal(&JsValue::String("".into()))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_loose_eq_boolean_coercion() {
+        // true == 1 → true (boolean coerced to 1)
+        assert!(
+            JsValue::Boolean(true)
+                .is_loosely_equal(&JsValue::Smi(1))
+                .unwrap()
+        );
+        // false == 0 → true (boolean coerced to 0)
+        assert!(
+            JsValue::Boolean(false)
+                .is_loosely_equal(&JsValue::Smi(0))
+                .unwrap()
+        );
+        // true == "1" → true (boolean → 1, then 1 == "1")
+        assert!(
+            JsValue::Boolean(true)
+                .is_loosely_equal(&JsValue::String("1".into()))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_loose_eq_symbol_not_equal() {
+        assert!(
+            !JsValue::Symbol(1)
+                .is_loosely_equal(&JsValue::Symbol(2))
+                .unwrap()
+        );
+        assert!(
+            JsValue::Symbol(1)
+                .is_loosely_equal(&JsValue::Symbol(1))
+                .unwrap()
+        );
+    }
+
+    // ── is_strictly_equal (===) edge cases ───────────────────────────────
+
+    #[test]
+    fn test_strict_eq_positive_negative_zero() {
+        // +0 === -0 should be true per IEEE 754 / ES spec
+        assert!(JsValue::Smi(0).is_strictly_equal(&JsValue::HeapNumber(-0.0)));
+        assert!(JsValue::HeapNumber(-0.0).is_strictly_equal(&JsValue::Smi(0)));
+        assert!(JsValue::HeapNumber(0.0).is_strictly_equal(&JsValue::HeapNumber(-0.0)));
+    }
+
+    #[test]
+    fn test_strict_eq_nan_not_equal() {
+        // NaN === NaN should be false
+        assert!(!JsValue::HeapNumber(f64::NAN).is_strictly_equal(&JsValue::HeapNumber(f64::NAN)));
+    }
+
+    #[test]
+    fn test_strict_eq_null_not_undefined() {
+        assert!(!JsValue::Null.is_strictly_equal(&JsValue::Undefined));
+    }
+
+    // ── abstract_relational_comparison edge cases ────────────────────────
+
+    #[test]
+    fn test_relational_nan_always_undefined() {
+        let nan = JsValue::HeapNumber(f64::NAN);
+        let one = JsValue::Smi(1);
+        // NaN < 1 → undefined (None)
+        assert_eq!(
+            JsValue::abstract_relational_comparison(&nan, &one, true).unwrap(),
+            None
+        );
+        // 1 < NaN → undefined (None)
+        assert_eq!(
+            JsValue::abstract_relational_comparison(&one, &nan, true).unwrap(),
+            None
+        );
+        // NaN < NaN → undefined (None)
+        assert_eq!(
+            JsValue::abstract_relational_comparison(&nan, &nan, true).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_less_than_or_equal_nan() {
+        let nan = JsValue::HeapNumber(f64::NAN);
+        let one = JsValue::Smi(1);
+        // NaN <= 1 → false
+        assert!(!JsValue::js_less_than_or_equal(&nan, &one).unwrap());
+        // 1 <= NaN → false
+        assert!(!JsValue::js_less_than_or_equal(&one, &nan).unwrap());
+    }
+
+    #[test]
+    fn test_greater_than_or_equal_nan() {
+        let nan = JsValue::HeapNumber(f64::NAN);
+        let one = JsValue::Smi(1);
+        // NaN >= 1 → false
+        assert!(!JsValue::js_greater_than_or_equal(&nan, &one).unwrap());
+        // 1 >= NaN → false
+        assert!(!JsValue::js_greater_than_or_equal(&one, &nan).unwrap());
+    }
+
+    #[test]
+    fn test_greater_than_nan() {
+        let nan = JsValue::HeapNumber(f64::NAN);
+        let one = JsValue::Smi(1);
+        // NaN > 1 → false
+        assert!(!JsValue::js_greater_than(&nan, &one).unwrap());
+        // 1 > NaN → false
+        assert!(!JsValue::js_greater_than(&one, &nan).unwrap());
+    }
+
+    // ── SameValue edge cases ─────────────────────────────────────────────
+
+    #[test]
+    fn test_same_value_nan_equals_nan() {
+        assert!(JsValue::HeapNumber(f64::NAN).same_value(&JsValue::HeapNumber(f64::NAN)));
+    }
+
+    #[test]
+    fn test_same_value_zero_signs_differ() {
+        // SameValue(+0, -0) → false
+        assert!(!JsValue::HeapNumber(0.0).same_value(&JsValue::HeapNumber(-0.0)));
+        assert!(!JsValue::Smi(0).same_value(&JsValue::HeapNumber(-0.0)));
+    }
+
+    // ── to_display_string (safe symbol) ──────────────────────────────────
+
+    #[test]
+    fn test_to_display_string_symbol() {
+        let sym = JsValue::Symbol(42);
+        assert_eq!(sym.to_display_string(), "Symbol(42)");
+    }
+
+    #[test]
+    fn test_to_display_string_number_neg_zero() {
+        // to_display_string delegates to to_js_string which uses number_to_string
+        assert_eq!(JsValue::HeapNumber(-0.0).to_display_string(), "0");
     }
 }
