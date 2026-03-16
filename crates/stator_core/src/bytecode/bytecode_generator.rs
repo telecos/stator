@@ -145,6 +145,22 @@ impl Label {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// LocalBinding – compile-time metadata for a local variable
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compile-time metadata for a local variable binding in a scope.
+#[derive(Clone, Copy)]
+struct LocalBinding {
+    /// Virtual register that holds the runtime value.
+    reg: Register,
+    /// `true` when the binding was declared with `const`.
+    is_const: bool,
+    /// `true` while the binding is still in the Temporal Dead Zone
+    /// (`let`/`const` before their declaration is reached at runtime).
+    needs_tdz_check: bool,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // FunctionCompiler
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -160,9 +176,8 @@ struct FunctionCompiler {
     /// Virtual-register allocator.
     allocator: RegisterAllocator,
     /// Variable scope stack.  Each entry is a map from variable name to
-    /// its assigned register and a flag indicating whether the binding is
-    /// `const`.  The outermost scope is `scopes[0]`.
-    scopes: Vec<HashMap<String, (Register, bool)>>,
+    /// its [`LocalBinding`].  The outermost scope is `scopes[0]`.
+    scopes: Vec<HashMap<String, LocalBinding>>,
     /// Source-position table (populated at expression boundaries).
     source_positions: Vec<SourcePosition>,
     /// Pending `(instruction_index, line, column)` entries collected during
@@ -286,7 +301,14 @@ impl FunctionCompiler {
                 && param.default.is_none()
             {
                 let reg = Register::parameter(i as u32);
-                compiler.scopes[0].insert(ident.name.clone(), (reg, false));
+                compiler.scopes[0].insert(
+                    ident.name.clone(),
+                    LocalBinding {
+                        reg,
+                        is_const: false,
+                        needs_tdz_check: false,
+                    },
+                );
             }
         }
         Ok(compiler)
@@ -868,10 +890,14 @@ impl FunctionCompiler {
     /// Define a local variable with an explicit const flag.
     fn define_local_with_kind(&mut self, name: &str, is_const: bool) -> Register {
         let reg = self.allocator.new_local();
-        self.scopes
-            .last_mut()
-            .unwrap()
-            .insert(name.to_owned(), (reg, is_const));
+        self.scopes.last_mut().unwrap().insert(
+            name.to_owned(),
+            LocalBinding {
+                reg,
+                is_const,
+                needs_tdz_check: false,
+            },
+        );
         reg
     }
 
@@ -880,22 +906,239 @@ impl FunctionCompiler {
     /// semantics for `var` declarations.
     fn define_function_scoped_local(&mut self, name: &str) -> Register {
         let reg = self.allocator.new_local();
-        self.scopes[0].insert(name.to_owned(), (reg, false));
+        self.scopes[0].insert(
+            name.to_owned(),
+            LocalBinding {
+                reg,
+                is_const: false,
+                needs_tdz_check: false,
+            },
+        );
         reg
     }
 
     /// Look up a variable in the scope chain (innermost first).
     ///
     /// Returns `None` if the name is not found (assumed to be global).
-    /// The returned tuple contains the register and whether the binding is
-    /// `const`.
-    fn lookup_var(&self, name: &str) -> Option<(Register, bool)> {
+    fn lookup_var(&self, name: &str) -> Option<LocalBinding> {
         for scope in self.scopes.iter().rev() {
-            if let Some(&(reg, is_const)) = scope.get(name) {
-                return Some((reg, is_const));
+            if let Some(&binding) = scope.get(name) {
+                return Some(binding);
             }
         }
         None
+    }
+
+    /// Mark a binding as initialised (clear TDZ flag) in the innermost
+    /// scope that contains it.
+    fn mark_initialized(&mut self, name: &str) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(binding) = scope.get_mut(name) {
+                binding.needs_tdz_check = false;
+                return;
+            }
+        }
+    }
+
+    // ── Declaration scanning helpers ─────────────────────────────────────────
+
+    /// Recursively collect all `var`-declared names in a statement list.
+    ///
+    /// `var` declarations are function-scoped, so we descend into blocks,
+    /// if/else, loops, try/catch, etc., but NOT into nested function bodies.
+    fn collect_var_names(stmts: &[Stmt]) -> Vec<String> {
+        let mut names = Vec::new();
+        for stmt in stmts {
+            Self::collect_var_names_in_stmt(stmt, &mut names);
+        }
+        names
+    }
+
+    /// Helper for [`collect_var_names`] — processes a single statement.
+    fn collect_var_names_in_stmt(stmt: &Stmt, names: &mut Vec<String>) {
+        match stmt {
+            Stmt::VarDecl(decl) if decl.kind == VarKind::Var => {
+                for d in &decl.declarators {
+                    Self::collect_pat_names(&d.id, names);
+                }
+            }
+            Stmt::Block(b) => {
+                for s in &b.body {
+                    Self::collect_var_names_in_stmt(s, names);
+                }
+            }
+            Stmt::If(s) => {
+                Self::collect_var_names_in_stmt(&s.consequent, names);
+                if let Some(alt) = &s.alternate {
+                    Self::collect_var_names_in_stmt(alt, names);
+                }
+            }
+            Stmt::While(s) => Self::collect_var_names_in_stmt(&s.body, names),
+            Stmt::DoWhile(s) => Self::collect_var_names_in_stmt(&s.body, names),
+            Stmt::For(s) => {
+                if let Some(ForInit::VarDecl(decl)) = &s.init
+                    && decl.kind == VarKind::Var
+                {
+                    for d in &decl.declarators {
+                        Self::collect_pat_names(&d.id, names);
+                    }
+                }
+                Self::collect_var_names_in_stmt(&s.body, names);
+            }
+            Stmt::ForIn(s) => {
+                if let crate::parser::ast::ForInOfLeft::VarDecl(decl) = &s.left
+                    && decl.kind == VarKind::Var
+                {
+                    for d in &decl.declarators {
+                        Self::collect_pat_names(&d.id, names);
+                    }
+                }
+                Self::collect_var_names_in_stmt(&s.body, names);
+            }
+            Stmt::ForOf(s) => {
+                if let crate::parser::ast::ForInOfLeft::VarDecl(decl) = &s.left
+                    && decl.kind == VarKind::Var
+                {
+                    for d in &decl.declarators {
+                        Self::collect_pat_names(&d.id, names);
+                    }
+                }
+                Self::collect_var_names_in_stmt(&s.body, names);
+            }
+            Stmt::Switch(s) => {
+                for case in &s.cases {
+                    for cs in &case.consequent {
+                        Self::collect_var_names_in_stmt(cs, names);
+                    }
+                }
+            }
+            Stmt::Try(s) => {
+                for ts in &s.block.body {
+                    Self::collect_var_names_in_stmt(ts, names);
+                }
+                if let Some(handler) = &s.handler {
+                    for hs in &handler.body.body {
+                        Self::collect_var_names_in_stmt(hs, names);
+                    }
+                }
+                if let Some(fin) = &s.finalizer {
+                    for fs in &fin.body {
+                        Self::collect_var_names_in_stmt(fs, names);
+                    }
+                }
+            }
+            Stmt::Labeled(s) => Self::collect_var_names_in_stmt(&s.body, names),
+            Stmt::With(s) => Self::collect_var_names_in_stmt(&s.body, names),
+            // FnDecl, ClassDecl, Expr, Return, Throw, Break, Continue,
+            // Debugger, Empty — do not contain var declarations.
+            _ => {}
+        }
+    }
+
+    /// Extract identifier names from a binding pattern.
+    fn collect_pat_names(pat: &Pat, names: &mut Vec<String>) {
+        match pat {
+            Pat::Ident(id) => names.push(id.name.clone()),
+            Pat::Array(arr) => {
+                for p in arr.elements.iter().flatten() {
+                    Self::collect_pat_names(p, names);
+                }
+            }
+            Pat::Object(obj) => {
+                for prop in &obj.properties {
+                    match prop {
+                        ObjectPatProp::KeyValue(kv) => Self::collect_pat_names(&kv.value, names),
+                        ObjectPatProp::Assign(a) => names.push(a.key.name.clone()),
+                        ObjectPatProp::Rest(r) => Self::collect_pat_names(&r.argument, names),
+                    }
+                }
+            }
+            Pat::Rest(r) => Self::collect_pat_names(&r.argument, names),
+            Pat::Assign(a) => Self::collect_pat_names(&a.left, names),
+            Pat::Expr(_) => {}
+        }
+    }
+
+    /// Collect `let`/`const` declared names in the **direct** children of a
+    /// statement list (non-recursive — these are block-scoped).
+    fn collect_lexical_names(stmts: &[Stmt]) -> Vec<(String, bool)> {
+        let mut names = Vec::new();
+        for stmt in stmts {
+            if let Stmt::VarDecl(decl) = stmt {
+                match decl.kind {
+                    VarKind::Let | VarKind::Const => {
+                        let is_const = decl.kind == VarKind::Const;
+                        for d in &decl.declarators {
+                            let mut pat_names = Vec::new();
+                            Self::collect_pat_names(&d.id, &mut pat_names);
+                            for n in pat_names {
+                                names.push((n, is_const));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        names
+    }
+
+    /// Pre-register `let`/`const` bindings in the current scope with
+    /// `TheHole` so that any access before the declaration statement
+    /// triggers a `ReferenceError` (Temporal Dead Zone).
+    fn hoist_lexical_decls(&mut self, stmts: &[Stmt]) {
+        let lex_names = Self::collect_lexical_names(stmts);
+        for (name, is_const) in lex_names {
+            let reg = self.allocator.new_local();
+            // Initialise the register with TheHole (TDZ sentinel).
+            self.emit(Instruction::new_unchecked(Opcode::LdaTheHole, vec![]));
+            self.emit_star(reg);
+            self.scopes.last_mut().unwrap().insert(
+                name,
+                LocalBinding {
+                    reg,
+                    is_const,
+                    needs_tdz_check: true,
+                },
+            );
+        }
+    }
+
+    /// Pre-hoist all `var` declarations inside `stmts` into the outermost
+    /// (function) scope, initialising each to `undefined`.
+    fn hoist_var_declarations(&mut self, stmts: &[Stmt]) {
+        let var_names = Self::collect_var_names(stmts);
+        for name in var_names {
+            if self.scopes[0].contains_key(&name) {
+                continue; // already hoisted (e.g. parameter or duplicate var)
+            }
+            let reg = self.allocator.new_local();
+            self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+            self.emit_star(reg);
+            self.scopes[0].insert(
+                name,
+                LocalBinding {
+                    reg,
+                    is_const: false,
+                    needs_tdz_check: false,
+                },
+            );
+        }
+    }
+
+    /// Pre-hoist `var` declarations at program level into the global env
+    /// so that reading them before assignment returns `undefined`.
+    fn hoist_var_declarations_global(&mut self, stmts: &[Stmt]) {
+        let var_names = Self::collect_var_names(stmts);
+        for name in var_names {
+            let name_idx = self.add_string(&name);
+            self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+            let slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
+            self.emit(Instruction::new_unchecked(
+                Opcode::StaGlobal,
+                vec![Operand::ConstantPoolIdx(name_idx), slot],
+            ));
+        }
     }
 
     // ── Statement compilation ─────────────────────────────────────────────────
@@ -948,8 +1191,13 @@ impl FunctionCompiler {
     }
 
     /// Compile a `{ … }` block, pushing/popping a scope.
+    ///
+    /// Before compiling statements, `let`/`const` bindings are pre-registered
+    /// with `TheHole` (TDZ sentinel) so that accessing them before their
+    /// declaration throws a `ReferenceError`.
     fn compile_block(&mut self, block: &BlockStmt) -> StatorResult<()> {
         self.push_scope();
+        self.hoist_lexical_decls(&block.body);
         for stmt in &block.body {
             self.compile_stmt(stmt)?;
         }
@@ -1051,9 +1299,29 @@ impl FunctionCompiler {
                         vec![Operand::ConstantPoolIdx(name_idx), sta_slot],
                     ));
                     Ok(None)
+                } else if is_var {
+                    // `var` in a function body: reuse the pre-hoisted
+                    // function-scope register if it exists, otherwise
+                    // allocate in the function scope.
+                    let reg = if let Some(binding) = self.scopes[0].get(&ident.name) {
+                        binding.reg
+                    } else {
+                        self.define_function_scoped_local(&ident.name)
+                    };
+                    if let Some(init) = &declarator.init {
+                        self.compile_expr(init)?;
+                        self.emit_star(reg);
+                    }
+                    // No init → the register already holds `undefined`
+                    // from hoisting, so nothing to emit.
+                    Ok(Some(reg))
                 } else {
-                    // Normal scope: allocate the local register.
-                    let reg = if is_const {
+                    // `let` / `const` — if the name was pre-registered
+                    // during TDZ hoisting, reuse that register and clear
+                    // the TDZ flag; otherwise allocate fresh.
+                    let reg = if let Some(binding) = self.scopes.last().unwrap().get(&ident.name) {
+                        binding.reg
+                    } else if is_const {
                         self.define_const_local(&ident.name)
                     } else {
                         self.define_local(&ident.name)
@@ -1064,6 +1332,8 @@ impl FunctionCompiler {
                         self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
                     }
                     self.emit_star(reg);
+                    // Clear TDZ — the binding is now initialised.
+                    self.mark_initialized(&ident.name);
                     Ok(Some(reg))
                 }
             }
@@ -1520,7 +1790,14 @@ impl FunctionCompiler {
             allocator: RegisterAllocator::new(1),
             scopes: vec![{
                 let mut s = HashMap::new();
-                s.insert(".this".to_owned(), (Register::parameter(0), false));
+                s.insert(
+                    ".this".to_owned(),
+                    LocalBinding {
+                        reg: Register::parameter(0),
+                        is_const: false,
+                        needs_tdz_check: false,
+                    },
+                );
                 s
             }],
             source_positions: Vec::new(),
@@ -2374,8 +2651,15 @@ impl FunctionCompiler {
     /// If the name is in the scope chain, emit `Ldar`.  Otherwise assume it is
     /// a global and emit `LdaGlobal`.
     fn compile_ident_load(&mut self, name: &str) {
-        if let Some((reg, _is_const)) = self.lookup_var(name) {
-            self.emit_ldar(reg);
+        if let Some(binding) = self.lookup_var(name) {
+            self.emit_ldar(binding.reg);
+            if binding.needs_tdz_check {
+                let name_idx = self.add_string(name);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::ThrowReferenceErrorIfHole,
+                    vec![Operand::ConstantPoolIdx(name_idx)],
+                ));
+            }
         } else {
             let name_idx = self.add_string(name);
             let slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
@@ -2391,9 +2675,19 @@ impl FunctionCompiler {
     /// For globals, emits [`Opcode::LdaGlobalInsideTypeof`] which returns
     /// `undefined` instead of throwing a `ReferenceError` when the name is
     /// not bound (ECMAScript §13.5.3).
+    ///
+    /// For local `let`/`const` bindings still in the TDZ, `typeof` must
+    /// **still** throw a `ReferenceError` (unlike undeclared globals).
     fn compile_ident_load_typeof(&mut self, name: &str) {
-        if let Some((reg, _is_const)) = self.lookup_var(name) {
-            self.emit_ldar(reg);
+        if let Some(binding) = self.lookup_var(name) {
+            self.emit_ldar(binding.reg);
+            if binding.needs_tdz_check {
+                let name_idx = self.add_string(name);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::ThrowReferenceErrorIfHole,
+                    vec![Operand::ConstantPoolIdx(name_idx)],
+                ));
+            }
         } else {
             let name_idx = self.add_string(name);
             let slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
@@ -2407,14 +2701,33 @@ impl FunctionCompiler {
     /// Store the accumulator to the variable named `name`.
     ///
     /// Returns an error if the variable is a `const` binding.
+    /// If the binding is still in the TDZ, emits a runtime
+    /// `ThrowReferenceErrorIfHole` check before the store.
     fn compile_ident_store(&mut self, name: &str) -> StatorResult<()> {
-        if let Some((reg, is_const)) = self.lookup_var(name) {
-            if is_const {
+        if let Some(binding) = self.lookup_var(name) {
+            if binding.is_const {
                 return Err(StatorError::TypeError(format!(
                     "Assignment to constant variable '{name}'"
                 )));
             }
-            self.emit_star(reg);
+            if binding.needs_tdz_check {
+                // Save the value being assigned, check TDZ, then store.
+                let tmp = self.allocator.allocate_temporary();
+                self.emit_star(tmp);
+                self.emit_ldar(binding.reg);
+                let name_idx = self.add_string(name);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::ThrowReferenceErrorIfHole,
+                    vec![Operand::ConstantPoolIdx(name_idx)],
+                ));
+                self.emit_ldar(tmp);
+                self.emit_star(binding.reg);
+                self.allocator
+                    .release_temporary(tmp)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+            } else {
+                self.emit_star(binding.reg);
+            }
         } else {
             let name_idx = self.add_string(name);
             let slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
@@ -4408,13 +4721,13 @@ impl FunctionCompiler {
             }
             ForInOfLeft::Pat(pat) => match pat {
                 crate::parser::ast::Pat::Ident(id) => {
-                    let (reg, _is_const) = self.lookup_var(&id.name).ok_or_else(|| {
+                    let binding = self.lookup_var(&id.name).ok_or_else(|| {
                         StatorError::SyntaxError(format!(
                             "for-in: undefined variable '{}'",
                             id.name
                         ))
                     })?;
-                    self.emit_star(reg);
+                    self.emit_star(binding.reg);
                 }
                 pat => {
                     // Destructuring: store key in a temporary, then unpack.
@@ -4604,14 +4917,14 @@ impl FunctionCompiler {
             }
             ForInOfLeft::Pat(pat) => match pat {
                 crate::parser::ast::Pat::Ident(id) => {
-                    let (reg, _is_const) = self.lookup_var(&id.name).ok_or_else(|| {
+                    let binding = self.lookup_var(&id.name).ok_or_else(|| {
                         StatorError::SyntaxError(format!(
                             "for-of: undefined variable '{}'",
                             id.name
                         ))
                     })?;
                     self.emit_ldar(val_reg);
-                    self.emit_star(reg);
+                    self.emit_star(binding.reg);
                 }
                 pat => {
                     // Destructuring: store value in a temporary, then unpack.
@@ -4801,8 +5114,8 @@ impl FunctionCompiler {
             // module variable so the runtime can expose them.
             let names = Self::declared_names(inner);
             for name in names {
-                if let Some((reg, _is_const)) = self.lookup_var(&name) {
-                    self.emit_ldar(reg);
+                if let Some(binding) = self.lookup_var(&name) {
+                    self.emit_ldar(binding.reg);
                 } else {
                     self.compile_ident_load(&name);
                 }
@@ -4850,8 +5163,8 @@ impl FunctionCompiler {
                 ModuleExportName::Ident(id) => id.name.as_str(),
                 ModuleExportName::Str(s) => s.value.as_str(),
             };
-            if let Some((reg, _is_const)) = self.lookup_var(local_name) {
-                self.emit_ldar(reg);
+            if let Some(binding) = self.lookup_var(local_name) {
+                self.emit_ldar(binding.reg);
             } else {
                 self.compile_ident_load(local_name);
             }
@@ -5118,6 +5431,11 @@ fn compile_function(
     let args_reg = compiler.define_local("arguments");
     compiler.emit_star(args_reg);
 
+    // Hoist `var` declarations to the function scope (initialised to
+    // `undefined`) so that reads before the declaration returns `undefined`
+    // instead of throwing.
+    compiler.hoist_var_declarations(&body.body);
+
     // Hoist function declarations to the top of the scope.
     for stmt in &body.body {
         if let Stmt::FnDecl(decl) = stmt {
@@ -5178,6 +5496,26 @@ impl BytecodeGenerator {
             compiler.is_async = true;
         }
 
+        // Collect top-level statements for hoisting.
+        let top_stmts: Vec<&Stmt> = program
+            .body
+            .iter()
+            .filter_map(|item| {
+                if let ProgramItem::Stmt(s) = item {
+                    Some(s)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let stmts_owned: Vec<Stmt> = top_stmts.iter().map(|s| (*s).clone()).collect();
+
+        // Hoist `var` declarations into the global env (set to undefined).
+        compiler.hoist_var_declarations_global(&stmts_owned);
+
+        // Hoist `let`/`const` declarations with TDZ.
+        compiler.hoist_lexical_decls(&stmts_owned);
+
         // Hoist function declarations to the top.
         for item in &program.body {
             if let ProgramItem::Stmt(Stmt::FnDecl(decl)) = item {
@@ -5212,6 +5550,22 @@ impl BytecodeGenerator {
         compiler.is_program = true;
         compiler.is_eval_scope = true;
         compiler.is_strict = program.is_strict;
+
+        // Collect top-level statements for TDZ hoisting.
+        let top_stmts: Vec<Stmt> = program
+            .body
+            .iter()
+            .filter_map(|item| {
+                if let ProgramItem::Stmt(s) = item {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Hoist `let`/`const` declarations with TDZ.
+        compiler.hoist_lexical_decls(&top_stmts);
 
         for item in &program.body {
             if let ProgramItem::Stmt(Stmt::FnDecl(decl)) = item {
@@ -9200,5 +9554,235 @@ mod tests {
     fn test_const_declaration_works() {
         let result = crate::builtins::global::global_eval("const x = 42; x").unwrap();
         assert_eq!(result, JsValue::Smi(42));
+    }
+
+    // ── Temporal Dead Zone (TDZ) ─────────────────────────────────────────────
+
+    #[test]
+    fn test_let_tdz_throws_reference_error() {
+        let result = crate::builtins::global::global_eval("x; let x = 1;");
+        assert!(
+            result.is_err(),
+            "accessing let before declaration should throw"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("before initialization")
+                || err.to_string().contains("ReferenceError"),
+            "should be ReferenceError, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_const_tdz_throws_reference_error() {
+        let result = crate::builtins::global::global_eval("x; const x = 1;");
+        assert!(
+            result.is_err(),
+            "accessing const before declaration should throw"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("before initialization")
+                || err.to_string().contains("ReferenceError"),
+            "should be ReferenceError, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_typeof_let_tdz_throws() {
+        // typeof on a let/const in TDZ should throw, unlike typeof on an
+        // undeclared global which returns "undefined".
+        let result = crate::builtins::global::global_eval("typeof x; let x = 1;");
+        assert!(result.is_err(), "typeof on TDZ let should throw");
+    }
+
+    #[test]
+    fn test_typeof_undeclared_returns_undefined() {
+        // Undeclared global: typeof should NOT throw, should return "undefined".
+        let result = crate::builtins::global::global_eval("typeof undeclaredGlobalVar").unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("undefined".into()),
+            "typeof undeclared should be 'undefined'"
+        );
+    }
+
+    #[test]
+    fn test_let_tdz_block_scoping_shadows() {
+        // Inner let shadows outer, and accessing before declaration should
+        // throw even though the outer binding exists.
+        let result = crate::builtins::global::global_eval(
+            "let x = 10; var result; { try { result = x; } catch(e) { result = 'error'; } let x = 20; } result",
+        ).unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("error".into()),
+            "should throw ReferenceError in block TDZ"
+        );
+    }
+
+    // ── var hoisting ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_var_hoisting_returns_undefined() {
+        let result = crate::builtins::global::global_eval("var r = x; var x = 5; r").unwrap();
+        assert_eq!(
+            result,
+            JsValue::Undefined,
+            "hoisted var before assignment should be undefined"
+        );
+    }
+
+    #[test]
+    fn test_var_hoisting_in_function() {
+        let result = crate::builtins::global::global_eval(
+            "function f() { var r = x; var x = 5; return r; } f()",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::Undefined,
+            "hoisted var in function before assignment should be undefined"
+        );
+    }
+
+    #[test]
+    fn test_var_in_block_is_function_scoped() {
+        let result =
+            crate::builtins::global::global_eval("function f() { { var x = 42; } return x; } f()")
+                .unwrap();
+        assert_eq!(
+            result,
+            JsValue::Smi(42),
+            "var in block should be visible outside"
+        );
+    }
+
+    #[test]
+    fn test_var_in_if_is_function_scoped() {
+        let result = crate::builtins::global::global_eval(
+            "function f() { if (true) { var x = 99; } return x; } f()",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::Smi(99),
+            "var in if-block should be function scoped"
+        );
+    }
+
+    #[test]
+    fn test_var_in_for_is_function_scoped() {
+        let result = crate::builtins::global::global_eval(
+            "function f() { for (var i = 0; i < 3; i++) {} return i; } f()",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::Smi(3),
+            "var in for-loop should be function scoped"
+        );
+    }
+
+    // ── Function hoisting ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_function_declaration_hoisted() {
+        let result =
+            crate::builtins::global::global_eval("var r = f(); function f() { return 42; } r")
+                .unwrap();
+        assert_eq!(
+            result,
+            JsValue::Smi(42),
+            "function declaration should be hoisted"
+        );
+    }
+
+    #[test]
+    fn test_function_declaration_hoisted_in_function() {
+        let result = crate::builtins::global::global_eval(
+            "function outer() { var r = inner(); function inner() { return 7; } return r; } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    // ── const reassignment ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_const_reassignment_simple() {
+        let result = crate::builtins::global::global_eval("const x = 1; x = 2;");
+        assert!(result.is_err(), "const reassignment should throw");
+    }
+
+    // ── Block scoping ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_let_block_scoped() {
+        // After the block, x should not be visible → ReferenceError.
+        let result = crate::builtins::global::global_eval("{ let x = 1; } x");
+        assert!(result.is_err(), "let should be block scoped");
+    }
+
+    #[test]
+    fn test_const_block_scoped() {
+        let result = crate::builtins::global::global_eval("{ const x = 1; } x");
+        assert!(result.is_err(), "const should be block scoped");
+    }
+
+    #[test]
+    fn test_let_in_for_block_scoped() {
+        let result = crate::builtins::global::global_eval("for (let i = 0; i < 3; i++) {} i");
+        assert!(result.is_err(), "let in for-loop should be block scoped");
+    }
+
+    #[test]
+    fn test_let_separate_blocks() {
+        // Same name in different blocks should work independently.
+        let result = crate::builtins::global::global_eval(
+            "var r; { let x = 10; r = x; } { let x = 20; r = r + x; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    // ── Strict mode ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_strict_mode_delete_variable_throws() {
+        let result = crate::builtins::global::global_eval("'use strict'; var x = 1; delete x;");
+        assert!(
+            result.is_err(),
+            "delete on variable in strict mode should throw SyntaxError"
+        );
+    }
+
+    // ── Combined scoping scenarios ───────────────────────────────────────────
+
+    #[test]
+    fn test_var_and_let_coexist() {
+        let result = crate::builtins::global::global_eval(
+            "function f() { var a = 1; let b = 2; { var c = 3; let d = 4; } return a + b + c; } f()",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::Smi(6),
+            "var c should be function-scoped, let d block-scoped"
+        );
+    }
+
+    #[test]
+    fn test_let_initialization_order() {
+        // let x is initialised properly after its declaration.
+        let result = crate::builtins::global::global_eval("let x = 5; x + 1").unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn test_const_in_block_works() {
+        let result =
+            crate::builtins::global::global_eval("var r; { const c = 100; r = c; } r").unwrap();
+        assert_eq!(result, JsValue::Smi(100));
     }
 }
