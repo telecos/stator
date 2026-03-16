@@ -5176,8 +5176,8 @@ impl FunctionCompiler {
     /// Compile a `yield* expr` (delegating yield).
     ///
     /// Iterates the inner iterable and re-yields each value to the outer
-    /// caller.  The accumulator is set to `undefined` when delegation
-    /// completes (simplified — does not propagate the inner return value).
+    /// caller.  In async generators, delegation uses `GetAsyncIterator` so
+    /// both async and sync iterables are supported.
     fn compile_yield_star(&mut self, expr: &crate::parser::ast::Expr) -> StatorResult<()> {
         // Evaluate the inner iterable → acc.
         self.compile_expr(expr)?;
@@ -5187,8 +5187,13 @@ impl FunctionCompiler {
         self.emit_star(iterable_reg);
         let load_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
         let call_slot = self.alloc_slot(FeedbackSlotKind::Call);
+        let get_iterator = if self.is_async {
+            Opcode::GetAsyncIterator
+        } else {
+            Opcode::GetIterator
+        };
         self.emit(Instruction::new_unchecked(
-            Opcode::GetIterator,
+            get_iterator,
             vec![to_reg_op(iterable_reg), load_slot, call_slot],
         ));
         self.allocator
@@ -5244,17 +5249,15 @@ impl FunctionCompiler {
         // done_lbl: delegation complete.
         self.bind_label(done_lbl);
 
+        // Result of `yield*` is the inner iterator's completion value.
+        self.emit_ldar(val_reg);
+
         self.allocator
             .release_temporary(val_reg)
             .map_err(|e| StatorError::Internal(e.to_string()))?;
         self.allocator
             .release_temporary(iter_reg)
             .map_err(|e| StatorError::Internal(e.to_string()))?;
-
-        // Result of `yield*` is the inner generator's return value.
-        // Simplified: leave undefined in acc (the done record's value is in
-        // val_reg which was already released; we emit LdaUndefined here).
-        self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
         Ok(())
     }
 
