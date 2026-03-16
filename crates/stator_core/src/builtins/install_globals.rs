@@ -19721,7 +19721,7 @@ mod tests {
 
     /// `Object.fromEntries([["a",1]])` → {a: 1}
     #[test]
-    fn e2e_object_from_entries_basic() {
+    fn e2e_object_from_entries_basic_v2() {
         let result = global_eval("Object.fromEntries([['a',1]]).a").unwrap();
         assert_eq!(result, JsValue::Smi(1));
     }
@@ -19742,7 +19742,7 @@ mod tests {
 
     /// `Object.is(NaN, NaN)` → true
     #[test]
-    fn e2e_object_is_nan() {
+    fn e2e_object_is_nan_v2() {
         let result = global_eval("Object.is(NaN, NaN)").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
@@ -19763,14 +19763,14 @@ mod tests {
 
     /// `Object.values({a:1,b:2})` returns own enumerable values
     #[test]
-    fn e2e_object_values_basic() {
+    fn e2e_object_values_basic_v2() {
         let result = global_eval("Object.values({a:1,b:2}).length").unwrap();
         assert_eq!(result, JsValue::Smi(2));
     }
 
     /// `Object.entries({a:1})` returns [[key,value]] pairs
     #[test]
-    fn e2e_object_entries_basic() {
+    fn e2e_object_entries_basic_v2() {
         let result = global_eval("Object.entries({a:1})[0][0]").unwrap();
         assert_eq!(result, JsValue::String("a".into()));
     }
@@ -19805,7 +19805,7 @@ mod tests {
 
     /// `Object.defineProperty` defines property with descriptor
     #[test]
-    fn e2e_object_define_property() {
+    fn e2e_object_define_property_v2() {
         let result = global_eval(
             "var o = {}; Object.defineProperty(o, 'x', {value:42, writable:true}); o.x",
         )
@@ -19815,7 +19815,7 @@ mod tests {
 
     /// `Object.create(null)` creates object with no prototype
     #[test]
-    fn e2e_object_create_null() {
+    fn e2e_object_create_null_v2() {
         let result = global_eval("Object.getPrototypeOf(Object.create(null))").unwrap();
         assert_eq!(result, JsValue::Null);
     }
@@ -19831,7 +19831,7 @@ mod tests {
 
     /// `Object.getOwnPropertyNames` includes non-enumerable props
     #[test]
-    fn e2e_object_get_own_property_names() {
+    fn e2e_object_get_own_property_names_no_internal() {
         let result = global_eval("Object.getOwnPropertyNames({a:1,b:2}).length").unwrap();
         assert_eq!(result, JsValue::Smi(2));
     }
