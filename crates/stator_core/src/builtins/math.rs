@@ -233,7 +233,9 @@ pub fn math_min(values: &[f64]) -> f64 {
 
 /// ECMAScript §21.3.2.26 `Math.pow(base, exponent)`.
 ///
-/// Returns `base` raised to the power `exponent`.
+/// Returns `base` raised to the power `exponent`, following ECMAScript
+/// semantics which differ from IEEE 754 / Rust's `powf` in a few edge
+/// cases.
 ///
 /// # Examples
 ///
@@ -242,8 +244,16 @@ pub fn math_min(values: &[f64]) -> f64 {
 ///
 /// assert!((math_pow(2.0, 10.0) - 1024.0).abs() < 1e-10);
 /// assert_eq!(math_pow(4.0, 0.5), 2.0);
+/// assert!(math_pow(-1.0, f64::INFINITY).is_nan());
+/// assert!(math_pow(1.0, f64::INFINITY).is_nan());
+/// assert!(math_pow(-1.0, f64::NEG_INFINITY).is_nan());
 /// ```
 pub fn math_pow(base: f64, exponent: f64) -> f64 {
+    // ECMAScript §21.3.2.26 step 3.b.iii:
+    // If abs(base) = 1 and exponent is +∞ or −∞, return NaN.
+    if base.abs() == 1.0 && exponent.is_infinite() {
+        return f64::NAN;
+    }
     base.powf(exponent)
 }
 
@@ -1133,9 +1143,11 @@ mod tests {
 
     #[test]
     fn test_ieee754_pow_neg1_infinity() {
-        // ECMAScript: (-1)^±Infinity == 1.
-        assert_eq!(math_pow(-1.0, f64::INFINITY), 1.0);
-        assert_eq!(math_pow(-1.0, f64::NEG_INFINITY), 1.0);
+        // ECMAScript §21.3.2.26: abs(base) == 1 and exponent ±∞ → NaN.
+        assert!(math_pow(-1.0, f64::INFINITY).is_nan());
+        assert!(math_pow(-1.0, f64::NEG_INFINITY).is_nan());
+        assert!(math_pow(1.0, f64::INFINITY).is_nan());
+        assert!(math_pow(1.0, f64::NEG_INFINITY).is_nan());
     }
 
     #[test]
@@ -1295,5 +1307,46 @@ mod tests {
     #[test]
     fn test_atanh_out_of_range() {
         assert!(math_atanh(2.0).is_nan());
+    }
+
+    // ── Math edge cases (ECMAScript conformance) ─────────────────────────────
+
+    #[test]
+    fn test_math_max_empty_returns_neg_infinity() {
+        assert_eq!(math_max(&[]), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_math_min_empty_returns_pos_infinity() {
+        assert_eq!(math_min(&[]), f64::INFINITY);
+    }
+
+    #[test]
+    fn test_math_pow_neg1_pos_infinity_is_nan() {
+        assert!(math_pow(-1.0, f64::INFINITY).is_nan());
+    }
+
+    #[test]
+    fn test_math_pow_1_neg_infinity_is_nan() {
+        assert!(math_pow(1.0, f64::NEG_INFINITY).is_nan());
+    }
+
+    #[test]
+    fn test_math_round_neg_half_is_neg_zero() {
+        let r = math_round(-0.5);
+        assert_eq!(r, 0.0);
+        assert!(r.is_sign_negative());
+    }
+
+    #[test]
+    fn test_math_pow_zero_exponent() {
+        // ECMAScript: anything^0 = 1, even NaN^0 = 1.
+        assert_eq!(math_pow(f64::NAN, 0.0), 1.0);
+        assert_eq!(math_pow(f64::INFINITY, 0.0), 1.0);
+    }
+
+    #[test]
+    fn test_math_pow_base_2_exponent_10() {
+        assert!((math_pow(2.0, 10.0) - 1024.0).abs() < 1e-10);
     }
 }

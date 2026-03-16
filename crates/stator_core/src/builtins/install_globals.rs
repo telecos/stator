@@ -78,6 +78,9 @@ use crate::builtins::math::{
     math_min, math_pow, math_random, math_round, math_sign, math_sin, math_sinh, math_sqrt,
     math_tan, math_tanh, math_trunc,
 };
+use crate::builtins::number::{
+    number_reformat_exponential, number_to_exponential, number_to_precision,
+};
 use crate::builtins::proxy::{
     ProxyHandler, proxy_new, proxy_new_callable, proxy_revocable, proxy_revoke,
 };
@@ -3062,16 +3065,36 @@ fn make_number() -> JsValue {
                 native(|args| {
                     let n = this_number_value(&args)?;
                     let digits = match args.get(1) {
-                        Some(JsValue::Smi(d)) => Some((*d).clamp(0, 100) as usize),
+                        Some(JsValue::Smi(d)) => Some((*d).clamp(0, 100) as u32),
                         Some(JsValue::HeapNumber(d)) => {
-                            Some(crate::builtins::util::clamped_f64_to_usize(*d).min(100))
+                            let v = d.floor() as i64;
+                            if !(0..=100).contains(&v) {
+                                return Err(StatorError::RangeError(
+                                    "toExponential() fractionDigits must be between 0 and 100"
+                                        .to_string(),
+                                ));
+                            }
+                            Some(v as u32)
                         }
                         Some(JsValue::Undefined) | None => None,
                         _ => None,
                     };
                     match digits {
-                        Some(d) => Ok(JsValue::String(format!("{n:.d$e}").into())),
-                        None => Ok(JsValue::String(format!("{n:e}").into())),
+                        Some(d) => Ok(JsValue::String(number_to_exponential(n, d)?.into())),
+                        None => {
+                            if n.is_nan() {
+                                return Ok(JsValue::String("NaN".into()));
+                            }
+                            if n.is_infinite() {
+                                return Ok(JsValue::String(
+                                    if n > 0.0 { "Infinity" } else { "-Infinity" }.into(),
+                                ));
+                            }
+                            // No argument: let Rust pick minimal fraction digits,
+                            // then reformat to ECMAScript style.
+                            let raw = format!("{n:e}");
+                            Ok(JsValue::String(number_reformat_exponential(&raw).into()))
+                        }
                     }
                 }),
             );
@@ -3083,18 +3106,20 @@ fn make_number() -> JsValue {
                     let n = this_number_value(&args)?;
                     match args.get(1) {
                         None | Some(JsValue::Undefined) => {
-                            Ok(JsValue::String(format!("{n}").into()))
+                            // No argument: return ToString(n).
+                            Ok(JsValue::String(
+                                JsValue::HeapNumber(n).to_js_string()?.into(),
+                            ))
                         }
                         Some(v) => {
-                            let p = v.to_number()? as usize;
-                            if p == 0 || p > 100 {
+                            let p = v.to_number()?;
+                            let pi = p.floor() as i64;
+                            if !(1..=100).contains(&pi) {
                                 return Err(StatorError::RangeError(
                                     "toPrecision() argument must be between 1 and 100".to_string(),
                                 ));
                             }
-                            Ok(JsValue::String(
-                                format!("{n:.prec$}", prec = p.saturating_sub(1)).into(),
-                            ))
+                            Ok(JsValue::String(number_to_precision(n, pi as u32)?.into()))
                         }
                     }
                 }),
