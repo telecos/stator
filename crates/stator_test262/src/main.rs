@@ -1824,8 +1824,8 @@ mod tests {
     fn test_collect_tests_empty_dir() {
         let tmp = std::env::temp_dir().join("stator_test262_empty_collect_test");
         let _ = std::fs::create_dir_all(&tmp);
-        let mut out = Vec::new();
-        collect_tests(&tmp, &mut out).unwrap();
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
         assert!(out.is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1836,8 +1836,8 @@ mod tests {
         let _ = std::fs::create_dir_all(&tmp);
         std::fs::write(tmp.join("a.js"), "var a;").unwrap();
         std::fs::write(tmp.join("b.txt"), "not js").unwrap();
-        let mut out = Vec::new();
-        collect_tests(&tmp, &mut out).unwrap();
+        let mut out: Vec<PathBuf> = Vec::new();
+        collect_tests(&tmp, &tmp, &mut out).unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].ends_with("a.js"));
         let _ = std::fs::remove_dir_all(&tmp);
