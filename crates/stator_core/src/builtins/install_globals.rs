@@ -7768,17 +7768,35 @@ fn make_function() -> JsValue {
                 let func = args.first().cloned().unwrap_or(JsValue::Undefined);
                 let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                 let bound_args: Vec<JsValue> = args.get(2..).unwrap_or(&[]).to_vec();
+                let bound_count = bound_args.len() as i32;
+
+                // Compute the bound function's `.length` (ES §20.2.3.2 step 6).
+                let target_len = match &func {
+                    JsValue::Function(ba) => ba.parameter_count() as i32,
+                    _ => 0,
+                };
+                let result_len = std::cmp::max(0, target_len - bound_count);
+
                 match &func {
                     JsValue::NativeFunction(f) => {
                         let bound = function_bind(f, &this_arg, &bound_args);
                         Ok(JsValue::NativeFunction(bound))
                     }
                     JsValue::Function(_) | JsValue::PlainObject(_) => {
-                        Ok(JsValue::NativeFunction(Rc::new(move |call_args| {
-                            let mut all_args = bound_args.clone();
-                            all_args.extend(call_args);
-                            dispatch_call_with_this(&func, this_arg.clone(), all_args)
-                        })))
+                        let call_fn =
+                            JsValue::NativeFunction(Rc::new(move |call_args: Vec<JsValue>| {
+                                let mut all_args = bound_args.clone();
+                                all_args.extend(call_args);
+                                dispatch_call_with_this(&func, this_arg.clone(), all_args)
+                            }));
+                        let mut props = PropertyMap::new();
+                        props.insert("__call__".to_string(), call_fn);
+                        props.insert(
+                            "name".to_string(),
+                            JsValue::String("bound ".to_string().into()),
+                        );
+                        props.insert("length".to_string(), JsValue::Smi(result_len));
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
                     }
                     _ => Err(StatorError::TypeError(
                         "Function.prototype.bind requires a callable".into(),
@@ -8250,7 +8268,28 @@ fn make_string() -> JsValue {
                     return result;
                 }
                 let search = search_arg.to_js_string()?;
-                let replacement = args.get(2).unwrap_or(&JsValue::Undefined).to_js_string()?;
+                let replace_arg = args.get(2).unwrap_or(&JsValue::Undefined);
+                // §22.1.3.17 step 7: if replaceValue is callable, call it.
+                if is_callable(replace_arg) {
+                    if let Some(byte_pos) = s.find(&*search) {
+                        let utf16_pos = crate::builtins::string::encode_utf16(&s[..byte_pos]).len();
+                        let result_val = call_callback(
+                            replace_arg,
+                            vec![
+                                JsValue::String(search.clone().into()),
+                                num(utf16_pos as f64),
+                                JsValue::String(s.clone().into()),
+                            ],
+                        )?;
+                        let rep = result_val.to_js_string()?;
+                        let mut result = s[..byte_pos].to_string();
+                        result.push_str(&rep);
+                        result.push_str(&s[byte_pos + search.len()..]);
+                        return Ok(JsValue::String(result.into()));
+                    }
+                    return Ok(JsValue::String(s.into()));
+                }
+                let replacement = replace_arg.to_js_string()?;
                 Ok(JsValue::String(
                     string_replace(&s, &search, &replacement).into(),
                 ))
@@ -8288,7 +8327,65 @@ fn make_string() -> JsValue {
                     }
                 }
                 let search = search_arg.to_js_string()?;
-                let replacement = args.get(2).unwrap_or(&JsValue::Undefined).to_js_string()?;
+                let replace_arg = args.get(2).unwrap_or(&JsValue::Undefined);
+                // §22.1.3.18 step 7: if replaceValue is callable, call it.
+                if is_callable(replace_arg) {
+                    if search.is_empty() {
+                        // Empty search: insert between every UTF-16 code unit.
+                        let units = crate::builtins::string::encode_utf16(&s);
+                        let mut result = String::new();
+                        for (idx, u) in units.iter().enumerate() {
+                            let rep = call_callback(
+                                replace_arg,
+                                vec![
+                                    JsValue::String("".into()),
+                                    num(idx as f64),
+                                    JsValue::String(s.clone().into()),
+                                ],
+                            )?;
+                            result.push_str(&rep.to_js_string()?);
+                            result.push_str(&crate::builtins::string::decode_utf16(&[*u]));
+                        }
+                        let rep = call_callback(
+                            replace_arg,
+                            vec![
+                                JsValue::String("".into()),
+                                num(units.len() as f64),
+                                JsValue::String(s.clone().into()),
+                            ],
+                        )?;
+                        result.push_str(&rep.to_js_string()?);
+                        return Ok(JsValue::String(result.into()));
+                    }
+                    let mut result = String::new();
+                    let mut last_end = 0usize;
+                    let mut start = 0usize;
+                    while start <= s.len() {
+                        match s[start..].find(&*search) {
+                            Some(relative_pos) => {
+                                let byte_pos = start + relative_pos;
+                                let utf16_pos =
+                                    crate::builtins::string::encode_utf16(&s[..byte_pos]).len();
+                                let rep = call_callback(
+                                    replace_arg,
+                                    vec![
+                                        JsValue::String(search.clone().into()),
+                                        num(utf16_pos as f64),
+                                        JsValue::String(s.clone().into()),
+                                    ],
+                                )?;
+                                result.push_str(&s[last_end..byte_pos]);
+                                result.push_str(&rep.to_js_string()?);
+                                last_end = byte_pos + search.len();
+                                start = last_end;
+                            }
+                            None => break,
+                        }
+                    }
+                    result.push_str(&s[last_end..]);
+                    return Ok(JsValue::String(result.into()));
+                }
+                let replacement = replace_arg.to_js_string()?;
                 Ok(JsValue::String(
                     string_replace_all(&s, &search, &replacement).into(),
                 ))
@@ -22128,5 +22225,253 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── String method edge-case tests ───────────────────────────────────────
+
+    /// `$$` in replacement inserts a literal `$`.
+    #[test]
+    fn e2e_replace_dollar_dollar() {
+        let r = global_eval("'abc'.replace('b', '$$')").unwrap();
+        assert_eq!(r, JsValue::String("a$c".into()));
+    }
+
+    /// `$&` in replacement inserts the matched substring.
+    #[test]
+    fn e2e_replace_dollar_ampersand() {
+        let r = global_eval("'abc'.replace('b', '[$&]')").unwrap();
+        assert_eq!(r, JsValue::String("a[b]c".into()));
+    }
+
+    /// `` $` `` in replacement inserts the portion before the match.
+    #[test]
+    fn e2e_replace_dollar_backtick() {
+        let r = global_eval("'abc'.replace('b', '$`')").unwrap();
+        assert_eq!(r, JsValue::String("aac".into()));
+    }
+
+    /// `$'` in replacement inserts the portion after the match.
+    #[test]
+    fn e2e_replace_dollar_singlequote() {
+        let r = global_eval("'abc'.replace('b', \"$'\")").unwrap();
+        assert_eq!(r, JsValue::String("acc".into()));
+    }
+
+    /// Replace with function replacer — receives (match, offset, string).
+    #[test]
+    fn e2e_replace_function_replacer() {
+        let r = global_eval(
+            "'hello'.replace('ll', function(m, off, s) { return off.toString(); })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("he2o".into()));
+    }
+
+    /// Replace with function replacer — match not found returns original.
+    #[test]
+    fn e2e_replace_fn_replacer_no_match() {
+        let r =
+            global_eval("'hello'.replace('xyz', function(m) { return 'Z'; })").unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    /// `$$` works in replaceAll.
+    #[test]
+    fn e2e_replace_all_dollar_dollar() {
+        let r = global_eval("'aba'.replaceAll('a', '$$')").unwrap();
+        assert_eq!(r, JsValue::String("$b$".into()));
+    }
+
+    /// `$&` works in replaceAll.
+    #[test]
+    fn e2e_replace_all_dollar_ampersand() {
+        let r = global_eval("'aba'.replaceAll('a', '[$&]')").unwrap();
+        assert_eq!(r, JsValue::String("[a]b[a]".into()));
+    }
+
+    /// replaceAll with function replacer.
+    #[test]
+    fn e2e_replace_all_fn_replacer() {
+        let r = global_eval(
+            "'abab'.replaceAll('a', function(m, off, s) { return off.toString(); })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0b2b".into()));
+    }
+
+    /// replaceAll empty search inserts between every character.
+    #[test]
+    fn e2e_replace_all_empty_search_inserts() {
+        let r = global_eval("'ab'.replaceAll('', '-')").unwrap();
+        assert_eq!(r, JsValue::String("-a-b-".into()));
+    }
+
+    /// `"".split("")` returns empty array.
+    #[test]
+    fn e2e_split_empty_on_empty_edge() {
+        let r = global_eval("''.split('').length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Split with limit 0 returns empty array.
+    #[test]
+    fn e2e_split_limit_zero_edge() {
+        let r = global_eval("'a,b,c'.split(',', 0).length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Split with limit 2 returns first 2 parts.
+    #[test]
+    fn e2e_split_limit_two() {
+        let r = global_eval("'a,b,c'.split(',', 2).join('-')").unwrap();
+        assert_eq!(r, JsValue::String("a-b".into()));
+    }
+
+    /// `slice(-2)` returns last 2 characters.
+    #[test]
+    fn e2e_slice_negative_start_edge() {
+        let r = global_eval("'abcde'.slice(-2)").unwrap();
+        assert_eq!(r, JsValue::String("de".into()));
+    }
+
+    /// `slice(1, -1)` with negative end.
+    #[test]
+    fn e2e_slice_negative_end_edge() {
+        let r = global_eval("'abcde'.slice(1, -1)").unwrap();
+        assert_eq!(r, JsValue::String("bcd".into()));
+    }
+
+    /// `slice` with start > end returns empty string.
+    #[test]
+    fn e2e_slice_start_gt_end_edge() {
+        let r = global_eval("'abcde'.slice(3, 1)").unwrap();
+        assert_eq!(r, JsValue::String("".into()));
+    }
+
+    /// `substring` swaps args when start > end.
+    #[test]
+    fn e2e_substring_swaps_edge() {
+        let r = global_eval("'abcde'.substring(3, 1)").unwrap();
+        assert_eq!(r, JsValue::String("bc".into()));
+    }
+
+    /// `substring` negative indices are clamped to 0.
+    #[test]
+    fn e2e_substring_negative_clamped_edge() {
+        let r = global_eval("'abcde'.substring(-3, 3)").unwrap();
+        assert_eq!(r, JsValue::String("abc".into()));
+    }
+
+    /// `substr` negative start counts from end.
+    #[test]
+    fn e2e_substr_negative_start_edge() {
+        let r = global_eval("'hello'.substr(-3, 2)").unwrap();
+        assert_eq!(r, JsValue::String("ll".into()));
+    }
+
+    /// `startsWith` with position parameter.
+    #[test]
+    fn e2e_starts_with_position_edge() {
+        let r = global_eval("'hello world'.startsWith('world', 6)").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `endsWith` with endPosition parameter.
+    #[test]
+    fn e2e_ends_with_position_edge() {
+        let r = global_eval("'hello world'.endsWith('hello', 5)").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `repeat(0)` returns empty string.
+    #[test]
+    fn e2e_repeat_zero_edge() {
+        let r = global_eval("'abc'.repeat(0)").unwrap();
+        assert_eq!(r, JsValue::String("".into()));
+    }
+
+    /// `repeat(-1)` throws RangeError.
+    #[test]
+    fn e2e_repeat_negative_throws_edge() {
+        let r = global_eval("try { 'x'.repeat(-1); 'ok' } catch(e) { 'error' }");
+        assert_eq!(r.unwrap(), JsValue::String("error".into()));
+    }
+
+    /// `repeat(Infinity)` throws RangeError.
+    #[test]
+    fn e2e_repeat_infinity_throws_edge() {
+        let r = global_eval("try { 'x'.repeat(Infinity); 'ok' } catch(e) { 'error' }");
+        assert_eq!(r.unwrap(), JsValue::String("error".into()));
+    }
+
+    /// `charAt` out-of-range returns empty string.
+    #[test]
+    fn e2e_char_at_out_of_range_edge() {
+        let r = global_eval("'abc'.charAt(10)").unwrap();
+        assert_eq!(r, JsValue::String("".into()));
+    }
+
+    /// `charCodeAt` out-of-range returns NaN.
+    #[test]
+    fn e2e_char_code_at_out_of_range_edge() {
+        let r = global_eval("isNaN('abc'.charCodeAt(10))").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `codePointAt` out-of-range returns undefined.
+    #[test]
+    fn e2e_code_point_at_out_of_range_edge() {
+        let r = global_eval("'abc'.codePointAt(10)").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    /// `normalize()` with default (NFC) composes.
+    #[test]
+    fn e2e_normalize_default_nfc_edge() {
+        let r = global_eval("'caf\\u0065\\u0301'.normalize()").unwrap();
+        assert_eq!(r, JsValue::String("caf\u{e9}".into()));
+    }
+
+    /// `normalize('NFD')` decomposes.
+    #[test]
+    fn e2e_normalize_nfd_edge() {
+        let r = global_eval("'caf\\u00e9'.normalize('NFD').length").unwrap();
+        // é decomposes to e + combining acute = 5 code units
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    /// `normalize` with invalid form throws RangeError.
+    #[test]
+    fn e2e_normalize_invalid_form_edge() {
+        let r = global_eval("try { 'a'.normalize('XYZ'); 'ok' } catch(e) { 'error' }");
+        assert_eq!(r.unwrap(), JsValue::String("error".into()));
+    }
+
+    /// `String.raw` interleaves substitutions.
+    #[test]
+    fn e2e_string_raw_with_subs_edge() {
+        let r = global_eval("String.raw({ raw: ['a', 'b', 'c'] }, 1, 2)").unwrap();
+        assert_eq!(r, JsValue::String("a1b2c".into()));
+    }
+
+    /// `includes` with position parameter.
+    #[test]
+    fn e2e_includes_with_position_edge() {
+        let r = global_eval("'hello'.includes('hel', 1)").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `replace` where search is not found returns original.
+    #[test]
+    fn e2e_replace_not_found_edge() {
+        let r = global_eval("'hello'.replace('xyz', 'Z')").unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    /// `substring` both args same returns empty string.
+    #[test]
+    fn e2e_substring_same_args_edge() {
+        let r = global_eval("'hello'.substring(2, 2)").unwrap();
+        assert_eq!(r, JsValue::String("".into()));
     }
 }

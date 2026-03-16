@@ -1396,8 +1396,9 @@ fn handle_call_undefined_receiver0(
                     tried_jit = true;
                 }
                 if !tried_jit {
+                    // Arrow functions use lexical `this` — skip override.
                     // Strict mode: `this` is undefined for free function calls.
-                    let saved_this = if ba.is_strict() {
+                    let saved_this = if !ba.is_arrow() && ba.is_strict() {
                         let old = ctx.frame.global_env.borrow().get("this").cloned();
                         ctx.frame
                             .global_env
@@ -1418,7 +1419,7 @@ fn handle_call_undefined_receiver0(
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
-                    if ba.is_strict() {
+                    if !ba.is_arrow() && ba.is_strict() {
                         match saved_this {
                             Some(v) => {
                                 ctx.frame
@@ -1494,8 +1495,8 @@ fn handle_call_undefined_receiver1(
                     tried_jit = true;
                 }
                 if !tried_jit {
-                    // Strict mode: `this` is undefined for free function calls.
-                    let saved_this = if ba.is_strict() {
+                    // Arrow functions use lexical `this` — skip override.
+                    let saved_this = if !ba.is_arrow() && ba.is_strict() {
                         let old = ctx.frame.global_env.borrow().get("this").cloned();
                         ctx.frame
                             .global_env
@@ -1516,7 +1517,7 @@ fn handle_call_undefined_receiver1(
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
-                    if ba.is_strict() {
+                    if !ba.is_arrow() && ba.is_strict() {
                         match saved_this {
                             Some(v) => {
                                 ctx.frame
@@ -1601,8 +1602,8 @@ fn handle_call_undefined_receiver2(
                     tried_jit = true;
                 }
                 if !tried_jit {
-                    // Strict mode: `this` is undefined for free function calls.
-                    let saved_this = if ba.is_strict() {
+                    // Arrow functions use lexical `this` — skip override.
+                    let saved_this = if !ba.is_arrow() && ba.is_strict() {
                         let old = ctx.frame.global_env.borrow().get("this").cloned();
                         ctx.frame
                             .global_env
@@ -1623,7 +1624,7 @@ fn handle_call_undefined_receiver2(
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
-                    if ba.is_strict() {
+                    if !ba.is_arrow() && ba.is_strict() {
                         match saved_this {
                             Some(v) => {
                                 ctx.frame
@@ -1712,10 +1713,13 @@ fn handle_call_property(
                     Rc::clone(&ctx.frame.global_env),
                 );
                 restore_closure_context(&mut callee_frame, &ba);
-                callee_frame
-                    .global_env
-                    .borrow_mut()
-                    .insert("this".to_string(), this_val);
+                // Arrow functions use lexical `this` — do NOT override.
+                if !ba.is_arrow() {
+                    callee_frame
+                        .global_env
+                        .borrow_mut()
+                        .insert("this".to_string(), this_val);
+                }
                 push_call_frame("<anonymous>")?;
                 let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
                     Interpreter::run(&mut callee_frame)
@@ -8674,5 +8678,295 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(42));
+    }
+
+    // ── Arrow function conformance ──────────────────────────────────────
+
+    #[test]
+    fn e2e_arrow_concise_body() {
+        let result = crate::builtins::global::global_eval("var f = x => x * 2; f(5)").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_arrow_block_body() {
+        let result =
+            crate::builtins::global::global_eval("var f = x => { return x * 3; }; f(4)").unwrap();
+        assert_eq!(result, JsValue::Smi(12));
+    }
+
+    #[test]
+    fn e2e_arrow_no_own_arguments() {
+        // Arrow functions do NOT have their own `arguments` object.
+        let result = crate::builtins::global::global_eval(
+            "function outer() { var f = () => typeof arguments; return f(); } outer(1,2,3)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_arrow_inherits_outer_arguments() {
+        // Arrow should read enclosing function's arguments.
+        let result = crate::builtins::global::global_eval(
+            "function outer() { var f = () => arguments.length; return f(); } outer(10,20,30)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_arrow_lexical_this_in_method() {
+        // Arrow inherits `this` from enclosing scope (the method's `this`).
+        let result = crate::builtins::global::global_eval(
+            "var obj = { x: 42, getX: function() { var f = () => this.x; return f(); } }; \
+             obj.getX()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_arrow_lexical_this_not_overridden_by_call() {
+        // .call() on an arrow should NOT change its `this`.
+        let result = crate::builtins::global::global_eval(
+            "var obj = { x: 99, getX: function() { var f = () => this.x; \
+             return f.call({x: 1}); } }; obj.getX()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn e2e_arrow_not_constructable_detailed() {
+        let result = crate::builtins::global::global_eval(
+            "var f = () => {}; var ok = false; \
+             try { new f(); } catch(e) { ok = e instanceof TypeError; } ok",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── this binding rules ──────────────────────────────────────────────
+
+    #[test]
+    fn e2e_this_implicit_binding() {
+        // obj.method() → this is obj.
+        let result = crate::builtins::global::global_eval(
+            "var obj = { val: 7, get: function() { return this.val; } }; obj.get()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_this_explicit_call() {
+        let result =
+            crate::builtins::global::global_eval("function f() { return this.x; } f.call({x: 55})")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(55));
+    }
+
+    #[test]
+    fn e2e_this_explicit_apply() {
+        let result = crate::builtins::global::global_eval(
+            "function f(a) { return this.x + a; } f.apply({x: 10}, [5])",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(15));
+    }
+
+    #[test]
+    fn e2e_this_new_binding() {
+        // `new` binding: `this` is the new object.
+        let result = crate::builtins::global::global_eval(
+            "function Foo(v) { this.val = v; } var f = new Foo(33); f.val",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(33));
+    }
+
+    // ── Function.prototype.bind ─────────────────────────────────────────
+
+    #[test]
+    fn e2e_bind_this() {
+        let result = crate::builtins::global::global_eval(
+            "function f() { return this.x; } var g = f.bind({x: 77}); g()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(77));
+    }
+
+    #[test]
+    fn e2e_bind_partial_application() {
+        let result = crate::builtins::global::global_eval(
+            "function add(a, b) { return a + b; } \
+             var add5 = add.bind(null, 5); add5(3)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(8));
+    }
+
+    #[test]
+    fn e2e_bind_length() {
+        // Bound function length = max(0, target.length - bound_args)
+        let result = crate::builtins::global::global_eval(
+            "function f(a, b, c) {} var g = f.bind(null, 1); g.length",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_bind_name() {
+        let result = crate::builtins::global::global_eval(
+            "function f(a, b, c) {} var g = f.bind(null); typeof g.name === 'string'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bind_subsequent_call_doesnt_change_this() {
+        // .bind() creates a bound function; subsequent .call() doesn't override.
+        let result = crate::builtins::global::global_eval(
+            "function f() { return this.x; } \
+             var g = f.bind({x: 100}); g.call({x: 999})",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(100));
+    }
+
+    // ── Function.prototype.call / apply ─────────────────────────────────
+
+    #[test]
+    fn e2e_call_with_args() {
+        let result = crate::builtins::global::global_eval(
+            "function f(a, b) { return this.x + a + b; } f.call({x: 1}, 2, 3)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_apply_with_array() {
+        let result = crate::builtins::global::global_eval(
+            "function f(a, b) { return a + b; } f.apply(null, [10, 20])",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    // ── Closures ────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_closure_captures_by_reference() {
+        let result = crate::builtins::global::global_eval(
+            "function make() { var x = 1; return { get: function() { return x; }, \
+             set: function(v) { x = v; } }; } \
+             var o = make(); o.set(42); o.get()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_closure_survives_after_return() {
+        let result = crate::builtins::global::global_eval(
+            "function counter() { var n = 0; return function() { n = n + 1; return n; }; } \
+             var c = counter(); c(); c(); c()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_closure_var_shared_in_loop() {
+        // Loop closures with `var` share the same variable.
+        let result = crate::builtins::global::global_eval(
+            "var fns = []; \
+             for (var i = 0; i < 3; i++) { fns[i] = function() { return i; }; } \
+             fns[0]() + ',' + fns[1]() + ',' + fns[2]()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("3,3,3".into()));
+    }
+
+    // ── arguments object ────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_arguments_length() {
+        let result = crate::builtins::global::global_eval(
+            "function f() { return arguments.length; } f(1,2,3)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_arguments_indexed_access() {
+        let result = crate::builtins::global::global_eval(
+            "function f() { return arguments[0] + arguments[1]; } f(10, 20)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    #[test]
+    fn e2e_arguments_not_array() {
+        let result = crate::builtins::global::global_eval(
+            "function f() { return Array.isArray(arguments); } f(1,2)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_arguments_iterable() {
+        let result = crate::builtins::global::global_eval(
+            "function f() { var r = ''; for (var x of arguments) r += x + ','; return r; } \
+             f('a','b','c')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,b,c,".into()));
+    }
+
+    // ── Default parameters ──────────────────────────────────────────────
+
+    #[test]
+    fn e2e_default_param_basic() {
+        let result =
+            crate::builtins::global::global_eval("function f(a = 10) { return a; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_default_param_overridden() {
+        let result =
+            crate::builtins::global::global_eval("function f(a = 10) { return a; } f(5)").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_default_param_references_earlier() {
+        // Later defaults can reference earlier params.
+        let result =
+            crate::builtins::global::global_eval("function f(a, b = a * 2) { return b; } f(3)")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_default_param_left_to_right() {
+        let result =
+            crate::builtins::global::global_eval("function f(a = 1, b = 2) { return a + b; } f()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_default_param_with_arrow() {
+        let result = crate::builtins::global::global_eval("var f = (a = 7) => a + 1; f()").unwrap();
+        assert_eq!(result, JsValue::Smi(8));
     }
 }

@@ -31,13 +31,13 @@ pub const MAX_STRING_LEN: usize = 1 << 28;
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Encodes a UTF-8 string slice into a `Vec` of UTF-16 code units.
-fn encode_utf16(s: &str) -> Vec<u16> {
+pub(crate) fn encode_utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
 /// Decodes a slice of UTF-16 code units back to a `String`, replacing any
 /// unpaired surrogates with the Unicode replacement character (`U+FFFD`).
-fn decode_utf16(units: &[u16]) -> String {
+pub(crate) fn decode_utf16(units: &[u16]) -> String {
     String::from_utf16_lossy(units)
 }
 
