@@ -5203,6 +5203,11 @@ pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) ->
 pub fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult<JsValue> {
     match callee {
         JsValue::Function(ba) => {
+            // Generator functions return a suspended generator object instead
+            // of executing the body (§27.3.3.1).
+            if ba.is_generator() {
+                return Ok(JsValue::Generator(GeneratorState::new((**ba).clone())));
+            }
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
                 InterpreterFrame::new_with_globals((**ba).clone(), args, globals)
@@ -5238,6 +5243,11 @@ pub fn dispatch_call_with_this(
 ) -> StatorResult<JsValue> {
     match callee {
         JsValue::Function(ba) => {
+            // Generator functions return a suspended generator object instead
+            // of executing the body (§27.3.3.1).
+            if ba.is_generator() {
+                return Ok(JsValue::Generator(GeneratorState::new((**ba).clone())));
+            }
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
                 InterpreterFrame::new_with_globals((**ba).clone(), args, globals)

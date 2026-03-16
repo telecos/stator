@@ -4526,6 +4526,17 @@ fn make_array() -> JsValue {
                         }
                         items
                     }
+                    JsValue::Generator(gs) => {
+                        use crate::interpreter::Interpreter;
+                        use crate::objects::value::GeneratorStep;
+                        let mut items = Vec::new();
+                        while let GeneratorStep::Yield(v) =
+                            Interpreter::run_generator_step(gs, JsValue::Undefined)?
+                        {
+                            items.push(v);
+                        }
+                        items
+                    }
                     _ => Vec::new(),
                 };
                 // Apply mapFn if provided.
@@ -7856,6 +7867,145 @@ fn make_function() -> JsValue {
         );
         ctor
     })
+}
+
+/// Build the `GeneratorFunction` constructor and `Generator.prototype`.
+///
+/// Per §27.3 / §27.5:
+/// - `GeneratorFunction` is a constructor (rarely used directly).
+/// - `GeneratorFunction.prototype` === `Generator` (the %Generator% intrinsic).
+/// - `Generator.prototype` carries `.next()`, `.return()`, `.throw()` and
+///   `@@iterator`.
+///
+/// The returned `PlainObject` is registered as `"GeneratorFunction"` in the
+/// global environment so that conformance tests can access it.
+fn make_generator_function() -> JsValue {
+    use crate::interpreter::Interpreter;
+    use crate::objects::value::GeneratorStep;
+
+    let mut props = PropertyMap::new();
+
+    // ── GeneratorFunction is not directly callable in most code ──────────
+    props.insert(
+        "__call__".into(),
+        native(|_args| {
+            Err(StatorError::TypeError(
+                "GeneratorFunction is not a constructor".into(),
+            ))
+        }),
+    );
+
+    // ── Generator.prototype (the %GeneratorPrototype% intrinsic) ────────
+    let mut gen_proto = PropertyMap::new();
+
+    // Generator.prototype.next(value)  §27.5.1.2
+    gen_proto.insert(
+        "next".into(),
+        builtin_fn("next", 1, |args| {
+            let this = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            match this {
+                JsValue::Generator(gs) => match Interpreter::run_generator_step(&gs, input)? {
+                    GeneratorStep::Yield(v) => Ok(make_iter_result(v, false)),
+                    GeneratorStep::Return(v) => Ok(make_iter_result(v, true)),
+                },
+                _ => Err(StatorError::TypeError(
+                    "Generator.prototype.next requires a generator receiver".into(),
+                )),
+            }
+        }),
+    );
+
+    // Generator.prototype.return(value)  §27.5.1.3
+    gen_proto.insert(
+        "return".into(),
+        builtin_fn("return", 1, |args| {
+            let this = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let value = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            match this {
+                JsValue::Generator(gs) => Interpreter::generator_return(&gs, value),
+                _ => Err(StatorError::TypeError(
+                    "Generator.prototype.return requires a generator receiver".into(),
+                )),
+            }
+        }),
+    );
+
+    // Generator.prototype.throw(exception)  §27.5.1.4
+    gen_proto.insert(
+        "throw".into(),
+        builtin_fn("throw", 1, |args| {
+            let this = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let value = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            match this {
+                JsValue::Generator(gs) => Interpreter::generator_throw(&gs, value),
+                _ => Err(StatorError::TypeError(
+                    "Generator.prototype.throw requires a generator receiver".into(),
+                )),
+            }
+        }),
+    );
+
+    // Generator.prototype[@@toStringTag] = "Generator"  §27.5.1.5
+    gen_proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("Generator".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    gen_proto.insert_with_attrs(
+        format!("Symbol({})", SYMBOL_TO_STRING_TAG),
+        JsValue::String("Generator".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+
+    gen_proto.make_all_non_enumerable();
+    let gen_proto_rc = Rc::new(RefCell::new(gen_proto));
+
+    // ── Generator (the %Generator% intrinsic = GeneratorFunction.prototype) ──
+    let mut generator_obj = PropertyMap::new();
+    generator_obj.insert(
+        "prototype".into(),
+        JsValue::PlainObject(gen_proto_rc.clone()),
+    );
+    generator_obj.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("GeneratorFunction".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    generator_obj.insert_with_attrs(
+        format!("Symbol({})", SYMBOL_TO_STRING_TAG),
+        JsValue::String("GeneratorFunction".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    generator_obj.make_all_non_enumerable();
+    let generator_obj_rc = Rc::new(RefCell::new(generator_obj));
+
+    // GeneratorFunction.prototype = %Generator%
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(generator_obj_rc.clone()),
+    );
+
+    // Wire constructor links:
+    // Generator.prototype.constructor = %Generator%
+    gen_proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        JsValue::PlainObject(generator_obj_rc.clone()),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+
+    props.insert("name".into(), JsValue::String("GeneratorFunction".into()));
+    props.insert("length".into(), JsValue::Smi(1));
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+/// Helper: create a `{value, done}` iterator result object.
+fn make_iter_result(value: JsValue, done: bool) -> JsValue {
+    let mut map = PropertyMap::new();
+    map.insert("value".to_string(), value);
+    map.insert("done".to_string(), JsValue::Boolean(done));
+    JsValue::PlainObject(Rc::new(RefCell::new(map)))
 }
 
 /// Build the `String` constructor/namespace object with static and prototype
@@ -12037,6 +12187,10 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         globals.insert(
             "Function".into(),
             finalize_ctor(make_function(), "Function"),
+        );
+        globals.insert(
+            "GeneratorFunction".into(),
+            finalize_ctor(make_generator_function(), "GeneratorFunction"),
         );
         globals.insert("Proxy".into(), finalize_ctor(make_proxy(), "Proxy"));
         globals.insert("Reflect".into(), make_reflect());
