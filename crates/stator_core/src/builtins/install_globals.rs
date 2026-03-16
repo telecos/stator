@@ -115,7 +115,7 @@ use crate::builtins::symbol::{
     SYMBOL_UNSCOPABLES, symbol_create, symbol_description, symbol_for, symbol_key_for,
 };
 use crate::builtins::typed_array::{
-    JsArrayBuffer, TypedArrayKind, arraybuffer_is_view, arraybuffer_new, dataview_get_bigint64,
+    JsArrayBuffer, TypedArrayKind, arraybuffer_new, arraybuffer_slice, dataview_get_bigint64,
     dataview_get_biguint64, dataview_get_float32, dataview_get_float64, dataview_get_int8,
     dataview_get_int16, dataview_get_int32, dataview_get_uint8, dataview_get_uint16,
     dataview_get_uint32, dataview_new, dataview_set_bigint64, dataview_set_biguint64,
@@ -11098,6 +11098,77 @@ fn require_object_arg(args: &[JsValue], idx: usize, name: &str) -> StatorResult<
 
 // ── ArrayBuffer / DataView / TypedArray constructors ─────────────────────────
 
+/// Extract the `Rc<RefCell<JsArrayBuffer>>` from a raw `JsValue::ArrayBuffer`
+/// *or* from a PlainObject wrapper produced by `make_arraybuffer_instance`.
+fn extract_arraybuffer(v: &JsValue) -> Option<Rc<RefCell<JsArrayBuffer>>> {
+    match v {
+        JsValue::ArrayBuffer(b) => Some(Rc::clone(b)),
+        JsValue::PlainObject(map) => {
+            if let Some(JsValue::ArrayBuffer(b)) = map.borrow().get("__arraybuffer__") {
+                Some(Rc::clone(b))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Wrap a raw `JsArrayBuffer` in a `PlainObject` with `byteLength` and
+/// `slice()` so that property access works from JavaScript.
+fn make_arraybuffer_instance(buf_rc: Rc<RefCell<JsArrayBuffer>>) -> JsValue {
+    let mut obj = PropertyMap::new();
+
+    // __arraybuffer__: identity marker for extract_arraybuffer()
+    obj.insert(
+        "__arraybuffer__".into(),
+        JsValue::ArrayBuffer(Rc::clone(&buf_rc)),
+    );
+
+    // byteLength
+    let byte_length = buf_rc.borrow().data.len();
+    obj.insert("byteLength".into(), JsValue::Smi(byte_length as i32));
+
+    // slice(begin, end)
+    {
+        let buf = Rc::clone(&buf_rc);
+        obj.insert(
+            "slice".into(),
+            native(move |a| {
+                let b = buf.borrow();
+                let len = b.data.len() as i64;
+                let begin = a
+                    .first()
+                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                    .unwrap_or(0);
+                let end = a
+                    .get(1)
+                    .map(|v| v.to_number().unwrap_or(len as f64) as i64)
+                    .unwrap_or(len);
+                let sliced = arraybuffer_slice(&b, begin, end);
+                Ok(make_arraybuffer_instance(Rc::new(RefCell::new(sliced))))
+            }),
+        );
+    }
+
+    obj.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(obj)))
+}
+
+/// Implementation of `ArrayBuffer.isView(arg)` that checks for PlainObject
+/// wrappers containing `__typed_array__` or `__dataview__` markers, as well
+/// as raw `JsValue::TypedArray` / `JsValue::DataView` variants.
+fn arraybuffer_is_view_rt(value: &JsValue) -> bool {
+    match value {
+        JsValue::TypedArray(_) | JsValue::DataView(_) => true,
+        JsValue::PlainObject(map) => {
+            let m = map.borrow();
+            m.get("__typed_array__").is_some() || m.get("__dataview__").is_some()
+        }
+        _ => false,
+    }
+}
+
 /// Build the `ArrayBuffer` constructor object.
 #[inline(never)]
 fn make_arraybuffer() -> JsValue {
@@ -11112,7 +11183,7 @@ fn make_arraybuffer() -> JsValue {
                 None => 0,
             };
             let buf = arraybuffer_new(len);
-            Ok(JsValue::ArrayBuffer(Rc::new(RefCell::new(buf))))
+            Ok(make_arraybuffer_instance(Rc::new(RefCell::new(buf))))
         }),
     );
 
@@ -11121,7 +11192,7 @@ fn make_arraybuffer() -> JsValue {
         "isView".into(),
         native(|args| {
             let arg = args.first().unwrap_or(&JsValue::Undefined);
-            Ok(JsValue::Boolean(arraybuffer_is_view(arg)))
+            Ok(JsValue::Boolean(arraybuffer_is_view_rt(arg)))
         }),
     );
 
@@ -11143,9 +11214,9 @@ fn make_dataview() -> JsValue {
     props.insert(
         "__call__".into(),
         native(|args| {
-            let buf_rc = match args.first() {
-                Some(JsValue::ArrayBuffer(b)) => Rc::clone(b),
-                _ => {
+            let buf_rc = match args.first().and_then(extract_arraybuffer) {
+                Some(b) => b,
+                None => {
                     return Err(StatorError::TypeError(
                         "First argument must be an ArrayBuffer".into(),
                     ));
@@ -11165,7 +11236,10 @@ fn make_dataview() -> JsValue {
             };
             let dv = dataview_new(buf_rc, offset, length)?;
             let inner = Rc::new(RefCell::new(dv));
-            let mut obj: HashMap<String, JsValue> = HashMap::new();
+            let mut obj = PropertyMap::new();
+
+            // __dataview__: identity marker for arraybuffer_is_view_rt()
+            obj.insert("__dataview__".into(), JsValue::DataView(Rc::clone(&inner)));
 
             // byteLength
             {
@@ -11188,7 +11262,7 @@ fn make_dataview() -> JsValue {
                 let inner = Rc::clone(&inner);
                 obj.insert(
                     "buffer".into(),
-                    JsValue::ArrayBuffer(Rc::clone(&inner.borrow().buffer)),
+                    make_arraybuffer_instance(Rc::clone(&inner.borrow().buffer)),
                 );
             }
 
@@ -11337,7 +11411,8 @@ fn make_dataview() -> JsValue {
                 }
             });
 
-            Ok(JsValue::DataView(inner))
+            obj.make_all_non_enumerable();
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
         }),
     );
 
@@ -11371,8 +11446,9 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
         "__call__".into(),
         native(move |args| {
             let ta = match args.first() {
-                // From ArrayBuffer
-                Some(JsValue::ArrayBuffer(buf)) => {
+                // From ArrayBuffer (raw or wrapped PlainObject)
+                Some(v) if extract_arraybuffer(v).is_some() => {
+                    let buf = extract_arraybuffer(v).unwrap();
                     let offset = match args.get(1) {
                         Some(v) if !v.is_undefined() => {
                             crate::builtins::util::checked_f64_to_length(v.to_number()?)?
@@ -11385,14 +11461,28 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
                         ),
                         _ => None,
                     };
-                    typed_array_new_from_buffer(kind, Rc::clone(buf), offset, length)?
+                    typed_array_new_from_buffer(kind, buf, offset, length)?
                 }
-                // From another TypedArray
+                // From another TypedArray (raw)
                 Some(JsValue::TypedArray(src_rc)) => {
                     let src = src_rc.borrow();
                     let vals: Vec<JsValue> =
                         (0..src.length).map(|i| typed_array_get(&src, i)).collect();
                     typed_array_from_values(kind, &vals)?
+                }
+                // From a wrapped TypedArray instance (PlainObject with __typed_array__)
+                Some(JsValue::PlainObject(map))
+                    if map.borrow().get("__typed_array__").is_some() =>
+                {
+                    let ta_inner = map.borrow().get("__typed_array__").unwrap().clone();
+                    if let JsValue::TypedArray(src_rc) = ta_inner {
+                        let src = src_rc.borrow();
+                        let vals: Vec<JsValue> =
+                            (0..src.length).map(|i| typed_array_get(&src, i)).collect();
+                        typed_array_from_values(kind, &vals)?
+                    } else {
+                        typed_array_new_from_length(kind, 0)
+                    }
                 }
                 // From Array
                 Some(JsValue::Array(arr)) => typed_array_from_values(kind, &arr.borrow())?,
@@ -11487,7 +11577,7 @@ fn make_typed_array_instance(
         let inner = Rc::clone(&inner);
         obj.insert(
             "buffer".into(),
-            JsValue::ArrayBuffer(Rc::clone(&inner.borrow().buffer)),
+            make_arraybuffer_instance(Rc::clone(&inner.borrow().buffer)),
         );
     }
     // at(index)
@@ -11599,7 +11689,8 @@ fn make_typed_array_instance(
                     }
                 }
                 let result = typed_array_from_values(ta.kind, &kept)?;
-                Ok(JsValue::TypedArray(Rc::new(RefCell::new(result))))
+                let inner = Rc::new(RefCell::new(result));
+                Ok(make_typed_array_instance(ta.kind, inner))
             }),
         );
     }
@@ -11804,7 +11895,8 @@ fn make_typed_array_instance(
                     }
                 }
                 let result = typed_array_from_values(ta.kind, &mapped)?;
-                Ok(JsValue::TypedArray(Rc::new(RefCell::new(result))))
+                let inner = Rc::new(RefCell::new(result));
+                Ok(make_typed_array_instance(ta.kind, inner))
             }),
         );
     }
@@ -11924,7 +12016,8 @@ fn make_typed_array_instance(
                     .map(|v| v.to_number().unwrap_or(ta.length as f64) as i64)
                     .unwrap_or(ta.length as i64);
                 let result = typed_array_slice(&ta, start, end)?;
-                Ok(JsValue::TypedArray(Rc::new(RefCell::new(result))))
+                let inner = Rc::new(RefCell::new(result));
+                Ok(make_typed_array_instance(ta.kind, inner))
             }),
         );
     }
