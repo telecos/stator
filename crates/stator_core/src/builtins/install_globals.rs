@@ -3485,6 +3485,17 @@ fn make_object() -> JsValue {
         ) -> StatorResult<()> {
             let has_get = desc.contains_key("get");
             let has_set = desc.contains_key("set");
+            let has_value = desc.contains_key("value");
+            let has_writable = desc.contains_key("writable");
+
+            // §6.2.6.1 step 8: cannot have both accessor and data fields.
+            if (has_get || has_set) && (has_value || has_writable) {
+                return Err(crate::error::StatorError::TypeError(
+                    "Invalid property descriptor. Cannot both specify accessors \
+                     and a value or writable attribute"
+                        .into(),
+                ));
+            }
 
             // Validate non-configurable invariants.
             // Accessor properties are stored as `__get_X__`/`__set_X__` keys, so
@@ -3643,14 +3654,23 @@ fn make_object() -> JsValue {
                 }
                 map.borrow_mut().remove(key);
             } else {
-                let has_value = desc.contains_key("value");
                 let writable_val = desc.get("writable").map(|v| v.to_boolean());
                 let enumerable_val = desc.get("enumerable").map(|v| v.to_boolean());
                 let configurable_val = desc.get("configurable").map(|v| v.to_boolean());
 
                 if !map.borrow().contains_key(key) {
-                    // Non-extensible: cannot add new properties.
-                    if !map.borrow().extensible {
+                    // Check whether the property already exists as an accessor
+                    // (stored under `__get_X__`/`__set_X__`).  Redefining an
+                    // existing accessor as a data property is allowed even on
+                    // non-extensible objects; only truly new properties are
+                    // blocked.
+                    let getter_key = format!("__get_{key}__");
+                    let setter_key = format!("__set_{key}__");
+                    let is_existing_accessor = {
+                        let borrow = map.borrow();
+                        borrow.contains_key(&getter_key) || borrow.contains_key(&setter_key)
+                    };
+                    if !map.borrow().extensible && !is_existing_accessor {
                         return Err(crate::error::StatorError::TypeError(format!(
                             "Cannot define property {key}, object is not extensible"
                         )));
@@ -3660,8 +3680,6 @@ fn make_object() -> JsValue {
                     } else {
                         JsValue::Undefined
                     };
-                    let getter_key = format!("__get_{key}__");
-                    let setter_key = format!("__set_{key}__");
                     map.borrow_mut().remove(&getter_key);
                     map.borrow_mut().remove(&setter_key);
                     let mut attrs = PropertyAttributes::empty();
@@ -24966,5 +24984,499 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::String("still_revoked".into()));
+    }
+
+    // ── Property descriptor conformance e2e tests ───────────────────────
+
+    /// Mixed descriptor (both accessor and data fields) throws TypeError.
+    #[test]
+    fn e2e_define_property_mixed_descriptor_throws() {
+        let r = global_eval(
+            r#"
+            try {
+                Object.defineProperty({}, 'x', { value: 1, get: function(){} });
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// Mixed descriptor with writable + set throws TypeError.
+    #[test]
+    fn e2e_define_property_writable_and_set_throws() {
+        let r = global_eval(
+            r#"
+            try {
+                Object.defineProperty({}, 'x', { writable: true, set: function(){} });
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// Non-configurable property cannot be deleted.
+    #[test]
+    fn e2e_nonconfig_cannot_delete() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            Object.defineProperty(o, 'x', { value: 1, configurable: false });
+            var deleted = delete o.x;
+            String(deleted) + ',' + String(o.x)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("false,1".into()));
+    }
+
+    /// Non-writable property silently ignores assignment (sloppy mode).
+    #[test]
+    fn e2e_nonwritable_ignores_assignment() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            Object.defineProperty(o, 'x', { value: 42, writable: false });
+            o.x = 99;
+            o.x
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// `getOwnPropertyDescriptor` returns correct data descriptor shape.
+    #[test]
+    fn e2e_gopd_data_descriptor_shape() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            Object.defineProperty(o, 'x', {
+                value: 10, writable: true, enumerable: false, configurable: true
+            });
+            var d = Object.getOwnPropertyDescriptor(o, 'x');
+            d.value + ',' + d.writable + ',' + d.enumerable + ',' + d.configurable
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("10,true,false,true".into()));
+    }
+
+    /// `getOwnPropertyDescriptor` returns correct accessor descriptor shape.
+    #[test]
+    fn e2e_gopd_accessor_descriptor_shape() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            Object.defineProperty(o, 'x', {
+                get: function(){ return 5; },
+                enumerable: true,
+                configurable: false
+            });
+            var d = Object.getOwnPropertyDescriptor(o, 'x');
+            (typeof d.get) + ',' + (typeof d.set) + ',' + d.enumerable + ',' + d.configurable
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("function,undefined,true,false".into()));
+    }
+
+    /// `getOwnPropertyDescriptor` returns undefined for missing property.
+    #[test]
+    fn e2e_gopd_missing_returns_undefined() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1 };
+            typeof Object.getOwnPropertyDescriptor(o, 'b')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// `getOwnPropertyDescriptors` returns all own descriptors.
+    #[test]
+    fn e2e_gopds_returns_all() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            Object.defineProperty(o, 'a', { value: 1, enumerable: true, configurable: true, writable: true });
+            Object.defineProperty(o, 'b', { value: 2, enumerable: false, configurable: true, writable: false });
+            var ds = Object.getOwnPropertyDescriptors(o);
+            ds.a.value + ',' + ds.a.enumerable + ',' + ds.b.value + ',' + ds.b.enumerable
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,true,2,false".into()));
+    }
+
+    /// `defineProperties` defines multiple properties at once.
+    #[test]
+    fn e2e_define_properties_multiple() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            Object.defineProperties(o, {
+                x: { value: 10, writable: true, enumerable: true, configurable: true },
+                y: { value: 20, writable: false, enumerable: false, configurable: false }
+            });
+            String(o.x) + ',' + String(o.y)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("10,20".into()));
+    }
+
+    /// `preventExtensions` blocks new property addition.
+    #[test]
+    fn e2e_prevent_extensions_blocks_new() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1 };
+            Object.preventExtensions(o);
+            o.b = 2;
+            typeof o.b
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// `preventExtensions` allows modifying existing properties.
+    #[test]
+    fn e2e_prevent_extensions_allows_modify() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1 };
+            Object.preventExtensions(o);
+            o.a = 99;
+            o.a
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    /// `isExtensible` returns false after `preventExtensions`.
+    #[test]
+    fn e2e_is_extensible_after_prevent() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            var before = Object.isExtensible(o);
+            Object.preventExtensions(o);
+            var after = Object.isExtensible(o);
+            before + ',' + after
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true,false".into()));
+    }
+
+    /// `seal` marks all properties non-configurable.
+    #[test]
+    fn e2e_seal_marks_nonconfigurable() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1, b: 2 };
+            Object.seal(o);
+            var da = Object.getOwnPropertyDescriptor(o, 'a');
+            var db = Object.getOwnPropertyDescriptor(o, 'b');
+            da.configurable + ',' + db.configurable
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("false,false".into()));
+    }
+
+    /// `seal` preserves writability.
+    #[test]
+    fn e2e_seal_preserves_writable() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1 };
+            Object.seal(o);
+            o.a = 42;
+            o.a
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// `isSealed` reflects sealed state.
+    #[test]
+    fn e2e_is_sealed_reflects_state() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1 };
+            var before = Object.isSealed(o);
+            Object.seal(o);
+            var after = Object.isSealed(o);
+            before + ',' + after
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("false,true".into()));
+    }
+
+    /// Sealed object rejects new properties via defineProperty.
+    #[test]
+    fn e2e_sealed_rejects_new_define_property() {
+        let r = global_eval(
+            r#"
+            var o = Object.seal({ a: 1 });
+            try {
+                Object.defineProperty(o, 'b', { value: 2 });
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// `freeze` marks all properties non-writable and non-configurable.
+    #[test]
+    fn e2e_freeze_marks_nonwritable_nonconfigurable() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1 };
+            Object.freeze(o);
+            var d = Object.getOwnPropertyDescriptor(o, 'a');
+            d.writable + ',' + d.configurable
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("false,false".into()));
+    }
+
+    /// Frozen object ignores assignment in sloppy mode.
+    #[test]
+    fn e2e_freeze_ignores_assignment() {
+        let r = global_eval(
+            r#"
+            var o = Object.freeze({ a: 1 });
+            o.a = 99;
+            o.a
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// `isFrozen` reflects frozen state.
+    #[test]
+    fn e2e_is_frozen_reflects_state() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1 };
+            var before = Object.isFrozen(o);
+            Object.freeze(o);
+            var after = Object.isFrozen(o);
+            before + ',' + after
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("false,true".into()));
+    }
+
+    /// Frozen object also reports as sealed.
+    #[test]
+    fn e2e_frozen_is_sealed() {
+        let r = global_eval("Object.isSealed(Object.freeze({ a: 1 }))").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Primitives are considered frozen and sealed.
+    #[test]
+    fn e2e_primitives_frozen_sealed() {
+        let r = global_eval(
+            r#"
+            Object.isFrozen(42) + ',' + Object.isSealed('hi') + ',' + Object.isExtensible(true)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true,true,false".into()));
+    }
+
+    /// Non-configurable property rejects configurable change via defineProperty.
+    #[test]
+    fn e2e_nonconfig_rejects_configurable_change() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            Object.defineProperty(o, 'x', { value: 1, configurable: false });
+            try {
+                Object.defineProperty(o, 'x', { configurable: true });
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// Non-configurable + non-writable rejects writable widening.
+    #[test]
+    fn e2e_nonconfig_nonwritable_rejects_writable_widening() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            Object.defineProperty(o, 'x', { value: 1, writable: false, configurable: false });
+            try {
+                Object.defineProperty(o, 'x', { writable: true });
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// Non-configurable data→accessor conversion throws.
+    #[test]
+    fn e2e_nonconfig_data_to_accessor_throws() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            Object.defineProperty(o, 'x', { value: 1, configurable: false });
+            try {
+                Object.defineProperty(o, 'x', { get: function(){ return 2; } });
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// Configurable property allows data→accessor conversion.
+    #[test]
+    fn e2e_configurable_data_to_accessor_ok() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            Object.defineProperty(o, 'x', { value: 1, configurable: true });
+            Object.defineProperty(o, 'x', { get: function(){ return 2; }, configurable: true });
+            var d = Object.getOwnPropertyDescriptor(o, 'x');
+            typeof d.get
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// Redefining non-configurable non-writable with same value succeeds.
+    #[test]
+    fn e2e_nonconfig_nonwritable_same_value_ok() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            Object.defineProperty(o, 'x', { value: 42, writable: false, configurable: false });
+            Object.defineProperty(o, 'x', { value: 42 });
+            o.x
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// `Object.freeze` on empty non-extensible object reports frozen.
+    #[test]
+    fn e2e_empty_non_extensible_is_frozen() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            Object.preventExtensions(o);
+            Object.isFrozen(o)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `Object.seal` on empty non-extensible object reports sealed.
+    #[test]
+    fn e2e_empty_non_extensible_is_sealed() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            Object.preventExtensions(o);
+            Object.isSealed(o)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `defineProperty` on non-object throws TypeError.
+    #[test]
+    fn e2e_define_property_non_object_throws() {
+        let r = global_eval(
+            r#"
+            try { Object.defineProperty(42, 'x', { value: 1 }); 'no'; } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// `defineProperty` descriptor must be an object.
+    #[test]
+    fn e2e_define_property_descriptor_must_be_object() {
+        let r = global_eval(
+            r#"
+            try { Object.defineProperty({}, 'x', 42); 'no'; } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// `getOwnPropertyDescriptors` on null/undefined throws.
+    #[test]
+    fn e2e_gopds_null_throws() {
+        let r = global_eval(
+            r#"
+            try { Object.getOwnPropertyDescriptors(null); 'no'; } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// Freeze then defineProperty throws.
+    #[test]
+    fn e2e_freeze_then_define_property_throws() {
+        let r = global_eval(
+            r#"
+            var o = Object.freeze({ a: 1 });
+            try {
+                Object.defineProperty(o, 'a', { value: 2 });
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// Delete on configurable property succeeds.
+    #[test]
+    fn e2e_delete_configurable_succeeds() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            Object.defineProperty(o, 'x', { value: 1, configurable: true });
+            var deleted = delete o.x;
+            String(deleted) + ',' + String(o.x)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true,undefined".into()));
     }
 }
