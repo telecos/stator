@@ -436,6 +436,14 @@ pub(super) const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 5_000;
 pub(super) const TURBOFAN_OSR_LOOP_THRESHOLD: u32 = 10_000;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Generator return completion sentinel
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Sentinel string used by `.return()` to force a return completion through the
+/// handler table so that `finally` blocks execute before the generator completes.
+pub(super) const GENERATOR_RETURN_SENTINEL: &str = "__stator_generator_return_completion__";
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Cross-frame exception propagation
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1504,9 +1512,26 @@ impl Interpreter {
     ) -> StatorResult<JsValue> {
         let status = state.borrow().status;
         match status {
-            GeneratorStatus::SuspendedAtStart | GeneratorStatus::SuspendedAtYield => {
+            GeneratorStatus::SuspendedAtStart => {
                 state.borrow_mut().status = GeneratorStatus::Completed;
                 Ok(make_iterator_result(value, true))
+            }
+            GeneratorStatus::SuspendedAtYield => {
+                // Resume the generator with a Return completion so that any
+                // enclosing `finally` blocks execute before completion.
+                state.borrow_mut().resume_mode = GeneratorResumeMode::Return(value.clone());
+                match Self::run_generator_step(state, JsValue::Undefined) {
+                    Ok(GeneratorStep::Yield(v)) => Ok(make_iterator_result(v, false)),
+                    Ok(GeneratorStep::Return(v)) => Ok(make_iterator_result(v, true)),
+                    Err(StatorError::JsException(ref msg)) if msg == GENERATOR_RETURN_SENTINEL => {
+                        state.borrow_mut().status = GeneratorStatus::Completed;
+                        Ok(make_iterator_result(value, true))
+                    }
+                    Err(e) => {
+                        state.borrow_mut().status = GeneratorStatus::Completed;
+                        Err(e)
+                    }
+                }
             }
             GeneratorStatus::Completed => Ok(make_iterator_result(value, true)),
             GeneratorStatus::Executing => Err(StatorError::TypeError(

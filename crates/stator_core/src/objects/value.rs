@@ -52,6 +52,9 @@ pub enum GeneratorResumeMode {
     Normal,
     /// `.throw(value)` — throw an exception at the yield point.
     Throw(JsValue),
+    /// `.return(value)` — force a return completion at the yield point,
+    /// triggering any enclosing `finally` blocks.
+    Return(JsValue),
 }
 
 /// Lifecycle status of a JavaScript generator object.

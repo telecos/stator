@@ -8124,6 +8124,23 @@ fn make_generator_function() -> JsValue {
         PropertyAttributes::CONFIGURABLE,
     );
 
+    // Generator.prototype[@@iterator]()  §27.5.1.6
+    // Generators are their own iterator: [Symbol.iterator]() returns `this`.
+    gen_proto.insert(
+        "@@iterator".into(),
+        builtin_fn("[Symbol.iterator]", 0, |args| {
+            let this = args.first().cloned().unwrap_or(JsValue::Undefined);
+            Ok(this)
+        }),
+    );
+    gen_proto.insert(
+        format!("Symbol({})", SYMBOL_ITERATOR),
+        builtin_fn("[Symbol.iterator]", 0, |args| {
+            let this = args.first().cloned().unwrap_or(JsValue::Undefined);
+            Ok(this)
+        }),
+    );
+
     gen_proto.make_all_non_enumerable();
     let gen_proto_rc = Rc::new(RefCell::new(gen_proto));
 
@@ -28079,5 +28096,473 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::String("second".into()));
+    }
+
+    // ΓöÇΓöÇ Generator and iterator protocol conformance ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+    /// Generator.prototype.next() basic ΓÇö yields values in order.
+    #[test]
+    fn e2e_generator_next_basic() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 1; yield 2; yield 3; }
+            var g = gen();
+            var a = g.next();
+            var b = g.next();
+            var c = g.next();
+            var d = g.next();
+            a.value + ',' + a.done + ',' +
+            b.value + ',' + b.done + ',' +
+            c.value + ',' + c.done + ',' +
+            String(d.value) + ',' + d.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            JsValue::String("1,false,2,false,3,false,undefined,true".into())
+        );
+    }
+
+    /// Generator.prototype.next(value) ΓÇö pass values into yield expressions.
+    #[test]
+    fn e2e_generator_next_with_value() {
+        let r = global_eval(
+            r#"
+            function* gen() {
+                var a = yield 'first';
+                var b = yield 'second';
+                return a + b;
+            }
+            var g = gen();
+            g.next();
+            g.next(10);
+            g.next(20).value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(30));
+    }
+
+    /// Generator return value ΓÇö `return value` inside generator sets done:true.
+    #[test]
+    fn e2e_generator_return_value() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 1; return 42; yield 3; }
+            var g = gen();
+            var a = g.next();
+            var b = g.next();
+            var c = g.next();
+            a.value + ',' + a.done + ',' +
+            b.value + ',' + b.done + ',' +
+            String(c.value) + ',' + c.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,false,42,true,undefined,true".into()));
+    }
+
+    /// Generator.prototype.return(value) ΓÇö early termination.
+    #[test]
+    fn e2e_generator_return_method() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 1; yield 2; yield 3; }
+            var g = gen();
+            var a = g.next();
+            var b = g.return(99);
+            var c = g.next();
+            a.value + ',' + a.done + ',' +
+            b.value + ',' + b.done + ',' +
+            String(c.value) + ',' + c.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,false,99,true,undefined,true".into()));
+    }
+
+    /// Generator.prototype.return on already-completed generator.
+    #[test]
+    fn e2e_generator_return_on_completed() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 1; }
+            var g = gen();
+            g.next();
+            g.next();
+            var r = g.return(42);
+            r.value + ',' + r.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("42,true".into()));
+    }
+
+    /// Generator.prototype.throw ΓÇö throws into a generator with try/catch.
+    #[test]
+    fn e2e_generator_throw_with_catch() {
+        let r = global_eval(
+            r#"
+            function* gen() {
+                try {
+                    yield 1;
+                    yield 2;
+                } catch(e) {
+                    yield 'caught: ' + e;
+                }
+            }
+            var g = gen();
+            g.next();
+            var r = g.throw('oops');
+            r.value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("caught: oops".into()));
+    }
+
+    /// Generator.prototype.throw on a generator without catch propagates error.
+    #[test]
+    fn e2e_generator_throw_uncaught() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 1; yield 2; }
+            var g = gen();
+            g.next();
+            try { g.throw('boom'); 'no error'; } catch(e) { 'error: ' + e; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error: boom".into()));
+    }
+
+    /// yield* delegation to an array (iterable).
+    #[test]
+    fn e2e_yield_star_array() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield* [10, 20, 30]; }
+            var g = gen();
+            var a = g.next().value;
+            var b = g.next().value;
+            var c = g.next().value;
+            a + ',' + b + ',' + c
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("10,20,30".into()));
+    }
+
+    /// yield* delegation to another generator.
+    #[test]
+    fn e2e_yield_star_generator() {
+        let r = global_eval(
+            r#"
+            function* inner() { yield 'a'; yield 'b'; }
+            function* outer() { yield 1; yield* inner(); yield 2; }
+            var r = [];
+            var g = outer();
+            var step;
+            while (!(step = g.next()).done) r.push(step.value);
+            r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,a,b,2".into()));
+    }
+
+    /// Generator as iterable ΓÇö for-of iterates yielded values.
+    #[test]
+    fn e2e_generator_for_of() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 10; yield 20; yield 30; }
+            var sum = 0;
+            for (var v of gen()) sum += v;
+            sum
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(60));
+    }
+
+    /// Generator expression ΓÇö `var gen = function*() { ... }`.
+    #[test]
+    fn e2e_generator_expression() {
+        let r = global_eval(
+            r#"
+            var gen = function*() { yield 1; yield 2; };
+            var g = gen();
+            g.next().value + ',' + g.next().value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,2".into()));
+    }
+
+    /// Infinite generator ΓÇö partial consumption with break.
+    #[test]
+    fn e2e_infinite_generator() {
+        let r = global_eval(
+            r#"
+            function* count() { var i = 0; while (true) yield i++; }
+            var g = count();
+            var r = [];
+            for (var i = 0; i < 5; i++) r.push(g.next().value);
+            r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,1,2,3,4".into()));
+    }
+
+    /// Generator with no yields ΓÇö immediately done.
+    #[test]
+    fn e2e_generator_no_yields() {
+        let r = global_eval(
+            r#"
+            function* gen() { return 42; }
+            var g = gen();
+            var a = g.next();
+            a.value + ',' + a.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("42,true".into()));
+    }
+
+    /// Bare yield (no argument) yields undefined.
+    #[test]
+    fn e2e_generator_bare_yield() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield; yield; }
+            var g = gen();
+            var a = g.next();
+            String(a.value) + ',' + a.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("undefined,false".into()));
+    }
+
+    /// Generator with arguments passed to the factory function.
+    #[test]
+    fn e2e_generator_with_arguments() {
+        let r = global_eval(
+            r#"
+            function* range(start, end) {
+                for (var i = start; i < end; i++) yield i;
+            }
+            var r = [];
+            for (var v of range(3, 7)) r.push(v);
+            r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("3,4,5,6".into()));
+    }
+
+    /// Multiple generators can run independently.
+    #[test]
+    fn e2e_generator_independent_instances() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 1; yield 2; yield 3; }
+            var g1 = gen();
+            var g2 = gen();
+            var a = g1.next().value;
+            var b = g2.next().value;
+            var c = g1.next().value;
+            var d = g2.next().value;
+            a + ',' + b + ',' + c + ',' + d
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,1,2,2".into()));
+    }
+
+    /// Generator next() after completion always returns done:true.
+    #[test]
+    fn e2e_generator_next_after_done() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 1; }
+            var g = gen();
+            g.next();
+            g.next();
+            var a = g.next();
+            var b = g.next();
+            String(a.value) + ',' + a.done + ',' + String(b.value) + ',' + b.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("undefined,true,undefined,true".into()));
+    }
+
+    /// Spread generator into array literal.
+    #[test]
+    fn e2e_generator_spread_into_array() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 1; yield 2; yield 3; }
+            var a = [...gen()];
+            a.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,2,3".into()));
+    }
+
+    /// Nested generators ΓÇö outer yields from inner via yield*.
+    #[test]
+    fn e2e_nested_yield_star() {
+        let r = global_eval(
+            r#"
+            function* a() { yield 1; yield 2; }
+            function* b() { yield* a(); yield* a(); }
+            var r = [];
+            for (var v of b()) r.push(v);
+            r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,2,1,2".into()));
+    }
+
+    /// Generator with try/finally ΓÇö finally runs on normal completion.
+    #[test]
+    fn e2e_generator_try_finally_normal() {
+        let r = global_eval(
+            r#"
+            var log = [];
+            function* gen() {
+                try { yield 1; yield 2; }
+                finally { log.push('finally'); }
+            }
+            var g = gen();
+            g.next();
+            g.next();
+            g.next();
+            log.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("finally".into()));
+    }
+
+    /// Generator with try/finally ΓÇö finally runs on .return() call.
+    #[test]
+    fn e2e_generator_try_finally_return() {
+        let r = global_eval(
+            r#"
+            var log = [];
+            function* gen() {
+                try { yield 1; yield 2; }
+                finally { log.push('finally'); }
+            }
+            var g = gen();
+            g.next();
+            var ret = g.return(99);
+            ret.value + ',' + ret.done + ',' + log.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("99,true,finally".into()));
+    }
+
+    /// Generator typeof is "object".
+    #[test]
+    fn e2e_generator_typeof() {
+        let r = global_eval("function* gen() { yield 1; } typeof gen()").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    /// Generator return(value) on not-yet-started generator.
+    #[test]
+    fn e2e_generator_return_before_start() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 1; yield 2; }
+            var g = gen();
+            var r = g.return(42);
+            r.value + ',' + r.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("42,true".into()));
+    }
+
+    /// yield* returns the inner generator's return value.
+    #[test]
+    fn e2e_yield_star_return_value() {
+        let r = global_eval(
+            r#"
+            function* inner() { yield 1; return 'done'; }
+            function* outer() { var x = yield* inner(); yield x; }
+            var g = outer();
+            g.next();
+            g.next().value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("done".into()));
+    }
+
+    /// Generator.prototype.throw on not-yet-started generator completes it.
+    #[test]
+    fn e2e_generator_throw_before_start() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 1; }
+            var g = gen();
+            try { g.throw('err'); 'no error'; } catch(e) { 'caught'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("caught".into()));
+    }
+
+    /// Infinite generator consumed via for-of with break.
+    #[test]
+    fn e2e_infinite_generator_for_of_break() {
+        let r = global_eval(
+            r#"
+            function* naturals() { var i = 1; while (true) yield i++; }
+            var r = [];
+            for (var v of naturals()) {
+                r.push(v);
+                if (v >= 5) break;
+            }
+            r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,2,3,4,5".into()));
+    }
+
+    /// Generator with computed yield values.
+    #[test]
+    fn e2e_generator_computed_yields() {
+        let r = global_eval(
+            r#"
+            function* fib() {
+                var a = 0, b = 1;
+                while (true) {
+                    yield a;
+                    var t = a + b;
+                    a = b;
+                    b = t;
+                }
+            }
+            var g = fib();
+            var r = [];
+            for (var i = 0; i < 8; i++) r.push(g.next().value);
+            r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,1,1,2,3,5,8,13".into()));
     }
 }
