@@ -21530,6 +21530,233 @@ mod tests {
         assert_eq!(result, JsValue::String("function".into()));
     }
 
+    /// `Date.parse` accepts ISO 8601 UTC strings.
+    #[test]
+    fn test_date_parse_iso_utc_value() {
+        let result = global_eval(
+            "Date.parse('2024-01-15T12:30:45.678Z') === Date.UTC(2024, 0, 15, 12, 30, 45, 678)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.parse` rejects invalid ISO dates.
+    #[test]
+    fn test_date_parse_invalid_iso_date_returns_nan() {
+        let result = global_eval("Number.isNaN(Date.parse('2024-02-30T12:00:00Z'))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.parse` rejects invalid ISO timezone offsets.
+    #[test]
+    fn test_date_parse_invalid_iso_offset_returns_nan() {
+        let result = global_eval("Number.isNaN(Date.parse('2024-01-15T12:30:00+25:00'))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.parse` rejects trailing garbage after an ISO string.
+    #[test]
+    fn test_date_parse_iso_trailing_garbage_returns_nan() {
+        let result =
+            global_eval("Number.isNaN(Date.parse('2024-01-15T12:30:00Zgarbage'))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.parse` accepts ISO 24:00:00 as midnight of the next day.
+    #[test]
+    fn test_date_parse_iso_24_hour_midnight() {
+        let result = global_eval("new Date('2024-01-15T24:00:00Z').toISOString()").unwrap();
+        assert_eq!(result, JsValue::String("2024-01-16T00:00:00.000Z".into()));
+    }
+
+    /// `Date.parse` handles legacy GMT offsets.
+    #[test]
+    fn test_date_parse_legacy_gmt_offset() {
+        let result =
+            global_eval("new Date('Mon Jan 15 2024 12:30:00 GMT+0200').toISOString()").unwrap();
+        assert_eq!(result, JsValue::String("2024-01-15T10:30:00.000Z".into()));
+    }
+
+    /// `new Date(ms)` stores the provided epoch milliseconds.
+    #[test]
+    fn test_new_date_number_get_time() {
+        let result = global_eval("new Date(1705321845678).getTime() === 1705321845678").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `new Date(string)` parses ISO strings.
+    #[test]
+    fn test_new_date_string_to_iso_string() {
+        let result = global_eval("new Date('2024-01-15T12:30:45.678Z').toISOString()").unwrap();
+        assert_eq!(result, JsValue::String("2024-01-15T12:30:45.678Z".into()));
+    }
+
+    /// `new Date(y, m, d, h, min, s, ms)` round-trips through local getters.
+    #[test]
+    fn test_new_date_components_local_getters_round_trip() {
+        let result = global_eval(
+            r#"
+            var d = new Date(2024, 0, 15, 12, 34, 56, 789);
+            d.getFullYear() === 2024 &&
+            d.getMonth() === 0 &&
+            d.getDate() === 15 &&
+            d.getDay() === 1 &&
+            d.getHours() === 12 &&
+            d.getMinutes() === 34 &&
+            d.getSeconds() === 56 &&
+            d.getMilliseconds() === 789
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `getTimezoneOffset` returns a number.
+    #[test]
+    fn test_date_get_timezone_offset_type() {
+        let result = global_eval("typeof new Date(0).getTimezoneOffset()").unwrap();
+        assert_eq!(result, JsValue::String("number".into()));
+    }
+
+    /// `setFullYear` updates the local year.
+    #[test]
+    fn test_date_set_full_year() {
+        let result = global_eval(
+            r#"
+            var d = new Date(2024, 0, 15, 12, 34, 56, 789);
+            d.setFullYear(2026);
+            d.getFullYear() === 2026
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `setMonth` updates the local month.
+    #[test]
+    fn test_date_set_month() {
+        let result = global_eval(
+            r#"
+            var d = new Date(2024, 0, 15, 12, 34, 56, 789);
+            d.setMonth(5);
+            d.getMonth() === 5
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `setDate` updates the local day of month.
+    #[test]
+    fn test_date_set_date() {
+        let result = global_eval(
+            r#"
+            var d = new Date(2024, 0, 15, 12, 34, 56, 789);
+            d.setDate(20);
+            d.getDate() === 20
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `setHours` updates the local time components.
+    #[test]
+    fn test_date_set_hours() {
+        let result = global_eval(
+            r#"
+            var d = new Date(2024, 0, 15, 12, 34, 56, 789);
+            d.setHours(8, 9, 10, 11);
+            d.getHours() === 8 &&
+            d.getMinutes() === 9 &&
+            d.getSeconds() === 10 &&
+            d.getMilliseconds() === 11
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `setMinutes` updates minutes and optional seconds/milliseconds.
+    #[test]
+    fn test_date_set_minutes() {
+        let result = global_eval(
+            r#"
+            var d = new Date(2024, 0, 15, 12, 34, 56, 789);
+            d.setMinutes(1, 2, 3);
+            d.getMinutes() === 1 &&
+            d.getSeconds() === 2 &&
+            d.getMilliseconds() === 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `setSeconds` updates seconds and optional milliseconds.
+    #[test]
+    fn test_date_set_seconds() {
+        let result = global_eval(
+            r#"
+            var d = new Date(2024, 0, 15, 12, 34, 56, 789);
+            d.setSeconds(5, 6);
+            d.getSeconds() === 5 &&
+            d.getMilliseconds() === 6
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `setMilliseconds` updates the local milliseconds component.
+    #[test]
+    fn test_date_set_milliseconds() {
+        let result = global_eval(
+            r#"
+            var d = new Date(2024, 0, 15, 12, 34, 56, 789);
+            d.setMilliseconds(123);
+            d.getMilliseconds() === 123
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `toString` returns a human-readable local string.
+    #[test]
+    fn test_date_to_string_contains_gmt() {
+        let result = global_eval("new Date(0).toString().indexOf('GMT') >= 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Invalid dates have NaN time values.
+    #[test]
+    fn test_invalid_date_get_time_is_nan() {
+        let result = global_eval("Number.isNaN(new Date('invalid').getTime())").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Global `isNaN` recognises invalid dates via `valueOf`.
+    #[test]
+    fn test_invalid_date_is_nan() {
+        let result = global_eval("isNaN(new Date('invalid'))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Invalid dates stringify as `Invalid Date`.
+    #[test]
+    fn test_invalid_date_to_string() {
+        let result = global_eval("new Date('invalid').toString()").unwrap();
+        assert_eq!(result, JsValue::String("Invalid Date".into()));
+    }
+
+    /// Invalid dates serialize to JSON as `null`.
+    #[test]
+    fn test_invalid_date_to_json_returns_null() {
+        let result = global_eval("new Date('invalid').toJSON()").unwrap();
+        assert_eq!(result, JsValue::Null);
+    }
+
     // ── JSON built-in tests ─────────────────────────────────────────────
 
     /// `JSON.stringify(null)` returns `"null"`.

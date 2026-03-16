@@ -237,6 +237,30 @@ fn time_clip(time: f64) -> f64 {
     }
 }
 
+fn days_in_month(year: f64, month: u32) -> u32 {
+    match month {
+        0 => 31,
+        1 => {
+            if days_in_year(year) == 366.0 {
+                29
+            } else {
+                28
+            }
+        }
+        2 => 31,
+        3 => 30,
+        4 => 31,
+        5 => 30,
+        6 => 31,
+        7 => 31,
+        8 => 30,
+        9 => 31,
+        10 => 30,
+        11 => 31,
+        _ => 0,
+    }
+}
+
 // ── Local time offset ────────────────────────────────────────────────────────
 
 /// Return the system's local timezone offset in milliseconds.
@@ -452,7 +476,7 @@ fn parse_iso8601(s: &str) -> Option<f64> {
 
     // Day
     let (day_val, pos) = parse_two_digits(s, pos)?;
-    if !(1..=31).contains(&day_val) {
+    if !(1..=31).contains(&day_val) || day_val > days_in_month(year, month - 1) {
         return None;
     }
 
@@ -470,10 +494,6 @@ fn parse_iso8601(s: &str) -> Option<f64> {
 
     // Hours
     let (hour, pos) = parse_two_digits(s, pos)?;
-    if hour > 24 {
-        return None;
-    }
-
     if pos >= len || bytes[pos] != b':' {
         return None;
     }
@@ -502,8 +522,12 @@ fn parse_iso8601(s: &str) -> Option<f64> {
         (0, 0, pos)
     };
 
+    if hour > 24 || (hour == 24 && (min != 0 || sec != 0 || ms != 0)) {
+        return None;
+    }
+
     // Timezone: Z, +HH:mm, -HH:mm, or absent (local for datetime forms)
-    let (tz_offset_ms, _pos) = if pos >= len {
+    let (tz_offset_ms, end_pos) = if pos >= len {
         // No timezone specified — treat as local time
         (None, pos)
     } else if bytes[pos] == b'Z' || bytes[pos] == b'z' {
@@ -512,10 +536,16 @@ fn parse_iso8601(s: &str) -> Option<f64> {
         let sign: f64 = if bytes[pos] == b'+' { 1.0 } else { -1.0 };
         let pos = pos + 1;
         let (tz_h, pos) = parse_two_digits(s, pos)?;
+        if tz_h > 23 {
+            return None;
+        }
         if pos >= len || bytes[pos] != b':' {
             return None;
         }
         let (tz_m, pos) = parse_two_digits(s, pos + 1)?;
+        if tz_m > 59 {
+            return None;
+        }
         (
             Some(sign * (tz_h as f64 * MS_PER_HOUR + tz_m as f64 * MS_PER_MINUTE)),
             pos,
@@ -523,6 +553,10 @@ fn parse_iso8601(s: &str) -> Option<f64> {
     } else {
         return None;
     };
+
+    if end_pos != len {
+        return None;
+    }
 
     let time = make_time(hour as f64, min as f64, sec as f64, ms as f64);
     let day = make_day(year, (month - 1) as f64, day_val as f64);
@@ -659,9 +693,11 @@ fn parse_legacy(s: &str) -> Option<f64> {
         let day = make_day(y, month as f64, d);
         let time = make_time(hour, min, sec, 0.0);
 
-        // If "GMT" or "UTC" is present, treat as UTC; otherwise local.
         let result = make_date(day, time);
-        if lower.contains("gmt") || lower.contains("utc") || lower.contains('z') {
+        if let Some(offset_ms) = extract_gmt_offset(&lower) {
+            return Some(result - offset_ms);
+        }
+        if lower.contains("gmt") || lower.contains("utc") || lower.ends_with('z') {
             return Some(result);
         }
         return Some(local_to_utc(result));
@@ -680,6 +716,48 @@ fn parse_legacy(s: &str) -> Option<f64> {
         }
     }
 
+    None
+}
+
+fn extract_gmt_offset(s: &str) -> Option<f64> {
+    let lower = s.to_ascii_lowercase();
+    for marker in ["gmt", "utc"] {
+        let Some(idx) = lower.find(marker) else {
+            continue;
+        };
+        let rest = lower[idx + marker.len()..].trim_start();
+        let Some(sign_char) = rest.chars().next() else {
+            return Some(0.0);
+        };
+        let sign = match sign_char {
+            '+' => 1.0,
+            '-' => -1.0,
+            _ => return Some(0.0),
+        };
+
+        let rest = &rest[1..];
+        let bytes = rest.as_bytes();
+        if bytes.len() < 2 || !bytes[0].is_ascii_digit() || !bytes[1].is_ascii_digit() {
+            return None;
+        }
+        let hours = ((bytes[0] - b'0') as u32) * 10 + (bytes[1] - b'0') as u32;
+        let mut minutes = 0_u32;
+
+        if bytes.len() >= 5 && bytes[2] == b':' {
+            if !bytes[3].is_ascii_digit() || !bytes[4].is_ascii_digit() {
+                return None;
+            }
+            minutes = ((bytes[3] - b'0') as u32) * 10 + (bytes[4] - b'0') as u32;
+        } else if bytes.len() >= 4 && bytes[2].is_ascii_digit() && bytes[3].is_ascii_digit() {
+            minutes = ((bytes[2] - b'0') as u32) * 10 + (bytes[3] - b'0') as u32;
+        }
+
+        if hours > 23 || minutes > 59 {
+            return None;
+        }
+
+        return Some(sign * (hours as f64 * MS_PER_HOUR + minutes as f64 * MS_PER_MINUTE));
+    }
     None
 }
 
@@ -1410,6 +1488,10 @@ mod tests {
     fn test_date_parse_invalid() {
         assert!(date_parse("not a date").is_nan());
         assert!(date_parse("").is_nan());
+        assert!(date_parse("2024-02-30T12:00:00Z").is_nan());
+        assert!(date_parse("2024-01-15T12:30:00+25:00").is_nan());
+        assert!(date_parse("2024-01-15T24:30:00Z").is_nan());
+        assert!(date_parse("2024-01-15T12:30:00Zextra").is_nan());
     }
 
     #[test]
@@ -1540,5 +1622,32 @@ mod tests {
         let t = date_set_time(86400000.0);
         assert_eq!(t, 86400000.0);
         assert!(date_set_time(f64::INFINITY).is_nan());
+    }
+
+    #[test]
+    fn test_extract_gmt_offset() {
+        assert_eq!(
+            extract_gmt_offset("Mon Jan 15 2024 12:30:00 GMT+0200"),
+            Some(7_200_000.0)
+        );
+        assert_eq!(
+            extract_gmt_offset("Mon Jan 15 2024 12:30:00 GMT-05:30"),
+            Some(-19_800_000.0)
+        );
+        assert_eq!(
+            extract_gmt_offset("Mon Jan 15 2024 12:30:00 UTC"),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn test_parse_legacy_gmt_offset() {
+        let t = date_parse("Mon Jan 15 2024 12:30:00 GMT+0200");
+        assert!(!t.is_nan());
+        assert_eq!(date_get_utc_full_year(t), 2024.0);
+        assert_eq!(date_get_utc_month(t), 0.0);
+        assert_eq!(date_get_utc_date(t), 15.0);
+        assert_eq!(date_get_utc_hours(t), 10.0);
+        assert_eq!(date_get_utc_minutes(t), 30.0);
     }
 }
