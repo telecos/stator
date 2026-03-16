@@ -9489,18 +9489,168 @@ fn make_regexp() -> JsValue {
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
                     if let JsValue::PlainObject(map) = this {
-                        let borrow = map.borrow();
-                        let source = match borrow.get("source") {
-                            Some(JsValue::String(s)) => s.to_string(),
-                            _ => "(?:)".to_string(),
+                        let source = if let Some(JsValue::NativeFunction(f)) =
+                            map.borrow().get("__get_source__").cloned()
+                        {
+                            f(vec![this.clone()])?.to_js_string()?
+                        } else {
+                            match map.borrow().get("source") {
+                                Some(JsValue::String(s)) => s.to_string(),
+                                _ => "(?:)".to_string(),
+                            }
                         };
-                        let flags = match borrow.get("flags") {
-                            Some(JsValue::String(s)) => s.to_string(),
-                            _ => String::new(),
+                        let flags = if let Some(JsValue::NativeFunction(f)) =
+                            map.borrow().get("__get_flags__").cloned()
+                        {
+                            f(vec![this.clone()])?.to_js_string()?
+                        } else {
+                            match map.borrow().get("flags") {
+                                Some(JsValue::String(s)) => s.to_string(),
+                                _ => String::new(),
+                            }
                         };
                         Ok(JsValue::String(format!("/{source}/{flags}").into()))
                     } else {
                         Ok(JsValue::String("/(?:)/".to_string().into()))
+                    }
+                }),
+            );
+
+            // §22.2.6.11 RegExp.prototype.source — accessor that returns the
+            // escaped source text for `this`.
+            proto.insert(
+                "__get_source__".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    if let JsValue::PlainObject(map) = this {
+                        let borrow = map.borrow();
+                        let raw = match borrow.get("source") {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            _ => String::new(),
+                        };
+                        let source = if raw.is_empty() {
+                            "(?:)".to_string()
+                        } else {
+                            raw.replace('/', "\\/")
+                        };
+                        Ok(JsValue::String(source.into()))
+                    } else {
+                        Err(crate::error::StatorError::TypeError(
+                            "RegExp.prototype.source requires that 'this' be an Object".into(),
+                        ))
+                    }
+                }),
+            );
+
+            proto.insert(
+                "__get_global__".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    if let JsValue::PlainObject(map) = this {
+                        Ok(JsValue::Boolean(matches!(
+                            map.borrow().get("global"),
+                            Some(JsValue::Boolean(true))
+                        )))
+                    } else {
+                        Err(crate::error::StatorError::TypeError(
+                            "RegExp.prototype.global requires that 'this' be an Object".into(),
+                        ))
+                    }
+                }),
+            );
+            proto.insert(
+                "__get_ignoreCase__".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    if let JsValue::PlainObject(map) = this {
+                        Ok(JsValue::Boolean(matches!(
+                            map.borrow().get("ignoreCase"),
+                            Some(JsValue::Boolean(true))
+                        )))
+                    } else {
+                        Err(crate::error::StatorError::TypeError(
+                            "RegExp.prototype.ignoreCase requires that 'this' be an Object".into(),
+                        ))
+                    }
+                }),
+            );
+            proto.insert(
+                "__get_multiline__".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    if let JsValue::PlainObject(map) = this {
+                        Ok(JsValue::Boolean(matches!(
+                            map.borrow().get("multiline"),
+                            Some(JsValue::Boolean(true))
+                        )))
+                    } else {
+                        Err(crate::error::StatorError::TypeError(
+                            "RegExp.prototype.multiline requires that 'this' be an Object".into(),
+                        ))
+                    }
+                }),
+            );
+            proto.insert(
+                "__get_dotAll__".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    if let JsValue::PlainObject(map) = this {
+                        Ok(JsValue::Boolean(matches!(
+                            map.borrow().get("dotAll"),
+                            Some(JsValue::Boolean(true))
+                        )))
+                    } else {
+                        Err(crate::error::StatorError::TypeError(
+                            "RegExp.prototype.dotAll requires that 'this' be an Object".into(),
+                        ))
+                    }
+                }),
+            );
+            proto.insert(
+                "__get_sticky__".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    if let JsValue::PlainObject(map) = this {
+                        Ok(JsValue::Boolean(matches!(
+                            map.borrow().get("sticky"),
+                            Some(JsValue::Boolean(true))
+                        )))
+                    } else {
+                        Err(crate::error::StatorError::TypeError(
+                            "RegExp.prototype.sticky requires that 'this' be an Object".into(),
+                        ))
+                    }
+                }),
+            );
+            proto.insert(
+                "__get_unicode__".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    if let JsValue::PlainObject(map) = this {
+                        Ok(JsValue::Boolean(matches!(
+                            map.borrow().get("unicode"),
+                            Some(JsValue::Boolean(true))
+                        )))
+                    } else {
+                        Err(crate::error::StatorError::TypeError(
+                            "RegExp.prototype.unicode requires that 'this' be an Object".into(),
+                        ))
+                    }
+                }),
+            );
+            proto.insert(
+                "__get_hasIndices__".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    if let JsValue::PlainObject(map) = this {
+                        Ok(JsValue::Boolean(matches!(
+                            map.borrow().get("hasIndices"),
+                            Some(JsValue::Boolean(true))
+                        )))
+                    } else {
+                        Err(crate::error::StatorError::TypeError(
+                            "RegExp.prototype.hasIndices requires that 'this' be an Object".into(),
+                        ))
                     }
                 }),
             );
@@ -24971,6 +25121,258 @@ mod tests {
     fn e2e_replace_all_empty_search_inserts() {
         let r = global_eval("'ab'.replaceAll('', '-')").unwrap();
         assert_eq!(r, JsValue::String("-a-b-".into()));
+    }
+
+    /// RegExp instances expose `global` as an accessor property.
+    #[test]
+    fn e2e_regexp_global_descriptor_is_getter() {
+        let r = global_eval(
+            "typeof Object.getOwnPropertyDescriptor(new RegExp('a', 'g'), 'global').get",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// RegExp instances expose `ignoreCase` as an accessor property.
+    #[test]
+    fn e2e_regexp_ignore_case_descriptor_is_getter() {
+        let r = global_eval(
+            "typeof Object.getOwnPropertyDescriptor(new RegExp('a', 'i'), 'ignoreCase').get",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// RegExp instances expose `multiline` as an accessor property.
+    #[test]
+    fn e2e_regexp_multiline_descriptor_is_getter() {
+        let r = global_eval(
+            "typeof Object.getOwnPropertyDescriptor(new RegExp('a', 'm'), 'multiline').get",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// RegExp instances expose `dotAll` as an accessor property.
+    #[test]
+    fn e2e_regexp_dot_all_descriptor_is_getter() {
+        let r = global_eval(
+            "typeof Object.getOwnPropertyDescriptor(new RegExp('a', 's'), 'dotAll').get",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// RegExp instances expose `sticky` as an accessor property.
+    #[test]
+    fn e2e_regexp_sticky_descriptor_is_getter() {
+        let r = global_eval(
+            "typeof Object.getOwnPropertyDescriptor(new RegExp('a', 'y'), 'sticky').get",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// RegExp instances expose `unicode` as an accessor property.
+    #[test]
+    fn e2e_regexp_unicode_descriptor_is_getter() {
+        let r = global_eval(
+            "typeof Object.getOwnPropertyDescriptor(new RegExp('a', 'u'), 'unicode').get",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// RegExp instances expose `hasIndices` as an accessor property.
+    #[test]
+    fn e2e_regexp_has_indices_descriptor_is_getter() {
+        let r = global_eval(
+            "typeof Object.getOwnPropertyDescriptor(new RegExp('a', 'd'), 'hasIndices').get",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// RegExp instances expose `flags` as an accessor property.
+    #[test]
+    fn e2e_regexp_flags_descriptor_is_getter() {
+        let r = global_eval(
+            "typeof Object.getOwnPropertyDescriptor(new RegExp('a', 'gi'), 'flags').get",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// RegExp instances expose `source` as an accessor property.
+    #[test]
+    fn e2e_regexp_source_descriptor_is_getter() {
+        let r =
+            global_eval("typeof Object.getOwnPropertyDescriptor(new RegExp('a'), 'source').get")
+                .unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// RegExp.prototype also exposes `source` as an accessor property.
+    #[test]
+    fn e2e_regexp_prototype_source_descriptor_is_getter() {
+        let r =
+            global_eval("typeof Object.getOwnPropertyDescriptor(RegExp.prototype, 'source').get")
+                .unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// RegExp.prototype also exposes `flags` as an accessor property.
+    #[test]
+    fn e2e_regexp_prototype_flags_descriptor_is_getter() {
+        let r =
+            global_eval("typeof Object.getOwnPropertyDescriptor(RegExp.prototype, 'flags').get")
+                .unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// RegExp.prototype also exposes `global` as an accessor property.
+    #[test]
+    fn e2e_regexp_prototype_global_descriptor_is_getter() {
+        let r =
+            global_eval("typeof Object.getOwnPropertyDescriptor(RegExp.prototype, 'global').get")
+                .unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// `source` escapes solidus characters from the original pattern.
+    #[test]
+    fn e2e_regexp_source_escapes_slash() {
+        let r = global_eval("new RegExp('a/b').source").unwrap();
+        assert_eq!(r, JsValue::String("a\\/b".into()));
+    }
+
+    /// Empty-pattern regexps expose `(?:)` as their source text.
+    #[test]
+    fn e2e_regexp_source_empty_pattern() {
+        let r = global_eval("new RegExp('').source").unwrap();
+        assert_eq!(r, JsValue::String("(?:)".into()));
+    }
+
+    /// `RegExp.prototype.source` on the prototype itself returns `(?:)`.
+    #[test]
+    fn e2e_regexp_prototype_source_default() {
+        let r = global_eval("RegExp.prototype.source").unwrap();
+        assert_eq!(r, JsValue::String("(?:)".into()));
+    }
+
+    /// `flags` are reported in canonical order including sticky and indices.
+    #[test]
+    fn e2e_regexp_flags_canonical_full_order() {
+        let r = global_eval("new RegExp('.', 'ygdmisu').flags").unwrap();
+        assert_eq!(r, JsValue::String("dgimsuy".into()));
+    }
+
+    /// `test` returns a boolean false result when the pattern does not match.
+    #[test]
+    fn e2e_regexp_test_false_boolean() {
+        let r =
+            global_eval("typeof new RegExp('z').test('abc') + ':' + new RegExp('z').test('abc')")
+                .unwrap();
+        assert_eq!(r, JsValue::String("boolean:false".into()));
+    }
+
+    /// Global `test` advances `lastIndex` after a successful match.
+    #[test]
+    fn e2e_regexp_test_global_updates_last_index() {
+        let r = global_eval(
+            "var re = new RegExp('a', 'g'); String(re.test('ba')) + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true:2".into()));
+    }
+
+    /// Sticky `test` respects `lastIndex` as the required start position.
+    #[test]
+    fn e2e_regexp_test_sticky_respects_last_index() {
+        let r = global_eval(
+            "var re = new RegExp('a', 'y'); re.lastIndex = 1; String(re.test('ba')) + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true:2".into()));
+    }
+
+    /// Sticky `test` resets `lastIndex` to zero after a failed anchored match.
+    #[test]
+    fn e2e_regexp_test_sticky_failure_resets_last_index() {
+        let r = global_eval(
+            "var re = new RegExp('a', 'y'); re.lastIndex = 2; String(re.test('ba')) + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("false:0".into()));
+    }
+
+    /// dotAll mode lets `.` match a newline.
+    #[test]
+    fn e2e_regexp_dot_all_matches_newline() {
+        let r = global_eval("new RegExp('a.b', 's').test('a\\nb')").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Without dotAll, `.` does not match a newline.
+    #[test]
+    fn e2e_regexp_without_dot_all_rejects_newline() {
+        let r = global_eval("new RegExp('a.b').test('a\\nb')").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `toString` includes escaped source text and canonical flags.
+    #[test]
+    fn e2e_regexp_to_string_escapes_source() {
+        let r = global_eval("new RegExp('a/b', 'yg').toString()").unwrap();
+        assert_eq!(r, JsValue::String("/a\\/b/gy".into()));
+    }
+
+    /// Prototype `toString` follows the same escaped source formatting.
+    #[test]
+    fn e2e_regexp_prototype_to_string_escapes_source() {
+        let r = global_eval("RegExp.prototype.toString.call(new RegExp('a/b', 'g'))").unwrap();
+        assert_eq!(r, JsValue::String("/a\\/b/g".into()));
+    }
+
+    /// Regex function replacers receive undefined for nonparticipating groups.
+    #[test]
+    fn e2e_replace_regex_function_replacer_missing_group() {
+        let r = global_eval(
+            "'a'.replace(/(a)?(b)?/, function(m, a, b, off, s) { return String(a === 'a') + ':' + String(b === undefined) + ':' + off + ':' + s; })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true:true:0:a".into()));
+    }
+
+    /// Global regex function replacers receive captures, offsets, and the full string.
+    #[test]
+    fn e2e_replace_regex_function_replacer_global_offsets() {
+        let r = global_eval(
+            "'a1b2'.replace(/(\\d)/g, function(m, d, off, s) { return '[' + d + ',' + off + ',' + s.length + ']'; })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a[1,1,4]b[2,3,4]".into()));
+    }
+
+    /// RegExp `split` counts capture groups toward the result limit.
+    #[test]
+    fn e2e_split_regexp_captures_respect_limit() {
+        let r = global_eval("'a1b2c'.split(/(\\d)/, 3).join('|')").unwrap();
+        assert_eq!(r, JsValue::String("a|1|b".into()));
+    }
+
+    /// RegExp `split` with limit 1 only returns the prefix before the first match.
+    #[test]
+    fn e2e_split_regexp_limit_one() {
+        let r = global_eval("'a1b2c'.split(/(\\d)/, 1).join('|')").unwrap();
+        assert_eq!(r, JsValue::String("a".into()));
+    }
+
+    /// RegExp `split` returns the whole string unchanged when there is no match.
+    #[test]
+    fn e2e_split_regexp_no_match_with_limit() {
+        let r = global_eval("'abc'.split(/(\\d)/, 2).join('|')").unwrap();
+        assert_eq!(r, JsValue::String("abc".into()));
     }
 
     /// `"".split("")` returns empty array.
