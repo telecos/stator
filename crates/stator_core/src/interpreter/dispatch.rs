@@ -21,9 +21,9 @@ use super::{
     error_message_from_value, extract_context, find_handler, fn_props_set, has_prototype_in_chain,
     is_js_receiver, js_add, js_less_than, keyed_load, keyed_store, maybe_compile_baseline,
     maybe_compile_maglev, maybe_compile_turbofan, number_to_jsvalue, plain_object_to_array_items,
-    proto_lookup, resolve_jump, restore_closure_context, set_pending_exception, strict_eq,
-    to_array_index, to_bigint, to_property_key, try_execute_best_jit, walk_context_chain,
-    wire_construct_prototype,
+    populate_self_name, proto_lookup, resolve_jump, restore_closure_context, set_pending_exception,
+    strict_eq, to_array_index, to_bigint, to_property_key, try_execute_best_jit,
+    walk_context_chain, wire_construct_prototype,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{proxy_delete_property, proxy_has, proxy_set};
@@ -1228,12 +1228,14 @@ fn handle_call_any_receiver(
                     tried_jit = true;
                 }
                 if !tried_jit {
+                    let callee_val = JsValue::Function(Rc::clone(&ba));
                     let mut callee_frame = InterpreterFrame::new_with_globals(
                         (*ba).clone(),
                         args,
                         Rc::clone(&ctx.frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, &ba);
+                    populate_self_name(&mut callee_frame, &ba, &callee_val);
                     push_call_frame("<anonymous>")?;
                     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
                         Interpreter::run(&mut callee_frame)
@@ -1415,6 +1417,7 @@ fn handle_call_undefined_receiver0(
                         Rc::clone(&ctx.frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, &ba);
+                    populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                     push_call_frame("<anonymous>")?;
                     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
                         Interpreter::run(&mut callee_frame)
@@ -1513,6 +1516,7 @@ fn handle_call_undefined_receiver1(
                         Rc::clone(&ctx.frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, &ba);
+                    populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                     push_call_frame("<anonymous>")?;
                     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
                         Interpreter::run(&mut callee_frame)
@@ -1620,6 +1624,7 @@ fn handle_call_undefined_receiver2(
                         Rc::clone(&ctx.frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, &ba);
+                    populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                     push_call_frame("<anonymous>")?;
                     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
                         Interpreter::run(&mut callee_frame)
@@ -1714,6 +1719,7 @@ fn handle_call_property(
                     Rc::clone(&ctx.frame.global_env),
                 );
                 restore_closure_context(&mut callee_frame, &ba);
+                populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                 // Arrow functions use lexical `this` — do NOT override.
                 if !ba.is_arrow() {
                     callee_frame
@@ -1911,6 +1917,7 @@ fn handle_call_with_spread(
                     Rc::clone(&ctx.frame.global_env),
                 );
                 restore_closure_context(&mut callee_frame, &ba);
+                populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                 push_call_frame("<anonymous>")?;
                 let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
                     Interpreter::run(&mut callee_frame)
@@ -5860,6 +5867,7 @@ fn handle_call_direct_eval(
                         Rc::clone(&ctx.frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, &ba);
+                    populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                     push_call_frame("<eval-fallback>")?;
                     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
                         Interpreter::run(&mut callee_frame)

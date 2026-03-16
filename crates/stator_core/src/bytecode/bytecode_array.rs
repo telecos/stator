@@ -294,6 +294,15 @@ pub struct BytecodeArray {
     /// reach captured variables.  `None` for top-level scripts and functions
     /// that do not close over any variables.
     closure_context: Option<Rc<RefCell<JsContext>>>,
+    /// Register index for the named function expression self-reference.
+    ///
+    /// When a named function expression (`var f = function g() { … }`) is
+    /// called, the interpreter writes the callee function value into this
+    /// register so that the body can reference the function by its own
+    /// name.  `None` for anonymous functions, arrow functions, and
+    /// function declarations (which are hoisted into the enclosing scope
+    /// instead).
+    self_name_register: Option<i32>,
 }
 
 impl PartialEq for BytecodeArray {
@@ -318,6 +327,7 @@ impl PartialEq for BytecodeArray {
             && self.is_module == other.is_module
             && self.is_strict == other.is_strict
             && self.is_arrow == other.is_arrow
+            && self.self_name_register == other.self_name_register
     }
 }
 
@@ -368,6 +378,7 @@ impl BytecodeArray {
             turbofan_jit_code: Arc::new(Mutex::new(None)),
             turbofan_compile_started: Arc::new(AtomicBool::new(false)),
             closure_context: None,
+            self_name_register: None,
         }
     }
 
@@ -450,6 +461,17 @@ impl BytecodeArray {
     /// Attach a captured closure context to this [`BytecodeArray`].
     pub fn set_closure_context(&mut self, ctx: Rc<RefCell<JsContext>>) {
         self.closure_context = Some(ctx);
+    }
+
+    /// Register index for a named function expression's self-reference.
+    pub fn self_name_register(&self) -> Option<i32> {
+        self.self_name_register
+    }
+
+    /// Set the self-name register for named function expressions.
+    pub fn with_self_name_register(mut self, reg: i32) -> Self {
+        self.self_name_register = Some(reg);
+        self
     }
 
     /// The raw encoded bytecode bytes.

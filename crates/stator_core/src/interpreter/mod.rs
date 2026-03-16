@@ -1389,6 +1389,9 @@ impl Interpreter {
         // scope variables through the context chain.
         let ba_ref = frame.bytecode_array.clone();
         restore_closure_context(&mut frame, &ba_ref);
+        // Named generator expressions: populate the self-name register so
+        // the body can reference the generator function by its own name.
+        populate_self_name(&mut frame, &ba_ref, &JsValue::Generator(Rc::clone(state)));
 
         state.borrow_mut().status = GeneratorStatus::Executing;
 
@@ -2271,6 +2274,7 @@ pub(super) fn dispatch_call(
                         Rc::clone(&frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, ba);
+                    populate_self_name(&mut callee_frame, ba, &JsValue::Function(Rc::clone(ba)));
                     push_call_frame("<anonymous>")?;
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
@@ -2337,6 +2341,7 @@ pub(super) fn dispatch_call_property(
                         Rc::clone(&frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, ba);
+                    populate_self_name(&mut callee_frame, ba, &JsValue::Function(Rc::clone(ba)));
                     // Arrow functions use lexical `this` — do NOT override.
                     if !ba.is_arrow() {
                         callee_frame
@@ -2423,6 +2428,26 @@ pub(super) fn restore_closure_context(
 ) {
     if let Some(ctx) = ba.closure_context() {
         frame.context = Some(JsValue::Context(Rc::clone(ctx)));
+    }
+}
+
+/// Populate the self-name register for named function expressions.
+///
+/// When a named function expression (`var f = function g() { … }`) is
+/// called, the bytecode compiler allocates a register for the name `g`.
+/// This helper writes the function value into that register so the body
+/// can reference the function by its own name (ES §15.2.4).
+pub(super) fn populate_self_name(
+    frame: &mut InterpreterFrame,
+    ba: &crate::bytecode::bytecode_array::BytecodeArray,
+    callee: &JsValue,
+) {
+    if let Some(reg_i32) = ba.self_name_register() {
+        let param_count = ba.parameter_count() as usize;
+        let idx = param_count + reg_i32 as usize;
+        if idx < frame.registers.len() {
+            frame.registers[idx] = callee.clone();
+        }
     }
 }
 
@@ -5521,6 +5546,7 @@ pub fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult
                 InterpreterFrame::new((**ba).clone(), args)
             };
             restore_closure_context(&mut frame, ba);
+            populate_self_name(&mut frame, ba, &JsValue::Function(Rc::clone(ba)));
             let result = Interpreter::run(&mut frame);
             pop_call_frame();
             result
@@ -5561,6 +5587,7 @@ pub fn dispatch_call_with_this(
                 InterpreterFrame::new((**ba).clone(), args)
             };
             restore_closure_context(&mut frame, ba);
+            populate_self_name(&mut frame, ba, &JsValue::Function(Rc::clone(ba)));
             // Arrow functions use lexical `this` — do NOT override.
             if !ba.is_arrow() {
                 // ES §10.2.1.2: in sloppy mode, null/undefined `this` → globalThis.

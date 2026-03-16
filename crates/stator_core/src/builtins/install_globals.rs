@@ -26707,4 +26707,320 @@ mod tests {
         .unwrap();
         assert_eq!(r, JsValue::Smi(7));
     }
+
+    // ── Scope chain, closure, and variable resolution tests ─────────────
+
+    // 1. Closure over loop variable (var shares binding)
+
+    /// Closure over `var` in a for-loop — all closures see the final value
+    /// because `var` is function-scoped (shared binding).
+    #[test]
+    fn e2e_closure_var_for_loop_shared() {
+        let r = global_eval(
+            "var fns = []; \
+             for (var i = 0; i < 3; i++) { fns.push(function() { return i; }); } \
+             fns[0]() + fns[1]() + fns[2]()",
+        )
+        .unwrap();
+        // var i is shared: all closures return 3 → 9
+        assert_eq!(r, JsValue::Smi(9));
+    }
+
+    // 2. Closure over var — shared global binding
+
+    /// Closure captures the variable, not the value — mutation is visible.
+    #[test]
+    fn e2e_closure_var_mutation_visible() {
+        let r = global_eval(
+            "var x = 1; \
+             function inc() { x = x + 1; } \
+             inc(); inc(); x",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// Multiple closures sharing the same top-level `var` binding.
+    #[test]
+    fn e2e_closure_var_shared_binding() {
+        let r = global_eval(
+            "var x = 0; \
+             function inc() { x = x + 1; } \
+             function get() { return x; } \
+             inc(); inc(); get()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// Arrow function closure over top-level `var`.
+    #[test]
+    fn e2e_closure_arrow_over_var() {
+        let r = global_eval(
+            "var x = 5; \
+             var f = () => x * 2; \
+             f()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    // 3. IIFE scoping
+
+    /// IIFE creates its own scope — `var` declarations inside are not
+    /// visible outside.
+    #[test]
+    fn e2e_iife_var_invisible_outside() {
+        let r = global_eval("(function() { var x = 1; })(); typeof x").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// IIFE returns a value correctly.
+    #[test]
+    fn e2e_iife_return_value() {
+        let r = global_eval("(function() { return 42; })()").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// IIFE with arguments receives values correctly.
+    #[test]
+    fn e2e_iife_with_arguments() {
+        let r = global_eval("(function(a, b) { return a + b; })(3, 4)").unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    // 4. Block scoping with let/const
+
+    /// Block scoping with `let` — variable not visible outside block.
+    #[test]
+    fn e2e_block_scope_let_invisible() {
+        let r = global_eval("{ let x = 1; } typeof x").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// Block scoping with `const` — variable not visible outside block.
+    #[test]
+    fn e2e_block_scope_const_invisible() {
+        let r = global_eval("{ const x = 1; } typeof x").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// `var` IS visible outside a block (function-scoped).
+    #[test]
+    fn e2e_var_visible_outside_block() {
+        let r = global_eval("{ var x = 42; } x").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// `let` inside an `if` block is block-scoped.
+    #[test]
+    fn e2e_let_in_if_block_scoped() {
+        let r = global_eval("if (true) { let x = 5; } typeof x").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// Nested blocks with `let` — inner `let` shadows outer `let`.
+    #[test]
+    fn e2e_nested_let_shadowing() {
+        let r = global_eval("let x = 1; { let x = 2; } x").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// `let` value inside block is correct.
+    #[test]
+    fn e2e_let_block_value_correct() {
+        let r = global_eval("let r; { let x = 10; r = x; } r").unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    /// `const` assignment throws TypeError.
+    #[test]
+    fn e2e_const_reassign_throws() {
+        let r = global_eval("const x = 1; x = 2");
+        assert!(r.is_err());
+    }
+
+    // 5. Function declaration hoisting
+
+    /// Function is callable before its declaration in the same scope.
+    #[test]
+    fn e2e_function_decl_hoisting() {
+        let r = global_eval("var result = foo(); function foo() { return 99; } result").unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    /// Multiple function declarations — last one wins in sloppy mode.
+    #[test]
+    fn e2e_function_decl_last_wins() {
+        let r = global_eval(
+            "function f() { return 1; } \
+             function f() { return 2; } \
+             f()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    // 6. Arguments object
+
+    /// `arguments.length` returns the actual argument count.
+    #[test]
+    fn e2e_arguments_length_extra() {
+        let r = global_eval("function f() { return arguments.length; } f(1, 2, 3)").unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// `arguments[i]` indexed access.
+    #[test]
+    fn e2e_arguments_indexed_access() {
+        let r = global_eval("function f() { return arguments[0] + arguments[2]; } f(10, 20, 30)")
+            .unwrap();
+        assert_eq!(r, JsValue::Smi(40));
+    }
+
+    /// `arguments` is available even when no formal params are declared.
+    #[test]
+    fn e2e_arguments_no_formals() {
+        let r = global_eval("function f() { return arguments[0]; } f(42)").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Arrow functions do NOT create their own `arguments` object.
+    #[test]
+    fn e2e_arrow_no_own_arguments() {
+        // At the top level there is no enclosing function, so `arguments`
+        // is not defined — typeof returns "undefined".
+        let r = global_eval("var f = () => typeof arguments; f()").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    // 7. Default parameters
+
+    /// Default parameter value is used when argument is undefined.
+    #[test]
+    fn e2e_default_param_used() {
+        let r = global_eval("function f(x = 10) { return x; } f()").unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    /// Default parameter is overridden when argument is provided.
+    #[test]
+    fn e2e_default_param_overridden() {
+        let r = global_eval("function f(x = 10) { return x; } f(5)").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    /// Default parameter references a previous parameter.
+    #[test]
+    fn e2e_default_param_references_previous() {
+        let r = global_eval("function f(x = 1, y = x + 1) { return y; } f()").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// Default parameter with explicit `undefined` still uses default.
+    #[test]
+    fn e2e_default_param_explicit_undefined() {
+        let r = global_eval("function f(x = 42) { return x; } f(undefined)").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    // 8. Destructuring in function parameters
+
+    /// Object destructuring in function parameters.
+    #[test]
+    fn e2e_destructuring_param_object() {
+        let r = global_eval("function f({a, b}) { return a + b; } f({a: 3, b: 4})").unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    /// Array destructuring in function parameters.
+    #[test]
+    fn e2e_destructuring_param_array() {
+        let r = global_eval("function f([a, b]) { return a * b; } f([3, 5])").unwrap();
+        assert_eq!(r, JsValue::Smi(15));
+    }
+
+    // 9. Rest parameters
+
+    /// Rest parameters collect remaining arguments.
+    #[test]
+    fn e2e_rest_params_length() {
+        let r =
+            global_eval("function f(a, ...rest) { return rest.length; } f(1, 2, 3, 4)").unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// Rest parameters — values are correct.
+    #[test]
+    fn e2e_rest_params_values() {
+        let r = global_eval("function f(a, ...rest) { return rest[0] + rest[1]; } f(1, 10, 20)")
+            .unwrap();
+        assert_eq!(r, JsValue::Smi(30));
+    }
+
+    /// Rest parameters with no extra args yields empty array.
+    #[test]
+    fn e2e_rest_params_empty() {
+        let r = global_eval("function f(a, ...rest) { return rest.length; } f(1)").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    // 10. Named function expression scope
+
+    /// Named function expression — the name is NOT visible outside.
+    #[test]
+    fn e2e_named_fn_expr_invisible_outside() {
+        let r = global_eval("var f = function myName() { return 1; }; typeof myName").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// Named function expression — the name is visible inside.
+    #[test]
+    fn e2e_named_fn_expr_visible_inside() {
+        let r = global_eval("var f = function myName() { return typeof myName; }; f()").unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    // ── Additional scope / variable resolution tests ────────────────────
+
+    /// `typeof` on an undeclared variable returns "undefined" (no error).
+    #[test]
+    fn e2e_typeof_undeclared_var() {
+        let r = global_eval("typeof neverDeclared").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// `var` hoisting — variable exists but is `undefined` before assignment.
+    #[test]
+    fn e2e_var_hoisting_undefined_before() {
+        let r =
+            global_eval("function f() { var result = x; var x = 5; return result; } f()").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    /// `var` inside a for-loop is function-scoped and visible after loop.
+    #[test]
+    fn e2e_var_for_loop_visible_after() {
+        let r = global_eval("for (var i = 0; i < 5; i++) {} i").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    /// `let` inside a for-loop head is not visible outside the loop.
+    #[test]
+    fn e2e_let_for_loop_invisible_after() {
+        let r = global_eval("for (let j = 0; j < 5; j++) {} typeof j").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// `let` inside for-loop body is block-scoped per iteration.
+    #[test]
+    fn e2e_let_in_for_body_scoped() {
+        let r = global_eval(
+            "var sum = 0; \
+             for (var i = 0; i < 3; i++) { let x = i * 10; sum = sum + x; } \
+             sum",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(30));
+    }
 }
