@@ -18,6 +18,21 @@ use crate::objects::value::{JsValue, NativeIterator};
 
 use super::util::same_value_zero;
 
+/// ECMAScript §24.2.3.1 step 5: if *value* is **-0**𝔽, set *value* to
+/// **+0**𝔽.
+///
+/// Mirrors the normalisation applied by [`super::map::map_set`] for `Map`
+/// keys.
+fn normalize_negative_zero(v: JsValue) -> JsValue {
+    if let JsValue::HeapNumber(n) = &v
+        && *n == 0.0
+        && n.is_sign_negative()
+    {
+        return JsValue::HeapNumber(0.0);
+    }
+    v
+}
+
 // ── SetIteratorKind ───────────────────────────────────────────────────────────
 
 /// The iteration kind for a `Set` iterator (ECMAScript §24.2.5.1).
@@ -124,6 +139,8 @@ pub fn set_from_iterable(items: Vec<JsValue>) -> JsSet {
 /// assert_eq!(set_size(&s), 1);
 /// ```
 pub fn set_add(set: &mut JsSet, value: JsValue) {
+    // §24.2.3.1 step 5: normalise -0 → +0.
+    let value = normalize_negative_zero(value);
     if !set.values.iter().any(|v| same_value_zero(v, &value)) {
         set.values.push(value);
     }

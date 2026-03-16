@@ -7503,18 +7503,109 @@ fn make_map_builtin() -> JsValue {
         props.insert(
             "__call__".into(),
             native(|args| {
-                let m = if args.first().is_some_and(is_js_array) {
-                    let (elements, _) = to_array_like_elements(args.first().unwrap());
-                    let mut pairs = Vec::new();
-                    for item in &elements {
-                        let (pair_elems, _) = to_array_like_elements(item);
-                        let k = pair_elems.first().cloned().unwrap_or(JsValue::Undefined);
-                        let v = pair_elems.get(1).cloned().unwrap_or(JsValue::Undefined);
-                        pairs.push((k, v));
+                let arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+                let m = match &arg {
+                    JsValue::Undefined | JsValue::Null => map_new(),
+                    _ if is_js_array(&arg) => {
+                        let (elements, _) = to_array_like_elements(&arg);
+                        let mut pairs = Vec::new();
+                        for item in &elements {
+                            let (pair_elems, _) = to_array_like_elements(item);
+                            let k = pair_elems.first().cloned().unwrap_or(JsValue::Undefined);
+                            let v = pair_elems.get(1).cloned().unwrap_or(JsValue::Undefined);
+                            pairs.push((k, v));
+                        }
+                        map_from_iterable(pairs)
                     }
-                    map_from_iterable(pairs)
-                } else {
-                    map_new()
+                    JsValue::PlainObject(rc) => {
+                        let borrow = rc.borrow();
+                        if borrow
+                            .get("__is_map__")
+                            .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
+                        {
+                            // Copy from another Map via @@iterator / entries
+                            if let Some(JsValue::NativeFunction(iter_fn)) =
+                                borrow.get("@@iterator").cloned()
+                            {
+                                drop(borrow);
+                                let iter_val = iter_fn(vec![])?;
+                                let mut pairs = Vec::new();
+                                if let JsValue::Iterator(iter_rc) = iter_val {
+                                    while let Some(item) = iter_rc.borrow_mut().next_item() {
+                                        let (pair_elems, _) = to_array_like_elements(&item);
+                                        let k = pair_elems
+                                            .first()
+                                            .cloned()
+                                            .unwrap_or(JsValue::Undefined);
+                                        let v = pair_elems
+                                            .get(1)
+                                            .cloned()
+                                            .unwrap_or(JsValue::Undefined);
+                                        pairs.push((k, v));
+                                    }
+                                }
+                                map_from_iterable(pairs)
+                            } else {
+                                drop(borrow);
+                                map_new()
+                            }
+                        } else if borrow
+                            .get("__is_set__")
+                            .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
+                        {
+                            // Set-like: iterate values as [value, value] pairs
+                            if let Some(JsValue::NativeFunction(iter_fn)) =
+                                borrow.get("@@iterator").cloned()
+                            {
+                                drop(borrow);
+                                let iter_val = iter_fn(vec![])?;
+                                let mut pairs = Vec::new();
+                                if let JsValue::Iterator(iter_rc) = iter_val {
+                                    while let Some(item) = iter_rc.borrow_mut().next_item() {
+                                        pairs.push((item.clone(), item));
+                                    }
+                                }
+                                map_from_iterable(pairs)
+                            } else {
+                                drop(borrow);
+                                map_new()
+                            }
+                        } else if borrow.get("@@iterator").is_some()
+                            || borrow.get("length").is_some()
+                        {
+                            // Array-like or iterable PlainObject
+                            drop(borrow);
+                            let (elements, _) = to_array_like_elements(&arg);
+                            let mut pairs = Vec::new();
+                            for item in &elements {
+                                let (pair_elems, _) = to_array_like_elements(item);
+                                let k = pair_elems.first().cloned().unwrap_or(JsValue::Undefined);
+                                let v = pair_elems.get(1).cloned().unwrap_or(JsValue::Undefined);
+                                pairs.push((k, v));
+                            }
+                            map_from_iterable(pairs)
+                        } else {
+                            drop(borrow);
+                            return Err(StatorError::TypeError(
+                                "Map: argument is not iterable".into(),
+                            ));
+                        }
+                    }
+                    JsValue::Iterator(iter_rc) => {
+                        let mut pairs = Vec::new();
+                        while let Some(item) = iter_rc.borrow_mut().next_item() {
+                            let (pair_elems, _) = to_array_like_elements(&item);
+                            let k = pair_elems.first().cloned().unwrap_or(JsValue::Undefined);
+                            let v = pair_elems.get(1).cloned().unwrap_or(JsValue::Undefined);
+                            pairs.push((k, v));
+                        }
+                        map_from_iterable(pairs)
+                    }
+                    _ => {
+                        return Err(StatorError::TypeError(
+                            "Map: argument is not iterable".into(),
+                        ));
+                    }
                 };
                 build_map_instance(m)
             }),
@@ -7687,11 +7778,70 @@ fn make_set_builtin() -> JsValue {
         props.insert(
             "__call__".into(),
             native(|args| {
-                let s = if args.first().is_some_and(is_js_array) {
-                    let (elements, _) = to_array_like_elements(args.first().unwrap());
-                    set_from_iterable(elements)
-                } else {
-                    set_new()
+                let arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+                let s = match &arg {
+                    JsValue::Undefined | JsValue::Null => set_new(),
+                    _ if is_js_array(&arg) => {
+                        let (elements, _) = to_array_like_elements(&arg);
+                        set_from_iterable(elements)
+                    }
+                    JsValue::String(str_val) => {
+                        let chars: Vec<JsValue> = str_val
+                            .chars()
+                            .map(|c| JsValue::String(c.to_string().into()))
+                            .collect();
+                        set_from_iterable(chars)
+                    }
+                    JsValue::PlainObject(rc) => {
+                        let borrow = rc.borrow();
+                        if borrow
+                            .get("__is_set__")
+                            .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
+                            || borrow
+                                .get("__is_map__")
+                                .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
+                        {
+                            if let Some(JsValue::NativeFunction(iter_fn)) =
+                                borrow.get("@@iterator").cloned()
+                            {
+                                drop(borrow);
+                                let iter_val = iter_fn(vec![])?;
+                                let mut items = Vec::new();
+                                if let JsValue::Iterator(iter_rc) = iter_val {
+                                    while let Some(item) = iter_rc.borrow_mut().next_item() {
+                                        items.push(item);
+                                    }
+                                }
+                                set_from_iterable(items)
+                            } else {
+                                drop(borrow);
+                                set_new()
+                            }
+                        } else if borrow.get("@@iterator").is_some()
+                            || borrow.get("length").is_some()
+                        {
+                            drop(borrow);
+                            let (elements, _) = to_array_like_elements(&arg);
+                            set_from_iterable(elements)
+                        } else {
+                            drop(borrow);
+                            return Err(StatorError::TypeError(
+                                "Set: argument is not iterable".into(),
+                            ));
+                        }
+                    }
+                    JsValue::Iterator(iter_rc) => {
+                        let mut items = Vec::new();
+                        while let Some(item) = iter_rc.borrow_mut().next_item() {
+                            items.push(item);
+                        }
+                        set_from_iterable(items)
+                    }
+                    _ => {
+                        return Err(StatorError::TypeError(
+                            "Set: argument is not iterable".into(),
+                        ));
+                    }
                 };
                 build_set_instance(s)
             }),
@@ -30060,6 +30210,268 @@ mod tests {
              (o.x = 42) === 42 && o.y === 42",
         )
         .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Map/Set/WeakMap/WeakSet deep conformance tests ───────────────────────
+
+    #[test]
+    fn e2e_map_negative_zero_key_normalized() {
+        let result = global_eval(
+            "var m = new Map(); m.set(-0, 'a'); \
+             var k; m.forEach(function(v, key) { k = key; }); \
+             1 / k === Infinity",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_negative_zero_and_positive_zero_same_key() {
+        let result = global_eval(
+            "var m = new Map(); m.set(-0, 'neg'); m.set(0, 'pos'); m.size === 1 && m.get(0) === 'pos'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_nan_key_identity() {
+        let result = global_eval(
+            "var m = new Map(); m.set(NaN, 'val'); m.has(NaN) && m.get(NaN) === 'val' && m.size === 1",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_nan_key_deduplicates() {
+        let result = global_eval(
+            "var m = new Map(); m.set(NaN, 1); m.set(NaN, 2); m.size === 1 && m.get(NaN) === 2",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_constructor_from_another_map() {
+        let result = global_eval(
+            "var a = new Map([['x', 1], ['y', 2]]); var b = new Map(a); \
+             b.size === 2 && b.get('x') === 1 && b.get('y') === 2",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_constructor_iterable_deduplicates_last_wins() {
+        let result =
+            global_eval("var m = new Map([['a', 1], ['a', 2]]); m.size === 1 && m.get('a') === 2")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_set_chaining_multiple() {
+        let result = global_eval(
+            "var m = new Map(); var r = m.set('a', 1).set('b', 2).set('c', 3); \
+             r === m && m.size === 3",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_delete_returns_boolean() {
+        let result = global_eval(
+            "var m = new Map([['a', 1]]); var r1 = m.delete('a'); var r2 = m.delete('a'); \
+             r1 === true && r2 === false",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_clear_empties_map() {
+        let result = global_eval(
+            "var m = new Map([['a', 1], ['b', 2]]); m.clear(); m.size === 0 && !m.has('a')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_to_string_tag() {
+        let result = global_eval("var m = new Map(); m[Symbol.toStringTag] === 'Map'").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_negative_zero_value_normalized() {
+        let result = global_eval(
+            "var s = new Set(); s.add(-0); \
+             var v; s.forEach(function(val) { v = val; }); \
+             1 / v === Infinity",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_negative_zero_and_positive_zero_same_value() {
+        let result = global_eval("var s = new Set(); s.add(-0); s.add(0); s.size === 1").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_nan_deduplicates() {
+        let result =
+            global_eval("var s = new Set(); s.add(NaN); s.add(NaN); s.size === 1 && s.has(NaN)")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_constructor_deduplicates() {
+        let result = global_eval(
+            "var s = new Set([1, 2, 2, 3, 3, 3]); s.size === 3 && s.has(1) && s.has(2) && s.has(3)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_delete_returns_boolean() {
+        let result = global_eval(
+            "var s = new Set([1, 2]); var r1 = s.delete(1); var r2 = s.delete(1); \
+             r1 === true && r2 === false && s.size === 1",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_clear_empties_set() {
+        let result =
+            global_eval("var s = new Set([1, 2, 3]); s.clear(); s.size === 0 && !s.has(1)")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_to_string_tag() {
+        let result = global_eval("var s = new Set(); s[Symbol.toStringTag] === 'Set'").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_rejects_primitive_key() {
+        let result = global_eval(
+            "var wm = new WeakMap(); \
+             try { wm.set(42, 'val'); false; } catch(e) { e instanceof TypeError; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_rejects_string_key() {
+        let result = global_eval(
+            "var wm = new WeakMap(); \
+             try { wm.set('str', 'val'); false; } catch(e) { e instanceof TypeError; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_no_size_property() {
+        let result = global_eval("var wm = new WeakMap(); wm.size === undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_object_key_works() {
+        let result = global_eval(
+            "var wm = new WeakMap(); var k = {}; wm.set(k, 'hello'); wm.get(k) === 'hello'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_delete_returns_boolean() {
+        let result = global_eval(
+            "var wm = new WeakMap(); var k = {}; wm.set(k, 1); \
+             var r1 = wm.delete(k); var r2 = wm.delete(k); \
+             r1 === true && r2 === false",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_to_string_tag() {
+        let result =
+            global_eval("var wm = new WeakMap(); wm[Symbol.toStringTag] === 'WeakMap'").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_rejects_primitive_value() {
+        let result = global_eval(
+            "var ws = new WeakSet(); \
+             try { ws.add(42); false; } catch(e) { e instanceof TypeError; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_no_size_property() {
+        let result = global_eval("var ws = new WeakSet(); ws.size === undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_object_value_works() {
+        let result =
+            global_eval("var ws = new WeakSet(); var o = {}; ws.add(o); ws.has(o)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_to_string_tag() {
+        let result =
+            global_eval("var ws = new WeakSet(); ws[Symbol.toStringTag] === 'WeakSet'").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_constructor_non_iterable_throws() {
+        let result =
+            global_eval("try { new Map(123); false; } catch(e) { e instanceof TypeError; }")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_constructor_non_iterable_throws() {
+        let result =
+            global_eval("try { new Set(123); false; } catch(e) { e instanceof TypeError; }")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_constructor_null_creates_empty() {
+        let result = global_eval("var m = new Map(null); m.size === 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_constructor_null_creates_empty() {
+        let result = global_eval("var s = new Set(null); s.size === 0").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
 }
