@@ -7613,18 +7613,20 @@ fn make_string() -> JsValue {
         );
 
         // trimLeft() — §B.2.3.1 legacy alias for trimStart
+        // Per spec, .name is "trimStart" (not "trimLeft").
         proto.insert(
             "trimLeft".into(),
-            native(|args| {
+            builtin_fn("trimStart", 0, |args| {
                 let s = require_coercible_string(&args)?;
                 Ok(JsValue::String(string_trim_start(&s).into()))
             }),
         );
 
         // trimRight() — §B.2.3.2 legacy alias for trimEnd
+        // Per spec, .name is "trimEnd" (not "trimRight").
         proto.insert(
             "trimRight".into(),
-            native(|args| {
+            builtin_fn("trimEnd", 0, |args| {
                 let s = require_coercible_string(&args)?;
                 Ok(JsValue::String(string_trim_end(&s).into()))
             }),
@@ -7984,7 +7986,7 @@ fn make_string() -> JsValue {
         // substr(start, length?)
         proto.insert(
             "substr".into(),
-            native(|args| {
+            builtin_fn("substr", 2, |args| {
                 let s = require_coercible_string(&args)?;
                 let start = args
                     .get(1)
@@ -8002,7 +8004,7 @@ fn make_string() -> JsValue {
         // anchor(name)
         proto.insert(
             "anchor".into(),
-            native(|args| {
+            builtin_fn("anchor", 1, |args| {
                 let s = require_coercible_string(&args)?;
                 let name = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
                 Ok(JsValue::String(string_anchor(&s, &name).into()))
@@ -8012,7 +8014,7 @@ fn make_string() -> JsValue {
         // big()
         proto.insert(
             "big".into(),
-            native(|args| {
+            builtin_fn("big", 0, |args| {
                 let s = require_coercible_string(&args)?;
                 Ok(JsValue::String(string_big(&s).into()))
             }),
@@ -8021,7 +8023,7 @@ fn make_string() -> JsValue {
         // blink()
         proto.insert(
             "blink".into(),
-            native(|args| {
+            builtin_fn("blink", 0, |args| {
                 let s = require_coercible_string(&args)?;
                 Ok(JsValue::String(string_blink(&s).into()))
             }),
@@ -8030,7 +8032,7 @@ fn make_string() -> JsValue {
         // bold()
         proto.insert(
             "bold".into(),
-            native(|args| {
+            builtin_fn("bold", 0, |args| {
                 let s = require_coercible_string(&args)?;
                 Ok(JsValue::String(string_bold(&s).into()))
             }),
@@ -8039,7 +8041,7 @@ fn make_string() -> JsValue {
         // fixed()
         proto.insert(
             "fixed".into(),
-            native(|args| {
+            builtin_fn("fixed", 0, |args| {
                 let s = require_coercible_string(&args)?;
                 Ok(JsValue::String(string_fixed(&s).into()))
             }),
@@ -8048,7 +8050,7 @@ fn make_string() -> JsValue {
         // fontcolor(color)
         proto.insert(
             "fontcolor".into(),
-            native(|args| {
+            builtin_fn("fontcolor", 1, |args| {
                 let s = require_coercible_string(&args)?;
                 let color = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
                 Ok(JsValue::String(string_fontcolor(&s, &color).into()))
@@ -8058,7 +8060,7 @@ fn make_string() -> JsValue {
         // fontsize(size)
         proto.insert(
             "fontsize".into(),
-            native(|args| {
+            builtin_fn("fontsize", 1, |args| {
                 let s = require_coercible_string(&args)?;
                 let size = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
                 Ok(JsValue::String(string_fontsize(&s, &size).into()))
@@ -8068,7 +8070,7 @@ fn make_string() -> JsValue {
         // italics()
         proto.insert(
             "italics".into(),
-            native(|args| {
+            builtin_fn("italics", 0, |args| {
                 let s = require_coercible_string(&args)?;
                 Ok(JsValue::String(string_italics(&s).into()))
             }),
@@ -8077,7 +8079,7 @@ fn make_string() -> JsValue {
         // link(url)
         proto.insert(
             "link".into(),
-            native(|args| {
+            builtin_fn("link", 1, |args| {
                 let s = require_coercible_string(&args)?;
                 let url = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
                 Ok(JsValue::String(string_link(&s, &url).into()))
@@ -8087,7 +8089,7 @@ fn make_string() -> JsValue {
         // small()
         proto.insert(
             "small".into(),
-            native(|args| {
+            builtin_fn("small", 0, |args| {
                 let s = require_coercible_string(&args)?;
                 Ok(JsValue::String(string_small(&s).into()))
             }),
@@ -8096,7 +8098,7 @@ fn make_string() -> JsValue {
         // strike()
         proto.insert(
             "strike".into(),
-            native(|args| {
+            builtin_fn("strike", 0, |args| {
                 let s = require_coercible_string(&args)?;
                 Ok(JsValue::String(string_strike(&s).into()))
             }),
@@ -8105,7 +8107,7 @@ fn make_string() -> JsValue {
         // sub()
         proto.insert(
             "sub".into(),
-            native(|args| {
+            builtin_fn("sub", 0, |args| {
                 let s = require_coercible_string(&args)?;
                 Ok(JsValue::String(string_sub(&s).into()))
             }),
@@ -8114,7 +8116,7 @@ fn make_string() -> JsValue {
         // sup()
         proto.insert(
             "sup".into(),
-            native(|args| {
+            builtin_fn("sup", 0, |args| {
                 let s = require_coercible_string(&args)?;
                 Ok(JsValue::String(string_sup(&s).into()))
             }),
@@ -11505,14 +11507,14 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         // ── Annex B global functions ─────────────────────────────────────────
         globals.insert(
             "escape".into(),
-            native(|args| {
+            builtin_fn("escape", 1, |args| {
                 let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                 Ok(JsValue::String(global_escape(&s).into()))
             }),
         );
         globals.insert(
             "unescape".into(),
-            native(|args| {
+            builtin_fn("unescape", 1, |args| {
                 let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                 Ok(JsValue::String(global_unescape(&s).into()))
             }),
@@ -19989,5 +19991,124 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::String("error".into()));
+    }
+
+    // ── Annex B: escape / unescape e2e ──────────────────────────────────
+
+    /// `escape` encodes special characters.
+    #[test]
+    fn e2e_escape_basic() {
+        let result = global_eval("escape('hello world')").unwrap();
+        assert_eq!(result, JsValue::String("hello%20world".into()));
+    }
+
+    /// `unescape` reverses `escape`.
+    #[test]
+    fn e2e_unescape_basic() {
+        let result = global_eval("unescape('hello%20world')").unwrap();
+        assert_eq!(result, JsValue::String("hello world".into()));
+    }
+
+    /// `escape.length` is 1 per spec.
+    #[test]
+    fn e2e_escape_length() {
+        let result = global_eval("escape.length").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `unescape.length` is 1 per spec.
+    #[test]
+    fn e2e_unescape_length() {
+        let result = global_eval("unescape.length").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    // ── Annex B: String.prototype.substr e2e ────────────────────────────
+
+    /// `substr` with positive start and length.
+    #[test]
+    fn e2e_substr_basic() {
+        let result = global_eval("'hello'.substr(1, 3)").unwrap();
+        assert_eq!(result, JsValue::String("ell".into()));
+    }
+
+    /// `substr` with negative start counts from end.
+    #[test]
+    fn e2e_substr_negative_start() {
+        let result = global_eval("'hello'.substr(-3, 2)").unwrap();
+        assert_eq!(result, JsValue::String("ll".into()));
+    }
+
+    /// `substr.length` is 2 per spec.
+    #[test]
+    fn e2e_substr_length_prop() {
+        let result = global_eval("''.substr.length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    // ── Annex B: HTML wrapper methods e2e ────────────────────────────────
+
+    /// `bold()` wraps in `<b>` tags.
+    #[test]
+    fn e2e_string_bold() {
+        let result = global_eval("'text'.bold()").unwrap();
+        assert_eq!(result, JsValue::String("<b>text</b>".into()));
+    }
+
+    /// `anchor(name)` wraps in `<a name="…">` and escapes quotes.
+    #[test]
+    fn e2e_string_anchor_quote_escape() {
+        let result = global_eval(r#"'text'.anchor('a"b')"#).unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("<a name=\"a&quot;b\">text</a>".into())
+        );
+    }
+
+    /// `link(url)` wraps in `<a href="…">`.
+    #[test]
+    fn e2e_string_link() {
+        let result = global_eval("'click'.link('http://x')").unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("<a href=\"http://x\">click</a>".into())
+        );
+    }
+
+    /// `italics()` wraps in `<i>` tags.
+    #[test]
+    fn e2e_string_italics() {
+        let result = global_eval("'text'.italics()").unwrap();
+        assert_eq!(result, JsValue::String("<i>text</i>".into()));
+    }
+
+    /// HTML method `.name` property is set correctly.
+    #[test]
+    fn e2e_html_method_name() {
+        let result = global_eval("''.bold.name").unwrap();
+        assert_eq!(result, JsValue::String("bold".into()));
+    }
+
+    /// HTML method `.length` property is set correctly.
+    #[test]
+    fn e2e_html_method_length() {
+        let result = global_eval("''.anchor.length").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    // ── Annex B: trimLeft / trimRight name properties ───────────────────
+
+    /// `trimLeft.name` is `"trimStart"` per spec.
+    #[test]
+    fn e2e_trim_left_name() {
+        let result = global_eval("''.trimLeft.name").unwrap();
+        assert_eq!(result, JsValue::String("trimStart".into()));
+    }
+
+    /// `trimRight.name` is `"trimEnd"` per spec.
+    #[test]
+    fn e2e_trim_right_name() {
+        let result = global_eval("''.trimRight.name").unwrap();
+        assert_eq!(result, JsValue::String("trimEnd".into()));
     }
 }

@@ -1145,9 +1145,12 @@ fn html_wrap(s: &str, tag: &str) -> String {
 }
 
 /// Wraps `s` in an HTML tag with one attribute: `<tag attr="value">s</tag>`.
+///
+/// Per §B.2.2.1 *CreateHTML* step 5, `"` in the attribute value is replaced
+/// with `&quot;`.
 fn html_wrap_attr(s: &str, tag: &str, attr: &str, value: &str) -> String {
-    // Per spec, attribute values are NOT escaped.
-    format!("<{tag} {attr}=\"{value}\">{s}</{tag}>")
+    let escaped = value.replace('"', "&quot;");
+    format!("<{tag} {attr}=\"{escaped}\">{s}</{tag}>")
 }
 
 /// Annex B §B.2.3.2 `String.prototype.anchor(name)`.
@@ -2140,6 +2143,14 @@ mod tests {
     #[test]
     fn test_html_anchor() {
         assert_eq!(string_anchor("text", "n"), "<a name=\"n\">text</a>");
+    }
+
+    #[test]
+    fn test_html_anchor_quote_escaping() {
+        assert_eq!(
+            string_anchor("text", "a\"b"),
+            "<a name=\"a&quot;b\">text</a>"
+        );
     }
 
     #[test]
