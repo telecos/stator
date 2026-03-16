@@ -3746,7 +3746,7 @@ fn handle_bitwise_not(
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(!n);
     } else {
-        let n = ctx.frame.accumulator.to_number()? as i32;
+        let n = ctx.frame.accumulator.to_int32()?;
         ctx.frame.accumulator = JsValue::Smi(!n);
     }
     Ok(DispatchAction::Continue)

@@ -28565,4 +28565,293 @@ mod tests {
         .unwrap();
         assert_eq!(r, JsValue::String("0,1,1,2,3,5,8,13".into()));
     }
+
+    // ΓöÇΓöÇ Type coercion & conversion conformance ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+    // -- ToNumber edge cases --
+
+    /// Unary `+` on empty string ΓåÆ 0.
+    #[test]
+    fn e2e_to_number_empty_string() {
+        let r = global_eval("+''").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Unary `+` on whitespace-only string ΓåÆ 0.
+    #[test]
+    fn e2e_to_number_whitespace_string() {
+        let r = global_eval("+' '").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Unary `+` on hex literal string ΓåÆ 16.
+    #[test]
+    fn e2e_to_number_hex_string() {
+        let r = global_eval("+'0x10'").unwrap();
+        assert_eq!(r, JsValue::Smi(16));
+    }
+
+    /// Unary `+` on "Infinity" string ΓåÆ Infinity.
+    #[test]
+    fn e2e_to_number_infinity_string() {
+        let r = global_eval("+'Infinity'").unwrap();
+        assert_eq!(r, JsValue::HeapNumber(f64::INFINITY));
+    }
+
+    /// Unary `+` on scientific notation string ΓåÆ 100.
+    #[test]
+    fn e2e_to_number_scientific_notation() {
+        let r = global_eval("+'1e2'").unwrap();
+        assert_eq!(r, JsValue::Smi(100));
+    }
+
+    /// Unary `+` on string with surrounding whitespace ΓåÆ 42.
+    #[test]
+    fn e2e_to_number_whitespace_around() {
+        let r = global_eval("+'  42  '").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Unary `+` on `null` ΓåÆ 0.
+    #[test]
+    fn e2e_to_number_null() {
+        let r = global_eval("+null").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Unary `+` on `true` ΓåÆ 1.
+    #[test]
+    fn e2e_to_number_true() {
+        let r = global_eval("+true").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// Unary `+` on `false` ΓåÆ 0.
+    #[test]
+    fn e2e_to_number_false() {
+        let r = global_eval("+false").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    // -- ToString --
+
+    /// `String(null)` ΓåÆ "null".
+    #[test]
+    fn e2e_to_string_null() {
+        let r = global_eval("String(null)").unwrap();
+        assert_eq!(r, JsValue::String("null".into()));
+    }
+
+    /// `String(undefined)` ΓåÆ "undefined".
+    #[test]
+    fn e2e_to_string_undefined() {
+        let r = global_eval("String(undefined)").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// `String(true)` ΓåÆ "true".
+    #[test]
+    fn e2e_to_string_true() {
+        let r = global_eval("String(true)").unwrap();
+        assert_eq!(r, JsValue::String("true".into()));
+    }
+
+    /// `String(false)` ΓåÆ "false".
+    #[test]
+    fn e2e_to_string_false() {
+        let r = global_eval("String(false)").unwrap();
+        assert_eq!(r, JsValue::String("false".into()));
+    }
+
+    // -- Abstract equality (==) --
+
+    /// `null == undefined` ΓåÆ true.
+    #[test]
+    fn e2e_abstract_eq_null_undefined() {
+        let r = global_eval("null == undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `null == 0` ΓåÆ false.
+    #[test]
+    fn e2e_abstract_eq_null_zero() {
+        let r = global_eval("null == 0").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `"" == 0` ΓåÆ true.
+    #[test]
+    fn e2e_abstract_eq_empty_string_zero() {
+        let r = global_eval("'' == 0").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `"" == false` ΓåÆ true.
+    #[test]
+    fn e2e_abstract_eq_empty_string_false() {
+        let r = global_eval("'' == false").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `undefined == null` ΓåÆ true (symmetric).
+    #[test]
+    fn e2e_abstract_eq_undefined_null() {
+        let r = global_eval("undefined == null").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // -- Strict equality (===) --
+
+    /// `NaN === NaN` ΓåÆ false.
+    #[test]
+    fn e2e_strict_eq_nan_nan() {
+        let r = global_eval("NaN === NaN").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `NaN !== NaN` ΓåÆ true.
+    #[test]
+    fn e2e_strict_neq_nan_nan() {
+        let r = global_eval("NaN !== NaN").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Type mismatch: `1 === '1'` ΓåÆ false.
+    #[test]
+    fn e2e_strict_eq_type_mismatch() {
+        let r = global_eval("1 === '1'").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    // -- Comparison operators --
+
+    /// String lexicographic: `"b" > "a"` ΓåÆ true.
+    #[test]
+    fn e2e_compare_string_gt() {
+        let r = global_eval("'b' > 'a'").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// String lexicographic: `"10" < "9"` ΓåÆ true (char-by-char).
+    #[test]
+    fn e2e_compare_string_lexicographic() {
+        let r = global_eval("'10' < '9'").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Mixed types: `2 < "10"` ΓåÆ true (string coerced to number).
+    #[test]
+    fn e2e_compare_mixed_types() {
+        let r = global_eval("2 < '10'").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // -- Unary operators --
+
+    /// Negate: `-5` ΓåÆ -5.
+    #[test]
+    fn e2e_unary_negate() {
+        let r = global_eval("var x = 5; -x").unwrap();
+        assert_eq!(r, JsValue::Smi(-5));
+    }
+
+    /// Bitwise NOT: `~0` ΓåÆ -1.
+    #[test]
+    fn e2e_bitwise_not_zero() {
+        let r = global_eval("~0").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    /// Bitwise NOT: `~-1` ΓåÆ 0.
+    #[test]
+    fn e2e_bitwise_not_neg_one() {
+        let r = global_eval("~-1").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Bitwise NOT uses ToInt32: `~NaN` ΓåÆ -1 (ToInt32(NaN) is 0).
+    #[test]
+    fn e2e_bitwise_not_nan() {
+        let r = global_eval("~NaN").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    // -- Boolean coercion (!value) --
+
+    /// `!0` ΓåÆ true (0 is falsy).
+    #[test]
+    fn e2e_logical_not_zero() {
+        let r = global_eval("!0").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `!""` ΓåÆ true (empty string is falsy).
+    #[test]
+    fn e2e_logical_not_empty_string() {
+        let r = global_eval("!''").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `!null` ΓåÆ true (null is falsy).
+    #[test]
+    fn e2e_logical_not_null() {
+        let r = global_eval("!null").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `!undefined` ΓåÆ true (undefined is falsy).
+    #[test]
+    fn e2e_logical_not_undefined() {
+        let r = global_eval("!undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `!1` ΓåÆ false (1 is truthy).
+    #[test]
+    fn e2e_logical_not_one() {
+        let r = global_eval("!1").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `!!"hello"` ΓåÆ true (non-empty string is truthy).
+    #[test]
+    fn e2e_double_not_string() {
+        let r = global_eval("!!'hello'").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `!!0` ΓåÆ false (double-not preserves falsiness).
+    #[test]
+    fn e2e_double_not_zero() {
+        let r = global_eval("!!0").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `!!NaN` ΓåÆ false (NaN is falsy).
+    #[test]
+    fn e2e_double_not_nan() {
+        let r = global_eval("!!NaN").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `!!""` ΓåÆ false (empty string is falsy).
+    #[test]
+    fn e2e_double_not_empty_string() {
+        let r = global_eval("!!''").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Array ToPrimitive: `[1] == 1` ΓåÆ true.
+    #[test]
+    fn e2e_abstract_eq_array_number() {
+        let r = global_eval("[1] == 1").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Empty array ToPrimitive: `[] == 0` ΓåÆ true ("" == 0).
+    #[test]
+    fn e2e_abstract_eq_empty_array_zero() {
+        let r = global_eval("[] == 0").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
 }
