@@ -3362,6 +3362,7 @@ fn handle_resume_generator(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     let mut throw_val: Option<JsValue> = None;
+    let mut return_val: Option<JsValue> = None;
     if let Some(gs_rc) = ctx.frame.generator_state.as_ref() {
         let mut gs = gs_rc.borrow_mut();
         // Restore the saved registers into the ctx.frame.
@@ -3372,11 +3373,10 @@ fn handle_resume_generator(
         let count = gs.registers.len().min(ctx.frame.registers.len());
         ctx.frame.registers[..count].clone_from_slice(&gs.registers[..count]);
         gs.status = GeneratorStatus::Executing;
-        // Check if we need to throw at the yield point.
-        if let GeneratorResumeMode::Throw(val) =
-            std::mem::replace(&mut gs.resume_mode, GeneratorResumeMode::Normal)
-        {
-            throw_val = Some(val);
+        match std::mem::replace(&mut gs.resume_mode, GeneratorResumeMode::Normal) {
+            GeneratorResumeMode::Throw(val) => throw_val = Some(val),
+            GeneratorResumeMode::Return(val) => return_val = Some(val),
+            GeneratorResumeMode::Normal => {}
         }
     }
     if let Some(val) = throw_val {
@@ -3386,6 +3386,17 @@ fn handle_resume_generator(
         set_pending_exception(val.clone());
         let msg = error_message_from_value(&val);
         return Err(StatorError::JsException(msg));
+    }
+    if return_val.is_some() {
+        // Force a "return" abrupt completion.  By throwing a sentinel
+        // through the handler table, any enclosing `finally` block will
+        // execute before the generator completes.
+        let sentinel = JsValue::String(super::GENERATOR_RETURN_SENTINEL.into());
+        ctx.frame.accumulator = sentinel.clone();
+        set_pending_exception(sentinel);
+        return Err(StatorError::JsException(
+            super::GENERATOR_RETURN_SENTINEL.into(),
+        ));
     }
     // Accumulator keeps the resume value supplied by run_generator_step.
     Ok(DispatchAction::Continue)
