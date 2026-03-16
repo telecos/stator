@@ -18,11 +18,12 @@ use super::{
     PropertyIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, concat_rc_strs,
     constant_pool_jump_delta, constant_to_value, decode_string_constant, dispatch_call_property,
     dispatch_call_value, dispatch_call_with_this, dispatch_setter, err_bad_operand,
-    error_message_from_value, extract_context, find_handler, fn_props_set, is_js_receiver, js_add,
-    js_less_than, keyed_load, keyed_store, maybe_compile_baseline, maybe_compile_maglev,
-    maybe_compile_turbofan, number_to_jsvalue, plain_object_to_array_items, proto_lookup,
-    resolve_jump, restore_closure_context, set_pending_exception, strict_eq, to_array_index,
-    to_bigint, to_property_key, try_execute_best_jit, walk_context_chain, wire_construct_prototype,
+    error_message_from_value, extract_context, find_handler, fn_props_set, has_prototype_in_chain,
+    is_js_receiver, js_add, js_less_than, keyed_load, keyed_store, maybe_compile_baseline,
+    maybe_compile_maglev, maybe_compile_turbofan, number_to_jsvalue, plain_object_to_array_items,
+    proto_lookup, resolve_jump, restore_closure_context, set_pending_exception, strict_eq,
+    to_array_index, to_bigint, to_property_key, try_execute_best_jit, walk_context_chain,
+    wire_construct_prototype,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{proxy_delete_property, proxy_has, proxy_set};
@@ -4342,28 +4343,7 @@ fn handle_test_instance_of(
     };
 
     let result = if let Some(proto_val) = ctor_proto {
-        // Walk the __proto__ chain of the accumulator object.
-        let mut current = ctx.frame.accumulator.clone();
-        let mut found = false;
-        for _ in 0..256 {
-            match &current {
-                JsValue::PlainObject(map) => {
-                    if let JsValue::PlainObject(p) = &proto_val
-                        && Rc::ptr_eq(map, p)
-                    {
-                        found = true;
-                        break;
-                    }
-                    let next = map.borrow().get("__proto__").cloned();
-                    match next {
-                        Some(v) => current = v,
-                        None => break,
-                    }
-                }
-                _ => break,
-            }
-        }
-        found
+        has_prototype_in_chain(&ctx.frame.accumulator, &proto_val)
     } else {
         false
     };

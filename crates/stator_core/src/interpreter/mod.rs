@@ -318,6 +318,43 @@ fn lookup_global_constructor(name: &str) -> JsValue {
     })
 }
 
+/// Return the current thread's active global environment, if any.
+pub(crate) fn current_global_env() -> Option<Rc<RefCell<HashMap<String, JsValue>>>> {
+    CURRENT_GLOBALS.with(|g| g.borrow().clone())
+}
+
+/// Return the immediate prototype of an object-like value.
+pub(crate) fn get_object_prototype(obj: &JsValue) -> Option<JsValue> {
+    match obj {
+        JsValue::PlainObject(map) => map.borrow().get("__proto__").cloned(),
+        JsValue::Error(e) => e.props.borrow().get("__proto__").cloned().or_else(|| {
+            let ctor = lookup_global_constructor(e.kind.as_name());
+            let proto = proto_lookup(&ctor, "prototype");
+            if matches!(proto, JsValue::Undefined) {
+                None
+            } else {
+                Some(proto)
+            }
+        }),
+        _ => None,
+    }
+}
+
+/// Return whether `target_proto` appears in `value`'s prototype chain.
+pub(crate) fn has_prototype_in_chain(value: &JsValue, target_proto: &JsValue) -> bool {
+    let mut current = value.clone();
+    for _ in 0..256 {
+        let Some(next) = get_object_prototype(&current) else {
+            return false;
+        };
+        if next == *target_proto {
+            return true;
+        }
+        current = next;
+    }
+    false
+}
+
 /// Run `f` with mutable access to the currently-attached [`Debugger`], if
 /// any, and return its result wrapped in `Some`.  Returns `None` when no
 /// debugger is attached.
@@ -4605,7 +4642,19 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let e2 = Rc::clone(e);
                 JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Error(Rc::clone(&e2)))))
             }
-            "constructor" => lookup_global_constructor(e.kind.as_name()),
+            "__proto__" => get_object_prototype(obj).unwrap_or(JsValue::Null),
+            "constructor" => {
+                if let Some(proto) = get_object_prototype(obj) {
+                    let ctor = proto_lookup(&proto, "constructor");
+                    if !matches!(ctor, JsValue::Undefined) {
+                        ctor
+                    } else {
+                        lookup_global_constructor(e.kind.as_name())
+                    }
+                } else {
+                    lookup_global_constructor(e.kind.as_name())
+                }
+            }
             "hasOwnProperty" => {
                 let e = Rc::clone(e);
                 JsValue::NativeFunction(Rc::new(move |args| {
@@ -4632,7 +4681,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "propertyIsEnumerable" => {
                 JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))))
             }
-            _ => JsValue::Undefined,
+            _ => {
+                if let Some(proto) = get_object_prototype(obj) {
+                    proto_lookup_chain(&proto, key, obj)
+                } else {
+                    JsValue::Undefined
+                }
+            }
         };
     }
     // Handle JsValue::Generator — expose next/return/throw/@@iterator methods.
@@ -5288,12 +5343,21 @@ pub fn dispatch_call_with_this(
 /// a `__proto__` link, set it to `ctor_proto` so that `instanceof` and
 /// prototype-chain property lookup work correctly.
 pub(super) fn wire_construct_prototype(result: JsValue, ctor_proto: &JsValue) -> JsValue {
-    if let JsValue::PlainObject(ref map) = result
-        && !matches!(ctor_proto, JsValue::Undefined)
-    {
-        let mut borrow = map.borrow_mut();
-        if !borrow.contains_key("__proto__") {
-            borrow.insert("__proto__".to_string(), ctor_proto.clone());
+    if !matches!(ctor_proto, JsValue::Undefined) {
+        match &result {
+            JsValue::PlainObject(map) => {
+                let mut borrow = map.borrow_mut();
+                if !borrow.contains_key("__proto__") {
+                    borrow.insert("__proto__".to_string(), ctor_proto.clone());
+                }
+            }
+            JsValue::Error(e) => {
+                let mut props = e.props.borrow_mut();
+                if !props.contains_key("__proto__") {
+                    props.insert("__proto__".to_string(), ctor_proto.clone());
+                }
+            }
+            _ => {}
         }
     }
     result
