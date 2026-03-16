@@ -18,6 +18,21 @@ use crate::objects::value::{JsValue, NativeIterator};
 
 use super::util::same_value_zero;
 
+/// ECMAScript §24.1.3.9 step 6: if *key* is **-0**𝔽, set *key* to **+0**𝔽.
+///
+/// This normalisation is required so that iterating a `Map` always yields
+/// `+0` rather than `-0` for zero keys, matching the spec and observable
+/// behaviour in all major engines.
+fn normalize_negative_zero(v: JsValue) -> JsValue {
+    if let JsValue::HeapNumber(n) = &v
+        && *n == 0.0
+        && n.is_sign_negative()
+    {
+        return JsValue::HeapNumber(0.0);
+    }
+    v
+}
+
 // ── MapIteratorKind ───────────────────────────────────────────────────────────
 
 /// The iteration kind for a `Map` iterator (ECMAScript §24.1.5.1).
@@ -129,6 +144,8 @@ pub fn map_from_iterable(pairs: Vec<(JsValue, JsValue)>) -> JsMap {
 /// assert_eq!(map_get(&m, &JsValue::Smi(1)), JsValue::Boolean(false));
 /// ```
 pub fn map_set(map: &mut JsMap, key: JsValue, value: JsValue) {
+    // §24.1.3.9 step 6: normalise -0 → +0.
+    let key = normalize_negative_zero(key);
     if let Some(entry) = map
         .entries
         .iter_mut()
