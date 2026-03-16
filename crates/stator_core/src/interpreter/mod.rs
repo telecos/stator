@@ -3004,7 +3004,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Some(v) => v.to_number()?,
                         None => 0.0,
                     };
-                    if count_f.is_nan() || count_f < 0.0 || count_f.is_infinite() {
+                    // ES §22.1.3.16 step 3: ToIntegerOrInfinity(NaN) → 0
+                    let count_f = if count_f.is_nan() { 0.0 } else { count_f };
+                    if count_f < 0.0 || count_f.is_infinite() {
                         return Err(crate::error::StatorError::RangeError(
                             "Invalid count value".into(),
                         ));
@@ -3016,17 +3018,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "padStart" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let target_len = match args.first() {
-                        Some(JsValue::Smi(n)) => (*n).max(0) as usize,
-                        Some(JsValue::HeapNumber(n)) => {
-                            let f = *n;
-                            if f.is_nan() || f < 0.0 {
-                                0usize
-                            } else {
-                                f as usize
-                            }
-                        }
-                        _ => 0,
+                    let raw = match args.first() {
+                        Some(v) => v.to_number().unwrap_or(0.0),
+                        None => 0.0,
+                    };
+                    let target_len = if raw.is_nan() || raw < 0.0 {
+                        0usize
+                    } else {
+                        raw as usize
                     };
                     let pad_str = match args.get(1) {
                         Some(JsValue::String(f)) => f.to_string(),
@@ -3040,17 +3039,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "padEnd" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    let target_len = match args.first() {
-                        Some(JsValue::Smi(n)) => (*n).max(0) as usize,
-                        Some(JsValue::HeapNumber(n)) => {
-                            let f = *n;
-                            if f.is_nan() || f < 0.0 {
-                                0usize
-                            } else {
-                                f as usize
-                            }
-                        }
-                        _ => 0,
+                    let raw = match args.first() {
+                        Some(v) => v.to_number().unwrap_or(0.0),
+                        None => 0.0,
+                    };
+                    let target_len = if raw.is_nan() || raw < 0.0 {
+                        0usize
+                    } else {
+                        raw as usize
                     };
                     let pad_str = match args.get(1) {
                         Some(JsValue::String(f)) => f.to_string(),
@@ -3791,23 +3787,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         let search = args.first().cloned().unwrap_or(JsValue::Undefined);
                         let items = a.borrow();
                         let len = items.len() as i32;
-                        let from = match args.get(1) {
-                            Some(JsValue::Smi(i)) => {
-                                if *i < 0 {
-                                    (len + *i).max(0) as usize
-                                } else {
-                                    (*i as usize).min(items.len())
-                                }
-                            }
-                            Some(JsValue::HeapNumber(n)) => {
-                                let i = *n as i32;
-                                if i < 0 {
-                                    (len + i).max(0) as usize
-                                } else {
-                                    (i as usize).min(items.len())
-                                }
-                            }
-                            _ => 0,
+                        let from_raw = match args.get(1) {
+                            Some(v) => v.to_number().unwrap_or(0.0) as i64,
+                            None => 0,
+                        };
+                        let from = if from_raw < 0 {
+                            ((len as i64) + from_raw).max(0) as usize
+                        } else {
+                            (from_raw as usize).min(items.len())
                         };
                         // SameValueZero: NaN === NaN, unlike strict equality
                         Ok(JsValue::Boolean(
@@ -4209,9 +4196,8 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
                         let idx = match args.first() {
-                            Some(JsValue::Smi(i)) => *i,
-                            Some(JsValue::HeapNumber(n)) => *n as i32,
-                            _ => 0,
+                            Some(v) => v.to_number().unwrap_or(0.0) as i32,
+                            None => 0,
                         };
                         let len = a.borrow().len() as i32;
                         let actual = if idx < 0 { len + idx } else { idx };
