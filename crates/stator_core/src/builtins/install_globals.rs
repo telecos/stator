@@ -27026,4 +27026,420 @@ mod tests {
         let r = global_eval("[1, 2, 3].some(function(x) { return x === 2; })").unwrap();
         assert_eq!(r, JsValue::Boolean(true));
     }
+
+    // ΓöÇΓöÇ Error and exception handling conformance ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+    /// try/catch ΓÇö catch receives the thrown Error object's message.
+    #[test]
+    fn e2e_try_catch_error_message() {
+        let r =
+            global_eval(r#"try { throw new Error("boom"); } catch (e) { e.message; }"#).unwrap();
+        assert_eq!(r, JsValue::String("boom".into()));
+    }
+
+    /// try/catch/finally ΓÇö finally always runs and its side-effect is visible.
+    #[test]
+    fn e2e_finally_always_runs() {
+        let r = global_eval(
+            r#"
+            var x = 0;
+            try { x = 1; } finally { x = 2; }
+            x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// finally runs even when an exception is thrown.
+    #[test]
+    fn e2e_finally_runs_on_throw() {
+        let r = global_eval(
+            r#"
+            var x = 0;
+            try {
+                try { throw new Error("e"); } finally { x = 99; }
+            } catch (e) {}
+            x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    /// finally overrides the return value from try block.
+    #[test]
+    fn e2e_finally_overrides_return() {
+        let r = global_eval(
+            r#"
+            function f() {
+                try { return 1; } finally { return 2; }
+            }
+            f();
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// finally overrides the return value from catch block.
+    #[test]
+    fn e2e_finally_overrides_catch_return() {
+        let r = global_eval(
+            r#"
+            function f() {
+                try { throw new Error("e"); } catch (e) { return 3; } finally { return 4; }
+            }
+            f();
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(4));
+    }
+
+    /// Catch binding is optional (catch without parameter).
+    #[test]
+    fn e2e_catch_binding_optional() {
+        let r = global_eval(
+            r#"
+            var caught = false;
+            try { throw new Error("e"); } catch { caught = true; }
+            caught;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// throw a number ΓÇö catch receives the numeric value.
+    #[test]
+    fn e2e_throw_number() {
+        let r = global_eval("try { throw 42; } catch (e) { e; }").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// throw a string ΓÇö catch receives the string value.
+    #[test]
+    fn e2e_throw_string() {
+        let r = global_eval(r#"try { throw "oops"; } catch (e) { e; }"#).unwrap();
+        assert_eq!(r, JsValue::String("oops".into()));
+    }
+
+    /// throw null ΓÇö catch receives null.
+    #[test]
+    fn e2e_throw_null() {
+        let r = global_eval("try { throw null; } catch (e) { e === null; }").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// throw undefined ΓÇö catch receives undefined.
+    #[test]
+    fn e2e_throw_undefined() {
+        let r = global_eval("try { throw undefined; } catch (e) { e === undefined; }").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// throw boolean ΓÇö catch receives the boolean value.
+    #[test]
+    fn e2e_throw_boolean() {
+        let r = global_eval("try { throw false; } catch (e) { e; }").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// throw an object literal ΓÇö catch receives the object.
+    #[test]
+    fn e2e_throw_object() {
+        let r = global_eval(r#"try { throw { code: 42 }; } catch (e) { e.code; }"#).unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Re-throw in catch preserves the original error.
+    #[test]
+    fn e2e_rethrow_preserves_error() {
+        let r = global_eval(
+            r#"
+            try {
+                try { throw new Error("original"); }
+                catch (e) { throw e; }
+            } catch (outer) {
+                outer.message;
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("original".into()));
+    }
+
+    /// Re-throw a primitive value in catch preserves the value.
+    #[test]
+    fn e2e_rethrow_primitive() {
+        let r = global_eval(
+            r#"
+            try {
+                try { throw 99; }
+                catch (e) { throw e; }
+            } catch (outer) {
+                outer;
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    /// Nested try/catch ΓÇö inner catch handles, outer does not see it.
+    #[test]
+    fn e2e_nested_try_catch_inner_handles() {
+        let r = global_eval(
+            r#"
+            var outer_caught = false;
+            try {
+                try { throw new Error("inner"); }
+                catch (e) { /* swallow */ }
+            } catch (e) {
+                outer_caught = true;
+            }
+            outer_caught;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Nested try/catch ΓÇö inner does not catch, outer catches.
+    #[test]
+    fn e2e_nested_try_outer_catches() {
+        let r = global_eval(
+            r#"
+            var which = "none";
+            try {
+                try { throw new Error("e"); }
+                finally { /* no catch, exception propagates */ }
+            } catch (e) {
+                which = "outer";
+            }
+            which;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("outer".into()));
+    }
+
+    /// try/finally without catch ΓÇö finally runs, exception propagates.
+    #[test]
+    fn e2e_try_finally_no_catch_propagates() {
+        let r = global_eval(
+            r#"
+            var fin = false;
+            try {
+                try { throw new Error("propagate"); }
+                finally { fin = true; }
+            } catch (e) {}
+            fin;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// new Error() with no message ΓÇö message defaults to empty string.
+    #[test]
+    fn e2e_error_no_message() {
+        let r = global_eval(r#"var e = new Error(); e.message === "" || e.message === undefined;"#)
+            .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Error.prototype.stack is a string (non-standard but expected).
+    #[test]
+    fn e2e_error_prototype_stack_is_string() {
+        let r = global_eval("typeof new Error('test').stack === 'string'").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Error stack trace contains the error message.
+    #[test]
+    fn e2e_error_stack_contains_message() {
+        let r = global_eval(r#"new Error("hello").stack.indexOf("hello") !== -1"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Error.prototype.name is "Error".
+    #[test]
+    fn e2e_error_name_property() {
+        let r = global_eval("new Error('x').name").unwrap();
+        assert_eq!(r, JsValue::String("Error".into()));
+    }
+
+    /// TypeError.prototype.name is "TypeError".
+    #[test]
+    fn e2e_type_error_name_property() {
+        let r = global_eval("new TypeError('x').name").unwrap();
+        assert_eq!(r, JsValue::String("TypeError".into()));
+    }
+
+    /// RangeError.prototype.name is "RangeError".
+    #[test]
+    fn e2e_range_error_name_property() {
+        let r = global_eval("new RangeError('x').name").unwrap();
+        assert_eq!(r, JsValue::String("RangeError".into()));
+    }
+
+    /// instanceof correctly identifies Error subtypes.
+    #[test]
+    fn e2e_error_instanceof() {
+        let r = global_eval(
+            r#"
+            var te = new TypeError("t");
+            te instanceof TypeError && te instanceof Error;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Error.prototype.toString returns "ErrorName: message".
+    #[test]
+    fn e2e_error_to_string() {
+        let r = global_eval(r#"new Error("fail").toString()"#).unwrap();
+        assert_eq!(r, JsValue::String("Error: fail".into()));
+    }
+
+    /// TypeError.prototype.toString returns "TypeError: message".
+    #[test]
+    fn e2e_type_error_to_string() {
+        let r = global_eval(r#"new TypeError("bad").toString()"#).unwrap();
+        assert_eq!(r, JsValue::String("TypeError: bad".into()));
+    }
+
+    /// Catching a TypeError thrown by the engine (e.g., calling non-function).
+    #[test]
+    fn e2e_catch_engine_type_error() {
+        let r = global_eval(
+            r#"
+            try {
+                var x = 1;
+                x();
+            } catch (e) {
+                e instanceof TypeError;
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Custom error subclass via class extends Error.
+    #[test]
+    fn e2e_custom_error_subclass() {
+        let r = global_eval(
+            r#"
+            class MyError extends Error {
+                constructor(msg) { super(msg); this.name = "MyError"; }
+            }
+            var e = new MyError("custom");
+            e.name + ": " + e.message;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("MyError: custom".into()));
+    }
+
+    /// Custom error subclass ΓÇö instanceof checks.
+    #[test]
+    fn e2e_custom_error_instanceof() {
+        let r = global_eval(
+            r#"
+            class AppError extends Error {
+                constructor(msg) { super(msg); this.name = "AppError"; }
+            }
+            var e = new AppError("app");
+            e instanceof AppError && e instanceof Error;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// try/catch/finally ΓÇö all three execute in order.
+    #[test]
+    fn e2e_try_catch_finally_order() {
+        let r = global_eval(
+            r#"
+            var log = "";
+            try { log += "T"; throw new Error("e"); }
+            catch (e) { log += "C"; }
+            finally { log += "F"; }
+            log;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("TCF".into()));
+    }
+
+    /// finally runs even when no exception is thrown (try/finally path).
+    #[test]
+    fn e2e_try_finally_no_exception() {
+        let r = global_eval(
+            r#"
+            var log = "";
+            try { log += "T"; } finally { log += "F"; }
+            log;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("TF".into()));
+    }
+
+    /// Exception in catch block is caught by outer try/catch.
+    #[test]
+    fn e2e_exception_in_catch_caught_by_outer() {
+        let r = global_eval(
+            r#"
+            try {
+                try { throw 1; }
+                catch (e) { throw 2; }
+            } catch (outer) {
+                outer;
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// finally runs when catch rethrows.
+    #[test]
+    fn e2e_finally_runs_when_catch_rethrows() {
+        let r = global_eval(
+            r#"
+            var fin = false;
+            try {
+                try { throw new Error("e"); }
+                catch (e) { throw e; }
+                finally { fin = true; }
+            } catch (e) {}
+            fin;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// throw inside finally replaces the original exception.
+    #[test]
+    fn e2e_throw_in_finally_replaces_exception() {
+        let r = global_eval(
+            r#"
+            try {
+                try { throw new Error("first"); }
+                finally { throw new Error("second"); }
+            } catch (e) {
+                e.message;
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("second".into()));
+    }
 }
