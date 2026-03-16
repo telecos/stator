@@ -39,6 +39,7 @@
 //! ```
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -221,6 +222,14 @@ pub struct BytecodeArray {
     frame_size: u32,
     /// Number of formal parameters declared by the function.
     parameter_count: u32,
+    /// `Function.prototype.length` metadata for this function.
+    function_length: u32,
+    /// Declared or inferred function name.
+    function_name: String,
+    /// Optional source text used by `Function.prototype.toString()`.
+    source_text: Option<String>,
+    /// Visible binding-to-register mapping for direct `eval()`.
+    binding_registers: HashMap<String, i32>,
     /// Sparse mapping from bytecode offsets to source locations.
     source_positions: Vec<SourcePosition>,
     /// Compile-time description of all inline-cache feedback slots.
@@ -297,6 +306,10 @@ impl PartialEq for BytecodeArray {
             && self.constant_pool == other.constant_pool
             && self.frame_size == other.frame_size
             && self.parameter_count == other.parameter_count
+            && self.function_length == other.function_length
+            && self.function_name == other.function_name
+            && self.source_text == other.source_text
+            && self.binding_registers == other.binding_registers
             && self.source_positions == other.source_positions
             && self.feedback_metadata == other.feedback_metadata
             && self.handler_table == other.handler_table
@@ -336,6 +349,10 @@ impl BytecodeArray {
             constant_pool,
             frame_size,
             parameter_count,
+            function_length: parameter_count,
+            function_name: String::new(),
+            source_text: None,
+            binding_registers: HashMap::new(),
             source_positions,
             feedback_metadata,
             handler_table,
@@ -453,6 +470,50 @@ impl BytecodeArray {
     /// Number of formal parameters declared by this function.
     pub fn parameter_count(&self) -> u32 {
         self.parameter_count
+    }
+
+    /// `Function.prototype.length` for this function.
+    pub fn function_length(&self) -> u32 {
+        self.function_length
+    }
+
+    /// Set `Function.prototype.length` metadata.
+    pub fn with_function_length(mut self, length: u32) -> Self {
+        self.function_length = length;
+        self
+    }
+
+    /// Declared or inferred function name.
+    pub fn function_name(&self) -> &str {
+        &self.function_name
+    }
+
+    /// Set the declared or inferred function name.
+    pub fn with_function_name(mut self, name: impl Into<String>) -> Self {
+        self.function_name = name.into();
+        self
+    }
+
+    /// Source text used by `Function.prototype.toString()`, if any.
+    pub fn source_text(&self) -> Option<&str> {
+        self.source_text.as_deref()
+    }
+
+    /// Set the source text used by `Function.prototype.toString()`.
+    pub fn with_source_text(mut self, source_text: impl Into<String>) -> Self {
+        self.source_text = Some(source_text.into());
+        self
+    }
+
+    /// Visible binding-to-register mapping for direct `eval()`.
+    pub fn binding_registers(&self) -> &HashMap<String, i32> {
+        &self.binding_registers
+    }
+
+    /// Set the binding-to-register mapping used by direct `eval()`.
+    pub fn with_binding_registers(mut self, binding_registers: HashMap<String, i32>) -> Self {
+        self.binding_registers = binding_registers;
+        self
     }
 
     /// The source-position table (may be empty if debug info was stripped).

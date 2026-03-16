@@ -197,6 +197,10 @@ struct FunctionCompiler {
     pending_label_name: Option<String>,
     /// Number of formal parameters.
     param_count: u32,
+    /// `Function.prototype.length` metadata.
+    function_length: u32,
+    /// Visible binding-to-register mapping used by direct `eval()`.
+    binding_registers: HashMap<String, i32>,
     /// Ordered list of feedback slot kinds allocated during compilation.
     slot_kinds: Vec<FeedbackSlotKind>,
     /// Per-function exception handler table entries.
@@ -261,11 +265,15 @@ impl FunctionCompiler {
     /// recorded so that [`emit_param_prologue`] can emit the
     /// corresponding bytecode at function entry.
     fn new(params: &[crate::parser::ast::Param]) -> StatorResult<Self> {
-        // parameter_count excludes rest params so the runtime can collect
-        // excess arguments starting from this index.
+        // Runtime parameter_count excludes rest params so the runtime can
+        // collect excess arguments starting from this index.
         let param_count = params
             .iter()
             .filter(|p| !matches!(p.pat, Pat::Rest(_)))
+            .count() as u32;
+        let function_length = params
+            .iter()
+            .take_while(|p| p.default.is_none() && !matches!(p.pat, Pat::Rest(_)))
             .count() as u32;
         let mut compiler = Self {
             instructions: Vec::new(),
@@ -279,6 +287,8 @@ impl FunctionCompiler {
             label_map: HashMap::new(),
             pending_label_name: None,
             param_count,
+            function_length,
+            binding_registers: HashMap::new(),
             slot_kinds: Vec::new(),
             handler_table: Vec::new(),
             is_generator: false,
@@ -309,6 +319,7 @@ impl FunctionCompiler {
                         needs_tdz_check: false,
                     },
                 );
+                compiler.binding_registers.insert(ident.name.clone(), reg.0);
             }
         }
         Ok(compiler)
@@ -954,6 +965,7 @@ impl FunctionCompiler {
                 needs_tdz_check: false,
             },
         );
+        self.binding_registers.insert(name.to_owned(), reg.0);
         reg
     }
 
@@ -970,6 +982,7 @@ impl FunctionCompiler {
                 needs_tdz_check: false,
             },
         );
+        self.binding_registers.insert(name.to_owned(), reg.0);
         reg
     }
 
@@ -1425,7 +1438,13 @@ impl FunctionCompiler {
             decl.is_generator,
             decl.is_async,
             decl.is_strict,
-        )?;
+        )?
+        .with_function_name(
+            decl.id
+                .as_ref()
+                .map(|id| id.name.clone())
+                .unwrap_or_default(),
+        );
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         // Emit CreateClosure: [func_idx, slot, flags]
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
@@ -1877,6 +1896,8 @@ impl FunctionCompiler {
             label_map: HashMap::new(),
             pending_label_name: None,
             param_count: 1,
+            function_length: 1,
+            binding_registers: HashMap::from([(".this".to_owned(), Register::parameter(0).0)]),
             slot_kinds: Vec::new(),
             handler_table: Vec::new(),
             is_generator: false,
@@ -4064,7 +4085,8 @@ impl FunctionCompiler {
     /// Compile a function expression.
     fn compile_fn_expr(&mut self, f: &FnExpr) -> StatorResult<()> {
         let func_array =
-            compile_function(&f.params, &f.body, f.is_generator, f.is_async, f.is_strict)?;
+            compile_function(&f.params, &f.body, f.is_generator, f.is_async, f.is_strict)?
+                .with_function_name(f.id.as_ref().map(|id| id.name.clone()).unwrap_or_default());
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
@@ -4094,7 +4116,8 @@ impl FunctionCompiler {
         };
         let func_array =
             compile_function_inner(&a.params, &body_block, false, a.is_async, a.is_strict, true)?
-                .with_arrow_flag(true);
+                .with_arrow_flag(true)
+                .with_function_name(String::new());
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         // Flag(1) marks this as an arrow function (no .prototype property).
@@ -5600,6 +5623,8 @@ impl FunctionCompiler {
             self.handler_table,
         );
         Ok(ba
+            .with_function_length(self.function_length)
+            .with_binding_registers(self.binding_registers)
             .with_generator_flag(self.is_generator)
             .with_async_flag(self.is_async)
             .with_module_flag(self.is_module)
@@ -5715,7 +5740,11 @@ fn compile_function_inner(
     if !is_arrow {
         // Create the `arguments` object and bind it as a local variable.
         compiler.emit(Instruction::new_unchecked(
-            Opcode::CreateMappedArguments,
+            if is_strict {
+                Opcode::CreateUnmappedArguments
+            } else {
+                Opcode::CreateMappedArguments
+            },
             vec![],
         ));
         let args_reg = compiler.define_local("arguments");

@@ -8,6 +8,7 @@
 #![allow(clippy::too_many_lines)]
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::objects::map::PropertyAttributes;
@@ -36,6 +37,46 @@ use crate::objects::value::{
     GeneratorResumeMode, GeneratorState, GeneratorStatus, GeneratorStep, JsContext, JsValue,
     NativeIterator,
 };
+
+fn direct_eval_local_bindings(frame: &InterpreterFrame) -> HashMap<String, JsValue> {
+    frame
+        .bytecode_array
+        .binding_registers()
+        .iter()
+        .filter_map(|(name, reg)| {
+            frame
+                .read_reg(*reg as u32)
+                .ok()
+                .cloned()
+                .map(|value| (name.clone(), value))
+        })
+        .collect()
+}
+
+fn sync_direct_eval_bindings(
+    frame: &mut InterpreterFrame,
+    eval_env: &HashMap<String, JsValue>,
+) -> StatorResult<()> {
+    let binding_updates: Vec<(i32, JsValue)> = frame
+        .bytecode_array
+        .binding_registers()
+        .iter()
+        .filter_map(|(name, reg)| eval_env.get(name).cloned().map(|value| (*reg, value)))
+        .collect();
+    for (reg, value) in binding_updates {
+        frame.write_reg(reg as u32, value)?;
+    }
+    Ok(())
+}
+
+fn set_function_name_if_anonymous(value: &JsValue, name: &str) {
+    if let JsValue::Function(ba) = value
+        && ba.function_name().is_empty()
+        && matches!(super::fn_props_get(ba, "name"), JsValue::Undefined)
+    {
+        fn_props_set(ba, "name".to_string(), JsValue::String(name.into()));
+    }
+}
 
 /// Result of executing a single opcode handler.
 pub(super) enum DispatchAction {
@@ -2654,6 +2695,14 @@ fn handle_lda_named_property(
             }
         )));
     }
+    if let JsValue::PlainObject(map) = &obj
+        && prop_name.as_ref() == "callee"
+        && map.borrow().get("__strict_arguments__") == Some(&JsValue::Boolean(true))
+    {
+        return Err(StatorError::TypeError(
+            "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them".into(),
+        ));
+    }
     let result = proto_lookup(&obj, &prop_name);
     // ── Populate shape IC for own-property hits on PlainObject ───────────
     if slot != u32::MAX
@@ -2740,6 +2789,7 @@ fn handle_sta_named_property(
                 if pm.shape_id() == ic.cached_shape {
                     if pm.is_writable_by_offset(ic.cached_offset) {
                         drop(pm);
+                        set_function_name_if_anonymous(&val, &prop_name);
                         map.borrow_mut().set_by_offset(ic.cached_offset, val);
                         // Invalidate value-based caches for this object.
                         let map_ptr = Rc::as_ptr(map) as usize;
@@ -2802,6 +2852,7 @@ fn handle_sta_named_property(
                     return Ok(DispatchAction::Continue);
                 }
             }
+            set_function_name_if_anonymous(&val, &prop_name);
             map.borrow_mut().insert(prop_name.to_string(), val);
             // Populate shape store IC for future fast-path stores.
             if slot != u32::MAX {
@@ -2947,6 +2998,7 @@ fn handle_sta_keyed_property(
             return Ok(DispatchAction::Continue);
         }
         drop(pm);
+        set_function_name_if_anonymous(&val, &key_str);
     }
     keyed_store(&obj, &key, val)?;
     // Accumulator stays unchanged.
@@ -4141,6 +4193,7 @@ fn handle_define_named_own_property(
     let val = ctx.frame.accumulator.clone();
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     if let JsValue::PlainObject(ref map) = obj {
+        set_function_name_if_anonymous(&val, &prop_name);
         map.borrow_mut().insert(prop_name, val);
     }
     // Accumulator stays unchanged.
@@ -4163,6 +4216,7 @@ fn handle_define_keyed_own_property(
     let val = ctx.frame.accumulator.clone();
     if let JsValue::PlainObject(ref map) = obj {
         let prop_name = to_property_key(&key)?;
+        set_function_name_if_anonymous(&val, &prop_name);
         map.borrow_mut().insert(prop_name, val);
     }
     // Accumulator stays unchanged.
@@ -4185,6 +4239,7 @@ fn handle_define_keyed_own_property_in_literal(
     let val = ctx.frame.accumulator.clone();
     if let JsValue::PlainObject(ref map) = obj {
         let prop_name = to_property_key(&key)?;
+        set_function_name_if_anonymous(&val, &prop_name);
         map.borrow_mut().insert(prop_name, val);
     }
     // Accumulator stays unchanged.
@@ -4783,6 +4838,7 @@ fn handle_create_unmapped_arguments(
         JsValue::Smi(args.len() as i32),
         PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
     );
+    map.insert_builtin("__strict_arguments__".to_string(), JsValue::Boolean(true));
     map.insert(
         "callee".to_string(),
         JsValue::NativeFunction(Rc::new(|_args: Vec<JsValue>| {
@@ -5748,8 +5804,32 @@ fn handle_call_direct_eval(
                 return Ok(DispatchAction::Continue);
             }
         };
-        ctx.frame.accumulator =
-            crate::builtins::global::global_eval_direct(&source, Rc::clone(&ctx.frame.global_env))?;
+        let local_binding_names: std::collections::HashSet<String> = ctx
+            .frame
+            .bytecode_array
+            .binding_registers()
+            .keys()
+            .cloned()
+            .collect();
+        let overlay_env = Rc::new(RefCell::new(ctx.frame.global_env.borrow().clone()));
+        {
+            let mut overlay = overlay_env.borrow_mut();
+            for (name, value) in direct_eval_local_bindings(ctx.frame) {
+                overlay.insert(name, value);
+            }
+        }
+        let result = crate::builtins::global::global_eval_direct(&source, Rc::clone(&overlay_env))?;
+        {
+            let overlay = overlay_env.borrow();
+            sync_direct_eval_bindings(ctx.frame, &overlay)?;
+            let mut globals = ctx.frame.global_env.borrow_mut();
+            for (name, value) in overlay.iter() {
+                if !local_binding_names.contains(name) {
+                    globals.insert(name.clone(), value.clone());
+                }
+            }
+        }
+        ctx.frame.accumulator = result;
     } else {
         // Callee was reassigned — fall through to normal call.
         match callee {

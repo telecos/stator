@@ -173,6 +173,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use crate::builtins::error::{pop_call_frame, push_call_frame};
+use crate::builtins::function::{function_bound_name, function_to_string};
 use crate::builtins::proxy::{proxy_get, proxy_set};
 use crate::builtins::symbol::symbol_description;
 use crate::bytecode::bytecode_array::{
@@ -347,7 +348,7 @@ fn fn_props_key(ba: &Rc<BytecodeArray>) -> usize {
 }
 
 /// Store a named property on a `Function` value's side-table entry.
-fn fn_props_set(ba: &Rc<BytecodeArray>, name: String, val: JsValue) {
+pub(crate) fn fn_props_set(ba: &Rc<BytecodeArray>, name: String, val: JsValue) {
     FUNCTION_PROPS.with(|fp| {
         let mut table = fp.borrow_mut();
         let map = table
@@ -368,6 +369,54 @@ fn fn_props_get(ba: &Rc<BytecodeArray>, name: &str) -> JsValue {
             .and_then(|map| map.borrow().get(name).cloned())
             .unwrap_or(JsValue::Undefined)
     })
+}
+
+fn function_name_of(value: &JsValue) -> String {
+    match value {
+        JsValue::Function(ba) => match fn_props_get(ba, "name") {
+            JsValue::String(name) => name.to_string(),
+            _ => ba.function_name().to_string(),
+        },
+        JsValue::PlainObject(map) => match map.borrow().get("name").cloned() {
+            Some(JsValue::String(name)) => name.to_string(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+fn function_length_of(value: &JsValue) -> i32 {
+    match value {
+        JsValue::Function(ba) => match fn_props_get(ba, "length") {
+            JsValue::Smi(length) => length,
+            JsValue::HeapNumber(length) => length as i32,
+            _ => ba.function_length() as i32,
+        },
+        JsValue::PlainObject(map) => match map.borrow().get("length").cloned() {
+            Some(JsValue::Smi(length)) => length,
+            Some(JsValue::HeapNumber(length)) => length as i32,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+fn function_source_of(value: &JsValue) -> Option<String> {
+    match value {
+        JsValue::Function(ba) => match fn_props_get(ba, "source") {
+            JsValue::String(source) => Some(source.to_string()),
+            _ => ba.source_text().map(str::to_string),
+        },
+        JsValue::PlainObject(map) => match map.borrow().get("source").cloned() {
+            Some(JsValue::String(source)) => Some(source.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn function_to_string_of(value: &JsValue) -> String {
+    function_source_of(value).unwrap_or_else(|| function_to_string(&function_name_of(value)))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2335,30 +2384,110 @@ pub(super) fn to_property_key(key: &JsValue) -> StatorResult<String> {
 pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
     // Fast path: PlainObject — the most common case.
     if let JsValue::PlainObject(map) = obj {
-        let borrow = map.borrow();
-        // Check for getter accessor (__get_<key>__) BEFORE the data key so
-        // that accessor properties defined via Object.defineProperty are
-        // dispatched correctly even when a placeholder data key exists.
         let getter_key = format!("__get_{key}__");
-        if let Some(getter) = borrow.get(&getter_key).cloned() {
-            drop(borrow);
-            return match dispatch_getter(&getter, obj) {
-                Ok(v) => v,
-                Err(_) => JsValue::Undefined,
-            };
-        }
-        if let Some(val) = borrow.get(key) {
-            return val.clone();
+        let has_call = {
+            let borrow = map.borrow();
+            // Check for getter accessor (__get_<key>__) BEFORE the data key so
+            // that accessor properties defined via Object.defineProperty are
+            // dispatched correctly even when a placeholder data key exists.
+            if let Some(getter) = borrow.get(&getter_key).cloned() {
+                return match dispatch_getter(&getter, obj) {
+                    Ok(v) => v,
+                    Err(_) => JsValue::Undefined,
+                };
+            }
+            if let Some(val) = borrow.get(key) {
+                return val.clone();
+            }
+            borrow.get("__call__").is_some()
+        };
+        if has_call {
+            match key {
+                "call" => {
+                    let callable = obj.clone();
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let call_args = args.get(1..).unwrap_or(&[]).to_vec();
+                        dispatch_call_with_this(&callable, this_arg, call_args)
+                    }));
+                }
+                "apply" => {
+                    let callable = obj.clone();
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let call_args = match args.get(1) {
+                            Some(JsValue::Array(arr)) => arr.borrow().clone(),
+                            Some(JsValue::PlainObject(map)) => {
+                                let borrow = map.borrow();
+                                let len = match borrow.get("length") {
+                                    Some(JsValue::Smi(n)) => *n as usize,
+                                    Some(JsValue::HeapNumber(n)) => *n as usize,
+                                    _ => 0,
+                                };
+                                (0..len)
+                                    .map(|i| {
+                                        borrow
+                                            .get(&i.to_string())
+                                            .cloned()
+                                            .unwrap_or(JsValue::Undefined)
+                                    })
+                                    .collect()
+                            }
+                            _ => vec![],
+                        };
+                        dispatch_call_with_this(&callable, this_arg, call_args)
+                    }));
+                }
+                "bind" => {
+                    let callable = obj.clone();
+                    let target_name = function_name_of(obj);
+                    let target_length = function_length_of(obj);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let bound_args = args.get(1..).unwrap_or(&[]).to_vec();
+                        let result_len = std::cmp::max(0, target_length - bound_args.len() as i32);
+                        let callable = callable.clone();
+                        let bound_this = this_arg.clone();
+                        let bound_prefix = bound_args.clone();
+                        let call_fn =
+                            JsValue::NativeFunction(Rc::new(move |call_args: Vec<JsValue>| {
+                                let mut all_args = bound_prefix.clone();
+                                all_args.extend(call_args);
+                                dispatch_call_with_this(&callable, bound_this.clone(), all_args)
+                            }));
+                        let mut props = PropertyMap::new();
+                        props.insert("__call__".to_string(), call_fn);
+                        props.insert(
+                            "name".to_string(),
+                            JsValue::String(function_bound_name(&target_name).into()),
+                        );
+                        props.insert("length".to_string(), JsValue::Smi(result_len));
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
+                    }));
+                }
+                "name" => return JsValue::String(function_name_of(obj).into()),
+                "length" => return JsValue::Smi(function_length_of(obj)),
+                "toString" => {
+                    let callable = obj.clone();
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let target = args.first().cloned().unwrap_or_else(|| callable.clone());
+                        Ok(JsValue::String(function_to_string_of(&target).into()))
+                    }));
+                }
+                "constructor" => return lookup_global_constructor("Function"),
+                _ => {}
+            }
         }
         // If this PlainObject is an array literal, delegate to Array.prototype
         // BEFORE falling through to Object.prototype methods (e.g. toString).
-        if borrow
+        if map
+            .borrow()
             .get("__is_array__")
             .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
         {
-            drop(borrow);
             return array_literal_proto_lookup(obj, key);
         }
+        let borrow = map.borrow();
         // Object.prototype methods available on all plain objects.
         match key {
             "hasOwnProperty" => {
@@ -4780,8 +4909,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     };
                     let ba2 = Rc::clone(&ba);
                     let bound_count = bound_args.len() as i32;
-                    let target_len = ba.parameter_count() as i32;
+                    let target_len = ba.function_length() as i32;
                     let result_len = std::cmp::max(0, target_len - bound_count);
+                    let bound_name =
+                        function_bound_name(&function_name_of(&JsValue::Function(Rc::clone(&ba))));
 
                     // Build bound function as a PlainObject with __call__,
                     // carrying the correct `name` and `length` per ES §20.2.3.2.
@@ -4797,25 +4928,22 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         }));
                     let mut props = PropertyMap::new();
                     props.insert("__call__".to_string(), call_fn);
-                    props.insert(
-                        "name".to_string(),
-                        JsValue::String("bound ".to_string().into()),
-                    );
+                    props.insert("name".to_string(), JsValue::String(bound_name.into()));
                     props.insert("length".to_string(), JsValue::Smi(result_len));
                     Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
                 }));
             }
             "name" => {
-                return JsValue::String(String::new().into());
+                return JsValue::String(function_name_of(obj).into());
             }
             "length" => {
-                return JsValue::Smi(ba.parameter_count() as i32);
+                return JsValue::Smi(ba.function_length() as i32);
             }
             "toString" => {
-                return JsValue::NativeFunction(Rc::new(|_args| {
-                    Ok(JsValue::String(
-                        "function () { [native code] }".to_string().into(),
-                    ))
+                let callable = obj.clone();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let target = args.first().cloned().unwrap_or_else(|| callable.clone());
+                    Ok(JsValue::String(function_to_string_of(&target).into()))
                 }));
             }
             "constructor" => return lookup_global_constructor("Function"),
@@ -4855,10 +4983,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 return JsValue::NativeFunction(Rc::new(move |_args| Ok(obj_clone.clone())));
             }
             "toLocaleString" => {
-                return JsValue::NativeFunction(Rc::new(|_args| {
-                    Ok(JsValue::String(
-                        "function () { [native code] }".to_string().into(),
-                    ))
+                let callable = obj.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(function_to_string_of(&callable).into()))
                 }));
             }
             _ => {}
@@ -4901,6 +5028,8 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             "bind" => {
                 let f = Rc::clone(f);
+                let target_name = function_name_of(obj);
+                let target_length = function_length_of(obj);
                 return JsValue::NativeFunction(Rc::new(move |args| {
                     let this_arg = args.first().cloned().unwrap_or(JsValue::Undefined);
                     let bound_args: Vec<JsValue> = if args.len() > 1 {
@@ -4909,21 +5038,30 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         vec![]
                     };
                     let f2 = Rc::clone(&f);
-                    Ok(JsValue::NativeFunction(Rc::new(move |call_args| {
-                        let mut all_args = vec![this_arg.clone()];
-                        all_args.extend(bound_args.clone());
+                    let bound_name = function_bound_name(&target_name);
+                    let result_len = std::cmp::max(0, target_length - bound_args.len() as i32);
+                    let bound_this = this_arg.clone();
+                    let bound_prefix = bound_args.clone();
+                    let call_fn = JsValue::NativeFunction(Rc::new(move |call_args| {
+                        let mut all_args = vec![bound_this.clone()];
+                        all_args.extend(bound_prefix.clone());
                         all_args.extend(call_args);
                         f2(all_args)
-                    })))
+                    }));
+                    let mut props = PropertyMap::new();
+                    props.insert("__call__".to_string(), call_fn);
+                    props.insert("name".to_string(), JsValue::String(bound_name.into()));
+                    props.insert("length".to_string(), JsValue::Smi(result_len));
+                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
                 }));
             }
-            "name" => return JsValue::String(String::new().into()),
-            "length" => return JsValue::Smi(0),
+            "name" => return JsValue::String(function_name_of(obj).into()),
+            "length" => return JsValue::Smi(function_length_of(obj)),
             "toString" => {
-                return JsValue::NativeFunction(Rc::new(|_args| {
-                    Ok(JsValue::String(
-                        "function () { [native code] }".to_string().into(),
-                    ))
+                let callable = obj.clone();
+                return JsValue::NativeFunction(Rc::new(move |args| {
+                    let target = args.first().cloned().unwrap_or_else(|| callable.clone());
+                    Ok(JsValue::String(function_to_string_of(&target).into()))
                 }));
             }
             "constructor" => return lookup_global_constructor("Function"),
@@ -4955,10 +5093,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 return JsValue::NativeFunction(Rc::new(move |_args| Ok(obj_clone.clone())));
             }
             "toLocaleString" => {
-                return JsValue::NativeFunction(Rc::new(|_args| {
-                    Ok(JsValue::String(
-                        "function () { [native code] }".to_string().into(),
-                    ))
+                let callable = obj.clone();
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::String(function_to_string_of(&callable).into()))
                 }));
             }
             _ => {}
@@ -5327,6 +5464,14 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
         }
         JsValue::PlainObject(_map) => {
             let prop_name = to_property_key(key)?;
+            if let JsValue::PlainObject(map) = obj
+                && prop_name == "callee"
+                && map.borrow().get("__strict_arguments__") == Some(&JsValue::Boolean(true))
+            {
+                return Err(StatorError::TypeError(
+                    "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them".into(),
+                ));
+            }
             Ok(proto_lookup(obj, &prop_name))
         }
         JsValue::Array(items) => {

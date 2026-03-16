@@ -268,12 +268,7 @@ pub fn function_dynamic_to_string(params: &[&str], body: &str) -> String {
 /// ```
 pub fn function_constructor(args: &[JsValue]) -> StatorResult<JsValue> {
     use crate::builtins::global::global_eval;
-
-    if args.is_empty() {
-        // new Function() — empty body
-        let source = "function anonymous() {\n\n}";
-        return global_eval(source);
-    }
+    use crate::interpreter::fn_props_set;
 
     // Convert all args to strings.
     let string_args: Vec<String> = args
@@ -281,14 +276,25 @@ pub fn function_constructor(args: &[JsValue]) -> StatorResult<JsValue> {
         .map(|a| a.to_js_string())
         .collect::<StatorResult<Vec<String>>>()?;
 
-    let (body, params) = string_args.split_last().unwrap();
-    let param_list = params.join(",");
-
-    // Validate parameters by attempting to parse a function declaration.
-    let source = format!("function anonymous({param_list}\n) {{\n{body}\n}}");
-
-    // Use indirect eval to compile and return the function value.
-    global_eval(&source)
+    let (body, params) = match string_args.split_last() {
+        Some((body, params)) => (body.clone(), params.to_vec()),
+        None => (String::new(), Vec::new()),
+    };
+    let source_text = function_dynamic_to_string(
+        &params.iter().map(String::as_str).collect::<Vec<_>>(),
+        &body,
+    );
+    let source = format!("({source_text})");
+    let result = global_eval(&source)?;
+    if let JsValue::Function(ba) = &result {
+        fn_props_set(ba, "name".to_string(), JsValue::String("anonymous".into()));
+        fn_props_set(
+            ba,
+            "source".to_string(),
+            JsValue::String(source_text.into()),
+        );
+    }
+    Ok(result)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
