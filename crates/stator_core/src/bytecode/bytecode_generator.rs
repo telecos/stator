@@ -1004,8 +1004,9 @@ impl FunctionCompiler {
     fn compile_var_decl(&mut self, decl: &VarDecl) -> StatorResult<()> {
         let is_using = matches!(decl.kind, VarKind::Using | VarKind::AwaitUsing);
         let is_const = matches!(decl.kind, VarKind::Const);
+        let is_var = matches!(decl.kind, VarKind::Var);
         for declarator in &decl.declarators {
-            let reg = self.compile_var_declarator(declarator, is_const)?;
+            let reg = self.compile_var_declarator(declarator, is_const, is_var)?;
             if is_using && let Some(r) = reg {
                 self.using_vars.last_mut().unwrap().push(r);
             }
@@ -1017,6 +1018,7 @@ impl FunctionCompiler {
         &mut self,
         declarator: &VarDeclarator,
         is_const: bool,
+        is_var: bool,
     ) -> StatorResult<Option<Register>> {
         match &declarator.id {
             Pat::Ident(ident) => {
@@ -1031,6 +1033,24 @@ impl FunctionCompiler {
                     }
                     self.compile_ident_store(&ident.name)?;
                     Ok(None)
+                } else if self.is_program && is_var {
+                    // Program-level `var`: store exclusively via StaGlobal
+                    // so that nested callbacks (which also use StaGlobal /
+                    // LdaGlobal) share the same storage.  Without this,
+                    // the program would read from a stale register while
+                    // the callback writes to global_env.
+                    if let Some(init) = &declarator.init {
+                        self.compile_expr(init)?;
+                    } else {
+                        self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                    }
+                    let name_idx = self.add_string(&ident.name);
+                    let sta_slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::StaGlobal,
+                        vec![Operand::ConstantPoolIdx(name_idx), sta_slot],
+                    ));
+                    Ok(None)
                 } else {
                     // Normal scope: allocate the local register.
                     let reg = if is_const {
@@ -1044,19 +1064,6 @@ impl FunctionCompiler {
                         self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
                     }
                     self.emit_star(reg);
-                    // Top-level var declarations must also be stored as
-                    // globals so that nested functions (which use
-                    // LdaGlobal) can see them — same as function
-                    // declarations (compile_fn_decl).
-                    if self.is_program {
-                        let name_idx = self.add_string(&ident.name);
-                        let sta_slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
-                        self.emit_ldar(reg);
-                        self.emit(Instruction::new_unchecked(
-                            Opcode::StaGlobal,
-                            vec![Operand::ConstantPoolIdx(name_idx), sta_slot],
-                        ));
-                    }
                     Ok(Some(reg))
                 }
             }
