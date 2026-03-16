@@ -7881,7 +7881,7 @@ fn make_finalization_registry_builtin() -> JsValue {
         "__call__".into(),
         native(|args| {
             let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
-            if !matches!(callback, JsValue::NativeFunction(_)) {
+            if !is_callable(&callback) {
                 return Err(StatorError::TypeError(
                     "FinalizationRegistry requires a callable cleanup callback".into(),
                 ));
@@ -7903,6 +7903,12 @@ fn make_finalization_registry_builtin() -> JsValue {
 
                         match target {
                             JsValue::Object(ptr) => {
+                                if matches!(&held_value, JsValue::Object(held_ptr) if *held_ptr == *ptr) {
+                                    return Err(StatorError::TypeError(
+                                        "FinalizationRegistry held value must not be the target"
+                                            .into(),
+                                    ));
+                                }
                                 let unregister_token = match token {
                                     JsValue::Object(tok_ptr) => Some(*tok_ptr),
                                     JsValue::Undefined => None,
@@ -7922,6 +7928,13 @@ fn make_finalization_registry_builtin() -> JsValue {
                                 Ok(JsValue::Undefined)
                             }
                             JsValue::PlainObject(rc) => {
+                                if matches!(&held_value, JsValue::PlainObject(held_rc) if Rc::ptr_eq(held_rc, rc))
+                                {
+                                    return Err(StatorError::TypeError(
+                                        "FinalizationRegistry held value must not be the target"
+                                            .into(),
+                                    ));
+                                }
                                 let unregister_token = match token {
                                     JsValue::PlainObject(tok_rc) => Some(tok_rc),
                                     JsValue::Undefined => None,
@@ -7979,10 +7992,8 @@ fn make_finalization_registry_builtin() -> JsValue {
                     native(move |_a| {
                         finalization_registry_sweep_plain(&mut inner.borrow_mut());
                         let held_values = finalization_registry_drain(&mut inner.borrow_mut());
-                        if let JsValue::NativeFunction(ref f) = *cb {
-                            for held in held_values {
-                                f(vec![held])?;
-                            }
+                        for held in held_values {
+                            dispatch_call_value(cb.as_ref(), vec![held])?;
                         }
                         Ok(JsValue::Undefined)
                     }),
@@ -8003,6 +8014,12 @@ fn make_finalization_registry_builtin() -> JsValue {
                     }),
                 );
             }
+
+            obj.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("FinalizationRegistry".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
 
             obj.make_all_non_enumerable();
             Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
@@ -15697,6 +15714,117 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── WeakRef & FinalizationRegistry (end-to-end) ─────────────────────────
+
+    /// `WeakRef.prototype.deref()` returns the original object and `@@toStringTag`
+    /// identifies the instance as `WeakRef`.
+    #[test]
+    fn test_e2e_weak_ref_deref_and_to_string_tag() {
+        let result = global_eval(
+            r#"
+            const target = {};
+            const refObj = new WeakRef(target);
+            refObj.deref() === target && Object.prototype.toString.call(refObj) === "[object WeakRef]";
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `WeakRef` construction rejects non-object targets.
+    #[test]
+    fn test_e2e_weak_ref_constructor_rejects_non_object() {
+        let result = global_eval(
+            r#"
+            try {
+                new WeakRef(1);
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `FinalizationRegistry` accepts ordinary JS functions as cleanup callbacks.
+    #[test]
+    fn test_e2e_finalization_registry_accepts_function_callback() {
+        let result = global_eval(
+            r#"
+            const registry = new FinalizationRegistry(function(value) { return value; });
+            typeof registry.register === "function" && typeof registry.unregister === "function";
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `FinalizationRegistry` construction rejects non-callable cleanup callbacks.
+    #[test]
+    fn test_e2e_finalization_registry_rejects_non_callable_callback() {
+        let result = global_eval(
+            r#"
+            try {
+                new FinalizationRegistry(1);
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `register`/`unregister` track object tokens and `@@toStringTag` identifies
+    /// the registry instance.
+    #[test]
+    fn test_e2e_finalization_registry_register_unregister_and_to_string_tag() {
+        let result = global_eval(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            const target = {};
+            const token = {};
+            registry.register(target, "held", token);
+            const first = registry.unregister(token);
+            const second = registry.unregister(token);
+            first === true
+                && second === false
+                && Object.prototype.toString.call(registry) === "[object FinalizationRegistry]";
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `register` rejects non-object targets and `target === heldValue`.
+    #[test]
+    fn test_e2e_finalization_registry_register_validates_inputs() {
+        let result = global_eval(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            let nonObjectRejected = false;
+            let sameValueRejected = false;
+            try {
+                registry.register(1, "held");
+            } catch (e) {
+                nonObjectRejected = true;
+            }
+            const target = {};
+            try {
+                registry.register(target, target);
+            } catch (e) {
+                sameValueRejected = true;
+            }
+            nonObjectRejected && sameValueRejected;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 
     // ── Promise ─────────────────────────────────────────────────────────────
