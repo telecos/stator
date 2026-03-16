@@ -82,6 +82,19 @@ pub fn weak_set_new() -> JsWeakSet {
     JsWeakSet::default()
 }
 
+/// ECMAScript §24.4.1.1 `new WeakSet(iterable)`.
+///
+/// Creates a [`JsWeakSet`] from an iterable of object pointers.
+///
+/// Returns [`StatorError::TypeError`] if any value is null.
+pub fn weak_set_from_iterable(values: Vec<*mut HeapObject>) -> StatorResult<JsWeakSet> {
+    let mut set = weak_set_new();
+    for value in values {
+        weak_set_add(&mut set, value)?;
+    }
+    Ok(set)
+}
+
 // ── weak_set_add ──────────────────────────────────────────────────────────────
 
 /// ECMAScript §24.4.3.1 `WeakSet.prototype.add(value)`.
@@ -267,6 +280,21 @@ mod tests {
     fn test_weak_set_null_delete_returns_false() {
         let mut ws = weak_set_new();
         assert!(!weak_set_delete(&mut ws, std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_weak_set_from_iterable_populates_entries() {
+        let mut a = HeapObject::new_null();
+        let mut b = HeapObject::new_null();
+        let ws = weak_set_from_iterable(vec![&raw mut a, &raw mut b]).unwrap();
+        assert!(weak_set_has(&ws, &raw mut a));
+        assert!(weak_set_has(&ws, &raw mut b));
+    }
+
+    #[test]
+    fn test_weak_set_from_iterable_rejects_null_value() {
+        let err = weak_set_from_iterable(vec![std::ptr::null_mut()]).unwrap_err();
+        assert!(matches!(err, StatorError::TypeError(_)));
     }
 
     // ── Pointer identity ──────────────────────────────────────────────────────
