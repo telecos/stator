@@ -693,8 +693,17 @@ fn make_error_constructor(kind: ErrorKind) -> JsValue {
 ///
 /// This allows `instanceof` checks (via `@@hasInstance`) and name-based
 /// detection in the Test262 harness (via the `name` property).
+///
+/// `error_proto` is `Error.prototype` and `error_ctor` is the `Error`
+/// constructor so that the correct prototype chains are established:
+///   - `NativeError.prototype.__proto__` → `Error.prototype`
+///   - `NativeError.__proto__` → `Error`
 #[inline(never)]
-fn make_error_constructor_object(kind: ErrorKind) -> JsValue {
+fn make_error_constructor_object(
+    kind: ErrorKind,
+    error_proto: &JsValue,
+    error_ctor: &JsValue,
+) -> JsValue {
     let mut props = PropertyMap::new();
     props.insert("__call__".into(), make_error_constructor(kind));
     props.insert(
@@ -711,6 +720,8 @@ fn make_error_constructor_object(kind: ErrorKind) -> JsValue {
             }
         }),
     );
+    // §20.5.6.1 NativeError.__proto__ → Error (constructor chain)
+    props.insert("__proto__".into(), error_ctor.clone());
     // ── Subtype prototype ───────────────────────────────────────────────
     let err_proto_rc = {
         let mut proto = PropertyMap::new();
@@ -726,6 +737,8 @@ fn make_error_constructor_object(kind: ErrorKind) -> JsValue {
                 error_prototype_to_string(this)
             }),
         );
+        // §20.5.6.2 NativeError.prototype.__proto__ → Error.prototype
+        proto.insert("__proto__".into(), error_proto.clone());
         proto.make_all_non_enumerable();
         let proto_rc = Rc::new(RefCell::new(proto));
         props.insert("prototype".into(), JsValue::PlainObject(proto_rc.clone()));
@@ -761,7 +774,7 @@ fn extract_cause(options: Option<&JsValue>) -> Option<JsValue> {
 /// Returns a `PlainObject` with `__call__`, `name`, `@@hasInstance`, and a
 /// `prototype` that carries `name`, `message`, `toString`, and `constructor`.
 #[inline(never)]
-fn make_aggregate_error_constructor() -> JsValue {
+fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue) -> JsValue {
     let call = native(|args| {
         // First arg: errors (iterable — we accept Array).
         let errors_val = args.first().unwrap_or(&JsValue::Undefined);
@@ -796,6 +809,8 @@ fn make_aggregate_error_constructor() -> JsValue {
             }
         }),
     );
+    // §20.5.6.1 AggregateError.__proto__ → Error
+    props.insert("__proto__".into(), error_ctor.clone());
 
     // ── AggregateError.prototype ────────────────────────────────────────
     let proto_rc = {
@@ -812,6 +827,8 @@ fn make_aggregate_error_constructor() -> JsValue {
                 error_prototype_to_string(this)
             }),
         );
+        // §20.5.6.2 AggregateError.prototype.__proto__ → Error.prototype
+        proto.insert("__proto__".into(), error_proto.clone());
         proto.make_all_non_enumerable();
         Rc::new(RefCell::new(proto))
     };
@@ -907,7 +924,9 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
     );
 
     // ── Error.prototype ─────────────────────────────────────────────────
-    {
+    // Build as a shared Rc so error subtype prototypes can link to it via
+    // __proto__, forming the correct prototype chain.
+    let error_proto_rc = {
         let mut proto = PropertyMap::new();
         proto.insert("name".into(), JsValue::String("Error".into()));
         proto.insert("message".into(), JsValue::String(String::new().into()));
@@ -920,61 +939,68 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
         );
         proto.insert("@@toStringTag".into(), JsValue::String("Error".into()));
         proto.make_all_non_enumerable();
-        error_props.insert(
-            "prototype".into(),
-            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
-        );
-    }
+        Rc::new(RefCell::new(proto))
+    };
+    error_props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(error_proto_rc.clone()),
+    );
 
     error_props.make_all_non_enumerable();
     let error_val = JsValue::PlainObject(Rc::new(RefCell::new(error_props)));
-    globals.insert("Error".into(), finalize_ctor(error_val, "Error"));
+    let error_ctor = finalize_ctor(error_val, "Error");
+    globals.insert("Error".into(), error_ctor.clone());
+
+    let error_proto_val = JsValue::PlainObject(error_proto_rc);
 
     globals.insert(
         "TypeError".into(),
         finalize_ctor(
-            make_error_constructor_object(ErrorKind::TypeError),
+            make_error_constructor_object(ErrorKind::TypeError, &error_proto_val, &error_ctor),
             "TypeError",
         ),
     );
     globals.insert(
         "RangeError".into(),
         finalize_ctor(
-            make_error_constructor_object(ErrorKind::RangeError),
+            make_error_constructor_object(ErrorKind::RangeError, &error_proto_val, &error_ctor),
             "RangeError",
         ),
     );
     globals.insert(
         "ReferenceError".into(),
         finalize_ctor(
-            make_error_constructor_object(ErrorKind::ReferenceError),
+            make_error_constructor_object(ErrorKind::ReferenceError, &error_proto_val, &error_ctor),
             "ReferenceError",
         ),
     );
     globals.insert(
         "SyntaxError".into(),
         finalize_ctor(
-            make_error_constructor_object(ErrorKind::SyntaxError),
+            make_error_constructor_object(ErrorKind::SyntaxError, &error_proto_val, &error_ctor),
             "SyntaxError",
         ),
     );
     globals.insert(
         "URIError".into(),
         finalize_ctor(
-            make_error_constructor_object(ErrorKind::URIError),
+            make_error_constructor_object(ErrorKind::URIError, &error_proto_val, &error_ctor),
             "URIError",
         ),
     );
     globals.insert(
         "EvalError".into(),
         finalize_ctor(
-            make_error_constructor_object(ErrorKind::EvalError),
+            make_error_constructor_object(ErrorKind::EvalError, &error_proto_val, &error_ctor),
             "EvalError",
         ),
     );
     globals.insert(
         "AggregateError".into(),
-        finalize_ctor(make_aggregate_error_constructor(), "AggregateError"),
+        finalize_ctor(
+            make_aggregate_error_constructor(&error_proto_val, &error_ctor),
+            "AggregateError",
+        ),
     );
     globals.insert(
         "SuppressedError".into(),
@@ -7464,7 +7490,7 @@ fn make_function() -> JsValue {
 
         // Function.prototype[Symbol.hasInstance](V)
         proto.insert(
-            format!("Symbol({})", SYMBOL_HAS_INSTANCE),
+            "@@hasInstance".into(),
             native(|args| {
                 let constructor_proto = args.first().cloned().unwrap_or(JsValue::Undefined);
                 let value = args.get(1).cloned().unwrap_or(JsValue::Undefined);
