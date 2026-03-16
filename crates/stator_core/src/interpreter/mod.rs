@@ -9329,6 +9329,8 @@ mod tests {
 
         let mut ctor_map = PropertyMap::new();
         ctor_map.insert("prototype".to_string(), JsValue::PlainObject(proto.clone()));
+        // Mark the mock constructor as callable so the RHS check passes.
+        ctor_map.insert("__call__".to_string(), JsValue::Boolean(true));
         let constructor = JsValue::PlainObject(Rc::new(RefCell::new(ctor_map)));
 
         let mut inst_map = PropertyMap::new();
@@ -9356,6 +9358,8 @@ mod tests {
 
         let mut ctor_map = PropertyMap::new();
         ctor_map.insert("prototype".to_string(), JsValue::PlainObject(proto_a));
+        // Mark the mock constructor as callable so the RHS check passes.
+        ctor_map.insert("__call__".to_string(), JsValue::Boolean(true));
         let constructor = JsValue::PlainObject(Rc::new(RefCell::new(ctor_map)));
 
         let mut inst_map = PropertyMap::new();
