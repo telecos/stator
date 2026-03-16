@@ -244,6 +244,108 @@ fn to_array_like_elements(val: &JsValue) -> (Vec<JsValue>, usize) {
     }
 }
 
+#[inline]
+fn parse_integer_index_key(key: &str) -> Option<u32> {
+    if key.is_empty() || (key.len() > 1 && key.as_bytes()[0] == b'0') {
+        return None;
+    }
+    let n: u32 = key.parse().ok()?;
+    if n < u32::MAX { Some(n) } else { None }
+}
+
+fn visible_string_property_name(raw_key: &str) -> Option<String> {
+    let visible = if let Some(prop) = raw_key
+        .strip_prefix("__get_")
+        .and_then(|s| s.strip_suffix("__"))
+    {
+        prop
+    } else if let Some(prop) = raw_key
+        .strip_prefix("__set_")
+        .and_then(|s| s.strip_suffix("__"))
+    {
+        prop
+    } else {
+        if raw_key.starts_with("__") || raw_key.starts_with('#') {
+            return None;
+        }
+        raw_key
+    };
+
+    if property_key_to_symbol(visible).is_some() {
+        return None;
+    }
+
+    Some(visible.to_string())
+}
+
+fn own_string_property_keys(map: &PropertyMap, enumerable_only: bool) -> Vec<String> {
+    let mut ordered = Vec::new();
+    let mut seen = HashSet::new();
+
+    for raw_key in map.keys() {
+        if enumerable_only && !map.is_enumerable(raw_key) {
+            continue;
+        }
+
+        if let Some(visible) = visible_string_property_name(raw_key)
+            && seen.insert(visible.clone())
+        {
+            ordered.push(visible);
+        }
+    }
+
+    let mut integer_keys = Vec::new();
+    let mut string_keys = Vec::new();
+    for key in ordered {
+        if let Some(index) = parse_integer_index_key(&key) {
+            integer_keys.push((index, key));
+        } else {
+            string_keys.push(key);
+        }
+    }
+    integer_keys.sort_by_key(|(index, _)| *index);
+
+    integer_keys
+        .into_iter()
+        .map(|(_, key)| key)
+        .chain(string_keys)
+        .collect()
+}
+
+fn enumerable_own_string_keys(value: &JsValue) -> Vec<String> {
+    match value {
+        JsValue::PlainObject(map) => own_string_property_keys(&map.borrow(), true),
+        JsValue::Error(error) => own_string_property_keys(&error.props.borrow(), true),
+        JsValue::Array(items) => (0..items.borrow().len()).map(|i| i.to_string()).collect(),
+        JsValue::String(s) => (0..s.chars().count()).map(|i| i.to_string()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn constructor_prototype(name: &str) -> Option<JsValue> {
+    current_global_env().and_then(|globals| {
+        let ctor = globals.borrow().get(name).cloned()?;
+        match ctor {
+            JsValue::PlainObject(map) => map.borrow().get("prototype").cloned(),
+            _ => None,
+        }
+    })
+}
+
+fn get_prototype_of_value(value: &JsValue) -> Option<JsValue> {
+    match value {
+        JsValue::PlainObject(_) | JsValue::Error(_) => get_object_prototype(value),
+        JsValue::Array(_) => constructor_prototype("Array"),
+        JsValue::Function(_) | JsValue::NativeFunction(_) => constructor_prototype("Function"),
+        JsValue::Boolean(_) => constructor_prototype("Boolean"),
+        JsValue::Smi(_) | JsValue::HeapNumber(_) => constructor_prototype("Number"),
+        JsValue::String(_) => constructor_prototype("String"),
+        JsValue::Symbol(_) => constructor_prototype("Symbol"),
+        JsValue::BigInt(_) => constructor_prototype("BigInt"),
+        _ => None,
+    }
+}
+
 /// Extract raw template segments for `String.raw`.
 fn string_raw_segments(raw: &JsValue) -> StatorResult<Vec<String>> {
     match raw {
@@ -4080,212 +4182,53 @@ fn make_object() -> JsValue {
             "keys".into(),
             builtin_fn("keys", 1, |args| {
                 let val = args.first().unwrap_or(&JsValue::Undefined);
-                // §20.1.2.15 step 1: throw TypeError for null/undefined.
                 if matches!(val, JsValue::Null | JsValue::Undefined) {
                     return Err(StatorError::TypeError(
                         "Cannot convert undefined or null to object".into(),
                     ));
                 }
-                if let JsValue::PlainObject(map) = val {
-                    let borrow = map.borrow();
-                    if borrow.get("__is_array__").is_some() {
-                        let len = match borrow.get("length") {
-                            Some(JsValue::Smi(n)) => *n as usize,
-                            _ => 0,
-                        };
-                        let keys: Vec<JsValue> = (0..len)
-                            .map(|i| JsValue::String(i.to_string().into()))
-                            .collect();
-                        Ok(JsValue::new_array(keys))
-                    } else {
-                        let mut keys: Vec<JsValue> = Vec::new();
-                        let mut seen = std::collections::HashSet::new();
-                        // Collect accessor property names from __get_*__/__set_*__.
-                        for k in borrow.enumerable_keys() {
-                            if let Some(prop) =
-                                k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
-                            {
-                                if seen.insert(prop.to_string()) {
-                                    keys.push(JsValue::String(prop.to_string().into()));
-                                }
-                                continue;
-                            }
-                            if let Some(prop) =
-                                k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
-                            {
-                                if seen.insert(prop.to_string()) {
-                                    keys.push(JsValue::String(prop.to_string().into()));
-                                }
-                                continue;
-                            }
-                            if k.starts_with("__") || k.starts_with('#') {
-                                continue;
-                            }
-                            if seen.insert(k.clone()) {
-                                keys.push(JsValue::String(k.clone().into()));
-                            }
-                        }
-                        Ok(JsValue::new_array(keys))
-                    }
-                } else if let JsValue::Array(items) = val {
-                    let len = items.borrow().len();
-                    let keys: Vec<JsValue> = (0..len)
-                        .map(|i| JsValue::String(i.to_string().into()))
-                        .collect();
-                    Ok(JsValue::new_array(keys))
-                } else if let JsValue::String(s) = val {
-                    let keys: Vec<JsValue> = (0..s.chars().count())
-                        .map(|i| JsValue::String(i.to_string().into()))
-                        .collect();
-                    Ok(JsValue::new_array(keys))
-                } else {
-                    Ok(JsValue::new_array(vec![]))
-                }
+                let keys = enumerable_own_string_keys(val)
+                    .into_iter()
+                    .map(|key| JsValue::String(key.into()))
+                    .collect();
+                Ok(JsValue::new_array(keys))
             }),
         );
         props.insert(
             "values".into(),
             builtin_fn("values", 1, |args| {
                 let val = args.first().unwrap_or(&JsValue::Undefined);
-                // §20.1.2.22 step 1: throw TypeError for null/undefined.
                 if matches!(val, JsValue::Null | JsValue::Undefined) {
                     return Err(StatorError::TypeError(
                         "Cannot convert undefined or null to object".into(),
                     ));
                 }
-                if let JsValue::PlainObject(map) = val {
-                    let borrow = map.borrow();
-                    if borrow.get("__is_array__").is_some() {
-                        let len = match borrow.get("length") {
-                            Some(JsValue::Smi(n)) => *n as usize,
-                            _ => 0,
-                        };
-                        let values: Vec<JsValue> = (0..len)
-                            .filter_map(|i| borrow.get(&i.to_string()).cloned())
-                            .collect();
-                        Ok(JsValue::new_array(values))
-                    } else {
-                        let mut values: Vec<JsValue> = Vec::new();
-                        let mut seen = std::collections::HashSet::new();
-                        // Include accessor property names (value=undefined
-                        // since we cannot invoke getters in this context).
-                        for k in borrow.enumerable_keys() {
-                            if let Some(prop) =
-                                k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
-                            {
-                                if seen.insert(prop.to_string()) {
-                                    values.push(JsValue::Undefined);
-                                }
-                                continue;
-                            }
-                            if let Some(prop) =
-                                k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
-                            {
-                                if seen.insert(prop.to_string()) {
-                                    values.push(JsValue::Undefined);
-                                }
-                                continue;
-                            }
-                            if k.starts_with("__") || k.starts_with('#') {
-                                continue;
-                            }
-                            if seen.insert(k.clone()) {
-                                values.push(borrow.get(k).cloned().unwrap_or(JsValue::Undefined));
-                            }
-                        }
-                        Ok(JsValue::new_array(values))
-                    }
-                } else if let JsValue::Array(items) = val {
-                    let values = items.borrow().clone();
-                    Ok(JsValue::new_array(values))
-                } else {
-                    Ok(JsValue::new_array(vec![]))
+                let mut values = Vec::new();
+                for key in enumerable_own_string_keys(val) {
+                    values.push(dispatch_get_property_value(
+                        val,
+                        JsValue::String(key.into()),
+                    )?);
                 }
+                Ok(JsValue::new_array(values))
             }),
         );
         props.insert(
             "entries".into(),
             builtin_fn("entries", 1, |args| {
                 let val = args.first().unwrap_or(&JsValue::Undefined);
-                // §20.1.2.5 step 1: throw TypeError for null/undefined.
                 if matches!(val, JsValue::Null | JsValue::Undefined) {
                     return Err(StatorError::TypeError(
                         "Cannot convert undefined or null to object".into(),
                     ));
                 }
-                if let JsValue::PlainObject(map) = val {
-                    let borrow = map.borrow();
-                    if borrow.get("__is_array__").is_some() {
-                        let len = match borrow.get("length") {
-                            Some(JsValue::Smi(n)) => *n as usize,
-                            _ => 0,
-                        };
-                        let entries: Vec<JsValue> = (0..len)
-                            .filter_map(|i| {
-                                borrow.get(&i.to_string()).cloned().map(|v| {
-                                    JsValue::new_array(vec![
-                                        JsValue::String(i.to_string().into()),
-                                        v,
-                                    ])
-                                })
-                            })
-                            .collect();
-                        Ok(JsValue::new_array(entries))
-                    } else {
-                        let mut entries: Vec<JsValue> = Vec::new();
-                        let mut seen = std::collections::HashSet::new();
-                        for k in borrow.enumerable_keys() {
-                            if let Some(prop) =
-                                k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
-                            {
-                                if seen.insert(prop.to_string()) {
-                                    entries.push(JsValue::new_array(vec![
-                                        JsValue::String(prop.to_string().into()),
-                                        JsValue::Undefined,
-                                    ]));
-                                }
-                                continue;
-                            }
-                            if let Some(prop) =
-                                k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
-                            {
-                                if seen.insert(prop.to_string()) {
-                                    entries.push(JsValue::new_array(vec![
-                                        JsValue::String(prop.to_string().into()),
-                                        JsValue::Undefined,
-                                    ]));
-                                }
-                                continue;
-                            }
-                            if k.starts_with("__") || k.starts_with('#') {
-                                continue;
-                            }
-                            if seen.insert(k.clone()) {
-                                let val = borrow.get(k).cloned().unwrap_or(JsValue::Undefined);
-                                entries.push(JsValue::new_array(vec![
-                                    JsValue::String(k.clone().into()),
-                                    val,
-                                ]));
-                            }
-                        }
-                        Ok(JsValue::new_array(entries))
-                    }
-                } else if let JsValue::Array(items) = val {
-                    let entries: Vec<JsValue> = items
-                        .borrow()
-                        .iter()
-                        .enumerate()
-                        .map(|(i, v)| {
-                            JsValue::new_array(vec![
-                                JsValue::String(i.to_string().into()),
-                                v.clone(),
-                            ])
-                        })
-                        .collect();
-                    Ok(JsValue::new_array(entries))
-                } else {
-                    Ok(JsValue::new_array(vec![]))
+                let mut entries = Vec::new();
+                for key in enumerable_own_string_keys(val) {
+                    let value =
+                        dispatch_get_property_value(val, JsValue::String(key.clone().into()))?;
+                    entries.push(JsValue::new_array(vec![JsValue::String(key.into()), value]));
                 }
+                Ok(JsValue::new_array(entries))
             }),
         );
 
@@ -4836,41 +4779,25 @@ fn make_object() -> JsValue {
             "assign".into(),
             builtin_fn("assign", 2, |args| {
                 let target = args.first().unwrap_or(&JsValue::Undefined).clone();
-
-                if let JsValue::PlainObject(target_map) = &target {
-                    for source in args.iter().skip(1) {
-                        match source {
-                            JsValue::PlainObject(src_map) => {
-                                let src = src_map.borrow();
-                                for k in src.enumerable_keys() {
-                                    if let Some(v) = src.get(k) {
-                                        target_map.borrow_mut().insert(k.clone(), v.clone());
-                                    }
-                                }
-                            }
-                            JsValue::Array(items) => {
-                                let borrow = items.borrow();
-                                for (i, v) in borrow.iter().enumerate() {
-                                    target_map.borrow_mut().insert(i.to_string(), v.clone());
-                                }
-                            }
-                            JsValue::String(s) => {
-                                for (i, ch) in s.chars().enumerate() {
-                                    target_map.borrow_mut().insert(
-                                        i.to_string(),
-                                        JsValue::String(ch.to_string().into()),
-                                    );
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    Ok(target)
-                } else {
-                    Err(crate::error::StatorError::TypeError(
-                        "Object.assign called on non-object".into(),
-                    ))
+                if matches!(target, JsValue::Null | JsValue::Undefined) {
+                    return Err(crate::error::StatorError::TypeError(
+                        "Cannot convert undefined or null to object".into(),
+                    ));
                 }
+
+                for source in args.iter().skip(1) {
+                    if matches!(source, JsValue::Null | JsValue::Undefined) {
+                        continue;
+                    }
+                    for key in enumerable_own_string_keys(source) {
+                        let value = dispatch_get_property_value(
+                            source,
+                            JsValue::String(key.clone().into()),
+                        )?;
+                        dispatch_set_property_value(&target, JsValue::String(key.into()), value)?;
+                    }
+                }
+                Ok(target)
             }),
         );
 
@@ -4930,12 +4857,9 @@ fn make_object() -> JsValue {
                 let mut map = PropertyMap::new();
                 match &proto {
                     JsValue::Null => {
-                        // Object with null prototype — no __proto__
+                        map.insert("__proto__".to_string(), JsValue::Null);
                     }
-                    JsValue::PlainObject(_) | JsValue::NativeFunction(_) => {
-                        map.insert("__proto__".to_string(), proto.clone());
-                    }
-                    JsValue::Function(_) => {
+                    _ if proto.is_object_like() => {
                         map.insert("__proto__".to_string(), proto.clone());
                     }
                     _ => {
@@ -4970,40 +4894,7 @@ fn make_object() -> JsValue {
             builtin_fn("is", 2, |args| {
                 let x = args.first().unwrap_or(&JsValue::Undefined);
                 let y = args.get(1).unwrap_or(&JsValue::Undefined);
-
-                let result = match (x, y) {
-                    (JsValue::Undefined, JsValue::Undefined) => true,
-                    (JsValue::Null, JsValue::Null) => true,
-                    (JsValue::Boolean(a), JsValue::Boolean(b)) => a == b,
-                    (JsValue::String(a), JsValue::String(b)) => a == b,
-                    (JsValue::Symbol(a), JsValue::Symbol(b)) => a == b,
-                    (JsValue::Smi(a), JsValue::Smi(b)) => a == b,
-                    (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
-                        if a.is_nan() && b.is_nan() {
-                            true
-                        } else {
-                            a.to_bits() == b.to_bits()
-                        }
-                    }
-                    (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
-                        let af = f64::from(*a);
-                        if af == 0.0 && b.is_sign_negative() {
-                            false
-                        } else {
-                            af == *b
-                        }
-                    }
-                    (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
-                        let bf = f64::from(*b);
-                        if bf == 0.0 && a.is_sign_negative() {
-                            false
-                        } else {
-                            *a == bf
-                        }
-                    }
-                    _ => false,
-                };
-                Ok(JsValue::Boolean(result))
+                Ok(JsValue::Boolean(x.same_value(y)))
             }),
         );
 
@@ -5118,8 +5009,8 @@ fn make_object() -> JsValue {
                     }
                 };
 
-                // Result is a null-prototype object (no __proto__).
-                let result = PropertyMap::new();
+                let mut result = PropertyMap::new();
+                result.insert("__proto__".to_string(), JsValue::Null);
                 let result_rc = Rc::new(RefCell::new(result));
                 for (i, item) in elements.iter().enumerate() {
                     let key = dispatch_call_value(&cb, vec![item.clone(), JsValue::Smi(i as i32)])?;
@@ -5140,23 +5031,12 @@ fn make_object() -> JsValue {
             "getPrototypeOf".into(),
             builtin_fn("getPrototypeOf", 1, |args| {
                 let obj = args.first().unwrap_or(&JsValue::Undefined);
-                // §20.1.2.12 step 1: throw TypeError for null/undefined.
                 if matches!(obj, JsValue::Null | JsValue::Undefined) {
                     return Err(StatorError::TypeError(
                         "Cannot convert undefined or null to object".into(),
                     ));
                 }
-                match obj {
-                    JsValue::PlainObject(map) => {
-                        let borrow = map.borrow();
-                        match borrow.get("__proto__") {
-                            Some(proto) => Ok(proto.clone()),
-                            None => Ok(JsValue::Null),
-                        }
-                    }
-                    JsValue::Error(_) => Ok(get_object_prototype(obj).unwrap_or(JsValue::Null)),
-                    _ => Ok(JsValue::Null),
-                }
+                Ok(get_prototype_of_value(obj).unwrap_or(JsValue::Null))
             }),
         );
 
@@ -5166,61 +5046,33 @@ fn make_object() -> JsValue {
             builtin_fn("setPrototypeOf", 2, |args| {
                 let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
                 let proto = args.get(1).unwrap_or(&JsValue::Undefined).clone();
-                // §20.1.2.21 step 1: RequireObjectCoercible(O).
                 if matches!(&obj, JsValue::Null | JsValue::Undefined) {
                     return Err(StatorError::TypeError(
                         "Cannot convert undefined or null to object".to_string(),
                     ));
                 }
-                // §20.1.2.21 step 2: proto must be Object or null.
-                if !matches!(
-                    &proto,
-                    JsValue::Null
-                        | JsValue::PlainObject(_)
-                        | JsValue::Function(_)
-                        | JsValue::NativeFunction(_)
-                        | JsValue::Array(_)
-                ) {
+                if !matches!(&proto, JsValue::Null) && !proto.is_object_like() {
                     return Err(StatorError::TypeError(
                         "Object prototype may only be an Object or null".to_string(),
                     ));
                 }
-                // §20.1.2.21 step 3: if O is not Object, return O.
                 if let JsValue::PlainObject(map) = &obj {
-                    // Non-extensible objects: TypeError unless prototype is unchanged.
                     if !map.borrow().extensible {
-                        let current_proto = map.borrow().get("__proto__").cloned();
-                        let same = match (&current_proto, &proto) {
-                            (None, JsValue::Null) => true,
-                            (Some(cur), _) => cur == &proto,
-                            _ => false,
-                        };
-                        if !same {
+                        let current_proto = get_object_prototype(&obj).unwrap_or(JsValue::Null);
+                        if !current_proto.same_value(&proto) {
                             return Err(StatorError::TypeError(
                                 "Cannot set prototype of a non-extensible object".to_string(),
                             ));
                         }
                     }
-                    // Cycle detection: walk the new proto chain and check for obj.
-                    if let JsValue::PlainObject(_) = &proto
+                    if !matches!(proto, JsValue::Null)
                         && has_prototype_in_chain(&proto, &JsValue::PlainObject(Rc::clone(map)))
                     {
                         return Err(StatorError::TypeError("Cyclic __proto__ value".to_string()));
                     }
-                    match &proto {
-                        JsValue::Null => {
-                            map.borrow_mut().remove("__proto__");
-                        }
-                        _ => {
-                            map.borrow_mut().insert("__proto__".to_string(), proto);
-                        }
-                    }
+                    map.borrow_mut().insert("__proto__".to_string(), proto);
                 } else if let JsValue::Error(e) = &obj {
-                    if matches!(proto, JsValue::Null) {
-                        e.props.borrow_mut().remove("__proto__");
-                    } else {
-                        e.props.borrow_mut().insert("__proto__".to_string(), proto);
-                    }
+                    e.props.borrow_mut().insert("__proto__".to_string(), proto);
                 }
                 Ok(obj)
             }),
@@ -16454,10 +16306,10 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(false));
     }
 
-    /// `Object.getPrototypeOf` returns null for plain objects.
+    /// `Object.getPrototypeOf` returns `Object.prototype` for plain objects.
     #[test]
     fn e2e_object_get_prototype_of_null() {
-        let result = global_eval("Object.getPrototypeOf({}) === null").unwrap();
+        let result = global_eval("Object.getPrototypeOf({}) === Object.prototype").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
 
@@ -20875,10 +20727,10 @@ mod tests {
         assert_eq!(result, JsValue::Smi(2));
     }
 
-    /// `Object.getPrototypeOf` returns a value (null for plain objects in this engine).
+    /// `Object.getPrototypeOf` returns `Object.prototype` for plain objects.
     #[test]
     fn e2e_object_get_prototype_of() {
-        let result = global_eval("Object.getPrototypeOf({}) === null").unwrap();
+        let result = global_eval("Object.getPrototypeOf({}) === Object.prototype").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
 
@@ -22185,10 +22037,10 @@ mod tests {
         assert_eq!(result, JsValue::String("object".into()));
     }
 
-    /// `Object.getPrototypeOf({})` returns null for plain objects in this engine.
+    /// `Object.getPrototypeOf({})` returns `Object.prototype`.
     #[test]
     fn test_object_get_prototype_of() {
-        let result = global_eval("Object.getPrototypeOf({}) === null").unwrap();
+        let result = global_eval("Object.getPrototypeOf({}) === Object.prototype").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
 
@@ -25677,11 +25529,10 @@ mod tests {
         assert_eq!(result, JsValue::String("error".into()));
     }
 
-    /// `Object.getPrototypeOf` returns null for plain objects (no prototype
-    /// chain in this engine's PlainObject model).
+    /// `Object.getPrototypeOf` returns `Object.prototype` for ordinary objects.
     #[test]
     fn test_get_prototype_of_plain_object() {
-        let result = global_eval("Object.getPrototypeOf({}) === null").unwrap();
+        let result = global_eval("Object.getPrototypeOf({}) === Object.prototype").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
 
@@ -26939,6 +26790,342 @@ mod tests {
         assert_eq!(result, JsValue::Smi(3));
     }
 
+    #[test]
+    fn test_object_keys_orders_integer_indices_before_strings() {
+        let result = global_eval(
+            "var o = {}; \
+             o.b = 'bee'; \
+             Object.defineProperty(o, '2', { value: 'two', enumerable: true }); \
+             o.a = 'aye'; \
+             Object.defineProperty(o, '1', { value: 'one', enumerable: true }); \
+             Object.keys(o).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1,2,b,a".into()));
+    }
+
+    #[test]
+    fn test_object_keys_skips_inherited_properties() {
+        let result =
+            global_eval("var p = { inherited: 1 }; var o = Object.create(p); o.own = 2; Object.keys(o).join(',')")
+                .unwrap();
+        assert_eq!(result, JsValue::String("own".into()));
+    }
+
+    #[test]
+    fn test_object_keys_skips_non_enumerable_accessor() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'hidden', { get: function() { return 1; }, enumerable: false }); \
+             Object.keys(o).length",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_object_keys_includes_enumerable_accessor() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'visible', { get: function() { return 1; }, enumerable: true }); \
+             Object.keys(o).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("visible".into()));
+    }
+
+    #[test]
+    fn test_object_keys_skips_symbol_keys() {
+        let result = global_eval(
+            "var s = Symbol('x'); \
+             var o = { visible: 1 }; \
+             o[s] = 2; \
+             Object.keys(o).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("visible".into()));
+    }
+
+    #[test]
+    fn test_object_keys_string_coercion_returns_indices() {
+        let result = global_eval("Object.keys('cat').join(',')").unwrap();
+        assert_eq!(result, JsValue::String("0,1,2".into()));
+    }
+
+    #[test]
+    fn test_object_values_respects_key_filtering_and_order() {
+        let result = global_eval(
+            "var p = { inherited: 0 }; \
+             var o = Object.create(p); \
+             Object.defineProperty(o, '2', { value: 'two', enumerable: true }); \
+             Object.defineProperty(o, 'hidden', { value: 'nope', enumerable: false }); \
+             o.a = 'aye'; \
+             Object.defineProperty(o, '1', { value: 'one', enumerable: true }); \
+             Object.values(o).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("one,two,aye".into()));
+    }
+
+    #[test]
+    fn test_object_values_invokes_getters() {
+        let result = global_eval(
+            "var calls = 0; \
+             var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { calls++; return 7; }, enumerable: true }); \
+             var values = Object.values(o); \
+             '' + values[0] + ',' + calls",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("7,1".into()));
+    }
+
+    #[test]
+    fn test_object_values_string_coercion_returns_characters() {
+        let result = global_eval("Object.values('go').join(',')").unwrap();
+        assert_eq!(result, JsValue::String("g,o".into()));
+    }
+
+    #[test]
+    fn test_object_values_orders_numeric_keys() {
+        let result = global_eval(
+            "var o = {}; \
+             o.z = 'zee'; \
+             Object.defineProperty(o, '10', { value: 'ten', enumerable: true }); \
+             Object.defineProperty(o, '2', { value: 'two', enumerable: true }); \
+             Object.values(o).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("two,ten,zee".into()));
+    }
+
+    #[test]
+    fn test_object_entries_respects_key_filtering_and_order() {
+        let result = global_eval(
+            "var p = { inherited: 0 }; \
+             var o = Object.create(p); \
+             Object.defineProperty(o, '2', { value: 'two', enumerable: true }); \
+             Object.defineProperty(o, 'hidden', { value: 'nope', enumerable: false }); \
+             o.a = 'aye'; \
+             Object.defineProperty(o, '1', { value: 'one', enumerable: true }); \
+             var e = Object.entries(o); \
+             e[0][0] + ':' + e[0][1] + ',' + e[1][0] + ':' + e[1][1] + ',' + e[2][0] + ':' + e[2][1]",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1:one,2:two,a:aye".into()));
+    }
+
+    #[test]
+    fn test_object_entries_invokes_getters() {
+        let result = global_eval(
+            "var calls = 0; \
+             var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { calls++; return 7; }, enumerable: true }); \
+             var entries = Object.entries(o); \
+             entries[0][0] + ':' + entries[0][1] + ',' + calls",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("x:7,1".into()));
+    }
+
+    #[test]
+    fn test_object_entries_string_coercion_returns_pairs() {
+        let result = global_eval(
+            "var e = Object.entries('ab'); \
+             e[0][0] + e[0][1] + e[1][0] + e[1][1]",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("0a1b".into()));
+    }
+
+    #[test]
+    fn test_object_entries_orders_numeric_keys() {
+        let result = global_eval(
+            "var o = {}; \
+             o.z = 'zee'; \
+             Object.defineProperty(o, '10', { value: 'ten', enumerable: true }); \
+             Object.defineProperty(o, '2', { value: 'two', enumerable: true }); \
+             var e = Object.entries(o); \
+             e[0][0] + ':' + e[0][1] + ',' + e[1][0] + ':' + e[1][1] + ',' + e[2][0] + ':' + e[2][1]",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("2:two,10:ten,z:zee".into()));
+    }
+
+    #[test]
+    fn test_object_assign_skips_non_enumerable_source_properties() {
+        let result = global_eval(
+            "var src = {}; \
+             Object.defineProperty(src, 'visible', { value: 1, enumerable: true }); \
+             Object.defineProperty(src, 'hidden', { value: 2, enumerable: false }); \
+             var target = {}; \
+             Object.assign(target, src); \
+             Object.keys(target).join(',') + ':' + target.visible + ':' + typeof target.hidden",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("visible:1:undefined".into()));
+    }
+
+    #[test]
+    fn test_object_assign_copies_accessor_values() {
+        let result = global_eval(
+            "var calls = 0; \
+             var src = {}; \
+             Object.defineProperty(src, 'x', { get: function() { calls++; return 7; }, enumerable: true }); \
+             var target = {}; \
+             Object.assign(target, src); \
+             '' + target.x + ',' + calls",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("7,1".into()));
+    }
+
+    #[test]
+    fn test_object_assign_triggers_target_setter() {
+        let result = global_eval(
+            "var seen = ''; \
+             var target = { set x(v) { seen = '' + v; } }; \
+             Object.assign(target, { x: 42 }); \
+             seen",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("42".into()));
+    }
+
+    #[test]
+    fn test_object_assign_handles_multiple_sources() {
+        let result =
+            global_eval("var target = {}; Object.assign(target, { a: 1 }, { b: 2 }, { c: 3 }); target.a + target.b + target.c")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn test_object_assign_skips_nullish_sources() {
+        let result = global_eval(
+            "var target = { a: 1 }; \
+             Object.assign(target, null, undefined, { b: 2 }); \
+             '' + target.a + ',' + target.b",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1,2".into()));
+    }
+
+    #[test]
+    fn test_object_assign_orders_numeric_keys_on_target() {
+        let result = global_eval(
+            "var target = {}; \
+             Object.assign(target, { b: 'bee' }, { 2: 'two' }, { a: 'aye' }, { 1: 'one' }); \
+             Object.keys(target).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1,2,b,a".into()));
+    }
+
+    #[test]
+    fn test_object_create_null_prototype_has_no_object_methods() {
+        let result = global_eval("typeof Object.create(null).toString").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn test_object_create_descriptors_control_enumerability() {
+        let result = global_eval(
+            "var o = Object.create({}, { \
+                 hidden: { value: 1, enumerable: false }, \
+                 visible: { value: 2, enumerable: true } \
+             }); \
+             Object.keys(o).join(',') + ':' + o.visible + ':' + typeof o.hidden",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("visible:2:number".into()));
+    }
+
+    #[test]
+    fn test_object_create_descriptor_getter_is_used() {
+        let result = global_eval(
+            "var o = Object.create({}, { \
+                 value: { get: function() { return 99; }, enumerable: true } \
+             }); \
+             o.value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_object_create_descriptor_numeric_ordering_is_preserved() {
+        let result = global_eval(
+            "var o = Object.create({}, { \
+                 b: { value: 'bee', enumerable: true }, \
+                 2: { value: 'two', enumerable: true }, \
+                 a: { value: 'aye', enumerable: true }, \
+                 1: { value: 'one', enumerable: true } \
+             }); \
+             Object.keys(o).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1,2,b,a".into()));
+    }
+
+    #[test]
+    fn test_object_get_prototype_of_plain_object_returns_object_prototype() {
+        let result = global_eval("Object.getPrototypeOf({}) === Object.prototype").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_object_get_prototype_of_null_prototype_object_returns_null() {
+        let result = global_eval("Object.getPrototypeOf(Object.create(null)) === null").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_object_set_prototype_of_null_removes_inherited_properties() {
+        let result = global_eval(
+            "var proto = { x: 1 }; \
+             var obj = Object.create(proto); \
+             Object.setPrototypeOf(obj, null); \
+             typeof obj.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn test_object_set_prototype_of_object_restores_chain() {
+        let result = global_eval(
+            "var proto = { x: 1 }; \
+             var obj = Object.create(null); \
+             Object.setPrototypeOf(obj, proto); \
+             obj.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_object_set_prototype_of_null_object_returns_same_object() {
+        let result = global_eval(
+            "var obj = {}; \
+             Object.setPrototypeOf(obj, null) === obj && Object.getPrototypeOf(obj) === null",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_object_is_treats_nan_as_same_value() {
+        let result = global_eval("Object.is(NaN, NaN)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_object_is_distinguishes_positive_and_negative_zero() {
+        let result = global_eval("Object.is(0, -0)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
     // ── String method edge-case tests ───────────────────────────────────────
 
     /// `$$` in replacement inserts a literal `$`.
@@ -27794,16 +27981,11 @@ mod tests {
         assert_eq!(r, JsValue::Boolean(true));
     }
 
-    /// Reflect.getPrototypeOf returns null for plain objects.
+    /// Reflect.getPrototypeOf returns `Object.prototype` for plain objects.
     #[test]
     fn e2e_reflect_get_prototype_of() {
-        let r = global_eval(
-            r#"
-            Reflect.getPrototypeOf({});
-            "#,
-        );
-        // Plain objects in our model may return null or an object for prototype.
-        assert!(r.is_ok());
+        let r = global_eval("Reflect.getPrototypeOf({}) === Object.prototype").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
     }
 
     /// Reflect.apply calls a function with arguments.
