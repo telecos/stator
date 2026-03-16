@@ -4576,6 +4576,11 @@ impl FunctionCompiler {
         // Jump to break if done.
         self.emit_jump_if_true_to(break_lbl);
 
+        // §14.7.5.13 step 7: the loop body (variable binding + user code) is
+        // wrapped in an implicit try/finally so that IteratorClose is called
+        // when the body throws.  Record the start of the "try" region.
+        let try_start = self.instructions.len() as u32;
+
         // Bind loop variable.
         match &stmt.left {
             ForInOfLeft::VarDecl(decl) => {
@@ -4634,11 +4639,50 @@ impl FunctionCompiler {
         // Compile the loop body (no extra scope — scope was opened above).
         self.compile_stmt(&stmt.body)?;
 
+        let try_end = self.instructions.len() as u32;
+
         // Back-edge jump.
         self.emit_jump_loop_to(loop_lbl);
 
         // Bind break target.
         self.bind_label(break_lbl);
+
+        // §14.7.5.13 step 7.k: emit the exception handler that calls
+        // IteratorClose before re-throwing.  When the loop body (or the
+        // variable-binding destructuring) throws, the interpreter jumps here.
+        //
+        // Layout:
+        //   [normal path falls through to break_lbl above]
+        //   Jump(after_ex_handler)          ← skip handler on normal exit
+        //   [ex_handler]  Star(ex_reg)      ← save thrown value
+        //                 IteratorClose(iter_reg)
+        //                 Ldar(ex_reg)
+        //                 ReThrow
+        //   [after_ex_handler] ...
+        let after_ex_label = self.new_label();
+        self.emit_jump(Opcode::Jump, after_ex_label);
+
+        let ex_handler_start = self.instructions.len() as u32;
+        let ex_reg = self.allocator.allocate_temporary();
+        self.emit_star(ex_reg);
+        self.emit(Instruction::new_unchecked(
+            Opcode::IteratorClose,
+            vec![to_reg_op(iter_reg)],
+        ));
+        self.emit_ldar(ex_reg);
+        self.emit(Instruction::new_unchecked(Opcode::ReThrow, vec![]));
+        self.allocator
+            .release_temporary(ex_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+
+        self.bind_label(after_ex_label);
+
+        self.handler_table.push(HandlerTableEntry {
+            try_start,
+            try_end,
+            handler: ex_handler_start,
+            is_finally: true,
+        });
 
         self.loop_stack.pop();
         self.for_of_iter_regs.remove(&break_lbl);
@@ -6480,6 +6524,44 @@ mod tests {
         assert!(
             instrs.iter().any(|i| i.opcode == Opcode::IteratorNext),
             "for-of must emit IteratorNext"
+        );
+    }
+
+    #[test]
+    fn test_for_of_emits_iterator_close_handler() {
+        // for-of must emit an IteratorClose in the exception handler
+        // so that the iterator is closed when the body throws (§14.7.5.13).
+        use crate::parser::ast::{ForInOfLeft, ForOfStmt, VarDecl, VarDeclarator, VarKind};
+        let prog = make_program(vec![Stmt::ForOf(ForOfStmt {
+            loc: span(),
+            is_await: false,
+            left: ForInOfLeft::VarDecl(VarDecl {
+                loc: span(),
+                kind: VarKind::Const,
+                declarators: vec![VarDeclarator {
+                    loc: span(),
+                    id: Pat::Ident(ident("x")),
+                    init: None,
+                }],
+            }),
+            right: Box::new(ident_expr("arr")),
+            body: Box::new(Stmt::Empty(crate::parser::ast::EmptyStmt { loc: span() })),
+        })]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        // The exception handler should contain IteratorClose + ReThrow.
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::IteratorClose),
+            "for-of must emit IteratorClose for exception handler"
+        );
+        assert!(
+            instrs.iter().any(|i| i.opcode == Opcode::ReThrow),
+            "for-of exception handler must re-throw"
+        );
+        // Verify handler table entry exists.
+        assert!(
+            !arr.handler_table().is_empty(),
+            "for-of must register an exception handler table entry"
         );
     }
 
