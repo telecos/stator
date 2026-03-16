@@ -323,6 +323,20 @@ pub(crate) fn current_global_env() -> Option<Rc<RefCell<HashMap<String, JsValue>
     CURRENT_GLOBALS.with(|g| g.borrow().clone())
 }
 
+/// Read a property using the interpreter's ordinary `[[Get]]` semantics.
+pub fn dispatch_get_property_value(obj: &JsValue, key: JsValue) -> StatorResult<JsValue> {
+    keyed_load(obj, &key)
+}
+
+/// Write a property using the interpreter's ordinary `[[Set]]` semantics.
+pub fn dispatch_set_property_value(
+    obj: &JsValue,
+    key: JsValue,
+    value: JsValue,
+) -> StatorResult<()> {
+    keyed_store(obj, &key, value)
+}
+
 /// Return the immediate prototype of an object-like value.
 pub(crate) fn get_object_prototype(obj: &JsValue) -> Option<JsValue> {
     match obj {
