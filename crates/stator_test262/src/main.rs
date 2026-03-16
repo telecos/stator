@@ -303,6 +303,10 @@ fn parse_frontmatter(source: &str) -> TestMeta {
 struct HarnessCache {
     harness_dir: PathBuf,
     cache: HashMap<String, String>,
+    /// Cached harness prefix strings keyed by the sorted includes list.
+    /// Most Test262 tests share the same set of includes, so this avoids
+    /// re-concatenating the same harness files thousands of times.
+    prefix_cache: HashMap<Vec<String>, String>,
 }
 
 impl HarnessCache {
@@ -310,6 +314,7 @@ impl HarnessCache {
         Self {
             harness_dir,
             cache: HashMap::new(),
+            prefix_cache: HashMap::new(),
         }
     }
 
@@ -329,21 +334,36 @@ impl HarnessCache {
     /// `sta.js` and `assert.js` are provided natively in `make_test_globals`,
     /// so they are skipped when building the harness prefix.  Other harness
     /// files listed in `includes` are loaded normally.
+    ///
+    /// Results are cached by the includes list so that tests sharing the same
+    /// set of harness files reuse a single allocation.
     fn build_prefix(&mut self, includes: &[String]) -> String {
-        let mut parts: Vec<String> = Vec::new();
+        // Build the cache key: the filtered, ordered list of includes.
+        let key: Vec<String> = includes
+            .iter()
+            .filter(|name| {
+                name.as_str() != "sta.js"
+                    && name.as_str() != "assert.js"
+                    && name.as_str() != "donNotEvaluate.js"
+            })
+            .cloned()
+            .collect();
 
-        for name in includes {
-            // Skip files whose functionality is provided natively.
-            if name == "sta.js" || name == "assert.js" || name == "donNotEvaluate.js" {
-                continue;
-            }
+        if let Some(cached) = self.prefix_cache.get(&key) {
+            return cached.clone();
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+        for name in &key {
             match self.get(name) {
                 Ok(s) => parts.push(s.to_string()),
                 Err(e) => log::warn!("failed to load harness file '{name}': {e}"),
             }
         }
 
-        parts.join("\n")
+        let prefix = parts.join("\n");
+        self.prefix_cache.insert(key, prefix.clone());
+        prefix
     }
 }
 
@@ -838,23 +858,27 @@ fn error_matches_type(err: &StatorError, expected: &str) -> bool {
 
 /// Compiles and runs `source` (with `harness_prefix` prepended) and returns
 /// the test outcome.
+///
+/// Accepts an owned `HashMap` of globals so the caller can provide
+/// a pre-cloned map (e.g. with `$DONE` already inserted for async tests),
+/// avoiding a redundant second clone.
 fn execute_source(
     source: &str,
     harness_prefix: &str,
-    template_globals: &HashMap<String, JsValue>,
+    globals_map: HashMap<String, JsValue>,
 ) -> Result<JsValue, StatorError> {
     // Each test execution gets a generous stack guarantee so that
     // pathological inputs (deep regex, deep eval chains) cannot
     // overflow the main thread stack across 53k+ tests.
     stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
-        execute_source_inner(source, harness_prefix, template_globals)
+        execute_source_inner(source, harness_prefix, globals_map)
     })
 }
 
 fn execute_source_inner(
     source: &str,
     harness_prefix: &str,
-    template_globals: &HashMap<String, JsValue>,
+    globals_map: HashMap<String, JsValue>,
 ) -> Result<JsValue, StatorError> {
     let combined = if harness_prefix.is_empty() {
         source.to_string()
@@ -862,12 +886,10 @@ fn execute_source_inner(
         format!("{harness_prefix}\n{source}")
     };
 
-    // Shallow-clone the template globals: each test gets its own HashMap
-    // (so top-level binding mutations don't leak), but the underlying
-    // builtin objects are shared via Rc::clone.  This is orders of
-    // magnitude faster than the old deep_clone_globals() and sufficient
-    // for Test262, whose tests are designed to be independent.
-    let globals = Rc::new(RefCell::new(template_globals.clone()));
+    // Wrap the caller-provided shallow clone in Rc<RefCell<…>> for the
+    // interpreter.  The caller already cloned the template globals, so no
+    // additional clone is needed here.
+    let globals = Rc::new(RefCell::new(globals_map));
     // Keep a handle so we can break Rc cycles after the test finishes.
     let globals_cleanup = Rc::clone(&globals);
 
@@ -880,10 +902,10 @@ fn execute_source_inner(
         // Limit each test to 5 million instructions to prevent infinite
         // loops from hanging the runner.
         frame.instruction_limit = 5_000_000;
-        // Wall-clock deadline: 3 seconds per test.  Set both on the frame AND as
+        // Wall-clock deadline: 2 seconds per test.  Set both on the frame AND as
         // a thread-local so that child frames created by eval() / Function()
         // also respect the timeout.
-        let dl = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let dl = std::time::Instant::now() + std::time::Duration::from_secs(2);
         frame.deadline = Some(dl);
         set_execution_deadline(Some(dl));
         let result = Interpreter::run(&mut frame);
@@ -982,10 +1004,15 @@ fn run_test(
     let is_async = meta.is_async();
     let done_called = Rc::new(Cell::new(false));
 
-    let mut async_globals = if is_async {
-        let mut g = template_globals.clone();
+    // Shallow-clone the template globals once.  For async tests we inject
+    // the $DONE callback into this clone; for sync tests the clone is
+    // passed straight through to the interpreter.  Either way, only ONE
+    // clone is made per test (previously async tests were cloned twice).
+    let mut test_globals = template_globals.clone();
+
+    if is_async {
         let dc = done_called.clone();
-        g.insert(
+        test_globals.insert(
             "$DONE".to_string(),
             JsValue::NativeFunction(Rc::new(move |args| {
                 dc.set(true);
@@ -999,17 +1026,13 @@ fn run_test(
                 }
             })),
         );
-        Some(g)
-    } else {
-        None
-    };
-    let effective_globals = async_globals.as_ref().unwrap_or(template_globals);
+    }
 
     // ── Execute ───────────────────────────────────────────────────────────
     // Wrap execution in catch_unwind to gracefully handle panics from
     // pathological test inputs.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        execute_source(source, &effective_prefix, effective_globals)
+        execute_source(source, &effective_prefix, test_globals)
     }));
 
     // Drain the microtask queue so that promise reactions (e.g. .then($DONE))
@@ -1041,14 +1064,8 @@ fn run_test(
         clear_intern_pool();
     }));
 
-    // Release the test's references from the async globals clone (if any).
-    if let Some(ref mut g) = async_globals {
-        g.clear();
-    }
-
     // Reset the allocator recursion guard so the next test can trigger it.
     reset_alloc_guard();
-
     let exec = match result {
         Ok(r) => ExecResult::from_result(r),
         Err(_) => ExecResult::OtherError("panicked (likely stack overflow)".into()),
@@ -1132,7 +1149,11 @@ fn run_test(
 // ─── Directory traversal ─────────────────────────────────────────────────────
 
 /// Recursively collects all `.js` files under `dir` into `out`.
-fn collect_tests(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+///
+/// Skips directories that match [`SKIPPED_PATH_PREFIXES`] and individual
+/// `_FIXTURE.js` files (harness fixtures, not runnable tests) to avoid
+/// wasting I/O and collection time on tests that will be skipped anyway.
+fn collect_tests(dir: &Path, test_root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     if !dir.is_dir() {
         return Ok(());
     }
@@ -1142,8 +1163,33 @@ fn collect_tests(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     for entry in entries {
         let path = entry.path();
         if path.is_dir() {
-            collect_tests(&path, out)?;
+            // Skip entire directory trees that are known to be unsupported,
+            // avoiding thousands of filesystem stat/read calls.
+            let rel = path
+                .strip_prefix(test_root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let rel_with_slash = if rel.ends_with('/') {
+                rel
+            } else {
+                format!("{rel}/")
+            };
+            if SKIPPED_PATH_PREFIXES
+                .iter()
+                .any(|prefix| rel_with_slash.starts_with(prefix))
+            {
+                continue;
+            }
+            collect_tests(&path, test_root, out)?;
         } else if path.extension().and_then(|e| e.to_str()) == Some("js") {
+            // Skip _FIXTURE.js files — they are included by other tests via
+            // the harness mechanism and are not runnable on their own.
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                && stem.ends_with("_FIXTURE")
+            {
+                continue;
+            }
             out.push(path);
         }
     }
@@ -1276,7 +1322,7 @@ fn main_inner() {
 
     // ── Collect test files ────────────────────────────────────────────────────
     let mut test_files: Vec<PathBuf> = Vec::new();
-    if let Err(e) = collect_tests(&test_dir, &mut test_files) {
+    if let Err(e) = collect_tests(&test_dir, &test_dir, &mut test_files) {
         eprintln!("stator_test262: error reading test directory: {e}");
         std::process::exit(1);
     }
@@ -1400,7 +1446,7 @@ fn main_inner() {
             }
         }
         let elapsed = test_start.elapsed();
-        if elapsed.as_secs() >= 5 {
+        if elapsed.as_secs() >= 3 {
             eprintln!("[SLOW] {}: {:.1}s", path.display(), elapsed.as_secs_f64());
         }
 
@@ -1421,11 +1467,13 @@ fn main_inner() {
             break;
         }
 
-        // Periodic progress line (every 1000 tests, unless verbose).
-        if !cli.verbose && (idx + 1) % 1000 == 0 {
+        // Periodic progress line (every 500 tests, unless verbose).
+        if !cli.verbose && (idx + 1) % 500 == 0 {
             let elapsed = run_start.elapsed();
+            let rate = (idx + 1) as f64 / elapsed.as_secs_f64();
             println!(
-                "  … {}/{total}  pass={pass}  fail={fail}  skip={skip}  elapsed={:.0}s",
+                "  … {}/{total}  pass={pass}  fail={fail}  skip={skip}  \
+                 elapsed={:.0}s  ({rate:.0} tests/sec)",
                 idx + 1,
                 elapsed.as_secs_f64()
             );
