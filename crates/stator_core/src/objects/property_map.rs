@@ -1178,4 +1178,135 @@ mod tests {
             "updating existing property should succeed on non-extensible"
         );
     }
+
+    // ── enumerable_keys / enumerable_iter ────────────────────────────────
+
+    #[test]
+    fn test_enumerable_keys_skips_non_enumerable() {
+        let mut pm = PropertyMap::new();
+        pm.insert("a".to_string(), JsValue::Smi(1)); // default = enumerable
+        pm.insert_with_attrs(
+            "b".to_string(),
+            JsValue::Smi(2),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        ); // not enumerable
+        pm.insert("c".to_string(), JsValue::Smi(3)); // default = enumerable
+        let keys: Vec<&String> = pm.enumerable_keys().collect();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], "a");
+        assert_eq!(keys[1], "c");
+    }
+
+    #[test]
+    fn test_enumerable_iter_returns_only_enumerable_pairs() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(10));
+        pm.insert_with_attrs(
+            "hidden".to_string(),
+            JsValue::Smi(99),
+            PropertyAttributes::empty(),
+        );
+        pm.insert("y".to_string(), JsValue::Smi(20));
+        let pairs: Vec<(&String, &JsValue)> = pm.enumerable_iter().collect();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, "x");
+        assert_eq!(pairs[1].0, "y");
+    }
+
+    // ── iter_with_attrs ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_iter_with_attrs_returns_all_triples() {
+        let mut pm = PropertyMap::new();
+        pm.insert("a".to_string(), JsValue::Smi(1));
+        pm.insert_with_attrs(
+            "b".to_string(),
+            JsValue::Smi(2),
+            PropertyAttributes::WRITABLE,
+        );
+        let triples: Vec<(&String, &JsValue, PropertyAttributes)> = pm.iter_with_attrs().collect();
+        assert_eq!(triples.len(), 2);
+        assert!(triples[0].2.contains(PropertyAttributes::ENUMERABLE));
+        assert!(!triples[1].2.contains(PropertyAttributes::ENUMERABLE));
+    }
+
+    // ── freeze / seal ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_freeze_makes_non_writable_non_configurable() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        pm.freeze();
+        assert!(!pm.is_writable("x"));
+        assert!(!pm.is_configurable("x"));
+        assert!(!pm.extensible);
+        assert!(pm.is_frozen());
+    }
+
+    #[test]
+    fn test_seal_makes_non_configurable() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        pm.seal();
+        assert!(pm.is_writable("x")); // seal doesn't remove writable
+        assert!(!pm.is_configurable("x"));
+        assert!(!pm.extensible);
+        assert!(pm.is_sealed());
+    }
+
+    // ── __proto__ key is non-enumerable ──────────────────────────────────
+
+    #[test]
+    fn test_proto_key_non_enumerable() {
+        let mut pm = PropertyMap::new();
+        pm.insert("__proto__".to_string(), JsValue::Null);
+        pm.insert("visible".to_string(), JsValue::Smi(1));
+        let enum_keys: Vec<&String> = pm.enumerable_keys().collect();
+        assert_eq!(enum_keys.len(), 1);
+        assert_eq!(enum_keys[0], "visible");
+    }
+
+    // ── make_all_non_enumerable ──────────────────────────────────────────
+
+    #[test]
+    fn test_make_all_non_enumerable() {
+        let mut pm = PropertyMap::new();
+        pm.insert("a".to_string(), JsValue::Smi(1));
+        pm.insert("b".to_string(), JsValue::Smi(2));
+        assert!(pm.is_enumerable("a"));
+        pm.make_all_non_enumerable();
+        assert!(!pm.is_enumerable("a"));
+        assert!(!pm.is_enumerable("b"));
+    }
+
+    // ── set_writable / set_enumerable / set_configurable ─────────────────
+
+    #[test]
+    fn test_set_writable_toggle() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        assert!(pm.is_writable("x"));
+        pm.set_writable("x", false);
+        assert!(!pm.is_writable("x"));
+        pm.set_writable("x", true);
+        assert!(pm.is_writable("x"));
+    }
+
+    #[test]
+    fn test_set_enumerable_toggle() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        assert!(pm.is_enumerable("x"));
+        pm.set_enumerable("x", false);
+        assert!(!pm.is_enumerable("x"));
+    }
+
+    #[test]
+    fn test_set_configurable_toggle() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        assert!(pm.is_configurable("x"));
+        pm.set_configurable("x", false);
+        assert!(!pm.is_configurable("x"));
+    }
 }

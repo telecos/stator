@@ -8125,4 +8125,90 @@ mod tests {
         .unwrap();
         assert_eq!(result, JsValue::String("a-b-c".into()));
     }
+
+    // ── for-in enumeration conformance ──────────────────────────────
+
+    /// for-in walks prototype chain and collects inherited keys.
+    #[test]
+    fn e2e_for_in_prototype_chain() {
+        let result = crate::builtins::global::global_eval(
+            "var gp = { z: 3 }; \
+             var p = Object.create(gp); p.y = 2; \
+             var o = Object.create(p); o.x = 1; \
+             var keys = []; for (var k in o) { keys.push(k); } \
+             keys.join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("x,y,z".into()));
+    }
+
+    /// Non-enumerable own property hides inherited enumerable one.
+    #[test]
+    fn e2e_for_in_non_enum_shadows_inherited() {
+        let result = crate::builtins::global::global_eval(
+            "var p = { x: 1, y: 2 }; \
+             var o = Object.create(p); \
+             Object.defineProperty(o, 'x', { value: 10, enumerable: false }); \
+             var keys = []; for (var k in o) { keys.push(k); } \
+             keys.join(',')",
+        )
+        .unwrap();
+        // 'x' is own non-enumerable → shadows inherited 'x'
+        // Only 'y' from proto should appear
+        assert_eq!(result, JsValue::String("y".into()));
+    }
+
+    /// for-in integer indices appear first in ascending order.
+    #[test]
+    fn e2e_for_in_integer_order() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; o.z = 1; o['10'] = 2; o['2'] = 3; o.a = 4; \
+             var keys = []; for (var k in o) { keys.push(k); } \
+             keys.join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("2,10,z,a".into()));
+    }
+
+    /// for-in on null produces no iterations.
+    #[test]
+    fn e2e_for_in_null() {
+        let result =
+            crate::builtins::global::global_eval("var n = 0; for (var k in null) { n++; } n")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// for-in on undefined produces no iterations.
+    #[test]
+    fn e2e_for_in_undefined() {
+        let result =
+            crate::builtins::global::global_eval("var n = 0; for (var k in undefined) { n++; } n")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// for-in can read property values via the key.
+    #[test]
+    fn e2e_for_in_sum_values() {
+        let result = crate::builtins::global::global_eval(
+            "var o = { a: 10, b: 20, c: 30 }; \
+             var sum = 0; for (var k in o) { sum = sum + o[k]; } sum",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(60));
+    }
+
+    // ── for-in with break / continue ────────────────────────────────
+
+    /// for-in with break stops iteration.
+    #[test]
+    fn e2e_for_in_break() {
+        let result = crate::builtins::global::global_eval(
+            "var o = { a: 1, b: 2, c: 3 }; \
+             var n = 0; for (var k in o) { n++; if (n === 2) break; } n",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
 }
