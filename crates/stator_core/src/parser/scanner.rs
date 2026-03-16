@@ -957,11 +957,17 @@ impl<'src> Scanner<'src> {
                 _ => break,
             }
         }
-        let name = self.source[id_start..self.pos].to_string();
+        let raw = self.source[id_start..self.pos].to_string();
         // For escaped identifiers, the raw text contains `\uXXXX` sequences;
         // keyword matching against raw text is intentionally skipped for them
         // (the spec allows `\u006C\u0065\u0074` as an identifier, not a keyword).
-        let kind = if first == '\\' {
+        let has_escape = first == '\\' || raw.contains('\\');
+        let name = if has_escape {
+            decode_unicode_escapes(&raw)
+        } else {
+            raw
+        };
+        let kind = if has_escape {
             TokenKind::Identifier
         } else {
             keyword_kind(&name).unwrap_or(TokenKind::Identifier)
@@ -1698,6 +1704,173 @@ impl<'src> Scanner<'src> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Unicode escape helpers (public within the crate)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Consume exactly `n` hex digits from the iterator, returning them as a
+/// [`String`].
+fn take_hex(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, n: usize) -> String {
+    let mut hex = String::with_capacity(n);
+    for _ in 0..n {
+        match chars.peek() {
+            Some(&d) if d.is_ascii_hexdigit() => {
+                hex.push(d);
+                chars.next();
+            }
+            _ => break,
+        }
+    }
+    hex
+}
+
+/// Decode `\uXXXX` and `\u{XXXX}` escape sequences inside an identifier
+/// name, returning the unescaped string.
+///
+/// Characters that are not part of a unicode escape sequence are passed
+/// through unchanged.
+pub(crate) fn decode_unicode_escapes(raw: &str) -> String {
+    if !raw.contains('\\') {
+        return raw.to_owned();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'u') {
+            chars.next(); // consume 'u'
+            if chars.peek() == Some(&'{') {
+                chars.next(); // consume '{'
+                let mut hex = String::new();
+                while let Some(&d) = chars.peek() {
+                    if d == '}' {
+                        chars.next();
+                        break;
+                    }
+                    hex.push(d);
+                    chars.next();
+                }
+                if let Some(cp) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    out.push(cp);
+                }
+            } else {
+                let h = take_hex(&mut chars, 4);
+                if let Some(cp) = u32::from_str_radix(&h, 16).ok().and_then(char::from_u32) {
+                    out.push(cp);
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Decode escape sequences in a template literal raw segment, producing the
+/// *cooked* value.
+///
+/// Returns `None` if the segment contains an invalid escape sequence (per
+/// ES2018 tagged-template revision: invalid escapes yield `undefined` for
+/// the cooked value).
+///
+/// The input should be the raw text of the template segment **without**
+/// surrounding delimiters (`` ` ``, `${`, `}`).
+pub(crate) fn cook_template_raw(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            // Handle bare CR → LF normalisation (ES2025 §12.9.4).
+            if c == '\r' {
+                out.push('\n');
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            } else {
+                out.push(c);
+            }
+            continue;
+        }
+        // Backslash escape.
+        match chars.next() {
+            None => return None,
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('b') => out.push('\u{0008}'),
+            Some('f') => out.push('\u{000C}'),
+            Some('v') => out.push('\u{000B}'),
+            Some('\\') => out.push('\\'),
+            Some('\'') => out.push('\''),
+            Some('"') => out.push('"'),
+            Some('`') => out.push('`'),
+            Some('$') => out.push('$'),
+            Some('0') if !matches!(chars.peek(), Some('0'..='9')) => {
+                out.push('\0');
+            }
+            Some('x') => {
+                let h = take_hex(&mut chars, 2);
+                if h.len() != 2 {
+                    return None;
+                }
+                match u32::from_str_radix(&h, 16).ok().and_then(char::from_u32) {
+                    Some(cp) => out.push(cp),
+                    None => return None,
+                }
+            }
+            Some('u') => {
+                if chars.peek() == Some(&'{') {
+                    chars.next(); // '{'
+                    let mut hex = String::new();
+                    loop {
+                        match chars.next() {
+                            Some('}') => break,
+                            Some(d) if d.is_ascii_hexdigit() => hex.push(d),
+                            _ => return None,
+                        }
+                    }
+                    if hex.is_empty() {
+                        return None;
+                    }
+                    match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                        Some(cp) => out.push(cp),
+                        None => return None,
+                    }
+                } else {
+                    let h = take_hex(&mut chars, 4);
+                    if h.len() != 4 {
+                        return None;
+                    }
+                    match u32::from_str_radix(&h, 16).ok().and_then(char::from_u32) {
+                        Some(cp) => out.push(cp),
+                        None => return None,
+                    }
+                }
+            }
+            // Line continuation: backslash + line terminator → nothing.
+            Some('\n') => {}
+            Some('\r') => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            Some('\u{2028}') | Some('\u{2029}') => {}
+            // Any other escape after `\` in a template is invalid per spec,
+            // but we treat it as an identity escape for non-tagged templates
+            // (the scanner would have already rejected truly invalid escapes
+            // in strict parsing mode).  For tagged templates the caller
+            // should check validity; we return the identity-escaped char.
+            Some(other) => {
+                // Legacy octal escapes (1-9) → invalid in templates.
+                if other.is_ascii_digit() {
+                    return None;
+                }
+                out.push(other);
+            }
+        }
+    }
+    Some(out)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Numeric parsing helper
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2397,5 +2570,85 @@ mod tests {
     fn test_error_unterminated_regexp() {
         let result = Scanner::tokenize_all("/oops");
         assert!(result.is_err());
+    }
+
+    // ── Unicode escape helpers ────────────────────────────────────────────────
+
+    #[test]
+    fn test_decode_unicode_escapes_4digit() {
+        assert_eq!(decode_unicode_escapes(r"\u0041"), "A");
+        assert_eq!(decode_unicode_escapes(r"\u0042\u0043"), "BC");
+        assert_eq!(decode_unicode_escapes(r"pre\u0041suf"), "preAsuf");
+    }
+
+    #[test]
+    fn test_decode_unicode_escapes_braced() {
+        assert_eq!(decode_unicode_escapes(r"\u{41}"), "A");
+        assert_eq!(decode_unicode_escapes(r"\u{0041}"), "A");
+        assert_eq!(decode_unicode_escapes(r"\u{1F600}"), "\u{1F600}");
+    }
+
+    #[test]
+    fn test_decode_unicode_escapes_no_escapes() {
+        assert_eq!(decode_unicode_escapes("hello"), "hello");
+        assert_eq!(decode_unicode_escapes(""), "");
+    }
+
+    #[test]
+    fn test_cook_template_raw_simple() {
+        assert_eq!(cook_template_raw("hello world"), Some("hello world".into()));
+    }
+
+    #[test]
+    fn test_cook_template_raw_unicode_4digit() {
+        assert_eq!(cook_template_raw(r"\u0041"), Some("A".into()));
+    }
+
+    #[test]
+    fn test_cook_template_raw_unicode_braced() {
+        assert_eq!(cook_template_raw(r"\u{42}"), Some("B".into()));
+    }
+
+    #[test]
+    fn test_cook_template_raw_hex_escape() {
+        assert_eq!(cook_template_raw(r"\x41"), Some("A".into()));
+    }
+
+    #[test]
+    fn test_cook_template_raw_standard_escapes() {
+        assert_eq!(cook_template_raw(r"\n\t\r"), Some("\n\t\r".into()));
+        assert_eq!(cook_template_raw(r"\\"), Some("\\".into()));
+        assert_eq!(cook_template_raw(r"\`"), Some("`".into()));
+    }
+
+    #[test]
+    fn test_cook_template_raw_invalid_returns_none() {
+        // Octal escapes are invalid in templates.
+        assert_eq!(cook_template_raw(r"\1"), None);
+        // Incomplete hex escape.
+        assert_eq!(cook_template_raw(r"\xG"), None);
+        // Incomplete unicode escape.
+        assert_eq!(cook_template_raw(r"\u00G"), None);
+    }
+
+    #[test]
+    fn test_identifier_unicode_escape_decoded() {
+        let toks = tokens(r"\u0041");
+        assert_eq!(toks[0].kind, TokenKind::Identifier);
+        assert_eq!(toks[0].value, TokenValue::Str("A".into()));
+    }
+
+    #[test]
+    fn test_identifier_unicode_escape_braced_decoded() {
+        let toks = tokens(r"\u{42}");
+        assert_eq!(toks[0].kind, TokenKind::Identifier);
+        assert_eq!(toks[0].value, TokenValue::Str("B".into()));
+    }
+
+    #[test]
+    fn test_identifier_mixed_unicode_escape() {
+        let toks = tokens(r"h\u0065llo");
+        assert_eq!(toks[0].kind, TokenKind::Identifier);
+        assert_eq!(toks[0].value, TokenValue::Str("hello".into()));
     }
 }
