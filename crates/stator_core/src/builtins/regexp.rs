@@ -13,6 +13,7 @@ use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
 use crate::builtins::string::encode_utf16;
+use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
 
 use crate::error::StatorResult;
@@ -124,6 +125,50 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
         props.insert(
             "hasIndices".into(),
             JsValue::Boolean(re.flags().contains(RegExpFlags::HAS_INDICES)),
+        );
+        insert_regexp_getter(
+            &mut props,
+            "source",
+            JsValue::NativeFunction(Rc::new({
+                let re = Rc::clone(&re);
+                move |_args: Vec<JsValue>| Ok(JsValue::String(re.source_text().into()))
+            })),
+        );
+        insert_regexp_getter(
+            &mut props,
+            "flags",
+            JsValue::NativeFunction(Rc::new({
+                let re = Rc::clone(&re);
+                move |_args: Vec<JsValue>| Ok(JsValue::String(re.flags().to_flags_string().into()))
+            })),
+        );
+        insert_regexp_getter(&mut props, "global", bool_getter(&re, RegExpFlags::GLOBAL));
+        insert_regexp_getter(
+            &mut props,
+            "ignoreCase",
+            bool_getter(&re, RegExpFlags::IGNORE_CASE),
+        );
+        insert_regexp_getter(
+            &mut props,
+            "multiline",
+            bool_getter(&re, RegExpFlags::MULTILINE),
+        );
+        insert_regexp_getter(&mut props, "dotAll", bool_getter(&re, RegExpFlags::DOT_ALL));
+        insert_regexp_getter(
+            &mut props,
+            "unicode",
+            bool_getter(&re, RegExpFlags::UNICODE),
+        );
+        insert_regexp_getter(
+            &mut props,
+            "unicodeSets",
+            bool_getter(&re, RegExpFlags::UNICODE_SETS),
+        );
+        insert_regexp_getter(&mut props, "sticky", bool_getter(&re, RegExpFlags::STICKY));
+        insert_regexp_getter(
+            &mut props,
+            "hasIndices",
+            bool_getter(&re, RegExpFlags::HAS_INDICES),
         );
 
         // ── lastIndex (read/write) ──────────────────────────────────────
@@ -321,6 +366,21 @@ fn is_callable(value: &JsValue) -> bool {
         JsValue::PlainObject(map) => map.borrow().contains_key("__call__"),
         _ => false,
     }
+}
+
+fn insert_regexp_getter(props: &mut PropertyMap, name: &str, getter: JsValue) {
+    props.insert_with_attrs(
+        format!("__get_{name}__"),
+        getter,
+        PropertyAttributes::CONFIGURABLE,
+    );
+}
+
+fn bool_getter(re: &Rc<JsRegExp>, flag: RegExpFlags) -> JsValue {
+    let re = Rc::clone(re);
+    JsValue::NativeFunction(Rc::new(move |_args: Vec<JsValue>| {
+        Ok(JsValue::Boolean(re.flags().contains(flag)))
+    }))
 }
 
 fn utf16_index(input: &str, byte_index: usize) -> i32 {

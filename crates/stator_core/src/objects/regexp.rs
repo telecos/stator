@@ -282,6 +282,26 @@ impl JsRegExp {
         &self.pattern
     }
 
+    /// Returns the ECMAScript `source` text for this regexp.
+    ///
+    /// This preserves the original pattern text, substitutes `(?:)` for the
+    /// empty pattern, and escapes `/` so the result can appear inside
+    /// `/source/flags`.
+    pub fn source_text(&self) -> String {
+        if self.pattern.is_empty() {
+            return "(?:)".to_string();
+        }
+
+        let mut source = String::with_capacity(self.pattern.len());
+        for ch in self.pattern.chars() {
+            if ch == '/' {
+                source.push('\\');
+            }
+            source.push(ch);
+        }
+        source
+    }
+
     /// Returns the [`RegExpFlags`] for this regexp.
     pub fn flags(&self) -> RegExpFlags {
         self.flags
@@ -386,7 +406,12 @@ impl std::fmt::Display for JsRegExp {
     /// Returns the ECMAScript `RegExp.prototype.toString()` representation:
     /// `/pattern/flags`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "/{}/{}", self.pattern, self.flags.to_flags_string())
+        write!(
+            f,
+            "/{}/{}",
+            self.source_text(),
+            self.flags.to_flags_string()
+        )
     }
 }
 
