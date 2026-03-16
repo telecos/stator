@@ -15,12 +15,13 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/test262.yml'
+  workflow_dispatch:
 
 # Cancel any in-progress run for the same branch/PR so that only the latest
 # commit is tested, saving runner minutes.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   test262:
