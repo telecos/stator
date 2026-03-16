@@ -26707,4 +26707,285 @@ mod tests {
         .unwrap();
         assert_eq!(r, JsValue::Smi(7));
     }
+
+    // ── Array method edge-case conformance tests ────────────────────────
+
+    /// `Array.from` with an array-like object (has length + indexed props).
+    #[test]
+    fn e2e_array_from_array_like() {
+        let r =
+            global_eval(r#"Array.from({length: 3, 0: "a", 1: "b", 2: "c"}).join(",")"#).unwrap();
+        assert_eq!(r, JsValue::String("a,b,c".into()));
+    }
+
+    /// `Array.from` with mapFn receiving index as second argument.
+    #[test]
+    fn e2e_array_from_mapfn_index() {
+        let r = global_eval("Array.from([10, 20, 30], function(v, i) { return i; }).join(',')")
+            .unwrap();
+        assert_eq!(r, JsValue::String("0,1,2".into()));
+    }
+
+    /// `Array.from` with mapFn that doubles values.
+    #[test]
+    fn e2e_array_from_mapfn_doubles() {
+        let r =
+            global_eval("Array.from([1,2,3], function(x) { return x * 2; }).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("2,4,6".into()));
+    }
+
+    /// `Array.from` on an empty array-like returns empty array.
+    #[test]
+    fn e2e_array_from_empty_array_like() {
+        let r = global_eval("Array.from({length: 0}).length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// `Array.from` with a Set produces the set's values.
+    #[test]
+    fn e2e_array_from_set() {
+        let r =
+            global_eval("var s = new Set(); s.add(1); s.add(2); s.add(3); Array.from(s).join(',')")
+                .unwrap();
+        assert_eq!(r, JsValue::String("1,2,3".into()));
+    }
+
+    /// `Array.from` with non-callable mapFn throws TypeError.
+    #[test]
+    fn e2e_array_from_non_callable_mapfn() {
+        let r = global_eval("Array.from([1,2], 42)");
+        assert!(r.is_err());
+    }
+
+    /// `Array.of` creates single-element array (unlike `Array(5)` which makes length-5).
+    #[test]
+    fn e2e_array_of_single_element_value() {
+        let r = global_eval("Array.of(5)[0]").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    /// `Array.of` with no arguments returns empty array.
+    #[test]
+    fn e2e_array_of_no_args() {
+        let r = global_eval("Array.of().length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// `Array.of` with mixed types.
+    #[test]
+    fn e2e_array_of_mixed_types() {
+        let r = global_eval(r#"Array.of(1, "two", true).length"#).unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// `Array.prototype.flat` with default depth (1).
+    #[test]
+    fn e2e_array_flat_depth_one() {
+        let r = global_eval("[1, [2, [3]]].flat().join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,2,3".into()));
+    }
+
+    /// `Array.prototype.flat` with depth 0 (no flattening).
+    #[test]
+    fn e2e_array_flat_depth_zero() {
+        let r = global_eval("[1, [2, 3]].flat(0).length").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// `Array.prototype.flat` with depth 2.
+    #[test]
+    fn e2e_array_flat_depth_two() {
+        let r = global_eval("[1, [2, [3, [4]]]].flat(2).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,2,3,4".into()));
+    }
+
+    /// `Array.prototype.flat` with Infinity depth.
+    #[test]
+    fn e2e_array_flat_infinity() {
+        let r = global_eval("[1, [2, [3, [4, [5]]]]].flat(Infinity).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,2,3,4,5".into()));
+    }
+
+    /// `Array.prototype.flatMap` maps and flattens one level.
+    #[test]
+    fn e2e_array_flatmap_basic() {
+        let r =
+            global_eval("[1, 2, 3].flatMap(function(x) { return [x, x * 2]; }).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,2,2,4,3,6".into()));
+    }
+
+    /// `Array.prototype.flatMap` returns non-array values as-is.
+    #[test]
+    fn e2e_array_flatmap_non_array_return() {
+        let r = global_eval("[1, 2, 3].flatMap(function(x) { return x * 10; }).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("10,20,30".into()));
+    }
+
+    /// `Array.prototype.every` returns true for empty arrays.
+    #[test]
+    fn e2e_array_every_empty() {
+        let r = global_eval("[].every(function() { return false; })").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `Array.prototype.every` short-circuits on first false.
+    #[test]
+    fn e2e_array_every_short_circuit() {
+        let r = global_eval(
+            r#"
+            var count = 0;
+            [1, 2, 3, 4, 5].every(function(x) { count++; return x < 3; });
+            count
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// `Array.prototype.some` returns false for empty arrays.
+    #[test]
+    fn e2e_array_some_empty() {
+        let r = global_eval("[].some(function() { return true; })").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `Array.prototype.some` short-circuits on first true.
+    #[test]
+    fn e2e_array_some_short_circuit() {
+        let r = global_eval(
+            r#"
+            var count = 0;
+            [1, 2, 3, 4, 5].some(function(x) { count++; return x === 2; });
+            count
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// `Array.prototype.fill` with start and end.
+    #[test]
+    fn e2e_array_fill_start_end() {
+        let r = global_eval("[1,2,3,4,5].fill(0, 1, 3).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,0,0,4,5".into()));
+    }
+
+    /// `Array.prototype.fill` with negative start.
+    #[test]
+    fn e2e_array_fill_negative_start() {
+        let r = global_eval("[1,2,3,4].fill(9, -2).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,2,9,9".into()));
+    }
+
+    /// `Array.prototype.fill` with negative end.
+    #[test]
+    fn e2e_array_fill_negative_end() {
+        let r = global_eval("[1,2,3,4].fill(0, 0, -2).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("0,0,3,4".into()));
+    }
+
+    /// `Array.prototype.fill` with no start/end fills entire array.
+    #[test]
+    fn e2e_array_fill_entire() {
+        let r = global_eval("[1,2,3].fill(7).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("7,7,7".into()));
+    }
+
+    /// `Array.prototype.copyWithin` basic positive indices.
+    #[test]
+    fn e2e_array_copywithin_basic() {
+        let r = global_eval("[1,2,3,4,5].copyWithin(0, 3).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("4,5,3,4,5".into()));
+    }
+
+    /// `Array.prototype.copyWithin` with negative target.
+    #[test]
+    fn e2e_array_copywithin_negative_target() {
+        let r = global_eval("[1,2,3,4,5].copyWithin(-2, 0, 2).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,2,3,1,2".into()));
+    }
+
+    /// `Array.prototype.copyWithin` with all negative indices.
+    #[test]
+    fn e2e_array_copywithin_negative_start() {
+        let r = global_eval("[1,2,3,4,5].copyWithin(0, -2).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("4,5,3,4,5".into()));
+    }
+
+    /// `Array.prototype.includes` finds NaN (SameValueZero).
+    #[test]
+    fn e2e_array_includes_nan() {
+        let r = global_eval("[1, NaN, 3].includes(NaN)").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `Array.prototype.includes` with fromIndex.
+    #[test]
+    fn e2e_array_includes_from_index() {
+        let r = global_eval("[1, 2, 3, 4].includes(2, 2)").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `Array.prototype.includes` with negative fromIndex.
+    #[test]
+    fn e2e_array_includes_negative_from_index() {
+        let r = global_eval("[1, 2, 3].includes(1, -1)").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `Array.prototype.includes` finds value at negative fromIndex.
+    #[test]
+    fn e2e_array_includes_negative_from_index_found() {
+        let r = global_eval("[1, 2, 3].includes(3, -1)").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `Array.isArray` returns true for literal arrays.
+    #[test]
+    fn e2e_array_isarray_literal() {
+        let r = global_eval("Array.isArray([])").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `Array.isArray` returns false for non-arrays.
+    #[test]
+    fn e2e_array_isarray_object() {
+        let r = global_eval("Array.isArray({length: 0})").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `Array.isArray` returns false for string.
+    #[test]
+    fn e2e_array_isarray_string() {
+        let r = global_eval(r#"Array.isArray("abc")"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `Array.isArray` on `Array.prototype` returns true (per spec).
+    #[test]
+    fn e2e_array_isarray_prototype() {
+        let r = global_eval("Array.isArray(Array.prototype)").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `Array.prototype.every` with all elements passing.
+    #[test]
+    fn e2e_array_every_all_pass() {
+        let r = global_eval("[2, 4, 6].every(function(x) { return x % 2 === 0; })").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `Array.prototype.some` with no match.
+    #[test]
+    fn e2e_array_some_no_match() {
+        let r = global_eval("[1, 3, 5].some(function(x) { return x % 2 === 0; })").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `Array.prototype.some` with match.
+    #[test]
+    fn e2e_array_some_match() {
+        let r = global_eval("[1, 2, 3].some(function(x) { return x === 2; })").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
 }
