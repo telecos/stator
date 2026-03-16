@@ -18261,6 +18261,242 @@ mod tests {
         assert_eq!(result, JsValue::String("undefined".into()));
     }
 
+    #[test]
+    fn e2e_class_static_method_constructs_instance() {
+        let result = global_eval(
+            "class Foo { static create() { return new Foo(); } } Foo.create() instanceof Foo",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_static_method_reads_static_field() {
+        let result = global_eval(
+            "class Foo { static count = 41; static read() { return this.count; } } Foo.read()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(41));
+    }
+
+    #[test]
+    fn e2e_class_static_field_is_defined_on_constructor() {
+        let result = global_eval("class Foo { static count = 0; } Foo.count").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn e2e_class_static_fields_preserve_multiple_values() {
+        let result = global_eval(
+            "class Foo { static first = 1; static second = 2; } Foo.first + Foo.second",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_class_static_field_not_on_instance() {
+        let result = global_eval("class Foo { static count = 9; } typeof new Foo().count").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_class_static_block_sets_property_via_this() {
+        let result =
+            global_eval("class Foo { static { this.initialized = true; } } Foo.initialized")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_static_block_sees_prior_static_field() {
+        let result = global_eval(
+            "class Foo { static count = 1; static { this.count = this.count + 1; } } Foo.count",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_class_static_block_can_define_multiple_fields() {
+        let result =
+            global_eval("class Foo { static { this.a = 1; this.b = 2; } } Foo.a + Foo.b").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_class_extends_dynamic_expression_evaluates_once() {
+        let result = global_eval(
+            "var calls = 0; \
+             function getBase() { calls = calls + 1; return class Base {}; } \
+             class Foo extends getBase() {} \
+             calls",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_class_extends_dynamic_expression_uses_returned_base() {
+        let result = global_eval(
+            "class Base { value() { return 7; } } \
+             function getBase() { return Base; } \
+             class Foo extends getBase() {} \
+             new Foo().value()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_class_default_derived_constructor_forwards_args() {
+        let result = global_eval(
+            "class Base { constructor(x) { this.x = x; } } \
+             class Child extends Base {} \
+             new Child(7).x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_class_default_derived_constructor_preserves_new_target() {
+        let result = global_eval(
+            "class Base { constructor() { this.isChild = new.target === Child; } } \
+             class Child extends Base {} \
+             new Child().isChild",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_super_method_call_uses_parent_method() {
+        let result = global_eval(
+            "class Base { value() { return 2; } } \
+             class Child extends Base { value() { return super.value() + 3; } } \
+             new Child().value()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_class_super_method_call_preserves_receiver() {
+        let result = global_eval(
+            "class Base { read() { return this.value; } } \
+             class Child extends Base { constructor() { super(); this.value = 9; } go() { return super.read(); } } \
+             new Child().go()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn e2e_class_super_property_access_in_method() {
+        let result = global_eval(
+            "class Base { get answer() { return 4; } } \
+             class Child extends Base { read() { return super.answer + 1; } } \
+             new Child().read()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_class_super_in_static_method_calls_parent_static() {
+        let result = global_eval(
+            "class Parent { static bar() { return 5; } } \
+             class Child extends Parent { static foo() { return super.bar() + 1; } } \
+             Child.foo()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_class_super_in_static_method_preserves_receiver() {
+        let result = global_eval(
+            "class Parent { static read() { return this.value; } } \
+             class Child extends Parent { static value = 12; static go() { return super.read(); } } \
+             Child.go()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(12));
+    }
+
+    #[test]
+    fn e2e_class_constructor_return_object_overrides_this() {
+        let result = global_eval(
+            "class Foo { constructor() { this.x = 1; return { marker: 2 }; } } \
+             new Foo().marker",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_class_constructor_return_primitive_keeps_this() {
+        let result = global_eval(
+            "class Foo { constructor() { this.x = 1; return 2; } } \
+             new Foo().x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_class_derived_constructor_return_object_overrides_this() {
+        let result = global_eval(
+            "class Base {} \
+             class Child extends Base { constructor() { super(); return { marker: 3 }; } } \
+             new Child().marker",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_class_new_target_in_constructor_is_current_class() {
+        let result = global_eval(
+            "class Foo { constructor() { this.ok = new.target === Foo; } } \
+             new Foo().ok",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_new_target_flows_through_super_call() {
+        let result = global_eval(
+            "class Base { constructor() { this.nt = new.target; } } \
+             class Child extends Base {} \
+             new Child().nt === Child",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_new_target_undefined_in_static_method_call() {
+        let result =
+            global_eval("class Foo { static check() { return typeof new.target; } } Foo.check()")
+                .unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_class_expression_name_not_visible_outside() {
+        let result = global_eval("var Foo = class Bar {}; typeof Bar").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_class_expression_value_is_assigned_to_outer_binding() {
+        let result = global_eval("var Foo = class Bar {}; typeof Foo").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
     // ── String ↔ RegExp delegation tests ────────────────────────────────────
 
     /// Helper: build a RegExp `JsValue` via `regexp_construct`.

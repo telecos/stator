@@ -1572,6 +1572,8 @@ impl FunctionCompiler {
                 false,
                 ctor.value.is_strict,
             )?
+        } else if super_class.is_some() {
+            self.compile_default_derived_constructor(body.loc)?
         } else {
             let empty_body = BlockStmt {
                 loc: body.loc,
@@ -1619,9 +1621,7 @@ impl FunctionCompiler {
                     self.compile_class_static_property(class_reg, p)?;
                 }
                 ClassMember::StaticBlock(sb) => {
-                    for stmt in &sb.body {
-                        self.compile_stmt(stmt)?;
-                    }
+                    self.compile_class_static_block(class_reg, sb)?;
                 }
                 _ => {} // instance fields + constructor handled separately
             }
@@ -1656,6 +1656,47 @@ impl FunctionCompiler {
 
         self.is_strict = outer_strict;
         Ok(())
+    }
+
+    fn compile_default_derived_constructor(
+        &mut self,
+        loc: crate::parser::ast::SourceLocation,
+    ) -> StatorResult<BytecodeArray> {
+        use crate::parser::ast::{
+            BlockStmt, CallExpr, Expr, ExprStmt, Ident, Param, Pat, RestElement, SpreadElement,
+            Stmt,
+        };
+
+        let args_ident = Ident {
+            loc,
+            name: "args".to_string(),
+        };
+        let params = vec![Param {
+            loc,
+            pat: Pat::Rest(Box::new(RestElement {
+                loc,
+                argument: Box::new(Pat::Ident(args_ident.clone())),
+            })),
+            default: None,
+        }];
+        let body = BlockStmt {
+            loc,
+            body: vec![Stmt::Expr(ExprStmt {
+                loc,
+                expr: Box::new(Expr::Call(Box::new(CallExpr {
+                    loc,
+                    callee: Box::new(Expr::Ident(Ident {
+                        loc,
+                        name: "super".to_string(),
+                    })),
+                    arguments: vec![Expr::Spread(Box::new(SpreadElement {
+                        loc,
+                        argument: Box::new(Expr::Ident(args_ident)),
+                    }))],
+                }))),
+            })],
+        };
+        compile_function(&params, &body, false, false, true)
     }
 
     /// Compile a non-constructor class method or accessor onto `target_reg`.
@@ -1885,6 +1926,40 @@ impl FunctionCompiler {
             }
         }
 
+        Ok(())
+    }
+
+    fn compile_class_static_block(
+        &mut self,
+        class_reg: Register,
+        block: &crate::parser::ast::StaticBlock,
+    ) -> StatorResult<()> {
+        let body = BlockStmt {
+            loc: block.loc,
+            body: block.body.clone(),
+        };
+        let block_array = compile_function(&[], &body, false, false, true)?;
+        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(block_array)));
+        let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
+        self.emit(Instruction::new_unchecked(
+            Opcode::CreateClosure,
+            vec![Operand::ConstantPoolIdx(pool_idx), slot, Operand::Flag(0)],
+        ));
+        let callee_reg = self.allocator.allocate_temporary();
+        self.emit_star(callee_reg);
+        let call_slot = self.alloc_slot(FeedbackSlotKind::Call);
+        self.emit(Instruction::new_unchecked(
+            Opcode::CallProperty,
+            vec![
+                to_reg_op(callee_reg),
+                to_reg_op(class_reg),
+                Operand::RegisterCount(0),
+                call_slot,
+            ],
+        ));
+        self.allocator
+            .release_temporary(callee_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -3408,19 +3483,11 @@ impl FunctionCompiler {
         ));
         self.emit_star(recv_reg);
 
-        self.compile_expr(&m.object)?;
-        let super_reg = self.allocator.allocate_temporary();
-        self.emit_star(super_reg);
-
-        let proto_name_idx = self.add_string("prototype");
-        let proto_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+        let super_lookup_idx = self.add_string(".super_lookup_start");
+        let super_slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
         self.emit(Instruction::new_unchecked(
-            Opcode::LdaNamedProperty,
-            vec![
-                to_reg_op(super_reg),
-                Operand::ConstantPoolIdx(proto_name_idx),
-                proto_slot,
-            ],
+            Opcode::LdaGlobal,
+            vec![Operand::ConstantPoolIdx(super_lookup_idx), super_slot],
         ));
 
         match &m.property {
@@ -3450,9 +3517,6 @@ impl FunctionCompiler {
             }
             crate::parser::ast::MemberProp::Computed(_) => {
                 self.allocator
-                    .release_temporary(super_reg)
-                    .map_err(|e| StatorError::Internal(e.to_string()))?;
-                self.allocator
                     .release_temporary(recv_reg)
                     .map_err(|e| StatorError::Internal(e.to_string()))?;
                 return Err(StatorError::SyntaxError(
@@ -3461,9 +3525,6 @@ impl FunctionCompiler {
             }
         }
 
-        self.allocator
-            .release_temporary(super_reg)
-            .map_err(|e| StatorError::Internal(e.to_string()))?;
         self.allocator
             .release_temporary(recv_reg)
             .map_err(|e| StatorError::Internal(e.to_string()))?;
@@ -4052,19 +4113,11 @@ impl FunctionCompiler {
         ));
         self.emit_star(recv_reg);
 
-        self.compile_expr(&m.object)?;
-        let super_reg = self.allocator.allocate_temporary();
-        self.emit_star(super_reg);
-
-        let proto_name_idx = self.add_string("prototype");
-        let proto_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+        let super_lookup_idx = self.add_string(".super_lookup_start");
+        let super_slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
         self.emit(Instruction::new_unchecked(
-            Opcode::LdaNamedProperty,
-            vec![
-                to_reg_op(super_reg),
-                Operand::ConstantPoolIdx(proto_name_idx),
-                proto_slot,
-            ],
+            Opcode::LdaGlobal,
+            vec![Operand::ConstantPoolIdx(super_lookup_idx), super_slot],
         ));
 
         match &m.property {
@@ -4093,9 +4146,6 @@ impl FunctionCompiler {
                 ));
             }
             crate::parser::ast::MemberProp::Computed(_) => {
-                self.allocator
-                    .release_temporary(super_reg)
-                    .map_err(|e| StatorError::Internal(e.to_string()))?;
                 self.allocator
                     .release_temporary(recv_reg)
                     .map_err(|e| StatorError::Internal(e.to_string()))?;
@@ -4145,9 +4195,6 @@ impl FunctionCompiler {
 
         self.allocator
             .release_temporary(callee_reg)
-            .map_err(|e| StatorError::Internal(e.to_string()))?;
-        self.allocator
-            .release_temporary(super_reg)
             .map_err(|e| StatorError::Internal(e.to_string()))?;
         self.allocator
             .release_temporary(recv_reg)

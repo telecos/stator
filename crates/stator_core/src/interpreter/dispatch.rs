@@ -4184,6 +4184,9 @@ fn handle_define_named_own_property(
     let val = ctx.frame.accumulator.clone();
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     if let JsValue::PlainObject(ref map) = obj {
+        if let JsValue::Function(ba) = &val {
+            fn_props_set(ba, ".home_object".to_string(), obj.clone());
+        }
         map.borrow_mut().insert(prop_name, val);
     }
     // Accumulator stays unchanged.
@@ -4206,6 +4209,9 @@ fn handle_define_keyed_own_property(
     let val = ctx.frame.accumulator.clone();
     if let JsValue::PlainObject(ref map) = obj {
         let prop_name = to_property_key(&key)?;
+        if let JsValue::Function(ba) = &val {
+            fn_props_set(ba, ".home_object".to_string(), obj.clone());
+        }
         map.borrow_mut().insert(prop_name, val);
     }
     // Accumulator stays unchanged.
@@ -4228,6 +4234,9 @@ fn handle_define_keyed_own_property_in_literal(
     let val = ctx.frame.accumulator.clone();
     if let JsValue::PlainObject(ref map) = obj {
         let prop_name = to_property_key(&key)?;
+        if let JsValue::Function(ba) = &val {
+            fn_props_set(ba, ".home_object".to_string(), obj.clone());
+        }
         map.borrow_mut().insert(prop_name, val);
     }
     // Accumulator stays unchanged.
@@ -6012,6 +6021,9 @@ fn handle_define_getter_property(
     let getter = ctx.frame.accumulator.clone();
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     if let JsValue::PlainObject(ref map) = obj {
+        if let JsValue::Function(ba) = &getter {
+            fn_props_set(ba, ".home_object".to_string(), obj.clone());
+        }
         // Store getter as __get_<name>__ — the property access handler
         // checks for this convention when loading.
         // Use insert_builtin to ensure the internal key is non-enumerable.
@@ -6043,6 +6055,9 @@ fn handle_define_setter_property(
     let setter = ctx.frame.accumulator.clone();
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     if let JsValue::PlainObject(ref map) = obj {
+        if let JsValue::Function(ba) = &setter {
+            fn_props_set(ba, ".home_object".to_string(), obj.clone());
+        }
         map.borrow_mut()
             .insert_builtin(format!("__set_{prop_name}__"), setter);
     }
@@ -6065,6 +6080,9 @@ fn handle_define_keyed_getter_property(
     let key = ctx.frame.read_reg(key_v)?.clone();
     let key_str = to_property_key(&key)?;
     if let JsValue::PlainObject(ref map) = obj {
+        if let JsValue::Function(ba) = &getter {
+            fn_props_set(ba, ".home_object".to_string(), obj.clone());
+        }
         map.borrow_mut()
             .insert_builtin(format!("__get_{key_str}__"), getter);
     }
@@ -6087,6 +6105,9 @@ fn handle_define_keyed_setter_property(
     let key = ctx.frame.read_reg(key_v)?.clone();
     let key_str = to_property_key(&key)?;
     if let JsValue::PlainObject(ref map) = obj {
+        if let JsValue::Function(ba) = &setter {
+            fn_props_set(ba, ".home_object".to_string(), obj.clone());
+        }
         map.borrow_mut()
             .insert_builtin(format!("__set_{key_str}__"), setter);
     }
