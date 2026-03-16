@@ -2682,11 +2682,33 @@ fn make_object() -> JsValue {
                             .collect();
                         Ok(JsValue::new_array(keys))
                     } else {
-                        let keys: Vec<JsValue> = borrow
-                            .enumerable_keys()
-                            .filter(|k| !k.starts_with("__"))
-                            .map(|k| JsValue::String(k.clone().into()))
-                            .collect();
+                        let mut keys: Vec<JsValue> = Vec::new();
+                        let mut seen = std::collections::HashSet::new();
+                        // Collect accessor property names from __get_*__/__set_*__.
+                        for k in borrow.enumerable_keys() {
+                            if let Some(prop) =
+                                k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
+                            {
+                                if seen.insert(prop.to_string()) {
+                                    keys.push(JsValue::String(prop.to_string().into()));
+                                }
+                                continue;
+                            }
+                            if let Some(prop) =
+                                k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
+                            {
+                                if seen.insert(prop.to_string()) {
+                                    keys.push(JsValue::String(prop.to_string().into()));
+                                }
+                                continue;
+                            }
+                            if k.starts_with("__") {
+                                continue;
+                            }
+                            if seen.insert(k.clone()) {
+                                keys.push(JsValue::String(k.clone().into()));
+                            }
+                        }
                         Ok(JsValue::new_array(keys))
                     }
                 } else if let JsValue::Array(items) = val {
@@ -2696,7 +2718,7 @@ fn make_object() -> JsValue {
                         .collect();
                     Ok(JsValue::new_array(keys))
                 } else if let JsValue::String(s) = val {
-                    let keys: Vec<JsValue> = (0..s.len())
+                    let keys: Vec<JsValue> = (0..s.chars().count())
                         .map(|i| JsValue::String(i.to_string().into()))
                         .collect();
                     Ok(JsValue::new_array(keys))
@@ -2727,11 +2749,34 @@ fn make_object() -> JsValue {
                             .collect();
                         Ok(JsValue::new_array(values))
                     } else {
-                        let values: Vec<JsValue> = borrow
-                            .enumerable_keys()
-                            .filter(|k| !k.starts_with("__"))
-                            .filter_map(|k| borrow.get(k).cloned())
-                            .collect();
+                        let mut values: Vec<JsValue> = Vec::new();
+                        let mut seen = std::collections::HashSet::new();
+                        // Include accessor property names (value=undefined
+                        // since we cannot invoke getters in this context).
+                        for k in borrow.enumerable_keys() {
+                            if let Some(prop) =
+                                k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
+                            {
+                                if seen.insert(prop.to_string()) {
+                                    values.push(JsValue::Undefined);
+                                }
+                                continue;
+                            }
+                            if let Some(prop) =
+                                k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
+                            {
+                                if seen.insert(prop.to_string()) {
+                                    values.push(JsValue::Undefined);
+                                }
+                                continue;
+                            }
+                            if k.starts_with("__") {
+                                continue;
+                            }
+                            if seen.insert(k.clone()) {
+                                values.push(borrow.get(k).cloned().unwrap_or(JsValue::Undefined));
+                            }
+                        }
                         Ok(JsValue::new_array(values))
                     }
                 } else if let JsValue::Array(items) = val {
@@ -2771,15 +2816,42 @@ fn make_object() -> JsValue {
                             .collect();
                         Ok(JsValue::new_array(entries))
                     } else {
-                        let entries: Vec<JsValue> = borrow
-                            .enumerable_keys()
-                            .filter(|k| !k.starts_with("__"))
-                            .filter_map(|k| {
-                                borrow.get(k).cloned().map(|v| {
-                                    JsValue::new_array(vec![JsValue::String(k.clone().into()), v])
-                                })
-                            })
-                            .collect();
+                        let mut entries: Vec<JsValue> = Vec::new();
+                        let mut seen = std::collections::HashSet::new();
+                        for k in borrow.enumerable_keys() {
+                            if let Some(prop) =
+                                k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
+                            {
+                                if seen.insert(prop.to_string()) {
+                                    entries.push(JsValue::new_array(vec![
+                                        JsValue::String(prop.to_string().into()),
+                                        JsValue::Undefined,
+                                    ]));
+                                }
+                                continue;
+                            }
+                            if let Some(prop) =
+                                k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
+                            {
+                                if seen.insert(prop.to_string()) {
+                                    entries.push(JsValue::new_array(vec![
+                                        JsValue::String(prop.to_string().into()),
+                                        JsValue::Undefined,
+                                    ]));
+                                }
+                                continue;
+                            }
+                            if k.starts_with("__") {
+                                continue;
+                            }
+                            if seen.insert(k.clone()) {
+                                let val = borrow.get(k).cloned().unwrap_or(JsValue::Undefined);
+                                entries.push(JsValue::new_array(vec![
+                                    JsValue::String(k.clone().into()),
+                                    val,
+                                ]));
+                            }
+                        }
                         Ok(JsValue::new_array(entries))
                     }
                 } else if let JsValue::Array(items) = val {
@@ -3127,10 +3199,16 @@ fn make_object() -> JsValue {
                         }
                     }
                     JsValue::String(s) => {
+                        let char_count = s.chars().count();
                         if key == "length" {
-                            Ok(data_desc(JsValue::Smi(s.len() as i32), false, false, false))
+                            Ok(data_desc(
+                                JsValue::Smi(char_count as i32),
+                                false,
+                                false,
+                                false,
+                            ))
                         } else if let Ok(idx) = key.parse::<usize>() {
-                            if idx < s.len() {
+                            if idx < char_count {
                                 let ch: String = s
                                     .chars()
                                     .nth(idx)
@@ -3201,13 +3279,34 @@ fn make_object() -> JsValue {
                 }
                 match obj {
                     JsValue::PlainObject(map) => {
-                        let keys: Vec<JsValue> = map
-                            .borrow()
-                            .keys()
-                            .filter(|k| !k.starts_with("__"))
-                            .map(|k| JsValue::String(k.clone().into()))
-                            .collect();
-                        Ok(JsValue::new_array(keys))
+                        let borrow = map.borrow();
+                        let mut names: Vec<JsValue> = Vec::new();
+                        let mut seen = std::collections::HashSet::new();
+                        for k in borrow.keys() {
+                            if let Some(prop) =
+                                k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
+                            {
+                                if seen.insert(prop.to_string()) {
+                                    names.push(JsValue::String(prop.to_string().into()));
+                                }
+                                continue;
+                            }
+                            if let Some(prop) =
+                                k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
+                            {
+                                if seen.insert(prop.to_string()) {
+                                    names.push(JsValue::String(prop.to_string().into()));
+                                }
+                                continue;
+                            }
+                            if k.starts_with("__") {
+                                continue;
+                            }
+                            if seen.insert(k.clone()) {
+                                names.push(JsValue::String(k.clone().into()));
+                            }
+                        }
+                        Ok(JsValue::new_array(names))
                     }
                     JsValue::Array(items) => {
                         let len = items.borrow().len();
@@ -3222,7 +3321,7 @@ fn make_object() -> JsValue {
                         JsValue::String("name".into()),
                     ])),
                     JsValue::String(s) => {
-                        let mut keys: Vec<JsValue> = (0..s.len())
+                        let mut keys: Vec<JsValue> = (0..s.chars().count())
                             .map(|i| JsValue::String(i.to_string().into()))
                             .collect();
                         keys.push(JsValue::String("length".into()));
@@ -19632,5 +19731,251 @@ mod tests {
     fn e2e_regexp_tostring() {
         let result = global_eval("new RegExp('abc', 'gi').toString()").unwrap();
         assert_eq!(result, JsValue::String("/abc/gi".into()));
+    }
+
+    // ── Property descriptor conformance tests ────────────────────────────
+
+    /// `Object.keys` uses character count, not byte count, for strings.
+    #[test]
+    fn test_object_keys_string_char_count() {
+        // ASCII: 5 chars = 5 keys.
+        let result = global_eval("Object.keys('hello').length").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// `Object.getOwnPropertyNames` on a string counts characters.
+    #[test]
+    fn test_gopn_string_char_count() {
+        // "abc" → ["0","1","2","length"]  → 4 entries.
+        let result = global_eval("Object.getOwnPropertyNames('abc').length").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    /// `Object.getOwnPropertyDescriptor` reports correct string length.
+    #[test]
+    fn test_gopd_string_length_chars() {
+        let result = global_eval("Object.getOwnPropertyDescriptor('abc', 'length').value").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Object.freeze` makes every own property non-writable and
+    /// non-configurable, and the object non-extensible.
+    #[test]
+    fn test_freeze_all_properties_locked() {
+        let result = global_eval(
+            "var o = {a: 1, b: 2}; Object.freeze(o); \
+             var da = Object.getOwnPropertyDescriptor(o, 'a'); \
+             var db = Object.getOwnPropertyDescriptor(o, 'b'); \
+             '' + da.writable + ',' + da.configurable + ',' + db.writable + ',' + db.configurable",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("false,false,false,false".into()));
+    }
+
+    /// `Object.isFrozen` returns false for extensible objects.
+    #[test]
+    fn test_is_frozen_false_for_normal_object() {
+        let result = global_eval("Object.isFrozen({a: 1})").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Object.seal` preserves writability but removes configurability.
+    #[test]
+    fn test_seal_preserves_writable_removes_configurable() {
+        let result = global_eval(
+            "var o = {a: 1}; Object.seal(o); \
+             var d = Object.getOwnPropertyDescriptor(o, 'a'); \
+             '' + d.writable + ',' + d.configurable",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("true,false".into()));
+    }
+
+    /// `Object.isSealed` returns false for extensible objects.
+    #[test]
+    fn test_is_sealed_false_for_normal_object() {
+        let result = global_eval("Object.isSealed({a: 1})").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Object.preventExtensions` makes `Object.isExtensible` return false.
+    #[test]
+    fn test_prevent_extensions_is_extensible() {
+        let result =
+            global_eval("var o = {}; Object.preventExtensions(o); Object.isExtensible(o)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Object.defineProperty` redefining a non-configurable property with
+    /// `configurable: true` should throw TypeError.
+    #[test]
+    fn test_define_property_nonconfig_to_config_throws() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 1, configurable: false }); \
+             try { Object.defineProperty(o, 'x', { configurable: true }); 'no error'; } \
+             catch(e) { 'error'; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("error".into()));
+    }
+
+    /// `Object.defineProperty` widening writable on non-configurable should throw.
+    #[test]
+    fn test_define_property_nonconfig_writable_false_to_true_throws() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 1, writable: false, configurable: false }); \
+             try { Object.defineProperty(o, 'x', { writable: true }); 'no error'; } \
+             catch(e) { 'error'; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("error".into()));
+    }
+
+    /// `Object.defineProperty` changing enumerable on non-configurable should throw.
+    #[test]
+    fn test_define_property_nonconfig_enumerable_change_throws() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 1, enumerable: false, configurable: false }); \
+             try { Object.defineProperty(o, 'x', { enumerable: true }); 'no error'; } \
+             catch(e) { 'error'; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("error".into()));
+    }
+
+    /// `Object.defineProperty` changing value on non-writable non-configurable
+    /// should throw.
+    #[test]
+    fn test_define_property_nonconfig_nonwritable_value_change_throws() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 1, writable: false, configurable: false }); \
+             try { Object.defineProperty(o, 'x', { value: 2 }); 'no error'; } \
+             catch(e) { 'error'; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("error".into()));
+    }
+
+    /// Redefining with the same value on non-writable non-configurable should
+    /// succeed (no-op).
+    #[test]
+    fn test_define_property_nonconfig_same_value_ok() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 1, writable: false, configurable: false }); \
+             Object.defineProperty(o, 'x', { value: 1 }); o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `Object.keys` returns own enumerable keys in insertion order.
+    #[test]
+    fn test_object_keys_insertion_order() {
+        let result = global_eval("Object.keys({b: 1, a: 2, c: 3}).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("b,a,c".into()));
+    }
+
+    /// `Object.keys` skips non-enumerable properties.
+    #[test]
+    fn test_object_keys_skips_non_enumerable() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'a', { value: 1, enumerable: true }); \
+             Object.defineProperty(o, 'b', { value: 2, enumerable: false }); \
+             Object.defineProperty(o, 'c', { value: 3, enumerable: true }); \
+             Object.keys(o).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,c".into()));
+    }
+
+    /// `Object.getOwnPropertyNames` includes non-enumerable property names.
+    #[test]
+    fn test_gopn_includes_all_own() {
+        let result = global_eval(
+            "var o = {a: 1}; \
+             Object.defineProperty(o, 'b', { value: 2, enumerable: false }); \
+             Object.getOwnPropertyNames(o).sort().join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,b".into()));
+    }
+
+    /// `Object.freeze` prevents new property addition.
+    #[test]
+    fn test_freeze_prevents_new_properties() {
+        let result = global_eval("var o = Object.freeze({}); o.x = 1; typeof o.x").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    /// `Object.seal` prevents new property addition.
+    #[test]
+    fn test_seal_prevents_new_properties() {
+        let result = global_eval("var o = Object.seal({a: 1}); o.b = 2; typeof o.b").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    /// `Object.setPrototypeOf` on non-extensible throws TypeError.
+    #[test]
+    fn test_set_prototype_non_extensible_throws() {
+        let result = global_eval(
+            "var o = Object.preventExtensions({}); \
+             try { Object.setPrototypeOf(o, {x: 1}); 'no error'; } \
+             catch(e) { 'error'; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("error".into()));
+    }
+
+    /// `Object.getPrototypeOf` returns null for plain objects (no prototype
+    /// chain in this engine's PlainObject model).
+    #[test]
+    fn test_get_prototype_of_plain_object() {
+        let result = global_eval("Object.getPrototypeOf({}) === null").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.isExtensible` returns false for primitives.
+    #[test]
+    fn test_is_extensible_primitive() {
+        let result = global_eval("Object.isExtensible(42)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Object.isFrozen` returns true for primitives.
+    #[test]
+    fn test_is_frozen_primitive() {
+        let result = global_eval("Object.isFrozen(42)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.isSealed` returns true for primitives.
+    #[test]
+    fn test_is_sealed_primitive() {
+        let result = global_eval("Object.isSealed('hello')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.freeze` on a non-object returns the value unchanged.
+    #[test]
+    fn test_freeze_primitive_returns_value() {
+        let result = global_eval("Object.freeze(42)").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// `Object.defineProperty` on frozen object throws TypeError.
+    #[test]
+    fn test_define_property_on_frozen_throws() {
+        let result = global_eval(
+            "try { var o = Object.freeze({}); Object.defineProperty(o, 'x', { value: 1 }); 'no error'; } \
+             catch(e) { 'error'; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("error".into()));
     }
 }

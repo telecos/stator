@@ -1100,4 +1100,82 @@ mod tests {
         let pm2 = PropertyMap::new();
         assert_ne!(pm1.shape_id(), pm2.shape_id());
     }
+
+    // ── freeze / seal / is_frozen / is_sealed ────────────────────────────
+
+    #[test]
+    fn test_freeze_makes_all_non_writable_non_configurable() {
+        let mut pm = PropertyMap::new();
+        pm.insert("a".to_string(), JsValue::Smi(1));
+        pm.insert("b".to_string(), JsValue::Smi(2));
+        pm.freeze();
+        assert!(!pm.is_writable("a"));
+        assert!(!pm.is_configurable("a"));
+        assert!(!pm.is_writable("b"));
+        assert!(!pm.is_configurable("b"));
+        assert!(!pm.extensible);
+    }
+
+    #[test]
+    fn test_seal_preserves_writable_removes_configurable() {
+        let mut pm = PropertyMap::new();
+        pm.insert("a".to_string(), JsValue::Smi(1));
+        pm.seal();
+        assert!(pm.is_writable("a"), "seal should preserve writable");
+        assert!(!pm.is_configurable("a"), "seal should remove configurable");
+        assert!(!pm.extensible);
+    }
+
+    #[test]
+    fn test_is_frozen_empty_non_extensible() {
+        let mut pm = PropertyMap::new();
+        pm.extensible = false;
+        assert!(pm.is_frozen(), "empty non-extensible map should be frozen");
+    }
+
+    #[test]
+    fn test_is_frozen_with_writable_property() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        pm.extensible = false;
+        assert!(
+            !pm.is_frozen(),
+            "non-extensible map with writable prop is not frozen"
+        );
+    }
+
+    #[test]
+    fn test_is_sealed_with_configurable_property() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        pm.extensible = false;
+        assert!(
+            !pm.is_sealed(),
+            "non-extensible map with configurable prop is not sealed"
+        );
+    }
+
+    #[test]
+    fn test_non_extensible_insert_rejected() {
+        let mut pm = PropertyMap::new();
+        pm.extensible = false;
+        pm.insert("newkey".to_string(), JsValue::Smi(42));
+        assert!(
+            !pm.contains_key("newkey"),
+            "non-extensible map should reject new property"
+        );
+    }
+
+    #[test]
+    fn test_non_extensible_allows_existing_update() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        pm.extensible = false;
+        pm.insert("x".to_string(), JsValue::Smi(2));
+        assert_eq!(
+            pm.get("x"),
+            Some(&JsValue::Smi(2)),
+            "updating existing property should succeed on non-extensible"
+        );
+    }
 }
