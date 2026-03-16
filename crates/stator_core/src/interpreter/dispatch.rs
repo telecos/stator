@@ -2657,11 +2657,17 @@ fn handle_lda_named_property(
     }
     let result = proto_lookup(&obj, &prop_name);
     // ── Populate shape IC for own-property hits on PlainObject ───────────
+    // Skip caching when the property has an accessor (__get_<key>__)
+    // because the IC fast-path would return the placeholder data value
+    // instead of invoking the getter.
     if slot != u32::MAX
         && let JsValue::PlainObject(ref map) = obj
     {
         let pm = map.borrow();
-        if let Some(offset) = pm.offset_of(&prop_name) {
+        let getter_key = format!("__get_{prop_name}__");
+        if !pm.contains_key(&getter_key)
+            && let Some(offset) = pm.offset_of(&prop_name)
+        {
             ctx.frame.shape_load_ic.insert(
                 slot,
                 PropertyIc {
@@ -8974,5 +8980,262 @@ mod tests {
     fn e2e_default_param_with_arrow() {
         let result = crate::builtins::global::global_eval("var f = (a = 7) => a + 1; f()").unwrap();
         assert_eq!(result, JsValue::Smi(8));
+    }
+
+    // ── Computed property names ─────────────────────────────────────────
+
+    #[test]
+    fn e2e_computed_prop_string_concat() {
+        let result =
+            crate::builtins::global::global_eval("var o = {['a' + 'b']: 1}; o.ab").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_computed_prop_variable_key() {
+        let result =
+            crate::builtins::global::global_eval("var k = 'hello'; var o = {[k]: 42}; o.hello")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_computed_prop_numeric_expr() {
+        let result =
+            crate::builtins::global::global_eval("var o = {[1 + 2]: 'three'}; o[3]").unwrap();
+        assert_eq!(result, JsValue::String("three".into()));
+    }
+
+    #[test]
+    fn e2e_computed_method() {
+        let result = crate::builtins::global::global_eval(
+            "var k = 'greet'; var o = {[k]() { return 'hi'; }}; o.greet()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("hi".into()));
+    }
+
+    // ── Shorthand properties ────────────────────────────────────────────
+
+    #[test]
+    fn e2e_shorthand_property() {
+        let result = crate::builtins::global::global_eval(
+            "var x = 10; var y = 20; var o = {x, y}; o.x + o.y",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    #[test]
+    fn e2e_shorthand_mixed_with_regular() {
+        let result =
+            crate::builtins::global::global_eval("var a = 1; var o = {a, b: 2}; o.a + o.b")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── Shorthand methods ───────────────────────────────────────────────
+
+    #[test]
+    fn e2e_shorthand_method() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {add(a, b) { return a + b; }}; o.add(3, 4)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_shorthand_method_this() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {v: 5, get_v() { return this.v; }}; o.get_v()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    // ── Getter / setter in object literals ──────────────────────────────
+
+    #[test]
+    fn e2e_getter_obj_literal() {
+        let result =
+            crate::builtins::global::global_eval("var o = {get x() { return 42; }}; o.x").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_setter_obj_literal() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {_v: 0, set v(x) { this._v = x; }}; o.v = 7; o._v",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_getter_setter_pair_literal() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {\
+               _val: 0,\
+               get val() { return this._val; },\
+               set val(v) { this._val = v * 2; }\
+             };\
+             o.val = 5;\
+             o.val",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_getter_computed_key() {
+        let result = crate::builtins::global::global_eval(
+            "var k = 'x'; var o = {get [k]() { return 99; }}; o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn e2e_setter_computed_key() {
+        let result = crate::builtins::global::global_eval(
+            "var k = 'v'; var o = {_r: 0, set [k](x) { this._r = x; }}; o.v = 3; o._r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── Object literal __proto__ ────────────────────────────────────────
+
+    #[test]
+    fn e2e_proto_in_literal() {
+        let result = crate::builtins::global::global_eval(
+            "var base = {greet() { return 'hello'; }};\
+             var child = {__proto__: base};\
+             child.greet()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("hello".into()));
+    }
+
+    #[test]
+    fn e2e_proto_inherited_property() {
+        let result = crate::builtins::global::global_eval(
+            "var parent = {x: 100};\
+             var child = {__proto__: parent, y: 200};\
+             child.x + child.y",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(300));
+    }
+
+    // ── Object.defineProperty accessor callable ─────────────────────────
+
+    #[test]
+    fn e2e_define_property_getter_accessible() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {};\
+             Object.defineProperty(o, 'x', {\
+               get: function() { return 55; },\
+               configurable: true\
+             });\
+             o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(55));
+    }
+
+    #[test]
+    fn e2e_define_property_setter_accessible() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {_v: 0};\
+             Object.defineProperty(o, 'x', {\
+               set: function(v) { this._v = v; },\
+               configurable: true\
+             });\
+             o.x = 11;\
+             o._v",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(11));
+    }
+
+    #[test]
+    fn e2e_define_property_accessor_pair() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {_v: 0};\
+             Object.defineProperty(o, 'val', {\
+               get: function() { return this._v; },\
+               set: function(v) { this._v = v + 1; },\
+               configurable: true\
+             });\
+             o.val = 10;\
+             o.val",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(11));
+    }
+
+    // ── Getter / setter .name property ──────────────────────────────────
+
+    #[test]
+    fn e2e_getter_name_property() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {get x() { return 1; }};\
+             var desc = Object.getOwnPropertyDescriptor(o, 'x');\
+             desc.get.name",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("get x".into()));
+    }
+
+    #[test]
+    fn e2e_setter_name_property() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {set x(v) {}};\
+             var desc = Object.getOwnPropertyDescriptor(o, 'x');\
+             desc.set.name",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("set x".into()));
+    }
+
+    #[test]
+    fn e2e_method_name_property() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {myMethod() { return 1; }}; o.myMethod.name",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("myMethod".into()));
+    }
+
+    // ── Mixed object literal features ───────────────────────────────────
+
+    #[test]
+    fn e2e_mixed_shorthand_computed_method() {
+        let result = crate::builtins::global::global_eval(
+            "var a = 1;\
+             var k = 'b';\
+             var o = {a, [k]: 2, c() { return 3; }};\
+             o.a + o.b + o.c()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_computed_getter_setter_pair() {
+        let result = crate::builtins::global::global_eval(
+            "var k = 'prop';\
+             var o = {\
+               _s: 0,\
+               get [k]() { return this._s; },\
+               set [k](v) { this._s = v * 3; }\
+             };\
+             o.prop = 4;\
+             o.prop",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(12));
     }
 }

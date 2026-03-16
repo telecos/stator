@@ -1591,6 +1591,7 @@ pub(crate) fn make_iterator_result(value: JsValue, done: bool) -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(map)))
 }
 
+#[allow(dead_code)]
 pub(crate) fn wrap_sync_iterator_as_async_iterator(iterator: JsValue) -> JsValue {
     use crate::builtins::promise::{MicrotaskQueue, promise_reject, promise_resolve};
 
@@ -5103,7 +5104,15 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             "name" => {
-                return JsValue::String(String::new().into());
+                let n = ba.function_name();
+                return JsValue::String(
+                    if n.is_empty() {
+                        String::new()
+                    } else {
+                        n.to_owned()
+                    }
+                    .into(),
+                );
             }
             "length" => {
                 return JsValue::Smi(ba.parameter_count() as i32);

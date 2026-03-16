@@ -4127,6 +4127,21 @@ impl FunctionCompiler {
         Ok(())
     }
 
+    /// Compile a function expression and set an inferred name on the
+    /// resulting [`BytecodeArray`].
+    fn compile_fn_expr_named(&mut self, f: &FnExpr, name: &str) -> StatorResult<()> {
+        let func_array =
+            compile_function(&f.params, &f.body, f.is_generator, f.is_async, f.is_strict)?
+                .with_function_name(name);
+        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
+        let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
+        self.emit(Instruction::new_unchecked(
+            Opcode::CreateClosure,
+            vec![Operand::ConstantPoolIdx(pool_idx), slot, Operand::Flag(0)],
+        ));
+        Ok(())
+    }
+
     /// Compile an arrow function expression.
     fn compile_arrow_expr(&mut self, a: &ArrowExpr) -> StatorResult<()> {
         // Build a synthetic block body if the arrow uses a concise expression.
@@ -4399,7 +4414,11 @@ impl FunctionCompiler {
                 }
             }
             PropValue::Method(fn_expr) => {
-                self.compile_fn_expr(fn_expr)?;
+                if let Some(ref name) = key_name {
+                    self.compile_fn_expr_named(fn_expr, name)?;
+                } else {
+                    self.compile_fn_expr(fn_expr)?;
+                }
                 if let Some(name) = key_name {
                     let name_idx = self.add_string(&name);
                     let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
@@ -4433,7 +4452,11 @@ impl FunctionCompiler {
                 }
             }
             PropValue::Get(fn_expr) => {
-                self.compile_fn_expr(fn_expr)?;
+                if let Some(ref name) = key_name {
+                    self.compile_fn_expr_named(fn_expr, &format!("get {name}"))?;
+                } else {
+                    self.compile_fn_expr(fn_expr)?;
+                }
                 if let Some(name) = key_name {
                     let name_idx = self.add_string(&name);
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
@@ -4462,7 +4485,11 @@ impl FunctionCompiler {
                 }
             }
             PropValue::Set(fn_expr) => {
-                self.compile_fn_expr(fn_expr)?;
+                if let Some(ref name) = key_name {
+                    self.compile_fn_expr_named(fn_expr, &format!("set {name}"))?;
+                } else {
+                    self.compile_fn_expr(fn_expr)?;
+                }
                 if let Some(name) = key_name {
                     let name_idx = self.add_string(&name);
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
