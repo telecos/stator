@@ -1829,11 +1829,15 @@ fn js_to_string(v: &JsValue) -> String {
     match v {
         JsValue::String(s) => s.to_string(),
         JsValue::Smi(n) => n.to_string(),
-        JsValue::HeapNumber(n) => format!("{n}"),
+        JsValue::HeapNumber(n) => crate::objects::value::number_to_string(*n),
         JsValue::Boolean(b) => b.to_string(),
         JsValue::Null => "null".to_string(),
         JsValue::Undefined => "undefined".to_string(),
-        _ => "[object Object]".to_string(),
+        JsValue::Symbol(id) => format!("Symbol({id})"),
+        JsValue::BigInt(n) => n.to_string(),
+        _ => v
+            .to_js_string()
+            .unwrap_or_else(|_| "[object Object]".to_string()),
     }
 }
 

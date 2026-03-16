@@ -841,8 +841,9 @@ fn handle_test_greater_than(
         return Ok(DispatchAction::Continue);
     }
     let rhs = rhs.clone();
-    // a > b  ≡  b < a
-    let result = js_less_than(&rhs, &ctx.frame.accumulator)?;
+    // §7.2.14: a > b ≡ IsLessThan(b, a, false) — evaluation order: right first
+    let result = JsValue::abstract_relational_comparison(&rhs, &ctx.frame.accumulator, false)?
+        .unwrap_or(false);
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
 }
@@ -863,8 +864,11 @@ fn handle_test_less_than_or_equal(
         return Ok(DispatchAction::Continue);
     }
     let rhs = rhs.clone();
-    // a <= b  ≡  !(b < a)
-    let result = !js_less_than(&rhs, &ctx.frame.accumulator)?;
+    // §7.2.14: a <= b ≡ !(IsLessThan(b, a, false))
+    // If result is undefined (NaN), return false (not !false=true).
+    let result = JsValue::abstract_relational_comparison(&rhs, &ctx.frame.accumulator, false)?
+        .map(|r| !r)
+        .unwrap_or(false);
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
 }
@@ -885,8 +889,11 @@ fn handle_test_greater_than_or_equal(
         return Ok(DispatchAction::Continue);
     }
     let rhs = rhs.clone();
-    // a >= b  ≡  !(a < b)
-    let result = !js_less_than(&ctx.frame.accumulator, &rhs)?;
+    // §7.2.14: a >= b ≡ !(IsLessThan(a, b, true))
+    // If result is undefined (NaN), return false (not !false=true).
+    let result = JsValue::abstract_relational_comparison(&ctx.frame.accumulator, &rhs, true)?
+        .map(|r| !r)
+        .unwrap_or(false);
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
 }
@@ -7732,5 +7739,166 @@ mod tests {
             crate::builtins::global::global_eval("var obj = {x: 77}; var key = 'x'; obj?.[key]")
                 .unwrap();
         assert_eq!(result, JsValue::Smi(77));
+    }
+
+    // ── NaN comparison edge cases (relational operators) ─────────────────
+
+    /// `NaN <= 1` must be `false`, not `true`.
+    #[test]
+    fn e2e_nan_less_than_or_equal() {
+        let result = crate::builtins::global::global_eval("NaN <= 1").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `1 <= NaN` must be `false`.
+    #[test]
+    fn e2e_one_lte_nan() {
+        let result = crate::builtins::global::global_eval("1 <= NaN").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `NaN >= 1` must be `false`.
+    #[test]
+    fn e2e_nan_greater_than_or_equal() {
+        let result = crate::builtins::global::global_eval("NaN >= 1").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `1 >= NaN` must be `false`.
+    #[test]
+    fn e2e_one_gte_nan() {
+        let result = crate::builtins::global::global_eval("1 >= NaN").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `NaN > 1` must be `false`.
+    #[test]
+    fn e2e_nan_greater_than() {
+        let result = crate::builtins::global::global_eval("NaN > 1").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `NaN < 1` must be `false`.
+    #[test]
+    fn e2e_nan_less_than() {
+        let result = crate::builtins::global::global_eval("NaN < 1").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `NaN == NaN` must be `false`.
+    #[test]
+    fn e2e_nan_loose_eq_nan() {
+        let result = crate::builtins::global::global_eval("NaN == NaN").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `NaN === NaN` must be `false`.
+    #[test]
+    fn e2e_nan_strict_eq_nan() {
+        let result = crate::builtins::global::global_eval("NaN === NaN").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // ── Type coercion in comparisons ─────────────────────────────────────
+
+    /// `null == undefined` must be `true`.
+    #[test]
+    fn e2e_null_loose_eq_undefined() {
+        let result = crate::builtins::global::global_eval("null == undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `null == 0` must be `false`.
+    #[test]
+    fn e2e_null_not_eq_zero() {
+        let result = crate::builtins::global::global_eval("null == 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `null == false` must be `false`.
+    #[test]
+    fn e2e_null_not_eq_false() {
+        let result = crate::builtins::global::global_eval("null == false").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `"" == 0` must be `true` (empty string coerces to 0).
+    #[test]
+    fn e2e_empty_string_eq_zero() {
+        let result = crate::builtins::global::global_eval("'' == 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `true == 1` must be `true`.
+    #[test]
+    fn e2e_true_eq_one() {
+        let result = crate::builtins::global::global_eval("true == 1").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `false == 0` must be `true`.
+    #[test]
+    fn e2e_false_eq_zero() {
+        let result = crate::builtins::global::global_eval("false == 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `+0 === -0` must be `true`.
+    #[test]
+    fn e2e_pos_zero_strict_eq_neg_zero() {
+        // Use a variable to create -0 since the literal -0 is parsed as Smi(0)
+        let result = crate::builtins::global::global_eval("var x = -0; x === 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `typeof null` must be `"object"`.
+    #[test]
+    fn e2e_typeof_null_is_object_coerce() {
+        let result = crate::builtins::global::global_eval("typeof null === 'object'").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// ToString(-0) must be "0".
+    #[test]
+    fn e2e_neg_zero_to_string() {
+        let result = crate::builtins::global::global_eval("String(-0)").unwrap();
+        assert_eq!(result, JsValue::String("0".into()));
+    }
+
+    /// Number("") must be 0.
+    #[test]
+    fn e2e_number_empty_string() {
+        let result = crate::builtins::global::global_eval("Number('')").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// Number(null) must be 0.
+    #[test]
+    fn e2e_number_null() {
+        let result = crate::builtins::global::global_eval("Number(null)").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// Number(undefined) must be NaN.
+    #[test]
+    fn e2e_number_undefined() {
+        let result = crate::builtins::global::global_eval("Number(undefined)").unwrap();
+        assert!(matches!(result, JsValue::HeapNumber(n) if n.is_nan()));
+    }
+
+    /// Number(true) must be 1, Number(false) must be 0.
+    #[test]
+    fn e2e_number_boolean() {
+        let r1 = crate::builtins::global::global_eval("Number(true)").unwrap();
+        assert_eq!(r1, JsValue::Smi(1));
+        let r2 = crate::builtins::global::global_eval("Number(false)").unwrap();
+        assert_eq!(r2, JsValue::Smi(0));
+    }
+
+    /// String(Symbol()) should work (not throw).
+    #[test]
+    fn e2e_string_of_symbol() {
+        let result = crate::builtins::global::global_eval("typeof String(Symbol())").unwrap();
+        assert_eq!(result, JsValue::String("string".into()));
     }
 }
