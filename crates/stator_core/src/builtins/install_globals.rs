@@ -101,8 +101,8 @@ use crate::builtins::string::{
     string_char_code_at, string_code_point_at, string_concat, string_ends_with, string_fixed,
     string_fontcolor, string_fontsize, string_from_char_code, string_from_code_point,
     string_includes, string_index_of, string_is_well_formed, string_italics, string_iter,
-    string_last_index_of, string_link, string_locale_compare, string_match, string_match_all,
-    string_normalize, string_pad_end, string_pad_start, string_raw, string_repeat, string_replace,
+    string_last_index_of, string_link, string_locale_compare, string_match, string_normalize,
+    string_pad_end, string_pad_start, string_raw, string_repeat, string_replace,
     string_replace_all, string_search, string_slice, string_small, string_split,
     string_starts_with, string_strike, string_sub, string_substr, string_substring, string_sup,
     string_to_locale_lower_case, string_to_locale_upper_case, string_to_lower_case,
@@ -8900,12 +8900,27 @@ fn make_string() -> JsValue {
             }),
         );
 
-        // matchAll(regexp)
+        // matchAll(regexp) — §22.1.3.13
         proto.insert(
             "matchAll".into(),
             native(|args| {
                 let s = require_coercible_string(&args)?;
                 let pattern_arg = args.get(1).unwrap_or(&JsValue::Undefined);
+
+                // §22.1.3.13 step 2: if the argument is a RegExp, it must
+                // have the global flag — otherwise throw TypeError.
+                if let JsValue::PlainObject(map) = pattern_arg
+                    && matches!(
+                        map.borrow().get("__is_regexp__"),
+                        Some(JsValue::Boolean(true))
+                    )
+                    && !matches!(map.borrow().get("global"), Some(JsValue::Boolean(true)))
+                {
+                    return Err(StatorError::TypeError(
+                        "String.prototype.matchAll called with a non-global RegExp argument".into(),
+                    ));
+                }
+
                 // Delegate to RegExp[@@matchAll] when argument is a regexp.
                 if let Some(result) = try_regexp_symbol(
                     pattern_arg,
@@ -8914,17 +8929,23 @@ fn make_string() -> JsValue {
                 ) {
                     return result;
                 }
+
+                // Non-regexp fallback: wrap in a global RegExp and delegate
+                // to its [@@matchAll] so we return a proper iterator of match
+                // objects (with index, input, and groups).
                 let pattern = pattern_arg.to_js_string()?;
-                match string_match_all(&s, &pattern) {
-                    Some(matches) => {
-                        let arr: Vec<JsValue> = matches
-                            .into_iter()
-                            .map(|s| JsValue::String(s.into()))
-                            .collect();
-                        Ok(JsValue::new_array(arr))
-                    }
-                    None => Ok(JsValue::new_array(Vec::new())),
+                let re_val = regexp_construct(&[
+                    JsValue::String(pattern.into()),
+                    JsValue::String("g".into()),
+                ])?;
+                if let Some(result) = try_regexp_symbol(
+                    &re_val,
+                    "__symbol_match_all__",
+                    vec![JsValue::String(s.into())],
+                ) {
+                    return result;
                 }
+                Ok(JsValue::Iterator(NativeIterator::from_items(vec![])))
             }),
         );
 
@@ -19213,6 +19234,197 @@ mod tests {
             result.is_err(),
             "Expected SyntaxError for duplicate RegExp flags"
         );
+    }
+
+    // ── RegExp named captures & matchAll e2e tests ──────────────────────
+
+    /// `exec` with named groups returns a `groups` object.
+    #[test]
+    fn e2e_regexp_exec_named_groups() {
+        let r = global_eval(
+            r#"
+            var m = /(?<year>\d{4})-(?<month>\d{2})/.exec("2024-07");
+            m.groups.year + "-" + m.groups.month
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("2024-07".into()));
+    }
+
+    /// Named groups object has null prototype (no inherited properties).
+    #[test]
+    fn e2e_regexp_groups_null_prototype() {
+        let r = global_eval(
+            r#"
+            var m = /(?<a>.)/.exec("x");
+            Object.getPrototypeOf(m.groups) === null
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Non-participating named group is `undefined`.
+    #[test]
+    fn e2e_regexp_groups_undefined_non_participating() {
+        let r = global_eval(
+            r#"
+            var m = /(?<a>a)|(?<b>b)/.exec("a");
+            m.groups.a === "a" && m.groups.b === undefined
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `exec` result includes `index` and `input`.
+    #[test]
+    fn e2e_regexp_exec_index_input() {
+        let r = global_eval(
+            r#"
+            var m = /world/.exec("hello world");
+            m.index === 6 && m.input === "hello world"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Without named groups, `groups` is `undefined`.
+    #[test]
+    fn e2e_regexp_exec_no_groups_undefined() {
+        let r = global_eval(
+            r#"
+            var m = /\d+/.exec("42");
+            m.groups === undefined
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `String.prototype.matchAll` with a global regexp returns an iterator.
+    #[test]
+    fn e2e_string_match_all_global_regexp() {
+        let r = global_eval(
+            r#"
+            var results = [];
+            for (var m of "a1 b22 c333".matchAll(/\d+/g)) {
+                results.push(m[0]);
+            }
+            results.join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,22,333".into()));
+    }
+
+    /// `matchAll` results include `index` per match.
+    #[test]
+    fn e2e_string_match_all_index() {
+        let r = global_eval(
+            r#"
+            var arr = Array.from("ab cd".matchAll(/\w+/g));
+            arr[0].index === 0 && arr[1].index === 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `matchAll` results include named groups.
+    #[test]
+    fn e2e_string_match_all_named_groups() {
+        let r = global_eval(
+            r#"
+            var arr = Array.from("2024-07 2025-01".matchAll(/(?<y>\d{4})-(?<m>\d{2})/g));
+            arr[0].groups.y + "," + arr[1].groups.y
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("2024,2025".into()));
+    }
+
+    /// `matchAll` with a non-global RegExp throws TypeError.
+    #[test]
+    fn e2e_string_match_all_non_global_throws() {
+        let r = global_eval(
+            r#"
+            try { "abc".matchAll(/a/); "no error"; } catch(e) { e instanceof TypeError ? "ok" : "wrong"; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
+    }
+
+    /// `matchAll` with a string pattern (non-regexp) works.
+    #[test]
+    fn e2e_string_match_all_string_pattern() {
+        let r = global_eval(
+            r#"
+            var results = [];
+            for (var m of "aXaXa".matchAll("a")) {
+                results.push(m.index);
+            }
+            results.join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,2,4".into()));
+    }
+
+    /// `matchAll` string pattern results include `input`.
+    #[test]
+    fn e2e_string_match_all_string_pattern_input() {
+        let r = global_eval(
+            r#"
+            var arr = Array.from("hello".matchAll("l"));
+            arr[0].input === "hello" && arr[1].input === "hello"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `matchAll` with no matches returns an empty iterator.
+    #[test]
+    fn e2e_string_match_all_no_matches() {
+        let r = global_eval(
+            r#"
+            Array.from("abc".matchAll(/\d+/g)).length === 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `RegExp.prototype[Symbol.matchAll]` is callable directly.
+    #[test]
+    fn e2e_regexp_symbol_match_all_direct() {
+        let r = global_eval(
+            r#"
+            var re = /\d+/g;
+            var results = [];
+            for (var m of re[Symbol.matchAll]("x1y22z")) {
+                results.push(m[0]);
+            }
+            results.join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,22".into()));
+    }
+
+    /// Named group `$<name>` replacement works with `replace`.
+    #[test]
+    fn e2e_regexp_replace_named_group() {
+        let r = global_eval(
+            r#"
+            "2024-07".replace(/(?<y>\d{4})-(?<m>\d{2})/, "$<m>/$<y>")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("07/2024".into()));
     }
 
     // ── Array.prototype.toString e2e tests ──────────────────────────────

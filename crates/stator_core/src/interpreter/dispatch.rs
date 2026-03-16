@@ -4054,8 +4054,15 @@ fn handle_create_reg_exp_literal(
                             props.insert("groups".to_string(), JsValue::Undefined);
                         } else {
                             let mut groups = PropertyMap::new();
+                            groups.insert("__proto__".to_string(), JsValue::Null);
                             for (k, v) in &m.named_groups {
-                                groups.insert(k.clone(), JsValue::String(v.clone().into()));
+                                groups.insert(
+                                    k.clone(),
+                                    match v {
+                                        Some(s) => JsValue::String(s.clone().into()),
+                                        None => JsValue::Undefined,
+                                    },
+                                );
                             }
                             props.insert(
                                 "groups".to_string(),
