@@ -1633,21 +1633,99 @@ pub(crate) fn make_iterator_result(value: JsValue, done: bool) -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(map)))
 }
 
-#[allow(dead_code)]
-pub(crate) fn wrap_sync_iterator_as_async_iterator(iterator: JsValue) -> JsValue {
+pub(crate) fn mark_as_async_iterator(value: &JsValue) {
+    if let JsValue::PlainObject(map) = value {
+        map.borrow_mut()
+            .insert("__async_iterator__".into(), JsValue::Boolean(true));
+    }
+}
+
+pub(crate) fn normalize_async_iterator(iterator: JsValue) -> JsValue {
+    match iterator {
+        JsValue::Iterator(_) => wrap_sync_iterator_as_async_iterator(iterator),
+        JsValue::Generator(ref state) if !state.borrow().bytecode_array.is_async() => {
+            wrap_sync_iterator_as_async_iterator(iterator)
+        }
+        JsValue::PlainObject(_) => {
+            mark_as_async_iterator(&iterator);
+            iterator
+        }
+        _ => iterator,
+    }
+}
+
+pub(crate) fn settle_async_iterator_result(
+    result: JsValue,
+    queue: &crate::builtins::promise::MicrotaskQueue,
+) -> Result<(JsValue, bool), JsValue> {
+    let settled = match resolve_promise_like(result, queue) {
+        AwaitResolution::Fulfilled(value) => value,
+        AwaitResolution::Rejected(reason) => return Err(reason),
+        AwaitResolution::Pending => make_iterator_result(JsValue::Undefined, false),
+    };
+
+    let JsValue::PlainObject(result_map) = settled else {
+        return Err(JsValue::String(
+            "TypeError: Iterator result is not an object".into(),
+        ));
+    };
+
+    let done = result_map
+        .borrow()
+        .get("done")
+        .is_some_and(|done| done.to_boolean());
+    let value = result_map
+        .borrow()
+        .get("value")
+        .cloned()
+        .unwrap_or(JsValue::Undefined);
+
+    let value = match resolve_promise_like(value, queue) {
+        AwaitResolution::Fulfilled(value) => value,
+        AwaitResolution::Rejected(reason) => return Err(reason),
+        AwaitResolution::Pending => JsValue::Undefined,
+    };
+
+    Ok((value, done))
+}
+
+pub(crate) fn async_iterator_result_promise(
+    result: StatorResult<JsValue>,
+) -> StatorResult<JsValue> {
     use crate::builtins::promise::{MicrotaskQueue, promise_reject, promise_resolve};
 
+    let queue = MicrotaskQueue::new();
+    let promise = match result {
+        Ok(result) => match settle_async_iterator_result(result, &queue) {
+            Ok((value, done)) => promise_resolve(make_iterator_result(value, done), &queue),
+            Err(reason) => promise_reject(reason, &queue),
+        },
+        Err(error) => {
+            if let Some(reason) = Interpreter::js_error_to_rejection_reason(&error) {
+                promise_reject(reason, &queue)
+            } else {
+                return Err(error);
+            }
+        }
+    };
+    queue.drain();
+    Ok(JsValue::Promise(promise))
+}
+
+pub(crate) fn async_iterator_reason_to_error(reason: JsValue) -> StatorError {
+    set_pending_exception(reason.clone());
+    StatorError::JsException(error_message_from_value(&reason))
+}
+
+pub(crate) fn wrap_sync_iterator_as_async_iterator(iterator: JsValue) -> JsValue {
     let props = Rc::new(RefCell::new(PropertyMap::new()));
     let async_iter = JsValue::PlainObject(Rc::clone(&props));
-    props
-        .borrow_mut()
-        .insert("__async_iterator__".into(), JsValue::Boolean(true));
+    mark_as_async_iterator(&async_iter);
 
     let next_iterator = iterator.clone();
     props.borrow_mut().insert(
         "next".into(),
         JsValue::NativeFunction(Rc::new(move |args| {
-            let queue = MicrotaskQueue::new();
             let input = args.into_iter().next().unwrap_or(JsValue::Undefined);
             let result = match &next_iterator {
                 JsValue::Iterator(ni) => match ni.borrow_mut().next_item() {
@@ -1669,42 +1747,7 @@ pub(crate) fn wrap_sync_iterator_as_async_iterator(iterator: JsValue) -> JsValue
                     "value is not a synchronous iterator".into(),
                 )),
             };
-
-            let promise = match result {
-                Ok(JsValue::PlainObject(result_map)) => {
-                    let done = result_map
-                        .borrow()
-                        .get("done")
-                        .is_some_and(|done| done.to_boolean());
-                    let value = result_map
-                        .borrow()
-                        .get("value")
-                        .cloned()
-                        .unwrap_or(JsValue::Undefined);
-                    match resolve_promise_like(value, &queue) {
-                        AwaitResolution::Fulfilled(value) => {
-                            promise_resolve(make_iterator_result(value, done), &queue)
-                        }
-                        AwaitResolution::Rejected(reason) => promise_reject(reason, &queue),
-                        AwaitResolution::Pending => {
-                            promise_resolve(make_iterator_result(JsValue::Undefined, done), &queue)
-                        }
-                    }
-                }
-                Ok(_) => promise_reject(
-                    JsValue::String("TypeError: Iterator result is not an object".into()),
-                    &queue,
-                ),
-                Err(error) => {
-                    if let Some(reason) = Interpreter::js_error_to_rejection_reason(&error) {
-                        promise_reject(reason, &queue)
-                    } else {
-                        return Err(error);
-                    }
-                }
-            };
-            queue.drain();
-            Ok(JsValue::Promise(promise))
+            async_iterator_result_promise(result)
         })),
     );
 
@@ -1712,7 +1755,6 @@ pub(crate) fn wrap_sync_iterator_as_async_iterator(iterator: JsValue) -> JsValue
     props.borrow_mut().insert(
         "return".into(),
         JsValue::NativeFunction(Rc::new(move |args| {
-            let queue = MicrotaskQueue::new();
             let return_value = args.into_iter().next().unwrap_or(JsValue::Undefined);
             let result = match &return_iterator {
                 JsValue::Iterator(ni) => {
@@ -1731,42 +1773,7 @@ pub(crate) fn wrap_sync_iterator_as_async_iterator(iterator: JsValue) -> JsValue
                 },
                 _ => Ok(make_iterator_result(JsValue::Undefined, true)),
             };
-
-            let promise = match result {
-                Ok(JsValue::PlainObject(result_map)) => {
-                    let done = result_map
-                        .borrow()
-                        .get("done")
-                        .is_some_and(|done| done.to_boolean());
-                    let value = result_map
-                        .borrow()
-                        .get("value")
-                        .cloned()
-                        .unwrap_or(JsValue::Undefined);
-                    match resolve_promise_like(value, &queue) {
-                        AwaitResolution::Fulfilled(value) => {
-                            promise_resolve(make_iterator_result(value, done), &queue)
-                        }
-                        AwaitResolution::Rejected(reason) => promise_reject(reason, &queue),
-                        AwaitResolution::Pending => {
-                            promise_resolve(make_iterator_result(JsValue::Undefined, done), &queue)
-                        }
-                    }
-                }
-                Ok(_) => promise_reject(
-                    JsValue::String("TypeError: Iterator result is not an object".into()),
-                    &queue,
-                ),
-                Err(error) => {
-                    if let Some(reason) = Interpreter::js_error_to_rejection_reason(&error) {
-                        promise_reject(reason, &queue)
-                    } else {
-                        return Err(error);
-                    }
-                }
-            };
-            queue.drain();
-            Ok(JsValue::Promise(promise))
+            async_iterator_result_promise(result)
         })),
     );
 
@@ -4946,31 +4953,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let gs = gs.clone();
                 if is_async_generator {
                     JsValue::NativeFunction(Rc::new(move |args| {
-                        use crate::builtins::promise::{
-                            MicrotaskQueue, promise_reject, promise_resolve,
-                        };
-
-                        let queue = MicrotaskQueue::new();
                         let input = args.into_iter().next().unwrap_or(JsValue::Undefined);
-                        let promise = match Interpreter::run_generator_step(&gs, input) {
-                            Ok(GeneratorStep::Yield(value)) => {
-                                promise_resolve(make_iterator_result(value, false), &queue)
-                            }
-                            Ok(GeneratorStep::Return(value)) => {
-                                promise_resolve(make_iterator_result(value, true), &queue)
-                            }
-                            Err(error) => {
-                                if let Some(reason) =
-                                    Interpreter::js_error_to_rejection_reason(&error)
-                                {
-                                    promise_reject(reason, &queue)
-                                } else {
-                                    return Err(error);
-                                }
-                            }
-                        };
-                        queue.drain();
-                        Ok(JsValue::Promise(promise))
+                        let result =
+                            Interpreter::run_generator_step(&gs, input).map(|step| match step {
+                                GeneratorStep::Yield(value) => make_iterator_result(value, false),
+                                GeneratorStep::Return(value) => make_iterator_result(value, true),
+                            });
+                        async_iterator_result_promise(result)
                     }))
                 } else {
                     JsValue::NativeFunction(Rc::new(move |args| {
@@ -4986,26 +4975,8 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let gs = gs.clone();
                 if is_async_generator {
                     JsValue::NativeFunction(Rc::new(move |args| {
-                        use crate::builtins::promise::{
-                            MicrotaskQueue, promise_reject, promise_resolve,
-                        };
-
-                        let queue = MicrotaskQueue::new();
                         let value = args.into_iter().next().unwrap_or(JsValue::Undefined);
-                        let promise = match Interpreter::generator_return(&gs, value) {
-                            Ok(result) => promise_resolve(result, &queue),
-                            Err(error) => {
-                                if let Some(reason) =
-                                    Interpreter::js_error_to_rejection_reason(&error)
-                                {
-                                    promise_reject(reason, &queue)
-                                } else {
-                                    return Err(error);
-                                }
-                            }
-                        };
-                        queue.drain();
-                        Ok(JsValue::Promise(promise))
+                        async_iterator_result_promise(Interpreter::generator_return(&gs, value))
                     }))
                 } else {
                     JsValue::NativeFunction(Rc::new(move |args| {
@@ -5018,26 +4989,8 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let gs = gs.clone();
                 if is_async_generator {
                     JsValue::NativeFunction(Rc::new(move |args| {
-                        use crate::builtins::promise::{
-                            MicrotaskQueue, promise_reject, promise_resolve,
-                        };
-
-                        let queue = MicrotaskQueue::new();
                         let value = args.into_iter().next().unwrap_or(JsValue::Undefined);
-                        let promise = match Interpreter::generator_throw(&gs, value) {
-                            Ok(result) => promise_resolve(result, &queue),
-                            Err(error) => {
-                                if let Some(reason) =
-                                    Interpreter::js_error_to_rejection_reason(&error)
-                                {
-                                    promise_reject(reason, &queue)
-                                } else {
-                                    return Err(error);
-                                }
-                            }
-                        };
-                        queue.drain();
-                        Ok(JsValue::Promise(promise))
+                        async_iterator_result_promise(Interpreter::generator_throw(&gs, value))
                     }))
                 } else {
                     JsValue::NativeFunction(Rc::new(move |args| {
@@ -13315,6 +13268,31 @@ mod tests {
         }
     }
 
+    fn assert_iterator_result(result: JsValue, expected_value: JsValue, expected_done: bool) {
+        match result {
+            JsValue::PlainObject(map) => {
+                let borrow = map.borrow();
+                assert_eq!(borrow.get("value"), Some(&expected_value));
+                assert_eq!(borrow.get("done"), Some(&JsValue::Boolean(expected_done)));
+            }
+            other => panic!("expected iterator result object, got {other:?}"),
+        }
+    }
+
+    fn assert_fulfilled_iterator_result(
+        result: JsValue,
+        expected_value: JsValue,
+        expected_done: bool,
+    ) {
+        match result {
+            JsValue::Promise(promise) => {
+                let value = promise.value().expect("promise should be fulfilled");
+                assert_iterator_result(value, expected_value, expected_done);
+            }
+            other => panic!("expected Promise, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_tagged_template_basic_call() {
         let result =
@@ -13648,6 +13626,323 @@ mod tests {
         )
         .unwrap();
         assert_rejected_promise_reason(result, JsValue::String("boom".into()));
+    }
+
+    #[test]
+    fn test_async_generator_yield_await_expression() {
+        let result = compile_source_and_run(
+            "async function* g() { yield await Promise.resolve(41); } async function f() { var r = await g().next(); return r.value; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(41));
+    }
+
+    #[test]
+    fn test_async_generator_yield_promise_resolves_to_value() {
+        let result = compile_source_and_run(
+            "async function* g() { yield Promise.resolve(42); } async function f() { var r = await g().next(); return r.value; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_async_generator_next_promise_resolves_value_promises() {
+        let result = compile_source_and_run(
+            "async function* g() { yield Promise.resolve(42); } var it = g(); it.next()",
+        )
+        .unwrap();
+        assert_fulfilled_iterator_result(result, JsValue::Smi(42), false);
+    }
+
+    #[test]
+    fn test_async_generator_final_next_returns_done_true() {
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); var r = await it.next(); return (r.done ? 1 : 0) + (r.value === undefined ? 10 : 0); } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(11));
+    }
+
+    #[test]
+    fn test_async_generator_return_from_start_completes() {
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; } async function f() { var r = await g().return(9); return r.value + (r.done ? 1 : 0); } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_async_generator_return_after_completion_keeps_done_true() {
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); await it.next(); var r = await it.return(7); return r.value + (r.done ? 1 : 0); } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(8));
+    }
+
+    #[test]
+    fn test_async_generator_return_awaits_return_argument() {
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); var r = await it.return(Promise.resolve(6)); return r.value + (r.done ? 1 : 0); } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn test_async_generator_returned_value_is_awaited() {
+        let result = compile_source_and_run(
+            "async function* g() { return Promise.resolve(5); } async function f() { var r = await g().next(); return r.value + (r.done ? 1 : 0); } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn test_async_generator_throw_caught_after_await() {
+        let result = compile_source_and_run(
+            "async function* g() { try { yield await Promise.resolve(1); } catch (e) { return e + '!'; } } async function f() { var it = g(); await it.next(); var r = await it.throw('boom'); return r.value; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::String("boom!".into()));
+    }
+
+    #[test]
+    fn test_async_generator_symbol_async_iterator_returns_self() {
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; } var it = g(); it[Symbol.asyncIterator]() === it",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_async_generator_multiple_next_promises_can_be_awaited_later() {
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; yield 2; } async function f() { var it = g(); var p1 = it.next(); var p2 = it.next(); var p3 = it.next(); var a = await p1; var b = await p2; var c = await p3; return a.value + b.value + (c.done ? 1 : 0); } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_for_await_of_symbol_async_iterator() {
+        let result = compile_source_and_run(
+            r#"async function f() {
+                var iterable = {};
+                iterable[Symbol.asyncIterator] = function() {
+                    var step = 0;
+                    return {
+                        next: function() {
+                            step = step + 1;
+                            if (step === 1) return Promise.resolve({ value: 2, done: false });
+                            if (step === 2) return Promise.resolve({ value: 3, done: false });
+                            return Promise.resolve({ value: 0, done: true });
+                        }
+                    };
+                };
+                var total = 0;
+                for await (const x of iterable) { total = total + x; }
+                return total;
+            } f()"#,
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_for_await_of_symbol_iterator_fallback() {
+        let result = compile_source_and_run(
+            r#"async function f() {
+                var iterable = {};
+                iterable[Symbol.iterator] = function() {
+                    var step = 0;
+                    return {
+                        next: function() {
+                            step = step + 1;
+                            if (step === 1) return { value: Promise.resolve(2), done: false };
+                            if (step === 2) return { value: Promise.resolve(3), done: false };
+                            return { value: 0, done: true };
+                        }
+                    };
+                };
+                var total = 0;
+                for await (const x of iterable) { total = total + x; }
+                return total;
+            } f()"#,
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_for_await_of_async_iterator_awaits_value_promises() {
+        let result = compile_source_and_run(
+            r#"async function f() {
+                var iterable = {};
+                iterable[Symbol.asyncIterator] = function() {
+                    var step = 0;
+                    return {
+                        next: function() {
+                            step = step + 1;
+                            if (step === 1) return Promise.resolve({ value: Promise.resolve(4), done: false });
+                            if (step === 2) return Promise.resolve({ value: Promise.resolve(5), done: false });
+                            return Promise.resolve({ value: 0, done: true });
+                        }
+                    };
+                };
+                var total = 0;
+                for await (const x of iterable) { total = total + x; }
+                return total;
+            } f()"#,
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn test_for_await_of_async_generator_awaits_promise_yields() {
+        let result = compile_source_and_run(
+            "async function* g() { yield Promise.resolve(2); yield Promise.resolve(3); } async function f() { var total = 0; for await (const x of g()) { total = total + x; } return total; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_for_await_of_break_calls_async_iterator_return() {
+        let result = compile_source_and_run(
+            r#"async function f() {
+                var closed = 0;
+                var iterable = {};
+                iterable[Symbol.asyncIterator] = function() {
+                    var step = 0;
+                    return {
+                        next: function() {
+                            step = step + 1;
+                            if (step === 1) return Promise.resolve({ value: 9, done: false });
+                            return Promise.resolve({ value: 0, done: true });
+                        },
+                        return: function() {
+                            closed = closed + 1;
+                            return Promise.resolve({ value: 0, done: true });
+                        }
+                    };
+                };
+                for await (const x of iterable) { break; }
+                return closed;
+            } f()"#,
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_for_await_of_break_calls_sync_iterator_return_via_wrapper() {
+        let result = compile_source_and_run(
+            r#"async function f() {
+                var closed = 0;
+                var iterable = {};
+                iterable[Symbol.iterator] = function() {
+                    var step = 0;
+                    return {
+                        next: function() {
+                            step = step + 1;
+                            if (step === 1) return { value: 9, done: false };
+                            return { value: 0, done: true };
+                        },
+                        return: function() {
+                            closed = closed + 1;
+                            return { value: 0, done: true };
+                        }
+                    };
+                };
+                for await (const x of iterable) { break; }
+                return closed;
+            } f()"#,
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_for_await_of_rejected_async_iterator_step_rejects() {
+        let result = compile_source_and_run(
+            r#"async function f() {
+                var iterable = {};
+                iterable[Symbol.asyncIterator] = function() {
+                    return {
+                        next: function() {
+                            return Promise.reject('bad');
+                        }
+                    };
+                };
+                for await (const x of iterable) { }
+            } f()"#,
+        )
+        .unwrap();
+        assert_rejected_promise_reason(result, JsValue::String("bad".into()));
+    }
+
+    #[test]
+    fn test_async_generator_yield_star_sync_array() {
+        let result = compile_source_and_run(
+            "async function* g() { yield* [1, 2]; } async function f() { var it = g(); var a = await it.next(); var b = await it.next(); var c = await it.next(); return a.value + b.value + (c.done ? 1 : 0); } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_async_generator_yield_star_sync_generator_return_value() {
+        let result = compile_source_and_run(
+            "function* inner() { yield 1; return 7; } async function* outer() { var x = yield* inner(); yield x; } async function f() { var it = outer(); var a = await it.next(); var b = await it.next(); return a.value + b.value; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(8));
+    }
+
+    #[test]
+    fn test_async_generator_yield_star_async_generator() {
+        let result = compile_source_and_run(
+            "async function* inner() { yield 1; yield Promise.resolve(2); return 3; } async function* outer() { var x = yield* inner(); yield x; } async function f() { var it = outer(); var a = await it.next(); var b = await it.next(); var c = await it.next(); return a.value + b.value + c.value; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn test_async_generator_yield_star_symbol_async_iterator() {
+        let result = compile_source_and_run(
+            r#"async function* outer() {
+                var iterable = {};
+                iterable[Symbol.asyncIterator] = function() {
+                    var step = 0;
+                    return {
+                        next: function() {
+                            step = step + 1;
+                            if (step === 1) return Promise.resolve({ value: 4, done: false });
+                            if (step === 2) return Promise.resolve({ value: 5, done: false });
+                            return Promise.resolve({ value: 6, done: true });
+                        }
+                    };
+                };
+                var end = yield* iterable;
+                yield end;
+            }
+            async function f() {
+                var it = outer();
+                var a = await it.next();
+                var b = await it.next();
+                var c = await it.next();
+                return a.value + b.value + c.value;
+            }
+            f()"#,
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(15));
     }
 
     // ── Generator .next()/.return()/.throw() ──────────────────────────────────

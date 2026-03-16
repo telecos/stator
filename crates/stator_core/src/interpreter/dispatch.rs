@@ -20,10 +20,11 @@ use super::{
     dispatch_call_value, dispatch_call_with_this, dispatch_setter, err_bad_operand,
     error_message_from_value, extract_context, find_handler, fn_props_set, has_prototype_in_chain,
     is_js_receiver, js_add, js_less_than, keyed_load, keyed_store, maybe_compile_baseline,
-    maybe_compile_maglev, maybe_compile_turbofan, number_to_jsvalue, plain_object_to_array_items,
-    populate_self_name, proto_lookup, resolve_jump, restore_closure_context, set_pending_exception,
-    strict_eq, to_array_index, to_bigint, to_property_key, try_execute_best_jit,
-    walk_context_chain, wire_construct_prototype,
+    maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue,
+    plain_object_to_array_items, populate_self_name, proto_lookup, resolve_jump,
+    restore_closure_context, set_pending_exception, settle_async_iterator_result, strict_eq,
+    to_array_index, to_bigint, to_property_key, try_execute_best_jit, walk_context_chain,
+    wire_construct_prototype,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{proxy_delete_property, proxy_has, proxy_set};
@@ -3103,16 +3104,26 @@ fn handle_get_async_iterator(
     ctx.frame.accumulator = match iterable {
         JsValue::Array(items) => {
             let items_vec: Vec<JsValue> = items.borrow().clone();
-            JsValue::Iterator(NativeIterator::from_items(items_vec))
+            normalize_async_iterator(JsValue::Iterator(NativeIterator::from_items(items_vec)))
         }
-        JsValue::String(ref s) => JsValue::Iterator(NativeIterator::from_string(s)),
-        JsValue::Generator(_) | JsValue::Iterator(_) => iterable,
+        JsValue::String(ref s) => {
+            normalize_async_iterator(JsValue::Iterator(NativeIterator::from_string(s)))
+        }
+        JsValue::Generator(ref state) if state.borrow().bytecode_array.is_async() => iterable,
+        JsValue::Generator(_) | JsValue::Iterator(_) => normalize_async_iterator(iterable),
         // PlainObject with @@asyncIterator → call it first (§27.1.4.2).
-        JsValue::PlainObject(ref map) if map.borrow().contains_key("@@asyncIterator") => {
-            let iter_fn = map.borrow().get("@@asyncIterator").cloned();
+        JsValue::PlainObject(ref map)
+            if map.borrow().contains_key("@@asyncIterator")
+                || map.borrow().contains_key("Symbol(2)") =>
+        {
+            let iter_fn = map
+                .borrow()
+                .get("@@asyncIterator")
+                .cloned()
+                .or_else(|| map.borrow().get("Symbol(2)").cloned());
             match iter_fn {
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
-                    dispatch_call_with_this(f, iterable.clone(), vec![])?
+                    normalize_async_iterator(dispatch_call_with_this(f, iterable.clone(), vec![])?)
                 }
                 _ => {
                     return Err(StatorError::TypeError(
@@ -3122,11 +3133,18 @@ fn handle_get_async_iterator(
             }
         }
         // Fall back to @@iterator (sync iterator wrapped for async).
-        JsValue::PlainObject(ref map) if map.borrow().contains_key("@@iterator") => {
-            let iter_fn = map.borrow().get("@@iterator").cloned();
+        JsValue::PlainObject(ref map)
+            if map.borrow().contains_key("@@iterator")
+                || map.borrow().contains_key("Symbol(1)") =>
+        {
+            let iter_fn = map
+                .borrow()
+                .get("@@iterator")
+                .cloned()
+                .or_else(|| map.borrow().get("Symbol(1)").cloned());
             match iter_fn {
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
-                    dispatch_call_with_this(f, iterable.clone(), vec![])?
+                    normalize_async_iterator(dispatch_call_with_this(f, iterable.clone(), vec![])?)
                 }
                 _ => {
                     return Err(StatorError::TypeError(
@@ -3137,7 +3155,12 @@ fn handle_get_async_iterator(
         }
         JsValue::PlainObject(ref map) if map.borrow().contains_key("length") => {
             let items = plain_object_to_array_items(map);
-            JsValue::Iterator(NativeIterator::from_items(items))
+            normalize_async_iterator(JsValue::Iterator(NativeIterator::from_items(items)))
+        }
+        JsValue::PlainObject(_) => {
+            return Err(StatorError::TypeError(
+                "GetAsyncIterator: value is not async iterable".into(),
+            ));
         }
         other => {
             return Err(StatorError::TypeError(format!(
@@ -3164,31 +3187,56 @@ fn handle_iterator_next(
             Some(v) => (v, false),
             None => (JsValue::Undefined, true),
         },
-        JsValue::Generator(gs) => match Interpreter::run_generator_step(&gs, JsValue::Undefined)? {
-            GeneratorStep::Yield(v) => (v, false),
-            GeneratorStep::Return(v) => (v, true),
-        },
+        JsValue::Generator(gs) => {
+            if gs.borrow().bytecode_array.is_async() {
+                let queue = crate::builtins::promise::MicrotaskQueue::new();
+                let result = Interpreter::run_generator_step(&gs, JsValue::Undefined).map(
+                    |step| match step {
+                        GeneratorStep::Yield(v) => super::make_iterator_result(v, false),
+                        GeneratorStep::Return(v) => super::make_iterator_result(v, true),
+                    },
+                )?;
+                settle_async_iterator_result(result, &queue)
+                    .map_err(super::async_iterator_reason_to_error)?
+            } else {
+                match Interpreter::run_generator_step(&gs, JsValue::Undefined)? {
+                    GeneratorStep::Yield(v) => (v, false),
+                    GeneratorStep::Return(v) => (v, true),
+                }
+            }
+        }
         JsValue::PlainObject(ref map) if map.borrow().contains_key("next") => {
             let next_fn = map.borrow().get("next").cloned();
             match next_fn {
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
                     let result = dispatch_call_with_this(f, iter.clone(), vec![])?;
-                    match result {
-                        JsValue::PlainObject(ref res_map) => {
-                            let done = res_map.borrow().get("done").is_some_and(|d| d.to_boolean());
-                            let value = res_map
-                                .borrow()
-                                .get("value")
-                                .cloned()
-                                .unwrap_or(JsValue::Undefined);
-                            (value, done)
-                        }
-                        // §7.4.3: If the result of .next() is not an object,
-                        // throw a TypeError.
-                        _ => {
-                            return Err(StatorError::TypeError(
-                                "Iterator result is not an object".into(),
-                            ));
+                    if map
+                        .borrow()
+                        .get("__async_iterator__")
+                        .is_some_and(|flag| flag.to_boolean())
+                    {
+                        let queue = crate::builtins::promise::MicrotaskQueue::new();
+                        settle_async_iterator_result(result, &queue)
+                            .map_err(super::async_iterator_reason_to_error)?
+                    } else {
+                        match result {
+                            JsValue::PlainObject(ref res_map) => {
+                                let done =
+                                    res_map.borrow().get("done").is_some_and(|d| d.to_boolean());
+                                let value = res_map
+                                    .borrow()
+                                    .get("value")
+                                    .cloned()
+                                    .unwrap_or(JsValue::Undefined);
+                                (value, done)
+                            }
+                            // §7.4.3: If the result of .next() is not an object,
+                            // throw a TypeError.
+                            _ => {
+                                return Err(StatorError::TypeError(
+                                    "Iterator result is not an object".into(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -3196,20 +3244,31 @@ fn handle_iterator_next(
                     if call_obj.borrow().contains_key("__call__") =>
                 {
                     let result = dispatch_call_with_this(f, iter.clone(), vec![])?;
-                    match result {
-                        JsValue::PlainObject(ref res_map) => {
-                            let done = res_map.borrow().get("done").is_some_and(|d| d.to_boolean());
-                            let value = res_map
-                                .borrow()
-                                .get("value")
-                                .cloned()
-                                .unwrap_or(JsValue::Undefined);
-                            (value, done)
-                        }
-                        _ => {
-                            return Err(StatorError::TypeError(
-                                "Iterator result is not an object".into(),
-                            ));
+                    if map
+                        .borrow()
+                        .get("__async_iterator__")
+                        .is_some_and(|flag| flag.to_boolean())
+                    {
+                        let queue = crate::builtins::promise::MicrotaskQueue::new();
+                        settle_async_iterator_result(result, &queue)
+                            .map_err(super::async_iterator_reason_to_error)?
+                    } else {
+                        match result {
+                            JsValue::PlainObject(ref res_map) => {
+                                let done =
+                                    res_map.borrow().get("done").is_some_and(|d| d.to_boolean());
+                                let value = res_map
+                                    .borrow()
+                                    .get("value")
+                                    .cloned()
+                                    .unwrap_or(JsValue::Undefined);
+                                (value, done)
+                            }
+                            _ => {
+                                return Err(StatorError::TypeError(
+                                    "Iterator result is not an object".into(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -3253,8 +3312,16 @@ fn handle_iterator_close(
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
                     let result =
                         dispatch_call_with_this(f, iter.clone(), vec![JsValue::Undefined])?;
-                    // §7.4.6 step 7: If the result is not an object, throw TypeError.
-                    if !result.is_object_like() {
+                    if map
+                        .borrow()
+                        .get("__async_iterator__")
+                        .is_some_and(|flag| flag.to_boolean())
+                    {
+                        let queue = crate::builtins::promise::MicrotaskQueue::new();
+                        settle_async_iterator_result(result, &queue)
+                            .map_err(super::async_iterator_reason_to_error)?;
+                    } else if !result.is_object_like() {
+                        // §7.4.6 step 7: If the result is not an object, throw TypeError.
                         return Err(StatorError::TypeError(
                             "Iterator .return() result is not an object".into(),
                         ));
@@ -3268,7 +3335,15 @@ fn handle_iterator_close(
                         iter.clone(),
                         vec![JsValue::Undefined],
                     )?;
-                    if !result.is_object_like() {
+                    if map
+                        .borrow()
+                        .get("__async_iterator__")
+                        .is_some_and(|flag| flag.to_boolean())
+                    {
+                        let queue = crate::builtins::promise::MicrotaskQueue::new();
+                        settle_async_iterator_result(result, &queue)
+                            .map_err(super::async_iterator_reason_to_error)?;
+                    } else if !result.is_object_like() {
                         return Err(StatorError::TypeError(
                             "Iterator .return() result is not an object".into(),
                         ));
@@ -3280,9 +3355,16 @@ fn handle_iterator_close(
         }
         // Close a generator by marking it as completed (§27.5.3.4).
         JsValue::Generator(gs) => {
-            let mut state = gs.borrow_mut();
-            if state.status != GeneratorStatus::Completed {
-                state.status = GeneratorStatus::Completed;
+            if gs.borrow().bytecode_array.is_async() {
+                let queue = crate::builtins::promise::MicrotaskQueue::new();
+                let result = Interpreter::generator_return(gs, JsValue::Undefined)?;
+                settle_async_iterator_result(result, &queue)
+                    .map_err(super::async_iterator_reason_to_error)?;
+            } else {
+                let mut state = gs.borrow_mut();
+                if state.status != GeneratorStatus::Completed {
+                    state.status = GeneratorStatus::Completed;
+                }
             }
         }
         // NativeIterator has no .return() — nothing to do.
