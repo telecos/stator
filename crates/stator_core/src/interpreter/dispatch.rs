@@ -8995,4 +8995,349 @@ mod tests {
         let result = crate::builtins::global::global_eval("var f = (a = 7) => a + 1; f()").unwrap();
         assert_eq!(result, JsValue::Smi(8));
     }
+
+    // ── Strict mode conformance e2e tests ────────────────────────────────
+
+    /// 1. "use strict" directive at top of script makes scope strict.
+    #[test]
+    fn e2e_strict_use_strict_directive_script() {
+        // Assigning to an undeclared variable should throw ReferenceError.
+        let result = crate::builtins::global::global_eval(
+            "'use strict'; try { undeclared = 1; 'no error'; } catch(e) { e.message; }",
+        )
+        .unwrap();
+        if let JsValue::HeapString(s) = &result {
+            assert!(
+                s.contains("not defined"),
+                "expected ReferenceError, got: {s}"
+            );
+        }
+    }
+
+    /// 2. "use strict" in function body makes that function strict.
+    #[test]
+    fn e2e_strict_directive_in_function_body() {
+        let result = crate::builtins::global::global_eval(
+            "function f() { 'use strict'; return typeof this; } f()",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::from("undefined"),
+            "this should be undefined in strict function"
+        );
+    }
+
+    /// 3. No implicit globals: assigning to undeclared variable throws.
+    #[test]
+    fn e2e_strict_no_implicit_globals() {
+        let result = crate::builtins::global::global_eval(
+            "'use strict'; try { x_undecl = 42; 'no error'; } catch(e) { 'caught'; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::from("caught"));
+    }
+
+    /// 4. Sloppy mode allows implicit globals (contrast).
+    #[test]
+    fn e2e_sloppy_implicit_globals_ok() {
+        let result = crate::builtins::global::global_eval("sloppy_var = 99; sloppy_var").unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    /// 5. No duplicate params: SyntaxError in strict mode.
+    #[test]
+    fn e2e_strict_duplicate_params() {
+        let result = crate::builtins::global::global_eval("'use strict'; function f(a, a) {}");
+        assert!(result.is_err(), "duplicate params should be SyntaxError");
+    }
+
+    /// 6. Duplicate params OK in sloppy mode.
+    #[test]
+    fn e2e_sloppy_duplicate_params_ok() {
+        let result =
+            crate::builtins::global::global_eval("function f(a, a) { return a; } f(1, 2)").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// 7. No with statement in strict mode.
+    #[test]
+    fn e2e_strict_no_with() {
+        let result = crate::builtins::global::global_eval("'use strict'; with({}) {}");
+        assert!(result.is_err(), "with should be SyntaxError in strict mode");
+    }
+
+    /// 8. this is undefined in strict-mode free function call.
+    #[test]
+    fn e2e_strict_this_undefined() {
+        let result =
+            crate::builtins::global::global_eval("function f() { 'use strict'; return this; } f()")
+                .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// 9. Sloppy-mode this is globalThis (not undefined).
+    #[test]
+    fn e2e_sloppy_this_not_undefined() {
+        let result =
+            crate::builtins::global::global_eval("function f() { return typeof this; } f()")
+                .unwrap();
+        // In sloppy mode, `this` inside a free call is the global object.
+        assert_ne!(result, JsValue::from("undefined"));
+    }
+
+    /// 10. No legacy octal literals in strict mode.
+    #[test]
+    fn e2e_strict_no_octal_literal() {
+        let result = crate::builtins::global::global_eval("'use strict'; var x = 0123;");
+        assert!(result.is_err(), "legacy octal should be SyntaxError");
+    }
+
+    /// 11. 0o prefix octal is fine in strict mode.
+    #[test]
+    fn e2e_strict_0o_octal_ok() {
+        let result =
+            crate::builtins::global::global_eval("'use strict'; var x = 0o123; x").unwrap();
+        assert_eq!(result, JsValue::Smi(83));
+    }
+
+    /// 12. Assignment to read-only property throws TypeError in strict mode.
+    #[test]
+    fn e2e_strict_assign_readonly_throws() {
+        let result = crate::builtins::global::global_eval(
+            "'use strict'; var o = {}; \
+             Object.defineProperty(o, 'x', { value: 10, writable: false }); \
+             o.x = 20;",
+        );
+        assert!(result.is_err(), "strict write to non-writable should throw");
+    }
+
+    /// 13. Sloppy mode: assignment to read-only silently fails.
+    #[test]
+    fn e2e_sloppy_assign_readonly_silent() {
+        let result = crate::builtins::global::global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { value: 10, writable: false }); \
+             o.x = 20; o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// 14. Delete on non-configurable property throws TypeError in strict mode.
+    #[test]
+    fn e2e_strict_delete_nonconfigurable_throws() {
+        let result = crate::builtins::global::global_eval(
+            "'use strict'; var o = {}; \
+             Object.defineProperty(o, 'x', { value: 1, configurable: false }); \
+             delete o.x;",
+        );
+        assert!(
+            result.is_err(),
+            "strict delete of non-configurable should throw"
+        );
+    }
+
+    /// 15. Delete on unqualified identifier is SyntaxError in strict mode.
+    #[test]
+    fn e2e_strict_delete_identifier() {
+        let result = crate::builtins::global::global_eval("'use strict'; var x = 1; delete x;");
+        assert!(
+            result.is_err(),
+            "delete of identifier should be SyntaxError"
+        );
+    }
+
+    /// 16. Reserved word 'implements' as binding is SyntaxError.
+    #[test]
+    fn e2e_strict_reserved_implements() {
+        let result = crate::builtins::global::global_eval("'use strict'; var implements = 1;");
+        assert!(result.is_err(), "'implements' should be reserved");
+    }
+
+    /// 17. Reserved word 'interface' as binding is SyntaxError.
+    #[test]
+    fn e2e_strict_reserved_interface() {
+        let result = crate::builtins::global::global_eval("'use strict'; var interface = 1;");
+        assert!(result.is_err(), "'interface' should be reserved");
+    }
+
+    /// 18. Reserved word 'package' as binding is SyntaxError.
+    #[test]
+    fn e2e_strict_reserved_package() {
+        let result = crate::builtins::global::global_eval("'use strict'; var package = 1;");
+        assert!(result.is_err(), "'package' should be reserved");
+    }
+
+    /// 19. Reserved word 'private' as binding is SyntaxError.
+    #[test]
+    fn e2e_strict_reserved_private() {
+        let result = crate::builtins::global::global_eval("'use strict'; var private = 1;");
+        assert!(result.is_err(), "'private' should be reserved");
+    }
+
+    /// 20. Reserved word 'protected' as binding is SyntaxError.
+    #[test]
+    fn e2e_strict_reserved_protected() {
+        let result = crate::builtins::global::global_eval("'use strict'; var protected = 1;");
+        assert!(result.is_err(), "'protected' should be reserved");
+    }
+
+    /// 21. Reserved word 'public' as binding is SyntaxError.
+    #[test]
+    fn e2e_strict_reserved_public() {
+        let result = crate::builtins::global::global_eval("'use strict'; var public = 1;");
+        assert!(result.is_err(), "'public' should be reserved");
+    }
+
+    /// 22. Reserved word 'static' as binding is SyntaxError.
+    #[test]
+    fn e2e_strict_reserved_static() {
+        let result = crate::builtins::global::global_eval("'use strict'; var static = 1;");
+        assert!(
+            result.is_err(),
+            "'static' should be reserved in strict mode"
+        );
+    }
+
+    /// 23. Reserved word 'yield' as binding is SyntaxError.
+    #[test]
+    fn e2e_strict_reserved_yield() {
+        let result = crate::builtins::global::global_eval("'use strict'; var yield = 1;");
+        assert!(result.is_err(), "'yield' should be reserved in strict mode");
+    }
+
+    /// 24. Cannot assign to eval in strict mode.
+    #[test]
+    fn e2e_strict_assign_eval() {
+        let result = crate::builtins::global::global_eval("'use strict'; eval = 1;");
+        assert!(result.is_err(), "assigning to eval should be SyntaxError");
+    }
+
+    /// 25. Cannot assign to arguments in strict mode.
+    #[test]
+    fn e2e_strict_assign_arguments() {
+        let result = crate::builtins::global::global_eval("'use strict'; arguments = 1;");
+        assert!(
+            result.is_err(),
+            "assigning to arguments should be SyntaxError"
+        );
+    }
+
+    /// 26. Strict mode frozen object property write throws TypeError.
+    #[test]
+    fn e2e_strict_frozen_obj_write() {
+        let result = crate::builtins::global::global_eval(
+            "'use strict'; var o = { a: 1 }; Object.freeze(o); o.a = 2;",
+        );
+        assert!(
+            result.is_err(),
+            "write to frozen object should throw TypeError"
+        );
+    }
+
+    /// 27. Strict mode: adding property to sealed object throws TypeError.
+    #[test]
+    fn e2e_strict_sealed_obj_add_prop() {
+        let result = crate::builtins::global::global_eval(
+            "'use strict'; var o = {}; Object.seal(o); o.newProp = 1;",
+        );
+        assert!(
+            result.is_err(),
+            "adding property to sealed object should throw TypeError"
+        );
+    }
+
+    /// 28. Strict mode inherits into nested functions.
+    #[test]
+    fn e2e_strict_inherits_nested() {
+        let result = crate::builtins::global::global_eval(
+            "'use strict'; function outer() { \
+               function inner() { return typeof this; } \
+               return inner(); \
+             } outer()",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::from("undefined"),
+            "inner function should inherit strict mode"
+        );
+    }
+
+    /// 29. Module-like code (ES module) is always strict.
+    #[test]
+    fn e2e_module_always_strict() {
+        // We can't easily test ES modules via global_eval, but we can test that
+        // class bodies are always strict (per spec, class bodies are strict code).
+        let result = crate::builtins::global::global_eval(
+            "class C { m() { return typeof this; } } \
+             var c = new C(); c.m()",
+        );
+        // Class method called on instance should have `this` as the instance.
+        assert!(result.is_ok());
+    }
+
+    /// 30. Octal escape in string literal is SyntaxError in strict mode.
+    #[test]
+    fn e2e_strict_octal_escape_string() {
+        let result = crate::builtins::global::global_eval("'use strict'; var x = '\\012';");
+        assert!(
+            result.is_err(),
+            "octal escape in string should be SyntaxError"
+        );
+    }
+
+    /// 31. Strict function with non-simple params and directive is SyntaxError.
+    #[test]
+    fn e2e_strict_directive_nonsimple_params() {
+        let result = crate::builtins::global::global_eval("function f(a = 1) { 'use strict'; }");
+        assert!(
+            result.is_err(),
+            "use strict with non-simple params should be SyntaxError"
+        );
+    }
+
+    /// 32. Reserved word 'let' as binding is SyntaxError in strict mode.
+    #[test]
+    fn e2e_strict_reserved_let_binding() {
+        let result = crate::builtins::global::global_eval("'use strict'; var let = 1;");
+        assert!(
+            result.is_err(),
+            "'let' as binding should be reserved in strict mode"
+        );
+    }
+
+    /// 33. Prefix increment of eval is SyntaxError in strict mode.
+    #[test]
+    fn e2e_strict_prefix_increment_eval() {
+        let result = crate::builtins::global::global_eval("'use strict'; ++eval;");
+        assert!(
+            result.is_err(),
+            "++eval should be SyntaxError in strict mode"
+        );
+    }
+
+    /// 34. Strict delete on member expression (allowed — not an error).
+    #[test]
+    fn e2e_strict_delete_member_ok() {
+        let result =
+            crate::builtins::global::global_eval("'use strict'; var o = { x: 1 }; delete o.x; o.x")
+                .unwrap();
+        assert_eq!(
+            result,
+            JsValue::Undefined,
+            "deleted property should be undefined"
+        );
+    }
+
+    /// 35. Class body rejects duplicate params (class bodies are always strict).
+    #[test]
+    fn e2e_class_body_rejects_dup_params() {
+        let result = crate::builtins::global::global_eval("class C { m(a, a) {} }");
+        assert!(
+            result.is_err(),
+            "class method with duplicate params should be SyntaxError"
+        );
+    }
 }

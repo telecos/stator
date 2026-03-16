@@ -4005,7 +4005,15 @@ impl<'src> Parser<'src> {
     fn is_strict_reserved_word(name: &str) -> bool {
         matches!(
             name,
-            "implements" | "interface" | "package" | "private" | "protected" | "public"
+            "implements"
+                | "interface"
+                | "let"
+                | "package"
+                | "private"
+                | "protected"
+                | "public"
+                | "static"
+                | "yield"
         )
     }
 
