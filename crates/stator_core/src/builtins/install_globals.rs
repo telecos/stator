@@ -8459,8 +8459,13 @@ fn make_promise() -> JsValue {
                                     Ok(JsValue::Undefined)
                                 }
                             }));
-                            if let JsValue::NativeFunction(f) = &executor {
-                                let _ = f(vec![resolve_fn, reject_fn]);
+                            if let JsValue::NativeFunction(f) = &executor
+                                && let Err(e) = f(vec![resolve_fn, reject_fn])
+                            {
+                                // §27.2.3.1 step 10: If executor throws, reject.
+                                if let Some(rej) = reject_box.borrow_mut().take() {
+                                    rej(JsValue::String(e.to_string().into()));
+                                }
                             }
                         },
                         &q,
@@ -8471,12 +8476,53 @@ fn make_promise() -> JsValue {
         }
 
         // ── Promise.resolve(value) ────────────────────────────────────────────
+        // §27.2.4.5: If value is already a Promise, return it as-is.
+        // If value is a thenable (has `.then` method), unwrap it.
         {
             let q = queue.clone();
             props.insert(
                 "resolve".into(),
                 native(move |args| {
                     let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    // Idempotence: return the same promise if already a Promise.
+                    if val.is_promise() {
+                        return Ok(val);
+                    }
+                    // Thenable unwrapping: if value is an object with a `.then` method,
+                    // call it to adopt its state.
+                    if let JsValue::PlainObject(ref obj) = val {
+                        let then_fn = obj.borrow().get("then").cloned();
+                        if let Some(JsValue::NativeFunction(f)) = then_fn {
+                            let q2 = q.clone();
+                            let p = promise_new(
+                                move |resolve_box, reject_box| {
+                                    let resolve_box = Rc::new(RefCell::new(Some(resolve_box)));
+                                    let reject_box = Rc::new(RefCell::new(Some(reject_box)));
+                                    let resolve_fn = JsValue::NativeFunction(Rc::new({
+                                        let rb = Rc::clone(&resolve_box);
+                                        move |a: Vec<JsValue>| {
+                                            if let Some(f) = rb.borrow_mut().take() {
+                                                f(a.first().cloned().unwrap_or(JsValue::Undefined));
+                                            }
+                                            Ok(JsValue::Undefined)
+                                        }
+                                    }));
+                                    let reject_fn = JsValue::NativeFunction(Rc::new({
+                                        let rb = Rc::clone(&reject_box);
+                                        move |a: Vec<JsValue>| {
+                                            if let Some(f) = rb.borrow_mut().take() {
+                                                f(a.first().cloned().unwrap_or(JsValue::Undefined));
+                                            }
+                                            Ok(JsValue::Undefined)
+                                        }
+                                    }));
+                                    let _ = f(vec![resolve_fn, reject_fn]);
+                                },
+                                &q2,
+                            );
+                            return Ok(JsValue::Promise(p));
+                        }
+                    }
                     Ok(JsValue::Promise(promise_resolve(val, &q)))
                 }),
             );
@@ -8500,7 +8546,7 @@ fn make_promise() -> JsValue {
             props.insert(
                 "all".into(),
                 native(move |args| {
-                    let promises = extract_promise_array(args.first());
+                    let promises = extract_promise_array(args.first(), &q);
                     Ok(JsValue::Promise(promise_all(promises, &q)))
                 }),
             );
@@ -8512,7 +8558,7 @@ fn make_promise() -> JsValue {
             props.insert(
                 "allSettled".into(),
                 native(move |args| {
-                    let promises = extract_promise_array(args.first());
+                    let promises = extract_promise_array(args.first(), &q);
                     Ok(JsValue::Promise(promise_all_settled(promises, &q)))
                 }),
             );
@@ -8524,7 +8570,7 @@ fn make_promise() -> JsValue {
             props.insert(
                 "any".into(),
                 native(move |args| {
-                    let promises = extract_promise_array(args.first());
+                    let promises = extract_promise_array(args.first(), &q);
                     Ok(JsValue::Promise(promise_any(promises, &q)))
                 }),
             );
@@ -8536,7 +8582,7 @@ fn make_promise() -> JsValue {
             props.insert(
                 "race".into(),
                 native(move |args| {
-                    let promises = extract_promise_array(args.first());
+                    let promises = extract_promise_array(args.first(), &q);
                     Ok(JsValue::Promise(promise_race(promises, &q)))
                 }),
             );
@@ -9088,18 +9134,23 @@ fn make_bigint() -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
-/// Extract a `Vec<JsPromise>` from an argument that should be a `JsValue::Array`
-/// of `JsValue::Promise` elements.
-fn extract_promise_array(arg: Option<&JsValue>) -> Vec<crate::builtins::promise::JsPromise> {
+/// Extract a `Vec<JsPromise>` from an argument that should be a `JsValue::Array`.
+///
+/// Non-promise values in the array are wrapped with [`promise_resolve`] per spec.
+fn extract_promise_array(
+    arg: Option<&JsValue>,
+    queue: &crate::builtins::promise::MicrotaskQueue,
+) -> Vec<crate::builtins::promise::JsPromise> {
+    use crate::builtins::promise::promise_resolve;
     match arg {
         Some(JsValue::Array(arr)) => arr
             .borrow()
             .iter()
-            .filter_map(|v| {
+            .map(|v| {
                 if let JsValue::Promise(p) = v {
-                    Some(p.clone())
+                    p.clone()
                 } else {
-                    None
+                    promise_resolve(v.clone(), queue)
                 }
             })
             .collect(),

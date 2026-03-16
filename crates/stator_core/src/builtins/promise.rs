@@ -30,6 +30,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 
 // ── Type aliases ───────────────────────────────────────────────────────────────
@@ -686,10 +687,10 @@ pub fn promise_all(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromis
 /// ECMAScript §27.2.4.2 `Promise.allSettled(promises)`.
 ///
 /// Always resolves (never rejects) with a [`JsValue::Array`] of one result per
-/// input promise.  Each result is itself a two-element [`JsValue::Array`]:
+/// input promise.  Each result is a plain object:
 ///
-/// - `["fulfilled", value]` for a fulfilled promise.
-/// - `["rejected",  reason]` for a rejected promise.
+/// - `{ status: "fulfilled", value }` for a fulfilled promise.
+/// - `{ status: "rejected",  reason }` for a rejected promise.
 ///
 /// An empty input resolves immediately with an empty array.
 pub fn promise_all_settled(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromise {
@@ -714,19 +715,19 @@ pub fn promise_all_settled(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> 
         let q_r = queue.clone();
 
         let on_fulfilled = Some(Box::new(move |v: JsValue| {
-            results_f.borrow_mut()[i] = Some(JsValue::new_array(vec![
-                JsValue::String("fulfilled".to_string().into()),
-                v,
-            ]));
+            let mut obj = PropertyMap::new();
+            obj.insert("status".into(), JsValue::String("fulfilled".into()));
+            obj.insert("value".into(), v);
+            results_f.borrow_mut()[i] = Some(JsValue::PlainObject(Rc::new(RefCell::new(obj))));
             settle_all_settled(&results_f, &remaining_f, &p_result_f, &q_f);
             Ok(JsValue::Undefined)
         }) as PromiseHandler);
 
         let on_rejected = Some(Box::new(move |r: JsValue| {
-            results_r.borrow_mut()[i] = Some(JsValue::new_array(vec![
-                JsValue::String("rejected".to_string().into()),
-                r.clone(),
-            ]));
+            let mut obj = PropertyMap::new();
+            obj.insert("status".into(), JsValue::String("rejected".into()));
+            obj.insert("reason".into(), r);
+            results_r.borrow_mut()[i] = Some(JsValue::PlainObject(Rc::new(RefCell::new(obj))));
             settle_all_settled(&results_r, &remaining_r, &p_result_r, &q_r);
             Ok(JsValue::Undefined)
         }) as PromiseHandler);
@@ -1339,27 +1340,30 @@ mod tests {
         assert!(p.is_fulfilled());
         if let Some(JsValue::Array(arr)) = p.value() {
             assert_eq!(arr.borrow().len(), 2);
-            if let JsValue::Array(inner0) = &arr.borrow()[0] {
+            // First element: { status: "fulfilled", value: 1 }
+            if let JsValue::PlainObject(obj0) = &arr.borrow()[0] {
+                let map0 = obj0.borrow();
                 assert_eq!(
-                    *inner0.borrow(),
-                    vec![
-                        JsValue::String("fulfilled".to_string().into()),
-                        JsValue::Smi(1)
-                    ]
+                    map0.get("status"),
+                    Some(&JsValue::String("fulfilled".into()))
                 );
+                assert_eq!(map0.get("value"), Some(&JsValue::Smi(1)));
             } else {
-                panic!("expected inner Array at [0]");
+                panic!("expected PlainObject at [0]");
             }
-            if let JsValue::Array(inner1) = &arr.borrow()[1] {
+            // Second element: { status: "rejected", reason: "boom" }
+            if let JsValue::PlainObject(obj1) = &arr.borrow()[1] {
+                let map1 = obj1.borrow();
                 assert_eq!(
-                    *inner1.borrow(),
-                    vec![
-                        JsValue::String("rejected".to_string().into()),
-                        JsValue::String("boom".to_string().into()),
-                    ]
+                    map1.get("status"),
+                    Some(&JsValue::String("rejected".into()))
+                );
+                assert_eq!(
+                    map1.get("reason"),
+                    Some(&JsValue::String("boom".to_string().into()))
                 );
             } else {
-                panic!("expected inner Array at [1]");
+                panic!("expected PlainObject at [1]");
             }
         } else {
             panic!("expected JsValue::Array");
