@@ -4346,6 +4346,17 @@ fn make_array() -> JsValue {
                         }
                         items
                     }
+                    JsValue::Generator(gs) => {
+                        use crate::interpreter::Interpreter;
+                        use crate::objects::value::GeneratorStep;
+                        let mut items = Vec::new();
+                        while let GeneratorStep::Yield(v) =
+                            Interpreter::run_generator_step(gs, JsValue::Undefined)?
+                        {
+                            items.push(v);
+                        }
+                        items
+                    }
                     _ => Vec::new(),
                 };
                 // Apply mapFn if provided.
@@ -7530,6 +7541,145 @@ fn make_function() -> JsValue {
         );
         ctor
     })
+}
+
+/// Build the `GeneratorFunction` constructor and `Generator.prototype`.
+///
+/// Per §27.3 / §27.5:
+/// - `GeneratorFunction` is a constructor (rarely used directly).
+/// - `GeneratorFunction.prototype` === `Generator` (the %Generator% intrinsic).
+/// - `Generator.prototype` carries `.next()`, `.return()`, `.throw()` and
+///   `@@iterator`.
+///
+/// The returned `PlainObject` is registered as `"GeneratorFunction"` in the
+/// global environment so that conformance tests can access it.
+fn make_generator_function() -> JsValue {
+    use crate::interpreter::Interpreter;
+    use crate::objects::value::GeneratorStep;
+
+    let mut props = PropertyMap::new();
+
+    // ── GeneratorFunction is not directly callable in most code ──────────
+    props.insert(
+        "__call__".into(),
+        native(|_args| {
+            Err(StatorError::TypeError(
+                "GeneratorFunction is not a constructor".into(),
+            ))
+        }),
+    );
+
+    // ── Generator.prototype (the %GeneratorPrototype% intrinsic) ────────
+    let mut gen_proto = PropertyMap::new();
+
+    // Generator.prototype.next(value)  §27.5.1.2
+    gen_proto.insert(
+        "next".into(),
+        builtin_fn("next", 1, |args| {
+            let this = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let input = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            match this {
+                JsValue::Generator(gs) => match Interpreter::run_generator_step(&gs, input)? {
+                    GeneratorStep::Yield(v) => Ok(make_iter_result(v, false)),
+                    GeneratorStep::Return(v) => Ok(make_iter_result(v, true)),
+                },
+                _ => Err(StatorError::TypeError(
+                    "Generator.prototype.next requires a generator receiver".into(),
+                )),
+            }
+        }),
+    );
+
+    // Generator.prototype.return(value)  §27.5.1.3
+    gen_proto.insert(
+        "return".into(),
+        builtin_fn("return", 1, |args| {
+            let this = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let value = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            match this {
+                JsValue::Generator(gs) => Interpreter::generator_return(&gs, value),
+                _ => Err(StatorError::TypeError(
+                    "Generator.prototype.return requires a generator receiver".into(),
+                )),
+            }
+        }),
+    );
+
+    // Generator.prototype.throw(exception)  §27.5.1.4
+    gen_proto.insert(
+        "throw".into(),
+        builtin_fn("throw", 1, |args| {
+            let this = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let value = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            match this {
+                JsValue::Generator(gs) => Interpreter::generator_throw(&gs, value),
+                _ => Err(StatorError::TypeError(
+                    "Generator.prototype.throw requires a generator receiver".into(),
+                )),
+            }
+        }),
+    );
+
+    // Generator.prototype[@@toStringTag] = "Generator"  §27.5.1.5
+    gen_proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("Generator".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    gen_proto.insert_with_attrs(
+        format!("Symbol({})", SYMBOL_TO_STRING_TAG),
+        JsValue::String("Generator".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+
+    gen_proto.make_all_non_enumerable();
+    let gen_proto_rc = Rc::new(RefCell::new(gen_proto));
+
+    // ── Generator (the %Generator% intrinsic = GeneratorFunction.prototype) ──
+    let mut generator_obj = PropertyMap::new();
+    generator_obj.insert(
+        "prototype".into(),
+        JsValue::PlainObject(gen_proto_rc.clone()),
+    );
+    generator_obj.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("GeneratorFunction".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    generator_obj.insert_with_attrs(
+        format!("Symbol({})", SYMBOL_TO_STRING_TAG),
+        JsValue::String("GeneratorFunction".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    generator_obj.make_all_non_enumerable();
+    let generator_obj_rc = Rc::new(RefCell::new(generator_obj));
+
+    // GeneratorFunction.prototype = %Generator%
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(generator_obj_rc.clone()),
+    );
+
+    // Wire constructor links:
+    // Generator.prototype.constructor = %Generator%
+    gen_proto_rc.borrow_mut().insert_with_attrs(
+        "constructor".into(),
+        JsValue::PlainObject(generator_obj_rc.clone()),
+        PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+    );
+
+    props.insert("name".into(), JsValue::String("GeneratorFunction".into()));
+    props.insert("length".into(), JsValue::Smi(1));
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+/// Helper: create a `{value, done}` iterator result object.
+fn make_iter_result(value: JsValue, done: bool) -> JsValue {
+    let mut map = PropertyMap::new();
+    map.insert("value".to_string(), value);
+    map.insert("done".to_string(), JsValue::Boolean(done));
+    JsValue::PlainObject(Rc::new(RefCell::new(map)))
 }
 
 /// Build the `String` constructor/namespace object with static and prototype
@@ -11581,6 +11731,10 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         globals.insert(
             "Function".into(),
             finalize_ctor(make_function(), "Function"),
+        );
+        globals.insert(
+            "GeneratorFunction".into(),
+            finalize_ctor(make_generator_function(), "GeneratorFunction"),
         );
         globals.insert("Proxy".into(), finalize_ctor(make_proxy(), "Proxy"));
         globals.insert("Reflect".into(), make_reflect());
@@ -21497,5 +21651,454 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── Conformance: Generator basics ───────────────────────────────────
+
+    /// Generator declaration + .next() returns {value, done}.
+    #[test]
+    fn e2e_generator_basic_yield() {
+        let result = global_eval(
+            "function* gen() { yield 1; yield 2; } \
+             var g = gen(); \
+             var r1 = g.next(); \
+             r1.value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// Second .next() yields the second value.
+    #[test]
+    fn e2e_generator_second_yield() {
+        let result = global_eval(
+            "function* gen() { yield 1; yield 2; } \
+             var g = gen(); \
+             g.next(); \
+             var r2 = g.next(); \
+             r2.value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// .next() done flag is false while yielding.
+    #[test]
+    fn e2e_generator_done_false() {
+        let result = global_eval(
+            "function* gen() { yield 1; } \
+             var g = gen(); \
+             g.next().done",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// Final .next() returns {value: undefined, done: true}.
+    #[test]
+    fn e2e_generator_done_true() {
+        let result = global_eval(
+            "function* gen() { yield 1; } \
+             var g = gen(); \
+             g.next(); \
+             var r = g.next(); \
+             r.done",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Final .next() value is undefined (no explicit return).
+    #[test]
+    fn e2e_generator_final_value_undefined() {
+        let result = global_eval(
+            "function* gen() { yield 1; } \
+             var g = gen(); g.next(); \
+             var r = g.next(); \
+             r.value === undefined",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// yield as expression — .next(val) sends val back.
+    #[test]
+    fn e2e_generator_send_value() {
+        let result = global_eval(
+            "function* gen() { var x = yield 42; yield x + 1; } \
+             var g = gen(); \
+             g.next(); \
+             var r = g.next(10); \
+             r.value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(11));
+    }
+
+    /// Generator with explicit return value.
+    #[test]
+    fn e2e_generator_explicit_return() {
+        let result = global_eval(
+            "function* gen() { yield 1; return 99; } \
+             var g = gen(); g.next(); \
+             var r = g.next(); \
+             r.value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    /// Explicit return sets done: true.
+    #[test]
+    fn e2e_generator_explicit_return_done() {
+        let result = global_eval(
+            "function* gen() { yield 1; return 99; } \
+             var g = gen(); g.next(); \
+             g.next().done",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Conformance: Generator.prototype methods ────────────────────────
+
+    /// .return(value) forces completion.
+    #[test]
+    fn e2e_generator_return_method() {
+        let result = global_eval(
+            "function* gen() { yield 1; yield 2; yield 3; } \
+             var g = gen(); g.next(); \
+             var r = g.return(42); \
+             r.value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// .return() sets done: true.
+    #[test]
+    fn e2e_generator_return_done() {
+        let result = global_eval(
+            "function* gen() { yield 1; yield 2; } \
+             var g = gen(); g.next(); \
+             g.return(42).done",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// After .return(), subsequent .next() returns done.
+    #[test]
+    fn e2e_generator_next_after_return() {
+        let result = global_eval(
+            "function* gen() { yield 1; yield 2; } \
+             var g = gen(); g.next(); g.return(42); \
+             g.next().done",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// .throw(error) injects error caught by try/catch.
+    #[test]
+    fn e2e_generator_throw_caught() {
+        let result = global_eval(
+            r#"function* gen() {
+                 try { yield 1; yield 2; } catch(e) { yield "caught: " + e; }
+               }
+               var g = gen(); g.next();
+               g.throw("oops").value"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("caught: oops".into()));
+    }
+
+    /// .throw(error) propagates if no try/catch.
+    #[test]
+    fn e2e_generator_throw_propagates() {
+        let result = global_eval(
+            r#"function* gen() { yield 1; yield 2; }
+               var g = gen(); g.next();
+               var caught = false;
+               try { g.throw("boom"); } catch(e) { caught = true; }
+               caught"#,
+        );
+        assert_eq!(result.unwrap(), JsValue::Boolean(true));
+    }
+
+    // ── Conformance: yield* delegation ──────────────────────────────────
+
+    /// yield* delegates to an array.
+    #[test]
+    fn e2e_yield_star_array() {
+        let result = global_eval(
+            "function* gen() { yield* [10, 20, 30]; } \
+             var g = gen(); \
+             var a = g.next().value; \
+             var b = g.next().value; \
+             var c = g.next().value; \
+             a + b + c",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(60));
+    }
+
+    /// yield* delegates to another generator.
+    #[test]
+    fn e2e_yield_star_generator() {
+        let result = global_eval(
+            "function* inner() { yield 'a'; yield 'b'; } \
+             function* outer() { yield 1; yield* inner(); yield 2; } \
+             var g = outer(); \
+             var r = []; \
+             r.push(g.next().value); \
+             r.push(g.next().value); \
+             r.push(g.next().value); \
+             r.push(g.next().value); \
+             r.length",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    /// yield* — first yielded value is from the delegate.
+    #[test]
+    fn e2e_yield_star_first_value() {
+        let result = global_eval(
+            "function* inner() { yield 'x'; } \
+             function* outer() { yield* inner(); } \
+             outer().next().value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("x".into()));
+    }
+
+    // ── Conformance: Generator as iterable ──────────────────────────────
+
+    /// for-of over a generator.
+    #[test]
+    fn e2e_generator_for_of() {
+        let result = global_eval(
+            "function* gen() { yield 1; yield 2; yield 3; } \
+             var sum = 0; \
+             for (var x of gen()) { sum += x; } \
+             sum",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    /// Spread of a generator into an array.
+    #[test]
+    fn e2e_generator_spread() {
+        let result = global_eval(
+            "function* gen() { yield 1; yield 2; yield 3; } \
+             var arr = [...gen()]; \
+             arr.length",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// Spread yields correct values.
+    #[test]
+    fn e2e_generator_spread_values() {
+        let result = global_eval(
+            "function* gen() { yield 10; yield 20; } \
+             var arr = [...gen()]; \
+             arr[0] + arr[1]",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    /// Array.from(gen()) works.
+    #[test]
+    fn e2e_generator_array_from() {
+        let result = global_eval(
+            "function* gen() { yield 1; yield 2; yield 3; } \
+             var arr = Array.from(gen()); \
+             arr.length",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// Array.from(gen()) yields correct values.
+    #[test]
+    fn e2e_generator_array_from_values() {
+        let result = global_eval(
+            "function* gen() { yield 5; yield 10; } \
+             var arr = Array.from(gen()); \
+             arr[0] + arr[1]",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(15));
+    }
+
+    // ── Conformance: Generator edge cases ───────────────────────────────
+
+    /// typeof generator function is "function".
+    #[test]
+    fn e2e_generator_typeof_function() {
+        let result = global_eval("function* gen() { yield 1; } typeof gen").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    /// typeof generator object is "object".
+    #[test]
+    fn e2e_generator_typeof_object() {
+        let result = global_eval("function* gen() { yield 1; } typeof gen()").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    /// Completed generator: .next() returns {value: undefined, done: true}.
+    #[test]
+    fn e2e_generator_completed_next() {
+        let result = global_eval(
+            "function* gen() { yield 1; } \
+             var g = gen(); g.next(); g.next(); \
+             var r = g.next(); \
+             r.done === true && r.value === undefined",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Multiple .next() calls after completion all return done.
+    #[test]
+    fn e2e_generator_repeated_done() {
+        let result = global_eval(
+            "function* gen() { yield 1; } \
+             var g = gen(); g.next(); g.next(); \
+             g.next().done && g.next().done && g.next().done",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Empty generator: first .next() returns done: true.
+    #[test]
+    fn e2e_generator_empty() {
+        let result = global_eval(
+            "function* gen() {} \
+             gen().next().done",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Generator with only return (no yield).
+    #[test]
+    fn e2e_generator_return_only() {
+        let result = global_eval(
+            "function* gen() { return 42; } \
+             var r = gen().next(); \
+             r.value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Generator with only return sets done: true on first .next().
+    #[test]
+    fn e2e_generator_return_only_done() {
+        let result = global_eval(
+            "function* gen() { return 42; } \
+             gen().next().done",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Conformance: Symbol.iterator on generators ──────────────────────
+
+    /// gen()[Symbol.iterator]() returns the generator itself.
+    #[test]
+    fn e2e_generator_symbol_iterator_identity() {
+        let result = global_eval(
+            "function* gen() { yield 1; } \
+             var g = gen(); \
+             g[Symbol.iterator]() === g",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Generator is iterable via Symbol.iterator protocol.
+    #[test]
+    fn e2e_generator_iterable_protocol() {
+        let result = global_eval(
+            "function* gen() { yield 10; yield 20; } \
+             var g = gen(); \
+             var iter = g[Symbol.iterator](); \
+             iter.next().value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// for-of uses Symbol.iterator implicitly.
+    #[test]
+    fn e2e_generator_for_of_implicit_iterator() {
+        let result = global_eval(
+            "function* range(n) { for (var i = 0; i < n; i++) yield i; } \
+             var sum = 0; \
+             for (var x of range(5)) { sum += x; } \
+             sum",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    /// Nested generators with yield* and for-of.
+    #[test]
+    fn e2e_generator_nested_yield_star_for_of() {
+        let result = global_eval(
+            "function* a() { yield 1; yield 2; } \
+             function* b() { yield* a(); yield 3; } \
+             var sum = 0; \
+             for (var x of b()) { sum += x; } \
+             sum",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    /// Generator expression works.
+    #[test]
+    fn e2e_generator_expression() {
+        let result = global_eval(
+            "var gen = function*() { yield 1; yield 2; }; \
+             var g = gen(); \
+             g.next().value + g.next().value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// Fibonacci generator.
+    #[test]
+    fn e2e_generator_fibonacci() {
+        let result = global_eval(
+            "function* fib() { \
+               var a = 0, b = 1; \
+               while (true) { yield a; var t = a + b; a = b; b = t; } \
+             } \
+             var g = fib(); \
+             var r = []; \
+             for (var i = 0; i < 7; i++) r.push(g.next().value); \
+             r[6]",
+        )
+        .unwrap();
+        // fib: 0, 1, 1, 2, 3, 5, 8
+        assert_eq!(result, JsValue::Smi(8));
+    }
+
+    /// GeneratorFunction constructor is accessible.
+    #[test]
+    fn e2e_generator_function_exists() {
+        let result = global_eval("typeof GeneratorFunction").unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
     }
 }
