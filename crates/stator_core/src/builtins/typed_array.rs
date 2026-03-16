@@ -1394,4 +1394,560 @@ mod tests {
         assert_eq!(TypedArrayKind::Float64.name(), "Float64Array");
         assert_eq!(TypedArrayKind::BigInt64.name(), "BigInt64Array");
     }
+
+    // ── Additional conformance tests ────────────────────────────────────
+
+    #[test]
+    fn test_arraybuffer_zero_length() {
+        let buf = arraybuffer_new(0);
+        assert_eq!(arraybuffer_byte_length(&buf), 0);
+        let sliced = arraybuffer_slice(&buf, 0, 0);
+        assert_eq!(sliced.data.len(), 0);
+    }
+
+    #[test]
+    fn test_arraybuffer_slice_clamps_beyond_end() {
+        let mut buf = arraybuffer_new(4);
+        buf.data = vec![1, 2, 3, 4];
+        let s = arraybuffer_slice(&buf, 2, 100);
+        assert_eq!(s.data, vec![3, 4]);
+    }
+
+    #[test]
+    fn test_arraybuffer_slice_negative_both() {
+        let mut buf = arraybuffer_new(4);
+        buf.data = vec![10, 20, 30, 40];
+        let s = arraybuffer_slice(&buf, -3, -1);
+        assert_eq!(s.data, vec![20, 30]);
+    }
+
+    #[test]
+    fn test_arraybuffer_slice_empty_when_begin_ge_end() {
+        let buf = arraybuffer_new(4);
+        let s = arraybuffer_slice(&buf, 3, 1);
+        assert!(s.data.is_empty());
+    }
+
+    #[test]
+    fn test_dataview_int16_endianness() {
+        let buf = Rc::new(RefCell::new(arraybuffer_new(4)));
+        let dv = dataview_new(Rc::clone(&buf), 0, None).unwrap();
+        dataview_set_int16(&dv, 0, 0x0102, false).unwrap();
+        assert_eq!(dataview_get_int16(&dv, 0, false).unwrap(), 0x0102);
+        assert_eq!(dataview_get_int16(&dv, 0, true).unwrap(), 0x0201);
+    }
+
+    #[test]
+    fn test_dataview_uint16_roundtrip() {
+        let buf = Rc::new(RefCell::new(arraybuffer_new(4)));
+        let dv = dataview_new(Rc::clone(&buf), 0, None).unwrap();
+        dataview_set_uint16(&dv, 0, 0xFFFE, true).unwrap();
+        assert_eq!(dataview_get_uint16(&dv, 0, true).unwrap(), 0xFFFE);
+    }
+
+    #[test]
+    fn test_dataview_float32_roundtrip() {
+        let buf = Rc::new(RefCell::new(arraybuffer_new(4)));
+        let dv = dataview_new(Rc::clone(&buf), 0, None).unwrap();
+        dataview_set_float32(&dv, 0, 1.5, true).unwrap();
+        let v = dataview_get_float32(&dv, 0, true).unwrap();
+        assert!((v - 1.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_dataview_new_invalid_offset() {
+        let buf = Rc::new(RefCell::new(arraybuffer_new(4)));
+        assert!(dataview_new(Rc::clone(&buf), 5, None).is_err());
+    }
+
+    #[test]
+    fn test_dataview_new_invalid_length() {
+        let buf = Rc::new(RefCell::new(arraybuffer_new(4)));
+        assert!(dataview_new(Rc::clone(&buf), 2, Some(4)).is_err());
+    }
+
+    #[test]
+    fn test_dataview_buffer_identity() {
+        let buf = Rc::new(RefCell::new(arraybuffer_new(8)));
+        let dv = dataview_new(Rc::clone(&buf), 0, None).unwrap();
+        let buf2 = dataview_buffer(&dv);
+        assert!(Rc::ptr_eq(&buf, &buf2));
+    }
+
+    #[test]
+    fn test_typed_array_all_kinds_roundtrip() {
+        for kind in &[
+            TypedArrayKind::Int8,
+            TypedArrayKind::Uint8,
+            TypedArrayKind::Uint8Clamped,
+            TypedArrayKind::Int16,
+            TypedArrayKind::Uint16,
+            TypedArrayKind::Int32,
+            TypedArrayKind::Uint32,
+            TypedArrayKind::Float32,
+            TypedArrayKind::Float64,
+        ] {
+            let ta = typed_array_new_from_length(*kind, 3);
+            assert_eq!(typed_array_length(&ta), 3);
+            typed_array_set(&ta, 0, &JsValue::Smi(7)).unwrap();
+            let v = typed_array_get(&ta, 0);
+            assert_ne!(v, JsValue::Undefined, "kind={:?} should store 7", kind);
+        }
+    }
+
+    #[test]
+    fn test_typed_array_from_buffer_alignment_error() {
+        let buf = Rc::new(RefCell::new(arraybuffer_new(8)));
+        let result = typed_array_new_from_buffer(TypedArrayKind::Int32, buf, 1, None);
+        assert!(result.is_err(), "Offset 1 is not aligned to 4");
+    }
+
+    #[test]
+    fn test_typed_array_from_buffer_auto_length() {
+        let buf = Rc::new(RefCell::new(arraybuffer_new(12)));
+        let ta = typed_array_new_from_buffer(TypedArrayKind::Int32, buf, 4, None).unwrap();
+        assert_eq!(typed_array_length(&ta), 2);
+        assert_eq!(typed_array_byte_offset(&ta), 4);
+    }
+
+    #[test]
+    fn test_typed_array_from_buffer_remainder_error() {
+        let buf = Rc::new(RefCell::new(arraybuffer_new(7)));
+        let result = typed_array_new_from_buffer(TypedArrayKind::Int32, buf, 0, None);
+        assert!(result.is_err(), "7 bytes not divisible by 4");
+    }
+
+    #[test]
+    fn test_typed_array_from_values_uint8() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Uint8,
+            &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(255)],
+        )
+        .unwrap();
+        assert_eq!(typed_array_length(&ta), 3);
+        assert_eq!(typed_array_get(&ta, 2), JsValue::Smi(255));
+    }
+
+    #[test]
+    fn test_typed_array_fill_partial() {
+        let ta = typed_array_new_from_length(TypedArrayKind::Int32, 5);
+        typed_array_fill(&ta, &JsValue::Smi(42), 1, 3).unwrap();
+        assert_eq!(typed_array_get(&ta, 0), JsValue::Smi(0));
+        assert_eq!(typed_array_get(&ta, 1), JsValue::Smi(42));
+        assert_eq!(typed_array_get(&ta, 2), JsValue::Smi(42));
+        assert_eq!(typed_array_get(&ta, 3), JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_typed_array_fill_negative_indices() {
+        let ta = typed_array_new_from_length(TypedArrayKind::Uint8, 4);
+        typed_array_fill(&ta, &JsValue::Smi(9), -2, 4).unwrap();
+        assert_eq!(typed_array_get(&ta, 0), JsValue::Smi(0));
+        assert_eq!(typed_array_get(&ta, 1), JsValue::Smi(0));
+        assert_eq!(typed_array_get(&ta, 2), JsValue::Smi(9));
+        assert_eq!(typed_array_get(&ta, 3), JsValue::Smi(9));
+    }
+
+    #[test]
+    fn test_typed_array_copy_within_overlap() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[
+                JsValue::Smi(1),
+                JsValue::Smi(2),
+                JsValue::Smi(3),
+                JsValue::Smi(4),
+            ],
+        )
+        .unwrap();
+        typed_array_copy_within(&ta, 1, 0, 3);
+        assert_eq!(typed_array_get(&ta, 0), JsValue::Smi(1));
+        assert_eq!(typed_array_get(&ta, 1), JsValue::Smi(1));
+        assert_eq!(typed_array_get(&ta, 2), JsValue::Smi(2));
+        assert_eq!(typed_array_get(&ta, 3), JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_typed_array_set_from_offset() {
+        let ta = typed_array_new_from_length(TypedArrayKind::Int32, 5);
+        typed_array_set_from(&ta, &[JsValue::Smi(10), JsValue::Smi(20)], 2).unwrap();
+        assert_eq!(typed_array_get(&ta, 2), JsValue::Smi(10));
+        assert_eq!(typed_array_get(&ta, 3), JsValue::Smi(20));
+    }
+
+    #[test]
+    fn test_typed_array_set_from_overflow() {
+        let ta = typed_array_new_from_length(TypedArrayKind::Int32, 2);
+        let result = typed_array_set_from(&ta, &[JsValue::Smi(1), JsValue::Smi(2)], 1);
+        assert!(result.is_err(), "Source is too large");
+    }
+
+    #[test]
+    fn test_typed_array_slice_negative_start() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[
+                JsValue::Smi(10),
+                JsValue::Smi(20),
+                JsValue::Smi(30),
+                JsValue::Smi(40),
+            ],
+        )
+        .unwrap();
+        let s = typed_array_slice(&ta, -2, 4).unwrap();
+        assert_eq!(typed_array_length(&s), 2);
+        assert_eq!(typed_array_get(&s, 0), JsValue::Smi(30));
+        assert_eq!(typed_array_get(&s, 1), JsValue::Smi(40));
+    }
+
+    #[test]
+    fn test_typed_array_subarray_negative_begin() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Uint8,
+            &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
+        )
+        .unwrap();
+        let sub = typed_array_subarray(&ta, -2, 3);
+        assert_eq!(typed_array_length(&sub), 2);
+        assert_eq!(typed_array_get(&sub, 0), JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_typed_array_index_of_from_negative() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(1)],
+        )
+        .unwrap();
+        assert_eq!(typed_array_index_of(&ta, &JsValue::Smi(1), -2), 2);
+    }
+
+    #[test]
+    fn test_typed_array_last_index_of_basic() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(1)],
+        )
+        .unwrap();
+        assert_eq!(typed_array_last_index_of(&ta, &JsValue::Smi(1), 2), 2);
+        assert_eq!(typed_array_last_index_of(&ta, &JsValue::Smi(1), 1), 0);
+    }
+
+    #[test]
+    fn test_typed_array_includes_nan() {
+        let ta = typed_array_from_values(TypedArrayKind::Float64, &[JsValue::HeapNumber(f64::NAN)])
+            .unwrap();
+        assert!(typed_array_includes(&ta, &JsValue::HeapNumber(f64::NAN), 0));
+    }
+
+    #[test]
+    fn test_typed_array_join_default_separator() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Uint8,
+            &[JsValue::Smi(10), JsValue::Smi(20), JsValue::Smi(30)],
+        )
+        .unwrap();
+        assert_eq!(typed_array_join(&ta, ",").unwrap(), "10,20,30");
+    }
+
+    #[test]
+    fn test_typed_array_join_custom_separator() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
+        )
+        .unwrap();
+        assert_eq!(typed_array_join(&ta, " - ").unwrap(), "1 - 2 - 3");
+    }
+
+    #[test]
+    fn test_typed_array_reduce_no_initial() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
+        )
+        .unwrap();
+        let sum = typed_array_reduce(
+            &ta,
+            |acc, v, _| {
+                let a = acc.to_number()?;
+                let b = v.to_number()?;
+                Ok(JsValue::Smi((a + b) as i32))
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(sum, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn test_typed_array_reduce_empty_no_initial_errors() {
+        let ta = typed_array_new_from_length(TypedArrayKind::Int32, 0);
+        let result = typed_array_reduce(&ta, |acc, _, _| Ok(acc.clone()), None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_typed_array_reduce_right() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
+        )
+        .unwrap();
+        let result = typed_array_reduce_right(
+            &ta,
+            |acc, v, _| {
+                let a = acc.to_js_string()?;
+                let b = v.to_js_string()?;
+                Ok(JsValue::String(format!("{a}{b}").into()))
+            },
+            Some(JsValue::String("".into())),
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("321".into()));
+    }
+
+    #[test]
+    fn test_typed_array_find_index_not_found() {
+        let ta =
+            typed_array_from_values(TypedArrayKind::Int32, &[JsValue::Smi(1), JsValue::Smi(2)])
+                .unwrap();
+        let idx = typed_array_find_index(&ta, |v, _| Ok(v.to_number()? > 10.0)).unwrap();
+        assert_eq!(idx, -1);
+    }
+
+    #[test]
+    fn test_typed_array_find_last() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
+        )
+        .unwrap();
+        let found = typed_array_find_last(&ta, |v, _| Ok(v.to_number()? < 3.0)).unwrap();
+        assert_eq!(found, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_typed_array_filter() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[
+                JsValue::Smi(1),
+                JsValue::Smi(2),
+                JsValue::Smi(3),
+                JsValue::Smi(4),
+            ],
+        )
+        .unwrap();
+        let filtered = typed_array_filter(&ta, |v, _| Ok(v.to_number()? > 2.0)).unwrap();
+        assert_eq!(typed_array_length(&filtered), 2);
+        assert_eq!(typed_array_get(&filtered, 0), JsValue::Smi(3));
+        assert_eq!(typed_array_get(&filtered, 1), JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_typed_array_map() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
+        )
+        .unwrap();
+        let mapped = typed_array_map(&ta, |v, _| {
+            let n = v.to_number()? as i32;
+            Ok(JsValue::Smi(n * 2))
+        })
+        .unwrap();
+        assert_eq!(typed_array_get(&mapped, 0), JsValue::Smi(2));
+        assert_eq!(typed_array_get(&mapped, 1), JsValue::Smi(4));
+        assert_eq!(typed_array_get(&mapped, 2), JsValue::Smi(6));
+    }
+
+    #[test]
+    fn test_typed_array_for_each() {
+        let ta =
+            typed_array_from_values(TypedArrayKind::Int32, &[JsValue::Smi(10), JsValue::Smi(20)])
+                .unwrap();
+        let sum = std::cell::Cell::new(0i32);
+        typed_array_for_each(&ta, |v, _| {
+            sum.set(sum.get() + v.to_number()? as i32);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(sum.get(), 30);
+    }
+
+    #[test]
+    fn test_typed_array_static_from() {
+        let ta = typed_array_static_from(
+            TypedArrayKind::Uint8,
+            &[JsValue::Smi(10), JsValue::Smi(20), JsValue::Smi(30)],
+        )
+        .unwrap();
+        assert_eq!(typed_array_length(&ta), 3);
+        assert_eq!(typed_array_get(&ta, 1), JsValue::Smi(20));
+    }
+
+    #[test]
+    fn test_typed_array_static_of_float64() {
+        let ta = typed_array_static_of(
+            TypedArrayKind::Float64,
+            &[JsValue::HeapNumber(1.1), JsValue::HeapNumber(2.2)],
+        )
+        .unwrap();
+        assert_eq!(typed_array_length(&ta), 2);
+        if let JsValue::HeapNumber(v) = typed_array_get(&ta, 0) {
+            assert!((v - 1.1).abs() < 1e-10);
+        } else {
+            panic!("Expected HeapNumber");
+        }
+    }
+
+    #[test]
+    fn test_typed_array_shared_buffer_via_subarray() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Uint8,
+            &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
+        )
+        .unwrap();
+        let sub = typed_array_subarray(&ta, 1, 2);
+        typed_array_set(&sub, 0, &JsValue::Smi(99)).unwrap();
+        assert_eq!(typed_array_get(&ta, 1), JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_typed_array_sort_float64_with_negatives() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Float64,
+            &[
+                JsValue::HeapNumber(3.0),
+                JsValue::HeapNumber(-1.0),
+                JsValue::HeapNumber(2.0),
+            ],
+        )
+        .unwrap();
+        typed_array_sort(&ta);
+        assert_eq!(typed_array_get(&ta, 0), JsValue::HeapNumber(-1.0));
+        assert_eq!(typed_array_get(&ta, 1), JsValue::HeapNumber(2.0));
+        assert_eq!(typed_array_get(&ta, 2), JsValue::HeapNumber(3.0));
+    }
+
+    #[test]
+    fn test_typed_array_byte_length_and_offset() {
+        let buf = Rc::new(RefCell::new(arraybuffer_new(16)));
+        let ta = typed_array_new_from_buffer(TypedArrayKind::Int32, buf, 8, Some(2)).unwrap();
+        assert_eq!(typed_array_byte_length(&ta), 8);
+        assert_eq!(typed_array_byte_offset(&ta), 8);
+        assert_eq!(typed_array_length(&ta), 2);
+    }
+
+    #[test]
+    fn test_typed_array_int8_overflow() {
+        let ta = typed_array_new_from_length(TypedArrayKind::Int8, 1);
+        typed_array_set(&ta, 0, &JsValue::Smi(200)).unwrap();
+        assert_eq!(typed_array_get(&ta, 0), JsValue::Smi(-56));
+    }
+
+    #[test]
+    fn test_typed_array_uint8_overflow() {
+        let ta = typed_array_new_from_length(TypedArrayKind::Uint8, 1);
+        typed_array_set(&ta, 0, &JsValue::Smi(256)).unwrap();
+        assert_eq!(typed_array_get(&ta, 0), JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_typed_array_uint8_clamped_nan() {
+        let ta = typed_array_new_from_length(TypedArrayKind::Uint8Clamped, 1);
+        typed_array_set(&ta, 0, &JsValue::HeapNumber(f64::NAN)).unwrap();
+        assert_eq!(typed_array_get(&ta, 0), JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_typed_array_at_out_of_bounds() {
+        let ta = typed_array_from_values(TypedArrayKind::Int32, &[JsValue::Smi(10)]).unwrap();
+        assert_eq!(typed_array_at(&ta, 1), JsValue::Undefined);
+        assert_eq!(typed_array_at(&ta, -2), JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_typed_array_reverse_even_length() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[
+                JsValue::Smi(1),
+                JsValue::Smi(2),
+                JsValue::Smi(3),
+                JsValue::Smi(4),
+            ],
+        )
+        .unwrap();
+        typed_array_reverse(&ta);
+        assert_eq!(typed_array_get(&ta, 0), JsValue::Smi(4));
+        assert_eq!(typed_array_get(&ta, 1), JsValue::Smi(3));
+        assert_eq!(typed_array_get(&ta, 2), JsValue::Smi(2));
+        assert_eq!(typed_array_get(&ta, 3), JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_dataview_bigint_roundtrip() {
+        let buf = Rc::new(RefCell::new(arraybuffer_new(16)));
+        let dv = dataview_new(Rc::clone(&buf), 0, None).unwrap();
+        dataview_set_bigint64(&dv, 0, i64::MIN, true).unwrap();
+        assert_eq!(dataview_get_bigint64(&dv, 0, true).unwrap(), i64::MIN);
+        dataview_set_biguint64(&dv, 8, u64::MAX, false).unwrap();
+        assert_eq!(dataview_get_biguint64(&dv, 8, false).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn test_typed_array_every_false() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(2), JsValue::Smi(3), JsValue::Smi(4)],
+        )
+        .unwrap();
+        let result = typed_array_every(&ta, |v, _| Ok(v.to_number()? % 2.0 == 0.0)).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_typed_array_some_found() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(1), JsValue::Smi(3), JsValue::Smi(4)],
+        )
+        .unwrap();
+        let result = typed_array_some(&ta, |v, _| Ok(v.to_number()? > 3.0)).unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn test_typed_array_some_not_found() {
+        let ta =
+            typed_array_from_values(TypedArrayKind::Int32, &[JsValue::Smi(1), JsValue::Smi(2)])
+                .unwrap();
+        let result = typed_array_some(&ta, |v, _| Ok(v.to_number()? > 10.0)).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_typed_array_float32_precision() {
+        let ta = typed_array_new_from_length(TypedArrayKind::Float32, 1);
+        typed_array_set(&ta, 0, &JsValue::HeapNumber(std::f64::consts::PI)).unwrap();
+        if let JsValue::HeapNumber(v) = typed_array_get(&ta, 0) {
+            assert!((v - std::f64::consts::PI).abs() < 1e-6);
+            assert!((v - std::f64::consts::PI).abs() > 1e-10);
+        } else {
+            panic!("Expected HeapNumber");
+        }
+    }
+
+    #[test]
+    fn test_typed_array_uint32_large_value() {
+        let ta = typed_array_new_from_length(TypedArrayKind::Uint32, 1);
+        typed_array_set(&ta, 0, &JsValue::HeapNumber(4_000_000_000.0)).unwrap();
+        if let JsValue::HeapNumber(v) = typed_array_get(&ta, 0) {
+            assert_eq!(v, 4_000_000_000.0);
+        } else {
+            panic!("Expected HeapNumber for Uint32");
+        }
+    }
 }
