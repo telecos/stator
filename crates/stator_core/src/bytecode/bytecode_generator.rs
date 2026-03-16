@@ -3818,8 +3818,9 @@ impl FunctionCompiler {
                 }
             }
         };
-        let func_array = compile_function(&a.params, &body_block, false, a.is_async, a.is_strict)?
-            .with_arrow_flag(true);
+        let func_array =
+            compile_function_inner(&a.params, &body_block, false, a.is_async, a.is_strict, true)?
+                .with_arrow_flag(true);
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         // Flag(1) marks this as an arrow function (no .prototype property).
@@ -5404,6 +5405,19 @@ fn compile_function(
     is_async: bool,
     is_strict: bool,
 ) -> StatorResult<BytecodeArray> {
+    compile_function_inner(params, body, is_generator, is_async, is_strict, false)
+}
+
+/// Core function compiler.  `is_arrow` controls whether an `arguments`
+/// binding is emitted (arrow functions inherit the enclosing `arguments`).
+fn compile_function_inner(
+    params: &[crate::parser::ast::Param],
+    body: &BlockStmt,
+    is_generator: bool,
+    is_async: bool,
+    is_strict: bool,
+    is_arrow: bool,
+) -> StatorResult<BytecodeArray> {
     let mut compiler = FunctionCompiler::new(params)?;
     compiler.is_generator = is_generator;
     compiler.is_async = is_async;
@@ -5422,14 +5436,17 @@ fn compile_function(
     // Emit default-value and destructuring prologue for parameters.
     compiler.emit_param_prologue(params)?;
 
-    // Create the `arguments` object and bind it as a local variable.
-    // Non-arrow functions always get an arguments binding.
-    compiler.emit(Instruction::new_unchecked(
-        Opcode::CreateMappedArguments,
-        vec![],
-    ));
-    let args_reg = compiler.define_local("arguments");
-    compiler.emit_star(args_reg);
+    // Arrow functions do NOT get their own `arguments` object — they
+    // inherit the enclosing function's `arguments` (ES §15.3.4).
+    if !is_arrow {
+        // Create the `arguments` object and bind it as a local variable.
+        compiler.emit(Instruction::new_unchecked(
+            Opcode::CreateMappedArguments,
+            vec![],
+        ));
+        let args_reg = compiler.define_local("arguments");
+        compiler.emit_star(args_reg);
+    }
 
     // Hoist `var` declarations to the function scope (initialised to
     // `undefined`) so that reads before the declaration returns `undefined`

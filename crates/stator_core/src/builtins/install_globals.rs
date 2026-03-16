@@ -7460,17 +7460,35 @@ fn make_function() -> JsValue {
                 let func = args.first().cloned().unwrap_or(JsValue::Undefined);
                 let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                 let bound_args: Vec<JsValue> = args.get(2..).unwrap_or(&[]).to_vec();
+                let bound_count = bound_args.len() as i32;
+
+                // Compute the bound function's `.length` (ES §20.2.3.2 step 6).
+                let target_len = match &func {
+                    JsValue::Function(ba) => ba.parameter_count() as i32,
+                    _ => 0,
+                };
+                let result_len = std::cmp::max(0, target_len - bound_count);
+
                 match &func {
                     JsValue::NativeFunction(f) => {
                         let bound = function_bind(f, &this_arg, &bound_args);
                         Ok(JsValue::NativeFunction(bound))
                     }
                     JsValue::Function(_) | JsValue::PlainObject(_) => {
-                        Ok(JsValue::NativeFunction(Rc::new(move |call_args| {
-                            let mut all_args = bound_args.clone();
-                            all_args.extend(call_args);
-                            dispatch_call_with_this(&func, this_arg.clone(), all_args)
-                        })))
+                        let call_fn =
+                            JsValue::NativeFunction(Rc::new(move |call_args: Vec<JsValue>| {
+                                let mut all_args = bound_args.clone();
+                                all_args.extend(call_args);
+                                dispatch_call_with_this(&func, this_arg.clone(), all_args)
+                            }));
+                        let mut props = PropertyMap::new();
+                        props.insert("__call__".to_string(), call_fn);
+                        props.insert(
+                            "name".to_string(),
+                            JsValue::String("bound ".to_string().into()),
+                        );
+                        props.insert("length".to_string(), JsValue::Smi(result_len));
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
                     }
                     _ => Err(StatorError::TypeError(
                         "Function.prototype.bind requires a callable".into(),

@@ -2134,10 +2134,13 @@ pub(super) fn dispatch_call_property(
                         Rc::clone(&frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, ba);
-                    callee_frame
-                        .global_env
-                        .borrow_mut()
-                        .insert("this".to_string(), this_val);
+                    // Arrow functions use lexical `this` — do NOT override.
+                    if !ba.is_arrow() {
+                        callee_frame
+                            .global_env
+                            .borrow_mut()
+                            .insert("this".to_string(), this_val);
+                    }
                     push_call_frame("<anonymous>")?;
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
@@ -4776,15 +4779,30 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         vec![]
                     };
                     let ba2 = Rc::clone(&ba);
-                    Ok(JsValue::NativeFunction(Rc::new(move |call_args| {
-                        let mut all_args = bound_args.clone();
-                        all_args.extend(call_args);
-                        dispatch_call_with_this(
-                            &JsValue::Function(Rc::clone(&ba2)),
-                            this_arg.clone(),
-                            all_args,
-                        )
-                    })))
+                    let bound_count = bound_args.len() as i32;
+                    let target_len = ba.parameter_count() as i32;
+                    let result_len = std::cmp::max(0, target_len - bound_count);
+
+                    // Build bound function as a PlainObject with __call__,
+                    // carrying the correct `name` and `length` per ES §20.2.3.2.
+                    let call_fn =
+                        JsValue::NativeFunction(Rc::new(move |call_args: Vec<JsValue>| {
+                            let mut all_args = bound_args.clone();
+                            all_args.extend(call_args);
+                            dispatch_call_with_this(
+                                &JsValue::Function(Rc::clone(&ba2)),
+                                this_arg.clone(),
+                                all_args,
+                            )
+                        }));
+                    let mut props = PropertyMap::new();
+                    props.insert("__call__".to_string(), call_fn);
+                    props.insert(
+                        "name".to_string(),
+                        JsValue::String("bound ".to_string().into()),
+                    );
+                    props.insert("length".to_string(), JsValue::Smi(result_len));
+                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
                 }));
             }
             "name" => {
@@ -5227,10 +5245,24 @@ pub fn dispatch_call_with_this(
                 InterpreterFrame::new((**ba).clone(), args)
             };
             restore_closure_context(&mut frame, ba);
-            frame
-                .global_env
-                .borrow_mut()
-                .insert("this".to_string(), this_val);
+            // Arrow functions use lexical `this` — do NOT override.
+            if !ba.is_arrow() {
+                // ES §10.2.1.2: in sloppy mode, null/undefined `this` → globalThis.
+                let effective_this = if !ba.is_strict() && this_val.is_nullish() {
+                    frame
+                        .global_env
+                        .borrow()
+                        .get("globalThis")
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined)
+                } else {
+                    this_val
+                };
+                frame
+                    .global_env
+                    .borrow_mut()
+                    .insert("this".to_string(), effective_this);
+            }
             let result = Interpreter::run(&mut frame);
             pop_call_frame();
             result
