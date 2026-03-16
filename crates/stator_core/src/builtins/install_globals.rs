@@ -3614,7 +3614,7 @@ fn make_object() -> JsValue {
             }),
         );
 
-        // ── Object.hasOwn(obj, key) ──────────────────────────────────────────
+        // ── Object.hasOwn(obj, key) — ES2022 §20.1.2.14 ──────────────────
         props.insert(
             "hasOwn".into(),
             builtin_fn("hasOwn", 2, |args| {
@@ -3626,39 +3626,85 @@ fn make_object() -> JsValue {
                     JsValue::PlainObject(map) => {
                         Ok(JsValue::Boolean(map.borrow().contains_key(&key)))
                     }
+                    JsValue::Array(items) => {
+                        if key == "length" {
+                            Ok(JsValue::Boolean(true))
+                        } else if let Ok(idx) = key.parse::<usize>() {
+                            Ok(JsValue::Boolean(idx < items.borrow().len()))
+                        } else {
+                            Ok(JsValue::Boolean(false))
+                        }
+                    }
                     _ => Ok(JsValue::Boolean(false)),
                 }
             }),
         );
 
-        // ── Object.groupBy(items, callbackFn) ────────────────────────────────
+        // ── Object.groupBy(items, callbackFn) — ES2024 §22.1.2.5 ─────────
         props.insert(
             "groupBy".into(),
-            native(|args| {
+            builtin_fn("groupBy", 2, |args| {
                 let items = args.first().unwrap_or(&JsValue::Undefined).clone();
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let arr = match &items {
-                    JsValue::Array(a) => a.clone(),
+
+                // §22.1.2.5 step 2: callbackFn must be callable.
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Object.groupBy: callbackFn is not a function".into(),
+                    ));
+                }
+
+                // Collect elements from iterable (Array, String, Iterator,
+                // or array-like PlainObject).
+                let elements: Vec<JsValue> = match &items {
+                    JsValue::Array(a) => a.borrow().clone(),
+                    JsValue::String(s) => s
+                        .chars()
+                        .map(|c| JsValue::String(c.to_string().into()))
+                        .collect(),
+                    JsValue::Iterator(iter) => {
+                        let mut v = Vec::new();
+                        while let Some(item) = iter.borrow_mut().next_item() {
+                            v.push(item);
+                        }
+                        v
+                    }
+                    JsValue::PlainObject(map) => {
+                        let borrow = map.borrow();
+                        if let Some(len_val) = borrow.get("length") {
+                            let len = match len_val {
+                                JsValue::Smi(n) => *n as usize,
+                                JsValue::HeapNumber(n) => n.trunc() as usize,
+                                _ => 0,
+                            };
+                            (0..len)
+                                .map(|i| {
+                                    borrow
+                                        .get(&i.to_string())
+                                        .cloned()
+                                        .unwrap_or(JsValue::Undefined)
+                                })
+                                .collect()
+                        } else {
+                            vec![]
+                        }
+                    }
                     _ => {
                         return Err(StatorError::TypeError(
-                            "Object.groupBy: first argument must be iterable".into(),
+                            "Object.groupBy: first argument is not iterable".into(),
                         ));
                     }
                 };
+
+                // Result is a null-prototype object (no __proto__).
                 let result = PropertyMap::new();
                 let result_rc = Rc::new(RefCell::new(result));
-                for (i, item) in arr.borrow().iter().enumerate() {
-                    let key = if let JsValue::NativeFunction(f) = &cb {
-                        f(vec![item.clone(), JsValue::Smi(i as i32)])?
-                    } else {
-                        JsValue::Undefined
-                    };
+                for (i, item) in elements.iter().enumerate() {
+                    let key = dispatch_call_value(&cb, vec![item.clone(), JsValue::Smi(i as i32)])?;
                     let group_key = key.to_js_string()?;
                     let mut borrow = result_rc.borrow_mut();
                     if let Some(JsValue::Array(existing)) = borrow.get(&group_key).cloned() {
-                        let mut v = existing.borrow().clone();
-                        v.push(item.clone());
-                        borrow.insert(group_key, JsValue::new_array(v));
+                        existing.borrow_mut().push(item.clone());
                     } else {
                         borrow.insert(group_key, JsValue::new_array(vec![item.clone()]));
                     }
@@ -6163,27 +6209,64 @@ fn make_map_builtin() -> JsValue {
             }),
         );
 
-        // ── Map.groupBy(items, callbackFn) ──────────────────────────────────
+        // ── Map.groupBy(items, callbackFn) — ES2024 §24.1.2.1 ──────────────
         props.insert(
             "groupBy".into(),
-            native(|args| {
+            builtin_fn("groupBy", 2, |args| {
                 let items = args.first().unwrap_or(&JsValue::Undefined).clone();
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let arr = match &items {
-                    JsValue::Array(a) => a.clone(),
+
+                // §24.1.2.1 step 2: callbackFn must be callable.
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Map.groupBy: callbackFn is not a function".into(),
+                    ));
+                }
+
+                // Collect elements from iterable.
+                let elements: Vec<JsValue> = match &items {
+                    JsValue::Array(a) => a.borrow().clone(),
+                    JsValue::String(s) => s
+                        .chars()
+                        .map(|c| JsValue::String(c.to_string().into()))
+                        .collect(),
+                    JsValue::Iterator(iter) => {
+                        let mut v = Vec::new();
+                        while let Some(item) = iter.borrow_mut().next_item() {
+                            v.push(item);
+                        }
+                        v
+                    }
+                    JsValue::PlainObject(map) => {
+                        let borrow = map.borrow();
+                        if let Some(len_val) = borrow.get("length") {
+                            let len = match len_val {
+                                JsValue::Smi(n) => *n as usize,
+                                JsValue::HeapNumber(n) => n.trunc() as usize,
+                                _ => 0,
+                            };
+                            (0..len)
+                                .map(|i| {
+                                    borrow
+                                        .get(&i.to_string())
+                                        .cloned()
+                                        .unwrap_or(JsValue::Undefined)
+                                })
+                                .collect()
+                        } else {
+                            vec![]
+                        }
+                    }
                     _ => {
                         return Err(StatorError::TypeError(
-                            "Map.groupBy: first argument must be iterable".into(),
+                            "Map.groupBy: first argument is not iterable".into(),
                         ));
                     }
                 };
+
                 let result_map = Rc::new(RefCell::new(map_new()));
-                for (i, item) in arr.borrow().iter().enumerate() {
-                    let key = if let JsValue::NativeFunction(f) = &cb {
-                        f(vec![item.clone(), JsValue::Smi(i as i32)])?
-                    } else {
-                        JsValue::Undefined
-                    };
+                for (i, item) in elements.iter().enumerate() {
+                    let key = dispatch_call_value(&cb, vec![item.clone(), JsValue::Smi(i as i32)])?;
                     let existing = map_get(&result_map.borrow(), &key);
                     if let JsValue::Array(existing_arr) = existing {
                         existing_arr.borrow_mut().push(item.clone());
@@ -6195,7 +6278,7 @@ fn make_map_builtin() -> JsValue {
                         );
                     }
                 }
-                // Build a Map instance with prototype methods from the result
+                // Build a Map instance with prototype methods from the result.
                 let inner = result_map;
                 let mut obj = PropertyMap::new();
                 {
@@ -13238,46 +13321,54 @@ mod tests {
         let obj = globals.get("Object").unwrap();
         if let JsValue::PlainObject(map) = obj {
             let group_by = map.borrow().get("groupBy").cloned().unwrap();
-            if let JsValue::NativeFunction(f) = group_by {
-                let items = JsValue::new_array(vec![
-                    JsValue::Smi(1),
-                    JsValue::Smi(2),
-                    JsValue::Smi(3),
-                    JsValue::Smi(4),
-                ]);
-                let cb = JsValue::NativeFunction(Rc::new(|args: Vec<JsValue>| {
-                    let v = args.first().unwrap_or(&JsValue::Undefined).clone();
-                    let n = v.to_number().unwrap_or(0.0) as i32;
-                    if n % 2 == 0 {
-                        Ok(JsValue::String("even".into()))
+            // builtin_fn wraps as PlainObject with __call__
+            let f = match &group_by {
+                JsValue::NativeFunction(f) => Rc::clone(f),
+                JsValue::PlainObject(po) => {
+                    if let Some(JsValue::NativeFunction(f)) = po.borrow().get("__call__") {
+                        Rc::clone(f)
                     } else {
-                        Ok(JsValue::String("odd".into()))
+                        panic!("groupBy should be callable");
                     }
-                }));
-                let result = f(vec![items, cb]).unwrap();
-                if let JsValue::PlainObject(r) = &result {
-                    let borrow = r.borrow();
-                    let odd = borrow.get("odd").cloned().unwrap();
-                    let even = borrow.get("even").cloned().unwrap();
-                    if let JsValue::Array(odd_arr) = odd {
-                        assert_eq!(odd_arr.borrow().len(), 2);
-                        assert_eq!(odd_arr.borrow()[0], JsValue::Smi(1));
-                        assert_eq!(odd_arr.borrow()[1], JsValue::Smi(3));
-                    } else {
-                        panic!("odd should be Array");
-                    }
-                    if let JsValue::Array(even_arr) = even {
-                        assert_eq!(even_arr.borrow().len(), 2);
-                        assert_eq!(even_arr.borrow()[0], JsValue::Smi(2));
-                        assert_eq!(even_arr.borrow()[1], JsValue::Smi(4));
-                    } else {
-                        panic!("even should be Array");
-                    }
+                }
+                _ => panic!("groupBy should be callable"),
+            };
+            let items = JsValue::new_array(vec![
+                JsValue::Smi(1),
+                JsValue::Smi(2),
+                JsValue::Smi(3),
+                JsValue::Smi(4),
+            ]);
+            let cb = JsValue::NativeFunction(Rc::new(|args: Vec<JsValue>| {
+                let v = args.first().unwrap_or(&JsValue::Undefined).clone();
+                let n = v.to_number().unwrap_or(0.0) as i32;
+                if n % 2 == 0 {
+                    Ok(JsValue::String("even".into()))
                 } else {
-                    panic!("Expected PlainObject");
+                    Ok(JsValue::String("odd".into()))
+                }
+            }));
+            let result = f(vec![items, cb]).unwrap();
+            if let JsValue::PlainObject(r) = &result {
+                let borrow = r.borrow();
+                let odd = borrow.get("odd").cloned().unwrap();
+                let even = borrow.get("even").cloned().unwrap();
+                if let JsValue::Array(odd_arr) = odd {
+                    assert_eq!(odd_arr.borrow().len(), 2);
+                    assert_eq!(odd_arr.borrow()[0], JsValue::Smi(1));
+                    assert_eq!(odd_arr.borrow()[1], JsValue::Smi(3));
+                } else {
+                    panic!("odd should be Array");
+                }
+                if let JsValue::Array(even_arr) = even {
+                    assert_eq!(even_arr.borrow().len(), 2);
+                    assert_eq!(even_arr.borrow()[0], JsValue::Smi(2));
+                    assert_eq!(even_arr.borrow()[1], JsValue::Smi(4));
+                } else {
+                    panic!("even should be Array");
                 }
             } else {
-                panic!("groupBy should be NativeFunction");
+                panic!("Expected PlainObject");
             }
         }
     }
@@ -20282,5 +20373,307 @@ mod tests {
     fn test_map_returns_array_for_native() {
         let result = global_eval("[1,2,3].map(function(x) { return x * 2; }).join(',')").unwrap();
         assert_eq!(result, JsValue::String("2,4,6".into()));
+    }
+
+    // ── Object.groupBy e2e tests ────────────────────────────────────────
+
+    /// `Object.groupBy` groups numbers by even/odd.
+    #[test]
+    fn e2e_object_group_by_even_odd() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([1,2,3,4,5,6], function(n) {
+                return n % 2 === 0 ? "even" : "odd";
+            });
+            r.odd.length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Object.groupBy` even group has correct elements.
+    #[test]
+    fn e2e_object_group_by_even_elements() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([1,2,3,4], function(n) {
+                return n % 2 === 0 ? "even" : "odd";
+            });
+            r.even.join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("2,4".into()));
+    }
+
+    /// `Object.groupBy` returns a null-prototype-like object.
+    #[test]
+    fn e2e_object_group_by_result_type() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([1], function(n) { return "a"; });
+            typeof r
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    /// `Object.groupBy` callback receives index as second argument.
+    #[test]
+    fn e2e_object_group_by_callback_index() {
+        let result = global_eval(
+            r#"
+            var indices = [];
+            Object.groupBy([10, 20, 30], function(v, i) {
+                indices.push(i);
+                return "g";
+            });
+            indices.join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("0,1,2".into()));
+    }
+
+    /// `Object.groupBy` with empty array returns empty object.
+    #[test]
+    fn e2e_object_group_by_empty() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([], function(n) { return "x"; });
+            Object.keys(r).length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// `Object.groupBy` single group gathers all items.
+    #[test]
+    fn e2e_object_group_by_single_group() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([1,2,3], function() { return "all"; });
+            r.all.join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1,2,3".into()));
+    }
+
+    /// `Object.groupBy` with string keys from callback.
+    #[test]
+    fn e2e_object_group_by_string_keys() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy(["apple", "avocado", "banana"], function(s) {
+                return s[0];
+            });
+            r.a.length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `Object.groupBy.length` is 2.
+    #[test]
+    fn e2e_object_group_by_length_prop() {
+        let result = global_eval("Object.groupBy.length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `Object.groupBy.name` is "groupBy".
+    #[test]
+    fn e2e_object_group_by_name_prop() {
+        let result = global_eval("Object.groupBy.name").unwrap();
+        assert_eq!(result, JsValue::String("groupBy".into()));
+    }
+
+    // ── Map.groupBy e2e tests ───────────────────────────────────────────
+
+    /// `Map.groupBy` returns a Map-like object with `get`.
+    #[test]
+    fn e2e_map_group_by_basic() {
+        let result = global_eval(
+            r#"
+            var m = Map.groupBy([1,2,3,4], function(n) {
+                return n % 2 === 0 ? "even" : "odd";
+            });
+            m.get("odd").join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1,3".into()));
+    }
+
+    /// `Map.groupBy` has correct size.
+    #[test]
+    fn e2e_map_group_by_size() {
+        let result = global_eval(
+            r#"
+            var m = Map.groupBy([1,2,3,4], function(n) {
+                return n % 2 === 0 ? "even" : "odd";
+            });
+            m.size
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `Map.groupBy` has() works for existing key.
+    #[test]
+    fn e2e_map_group_by_has() {
+        let result = global_eval(
+            r#"
+            var m = Map.groupBy([1,2,3], function(n) { return "k"; });
+            m.has("k")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Map.groupBy` has() returns false for missing key.
+    #[test]
+    fn e2e_map_group_by_has_missing() {
+        let result = global_eval(
+            r#"
+            var m = Map.groupBy([1], function(n) { return "a"; });
+            m.has("b")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Map.groupBy` callback receives index.
+    #[test]
+    fn e2e_map_group_by_callback_index() {
+        let result = global_eval(
+            r#"
+            var idxs = [];
+            Map.groupBy([10,20], function(v, i) { idxs.push(i); return "g"; });
+            idxs.join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("0,1".into()));
+    }
+
+    /// `Map.groupBy.length` is 2.
+    #[test]
+    fn e2e_map_group_by_length_prop() {
+        let result = global_eval("Map.groupBy.length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `Map.groupBy.name` is "groupBy".
+    #[test]
+    fn e2e_map_group_by_name_prop() {
+        let result = global_eval("Map.groupBy.name").unwrap();
+        assert_eq!(result, JsValue::String("groupBy".into()));
+    }
+
+    // ── Object.hasOwn e2e conformance ───────────────────────────────────
+
+    /// `Object.hasOwn` works on arrays with valid index.
+    #[test]
+    fn e2e_object_has_own_array_index() {
+        let result = global_eval("Object.hasOwn([10, 20, 30], '1')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.hasOwn` on arrays returns false for out-of-bounds index.
+    #[test]
+    fn e2e_object_has_own_array_oob() {
+        let result = global_eval("Object.hasOwn([10], '5')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Object.hasOwn` on arrays with "length" returns true.
+    #[test]
+    fn e2e_object_has_own_array_length() {
+        let result = global_eval("Object.hasOwn([1,2,3], 'length')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object.hasOwn.length` is 2.
+    #[test]
+    fn e2e_object_has_own_length_prop() {
+        let result = global_eval("Object.hasOwn.length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// `Object.hasOwn.name` is "hasOwn".
+    #[test]
+    fn e2e_object_has_own_name_prop() {
+        let result = global_eval("Object.hasOwn.name").unwrap();
+        assert_eq!(result, JsValue::String("hasOwn".into()));
+    }
+
+    // ── Array.from conformance edge cases ───────────────────────────────
+
+    /// `Array.from` with array-like and mapFn applies mapping.
+    #[test]
+    fn e2e_array_from_array_like_with_map_fn() {
+        let result = global_eval(
+            "Array.from({0: 1, 1: 2, 2: 3, length: 3}, function(x) { return x * 10; }).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("10,20,30".into()));
+    }
+
+    /// `Array.from` mapFn receives (element, index).
+    #[test]
+    fn e2e_array_from_map_fn_index() {
+        let result =
+            global_eval("Array.from([10, 20, 30], function(v, i) { return i; }).join(',')")
+                .unwrap();
+        assert_eq!(result, JsValue::String("0,1,2".into()));
+    }
+
+    /// `Array.from` with string source produces character array.
+    #[test]
+    fn e2e_array_from_string_chars() {
+        let result = global_eval("Array.from('hello').join(',')").unwrap();
+        assert_eq!(result, JsValue::String("h,e,l,l,o".into()));
+    }
+
+    /// `Array.from` with undefined mapFn is same as no mapFn.
+    #[test]
+    fn e2e_array_from_undefined_map_fn() {
+        let result = global_eval("Array.from([1,2,3], undefined).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("1,2,3".into()));
+    }
+
+    /// `Array.from.length` is 1.
+    #[test]
+    fn e2e_array_from_length_prop() {
+        let result = global_eval("Array.from.length").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `Array.from.name` is "from".
+    #[test]
+    fn e2e_array_from_name_prop() {
+        let result = global_eval("Array.from.name").unwrap();
+        assert_eq!(result, JsValue::String("from".into()));
+    }
+
+    /// `Array.from` with sparse array-like fills gaps with undefined.
+    #[test]
+    fn e2e_array_from_sparse_array_like() {
+        let result = global_eval(
+            r#"
+            var r = Array.from({0: "a", 2: "c", length: 3});
+            r[1] === undefined
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 }
