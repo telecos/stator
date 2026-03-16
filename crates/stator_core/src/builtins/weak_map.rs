@@ -85,6 +85,19 @@ pub fn weak_map_new() -> JsWeakMap {
     JsWeakMap::default()
 }
 
+/// ECMAScript §24.3.1.1 `new WeakMap(iterable)`.
+///
+/// Creates a [`JsWeakMap`] from an iterable of `(key, value)` pairs.
+///
+/// Returns [`StatorError::TypeError`] if any key is null.
+pub fn weak_map_from_iterable(entries: Vec<(*mut HeapObject, JsValue)>) -> StatorResult<JsWeakMap> {
+    let mut map = weak_map_new();
+    for (key, value) in entries {
+        weak_map_set(&mut map, key, value)?;
+    }
+    Ok(map)
+}
+
 // ── weak_map_set ──────────────────────────────────────────────────────────────
 
 /// ECMAScript §24.3.3.5 `WeakMap.prototype.set(key, value)`.
@@ -314,6 +327,26 @@ mod tests {
     fn test_weak_map_null_key_delete_returns_false() {
         let mut wm = weak_map_new();
         assert!(!weak_map_delete(&mut wm, std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn test_weak_map_from_iterable_populates_entries() {
+        let mut a = HeapObject::new_null();
+        let mut b = HeapObject::new_null();
+        let wm = weak_map_from_iterable(vec![
+            (&raw mut a, JsValue::Smi(1)),
+            (&raw mut b, JsValue::Smi(2)),
+        ])
+        .unwrap();
+        assert_eq!(weak_map_get(&wm, &raw mut a), JsValue::Smi(1));
+        assert_eq!(weak_map_get(&wm, &raw mut b), JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_weak_map_from_iterable_rejects_null_key() {
+        let err =
+            weak_map_from_iterable(vec![(std::ptr::null_mut(), JsValue::Smi(1))]).unwrap_err();
+        assert!(matches!(err, StatorError::TypeError(_)));
     }
 
     // ── Pointer identity ──────────────────────────────────────────────────────
