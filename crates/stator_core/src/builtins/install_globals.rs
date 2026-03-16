@@ -26707,4 +26707,293 @@ mod tests {
         .unwrap();
         assert_eq!(r, JsValue::Smi(7));
     }
+
+    // ── Type coercion & conversion conformance ────────────────────────────
+
+    // -- ToNumber edge cases --
+
+    /// Unary `+` on empty string → 0.
+    #[test]
+    fn e2e_to_number_empty_string() {
+        let r = global_eval("+''").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Unary `+` on whitespace-only string → 0.
+    #[test]
+    fn e2e_to_number_whitespace_string() {
+        let r = global_eval("+' '").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Unary `+` on hex literal string → 16.
+    #[test]
+    fn e2e_to_number_hex_string() {
+        let r = global_eval("+'0x10'").unwrap();
+        assert_eq!(r, JsValue::Smi(16));
+    }
+
+    /// Unary `+` on "Infinity" string → Infinity.
+    #[test]
+    fn e2e_to_number_infinity_string() {
+        let r = global_eval("+'Infinity'").unwrap();
+        assert_eq!(r, JsValue::HeapNumber(f64::INFINITY));
+    }
+
+    /// Unary `+` on scientific notation string → 100.
+    #[test]
+    fn e2e_to_number_scientific_notation() {
+        let r = global_eval("+'1e2'").unwrap();
+        assert_eq!(r, JsValue::Smi(100));
+    }
+
+    /// Unary `+` on string with surrounding whitespace → 42.
+    #[test]
+    fn e2e_to_number_whitespace_around() {
+        let r = global_eval("+'  42  '").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Unary `+` on `null` → 0.
+    #[test]
+    fn e2e_to_number_null() {
+        let r = global_eval("+null").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Unary `+` on `true` → 1.
+    #[test]
+    fn e2e_to_number_true() {
+        let r = global_eval("+true").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// Unary `+` on `false` → 0.
+    #[test]
+    fn e2e_to_number_false() {
+        let r = global_eval("+false").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    // -- ToString --
+
+    /// `String(null)` → "null".
+    #[test]
+    fn e2e_to_string_null() {
+        let r = global_eval("String(null)").unwrap();
+        assert_eq!(r, JsValue::String("null".into()));
+    }
+
+    /// `String(undefined)` → "undefined".
+    #[test]
+    fn e2e_to_string_undefined() {
+        let r = global_eval("String(undefined)").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// `String(true)` → "true".
+    #[test]
+    fn e2e_to_string_true() {
+        let r = global_eval("String(true)").unwrap();
+        assert_eq!(r, JsValue::String("true".into()));
+    }
+
+    /// `String(false)` → "false".
+    #[test]
+    fn e2e_to_string_false() {
+        let r = global_eval("String(false)").unwrap();
+        assert_eq!(r, JsValue::String("false".into()));
+    }
+
+    // -- Abstract equality (==) --
+
+    /// `null == undefined` → true.
+    #[test]
+    fn e2e_abstract_eq_null_undefined() {
+        let r = global_eval("null == undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `null == 0` → false.
+    #[test]
+    fn e2e_abstract_eq_null_zero() {
+        let r = global_eval("null == 0").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `"" == 0` → true.
+    #[test]
+    fn e2e_abstract_eq_empty_string_zero() {
+        let r = global_eval("'' == 0").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `"" == false` → true.
+    #[test]
+    fn e2e_abstract_eq_empty_string_false() {
+        let r = global_eval("'' == false").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `undefined == null` → true (symmetric).
+    #[test]
+    fn e2e_abstract_eq_undefined_null() {
+        let r = global_eval("undefined == null").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // -- Strict equality (===) --
+
+    /// `NaN === NaN` → false.
+    #[test]
+    fn e2e_strict_eq_nan_nan() {
+        let r = global_eval("NaN === NaN").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `NaN !== NaN` → true.
+    #[test]
+    fn e2e_strict_neq_nan_nan() {
+        let r = global_eval("NaN !== NaN").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Type mismatch: `1 === '1'` → false.
+    #[test]
+    fn e2e_strict_eq_type_mismatch() {
+        let r = global_eval("1 === '1'").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    // -- Comparison operators --
+
+    /// String lexicographic: `"b" > "a"` → true.
+    #[test]
+    fn e2e_compare_string_gt() {
+        let r = global_eval("'b' > 'a'").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// String lexicographic: `"10" < "9"` → true (char-by-char).
+    #[test]
+    fn e2e_compare_string_lexicographic() {
+        let r = global_eval("'10' < '9'").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Mixed types: `2 < "10"` → true (string coerced to number).
+    #[test]
+    fn e2e_compare_mixed_types() {
+        let r = global_eval("2 < '10'").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // -- Unary operators --
+
+    /// Negate: `-5` → -5.
+    #[test]
+    fn e2e_unary_negate() {
+        let r = global_eval("var x = 5; -x").unwrap();
+        assert_eq!(r, JsValue::Smi(-5));
+    }
+
+    /// Bitwise NOT: `~0` → -1.
+    #[test]
+    fn e2e_bitwise_not_zero() {
+        let r = global_eval("~0").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    /// Bitwise NOT: `~-1` → 0.
+    #[test]
+    fn e2e_bitwise_not_neg_one() {
+        let r = global_eval("~-1").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Bitwise NOT uses ToInt32: `~NaN` → -1 (ToInt32(NaN) is 0).
+    #[test]
+    fn e2e_bitwise_not_nan() {
+        let r = global_eval("~NaN").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    // -- Boolean coercion (!value) --
+
+    /// `!0` → true (0 is falsy).
+    #[test]
+    fn e2e_logical_not_zero() {
+        let r = global_eval("!0").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `!""` → true (empty string is falsy).
+    #[test]
+    fn e2e_logical_not_empty_string() {
+        let r = global_eval("!''").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `!null` → true (null is falsy).
+    #[test]
+    fn e2e_logical_not_null() {
+        let r = global_eval("!null").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `!undefined` → true (undefined is falsy).
+    #[test]
+    fn e2e_logical_not_undefined() {
+        let r = global_eval("!undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `!1` → false (1 is truthy).
+    #[test]
+    fn e2e_logical_not_one() {
+        let r = global_eval("!1").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `!!"hello"` → true (non-empty string is truthy).
+    #[test]
+    fn e2e_double_not_string() {
+        let r = global_eval("!!'hello'").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `!!0` → false (double-not preserves falsiness).
+    #[test]
+    fn e2e_double_not_zero() {
+        let r = global_eval("!!0").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `!!NaN` → false (NaN is falsy).
+    #[test]
+    fn e2e_double_not_nan() {
+        let r = global_eval("!!NaN").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `!!""` → false (empty string is falsy).
+    #[test]
+    fn e2e_double_not_empty_string() {
+        let r = global_eval("!!''").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Array ToPrimitive: `[1] == 1` → true.
+    #[test]
+    fn e2e_abstract_eq_array_number() {
+        let r = global_eval("[1] == 1").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Empty array ToPrimitive: `[] == 0` → true ("" == 0).
+    #[test]
+    fn e2e_abstract_eq_empty_array_zero() {
+        let r = global_eval("[] == 0").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
 }
