@@ -79,7 +79,10 @@ use crate::builtins::math::{
     math_tan, math_tanh, math_trunc,
 };
 use crate::builtins::number::{
-    number_reformat_exponential, number_to_exponential, number_to_precision,
+    NUMBER_EPSILON, NUMBER_MAX_SAFE_INTEGER, NUMBER_MAX_VALUE, NUMBER_MIN_SAFE_INTEGER,
+    NUMBER_MIN_VALUE, NUMBER_NAN, NUMBER_NEGATIVE_INFINITY, NUMBER_POSITIVE_INFINITY,
+    number_is_finite, number_is_integer, number_is_nan, number_is_safe_integer,
+    number_reformat_exponential, number_to_exponential, number_to_fixed, number_to_precision,
 };
 use crate::builtins::proxy::{
     ProxyHandler, proxy_define_property, proxy_delete_property, proxy_get, proxy_get_prototype_of,
@@ -3671,7 +3674,8 @@ fn make_number() -> JsValue {
             builtin_fn("isNaN", 1, |args| {
                 let val = args.first().unwrap_or(&JsValue::Undefined);
                 let result = match val {
-                    JsValue::HeapNumber(n) => n.is_nan(),
+                    JsValue::Smi(_) => false,
+                    JsValue::HeapNumber(n) => number_is_nan(*n),
                     _ => false,
                 };
                 Ok(JsValue::Boolean(result))
@@ -3684,7 +3688,7 @@ fn make_number() -> JsValue {
                 let val = args.first().unwrap_or(&JsValue::Undefined);
                 let result = match val {
                     JsValue::Smi(_) => true,
-                    JsValue::HeapNumber(n) => n.is_finite(),
+                    JsValue::HeapNumber(n) => number_is_finite(*n),
                     _ => false,
                 };
                 Ok(JsValue::Boolean(result))
@@ -3693,11 +3697,11 @@ fn make_number() -> JsValue {
         // Number.isInteger
         props.insert(
             "isInteger".into(),
-            native(|args| {
+            builtin_fn("isInteger", 1, |args| {
                 let val = args.first().unwrap_or(&JsValue::Undefined);
                 let result = match val {
                     JsValue::Smi(_) => true,
-                    JsValue::HeapNumber(n) => n.is_finite() && n.fract() == 0.0,
+                    JsValue::HeapNumber(n) => number_is_integer(*n),
                     _ => false,
                 };
                 Ok(JsValue::Boolean(result))
@@ -3706,13 +3710,11 @@ fn make_number() -> JsValue {
         // Number.isSafeInteger
         props.insert(
             "isSafeInteger".into(),
-            native(|args| {
+            builtin_fn("isSafeInteger", 1, |args| {
                 let val = args.first().unwrap_or(&JsValue::Undefined);
                 let result = match val {
                     JsValue::Smi(_) => true,
-                    JsValue::HeapNumber(n) => {
-                        n.is_finite() && n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0
-                    }
+                    JsValue::HeapNumber(n) => number_is_safe_integer(*n),
                     _ => false,
                 };
                 Ok(JsValue::Boolean(result))
@@ -3724,12 +3726,7 @@ fn make_number() -> JsValue {
             builtin_fn("parseInt", 2, |args| {
                 let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                 let radix = if args.len() > 1 {
-                    let r = args[1].to_number()?;
-                    if r.is_nan() || r == 0.0 {
-                        0
-                    } else {
-                        r.floor() as u32
-                    }
+                    args[1].to_int32()?
                 } else {
                     0
                 };
@@ -3748,24 +3745,24 @@ fn make_number() -> JsValue {
         // Constants
         props.insert(
             "MAX_SAFE_INTEGER".into(),
-            JsValue::HeapNumber(9_007_199_254_740_991.0),
+            JsValue::HeapNumber(NUMBER_MAX_SAFE_INTEGER),
         );
         props.insert(
             "MIN_SAFE_INTEGER".into(),
-            JsValue::HeapNumber(-9_007_199_254_740_991.0),
+            JsValue::HeapNumber(NUMBER_MIN_SAFE_INTEGER),
         );
-        props.insert("MAX_VALUE".into(), JsValue::HeapNumber(f64::MAX));
-        props.insert("MIN_VALUE".into(), JsValue::HeapNumber(5e-324));
-        props.insert("EPSILON".into(), JsValue::HeapNumber(f64::EPSILON));
+        props.insert("MAX_VALUE".into(), JsValue::HeapNumber(NUMBER_MAX_VALUE));
+        props.insert("MIN_VALUE".into(), JsValue::HeapNumber(NUMBER_MIN_VALUE));
+        props.insert("EPSILON".into(), JsValue::HeapNumber(NUMBER_EPSILON));
         props.insert(
             "POSITIVE_INFINITY".into(),
-            JsValue::HeapNumber(f64::INFINITY),
+            JsValue::HeapNumber(NUMBER_POSITIVE_INFINITY),
         );
         props.insert(
             "NEGATIVE_INFINITY".into(),
-            JsValue::HeapNumber(f64::NEG_INFINITY),
+            JsValue::HeapNumber(NUMBER_NEGATIVE_INFINITY),
         );
-        props.insert("NaN".into(), JsValue::HeapNumber(f64::NAN));
+        props.insert("NaN".into(), JsValue::HeapNumber(NUMBER_NAN));
 
         // ── Number.prototype ─────────────────────────────────────────────────
         let num_proto_rc = {
@@ -3866,7 +3863,7 @@ fn make_number() -> JsValue {
                             JsValue::HeapNumber(n).to_js_string()?.into(),
                         ));
                     }
-                    Ok(JsValue::String(format!("{n:.digits$}").into()))
+                    Ok(JsValue::String(number_to_fixed(n, digits as u32)?.into()))
                 }),
             );
 
@@ -13447,12 +13444,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             builtin_fn("parseInt", 2, |args| {
                 let s = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                 let radix = if args.len() > 1 {
-                    let r = args[1].to_number()?;
-                    if r.is_nan() || r == 0.0 {
-                        0
-                    } else {
-                        r.floor() as u32
-                    }
+                    args[1].to_int32()?
                 } else {
                     0
                 };
@@ -17016,7 +17008,7 @@ mod tests {
     // -- Literal parsing --
 
     #[test]
-    fn e2e_bigint_literal_zero() {
+    fn e2e_bigint_literal_zero_repeated() {
         let result = global_eval("0n").unwrap();
         assert_eq!(result, JsValue::BigInt(0));
     }
@@ -17447,7 +17439,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_bigint_strict_eq_number_false() {
+    fn e2e_bigint_strict_eq_number_false_one_n() {
         let result = global_eval("42n === 42").unwrap();
         assert_eq!(result, JsValue::Boolean(false));
     }
@@ -19680,6 +19672,216 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
+    #[test]
+    fn e2e_number_is_integer_infinity_false() {
+        let result = global_eval("Number.isInteger(Infinity)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_number_is_integer_nan_false() {
+        let result = global_eval("Number.isInteger(NaN)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_number_is_integer_string_false() {
+        let result = global_eval("Number.isInteger('1')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_number_is_finite_string_false() {
+        let result = global_eval("Number.isFinite('1')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_number_is_nan_string_nan_false() {
+        let result = global_eval("Number.isNaN('NaN')").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_number_is_safe_integer_max_boundary() {
+        let result = global_eval("Number.isSafeInteger(Number.MAX_SAFE_INTEGER)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_number_is_safe_integer_above_max_boundary() {
+        let result = global_eval("Number.isSafeInteger(Number.MAX_SAFE_INTEGER + 1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_number_is_safe_integer_min_boundary() {
+        let result = global_eval("Number.isSafeInteger(Number.MIN_SAFE_INTEGER)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_number_is_safe_integer_below_min_boundary() {
+        let result = global_eval("Number.isSafeInteger(Number.MIN_SAFE_INTEGER - 1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_number_epsilon_exact_value() {
+        let result = global_eval("Number.EPSILON === 2.220446049250313e-16").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_parse_int_defaults_radix_for_undefined() {
+        let result = global_eval("parseInt('10', undefined)").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_parse_int_defaults_radix_for_zero() {
+        let result = global_eval("parseInt('10', 0)").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_parse_int_defaults_radix_for_infinity() {
+        let result = global_eval("parseInt('10', Infinity)").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_parse_int_wraps_radix_via_to_int32() {
+        let result = global_eval("parseInt('11', 4294967298)").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_parse_int_defaults_hex_prefix_to_radix_sixteen() {
+        let result = global_eval("parseInt('0x10')").unwrap();
+        assert_eq!(result, JsValue::Smi(16));
+    }
+
+    #[test]
+    fn e2e_parse_int_explicit_radix_sixteen_accepts_hex_prefix() {
+        let result = global_eval("parseInt('0x10', 16)").unwrap();
+        assert_eq!(result, JsValue::Smi(16));
+    }
+
+    #[test]
+    fn e2e_parse_int_leading_zeroes_stay_decimal() {
+        let result = global_eval("parseInt('077')").unwrap();
+        assert_eq!(result, JsValue::Smi(77));
+    }
+
+    #[test]
+    fn e2e_parse_int_partial_decimal_parse() {
+        let result = global_eval("parseInt('123abc', 10)").unwrap();
+        assert_eq!(result, JsValue::Smi(123));
+    }
+
+    #[test]
+    fn e2e_parse_int_invalid_low_radix_returns_nan() {
+        let result = global_eval("Number.isNaN(parseInt('10', 1))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_parse_int_invalid_high_radix_returns_nan() {
+        let result = global_eval("Number.isNaN(parseInt('10', 37))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_number_parse_int_alias_uses_same_radix_defaults() {
+        let result = global_eval("Number.parseInt('0x20', undefined)").unwrap();
+        assert_eq!(result, JsValue::Smi(32));
+    }
+
+    #[test]
+    fn e2e_parse_float_parses_infinity_literal() {
+        let result = global_eval("parseFloat('Infinity')").unwrap();
+        assert_eq!(result, JsValue::HeapNumber(f64::INFINITY));
+    }
+
+    #[test]
+    fn e2e_parse_float_trims_whitespace_before_infinity() {
+        let result = global_eval("parseFloat('   Infinity')").unwrap();
+        assert_eq!(result, JsValue::HeapNumber(f64::INFINITY));
+    }
+
+    #[test]
+    fn e2e_parse_float_parses_negative_infinity_prefix() {
+        let result = global_eval("parseFloat('  -Infinityxyz')").unwrap();
+        assert_eq!(result, JsValue::HeapNumber(f64::NEG_INFINITY));
+    }
+
+    #[test]
+    fn e2e_parse_float_partial_parse_keeps_numeric_prefix() {
+        let result = global_eval("parseFloat('123.5px')").unwrap();
+        assert_eq!(result, JsValue::HeapNumber(123.5));
+    }
+
+    #[test]
+    fn e2e_parse_float_invalid_returns_nan() {
+        let result = global_eval("Number.isNaN(parseFloat('abc'))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_number_parse_float_alias_parses_infinity() {
+        let result = global_eval("Number.parseFloat('Infinity')").unwrap();
+        assert_eq!(result, JsValue::HeapNumber(f64::INFINITY));
+    }
+
+    #[test]
+    fn e2e_number_conversion_no_args_returns_zero() {
+        let result = global_eval("Number()").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn e2e_number_conversion_empty_string_returns_zero() {
+        let result = global_eval("Number('')").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn e2e_number_conversion_whitespace_string_returns_zero() {
+        let result = global_eval("Number('   ')").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn e2e_number_conversion_null_returns_zero() {
+        let result = global_eval("Number(null)").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn e2e_number_conversion_true_returns_one() {
+        let result = global_eval("Number(true)").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_number_conversion_hex_string_returns_number() {
+        let result = global_eval("Number('0x10')").unwrap();
+        assert_eq!(result, JsValue::Smi(16));
+    }
+
+    #[test]
+    fn e2e_number_conversion_undefined_returns_nan() {
+        let result = global_eval("Number.isNaN(Number(undefined))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_number_conversion_invalid_numeric_string_returns_nan() {
+        let result = global_eval("Number.isNaN(Number('123abc'))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
     // ── Object.fromEntries e2e tests ────────────────────────────────────
 
     /// `Object.fromEntries` builds an object from key-value pairs.
@@ -20773,6 +20975,36 @@ mod tests {
     fn e2e_number_to_fixed_infinity() {
         let result = global_eval("Infinity.toFixed(2)").unwrap();
         assert_eq!(result, JsValue::String("Infinity".into()));
+    }
+
+    #[test]
+    fn e2e_number_to_fixed_rounds_half_up_positive() {
+        let result = global_eval("(2.5).toFixed(0)").unwrap();
+        assert_eq!(result, JsValue::String("3".into()));
+    }
+
+    #[test]
+    fn e2e_number_to_fixed_rounds_half_up_negative() {
+        let result = global_eval("(-2.5).toFixed(0)").unwrap();
+        assert_eq!(result, JsValue::String("-3".into()));
+    }
+
+    #[test]
+    fn e2e_number_to_fixed_rounds_decimal_places() {
+        let result = global_eval("(0.615).toFixed(2)").unwrap();
+        assert_eq!(result, JsValue::String("0.62".into()));
+    }
+
+    #[test]
+    fn e2e_number_to_fixed_pads_fractional_zeroes() {
+        let result = global_eval("(1.2).toFixed(3)").unwrap();
+        assert_eq!(result, JsValue::String("1.200".into()));
+    }
+
+    #[test]
+    fn e2e_number_to_fixed_normalizes_negative_zero() {
+        let result = global_eval("(-0).toFixed(1)").unwrap();
+        assert_eq!(result, JsValue::String("0.0".into()));
     }
 
     // ── String.prototype.repeat tests ───────────────────────────────────
@@ -22541,7 +22773,7 @@ mod tests {
 
     /// `flat(Infinity)` fully flattens nested arrays.
     #[test]
-    fn e2e_array_flat_infinity() {
+    fn e2e_array_flat_infinity_join() {
         let result = global_eval("[1,[2,[3,[4]]]].flat(Infinity).length").unwrap();
         assert_eq!(result, JsValue::Smi(4));
     }
@@ -28925,7 +29157,7 @@ mod tests {
 
     /// Error.prototype.name is "Error".
     #[test]
-    fn e2e_error_name_property() {
+    fn e2e_error_name_property_stack_section() {
         let r = global_eval("new Error('x').name").unwrap();
         assert_eq!(r, JsValue::String("Error".into()));
     }
@@ -28959,7 +29191,7 @@ mod tests {
 
     /// Error.prototype.toString returns "ErrorName: message".
     #[test]
-    fn e2e_error_to_string() {
+    fn e2e_error_to_string_stack_section() {
         let r = global_eval(r#"new Error("fail").toString()"#).unwrap();
         assert_eq!(r, JsValue::String("Error: fail".into()));
     }
