@@ -14,17 +14,20 @@ use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
 
 use super::{
-    ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
-    PropertyIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, concat_rc_strs,
-    constant_pool_jump_delta, constant_to_value, decode_string_constant, dispatch_call_property,
-    dispatch_call_value, dispatch_call_with_this, dispatch_setter, err_bad_operand,
-    error_message_from_value, extract_context, find_handler, fn_props_set, is_js_receiver, js_add,
-    js_less_than, keyed_load, keyed_store, maybe_compile_baseline, maybe_compile_maglev,
-    maybe_compile_turbofan, number_to_jsvalue, plain_object_to_array_items, proto_lookup,
-    resolve_jump, restore_closure_context, set_pending_exception, strict_eq, to_array_index,
-    to_bigint, to_property_key, try_execute_best_jit, walk_context_chain, wire_construct_prototype,
+    ACTIVE_DEBUGGER, AwaitResolution, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD,
+    OSR_LOOP_THRESHOLD, PropertyIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow,
+    collect_args, concat_rc_strs, constant_pool_jump_delta, constant_to_value,
+    decode_string_constant, dispatch_call_property, dispatch_call_value, dispatch_call_with_this,
+    dispatch_setter, err_bad_operand, error_message_from_value, extract_context, find_handler,
+    fn_props_set, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
+    make_iterator_result, maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan,
+    number_to_jsvalue, plain_object_to_array_items, proto_lookup, resolve_jump,
+    resolve_promise_like, restore_closure_context, set_pending_exception, strict_eq,
+    to_array_index, to_bigint, to_property_key, try_execute_best_jit, walk_context_chain,
+    wire_construct_prototype, wrap_sync_iterator_as_async_iterator,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
+use crate::builtins::promise::MicrotaskQueue;
 use crate::builtins::proxy::{proxy_delete_property, proxy_has, proxy_set};
 use crate::bytecode::bytecode_array::{
     ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD, TIERING_THRESHOLD,
@@ -3054,10 +3057,17 @@ fn handle_get_async_iterator(
     ctx.frame.accumulator = match iterable {
         JsValue::Array(items) => {
             let items_vec: Vec<JsValue> = items.borrow().clone();
-            JsValue::Iterator(NativeIterator::from_items(items_vec))
+            wrap_sync_iterator_as_async_iterator(JsValue::Iterator(NativeIterator::from_items(
+                items_vec,
+            )))
         }
-        JsValue::String(ref s) => JsValue::Iterator(NativeIterator::from_string(s)),
-        JsValue::Generator(_) | JsValue::Iterator(_) => iterable,
+        JsValue::String(ref s) => {
+            wrap_sync_iterator_as_async_iterator(JsValue::Iterator(NativeIterator::from_string(s)))
+        }
+        JsValue::Generator(ref gs) if gs.borrow().bytecode_array.is_async() => iterable,
+        JsValue::Generator(_) | JsValue::Iterator(_) => {
+            wrap_sync_iterator_as_async_iterator(iterable)
+        }
         // PlainObject with @@asyncIterator → call it first (§27.1.4.2).
         JsValue::PlainObject(ref map) if map.borrow().contains_key("@@asyncIterator") => {
             let iter_fn = map.borrow().get("@@asyncIterator").cloned();
@@ -3077,7 +3087,11 @@ fn handle_get_async_iterator(
             let iter_fn = map.borrow().get("@@iterator").cloned();
             match iter_fn {
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
-                    dispatch_call_with_this(f, iterable.clone(), vec![])?
+                    wrap_sync_iterator_as_async_iterator(dispatch_call_with_this(
+                        f,
+                        iterable.clone(),
+                        vec![],
+                    )?)
                 }
                 _ => {
                     return Err(StatorError::TypeError(
@@ -3088,7 +3102,9 @@ fn handle_get_async_iterator(
         }
         JsValue::PlainObject(ref map) if map.borrow().contains_key("length") => {
             let items = plain_object_to_array_items(map);
-            JsValue::Iterator(NativeIterator::from_items(items))
+            wrap_sync_iterator_as_async_iterator(JsValue::Iterator(NativeIterator::from_items(
+                items,
+            )))
         }
         other => {
             return Err(StatorError::TypeError(format!(
@@ -3115,15 +3131,40 @@ fn handle_iterator_next(
             Some(v) => (v, false),
             None => (JsValue::Undefined, true),
         },
+        JsValue::Generator(gs) if gs.borrow().bytecode_array.is_async() => {
+            match Interpreter::run_generator_step(&gs, JsValue::Undefined)? {
+                GeneratorStep::Yield(v) => (v, false),
+                GeneratorStep::Return(v) => (v, true),
+            }
+        }
         JsValue::Generator(gs) => match Interpreter::run_generator_step(&gs, JsValue::Undefined)? {
             GeneratorStep::Yield(v) => (v, false),
             GeneratorStep::Return(v) => (v, true),
         },
         JsValue::PlainObject(ref map) if map.borrow().contains_key("next") => {
             let next_fn = map.borrow().get("next").cloned();
+            let is_async_iterator = map
+                .borrow()
+                .get("__async_iterator__")
+                .is_some_and(|flag| flag.to_boolean());
             match next_fn {
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
-                    let result = dispatch_call_with_this(f, iter.clone(), vec![])?;
+                    let mut result = dispatch_call_with_this(f, iter.clone(), vec![])?;
+                    if is_async_iterator || matches!(result, JsValue::Promise(_)) {
+                        let queue = MicrotaskQueue::new();
+                        result = match resolve_promise_like(result, &queue) {
+                            AwaitResolution::Fulfilled(value) => value,
+                            AwaitResolution::Rejected(reason) => {
+                                set_pending_exception(reason.clone());
+                                return Err(StatorError::JsException(error_message_from_value(
+                                    &reason,
+                                )));
+                            }
+                            AwaitResolution::Pending => {
+                                make_iterator_result(JsValue::Undefined, true)
+                            }
+                        };
+                    }
                     match result {
                         JsValue::PlainObject(ref res_map) => {
                             let done = res_map.borrow().get("done").is_some_and(|d| d.to_boolean());

@@ -26,10 +26,12 @@
 //! * ECMAScript 2025 Language Specification §27 — *Control Abstraction Objects*
 //! * Promises/A+ specification — <https://promisesaplus.com/>
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use crate::error::StatorError;
+use crate::interpreter::dispatch_call_with_this;
 use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 
@@ -305,6 +307,63 @@ impl JsPromise {
     /// all pending fulfillment reactions as microtasks on `queue`.
     /// A no-op if the promise is already settled.
     fn resolve(&self, value: JsValue, queue: &MicrotaskQueue) {
+        if let JsValue::Promise(other) = &value {
+            if Rc::ptr_eq(&self.0, &other.0) {
+                self.reject(
+                    JsValue::String("TypeError: promise cannot resolve itself".into()),
+                    queue,
+                );
+                return;
+            }
+            let fulfill_self = self.clone();
+            let reject_self = self.clone();
+            let fulfill_queue = queue.clone();
+            let reject_queue = queue.clone();
+            other.add_reactions(
+                Box::new(move |resolved| fulfill_self.resolve(resolved, &fulfill_queue)),
+                Box::new(move |reason| reject_self.reject(reason, &reject_queue)),
+                queue,
+            );
+            return;
+        }
+
+        if let Some(then_fn) = get_thenable_method(&value) {
+            let already_called = Rc::new(Cell::new(false));
+
+            let resolve_self = self.clone();
+            let resolve_queue = queue.clone();
+            let resolve_called = Rc::clone(&already_called);
+            let resolve_fn = JsValue::NativeFunction(Rc::new(move |args| {
+                if resolve_called.replace(true) {
+                    return Ok(JsValue::Undefined);
+                }
+                let resolved = args.first().cloned().unwrap_or(JsValue::Undefined);
+                resolve_self.resolve(resolved, &resolve_queue);
+                Ok(JsValue::Undefined)
+            }));
+
+            let reject_self = self.clone();
+            let reject_queue = queue.clone();
+            let reject_called = Rc::clone(&already_called);
+            let reject_fn = JsValue::NativeFunction(Rc::new(move |args| {
+                if reject_called.replace(true) {
+                    return Ok(JsValue::Undefined);
+                }
+                let reason = args.first().cloned().unwrap_or(JsValue::Undefined);
+                reject_self.reject(reason, &reject_queue);
+                Ok(JsValue::Undefined)
+            }));
+
+            match dispatch_call_with_this(&then_fn, value.clone(), vec![resolve_fn, reject_fn]) {
+                Ok(_) => {}
+                Err(err) if !already_called.replace(true) => {
+                    self.reject(rejection_reason_from_error(&err), queue);
+                }
+                Err(_) => {}
+            }
+            return;
+        }
+
         let reactions = {
             let mut inner = self.0.borrow_mut();
             if !matches!(inner.state, PromiseStateInner::Pending { .. }) {
@@ -393,6 +452,26 @@ impl JsPromise {
     }
 }
 
+fn is_thenable_callable(value: &JsValue) -> bool {
+    matches!(value, JsValue::Function(_) | JsValue::NativeFunction(_))
+        || matches!(value, JsValue::PlainObject(map) if map.borrow().contains_key("__call__"))
+}
+
+fn get_thenable_method(value: &JsValue) -> Option<JsValue> {
+    match value {
+        JsValue::PlainObject(map) => map
+            .borrow()
+            .get("then")
+            .cloned()
+            .filter(is_thenable_callable),
+        _ => None,
+    }
+}
+
+fn rejection_reason_from_error(error: &StatorError) -> JsValue {
+    JsValue::String(error.to_string().into())
+}
+
 // ── Constructor ────────────────────────────────────────────────────────────────
 
 /// ECMAScript §27.2.3.1 `new Promise(executor)`.
@@ -445,7 +524,12 @@ where
 /// assert_eq!(p.value(), Some(JsValue::Smi(42)));
 /// ```
 pub fn promise_resolve(value: JsValue, queue: &MicrotaskQueue) -> JsPromise {
-    promise_new(|resolve, _reject| resolve(value), queue)
+    if let JsValue::Promise(promise) = value {
+        return promise;
+    }
+    let promise = JsPromise::new_pending();
+    promise.resolve(value, queue);
+    promise
 }
 
 /// ECMAScript §27.2.4.4 `Promise.reject(reason)`.
