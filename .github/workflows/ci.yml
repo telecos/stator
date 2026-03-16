@@ -162,10 +162,10 @@ jobs:
           check_contains '[tab] compiling: var x = 1 + 2;'
           check_contains '[tab] OK -- 6 bytecode(s) generated'
           check_contains '  LdaSmi 2'
-          check_contains '  Star r1'
-          check_contains '  LdaSmi 1'
-          check_contains '  Add r1, slot(0)'
           check_contains '  Star r0'
+          check_contains '  LdaSmi 1'
+          check_contains '  Add r0, slot(0)'
+          check_contains '  StaGlobal [0], slot(1)'
           check_contains '  Return'
           check_contains '[tab] ERROR: SyntaxError: at 1:5'
 
