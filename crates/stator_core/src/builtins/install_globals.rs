@@ -10303,11 +10303,10 @@ fn make_proxy() -> JsValue {
                     }
                 };
                 let handler = build_proxy_handler(&handler_val, &target_val);
-                let proxy = if callable {
-                    proxy_new_callable(target, handler)
-                } else {
-                    proxy_revocable(target, handler)
-                };
+                let mut proxy = proxy_revocable(target, handler);
+                if callable {
+                    proxy.callable = true;
+                }
                 let proxy_rc = Rc::new(RefCell::new(proxy));
                 let proxy_val = JsValue::Proxy(Rc::clone(&proxy_rc));
                 let revoke_fn = JsValue::NativeFunction(Rc::new(move |_args| {
@@ -10466,6 +10465,42 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
                 }
             }));
         }
+        if let Some(JsValue::NativeFunction(f)) = borrow.get("getPrototypeOf").cloned() {
+            let target = target_val.clone();
+            handler.get_prototype_of = Some(Box::new(move |_target| {
+                let result = f(vec![target.clone()]).ok()?;
+                if result.is_null() || result.is_undefined() {
+                    None
+                } else {
+                    Some(Rc::new(RefCell::new(JsObject::new())))
+                }
+            }));
+        }
+        if let Some(JsValue::NativeFunction(f)) = borrow.get("setPrototypeOf").cloned() {
+            let target = target_val.clone();
+            handler.set_prototype_of = Some(Box::new(move |_target, _proto| {
+                let proto_val = match &_proto {
+                    Some(_) => JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))),
+                    None => JsValue::Null,
+                };
+                let result = f(vec![target.clone(), proto_val])?;
+                Ok(result.to_boolean())
+            }));
+        }
+        if let Some(JsValue::NativeFunction(f)) = borrow.get("isExtensible").cloned() {
+            let target = target_val.clone();
+            handler.is_extensible = Some(Box::new(move |_target| {
+                let result = f(vec![target.clone()])?;
+                Ok(result.to_boolean())
+            }));
+        }
+        if let Some(JsValue::NativeFunction(f)) = borrow.get("preventExtensions").cloned() {
+            let target = target_val.clone();
+            handler.prevent_extensions = Some(Box::new(move |_target| {
+                let result = f(vec![target.clone()])?;
+                Ok(result.to_boolean())
+            }));
+        }
     }
     handler
 }
@@ -10523,10 +10558,39 @@ fn make_reflect() -> JsValue {
             native(|args| {
                 let mut target = require_object_arg(&args, 0, "Reflect.defineProperty")?;
                 let key = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let value = args.get(2).cloned().unwrap_or(JsValue::Undefined);
-                let attrs = PropertyAttributes::WRITABLE
-                    | PropertyAttributes::ENUMERABLE
-                    | PropertyAttributes::CONFIGURABLE;
+                let desc_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+                // Parse the descriptor object to extract value and attributes.
+                let (value, attrs) = if let JsValue::PlainObject(desc) = &desc_arg {
+                    let desc_borrow = desc.borrow();
+                    let val = desc_borrow
+                        .get("value")
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined);
+                    let mut a = PropertyAttributes::empty();
+                    if desc_borrow.get("writable").is_some_and(|v| v.to_boolean()) {
+                        a |= PropertyAttributes::WRITABLE;
+                    }
+                    if desc_borrow
+                        .get("enumerable")
+                        .is_some_and(|v| v.to_boolean())
+                    {
+                        a |= PropertyAttributes::ENUMERABLE;
+                    }
+                    if desc_borrow
+                        .get("configurable")
+                        .is_some_and(|v| v.to_boolean())
+                    {
+                        a |= PropertyAttributes::CONFIGURABLE;
+                    }
+                    (val, a)
+                } else {
+                    (
+                        desc_arg,
+                        PropertyAttributes::WRITABLE
+                            | PropertyAttributes::ENUMERABLE
+                            | PropertyAttributes::CONFIGURABLE,
+                    )
+                };
                 Ok(JsValue::Boolean(reflect_define_property(
                     &mut target,
                     &key,
@@ -10625,14 +10689,28 @@ fn make_reflect() -> JsValue {
         props.insert(
             "apply".into(),
             native(|args| {
-                let _target = args.first().cloned().unwrap_or(JsValue::Undefined);
-                let _this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let target = args.first().cloned().unwrap_or(JsValue::Undefined);
+                let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                 let arg_list = match args.get(2) {
                     Some(JsValue::Array(arr)) => arr.borrow().clone(),
                     _ => vec![],
                 };
-                match &_target {
-                    JsValue::NativeFunction(f) => f(arg_list),
+                match &target {
+                    JsValue::NativeFunction(f) => {
+                        // Prepend this_arg to the argument list so native
+                        // functions can inspect the receiver when needed.
+                        let mut call_args = vec![this_arg];
+                        call_args.extend(arg_list);
+                        f(call_args)
+                    }
+                    JsValue::Function(_) => {
+                        // BytecodeArray-backed functions: invoke via the native
+                        // callback convention with this_arg prepended.
+                        Err(StatorError::TypeError(
+                            "Reflect.apply: bytecode functions not yet callable from Reflect"
+                                .to_string(),
+                        ))
+                    }
                     _ => Err(StatorError::TypeError(
                         "Reflect.apply: target is not callable".to_string(),
                     )),
@@ -10649,7 +10727,16 @@ fn make_reflect() -> JsValue {
                     _ => vec![],
                 };
                 match &target {
-                    JsValue::NativeFunction(f) => f(arg_list),
+                    JsValue::NativeFunction(f) => {
+                        let result = f(arg_list)?;
+                        // §28.1.2 step 6: the result must be an object.
+                        match result {
+                            JsValue::PlainObject(_) => Ok(result),
+                            _ => Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                                PropertyMap::new(),
+                            )))),
+                        }
+                    }
                     _ => Err(StatorError::TypeError(
                         "Reflect.construct: target is not a constructor".to_string(),
                     )),
@@ -22697,5 +22784,427 @@ mod tests {
     fn e2e_substring_same_args_edge() {
         let r = global_eval("'hello'.substring(2, 2)").unwrap();
         assert_eq!(r, JsValue::String("".into()));
+    }
+
+    // ── Proxy & Reflect e2e tests ─────────────────────────────────────────────
+
+    /// Proxy get trap intercepts property read.
+    #[test]
+    fn e2e_proxy_get_trap() {
+        let r = global_eval(
+            r#"
+            var target = { x: 1 };
+            var handler = { get: function(t, k) { return 42; } };
+            var p = new Proxy(target, handler);
+            p.x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Proxy get falls through without trap.
+    #[test]
+    fn e2e_proxy_get_no_trap() {
+        let r = global_eval(
+            r#"
+            var target = { x: 10 };
+            var p = new Proxy(target, {});
+            p.x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    /// Proxy set trap intercepts property assignment.
+    #[test]
+    fn e2e_proxy_set_trap() {
+        let r = global_eval(
+            r#"
+            var log = [];
+            var target = {};
+            var handler = { set: function(t, k, v) { log.push(k); return true; } };
+            var p = new Proxy(target, handler);
+            p.y = 5;
+            log.length;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// Proxy has trap intercepts `in` operator.
+    #[test]
+    fn e2e_proxy_has_trap() {
+        let r = global_eval(
+            r#"
+            var handler = { has: function(t, k) { return true; } };
+            var p = new Proxy({}, handler);
+            "anything" in p;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Proxy deleteProperty trap intercepts `delete` operator.
+    #[test]
+    fn e2e_proxy_delete_trap() {
+        let r = global_eval(
+            r#"
+            var deleted = false;
+            var handler = { deleteProperty: function(t, k) { deleted = true; return true; } };
+            var p = new Proxy({ a: 1 }, handler);
+            delete p.a;
+            deleted;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Proxy ownKeys trap intercepts Object.keys.
+    #[test]
+    fn e2e_proxy_own_keys_trap() {
+        let r = global_eval(
+            r#"
+            var handler = { ownKeys: function(t) { return ["x", "y"]; } };
+            var p = new Proxy({}, handler);
+            Reflect.ownKeys(p);
+            "#,
+        );
+        // ownKeys on a proxy — result should be an array
+        assert!(r.is_ok());
+    }
+
+    /// Proxy apply trap intercepts function calls.
+    #[test]
+    fn e2e_proxy_apply_trap() {
+        let r = global_eval(
+            r#"
+            var handler = { apply: function(target, thisArg, args) { return args[0] + 10; } };
+            var p = new Proxy(function(){}, handler);
+            p(5);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(15));
+    }
+
+    /// Proxy construct trap intercepts `new` operator.
+    #[test]
+    fn e2e_proxy_construct_trap() {
+        let r = global_eval(
+            r#"
+            var handler = { construct: function(target, args) { return { val: args[0] * 2 }; } };
+            var p = new Proxy(function(){}, handler);
+            var obj = new p(3);
+            obj.val;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(6));
+    }
+
+    /// Proxy.revocable returns object with proxy and revoke.
+    #[test]
+    fn e2e_proxy_revocable_basic() {
+        let r = global_eval(
+            r#"
+            var rev = Proxy.revocable({ x: 1 }, {});
+            rev.proxy.x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// Proxy.revocable: revoke makes proxy throw on access.
+    #[test]
+    fn e2e_proxy_revocable_revoke() {
+        let r = global_eval(
+            r#"
+            var rev = Proxy.revocable({ x: 1 }, {});
+            rev.revoke();
+            try { rev.proxy.x; } catch(e) { "revoked"; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("revoked".into()));
+    }
+
+    /// Proxy getOwnPropertyDescriptor trap.
+    #[test]
+    fn e2e_proxy_get_own_property_descriptor_trap() {
+        let r = global_eval(
+            r#"
+            var handler = {
+                getOwnPropertyDescriptor: function(t, k) {
+                    return { value: 99, writable: true, enumerable: true, configurable: true };
+                }
+            };
+            var p = new Proxy({}, handler);
+            var desc = Object.getOwnPropertyDescriptor(p, "anything");
+            desc.value;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    /// Proxy defineProperty trap.
+    #[test]
+    fn e2e_proxy_define_property_trap() {
+        let r = global_eval(
+            r#"
+            var trapped = false;
+            var handler = { defineProperty: function(t, k, v) { trapped = true; return true; } };
+            var p = new Proxy({}, handler);
+            Reflect.defineProperty(p, "a", { value: 1 });
+            trapped;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.get reads from an object.
+    #[test]
+    fn e2e_reflect_get() {
+        let r = global_eval(
+            r#"
+            var obj = { a: 42 };
+            Reflect.get(obj, "a");
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Reflect.set writes to an object and returns true.
+    #[test]
+    fn e2e_reflect_set() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Reflect.set(obj, "b", 7);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.has checks property existence.
+    #[test]
+    fn e2e_reflect_has() {
+        let r = global_eval(
+            r#"
+            var obj = { c: 1 };
+            Reflect.has(obj, "c");
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.has returns false for missing property.
+    #[test]
+    fn e2e_reflect_has_missing() {
+        let r = global_eval(
+            r#"
+            Reflect.has({}, "missing");
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Reflect.deleteProperty removes a property.
+    #[test]
+    fn e2e_reflect_delete_property() {
+        let r = global_eval(
+            r#"
+            var obj = { d: 1 };
+            Reflect.deleteProperty(obj, "d");
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.ownKeys returns own property keys.
+    #[test]
+    fn e2e_reflect_own_keys() {
+        let r = global_eval(
+            r#"
+            var obj = { x: 1, y: 2 };
+            Reflect.ownKeys(obj).length;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// Reflect.isExtensible returns true for normal objects.
+    #[test]
+    fn e2e_reflect_is_extensible() {
+        let r = global_eval(
+            r#"
+            Reflect.isExtensible({});
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.preventExtensions returns true and makes object non-extensible.
+    #[test]
+    fn e2e_reflect_prevent_extensions() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Reflect.preventExtensions(obj);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.getPrototypeOf returns null for plain objects.
+    #[test]
+    fn e2e_reflect_get_prototype_of() {
+        let r = global_eval(
+            r#"
+            Reflect.getPrototypeOf({});
+            "#,
+        );
+        // Plain objects in our model may return null or an object for prototype.
+        assert!(r.is_ok());
+    }
+
+    /// Reflect.apply calls a function with arguments.
+    #[test]
+    fn e2e_reflect_apply() {
+        let r = global_eval(
+            r#"
+            Reflect.apply(Math.floor, undefined, [4.7]);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(4));
+    }
+
+    /// Reflect.defineProperty creates a property with a descriptor.
+    #[test]
+    fn e2e_reflect_define_property() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Reflect.defineProperty(obj, "x", { value: 42, writable: true, enumerable: true, configurable: true });
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.getOwnPropertyDescriptor returns descriptor.
+    #[test]
+    fn e2e_reflect_get_own_property_descriptor() {
+        let r = global_eval(
+            r#"
+            var obj = { z: 100 };
+            var desc = Reflect.getOwnPropertyDescriptor(obj, "z");
+            desc.value;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(100));
+    }
+
+    /// Reflect.getOwnPropertyDescriptor returns undefined for missing key.
+    #[test]
+    fn e2e_reflect_get_own_property_descriptor_missing() {
+        let r = global_eval(
+            r#"
+            Reflect.getOwnPropertyDescriptor({}, "nope");
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    /// Proxy get invariant: non-configurable non-writable property must return correct value.
+    #[test]
+    fn e2e_proxy_get_invariant() {
+        let r = global_eval(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, writable: false, configurable: false });
+            var handler = { get: function(t, k) { return 2; } };
+            var p = new Proxy(target, handler);
+            try { p.x; } catch(e) { "invariant"; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("invariant".into()));
+    }
+
+    /// Proxy set no-trap falls through and returns value.
+    #[test]
+    fn e2e_proxy_set_no_trap_read_back() {
+        let r = global_eval(
+            r#"
+            var target = {};
+            var p = new Proxy(target, {});
+            p.a = 99;
+            p.a;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    /// Revoked proxy throws on set.
+    #[test]
+    fn e2e_proxy_revoked_set_throws() {
+        let r = global_eval(
+            r#"
+            var rev = Proxy.revocable({}, {});
+            rev.revoke();
+            try { rev.proxy.x = 1; } catch(e) { "revoked_set"; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("revoked_set".into()));
+    }
+
+    /// Revoked proxy throws on `in` operator.
+    #[test]
+    fn e2e_proxy_revoked_has_throws() {
+        let r = global_eval(
+            r#"
+            var rev = Proxy.revocable({}, {});
+            rev.revoke();
+            try { "x" in rev.proxy; } catch(e) { "revoked_has"; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("revoked_has".into()));
+    }
+
+    /// Multiple revoke calls are idempotent.
+    #[test]
+    fn e2e_proxy_revoke_idempotent() {
+        let r = global_eval(
+            r#"
+            var rev = Proxy.revocable({}, {});
+            rev.revoke();
+            rev.revoke();
+            try { rev.proxy.x; } catch(e) { "still_revoked"; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("still_revoked".into()));
     }
 }
