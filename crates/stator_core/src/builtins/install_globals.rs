@@ -24967,4 +24967,465 @@ mod tests {
         .unwrap();
         assert_eq!(r, JsValue::String("still_revoked".into()));
     }
+
+    // ── Iteration protocol & for-in/for-of conformance ──────────────────
+
+    /// for-in on string enumerates character indices.
+    #[test]
+    fn e2e_for_in_string_indices() {
+        let r = global_eval("var keys = []; for (var k in 'abc') keys.push(k); keys.join(',')")
+            .unwrap();
+        assert_eq!(r, JsValue::String("0,1,2".into()));
+    }
+
+    /// for-in with continue skips current iteration.
+    #[test]
+    fn e2e_for_in_continue() {
+        let r = global_eval(
+            "var o = { a: 1, b: 2, c: 3 }; \
+             var keys = []; \
+             for (var k in o) { if (k === 'b') continue; keys.push(k); } \
+             keys.join(',')",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a,c".into()));
+    }
+
+    /// for-of with continue skips current iteration.
+    #[test]
+    fn e2e_for_of_continue() {
+        let r = global_eval(
+            "var r = []; for (var x of [1,2,3,4]) { if (x === 2) continue; r.push(x); } r.join(',')",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,3,4".into()));
+    }
+
+    /// for-of with custom Symbol.iterator.
+    #[test]
+    fn e2e_for_of_custom_iterator() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var i = 0;
+                return {
+                    next: function() {
+                        i++;
+                        if (i <= 3) return { value: i * 10, done: false };
+                        return { value: undefined, done: true };
+                    }
+                };
+            };
+            var sum = 0;
+            for (var v of obj) sum += v;
+            sum
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(60));
+    }
+
+    /// for-of break calls .return() on the iterator.
+    #[test]
+    fn e2e_for_of_break_calls_return() {
+        let r = global_eval(
+            r#"
+            var closed = false;
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var i = 0;
+                return {
+                    next: function() {
+                        i++;
+                        return { value: i, done: false };
+                    },
+                    return: function() {
+                        closed = true;
+                        return { done: true };
+                    }
+                };
+            };
+            for (var v of obj) { if (v === 2) break; }
+            closed
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Spread in array literal uses iteration protocol.
+    #[test]
+    fn e2e_spread_array_literal() {
+        let r = global_eval("var a = [1, ...[2, 3], 4]; a.join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,2,3,4".into()));
+    }
+
+    /// Spread string in array literal.
+    #[test]
+    fn e2e_spread_string_in_array() {
+        let r = global_eval("var a = [...'hi']; a.join(',')").unwrap();
+        assert_eq!(r, JsValue::String("h,i".into()));
+    }
+
+    /// Spread in function call uses iteration protocol.
+    #[test]
+    fn e2e_spread_in_function_call() {
+        let r = global_eval("function sum(a, b, c) { return a + b + c; } sum(...[10, 20, 30])")
+            .unwrap();
+        assert_eq!(r, JsValue::Smi(60));
+    }
+
+    /// Destructuring array uses iteration protocol.
+    #[test]
+    fn e2e_destructuring_array_basic() {
+        let r = global_eval("var [a, b, c] = [10, 20, 30]; a + b + c").unwrap();
+        assert_eq!(r, JsValue::Smi(60));
+    }
+
+    /// Destructuring with rest element.
+    #[test]
+    fn e2e_destructuring_rest() {
+        let r = global_eval("var [first, ...rest] = [1, 2, 3, 4]; rest.join(',')").unwrap();
+        assert_eq!(r, JsValue::String("2,3,4".into()));
+    }
+
+    /// Destructuring with fewer elements than iterable.
+    #[test]
+    fn e2e_destructuring_fewer_elements() {
+        let r = global_eval("var [a, b] = [10, 20, 30]; a + b").unwrap();
+        assert_eq!(r, JsValue::Smi(30));
+    }
+
+    /// Destructuring with more elements than iterable gives undefined.
+    #[test]
+    fn e2e_destructuring_more_elements() {
+        let r = global_eval("var [a, b, c] = [10, 20]; c === undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Destructuring from string uses iteration protocol.
+    #[test]
+    fn e2e_destructuring_string() {
+        let r = global_eval("var [a, b, c] = 'xyz'; a + b + c").unwrap();
+        assert_eq!(r, JsValue::String("xyz".into()));
+    }
+
+    /// Iterator protocol: missing done defaults to false.
+    #[test]
+    fn e2e_iterator_missing_done_defaults_false() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var calls = 0;
+                return {
+                    next: function() {
+                        calls++;
+                        if (calls <= 2) return { value: calls };
+                        return { done: true };
+                    }
+                };
+            };
+            var r = []; for (var v of obj) r.push(v); r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,2".into()));
+    }
+
+    /// Iterator protocol: truthy string done stops iteration.
+    #[test]
+    fn e2e_iterator_truthy_done() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var calls = 0;
+                return {
+                    next: function() {
+                        calls++;
+                        if (calls === 1) return { value: 42, done: "" };
+                        return { value: 99, done: "yes" };
+                    }
+                };
+            };
+            var r = []; for (var v of obj) r.push(v); r.join(',')
+            "#,
+        )
+        .unwrap();
+        // First call: done="" (falsy) → value 42 collected
+        // Second call: done="yes" (truthy) → stops
+        assert_eq!(r, JsValue::String("42".into()));
+    }
+
+    /// Iterator protocol: missing value defaults to undefined.
+    #[test]
+    fn e2e_iterator_missing_value() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var calls = 0;
+                return {
+                    next: function() {
+                        calls++;
+                        if (calls === 1) return { done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var r = []; for (var v of obj) r.push(v); r[0] === undefined
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// for-in with let binding.
+    #[test]
+    fn e2e_for_in_let() {
+        let r = global_eval(
+            "var keys = []; for (let k in { a: 1, b: 2 }) keys.push(k); keys.join(',')",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a,b".into()));
+    }
+
+    /// for-in with const binding.
+    #[test]
+    fn e2e_for_in_const() {
+        let r =
+            global_eval("var keys = []; for (const k in { x: 1 }) keys.push(k); keys.join(',')")
+                .unwrap();
+        assert_eq!(r, JsValue::String("x".into()));
+    }
+
+    /// for-of over generator with early return.
+    #[test]
+    fn e2e_for_of_generator_break() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 1; yield 2; yield 3; yield 4; }
+            var r = [];
+            for (var v of gen()) { r.push(v); if (v === 2) break; }
+            r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,2".into()));
+    }
+
+    /// Nested for-of loops.
+    #[test]
+    fn e2e_for_of_nested_loops() {
+        let r = global_eval(
+            "var r = []; \
+             for (var a of [1, 2]) \
+                 for (var b of [10, 20]) \
+                     r.push(a + b); \
+             r.join(',')",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("11,21,12,22".into()));
+    }
+
+    /// for-of with object destructuring in loop variable.
+    #[test]
+    fn e2e_for_of_object_destructuring() {
+        let r = global_eval(
+            r#"
+            var items = [{ name: "a", val: 1 }, { name: "b", val: 2 }];
+            var r = [];
+            for (var { name, val } of items) r.push(name + val);
+            r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a1,b2".into()));
+    }
+
+    /// Spread generator in function call.
+    #[test]
+    fn e2e_spread_generator_in_call() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 1; yield 2; yield 3; }
+            function sum(a, b, c) { return a + b + c; }
+            sum(...gen())
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(6));
+    }
+
+    /// Spread multiple iterables in array.
+    #[test]
+    fn e2e_spread_multiple_in_array() {
+        let r = global_eval("var a = [...[1, 2], ...[3, 4], 5]; a.join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,2,3,4,5".into()));
+    }
+
+    /// for-in prototype chain: three levels deep.
+    #[test]
+    fn e2e_for_in_deep_proto_chain() {
+        let r = global_eval(
+            "var gp = { z: 3 }; \
+             var p = Object.create(gp); p.y = 2; \
+             var o = Object.create(p); o.x = 1; \
+             var keys = []; for (var k in o) keys.push(k); \
+             keys.join(',')",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("x,y,z".into()));
+    }
+
+    /// for-of on empty array produces no iterations.
+    #[test]
+    fn e2e_for_of_empty_array() {
+        let r = global_eval("var n = 0; for (var x of []) n++; n").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// for-of on empty string produces no iterations.
+    #[test]
+    fn e2e_for_of_empty_string() {
+        let r = global_eval("var n = 0; for (var c of '') n++; n").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Spread empty array produces empty.
+    #[test]
+    fn e2e_spread_empty_array() {
+        let r = global_eval("[...[]].length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// for-in on number/boolean produces no iterations.
+    #[test]
+    fn e2e_for_in_primitive_noop() {
+        let r =
+            global_eval("var n = 0; for (var k in 42) n++; for (var k in true) n++; n").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Destructuring assignment (not declaration).
+    #[test]
+    fn e2e_destructuring_assignment() {
+        let r = global_eval("var a, b; [a, b] = [100, 200]; a + b").unwrap();
+        assert_eq!(r, JsValue::Smi(300));
+    }
+
+    /// for-of with array of mixed types.
+    #[test]
+    fn e2e_for_of_mixed_types() {
+        let r = global_eval(
+            r#"
+            var types = [];
+            for (var v of [1, "two", true, null]) types.push(typeof v);
+            types.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("number,string,boolean,object".into()));
+    }
+
+    /// for-in with break stops iteration.
+    #[test]
+    fn e2e_for_in_break_stops() {
+        let r = global_eval(
+            "var o = { a: 1, b: 2, c: 3 }; \
+             var count = 0; \
+             for (var k in o) { count++; if (count === 2) break; } \
+             count",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// Spread with custom Symbol.iterator.
+    #[test]
+    fn e2e_spread_custom_iterator() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var i = 0;
+                return {
+                    next: function() {
+                        i++;
+                        if (i <= 3) return { value: i, done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var a = [...obj];
+            a.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,2,3".into()));
+    }
+
+    /// Destructuring with default values.
+    #[test]
+    fn e2e_destructuring_default_values() {
+        let r = global_eval("var [a = 10, b = 20, c = 30] = [1, 2]; a + b + c").unwrap();
+        assert_eq!(r, JsValue::Smi(33));
+    }
+
+    /// for-of return inside function exits the function and closes iterator.
+    #[test]
+    fn e2e_for_of_return_inside_function() {
+        let r = global_eval(
+            r#"
+            function f() {
+                for (var x of [10, 20, 30, 40]) {
+                    if (x === 20) return x;
+                }
+                return 0;
+            }
+            f()
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(20));
+    }
+
+    /// for-in enumerates array indices as strings.
+    #[test]
+    fn e2e_for_in_array_indices() {
+        let r =
+            global_eval("var keys = []; for (var k in [10, 20, 30]) keys.push(k); keys.join(',')")
+                .unwrap();
+        assert_eq!(r, JsValue::String("0,1,2".into()));
+    }
+
+    /// for-of over Set (if available), otherwise test with array.
+    #[test]
+    fn e2e_for_of_set_iteration() {
+        let r = global_eval(
+            "var s = new Set([3, 1, 4, 1, 5]); \
+             var r = []; for (var v of s) r.push(v); r.join(',')",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("3,1,4,5".into()));
+    }
+
+    /// for-of over Map entries.
+    #[test]
+    fn e2e_for_of_map_iteration() {
+        let r = global_eval(
+            r#"
+            var m = new Map();
+            m.set("a", 1);
+            m.set("b", 2);
+            var r = [];
+            for (var e of m) r.push(e[0] + "=" + e[1]);
+            r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a=1,b=2".into()));
+    }
 }
