@@ -12,10 +12,12 @@
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
+use crate::builtins::string::encode_utf16;
 use crate::objects::property_map::PropertyMap;
 
 use crate::error::StatorResult;
-use crate::objects::regexp::{JsRegExp, RegExpFlags, SymbolMatchResult};
+use crate::interpreter::dispatch_call_value;
+use crate::objects::regexp::{JsRegExp, RegExpFlags, RegExpMatch, SymbolMatchResult};
 use crate::objects::value::{JsValue, NativeIterator};
 
 /// Create a new [`JsRegExp`] from positional `JsValue` arguments.
@@ -212,8 +214,12 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
             JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
                 sync_last_index_from_props(&w, &re_replace);
                 let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let replacement = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let result = re_replace.symbol_replace(&input, &replacement);
+                let replacement = args.get(1).unwrap_or(&JsValue::Undefined).clone();
+                let result = if is_callable(&replacement) {
+                    regexp_replace_with_callback(&re_replace, &input, &replacement)?
+                } else {
+                    re_replace.symbol_replace(&input, &replacement.to_js_string()?)
+                };
                 sync_last_index_to_props(&w, &re_replace);
                 Ok(JsValue::String(result.into()))
             })),
@@ -307,6 +313,80 @@ fn sync_last_index_to_props(weak: &Weak<RefCell<PropertyMap>>, re: &JsRegExp) {
         rc.borrow_mut()
             .insert("lastIndex".into(), JsValue::Smi(re.last_index() as i32));
     }
+}
+
+fn is_callable(value: &JsValue) -> bool {
+    match value {
+        JsValue::Function(_) | JsValue::NativeFunction(_) => true,
+        JsValue::PlainObject(map) => map.borrow().contains_key("__call__"),
+        _ => false,
+    }
+}
+
+fn utf16_index(input: &str, byte_index: usize) -> i32 {
+    encode_utf16(&input[..byte_index]).len() as i32
+}
+
+fn call_replace_callback(
+    callback: &JsValue,
+    input: &str,
+    matched: &RegExpMatch,
+) -> StatorResult<String> {
+    let mut args = Vec::with_capacity(3 + matched.captures.len());
+    args.push(JsValue::String(matched.matched.clone().into()));
+    for capture in &matched.captures {
+        match capture {
+            Some(value) => args.push(JsValue::String(value.clone().into())),
+            None => args.push(JsValue::Undefined),
+        }
+    }
+    args.push(JsValue::Smi(utf16_index(input, matched.index)));
+    args.push(JsValue::String(input.to_string().into()));
+    dispatch_call_value(callback, args)?.to_js_string()
+}
+
+fn regexp_replace_with_callback(
+    re: &JsRegExp,
+    input: &str,
+    replacement: &JsValue,
+) -> StatorResult<String> {
+    let stateful = re
+        .flags()
+        .intersects(RegExpFlags::GLOBAL | RegExpFlags::STICKY);
+    let mut result = String::new();
+    let mut next_source_position = 0usize;
+
+    if stateful {
+        re.set_last_index(0);
+        let matches = re.symbol_match_all(input);
+        if matches.is_empty() {
+            return Ok(input.to_string());
+        }
+
+        let mut final_last_index = 0usize;
+        for matched in matches {
+            let end = matched.index + matched.matched.len();
+            result.push_str(&input[next_source_position..matched.index]);
+            result.push_str(&call_replace_callback(replacement, input, &matched)?);
+            next_source_position = end;
+            final_last_index = if end > matched.index {
+                end
+            } else {
+                matched.index + 1
+            };
+        }
+        re.set_last_index(final_last_index);
+    } else if let Some(matched) = re.exec(input) {
+        let end = matched.index + matched.matched.len();
+        result.push_str(&input[..matched.index]);
+        result.push_str(&call_replace_callback(replacement, input, &matched)?);
+        next_source_position = end;
+    } else {
+        return Ok(input.to_string());
+    }
+
+    result.push_str(&input[next_source_position..]);
+    Ok(result)
 }
 
 /// Convert a [`RegExpMatch`] into a `JsValue::PlainObject` matching the

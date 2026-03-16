@@ -41,6 +41,81 @@ pub(crate) fn decode_utf16(units: &[u16]) -> String {
     String::from_utf16_lossy(units)
 }
 
+/// ECMAScript `GetSubstitution` replacement-template expansion.
+pub(crate) fn get_substitution(
+    replacement: &str,
+    matched: &str,
+    prefix: &str,
+    suffix: &str,
+    captures: &[Option<&str>],
+) -> String {
+    let bytes = replacement.as_bytes();
+    let mut out = String::with_capacity(replacement.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'$' => {
+                    out.push('$');
+                    i += 2;
+                }
+                b'&' => {
+                    out.push_str(matched);
+                    i += 2;
+                }
+                b'`' => {
+                    out.push_str(prefix);
+                    i += 2;
+                }
+                b'\'' => {
+                    out.push_str(suffix);
+                    i += 2;
+                }
+                b'0' => {
+                    out.push('$');
+                    out.push('0');
+                    i += 2;
+                }
+                b'1'..=b'9' => {
+                    let mut capture_index = (bytes[i + 1] - b'0') as usize;
+                    let mut consumed = 2;
+                    if i + 2 < bytes.len()
+                        && let Some(next_digit) = (bytes[i + 2] as char).to_digit(10)
+                    {
+                        let two_digit = capture_index * 10 + next_digit as usize;
+                        if two_digit > 0 && two_digit <= captures.len() {
+                            capture_index = two_digit;
+                            consumed = 3;
+                        }
+                    }
+
+                    match captures.get(capture_index - 1) {
+                        Some(Some(capture)) => out.push_str(capture),
+                        Some(None) => {}
+                        None => {
+                            out.push('$');
+                            out.push(bytes[i + 1] as char);
+                        }
+                    }
+                    i += consumed;
+                }
+                _ => {
+                    out.push('$');
+                    i += 1;
+                }
+            }
+        } else if let Some(ch) = replacement[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    out
+}
+
 /// Clamps a potentially-negative index to the valid range `[0, len]` using
 /// ECMAScript relative-index semantics (negative means offset from the end).
 fn clamp_index(index: i64, len: usize) -> usize {
@@ -603,9 +678,16 @@ pub fn string_split(s: &str, separator: Option<&str>, limit: Option<u32>) -> Vec
 pub fn string_replace(s: &str, search: &str, replacement: &str) -> String {
     match s.find(search) {
         Some(pos) => {
+            let end = pos + search.len();
             let mut result = s[..pos].to_string();
-            result.push_str(replacement);
-            result.push_str(&s[pos + search.len()..]);
+            result.push_str(&get_substitution(
+                replacement,
+                &s[pos..end],
+                &s[..pos],
+                &s[end..],
+                &[],
+            ));
+            result.push_str(&s[end..]);
             result
         }
         None => s.to_string(),
@@ -636,7 +718,24 @@ pub fn string_replace_all(s: &str, search: &str, replacement: &str) -> String {
         }
         return result;
     }
-    s.replace(search, replacement)
+
+    let mut result = String::new();
+    let mut cursor = 0;
+    while let Some(relative_pos) = s[cursor..].find(search) {
+        let pos = cursor + relative_pos;
+        let end = pos + search.len();
+        result.push_str(&s[cursor..pos]);
+        result.push_str(&get_substitution(
+            replacement,
+            &s[pos..end],
+            &s[..pos],
+            &s[end..],
+            &[],
+        ));
+        cursor = end;
+    }
+    result.push_str(&s[cursor..]);
+    result
 }
 
 // ── match ─────────────────────────────────────────────────────────────────────
@@ -1720,6 +1819,26 @@ mod tests {
     }
 
     #[test]
+    fn test_replace_expands_dollar_dollar() {
+        assert_eq!(string_replace("abc", "b", "$$"), "a$c");
+    }
+
+    #[test]
+    fn test_replace_expands_dollar_ampersand() {
+        assert_eq!(string_replace("abc", "b", "[$&]"), "a[b]c");
+    }
+
+    #[test]
+    fn test_replace_expands_dollar_backtick_and_quote() {
+        assert_eq!(string_replace("abc", "b", "$`-$'"), "aa-cc");
+    }
+
+    #[test]
+    fn test_replace_leaves_missing_capture_literal() {
+        assert_eq!(string_replace("abc", "b", "$1"), "a$1c");
+    }
+
+    #[test]
     fn test_replace_all_basic() {
         assert_eq!(string_replace_all("aabbaa", "aa", "X"), "XbbX");
     }
@@ -1735,6 +1854,11 @@ mod tests {
         // and at both ends.
         let result = string_replace_all("ab", "", "-");
         assert_eq!(result, "-a-b-");
+    }
+
+    #[test]
+    fn test_replace_all_expands_replacement_patterns() {
+        assert_eq!(string_replace_all("aba", "a", "[$&]-$$"), "[a]-$b[a]-$");
     }
 
     // ── string_match / match_all ──────────────────────────────────────────────

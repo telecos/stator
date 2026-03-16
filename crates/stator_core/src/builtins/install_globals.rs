@@ -22414,18 +22414,40 @@ mod tests {
     /// Replace with function replacer — receives (match, offset, string).
     #[test]
     fn e2e_replace_function_replacer() {
+        let r =
+            global_eval("'hello'.replace('ll', function(m, off, s) { return off.toString(); })")
+                .unwrap();
+        assert_eq!(r, JsValue::String("he2o".into()));
+    }
+
+    /// Regex replacer receives (match, ...groups, offset, string).
+    #[test]
+    fn e2e_replace_regex_function_replacer_groups() {
         let r = global_eval(
-            "'hello'.replace('ll', function(m, off, s) { return off.toString(); })",
+            "'2024-07'.replace(/(\\d+)-(\\d+)/, function(m, y, mo, off, s) { return y + ':' + mo + ':' + off + ':' + s; })",
         )
         .unwrap();
-        assert_eq!(r, JsValue::String("he2o".into()));
+        assert_eq!(r, JsValue::String("2024:07:0:2024-07".into()));
+    }
+
+    /// Regex replacement expands `$1` and `$2` capture references.
+    #[test]
+    fn e2e_replace_regex_capture_groups() {
+        let r = global_eval("'2024-07'.replace(/(\\d+)-(\\d+)/, '$2/$1')").unwrap();
+        assert_eq!(r, JsValue::String("07/2024".into()));
+    }
+
+    /// Plain-string replace leaves missing capture references literal.
+    #[test]
+    fn e2e_replace_missing_capture_literal() {
+        let r = global_eval("'abc'.replace('b', '$1')").unwrap();
+        assert_eq!(r, JsValue::String("a$1c".into()));
     }
 
     /// Replace with function replacer — match not found returns original.
     #[test]
     fn e2e_replace_fn_replacer_no_match() {
-        let r =
-            global_eval("'hello'.replace('xyz', function(m) { return 'Z'; })").unwrap();
+        let r = global_eval("'hello'.replace('xyz', function(m) { return 'Z'; })").unwrap();
         assert_eq!(r, JsValue::String("hello".into()));
     }
 
@@ -22446,10 +22468,9 @@ mod tests {
     /// replaceAll with function replacer.
     #[test]
     fn e2e_replace_all_fn_replacer() {
-        let r = global_eval(
-            "'abab'.replaceAll('a', function(m, off, s) { return off.toString(); })",
-        )
-        .unwrap();
+        let r =
+            global_eval("'abab'.replaceAll('a', function(m, off, s) { return off.toString(); })")
+                .unwrap();
         assert_eq!(r, JsValue::String("0b2b".into()));
     }
 
@@ -22479,6 +22500,27 @@ mod tests {
     fn e2e_split_limit_two() {
         let r = global_eval("'a,b,c'.split(',', 2).join('-')").unwrap();
         assert_eq!(r, JsValue::String("a-b".into()));
+    }
+
+    /// Empty separator splits into UTF-16 code units.
+    #[test]
+    fn e2e_split_empty_separator_chars() {
+        let r = global_eval("'abc'.split('').join('-')").unwrap();
+        assert_eq!(r, JsValue::String("a-b-c".into()));
+    }
+
+    /// RegExp separators include capture groups in the result.
+    #[test]
+    fn e2e_split_regexp_captures() {
+        let r = global_eval("'a1b2c'.split(/(\\d)/).join('|')").unwrap();
+        assert_eq!(r, JsValue::String("a|1|b|2|c".into()));
+    }
+
+    /// Split without a separator returns the original string as one element.
+    #[test]
+    fn e2e_split_undefined_separator() {
+        let r = global_eval("'abc'.split(undefined).length").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
     }
 
     /// `slice(-2)` returns last 2 characters.
@@ -22514,6 +22556,13 @@ mod tests {
     fn e2e_substring_negative_clamped_edge() {
         let r = global_eval("'abcde'.substring(-3, 3)").unwrap();
         assert_eq!(r, JsValue::String("abc".into()));
+    }
+
+    /// `substring` clamps negative end to 0 before swapping.
+    #[test]
+    fn e2e_substring_negative_end_clamped_edge() {
+        let r = global_eval("'abcde'.substring(2, -1)").unwrap();
+        assert_eq!(r, JsValue::String("ab".into()));
     }
 
     /// `substr` negative start counts from end.
@@ -22565,6 +22614,13 @@ mod tests {
         assert_eq!(r, JsValue::String("".into()));
     }
 
+    /// `charAt` negative index returns empty string.
+    #[test]
+    fn e2e_char_at_negative_edge() {
+        let r = global_eval("'abc'.charAt(-1)").unwrap();
+        assert_eq!(r, JsValue::String("".into()));
+    }
+
     /// `charCodeAt` out-of-range returns NaN.
     #[test]
     fn e2e_char_code_at_out_of_range_edge() {
@@ -22572,10 +22628,24 @@ mod tests {
         assert_eq!(r, JsValue::Boolean(true));
     }
 
+    /// `charCodeAt` negative index returns NaN.
+    #[test]
+    fn e2e_char_code_at_negative_edge() {
+        let r = global_eval("isNaN('abc'.charCodeAt(-1))").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
     /// `codePointAt` out-of-range returns undefined.
     #[test]
     fn e2e_code_point_at_out_of_range_edge() {
         let r = global_eval("'abc'.codePointAt(10)").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    /// `codePointAt` negative index returns undefined.
+    #[test]
+    fn e2e_code_point_at_negative_edge() {
+        let r = global_eval("'abc'.codePointAt(-1)").unwrap();
         assert_eq!(r, JsValue::Undefined);
     }
 
