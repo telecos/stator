@@ -246,6 +246,47 @@ fn to_array_like_elements(val: &JsValue) -> (Vec<JsValue>, usize) {
     }
 }
 
+/// Extract raw template segments for `String.raw`.
+fn string_raw_segments(raw: &JsValue) -> StatorResult<Vec<String>> {
+    match raw {
+        JsValue::Undefined | JsValue::Null => Err(StatorError::TypeError(
+            "String.raw requires a template object with a raw property".into(),
+        )),
+        JsValue::String(s) => Ok(crate::builtins::string::encode_utf16(s)
+            .into_iter()
+            .map(|unit| crate::builtins::string::decode_utf16(&[unit]))
+            .collect()),
+        JsValue::Array(items) => Ok(items
+            .borrow()
+            .iter()
+            .map(JsValue::to_js_string)
+            .collect::<StatorResult<Vec<_>>>()?),
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            let len = borrow
+                .get("length")
+                .map(JsValue::to_length)
+                .transpose()?
+                .unwrap_or(0)
+                .min(usize::MAX as u64) as usize;
+            let values: Vec<JsValue> = (0..len)
+                .map(|i| {
+                    borrow
+                        .get(&i.to_string())
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined)
+                })
+                .collect();
+            drop(borrow);
+            values
+                .iter()
+                .map(JsValue::to_js_string)
+                .collect::<StatorResult<Vec<_>>>()
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
 /// Return the spec-visible `length` of an array-like value.
 fn array_like_length(val: &JsValue) -> StatorResult<usize> {
     match val {
@@ -8176,10 +8217,21 @@ fn make_string() -> JsValue {
         props.insert(
             "fromCodePoint".into(),
             native(|args| {
-                let codes: Vec<u32> = args
-                    .iter()
-                    .map(|a| a.to_number().unwrap_or(0.0) as u32)
-                    .collect();
+                let mut codes = Vec::with_capacity(args.len());
+                for value in args {
+                    let code_point = value.to_number()?;
+                    let integer = if code_point.is_nan() {
+                        0.0
+                    } else {
+                        code_point.trunc()
+                    };
+                    if !code_point.is_finite() || integer != code_point {
+                        return Err(StatorError::RangeError(format!(
+                            "Invalid code point {code_point}"
+                        )));
+                    }
+                    codes.push(integer as u32);
+                }
                 Ok(JsValue::String(string_from_code_point(&codes)?.into()))
             }),
         );
@@ -8190,28 +8242,14 @@ fn make_string() -> JsValue {
             native(|args| {
                 // First arg is the template object with a `raw` property.
                 let template = args.first().unwrap_or(&JsValue::Undefined);
-                let raw_array = match template {
+                let raw_value = match template {
                     JsValue::PlainObject(map) => {
                         let borrowed = map.borrow();
-                        borrowed.get("raw").cloned()
+                        borrowed.get("raw").cloned().unwrap_or(JsValue::Undefined)
                     }
-                    _ => None,
+                    _ => JsValue::Undefined,
                 };
-                let raw_strings: Vec<String> = match &raw_array {
-                    Some(JsValue::Array(arr)) => arr
-                        .borrow()
-                        .iter()
-                        .map(|v| v.to_js_string().unwrap_or_default())
-                        .collect(),
-                    Some(val @ JsValue::PlainObject(_)) => {
-                        let (elements, _) = to_array_like_elements(val);
-                        elements
-                            .iter()
-                            .map(|v| v.to_js_string().unwrap_or_default())
-                            .collect()
-                    }
-                    _ => Vec::new(),
-                };
+                let raw_strings = string_raw_segments(&raw_value)?;
                 let subs: Vec<String> = args
                     .iter()
                     .skip(1)
