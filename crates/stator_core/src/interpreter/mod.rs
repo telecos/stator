@@ -397,7 +397,7 @@ pub(crate) fn fn_props_set(ba: &Rc<BytecodeArray>, name: String, val: JsValue) {
 /// Load a named property from a `Function` value's side-table entry.
 ///
 /// Returns `JsValue::Undefined` when the property has not been set.
-fn fn_props_get(ba: &Rc<BytecodeArray>, name: &str) -> JsValue {
+pub(crate) fn fn_props_get(ba: &Rc<BytecodeArray>, name: &str) -> JsValue {
     FUNCTION_PROPS.with(|fp| {
         let table = fp.borrow();
         table
@@ -1387,7 +1387,7 @@ impl Interpreter {
         };
         // Restore the captured closure context so generators can access outer
         // scope variables through the context chain.
-        let ba_ref = frame.bytecode_array.clone();
+        let ba_ref = Rc::new(frame.bytecode_array.clone());
         restore_closure_context(&mut frame, &ba_ref);
 
         state.borrow_mut().status = GeneratorStatus::Executing;
@@ -2419,10 +2419,27 @@ pub(super) fn walk_context_chain(
 /// captured scope and context-slot opcodes can walk up to outer variables.
 pub(super) fn restore_closure_context(
     frame: &mut InterpreterFrame,
-    ba: &crate::bytecode::bytecode_array::BytecodeArray,
+    ba: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
 ) {
     if let Some(ctx) = ba.closure_context() {
         frame.context = Some(JsValue::Context(Rc::clone(ctx)));
+    }
+    let home_object = fn_props_get(ba, ".home_object");
+    match home_object {
+        JsValue::PlainObject(map) => {
+            let super_lookup_start = map
+                .borrow()
+                .get("__proto__")
+                .cloned()
+                .unwrap_or(JsValue::Undefined);
+            frame
+                .global_env
+                .borrow_mut()
+                .insert(".super_lookup_start".to_string(), super_lookup_start);
+        }
+        _ => {
+            frame.global_env.borrow_mut().remove(".super_lookup_start");
+        }
     }
 }
 
@@ -5467,8 +5484,16 @@ fn dispatch_getter(getter: &JsValue, this: &JsValue) -> StatorResult<JsValue> {
     match getter {
         JsValue::Function(ba) => {
             push_call_frame("<getter>")?;
-            let mut frame = InterpreterFrame::new((**ba).clone(), vec![]);
-            frame.context = Some(this.clone());
+            let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
+                InterpreterFrame::new_with_globals((**ba).clone(), vec![], globals)
+            } else {
+                InterpreterFrame::new((**ba).clone(), vec![])
+            };
+            restore_closure_context(&mut frame, ba);
+            frame
+                .global_env
+                .borrow_mut()
+                .insert("this".to_string(), this.clone());
             let result = Interpreter::run(&mut frame);
             pop_call_frame();
             result
@@ -5483,8 +5508,16 @@ pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) ->
     match setter {
         JsValue::Function(ba) => {
             push_call_frame("<setter>")?;
-            let mut frame = InterpreterFrame::new((**ba).clone(), vec![val]);
-            frame.context = Some(this.clone());
+            let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
+                InterpreterFrame::new_with_globals((**ba).clone(), vec![val], globals)
+            } else {
+                InterpreterFrame::new((**ba).clone(), vec![val])
+            };
+            restore_closure_context(&mut frame, ba);
+            frame
+                .global_env
+                .borrow_mut()
+                .insert("this".to_string(), this.clone());
             let result = Interpreter::run(&mut frame);
             pop_call_frame();
             result?;
