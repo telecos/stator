@@ -16107,6 +16107,37 @@ mod tests {
         assert_eq!(result, JsValue::BigInt(31));
     }
 
+    #[test]
+    fn e2e_bigint_literal_zero() {
+        let result = global_eval("0n").unwrap();
+        assert_eq!(result, JsValue::BigInt(0));
+    }
+
+    #[test]
+    fn e2e_numeric_separator_literals() {
+        let result = global_eval("1_000_000 + 0xFF_FF + 0o7_7 + 0b10_10").unwrap();
+        assert_eq!(result, JsValue::Smi(1_065_622));
+    }
+
+    #[test]
+    fn e2e_numeric_separator_invalid_literals() {
+        for src in ["1__0", "1_", "0_1", "0x_FF", "0o7_", "0b10__10"] {
+            assert!(global_eval(src).is_err(), "{src} should be rejected");
+        }
+    }
+
+    #[test]
+    fn e2e_prefixed_numeric_literals() {
+        let result = global_eval("0o17 + 0b1010 + 0xFF").unwrap();
+        assert_eq!(result, JsValue::Smi(280));
+    }
+
+    #[test]
+    fn e2e_legacy_octal_literal_sloppy_mode() {
+        let result = global_eval("0777").unwrap();
+        assert_eq!(result, JsValue::Smi(0o777));
+    }
+
     // -- typeof --
 
     #[test]
@@ -16537,6 +16568,18 @@ mod tests {
     fn e2e_bigint_abstract_eq_true() {
         let result = global_eval("1n == true").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_abstract_eq_number_true() {
+        let result = global_eval("1n == 1").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_bigint_strict_eq_number_false() {
+        let result = global_eval("1n === 1").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
     }
 
     // -- Comparison: relational --

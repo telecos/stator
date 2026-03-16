@@ -598,28 +598,59 @@ impl<'src> Scanner<'src> {
 
     // ── Digit-run helpers ───────────────────────────────────────────────────
 
-    fn scan_decimal_digits(&mut self) {
-        while matches!(self.peek(), Some(c) if c.is_ascii_digit() || c == '_') {
-            self.advance();
+    fn scan_digit_sequence(
+        &mut self,
+        mut saw_digit: bool,
+        require_digit: bool,
+        is_digit: impl Fn(char) -> bool,
+        kind: &'static str,
+    ) -> StatorResult<()> {
+        let mut previous_was_separator = false;
+        while let Some(c) = self.peek() {
+            if is_digit(c) {
+                saw_digit = true;
+                previous_was_separator = false;
+                self.advance();
+            } else if c == '_' {
+                if !saw_digit || previous_was_separator {
+                    return Err(StatorError::SyntaxError(format!(
+                        "invalid numeric separator in {kind} literal"
+                    )));
+                }
+                previous_was_separator = true;
+                self.advance();
+            } else {
+                break;
+            }
         }
+
+        if previous_was_separator {
+            return Err(StatorError::SyntaxError(format!(
+                "invalid numeric separator in {kind} literal"
+            )));
+        }
+        if require_digit && !saw_digit {
+            return Err(StatorError::SyntaxError(format!(
+                "missing digits in {kind} literal"
+            )));
+        }
+        Ok(())
     }
 
-    fn scan_hex_digits(&mut self) {
-        while matches!(self.peek(), Some(c) if c.is_ascii_hexdigit() || c == '_') {
-            self.advance();
-        }
+    fn scan_decimal_digits(&mut self, saw_digit: bool, require_digit: bool) -> StatorResult<()> {
+        self.scan_digit_sequence(saw_digit, require_digit, |c| c.is_ascii_digit(), "decimal")
     }
 
-    fn scan_binary_digits(&mut self) {
-        while matches!(self.peek(), Some(c) if matches!(c, '0' | '1') || c == '_') {
-            self.advance();
-        }
+    fn scan_hex_digits(&mut self) -> StatorResult<()> {
+        self.scan_digit_sequence(false, true, |c| c.is_ascii_hexdigit(), "hex")
     }
 
-    fn scan_octal_digits(&mut self) {
-        while matches!(self.peek(), Some(c) if matches!(c, '0'..='7') || c == '_') {
-            self.advance();
-        }
+    fn scan_binary_digits(&mut self) -> StatorResult<()> {
+        self.scan_digit_sequence(false, true, |c| matches!(c, '0' | '1'), "binary")
+    }
+
+    fn scan_octal_digits(&mut self) -> StatorResult<()> {
+        self.scan_digit_sequence(false, true, |c| matches!(c, '0'..='7'), "octal")
     }
 
     // ── String / template escape helper ─────────────────────────────────────
@@ -841,46 +872,51 @@ impl<'src> Scanner<'src> {
 
         if first == '0' {
             match self.peek() {
+                Some('_') => {
+                    return Err(StatorError::SyntaxError(
+                        "invalid numeric separator in decimal literal".into(),
+                    ));
+                }
                 Some('x') | Some('X') => {
                     self.advance();
-                    self.scan_hex_digits();
+                    self.scan_hex_digits()?;
                     if self.peek() == Some('n') {
                         self.advance();
                     }
                 }
                 Some('o') | Some('O') => {
                     self.advance();
-                    self.scan_octal_digits();
+                    self.scan_octal_digits()?;
                     if self.peek() == Some('n') {
                         self.advance();
                     }
                 }
                 Some('b') | Some('B') => {
                     self.advance();
-                    self.scan_binary_digits();
+                    self.scan_binary_digits()?;
                     if self.peek() == Some('n') {
                         self.advance();
                     }
                 }
                 Some(c) if c.is_ascii_digit() => {
                     // Legacy octal (e.g. `017`) or decimal continuation.
-                    self.scan_decimal_digits();
+                    self.scan_decimal_digits(true, false)?;
                     // If it has a decimal point or exponent, treat as decimal.
                     if matches!(self.peek(), Some('.')) {
                         self.advance();
-                        self.scan_decimal_digits();
-                        self.scan_exponent();
+                        self.scan_decimal_digits(false, false)?;
+                        self.scan_exponent()?;
                     } else {
-                        self.scan_exponent();
+                        self.scan_exponent()?;
                     }
                 }
                 Some('.') => {
                     self.advance();
-                    self.scan_decimal_digits();
-                    self.scan_exponent();
+                    self.scan_decimal_digits(false, false)?;
+                    self.scan_exponent()?;
                 }
                 Some('e') | Some('E') => {
-                    self.scan_exponent();
+                    self.scan_exponent()?;
                 }
                 Some('n') => {
                     self.advance(); // BigInt `0n`
@@ -889,17 +925,17 @@ impl<'src> Scanner<'src> {
             }
         } else if first == '.' {
             // `.5`, `.5e3`, etc. — leading dot, digits follow.
-            self.scan_decimal_digits();
-            self.scan_exponent();
+            self.scan_decimal_digits(false, true)?;
+            self.scan_exponent()?;
         } else {
             // Decimal integer: first digit already consumed.
-            self.scan_decimal_digits();
+            self.scan_decimal_digits(true, false)?;
             if self.peek() == Some('.') {
                 self.advance();
-                self.scan_decimal_digits();
-                self.scan_exponent();
+                self.scan_decimal_digits(false, false)?;
+                self.scan_exponent()?;
             } else if matches!(self.peek(), Some('e') | Some('E')) {
-                self.scan_exponent();
+                self.scan_exponent()?;
             } else if self.peek() == Some('n') {
                 self.advance(); // BigInt
             }
@@ -924,14 +960,15 @@ impl<'src> Scanner<'src> {
     }
 
     /// Consume an optional exponent part (`e` / `E`, optional sign, digits).
-    fn scan_exponent(&mut self) {
+    fn scan_exponent(&mut self) -> StatorResult<()> {
         if matches!(self.peek(), Some('e') | Some('E')) {
             self.advance();
             if matches!(self.peek(), Some('+') | Some('-')) {
                 self.advance();
             }
-            self.scan_decimal_digits();
+            self.scan_decimal_digits(false, true)?;
         }
+        Ok(())
     }
 
     // ── Identifier / keyword ────────────────────────────────────────────────
@@ -1893,6 +1930,14 @@ fn parse_numeric_raw(raw: &str) -> f64 {
         i64::from_str_radix(&clean[2..], 2)
             .map(|n| n as f64)
             .unwrap_or(f64::NAN)
+    } else if clean.len() >= 2
+        && clean.starts_with('0')
+        && clean.as_bytes()[1].is_ascii_digit()
+        && clean[1..].chars().all(|c| matches!(c, '0'..='7'))
+    {
+        i64::from_str_radix(&clean[1..], 8)
+            .map(|n| n as f64)
+            .unwrap_or(f64::NAN)
     } else {
         clean.parse::<f64>().unwrap_or(f64::NAN)
     }
@@ -2083,9 +2128,38 @@ mod tests {
 
     #[test]
     fn test_numeric_separator() {
-        let toks = tokens("1_000_000 0xFF_FF");
+        let toks = tokens("1_000_000 0xFF_FF 0o7_7 0b10_10 1_2n");
         assert_eq!(toks[0].value, TokenValue::Number(1_000_000.0));
         assert_eq!(toks[1].value, TokenValue::Number(0xFFFF as f64));
+        assert_eq!(toks[2].value, TokenValue::Number(0o77 as f64));
+        assert_eq!(toks[3].value, TokenValue::Number(0b1010 as f64));
+        assert_eq!(toks[4].value, TokenValue::BigInt("12".into()));
+    }
+
+    #[test]
+    fn test_numeric_separator_invalid() {
+        for src in ["1__0", "1_", "0_1", "0x_FF", "0o7_", "0b10__10", "1e_3"] {
+            assert!(
+                Scanner::tokenize_all(src).is_err(),
+                "{src} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_numeric_prefixed_requires_digits() {
+        for src in ["0x", "0o", "0b"] {
+            assert!(
+                Scanner::tokenize_all(src).is_err(),
+                "{src} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_numeric_legacy_octal() {
+        let toks = tokens("0777");
+        assert_eq!(toks[0].value, TokenValue::Number(0o777 as f64));
     }
 
     // ── String literals ───────────────────────────────────────────────────────
