@@ -7204,6 +7204,9 @@ fn make_symbol() -> JsValue {
         }),
     );
 
+    // Symbol is NOT a constructor — `new Symbol()` must throw TypeError.
+    props.insert("__no_construct__".into(), JsValue::Boolean(true));
+
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
@@ -15527,6 +15530,303 @@ mod tests {
                 "All well-known symbols must have distinct IDs"
             );
         }
+    }
+
+    // ── Symbol edge-case conformance tests ──────────────────────────────
+
+    /// `new Symbol()` throws TypeError — Symbol is not a constructor.
+    #[test]
+    fn e2e_new_symbol_throws_type_error() {
+        let result = global_eval(
+            r#"
+            try { new Symbol(); false; } catch (e) { e instanceof TypeError; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `new Symbol("desc")` also throws TypeError.
+    #[test]
+    fn e2e_new_symbol_with_desc_throws() {
+        let result = global_eval(
+            r#"
+            try { new Symbol("desc"); false; } catch (e) { e instanceof TypeError; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Implicit symbol-to-string coercion throws TypeError.
+    #[test]
+    fn e2e_symbol_string_concat_throws() {
+        let result = global_eval(
+            r#"
+            try { "" + Symbol("x"); false; } catch (e) { e instanceof TypeError; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Implicit symbol-to-number coercion throws TypeError.
+    #[test]
+    fn e2e_symbol_number_coercion_throws() {
+        let result = global_eval(
+            r#"
+            try { +Symbol("x"); false; } catch (e) { e instanceof TypeError; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Symbol.for` / `Symbol.keyFor` round-trip.
+    #[test]
+    fn e2e_symbol_for_key_for_round_trip() {
+        let result = global_eval(
+            r#"
+            var s = Symbol.for("round");
+            Symbol.keyFor(s) === "round" && Symbol.for("round") === s
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Symbol.for("")` round-trips with empty key.
+    #[test]
+    fn e2e_symbol_for_empty_key_round_trip() {
+        let result = global_eval(
+            r#"
+            var s = Symbol.for("");
+            Symbol.keyFor(s) === "" && Symbol.for("") === s
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Symbol.for("key").description` equals the key.
+    #[test]
+    fn e2e_symbol_for_description_matches_key() {
+        let result = global_eval(r#"Symbol.for("myKey").description === "myKey""#).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Symbol.iterator.toString()` returns "Symbol(Symbol.iterator)".
+    #[test]
+    fn e2e_symbol_iterator_to_string() {
+        let result = global_eval("Symbol.iterator.toString()").unwrap();
+        assert_eq!(result, JsValue::String("Symbol(Symbol.iterator)".into()));
+    }
+
+    /// `Symbol("").toString()` → "Symbol()"
+    #[test]
+    fn e2e_symbol_empty_desc_to_string() {
+        let result = global_eval(r#"Symbol("").toString()"#).unwrap();
+        assert_eq!(result, JsValue::String("Symbol()".into()));
+    }
+
+    /// `typeof` comparison: `typeof Symbol() === "symbol"` evaluates to true.
+    #[test]
+    fn e2e_typeof_symbol_equality_check() {
+        let result = global_eval(r#"typeof Symbol("x") === "symbol""#).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Symbols are truthy in boolean context.
+    #[test]
+    fn e2e_symbol_is_truthy() {
+        let result = global_eval(r#"!!Symbol("x")"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// No-description symbol is also truthy.
+    #[test]
+    fn e2e_symbol_no_desc_is_truthy() {
+        let result = global_eval("!!Symbol()").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Symbol() == null` → false (no implicit coercion).
+    #[test]
+    fn e2e_symbol_not_equal_null() {
+        let result = global_eval("Symbol() == null").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Symbol() == undefined` → false.
+    #[test]
+    fn e2e_symbol_not_equal_undefined() {
+        let result = global_eval("Symbol() == undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `delete obj[sym]` removes the symbol-keyed property.
+    #[test]
+    fn e2e_delete_symbol_property() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("del");
+            var obj = {};
+            obj[s] = 1;
+            delete obj[s];
+            obj[s] === undefined
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `sym in obj` works for symbol property keys.
+    #[test]
+    fn e2e_in_operator_with_symbol_key() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("prop");
+            var obj = {};
+            obj[s] = 42;
+            s in obj
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `sym in obj` returns false when symbol key is absent.
+    #[test]
+    fn e2e_in_operator_symbol_absent() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("missing");
+            var obj = { a: 1 };
+            s in obj
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// `Symbol.hasInstance` customises `instanceof`.
+    #[test]
+    fn e2e_symbol_has_instance_usage() {
+        let result = global_eval(
+            r#"
+            var MyObj = { [Symbol.hasInstance](instance) { return instance.custom === true; } };
+            var a = { custom: true };
+            var b = { custom: false };
+            a instanceof MyObj === true && b instanceof MyObj === false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Symbol.toStringTag` controls Object.prototype.toString output.
+    #[test]
+    fn e2e_symbol_to_string_tag_usage() {
+        let result = global_eval(
+            r#"
+            var obj = { [Symbol.toStringTag]: "Custom" };
+            Object.prototype.toString.call(obj)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("[object Custom]".into()));
+    }
+
+    /// Well-known symbol descriptions include `Symbol.dispose`.
+    #[test]
+    fn e2e_symbol_dispose_description() {
+        let result = global_eval("Symbol.dispose.description").unwrap();
+        assert_eq!(result, JsValue::String("Symbol.dispose".into()));
+    }
+
+    /// Well-known `Symbol.asyncDispose` has correct description.
+    #[test]
+    fn e2e_symbol_async_dispose_description() {
+        let result = global_eval("Symbol.asyncDispose.description").unwrap();
+        assert_eq!(result, JsValue::String("Symbol.asyncDispose".into()));
+    }
+
+    /// `typeof Symbol.dispose` → "symbol"
+    #[test]
+    fn e2e_typeof_symbol_dispose() {
+        let result = global_eval("typeof Symbol.dispose").unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// `typeof Symbol.asyncDispose` → "symbol"
+    #[test]
+    fn e2e_typeof_symbol_async_dispose() {
+        let result = global_eval("typeof Symbol.asyncDispose").unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// Computed property with symbol in object literal.
+    #[test]
+    fn e2e_symbol_computed_property_literal() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("lit");
+            var obj = { [s]: 99 };
+            obj[s]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    /// Symbol key survives `Object.assign`.
+    #[test]
+    fn e2e_symbol_key_copied_by_object_assign() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("copy");
+            var src = {};
+            src[s] = 7;
+            var dest = Object.assign({}, src);
+            dest[s] === 7
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Symbol keys not included in `JSON.stringify`.
+    #[test]
+    fn e2e_symbol_keys_excluded_from_json() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("hidden");
+            var obj = { visible: 1 };
+            obj[s] = 2;
+            JSON.stringify(obj) === '{"visible":1}'
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Multiple symbol keys on the same object.
+    #[test]
+    fn e2e_multiple_symbol_keys() {
+        let result = global_eval(
+            r#"
+            var s1 = Symbol("a");
+            var s2 = Symbol("b");
+            var s3 = Symbol("c");
+            var obj = {};
+            obj[s1] = 1;
+            obj[s2] = 2;
+            obj[s3] = 3;
+            obj[s1] + obj[s2] + obj[s3]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
     }
 
     // ── Object.defineProperty / getOwnPropertyDescriptor tests ──────────
