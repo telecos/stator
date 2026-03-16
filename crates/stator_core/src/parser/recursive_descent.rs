@@ -3180,6 +3180,14 @@ impl<'src> Parser<'src> {
                 _ => break,
             }
         }
+        // Wrap the entire expression in an OptionalChain node when any `?.`
+        // was encountered.  This lets the bytecode generator emit a single
+        // nullish check at the chain root so that continuation accesses
+        // (`.prop`, `[expr]`, `(args)`) after the first `?.` short-circuit
+        // correctly.
+        if after_optional {
+            expr = Expr::OptionalChain(Box::new(expr));
+        }
         Ok(expr)
     }
 
@@ -4429,6 +4437,8 @@ impl<'src> Parser<'src> {
                 Self::contains_private_member_delete(&c.consequent)
                     || Self::contains_private_member_delete(&c.alternate)
             }
+            Expr::OptionalMember(m) => matches!(m.property, MemberProp::Private(_)),
+            Expr::OptionalChain(inner) => Self::contains_private_member_delete(inner),
             _ => false,
         }
     }
@@ -7395,23 +7405,27 @@ mod tests {
 
     #[test]
     fn test_class_private_optional_chain() {
-        // `obj?.#field` should produce OptionalMember with MemberProp::Private.
+        // `obj?.#field` should produce OptionalChain(OptionalMember) with MemberProp::Private.
         let prog = parse("class C { #x; m(o) { return o?.#x; } }").unwrap();
         if let ProgramItem::Stmt(Stmt::ClassDecl(c)) = &prog.body[0] {
             assert_eq!(c.body.body.len(), 2);
             if let ClassMember::Method(m) = &c.body.body[1] {
                 if let Stmt::Return(ret) = &m.value.body.body[0] {
                     if let Some(arg) = &ret.argument {
-                        if let Expr::OptionalMember(om) = arg.as_ref() {
-                            assert!(
-                                matches!(
-                                    &om.property,
-                                    crate::parser::ast::MemberProp::Private(p) if p.name == "x"
-                                ),
-                                "expected MemberProp::Private(\"x\")"
-                            );
+                        if let Expr::OptionalChain(inner) = arg.as_ref() {
+                            if let Expr::OptionalMember(om) = inner.as_ref() {
+                                assert!(
+                                    matches!(
+                                        &om.property,
+                                        crate::parser::ast::MemberProp::Private(p) if p.name == "x"
+                                    ),
+                                    "expected MemberProp::Private(\"x\")"
+                                );
+                            } else {
+                                panic!("expected OptionalMember expression");
+                            }
                         } else {
-                            panic!("expected OptionalMember expression");
+                            panic!("expected OptionalChain wrapping OptionalMember");
                         }
                     } else {
                         panic!("expected return argument");
@@ -8259,7 +8273,11 @@ mod tests {
     fn test_parse_optional_member() {
         let prog = parse("obj?.prop").unwrap();
         if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
-            assert!(matches!(es.expr.as_ref(), Expr::OptionalMember(_)));
+            if let Expr::OptionalChain(inner) = es.expr.as_ref() {
+                assert!(matches!(inner.as_ref(), Expr::OptionalMember(_)));
+            } else {
+                panic!("expected OptionalChain wrapping OptionalMember");
+            }
         } else {
             panic!("expected OptionalMember expression");
         }
@@ -8269,10 +8287,14 @@ mod tests {
     fn test_parse_optional_member_computed() {
         let prog = parse("obj?.[0]").unwrap();
         if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
-            if let Expr::OptionalMember(m) = es.expr.as_ref() {
-                assert!(m.is_computed);
+            if let Expr::OptionalChain(inner) = es.expr.as_ref() {
+                if let Expr::OptionalMember(m) = inner.as_ref() {
+                    assert!(m.is_computed);
+                } else {
+                    panic!("expected OptionalMember");
+                }
             } else {
-                panic!("expected OptionalMember");
+                panic!("expected OptionalChain");
             }
         } else {
             panic!("expected expression statement");
@@ -8283,7 +8305,11 @@ mod tests {
     fn test_parse_optional_call() {
         let prog = parse("fn?.()").unwrap();
         if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
-            assert!(matches!(es.expr.as_ref(), Expr::OptionalCall(_)));
+            if let Expr::OptionalChain(inner) = es.expr.as_ref() {
+                assert!(matches!(inner.as_ref(), Expr::OptionalCall(_)));
+            } else {
+                panic!("expected OptionalChain wrapping OptionalCall");
+            }
         } else {
             panic!("expected OptionalCall expression");
         }
@@ -8291,13 +8317,17 @@ mod tests {
 
     #[test]
     fn test_parse_optional_chain_chained() {
-        // a?.b?.c should parse as OptionalMember(OptionalMember(a, b), c)
+        // a?.b?.c should parse as OptionalChain(OptionalMember(OptionalMember(a, b), c))
         let prog = parse("a?.b?.c").unwrap();
         if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
-            if let Expr::OptionalMember(outer) = es.expr.as_ref() {
-                assert!(matches!(outer.object.as_ref(), Expr::OptionalMember(_)));
+            if let Expr::OptionalChain(inner) = es.expr.as_ref() {
+                if let Expr::OptionalMember(outer) = inner.as_ref() {
+                    assert!(matches!(outer.object.as_ref(), Expr::OptionalMember(_)));
+                } else {
+                    panic!("expected nested OptionalMember");
+                }
             } else {
-                panic!("expected nested OptionalMember");
+                panic!("expected OptionalChain");
             }
         } else {
             panic!("expected expression statement");
@@ -8308,17 +8338,21 @@ mod tests {
 
     #[test]
     fn test_parse_optional_member_then_call() {
-        // obj?.method() → Call(OptionalMember(obj, "method"), [])
+        // obj?.method() → OptionalChain(Call(OptionalMember(obj, "method"), []))
         let prog = parse("obj?.method()").unwrap();
         if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
-            if let Expr::Call(call) = es.expr.as_ref() {
-                assert!(
-                    matches!(call.callee.as_ref(), Expr::OptionalMember(_)),
-                    "callee should be OptionalMember"
-                );
-                assert!(call.arguments.is_empty());
+            if let Expr::OptionalChain(inner) = es.expr.as_ref() {
+                if let Expr::Call(call) = inner.as_ref() {
+                    assert!(
+                        matches!(call.callee.as_ref(), Expr::OptionalMember(_)),
+                        "callee should be OptionalMember"
+                    );
+                    assert!(call.arguments.is_empty());
+                } else {
+                    panic!("expected Call expression, got {:?}", inner);
+                }
             } else {
-                panic!("expected Call expression, got {:?}", es.expr);
+                panic!("expected OptionalChain");
             }
         } else {
             panic!("expected expression statement");
@@ -8327,23 +8361,27 @@ mod tests {
 
     #[test]
     fn test_parse_optional_member_then_call_with_args() {
-        // obj?.method(1, 2) → Call(OptionalMember(obj, "method"), [1, 2])
+        // obj?.method(1, 2) → OptionalChain(Call(OptionalMember(obj, "method"), [1, 2]))
         let prog = parse("obj?.method(1, 2)").unwrap();
         if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
-            if let Expr::Call(call) = es.expr.as_ref() {
-                if let Expr::OptionalMember(m) = call.callee.as_ref() {
-                    assert!(!m.is_computed);
-                    if let crate::parser::ast::MemberProp::Ident(id) = &m.property {
-                        assert_eq!(id.name, "method");
+            if let Expr::OptionalChain(inner) = es.expr.as_ref() {
+                if let Expr::Call(call) = inner.as_ref() {
+                    if let Expr::OptionalMember(m) = call.callee.as_ref() {
+                        assert!(!m.is_computed);
+                        if let crate::parser::ast::MemberProp::Ident(id) = &m.property {
+                            assert_eq!(id.name, "method");
+                        } else {
+                            panic!("expected Ident property");
+                        }
                     } else {
-                        panic!("expected Ident property");
+                        panic!("expected OptionalMember callee");
                     }
+                    assert_eq!(call.arguments.len(), 2);
                 } else {
-                    panic!("expected OptionalMember callee");
+                    panic!("expected Call expression");
                 }
-                assert_eq!(call.arguments.len(), 2);
             } else {
-                panic!("expected Call expression");
+                panic!("expected OptionalChain");
             }
         } else {
             panic!("expected expression statement");
@@ -8352,13 +8390,17 @@ mod tests {
 
     #[test]
     fn test_parse_optional_call_with_args() {
-        // fn?.(1, 2) → OptionalCall(fn, [1, 2])
+        // fn?.(1, 2) → OptionalChain(OptionalCall(fn, [1, 2]))
         let prog = parse("fn?.(1, 2)").unwrap();
         if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
-            if let Expr::OptionalCall(oc) = es.expr.as_ref() {
-                assert_eq!(oc.arguments.len(), 2);
+            if let Expr::OptionalChain(inner) = es.expr.as_ref() {
+                if let Expr::OptionalCall(oc) = inner.as_ref() {
+                    assert_eq!(oc.arguments.len(), 2);
+                } else {
+                    panic!("expected OptionalCall expression");
+                }
             } else {
-                panic!("expected OptionalCall expression");
+                panic!("expected OptionalChain");
             }
         } else {
             panic!("expected expression statement");
@@ -8367,13 +8409,17 @@ mod tests {
 
     #[test]
     fn test_parse_optional_computed_member_string_key() {
-        // obj?.["key"] → OptionalMember(obj, "key", computed=true)
+        // obj?.["key"] → OptionalChain(OptionalMember(obj, "key", computed=true))
         let prog = parse(r#"obj?.["key"]"#).unwrap();
         if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
-            if let Expr::OptionalMember(m) = es.expr.as_ref() {
-                assert!(m.is_computed);
+            if let Expr::OptionalChain(inner) = es.expr.as_ref() {
+                if let Expr::OptionalMember(m) = inner.as_ref() {
+                    assert!(m.is_computed);
+                } else {
+                    panic!("expected OptionalMember");
+                }
             } else {
-                panic!("expected OptionalMember");
+                panic!("expected OptionalChain");
             }
         } else {
             panic!("expected expression statement");

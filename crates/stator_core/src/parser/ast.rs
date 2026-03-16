@@ -919,6 +919,13 @@ pub enum Expr {
     Call(Box<CallExpr>),
     /// `callee?.(args)`
     OptionalCall(Box<OptionalCallExpr>),
+    /// Entire optional-chain expression (`a?.b.c`, `a?.b()`, etc.).
+    ///
+    /// The inner expression tree contains `OptionalMember` / `OptionalCall`
+    /// for the `?.` links and regular `Member` / `Call` for continuation
+    /// accesses that are still part of the chain.  A single nullish check
+    /// on the chain root short-circuits the whole thing to `undefined`.
+    OptionalChain(Box<Expr>),
     /// `new callee(args)`
     New(Box<NewExpr>),
 
@@ -976,6 +983,7 @@ impl Expr {
             Expr::OptionalMember(e) => e.loc,
             Expr::Call(e) => e.loc,
             Expr::OptionalCall(e) => e.loc,
+            Expr::OptionalChain(e) => e.loc(),
             Expr::New(e) => e.loc,
             Expr::TaggedTemplate(e) => e.loc,
             Expr::Spread(e) => e.loc,
@@ -1868,6 +1876,7 @@ mod tests {
                 callee: null(),
                 arguments: vec![],
             })),
+            Expr::OptionalChain(null()),
             Expr::New(Box::new(NewExpr {
                 loc,
                 callee: null(),

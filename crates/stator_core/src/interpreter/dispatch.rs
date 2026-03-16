@@ -7905,9 +7905,7 @@ mod tests {
     }
 
     /// Optional chaining method call on null.
-    // NOTE: optional chaining method calls not yet fully implemented
     #[test]
-    #[ignore]
     fn test_optional_chaining_method_null() {
         let result =
             crate::builtins::global::global_eval("var obj = null; obj?.toString()").unwrap();
@@ -7930,6 +7928,240 @@ mod tests {
             crate::builtins::global::global_eval("var obj = {x: 77}; var key = 'x'; obj?.[key]")
                 .unwrap();
         assert_eq!(result, JsValue::Smi(77));
+    }
+
+    // ── Optional chaining / nullish coalescing e2e tests ────────────────
+
+    /// `null?.x` returns undefined without error.
+    #[test]
+    fn e2e_optional_chain_null_prop() {
+        let r = crate::builtins::global::global_eval("null?.x").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    /// `undefined?.x` returns undefined without error.
+    #[test]
+    fn e2e_optional_chain_undefined_prop() {
+        let r = crate::builtins::global::global_eval("undefined?.x").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    /// `({a:1})?.a` returns 1.
+    #[test]
+    fn e2e_optional_chain_value_prop() {
+        let r = crate::builtins::global::global_eval("({a:1})?.a").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// `null?.[0]` returns undefined.
+    #[test]
+    fn e2e_optional_chain_null_computed() {
+        let r = crate::builtins::global::global_eval("null?.[0]").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    /// `([10,20])?.[1]` returns 20.
+    #[test]
+    fn e2e_optional_chain_array_computed() {
+        let r = crate::builtins::global::global_eval("([10,20])?.[1]").unwrap();
+        assert_eq!(r, JsValue::Smi(20));
+    }
+
+    /// `null?.toString()` returns undefined (method call on null).
+    #[test]
+    fn e2e_optional_chain_method_null() {
+        let r = crate::builtins::global::global_eval("null?.toString()").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    /// `({f: function(){ return 99; }})?.f()` returns 99.
+    #[test]
+    fn e2e_optional_chain_method_call_value() {
+        let r =
+            crate::builtins::global::global_eval("var o = {f: function(){ return 99; }}; o?.f()")
+                .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    /// `func?.()` — call if callable, undefined otherwise.
+    #[test]
+    fn e2e_optional_call_null() {
+        let r = crate::builtins::global::global_eval("var f = null; f?.()").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    /// `func?.()` — call if callable.
+    #[test]
+    fn e2e_optional_call_function() {
+        let r = crate::builtins::global::global_eval("var f = function(){ return 42; }; f?.()")
+            .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Deep chain `a?.b?.c?.d` all present.
+    #[test]
+    fn e2e_optional_chain_deep_all_present() {
+        let r = crate::builtins::global::global_eval("var a = {b:{c:{d:7}}}; a?.b?.c?.d").unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    /// Deep chain `a?.b?.c?.d` with null intermediate.
+    #[test]
+    fn e2e_optional_chain_deep_null_intermediate() {
+        let r = crate::builtins::global::global_eval("var a = {b:null}; a?.b?.c?.d").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    /// `null?.x` entire chain short-circuits.
+    #[test]
+    fn e2e_optional_chain_short_circuit_entire_chain() {
+        let r = crate::builtins::global::global_eval("var a = null; a?.b.c").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    /// `delete obj?.prop` on null returns true.
+    #[test]
+    fn e2e_delete_optional_null() {
+        let r = crate::builtins::global::global_eval("var obj = null; delete obj?.x").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `delete obj?.prop` on real object deletes the property.
+    #[test]
+    fn e2e_delete_optional_real() {
+        let r = crate::builtins::global::global_eval(
+            "var obj = {x:1}; delete obj?.x; obj.x === undefined",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `null ?? 'default'` returns 'default'.
+    #[test]
+    fn e2e_nullish_coalesce_null() {
+        let r = crate::builtins::global::global_eval("null ?? 'default'").unwrap();
+        assert_eq!(r, JsValue::String("default".into()));
+    }
+
+    /// `undefined ?? 'default'` returns 'default'.
+    #[test]
+    fn e2e_nullish_coalesce_undefined() {
+        let r = crate::builtins::global::global_eval("undefined ?? 'default'").unwrap();
+        assert_eq!(r, JsValue::String("default".into()));
+    }
+
+    /// `0 ?? 'default'` returns 0 (not 'default').
+    #[test]
+    fn e2e_nullish_coalesce_zero() {
+        let r = crate::builtins::global::global_eval("0 ?? 'default'").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// `'' ?? 'default'` returns '' (not 'default').
+    #[test]
+    fn e2e_nullish_coalesce_empty_string() {
+        let r = crate::builtins::global::global_eval("'' ?? 'default'").unwrap();
+        assert_eq!(r, JsValue::String("".into()));
+    }
+
+    /// `false ?? 'default'` returns false.
+    #[test]
+    fn e2e_nullish_coalesce_false() {
+        let r = crate::builtins::global::global_eval("false ?? 'default'").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `x ??= value` only assigns if x is null/undefined.
+    #[test]
+    fn e2e_nullish_assign_null() {
+        let r = crate::builtins::global::global_eval("var x = null; x ??= 42; x").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// `x ??= value` does NOT assign if x is 0.
+    #[test]
+    fn e2e_nullish_assign_zero_keeps() {
+        let r = crate::builtins::global::global_eval("var x = 0; x ??= 42; x").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// `x ??= value` does NOT assign if x is ''.
+    #[test]
+    fn e2e_nullish_assign_empty_string_keeps() {
+        let r = crate::builtins::global::global_eval("var x = ''; x ??= 'hi'; x").unwrap();
+        assert_eq!(r, JsValue::String("".into()));
+    }
+
+    /// `x &&= value` — assigns only if x is truthy.
+    #[test]
+    fn e2e_logical_and_assign_truthy() {
+        let r = crate::builtins::global::global_eval("var x = 1; x &&= 5; x").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    /// `x &&= value` — does NOT assign if x is falsy.
+    #[test]
+    fn e2e_logical_and_assign_falsy() {
+        let r = crate::builtins::global::global_eval("var x = 0; x &&= 5; x").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// `x ||= value` — assigns only if x is falsy.
+    #[test]
+    fn e2e_logical_or_assign_falsy() {
+        let r = crate::builtins::global::global_eval("var x = 0; x ||= 5; x").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    /// `x ||= value` — does NOT assign if x is truthy.
+    #[test]
+    fn e2e_logical_or_assign_truthy() {
+        let r = crate::builtins::global::global_eval("var x = 1; x ||= 5; x").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// Interaction: `obj?.prop ?? 'default'`.
+    #[test]
+    fn e2e_optional_chain_then_nullish() {
+        let r =
+            crate::builtins::global::global_eval("var obj = null; obj?.x ?? 'default'").unwrap();
+        assert_eq!(r, JsValue::String("default".into()));
+    }
+
+    /// Interaction: `(a ?? b)?.prop`.
+    #[test]
+    fn e2e_nullish_then_optional_chain() {
+        let r = crate::builtins::global::global_eval("var a = null; var b = {x: 10}; (a ?? b)?.x")
+            .unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    /// Precedence: `a ?? b && c` is a SyntaxError.
+    #[test]
+    fn e2e_nullish_mixed_and_error() {
+        let r = crate::builtins::global::global_eval("1 ?? 2 && 3");
+        assert!(r.is_err());
+    }
+
+    /// Precedence: `a ?? b || c` is a SyntaxError.
+    #[test]
+    fn e2e_nullish_mixed_or_error() {
+        let r = crate::builtins::global::global_eval("1 ?? 2 || 3");
+        assert!(r.is_err());
+    }
+
+    /// Precedence: `a || b ?? c` is a SyntaxError.
+    #[test]
+    fn e2e_or_then_nullish_error() {
+        let r = crate::builtins::global::global_eval("1 || 2 ?? 3");
+        assert!(r.is_err());
+    }
+
+    /// Precedence: `(a || b) ?? c` is allowed (parens).
+    #[test]
+    fn e2e_paren_or_then_nullish_ok() {
+        let r = crate::builtins::global::global_eval("(null || undefined) ?? 42").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
     }
 
     // ── NaN comparison edge cases (relational operators) ─────────────────
