@@ -1544,4 +1544,350 @@ mod tests {
         // Empty pattern matches at every position: "", "", ""
         assert_eq!(results.len(), 3);
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Advanced features — lookbehind, dotAll, Unicode property escapes,
+    //                      named backreferences, flag combinations
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── Positive lookbehind (?<=...) ─────────────────────────────────────
+
+    #[test]
+    fn test_lookbehind_positive_dollar_sign() {
+        let re = JsRegExp::new(r"(?<=\$)\d+", "").unwrap();
+        let m = re.exec("price $100 and €200").unwrap();
+        assert_eq!(m.matched, "100");
+    }
+
+    #[test]
+    fn test_lookbehind_positive_word_boundary() {
+        let re = JsRegExp::new(r"(?<=\bfoo)\w+", "").unwrap();
+        let m = re.exec("foobar baz").unwrap();
+        assert_eq!(m.matched, "bar");
+    }
+
+    #[test]
+    fn test_lookbehind_positive_global_all() {
+        let re = JsRegExp::new(r"(?<=@)\w+", "g").unwrap();
+        let results = re.symbol_match_all("@alice and @bob");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].matched, "alice");
+        assert_eq!(results[1].matched, "bob");
+    }
+
+    // ── Negative lookbehind (?<!...) ─────────────────────────────────────
+
+    #[test]
+    fn test_lookbehind_negative_no_dollar() {
+        let re = JsRegExp::new(r"(?<!\$)\d+", "").unwrap();
+        let m = re.exec("free 42 items").unwrap();
+        assert_eq!(m.matched, "42");
+    }
+
+    #[test]
+    fn test_lookbehind_negative_skips_prefixed() {
+        let re = JsRegExp::new(r"(?<!un)happy", "").unwrap();
+        assert!(re.test("happy day"));
+        assert!(!re.test("unhappy day"));
+    }
+
+    #[test]
+    fn test_lookbehind_negative_global() {
+        let re = JsRegExp::new(r"(?<!#)\b\w+", "g").unwrap();
+        let results = re.symbol_match_all("hello #world foo");
+        // "hello" and "foo" should match; "world" is preceded by #
+        let matched: Vec<&str> = results.iter().map(|m| m.matched.as_str()).collect();
+        assert!(matched.contains(&"hello"));
+        assert!(matched.contains(&"foo"));
+    }
+
+    // ── Lookbehind with captures ─────────────────────────────────────────
+
+    #[test]
+    fn test_lookbehind_with_capture_group() {
+        let re = JsRegExp::new(r"(?<=(\d+)\s)\w+", "").unwrap();
+        let m = re.exec("42 apples").unwrap();
+        assert_eq!(m.matched, "apples");
+        // The capture inside the lookbehind should be recorded
+        assert_eq!(m.captures[0], Some("42".to_string()));
+    }
+
+    #[test]
+    fn test_lookbehind_capture_numbering() {
+        // Capture groups inside lookbehind are numbered before those outside
+        let re = JsRegExp::new(r"(?<=(a)(b))cd", "").unwrap();
+        let m = re.exec("abcd").unwrap();
+        assert_eq!(m.matched, "cd");
+        assert_eq!(m.captures[0], Some("a".to_string()));
+        assert_eq!(m.captures[1], Some("b".to_string()));
+    }
+
+    // ── Lookbehind with quantifiers (variable-length) ────────────────────
+
+    #[test]
+    fn test_lookbehind_variable_length() {
+        // regress supports variable-length lookbehind
+        let re = JsRegExp::new(r"(?<=\d+)\s\w+", "").unwrap();
+        let m = re.exec("123 abc").unwrap();
+        assert_eq!(m.matched, " abc");
+    }
+
+    #[test]
+    fn test_lookbehind_alternation_variable_length() {
+        let re = JsRegExp::new(r"(?<=cat|hello)\s\w+", "").unwrap();
+        let m = re.exec("hello world").unwrap();
+        assert_eq!(m.matched, " world");
+    }
+
+    // ── dotAll flag (s) — dot matches newlines ───────────────────────────
+
+    #[test]
+    fn test_dotall_dot_matches_newline() {
+        let re = JsRegExp::new("a.b", "s").unwrap();
+        assert!(re.test("a\nb"));
+        assert!(re.test("a\rb"));
+        assert!(re.test("axb"));
+    }
+
+    #[test]
+    fn test_dotall_off_dot_rejects_newline() {
+        let re = JsRegExp::new("a.b", "").unwrap();
+        assert!(!re.test("a\nb"));
+        assert!(re.test("axb"));
+    }
+
+    #[test]
+    fn test_dotall_multiline_interaction() {
+        // /s and /m can coexist: dot matches newline, ^/$ match line boundaries
+        let re = JsRegExp::new(r"^.+$", "sm").unwrap();
+        let m = re.exec("line1\nline2").unwrap();
+        // With /s, . matches \n, so ^.+$ can match across lines
+        assert!(m.matched.contains('\n'));
+    }
+
+    #[test]
+    fn test_dotall_flag_accessor() {
+        let re = JsRegExp::new("a", "s").unwrap();
+        assert!(re.flags().contains(RegExpFlags::DOT_ALL));
+    }
+
+    #[test]
+    fn test_dotall_in_flags_string() {
+        let re = JsRegExp::new("a", "gs").unwrap();
+        assert_eq!(re.flags().to_flags_string(), "gs");
+    }
+
+    #[test]
+    fn test_dotall_global_replaces_across_newlines() {
+        let re = JsRegExp::new(".+", "gs").unwrap();
+        let result = re.symbol_replace("a\nb", "x");
+        assert_eq!(result, "x");
+    }
+
+    // ── Unicode property escapes ─────────────────────────────────────────
+
+    #[test]
+    fn test_unicode_property_letter_match() {
+        let re = JsRegExp::new(r"\p{Letter}+", "u").unwrap();
+        let m = re.exec("hello123").unwrap();
+        assert_eq!(m.matched, "hello");
+    }
+
+    #[test]
+    fn test_unicode_property_number_match() {
+        let re = JsRegExp::new(r"\p{Number}+", "u").unwrap();
+        let m = re.exec("abc42def").unwrap();
+        assert_eq!(m.matched, "42");
+    }
+
+    #[test]
+    fn test_unicode_property_negated_number() {
+        let re = JsRegExp::new(r"\P{Number}+", "u").unwrap();
+        let m = re.exec("42abc99").unwrap();
+        assert_eq!(m.matched, "abc");
+    }
+
+    #[test]
+    fn test_unicode_property_script_greek() {
+        let re = JsRegExp::new(r"\p{Script=Greek}+", "u").unwrap();
+        assert!(re.test("αβγ"));
+        assert!(!re.test("abc"));
+    }
+
+    #[test]
+    fn test_unicode_property_script_latin() {
+        let re = JsRegExp::new(r"\p{Script=Latin}+", "u").unwrap();
+        let m = re.exec("hello世界").unwrap();
+        assert_eq!(m.matched, "hello");
+    }
+
+    #[test]
+    fn test_unicode_property_general_category_uppercase() {
+        let re = JsRegExp::new(r"\p{General_Category=Uppercase_Letter}+", "u").unwrap();
+        let m = re.exec("helloWORLD").unwrap();
+        assert_eq!(m.matched, "WORLD");
+    }
+
+    #[test]
+    fn test_unicode_property_emoji_like() {
+        // \p{L} should match CJK characters
+        let re = JsRegExp::new(r"\p{L}+", "u").unwrap();
+        assert!(re.test("你好"));
+    }
+
+    #[test]
+    fn test_unicode_property_global_all_letters() {
+        let re = JsRegExp::new(r"\p{L}+", "gu").unwrap();
+        let results = re.symbol_match_all("hello 42 world");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].matched, "hello");
+        assert_eq!(results[1].matched, "world");
+    }
+
+    // ── Named capture backreferences \k<name> ────────────────────────────
+
+    #[test]
+    fn test_backreference_named_repeat() {
+        let re = JsRegExp::new(r"(?<ch>.)\k<ch>", "").unwrap();
+        let m = re.exec("aabbcc").unwrap();
+        assert_eq!(m.matched, "aa");
+    }
+
+    #[test]
+    fn test_backreference_named_no_match_different() {
+        let re = JsRegExp::new(r"(?<ch>.)\k<ch>", "").unwrap();
+        assert!(re.exec("abcd").is_none());
+    }
+
+    #[test]
+    fn test_backreference_named_html_tags() {
+        let re = JsRegExp::new(r"<(?<tag>\w+)>[^<]*</\k<tag>>", "").unwrap();
+        let m = re.exec("<b>bold</b>").unwrap();
+        assert_eq!(m.matched, "<b>bold</b>");
+        assert!(re.exec("<b>bold</i>").is_none());
+    }
+
+    #[test]
+    fn test_backreference_named_with_unicode() {
+        let re = JsRegExp::new(r"(?<w>\w+)\s\k<w>", "u").unwrap();
+        let m = re.exec("the the dog").unwrap();
+        assert_eq!(m.matched, "the the");
+    }
+
+    #[test]
+    fn test_backreference_named_global_replace() {
+        let re = JsRegExp::new(r"(?<w>\w+)\s\k<w>", "g").unwrap();
+        let result = re.symbol_replace("the the is is ok", "[$<w>]");
+        assert_eq!(result, "[the] [is] ok");
+    }
+
+    // ── Flag combinations ────────────────────────────────────────────────
+
+    #[test]
+    fn test_flags_gimus() {
+        let re = JsRegExp::new(".", "gimus").unwrap();
+        assert_eq!(re.flags().to_flags_string(), "gimsu");
+        assert!(re.flags().contains(RegExpFlags::GLOBAL));
+        assert!(re.flags().contains(RegExpFlags::IGNORE_CASE));
+        assert!(re.flags().contains(RegExpFlags::MULTILINE));
+        assert!(re.flags().contains(RegExpFlags::UNICODE));
+        assert!(re.flags().contains(RegExpFlags::DOT_ALL));
+    }
+
+    #[test]
+    fn test_flags_gimsuy() {
+        let re = JsRegExp::new(".", "gimsuy").unwrap();
+        assert_eq!(re.flags().to_flags_string(), "gimsuy");
+        assert!(re.flags().contains(RegExpFlags::GLOBAL));
+        assert!(re.flags().contains(RegExpFlags::IGNORE_CASE));
+        assert!(re.flags().contains(RegExpFlags::MULTILINE));
+        assert!(re.flags().contains(RegExpFlags::DOT_ALL));
+        assert!(re.flags().contains(RegExpFlags::UNICODE));
+        assert!(re.flags().contains(RegExpFlags::STICKY));
+    }
+
+    #[test]
+    fn test_flags_du_combined() {
+        let re = JsRegExp::new(r"\p{L}+", "du").unwrap();
+        assert_eq!(re.flags().to_flags_string(), "du");
+        let m = re.exec("hello").unwrap();
+        assert!(m.indices.is_some());
+    }
+
+    #[test]
+    fn test_flags_dgs_combined() {
+        let re = JsRegExp::new(".+", "dgs").unwrap();
+        let results = re.symbol_match_all("a\nb");
+        // With /s, . matches newlines, so we get one match "a\nb"
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].matched, "a\nb");
+        assert!(results[0].indices.is_some());
+    }
+
+    // ── dotAll + lookbehind combined ─────────────────────────────────────
+
+    #[test]
+    fn test_dotall_with_lookbehind() {
+        let re = JsRegExp::new(r"(?<=\n)\w+", "s").unwrap();
+        let m = re.exec("line1\nline2").unwrap();
+        assert_eq!(m.matched, "line2");
+    }
+
+    // ── Unicode property with lookbehind ─────────────────────────────────
+
+    #[test]
+    fn test_unicode_property_with_lookbehind() {
+        let re = JsRegExp::new(r"(?<=\p{L})\d+", "u").unwrap();
+        let m = re.exec("abc42").unwrap();
+        assert_eq!(m.matched, "42");
+        assert!(re.exec("  42").is_none());
+    }
+
+    // ── Unicode + dotAll combined ────────────────────────────────────────
+
+    #[test]
+    fn test_unicode_dotall_combined() {
+        let re = JsRegExp::new(r"\p{L}.+\p{L}", "su").unwrap();
+        let m = re.exec("a\nb").unwrap();
+        assert_eq!(m.matched, "a\nb");
+    }
+
+    // ── Named captures with indices ──────────────────────────────────────
+
+    #[test]
+    fn test_named_capture_with_indices() {
+        let re = JsRegExp::new(r"(?<word>\w+)", "du").unwrap();
+        let m = re.exec("hello").unwrap();
+        let idx = m.indices.as_ref().unwrap();
+        assert_eq!(idx.pairs[0], Some((0, 5)));
+        assert_eq!(idx.groups.get("word"), Some(&(0, 5)));
+    }
+
+    // ── Lookbehind in replace ────────────────────────────────────────────
+
+    #[test]
+    fn test_lookbehind_in_global_replace() {
+        let re = JsRegExp::new(r"(?<=\$)\d+", "g").unwrap();
+        let result = re.symbol_replace("$100 and $200", "XXX");
+        assert_eq!(result, "$XXX and $XXX");
+    }
+
+    // ── Edge: lookbehind at start of string ──────────────────────────────
+
+    #[test]
+    fn test_lookbehind_at_start_no_match() {
+        let re = JsRegExp::new(r"(?<=x)\d+", "").unwrap();
+        assert!(re.exec("42").is_none());
+    }
+
+    // ── Lookahead + lookbehind combined ──────────────────────────────────
+
+    #[test]
+    fn test_lookahead_and_lookbehind_combined() {
+        let re = JsRegExp::new(r"(?<=\$)\d+(?=\s)", "").unwrap();
+        let m = re.exec("$100 dollars").unwrap();
+        assert_eq!(m.matched, "100");
+        // Must not match: no space after digits
+        assert!(re.exec("$100dollars").is_none());
+    }
 }
