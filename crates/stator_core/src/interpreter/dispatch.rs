@@ -1838,6 +1838,18 @@ fn expand_spread_args(raw_args: Vec<JsValue>) -> Vec<JsValue> {
                                         Err(_) => break,
                                     }
                                 },
+                                // PlainObject with "next" → user-defined iterator.
+                                JsValue::PlainObject(ref iter_map)
+                                    if iter_map.borrow().contains_key("next") =>
+                                {
+                                    if let Ok(items) =
+                                        collect_from_plain_object_iterator(&iter_obj, iter_map)
+                                    {
+                                        out.extend(items);
+                                    } else {
+                                        out.push(arg.clone());
+                                    }
+                                }
                                 _ => out.push(arg.clone()),
                             }
                         } else {
@@ -3119,17 +3131,21 @@ fn handle_get_iterator(
                         let items = plain_object_to_array_items(map);
                         JsValue::Iterator(NativeIterator::from_items(items))
                     } else {
-                        return Err(StatorError::TypeError(format!(
-                            "GetIterator: value is not iterable (got {iterable:?})"
-                        )));
+                        return Err(StatorError::TypeError("object is not iterable".into()));
                     }
                 }
             }
         }
         other => {
-            return Err(StatorError::TypeError(format!(
-                "GetIterator: value is not iterable (got {other:?})"
-            )));
+            let desc = match &other {
+                JsValue::Null => "null".to_string(),
+                JsValue::Undefined => "undefined".to_string(),
+                JsValue::Smi(n) => n.to_string(),
+                JsValue::HeapNumber(n) => n.to_string(),
+                JsValue::Boolean(b) => b.to_string(),
+                _ => format!("{other:?}"),
+            };
+            return Err(StatorError::TypeError(format!("{desc} is not iterable")));
         }
     };
     Ok(DispatchAction::Continue)
@@ -4077,11 +4093,10 @@ fn handle_create_array_from_iterable(
                 return Err(StatorError::TypeError("object is not iterable".into()));
             }
         }
-        // Null and Undefined are not iterable.
-        JsValue::Null | JsValue::Undefined => {
+        // Null, Undefined, and other non-iterable primitives.
+        _ => {
             return Err(StatorError::TypeError("object is not iterable".into()));
         }
-        _ => vec![],
     };
     let mut map = PropertyMap::new();
     for (i, v) in items.iter().enumerate() {
