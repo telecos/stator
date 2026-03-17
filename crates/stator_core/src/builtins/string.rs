@@ -24,6 +24,7 @@
 //! * ECMAScript 2025 Language Specification §22.1 — *The String Constructor*
 
 use crate::error::{StatorError, StatorResult};
+use unicode_normalization::UnicodeNormalization;
 
 /// Maximum string length in UTF-16 code units (~256 MiB), matching V8's limit.
 pub const MAX_STRING_LEN: usize = 1 << 28;
@@ -786,6 +787,111 @@ pub fn string_replace_all(s: &str, search: &str, replacement: &str) -> String {
     result
 }
 
+/// ECMAScript §22.1.3.18 `String.prototype.replaceAll(searchValue, replaceValue)` —
+/// checked variant.
+///
+/// Equivalent to [`string_replace_all`] but returns a [`StatorError::TypeError`]
+/// if `is_regex` is `true` and `has_global_flag` is `false`, matching the spec
+/// requirement that a RegExp pattern **must** have the global flag.
+///
+/// # Errors
+///
+/// Returns [`StatorError::TypeError`] when `is_regex && !has_global_flag`.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::string::string_replace_all_checked;
+///
+/// // String pattern — no flag check needed.
+/// assert_eq!(
+///     string_replace_all_checked("aabb", "a", "x", false, false).unwrap(),
+///     "xxbb"
+/// );
+///
+/// // Regex-like pattern *with* global flag → ok.
+/// assert_eq!(
+///     string_replace_all_checked("aabb", "a", "x", true, true).unwrap(),
+///     "xxbb"
+/// );
+///
+/// // Regex-like pattern *without* global flag → TypeError.
+/// assert!(string_replace_all_checked("aabb", "a", "x", true, false).is_err());
+/// ```
+pub fn string_replace_all_checked(
+    s: &str,
+    search: &str,
+    replacement: &str,
+    is_regex: bool,
+    has_global_flag: bool,
+) -> StatorResult<String> {
+    if is_regex && !has_global_flag {
+        return Err(StatorError::TypeError(
+            "String.prototype.replaceAll called with a non-global RegExp argument".to_string(),
+        ));
+    }
+    Ok(string_replace_all(s, search, replacement))
+}
+
+/// ECMAScript §22.1.3.18 `String.prototype.replaceAll` — functional replacer variant.
+///
+/// Like [`string_replace_all`] but instead of a static `replacement` string the
+/// caller provides a closure that receives `(matched, position, whole_string)`
+/// and returns the replacement text, mirroring the JS `replaceAll(search, fn)`
+/// overload.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::string::string_replace_all_functional;
+///
+/// let result = string_replace_all_functional("aXbXc", "X", |matched, pos, _whole| {
+///     format!("[{matched}@{pos}]")
+/// });
+/// assert_eq!(result, "a[X@1]b[X@3]c");
+/// ```
+pub fn string_replace_all_functional<F>(s: &str, search: &str, replacer: F) -> String
+where
+    F: Fn(&str, usize, &str) -> String,
+{
+    if search.is_empty() {
+        let units = encode_utf16(s);
+        let mut result = replacer("", 0, s);
+        let mut utf16_pos = 0;
+        for u in &units {
+            result.push_str(&decode_utf16(&[*u]));
+            utf16_pos += 1;
+            result.push_str(&replacer("", utf16_pos, s));
+        }
+        return result;
+    }
+
+    let search_units = encode_utf16(search);
+    let search_len = search_units.len();
+    let s_units = encode_utf16(s);
+    let mut result = String::new();
+    let mut cursor = 0usize; // byte cursor
+    let mut utf16_cursor = 0usize; // UTF-16 unit cursor
+
+    while let Some(relative_pos) = s[cursor..].find(search) {
+        let pos = cursor + relative_pos;
+        // Count UTF-16 code units for the skipped portion
+        let skipped = &s[cursor..pos];
+        utf16_cursor += encode_utf16(skipped).len();
+
+        result.push_str(skipped);
+        result.push_str(&replacer(search, utf16_cursor, s));
+
+        let end = pos + search.len();
+        cursor = end;
+        utf16_cursor += search_len;
+    }
+    result.push_str(&s[cursor..]);
+    // Suppress unused variable warning for s_units (used for semantics clarity).
+    let _ = s_units;
+    result
+}
+
 // ── match ─────────────────────────────────────────────────────────────────────
 
 /// ECMAScript §22.1.3.12 `String.prototype.match(regexp)` — non-global variant.
@@ -885,6 +991,37 @@ pub fn string_repeat(s: &str, count: i64) -> StatorResult<String> {
         ));
     }
     Ok(s.repeat(n))
+}
+
+/// ECMAScript §22.1.3.16 `String.prototype.repeat(count)` — `f64` overload.
+///
+/// Accepts the count as an `f64` so that `Infinity` and `NaN` are handled per
+/// spec: `Infinity` → `RangeError`, `NaN` → equivalent to `0`.
+///
+/// # Errors
+///
+/// Returns [`StatorError::RangeError`] if `count` is negative or `+Infinity`.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::string::string_repeat_f64;
+///
+/// assert_eq!(string_repeat_f64("ab", 3.0).unwrap(), "ababab");
+/// assert_eq!(string_repeat_f64("x", f64::NAN).unwrap(), "");
+/// assert!(string_repeat_f64("a", f64::INFINITY).is_err());
+/// assert!(string_repeat_f64("a", -1.0).is_err());
+/// ```
+pub fn string_repeat_f64(s: &str, count: f64) -> StatorResult<String> {
+    if count.is_nan() {
+        return string_repeat(s, 0);
+    }
+    if count.is_infinite() || count < 0.0 {
+        return Err(StatorError::RangeError(
+            "Invalid count value: must be non-negative and finite".to_string(),
+        ));
+    }
+    string_repeat(s, count as i64)
 }
 
 // ── padStart / padEnd ─────────────────────────────────────────────────────────
@@ -1024,16 +1161,6 @@ pub fn string_at(s: &str, index: i64) -> Option<String> {
 /// Returns a Unicode Normalization Form of `s`.  Accepted values for `form`
 /// are `"NFC"` (default), `"NFD"`, `"NFKC"`, and `"NFKD"`.
 ///
-/// # Current limitation
-///
-/// Full canonical decomposition / composition requires tables that are not
-/// bundled in this build.  For ASCII-only strings all four forms are identical,
-/// so those return the input unchanged.  For non-ASCII strings the current
-/// implementation returns the input string as-is (which is a valid NFC
-/// representation for all strings produced by Rust literals and most common
-/// inputs).  A future version should integrate a crate such as
-/// `unicode-normalization` to provide a complete implementation.
-///
 /// # Errors
 ///
 /// Returns [`StatorError::RangeError`] if `form` is not one of the four
@@ -1050,7 +1177,10 @@ pub fn string_at(s: &str, index: i64) -> Option<String> {
 /// ```
 pub fn string_normalize(s: &str, form: Option<&str>) -> StatorResult<String> {
     match form.unwrap_or("NFC") {
-        "NFC" | "NFD" | "NFKC" | "NFKD" => Ok(s.to_string()),
+        "NFC" => Ok(s.nfc().collect()),
+        "NFD" => Ok(s.nfd().collect()),
+        "NFKC" => Ok(s.nfkc().collect()),
+        "NFKD" => Ok(s.nfkd().collect()),
         f => Err(StatorError::RangeError(format!(
             "The normalization form should be one of NFC, NFD, NFKC, or NFKD; got \"{f}\""
         ))),
@@ -1112,6 +1242,39 @@ pub fn string_raw(raw_strings: &[&str], substitutions: &[&str]) -> String {
         }
     }
     result
+}
+
+/// ECMAScript §22.1.2.4 `String.raw(callSite, ...substitutions)` — checked variant.
+///
+/// Returns a [`StatorError::TypeError`] when the template object is `undefined`
+/// or `null` (represented here by `raw_strings` being `None`).  Otherwise
+/// behaves identically to [`string_raw`].
+///
+/// # Errors
+///
+/// Returns [`StatorError::TypeError`] when `raw_strings` is `None`.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::string::string_raw_checked;
+///
+/// assert_eq!(
+///     string_raw_checked(Some(&["a", "b"][..]), &["1"]).unwrap(),
+///     "a1b"
+/// );
+/// assert!(string_raw_checked(None, &[]).is_err());
+/// ```
+pub fn string_raw_checked(
+    raw_strings: Option<&[&str]>,
+    substitutions: &[&str],
+) -> StatorResult<String> {
+    match raw_strings {
+        None => Err(StatorError::TypeError(
+            "Cannot convert undefined or null to object".to_string(),
+        )),
+        Some(raw) => Ok(string_raw(raw, substitutions)),
+    }
 }
 
 // ── isWellFormed ──────────────────────────────────────────────────────────────
@@ -2446,5 +2609,352 @@ mod tests {
     #[test]
     fn test_to_locale_upper_case_unicode() {
         assert_eq!(string_to_locale_upper_case("café"), "CAFÉ");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Deep conformance tests (35+ e2e edge-case tests)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── replaceAll conformance ────────────────────────────────────────────────
+
+    #[test]
+    fn test_replace_all_checked_regex_without_global_throws() {
+        let r = string_replace_all_checked("abc", "a", "x", true, false);
+        assert!(matches!(r, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn test_replace_all_checked_regex_with_global_ok() {
+        let r = string_replace_all_checked("aabb", "a", "x", true, true).unwrap();
+        assert_eq!(r, "xxbb");
+    }
+
+    #[test]
+    fn test_replace_all_checked_string_pattern_ignores_flags() {
+        let r = string_replace_all_checked("aabb", "a", "x", false, false).unwrap();
+        assert_eq!(r, "xxbb");
+    }
+
+    #[test]
+    fn test_replace_all_functional_basic() {
+        let result =
+            string_replace_all_functional("aXbXc", "X", |m, pos, _| format!("[{m}@{pos}]"));
+        assert_eq!(result, "a[X@1]b[X@3]c");
+    }
+
+    #[test]
+    fn test_replace_all_functional_empty_search() {
+        let result = string_replace_all_functional("ab", "", |_m, pos, _| format!("{pos}"));
+        // Between every char and at both ends: "0" + "a" + "1" + "b" + "2"
+        assert_eq!(result, "0a1b2");
+    }
+
+    #[test]
+    fn test_replace_all_functional_no_match() {
+        let result = string_replace_all_functional("hello", "xyz", |_, _, _| "!".to_string());
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_replace_all_functional_whole_string_match() {
+        let result = string_replace_all_functional("aa", "aa", |_, _, _| "bb".to_string());
+        assert_eq!(result, "bb");
+    }
+
+    #[test]
+    fn test_replace_all_dollar_ampersand_substitution() {
+        // $& refers to the matched substring
+        assert_eq!(string_replace_all("abab", "ab", "[$&]"), "[ab][ab]");
+    }
+
+    #[test]
+    fn test_replace_all_dollar_backtick_substitution() {
+        // $` refers to the text before the match
+        assert_eq!(string_replace_all("XaX", "a", "[$`]"), "X[X]X");
+    }
+
+    #[test]
+    fn test_replace_all_dollar_tick_substitution() {
+        // $' refers to the text after the match
+        assert_eq!(string_replace_all("XaY", "a", "[$']"), "X[Y]Y");
+    }
+
+    // ── String.raw conformance ───────────────────────────────────────────────
+
+    #[test]
+    fn test_raw_empty_template() {
+        assert_eq!(string_raw(&[], &[]), "");
+    }
+
+    #[test]
+    fn test_raw_single_segment_no_substitution() {
+        assert_eq!(string_raw(&["hello"], &[]), "hello");
+    }
+
+    #[test]
+    fn test_raw_preserves_backslash_sequences() {
+        assert_eq!(string_raw(&["a\\nb"], &[]), "a\\nb");
+    }
+
+    #[test]
+    fn test_raw_extra_substitutions_ignored() {
+        // More substitutions than gaps → extras are silently ignored.
+        assert_eq!(string_raw(&["a", "b"], &["1", "2", "3"]), "a1b");
+    }
+
+    #[test]
+    fn test_raw_fewer_substitutions_than_gaps() {
+        // Fewer substitutions than gaps → missing ones produce no output.
+        assert_eq!(string_raw(&["a", "b", "c"], &["1"]), "a1bc");
+    }
+
+    #[test]
+    fn test_raw_checked_null_template_throws() {
+        assert!(matches!(
+            string_raw_checked(None, &[]),
+            Err(StatorError::TypeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_raw_checked_valid_template() {
+        assert_eq!(
+            string_raw_checked(Some(&["x", "y"]), &["+"]).unwrap(),
+            "x+y"
+        );
+    }
+
+    #[test]
+    fn test_raw_unicode_segments() {
+        assert_eq!(string_raw(&["café", "naïve"], &[" & "]), "café & naïve");
+    }
+
+    // ── normalize conformance ────────────────────────────────────────────────
+
+    #[test]
+    fn test_normalize_nfd_decomposes_accented() {
+        // é (U+00E9) decomposes to e (U+0065) + combining acute (U+0301) in NFD
+        let composed = "\u{00E9}";
+        let decomposed = string_normalize(composed, Some("NFD")).unwrap();
+        assert_eq!(decomposed, "e\u{0301}");
+        assert_ne!(composed, &decomposed);
+    }
+
+    #[test]
+    fn test_normalize_nfc_recomposes() {
+        let decomposed = "e\u{0301}";
+        let composed = string_normalize(decomposed, Some("NFC")).unwrap();
+        assert_eq!(composed, "\u{00E9}");
+    }
+
+    #[test]
+    fn test_normalize_nfkd_compatibility_decomposition() {
+        // ﬁ (U+FB01) decomposes to "fi" in NFKD
+        let ligature = "\u{FB01}";
+        let decomposed = string_normalize(ligature, Some("NFKD")).unwrap();
+        assert_eq!(decomposed, "fi");
+    }
+
+    #[test]
+    fn test_normalize_nfkc_compatibility_composition() {
+        // ﬁ (U+FB01) → "fi" in NFKC as well
+        let ligature = "\u{FB01}";
+        let composed = string_normalize(ligature, Some("NFKC")).unwrap();
+        assert_eq!(composed, "fi");
+    }
+
+    #[test]
+    fn test_normalize_default_is_nfc() {
+        let decomposed = "e\u{0301}";
+        assert_eq!(
+            string_normalize(decomposed, None).unwrap(),
+            string_normalize(decomposed, Some("NFC")).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_normalize_ascii_is_identity() {
+        for form in &["NFC", "NFD", "NFKC", "NFKD"] {
+            assert_eq!(string_normalize("hello", Some(form)).unwrap(), "hello");
+        }
+    }
+
+    #[test]
+    fn test_normalize_empty_string() {
+        assert_eq!(string_normalize("", None).unwrap(), "");
+    }
+
+    // ── localeCompare conformance ────────────────────────────────────────────
+
+    #[test]
+    fn test_locale_compare_equal_strings() {
+        assert_eq!(string_locale_compare("abc", "abc"), 0);
+    }
+
+    #[test]
+    fn test_locale_compare_empty_strings() {
+        assert_eq!(string_locale_compare("", ""), 0);
+    }
+
+    #[test]
+    fn test_locale_compare_less_than() {
+        assert!(string_locale_compare("a", "b") < 0);
+    }
+
+    #[test]
+    fn test_locale_compare_greater_than() {
+        assert!(string_locale_compare("b", "a") > 0);
+    }
+
+    #[test]
+    fn test_locale_compare_prefix() {
+        assert!(string_locale_compare("ab", "abc") < 0);
+    }
+
+    // ── toLocaleLowerCase / toLocaleUpperCase conformance ─────────────────────
+
+    #[test]
+    fn test_to_locale_lower_case_empty() {
+        assert_eq!(string_to_locale_lower_case(""), "");
+    }
+
+    #[test]
+    fn test_to_locale_upper_case_empty() {
+        assert_eq!(string_to_locale_upper_case(""), "");
+    }
+
+    #[test]
+    fn test_to_locale_lower_case_already_lower() {
+        assert_eq!(string_to_locale_lower_case("hello"), "hello");
+    }
+
+    #[test]
+    fn test_to_locale_upper_case_already_upper() {
+        assert_eq!(string_to_locale_upper_case("HELLO"), "HELLO");
+    }
+
+    // ── padStart / padEnd edge cases ─────────────────────────────────────────
+
+    #[test]
+    fn test_pad_start_empty_fill_returns_original() {
+        assert_eq!(string_pad_start("abc", 10, Some("")).unwrap(), "abc");
+    }
+
+    #[test]
+    fn test_pad_end_empty_fill_returns_original() {
+        assert_eq!(string_pad_end("abc", 10, Some("")).unwrap(), "abc");
+    }
+
+    #[test]
+    fn test_pad_start_target_equals_length() {
+        assert_eq!(string_pad_start("abc", 3, Some("0")).unwrap(), "abc");
+    }
+
+    #[test]
+    fn test_pad_end_target_equals_length() {
+        assert_eq!(string_pad_end("abc", 3, Some("0")).unwrap(), "abc");
+    }
+
+    #[test]
+    fn test_pad_start_fill_truncated() {
+        // Need 2 chars of padding, fill is "abc" → take "ab"
+        assert_eq!(string_pad_start("x", 3, Some("abc")).unwrap(), "abx");
+    }
+
+    #[test]
+    fn test_pad_end_fill_truncated() {
+        assert_eq!(string_pad_end("x", 3, Some("abc")).unwrap(), "xab");
+    }
+
+    #[test]
+    fn test_pad_start_unicode_fill() {
+        // "5" padded to 5 with "😀" (2 UTF-16 units each)
+        let r = string_pad_start("5", 5, Some("😀")).unwrap();
+        assert_eq!(utf16_len(&r), 5);
+    }
+
+    #[test]
+    fn test_pad_end_zero_target() {
+        assert_eq!(string_pad_end("hello", 0, None).unwrap(), "hello");
+    }
+
+    // ── repeat edge cases ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_repeat_empty_string_returns_empty() {
+        assert_eq!(string_repeat("", 1000).unwrap(), "");
+    }
+
+    #[test]
+    fn test_repeat_one() {
+        assert_eq!(string_repeat("abc", 1).unwrap(), "abc");
+    }
+
+    #[test]
+    fn test_repeat_f64_infinity_is_range_error() {
+        assert!(matches!(
+            string_repeat_f64("a", f64::INFINITY),
+            Err(StatorError::RangeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_repeat_f64_neg_infinity_is_range_error() {
+        assert!(matches!(
+            string_repeat_f64("a", f64::NEG_INFINITY),
+            Err(StatorError::RangeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_repeat_f64_nan_is_zero() {
+        assert_eq!(string_repeat_f64("abc", f64::NAN).unwrap(), "");
+    }
+
+    #[test]
+    fn test_repeat_f64_negative_is_range_error() {
+        assert!(matches!(
+            string_repeat_f64("a", -1.0),
+            Err(StatorError::RangeError(_))
+        ));
+    }
+
+    #[test]
+    fn test_repeat_f64_fractional_truncates() {
+        // 2.9 → 2 as i64
+        assert_eq!(string_repeat_f64("ab", 2.9).unwrap(), "abab");
+    }
+
+    // ── at edge cases ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_at_empty_string() {
+        assert_eq!(string_at("", 0), None);
+    }
+
+    #[test]
+    fn test_at_negative_wraps_around() {
+        assert_eq!(string_at("abcde", -2), Some("d".to_string()));
+    }
+
+    #[test]
+    fn test_at_negative_exactly_length() {
+        // -5 on "abcde" (length 5) → index 0 → "a"
+        assert_eq!(string_at("abcde", -5), Some("a".to_string()));
+    }
+
+    #[test]
+    fn test_at_negative_beyond_length() {
+        assert_eq!(string_at("abcde", -6), None);
+    }
+
+    #[test]
+    fn test_at_emoji_surrogate_pair() {
+        // "😀" is 2 UTF-16 code units; at(0) returns the high surrogate char,
+        // at(-1) returns the low surrogate char.
+        let s = "😀";
+        assert!(string_at(s, 0).is_some());
+        assert!(string_at(s, 1).is_some());
+        assert_eq!(string_at(s, 2), None);
     }
 }
