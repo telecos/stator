@@ -59185,4 +59185,417 @@ mod tests {
     fn e2e_w21f_typed_array_length() {
         assert_e2e_true("var ta = new Int32Array(5); ta.length === 5");
     }
+
+    // ── Strict mode comprehensive conformance (w22j) ─────────────────────
+
+    fn assert_eval_reference_error(script: &str) {
+        assert!(
+            matches!(global_eval(script), Err(StatorError::ReferenceError(_))),
+            "expected ReferenceError for: {script}"
+        );
+    }
+
+    // 1. "use strict" directive prologue — must be first statement
+
+    /// Global "use strict" directive enables strict semantics.
+    #[test]
+    fn e2e_w22j_use_strict_global_directive() {
+        assert_eval_syntax_error("\"use strict\"; with ({}) {}");
+    }
+
+    /// "use strict" with single quotes is also recognised.
+    #[test]
+    fn e2e_w22j_use_strict_single_quotes() {
+        assert_eval_syntax_error("'use strict'; with ({}) {}");
+    }
+
+    /// A non-directive statement before "use strict" means it is NOT a directive.
+    #[test]
+    fn e2e_w22j_use_strict_not_prologue_after_expression() {
+        // `with` should succeed because "use strict" comes after a regular statement.
+        let result = global_eval("var x = 1; 'use strict'; with ({a:42}) { a }");
+        assert!(result.is_ok(), "should not be strict: {result:?}");
+    }
+
+    // 2. Assignment to undeclared variable throws ReferenceError
+
+    /// Strict mode: assigning to undeclared variable is ReferenceError.
+    #[test]
+    fn e2e_w22j_strict_assign_undeclared_reference_error() {
+        assert_eval_reference_error("'use strict'; undeclaredVar = 1;");
+    }
+
+    /// Sloppy mode: assigning to undeclared variable creates a global.
+    #[test]
+    fn e2e_w22j_sloppy_assign_undeclared_ok() {
+        let result = global_eval("(function(){ implicitGlobal = 42; return implicitGlobal; })()");
+        assert!(result.is_ok());
+    }
+
+    // 3. delete on variable/function/argument throws SyntaxError
+
+    /// Strict mode: `delete` on a variable is SyntaxError.
+    #[test]
+    fn e2e_w22j_strict_delete_variable_syntax_error() {
+        assert_eval_syntax_error("'use strict'; var x = 1; delete x;");
+    }
+
+    /// Strict mode: `delete` on a function name is SyntaxError.
+    #[test]
+    fn e2e_w22j_strict_delete_function_syntax_error() {
+        assert_eval_syntax_error("'use strict'; function f() {} delete f;");
+    }
+
+    /// Strict mode: `delete` on a parameter is SyntaxError.
+    #[test]
+    fn e2e_w22j_strict_delete_parameter_syntax_error() {
+        assert_eval_syntax_error("'use strict'; function f(a) { delete a; }");
+    }
+
+    /// Sloppy mode: `delete` on a variable is allowed (returns false).
+    #[test]
+    fn e2e_w22j_sloppy_delete_variable_ok() {
+        let result = global_eval("var x = 1; delete x");
+        assert!(result.is_ok());
+    }
+
+    // 4. Duplicate parameter names throw SyntaxError
+
+    /// Strict mode: duplicate parameter names are rejected.
+    #[test]
+    fn e2e_w22j_strict_duplicate_params_syntax_error() {
+        assert_eval_syntax_error("'use strict'; function f(a, a) {}");
+    }
+
+    /// Function body directive: duplicate params also rejected.
+    #[test]
+    fn e2e_w22j_strict_duplicate_params_fn_body_directive() {
+        assert_eval_syntax_error("function f(a, a) { 'use strict'; }");
+    }
+
+    /// Sloppy mode: duplicate params are allowed.
+    #[test]
+    fn e2e_w22j_sloppy_duplicate_params_ok() {
+        let result = global_eval("function f(a, a) { return a; } f(1, 2)");
+        assert_eq!(result.unwrap(), JsValue::Smi(2));
+    }
+
+    // 5. `with` statement throws SyntaxError
+
+    /// Strict mode: `with` is a SyntaxError (double-quote directive).
+    #[test]
+    fn e2e_w22j_strict_with_syntax_error_dq() {
+        assert_eval_syntax_error("\"use strict\"; with ({x:1}) { x }");
+    }
+
+    /// Strict mode: `with` is SyntaxError inside a strict function.
+    #[test]
+    fn e2e_w22j_strict_with_in_function_syntax_error() {
+        assert_eval_syntax_error("function f() { 'use strict'; with ({}) {} }");
+    }
+
+    /// Sloppy mode: `with` works fine.
+    #[test]
+    fn e2e_w22j_sloppy_with_ok() {
+        let result = global_eval("var r; with ({x:99}) { r = x; } r").unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    // 6. arguments.callee throws TypeError
+
+    /// Strict mode: `arguments.callee` throws TypeError.
+    #[test]
+    fn e2e_w22j_strict_arguments_callee_type_error() {
+        assert_eval_type_error("function f() { 'use strict'; return arguments.callee; } f()");
+    }
+
+    /// Strict mode: `arguments['callee']` also throws TypeError.
+    #[test]
+    fn e2e_w22j_strict_arguments_callee_computed_type_error() {
+        assert_eval_type_error("function f() { 'use strict'; return arguments['callee']; } f()");
+    }
+
+    /// Sloppy mode: `arguments.callee` returns the function itself.
+    #[test]
+    fn e2e_w22j_sloppy_arguments_callee_ok() {
+        assert_eval_true("function f() { return arguments.callee === f; } f()");
+    }
+
+    // 7. Octal literals throw SyntaxError
+
+    /// Strict mode: legacy octal literal `0123` is SyntaxError.
+    #[test]
+    fn e2e_w22j_strict_octal_literal_syntax_error() {
+        assert_eval_syntax_error("'use strict'; 0123;");
+    }
+
+    /// Strict mode: octal escape in string `\"\\1\"` is SyntaxError.
+    #[test]
+    fn e2e_w22j_strict_octal_escape_string_syntax_error() {
+        assert_eval_syntax_error("'use strict'; '\\1';");
+    }
+
+    /// Sloppy mode: legacy octal literal is fine.
+    #[test]
+    fn e2e_w22j_sloppy_octal_literal_ok() {
+        let result = global_eval("0123").unwrap();
+        assert_eq!(result, JsValue::Smi(83));
+    }
+
+    /// Strict mode: `0o` prefix octal is always allowed (ES2015+).
+    #[test]
+    fn e2e_w22j_strict_0o_octal_ok() {
+        let result = global_eval("'use strict'; 0o123").unwrap();
+        assert_eq!(result, JsValue::Smi(83));
+    }
+
+    // 8. eval and arguments can't be assigned to
+
+    /// Strict mode: `eval = 1` is SyntaxError.
+    #[test]
+    fn e2e_w22j_strict_assign_eval_syntax_error() {
+        assert_eval_syntax_error("'use strict'; eval = 1;");
+    }
+
+    /// Strict mode: `arguments = 1` is SyntaxError.
+    #[test]
+    fn e2e_w22j_strict_assign_arguments_syntax_error() {
+        assert_eval_syntax_error("'use strict'; arguments = 1;");
+    }
+
+    /// Strict mode: `eval++` is SyntaxError.
+    #[test]
+    fn e2e_w22j_strict_update_eval_syntax_error() {
+        assert_eval_syntax_error("'use strict'; eval++;");
+    }
+
+    /// Strict mode: `arguments--` is SyntaxError.
+    #[test]
+    fn e2e_w22j_strict_update_arguments_syntax_error() {
+        assert_eval_syntax_error("'use strict'; arguments--;");
+    }
+
+    // 9. `this` in function call is undefined (not global)
+
+    /// Strict mode: `this` in a plain function call is `undefined`.
+    #[test]
+    fn e2e_w22j_strict_this_undefined_in_function() {
+        assert_eval_true("function f() { 'use strict'; return this === undefined; } f()");
+    }
+
+    /// Sloppy mode: `this` in a plain function call is the global object.
+    #[test]
+    fn e2e_w22j_sloppy_this_is_global_in_function() {
+        assert_eval_true("function f() { return this === globalThis; } f()");
+    }
+
+    /// Strict mode: `this` inside eval inside strict function is `undefined`.
+    #[test]
+    fn e2e_w22j_strict_this_undefined_via_eval() {
+        assert_eval_true("function f() { 'use strict'; return eval('this') === undefined; } f()");
+    }
+
+    // 10. Class bodies are always strict
+
+    /// Class body: `with` inside a class method is rejected.
+    #[test]
+    fn e2e_w22j_class_body_rejects_with() {
+        assert_eval_syntax_error("class C { m() { with ({}) {} } }");
+    }
+
+    /// Class body: octal literal inside class method is rejected.
+    #[test]
+    fn e2e_w22j_class_body_rejects_octal() {
+        assert_eval_syntax_error("class C { m() { return 0123; } }");
+    }
+
+    /// Class body: duplicate params in class method rejected.
+    #[test]
+    fn e2e_w22j_class_body_rejects_duplicate_params() {
+        assert_eval_syntax_error("class C { m(a, a) {} }");
+    }
+
+    /// Class body: `delete x` on identifier inside class method rejected.
+    #[test]
+    fn e2e_w22j_class_body_rejects_delete_ident() {
+        assert_eval_syntax_error("class C { m() { var x; delete x; } }");
+    }
+
+    // 11. Module code is always strict
+
+    /// Module parsing: `with` rejected in module source.
+    #[test]
+    fn e2e_w22j_module_rejects_with() {
+        let result = crate::parser::parse_module("with ({}) {}");
+        assert!(result.is_err(), "module should reject with statement");
+    }
+
+    /// Module parsing: octal literal rejected in module source.
+    #[test]
+    fn e2e_w22j_module_rejects_octal() {
+        let result = crate::parser::parse_module("var x = 0123;");
+        assert!(result.is_err(), "module should reject legacy octal");
+    }
+
+    // 12. Writing to read-only property throws TypeError
+
+    /// Strict mode: writing to a non-writable property throws TypeError.
+    #[test]
+    fn e2e_w22j_strict_write_readonly_type_error() {
+        assert_eval_type_error(
+            "'use strict'; var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1, writable: false}); \
+             o.x = 2;",
+        );
+    }
+
+    /// Strict mode: writing to frozen object throws TypeError.
+    #[test]
+    fn e2e_w22j_strict_write_frozen_type_error() {
+        assert_eval_type_error("'use strict'; var o = {x:1}; Object.freeze(o); o.x = 2;");
+    }
+
+    /// Sloppy mode: writing to non-writable silently fails.
+    #[test]
+    fn e2e_w22j_sloppy_write_readonly_silent() {
+        let result = global_eval(
+            "var o = {}; Object.defineProperty(o, 'x', {value:1, writable:false}); o.x = 2; o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    // 13. Deleting non-configurable property throws TypeError
+
+    /// Strict mode: deleting a non-configurable property throws TypeError.
+    #[test]
+    fn e2e_w22j_strict_delete_nonconfigurable_type_error() {
+        assert_eval_type_error(
+            "'use strict'; var o = {}; \
+             Object.defineProperty(o, 'x', {value:1, configurable:false}); \
+             delete o.x;",
+        );
+    }
+
+    /// Sloppy mode: deleting non-configurable returns false.
+    #[test]
+    fn e2e_w22j_sloppy_delete_nonconfigurable_returns_false() {
+        let result = global_eval(
+            "var o = {}; Object.defineProperty(o, 'x', {value:1, configurable:false}); delete o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // 14. "use strict" in function body — only that function is strict
+
+    /// Function-level strict mode does not leak to the enclosing scope.
+    #[test]
+    fn e2e_w22j_strict_function_body_scoped() {
+        // The outer function is sloppy, inner is strict.
+        assert_eval_true(
+            "function outer() { \
+               function inner() { 'use strict'; return this === undefined; } \
+               return inner() && this === globalThis; \
+             } outer()",
+        );
+    }
+
+    /// Function-level strict mode: `with` rejected in strict function only.
+    #[test]
+    fn e2e_w22j_strict_fn_body_with_rejected() {
+        assert_eval_syntax_error("function f() { 'use strict'; with ({}) {} }");
+    }
+
+    /// Non-strict outer function: `with` is fine.
+    #[test]
+    fn e2e_w22j_sloppy_fn_with_ok() {
+        let result = global_eval("function f() { with ({val:7}) { return val; } } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    // ── Additional strict mode edge cases ────────────────────────────────
+
+    /// Strict mode: adding property to non-extensible object throws TypeError.
+    #[test]
+    fn e2e_w22j_strict_non_extensible_add_prop_type_error() {
+        assert_eval_type_error(
+            "'use strict'; var o = {}; Object.preventExtensions(o); o.newProp = 1;",
+        );
+    }
+
+    /// Strict mode: sealed object rejects new property with TypeError.
+    #[test]
+    fn e2e_w22j_strict_sealed_new_prop_type_error() {
+        assert_eval_type_error("'use strict'; var o = {x:1}; Object.seal(o); o.y = 2;");
+    }
+
+    /// Strict mode: sealed object allows modifying existing writable property.
+    #[test]
+    fn e2e_w22j_strict_sealed_modify_existing_ok() {
+        let result =
+            global_eval("'use strict'; var o = {x:1}; Object.seal(o); o.x = 99; o.x").unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    /// Strict unmapped arguments: mutation of arguments[0] doesn't affect param.
+    #[test]
+    fn e2e_w22j_strict_unmapped_arguments_no_link() {
+        let result =
+            global_eval("function f(a) { 'use strict'; arguments[0] = 7; return a; } f(1)")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// Strict mode: param assignment doesn't update arguments object.
+    #[test]
+    fn e2e_w22j_strict_unmapped_arguments_reverse() {
+        let result =
+            global_eval("function f(a) { 'use strict'; a = 9; return arguments[0]; } f(1)")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// Strict eval: var declaration doesn't leak to outer scope.
+    #[test]
+    fn e2e_w22j_strict_eval_var_no_leak() {
+        let result = global_eval(
+            "function f() { eval('\"use strict\"; var hidden = 5'); return typeof hidden; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    /// Global strict: assignment to undeclared inside a function body.
+    #[test]
+    fn e2e_w22j_strict_fn_undeclared_assign_reference_error() {
+        assert_eval_reference_error("function f() { 'use strict'; noSuchVar = 42; } f()");
+    }
+
+    /// Strict mode in nested function doesn't affect outer sloppy function.
+    #[test]
+    fn e2e_w22j_nested_strict_does_not_propagate_up() {
+        // Outer is sloppy: `with` should work. Inner is strict.
+        let result = global_eval(
+            "function outer() { \
+               function inner() { 'use strict'; return 10; } \
+               var r; with ({val:5}) { r = val; } \
+               return r + inner(); \
+             } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(15));
+    }
+
+    /// Strict mode: `delete` on a property expression is allowed.
+    #[test]
+    fn e2e_w22j_strict_delete_property_ok() {
+        assert_eval_true("'use strict'; var o = {x:1}; delete o.x; !('x' in o)");
+    }
+
+    /// Strict mode: `delete` on computed property expression is allowed.
+    #[test]
+    fn e2e_w22j_strict_delete_computed_property_ok() {
+        assert_eval_true("'use strict'; var o = {x:1}; delete o['x']; !('x' in o)");
+    }
 }
