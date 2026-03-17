@@ -344,24 +344,136 @@ fn parse_int_digits(digits: &str, radix: u32) -> f64 {
         .unwrap_or(f64::NAN)
 }
 
-fn round_to_fixed_integer(value: f64, digits: u32) -> BigUint {
+fn decompose_finite_positive(value: f64) -> (u64, i32) {
     let bits = value.to_bits();
     let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
     let fraction_bits = bits & ((1_u64 << 52) - 1);
-    let (mantissa, exponent) = if exponent_bits == 0 {
+    if exponent_bits == 0 {
         (fraction_bits, -1074)
     } else {
         ((1_u64 << 52) | fraction_bits, exponent_bits - 1075)
-    };
-
-    let scaled_numerator = BigUint::from(mantissa) * BigUint::from(5_u8).pow(digits);
-    let binary_shift = exponent + digits as i32;
-    if binary_shift >= 0 {
-        scaled_numerator << binary_shift as usize
-    } else {
-        let denominator = BigUint::from(1_u8) << (-binary_shift as usize);
-        ((&scaled_numerator << 1) + &denominator) / (denominator << 1)
     }
+}
+
+fn round_to_decimal_integer(value: f64, decimal_shift: i32) -> BigUint {
+    if value == 0.0 {
+        return BigUint::default();
+    }
+
+    let (mantissa, binary_exponent) = decompose_finite_positive(value);
+    let mut numerator = BigUint::from(mantissa);
+    let mut denominator = BigUint::from(1_u8);
+
+    if decimal_shift >= 0 {
+        numerator *= BigUint::from(5_u8).pow(decimal_shift as u32);
+    } else {
+        denominator *= BigUint::from(5_u8).pow((-decimal_shift) as u32);
+    }
+
+    let binary_shift = binary_exponent + decimal_shift;
+    if binary_shift >= 0 {
+        numerator <<= binary_shift as usize;
+    } else {
+        denominator <<= (-binary_shift) as usize;
+    }
+
+    let mut rounded = &numerator / &denominator;
+    let remainder = numerator % &denominator;
+    if (remainder << 1usize) >= denominator {
+        rounded += BigUint::from(1_u8);
+    }
+    rounded
+}
+
+fn round_to_fixed_integer(value: f64, digits: u32) -> BigUint {
+    round_to_decimal_integer(value, digits as i32)
+}
+
+fn decimal_exponent(value: f64) -> i32 {
+    let text = number_to_string(value);
+    if let Some(pos) = text.find('e') {
+        return text[pos + 1..].parse().unwrap_or(0);
+    }
+
+    if let Some(pos) = text.find('.') {
+        if let Some(fraction) = text.strip_prefix("0.") {
+            let leading_zero_count = fraction.bytes().take_while(|digit| *digit == b'0').count();
+            return -((leading_zero_count as i32) + 1);
+        }
+        return pos as i32 - 1;
+    }
+
+    text.len() as i32 - 1
+}
+
+fn format_exponential_digits(digits: &str, exponent: i32) -> String {
+    let mut chars = digits.chars();
+    let first = chars.next().unwrap_or('0');
+    let rest: String = chars.collect();
+    let exponent_sign = if exponent >= 0 { '+' } else { '-' };
+    let exponent_magnitude = exponent.unsigned_abs();
+    if rest.is_empty() {
+        format!("{first}e{exponent_sign}{exponent_magnitude}")
+    } else {
+        format!("{first}.{rest}e{exponent_sign}{exponent_magnitude}")
+    }
+}
+
+fn pad_significant_digits(mut digits: String, width: usize) -> String {
+    while digits.len() < width {
+        digits.insert(0, '0');
+    }
+    digits
+}
+
+fn pow10_biguint(power: usize) -> BigUint {
+    BigUint::from(10_u8).pow(power as u32)
+}
+
+fn format_precision_digits(digits: &str, exponent: i32, precision: u32) -> String {
+    if exponent < -6 || exponent >= precision as i32 {
+        return format_exponential_digits(digits, exponent);
+    }
+
+    if exponent >= 0 {
+        let integer_len = exponent as usize + 1;
+        if integer_len >= digits.len() {
+            let mut out = digits.to_string();
+            out.push_str(&"0".repeat(integer_len - digits.len()));
+            out
+        } else {
+            format!("{}.{}", &digits[..integer_len], &digits[integer_len..])
+        }
+    } else {
+        format!("0.{}{}", "0".repeat((-exponent - 1) as usize), digits)
+    }
+}
+
+fn format_zero_precision(precision: u32) -> String {
+    if precision == 1 {
+        "0".to_string()
+    } else {
+        format!("0.{}", "0".repeat((precision - 1) as usize))
+    }
+}
+
+fn rounded_significant_digits(value: f64, precision: u32) -> (String, i32) {
+    let mut exponent = decimal_exponent(value);
+    let mut rounded = round_to_decimal_integer(value, precision as i32 - 1 - exponent);
+    if rounded == pow10_biguint(precision as usize) {
+        rounded /= 10_u8;
+        exponent += 1;
+    }
+
+    (
+        pad_significant_digits(rounded.to_str_radix(10), precision as usize),
+        exponent,
+    )
+}
+
+fn rounded_exponential_digits(value: f64, fraction_digits: u32) -> (String, i32) {
+    let significant_digits = fraction_digits + 1;
+    rounded_significant_digits(value, significant_digits)
 }
 
 fn format_fixed_digits(integer: BigUint, digits: u32) -> String {
@@ -413,66 +525,16 @@ pub fn number_to_precision(value: f64, precision: u32) -> StatorResult<String> {
             "-Infinity".to_string()
         });
     }
-    Ok(
-        format!("{:.prec$e}", value, prec = (precision as usize) - 1)
-            .pipe(|s| normalize_precision_output(&s, value, precision)),
-    )
-}
-
-/// Converts the raw `{:.Ne}` Rust output to ECMAScript `toPrecision` format.
-fn normalize_precision_output(exp_str: &str, value: f64, precision: u32) -> String {
-    // Parse the Rust exponential string "m.nnnne±exp"
-    let (mantissa_str, exp_part) = if let Some(pos) = exp_str.find('e') {
-        (&exp_str[..pos], &exp_str[pos + 1..])
-    } else {
-        return format!("{:.prec$}", value, prec = (precision as usize) - 1);
-    };
-
-    let exponent: i32 = exp_part.parse().unwrap_or(0);
-
-    // Collect significant digits from mantissa (strip the decimal point).
-    let digits: String = mantissa_str
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '-')
-        .collect();
-
-    let negative = digits.starts_with('-');
-    let digits: String = digits.chars().filter(|c| c.is_ascii_digit()).collect();
-
-    // Pad or truncate to exactly `precision` significant digits.
-    let mut sig: Vec<char> = digits.chars().take(precision as usize).collect();
-    while sig.len() < precision as usize {
-        sig.push('0');
+    if value == 0.0 {
+        return Ok(format_zero_precision(precision));
     }
 
-    let p = precision as i32;
-    // e is 0-based: position of the decimal point relative to sig[0].
-    // exponent from Rust's `e` format = position of first significant digit.
-    let e = exponent;
-
-    let sign = if negative { "-" } else { "" };
-
-    if e >= 0 && e < p {
-        // Fixed notation: insert decimal point at position e+1.
-        let int_digits: String = sig[..=(e as usize)].iter().collect();
-        let frac_digits: String = sig[(e as usize) + 1..].iter().collect();
-        if frac_digits.is_empty() {
-            format!("{sign}{int_digits}")
-        } else {
-            format!("{sign}{int_digits}.{frac_digits}")
-        }
-    } else if e >= p {
-        // Large integer: append zeros.
-        let all_digits: String = sig.iter().collect();
-        let zeros = "0".repeat((e - p + 1) as usize);
-        format!("{sign}{all_digits}{zeros}")
-    } else {
-        // Small fraction: prepend "0.00..."
-        let leading_zeros = (-e - 1) as usize;
-        let all_digits: String = sig.iter().collect();
-        let zeroes = "0".repeat(leading_zeros);
-        format!("{sign}0.{zeroes}{all_digits}")
-    }
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    let (digits, exponent) = rounded_significant_digits(value.abs(), precision);
+    Ok(format!(
+        "{sign}{}",
+        format_precision_digits(&digits, exponent, precision)
+    ))
 }
 
 // ── Number.prototype.toExponential ────────────────────────────────────────────
@@ -508,10 +570,17 @@ pub fn number_to_exponential(value: f64, fraction_digits: u32) -> StatorResult<S
             "-Infinity".to_string()
         });
     }
+    if value == 0.0 {
+        let digits = format!("0{}", "0".repeat(fraction_digits as usize));
+        return Ok(format_exponential_digits(&digits, 0));
+    }
 
-    // Use Rust's `{:.Ne}` format and then rewrite the exponent to ECMAScript style.
-    let raw = format!("{:.prec$e}", value, prec = fraction_digits as usize);
-    Ok(number_reformat_exponential(&raw))
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    let (digits, exponent) = rounded_exponential_digits(value.abs(), fraction_digits);
+    Ok(format!(
+        "{sign}{}",
+        format_exponential_digits(&digits, exponent)
+    ))
 }
 
 /// Converts Rust's `{:e}` output (e.g. `"1.23e5"`) to ECMAScript exponential
@@ -607,20 +676,6 @@ fn int_to_string_radix(n: i64, radix: u32) -> String {
     }
     buf.reverse();
     String::from_utf8(buf).unwrap_or_default()
-}
-
-// ── Helper trait for method chaining ─────────────────────────────────────────
-
-/// Internal convenience trait for chaining method calls on `String`.
-trait Pipe: Sized {
-    /// Apply `f` to `self` and return the result.
-    fn pipe<F: FnOnce(Self) -> Self>(self, f: F) -> Self;
-}
-
-impl Pipe for String {
-    fn pipe<F: FnOnce(Self) -> Self>(self, f: F) -> Self {
-        f(self)
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -990,6 +1045,26 @@ mod tests {
         assert_eq!(number_to_precision(1000.0, 4).unwrap(), "1000");
     }
 
+    #[test]
+    fn test_to_precision_switches_to_exponential_for_tiny_values() {
+        assert_eq!(number_to_precision(1e-7, 1).unwrap(), "1e-7");
+    }
+
+    #[test]
+    fn test_to_precision_stays_fixed_at_negative_six_exponent() {
+        assert_eq!(number_to_precision(1e-6, 1).unwrap(), "0.000001");
+    }
+
+    #[test]
+    fn test_to_precision_rounds_exact_half_up() {
+        assert_eq!(number_to_precision(12.5, 2).unwrap(), "13");
+    }
+
+    #[test]
+    fn test_to_precision_zero_padding() {
+        assert_eq!(number_to_precision(0.0, 4).unwrap(), "0.000");
+    }
+
     // ── Number.prototype.toString(radix) ────────────────────────────────
 
     #[test]
@@ -1117,6 +1192,22 @@ mod tests {
     fn test_to_exponential_negative() {
         let s = number_to_exponential(0.001, 2).unwrap();
         assert_eq!(s, "1.00e-3");
+    }
+
+    #[test]
+    fn test_to_exponential_rounds_exact_half_up() {
+        assert_eq!(number_to_exponential(1.25, 1).unwrap(), "1.3e+0");
+        assert_eq!(number_to_exponential(-1.25, 1).unwrap(), "-1.3e+0");
+    }
+
+    #[test]
+    fn test_to_exponential_rounding_carries_into_exponent() {
+        assert_eq!(number_to_exponential(99.5, 1).unwrap(), "1.0e+2");
+    }
+
+    #[test]
+    fn test_to_exponential_negative_zero_formats_without_sign() {
+        assert_eq!(number_to_exponential(-0.0, 2).unwrap(), "0.00e+0");
     }
 
     // ── number_to_string_radix ────────────────────────────────────────────────
