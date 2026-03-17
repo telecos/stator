@@ -330,6 +330,10 @@ fn generator_function_prototype() -> Option<JsValue> {
     global_constructor_prototype("GeneratorFunction")
 }
 
+fn async_generator_function_prototype() -> Option<JsValue> {
+    global_constructor_prototype("AsyncGeneratorFunction")
+}
+
 pub(super) fn default_generator_object_prototype() -> Option<JsValue> {
     generator_function_prototype().and_then(|proto| {
         let value = proto_lookup(&proto, "prototype");
@@ -341,21 +345,43 @@ pub(super) fn default_generator_object_prototype() -> Option<JsValue> {
     })
 }
 
+/// Default prototype for async generator instances:
+/// `AsyncGeneratorFunction.prototype.prototype` === `%AsyncGeneratorPrototype%`.
+pub(super) fn default_async_generator_object_prototype() -> Option<JsValue> {
+    async_generator_function_prototype().and_then(|proto| {
+        let value = proto_lookup(&proto, "prototype");
+        if matches!(value, JsValue::Undefined) {
+            None
+        } else {
+            Some(value)
+        }
+    })
+}
+
 fn generator_object_prototype(state: &Rc<RefCell<GeneratorState>>) -> Option<JsValue> {
-    state
-        .borrow()
-        .prototype
-        .clone()
-        .or_else(default_generator_object_prototype)
+    state.borrow().prototype.clone().or_else(|| {
+        if state.borrow().bytecode_array.is_async() {
+            default_async_generator_object_prototype()
+        } else {
+            default_generator_object_prototype()
+        }
+    })
 }
 
 pub(super) fn init_generator_state_prototype(
     state: &Rc<RefCell<GeneratorState>>,
     ba: &Rc<BytecodeArray>,
 ) {
+    let is_async = ba.is_async();
     let prototype = match fn_props_get(ba, "prototype") {
         value @ (JsValue::PlainObject(_) | JsValue::Object(_)) => Some(value),
-        _ => default_generator_object_prototype(),
+        _ => {
+            if is_async {
+                default_async_generator_object_prototype()
+            } else {
+                default_generator_object_prototype()
+            }
+        }
     };
     state.borrow_mut().prototype = prototype;
 }
@@ -14225,6 +14251,397 @@ mod tests {
         )
         .unwrap();
         assert_fulfilled_promise_value(result, JsValue::Smi(15));
+    }
+
+    // ── Async generator deep conformance tests ────────────────────────────────
+
+    #[test]
+    fn test_async_gen_yield_undefined_without_value() {
+        // `yield` without a value yields undefined.
+        let result = compile_source_and_run(
+            "async function* g() { yield; } async function f() { var r = await g().next(); return r.value === undefined ? 1 : 0; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_async_gen_multiple_yields_in_sequence() {
+        let result = compile_source_and_run(
+            "async function* g() { yield 10; yield 20; yield 30; } async function f() { var it = g(); var a = await it.next(); var b = await it.next(); var c = await it.next(); return a.value + b.value + c.value; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(60));
+    }
+
+    #[test]
+    fn test_async_gen_yield_await_chain() {
+        // yield await p1; yield await p2 — two awaits in sequence.
+        let result = compile_source_and_run(
+            "async function* g() { yield await Promise.resolve(3); yield await Promise.resolve(7); } async function f() { var it = g(); var a = await it.next(); var b = await it.next(); return a.value + b.value; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_async_gen_for_await_basic() {
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; yield 2; yield 3; } async function f() { var s = 0; for await (const x of g()) { s = s + x; } return s; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn test_async_gen_for_await_with_promises() {
+        let result = compile_source_and_run(
+            "async function* g() { yield Promise.resolve(10); yield Promise.resolve(20); } async function f() { var s = 0; for await (const x of g()) { s = s + x; } return s; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(30));
+    }
+
+    #[test]
+    fn test_async_gen_for_await_break_early() {
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; yield 2; yield 3; } async function f() { var s = 0; for await (const x of g()) { s = s + x; if (x === 2) break; } return s; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_async_gen_return_executes_finally() {
+        let result = compile_source_and_run(
+            r#"async function* g() {
+                try { yield 1; yield 2; } finally { return 99; }
+            }
+            async function f() {
+                var it = g();
+                await it.next();
+                var r = await it.return(0);
+                return r.value;
+            } f()"#,
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_async_gen_throw_into_try_catch_continues() {
+        // After catching, generator can continue yielding.
+        let result = compile_source_and_run(
+            r#"async function* g() {
+                try { yield 1; } catch (e) { yield e + 10; }
+                yield 100;
+            }
+            async function f() {
+                var it = g();
+                await it.next();
+                var a = await it.throw(5);
+                var b = await it.next();
+                return a.value + b.value;
+            } f()"#,
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(115));
+    }
+
+    #[test]
+    fn test_async_gen_throw_at_start_rejects() {
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; } async function f() { var it = g(); return await it.throw('err'); } f()",
+        )
+        .unwrap();
+        assert_rejected_promise_reason(result, JsValue::String("err".into()));
+    }
+
+    #[test]
+    fn test_async_gen_return_promise_value_is_awaited() {
+        // .return(Promise.resolve(X)) should await the promise.
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); var r = await it.return(Promise.resolve(42)); return r.value; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_async_gen_backpressure_queue() {
+        // Call next() multiple times before awaiting: results arrive in order.
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; yield 2; yield 3; } async function f() { var it = g(); var p1 = it.next(); var p2 = it.next(); var p3 = it.next(); var a = await p1; var b = await p2; var c = await p3; return a.value * 100 + b.value * 10 + c.value; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(123));
+    }
+
+    #[test]
+    fn test_async_gen_backpressure_includes_done() {
+        // Fourth next() after 3 yields returns done:true.
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; yield 2; yield 3; } async function f() { var it = g(); var p1 = it.next(); var p2 = it.next(); var p3 = it.next(); var p4 = it.next(); var d = await p4; return d.done ? 1 : 0; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_async_gen_symbol_async_iterator_identity() {
+        // it[Symbol.asyncIterator]() === it.
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; } var it = g(); it[Symbol.asyncIterator]() === it",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_async_gen_yield_star_sync_iterable() {
+        let result = compile_source_and_run(
+            "async function* g() { yield* [10, 20, 30]; } async function f() { var s = 0; for await (const x of g()) { s = s + x; } return s; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(60));
+    }
+
+    #[test]
+    fn test_async_gen_yield_star_async_gen() {
+        let result = compile_source_and_run(
+            "async function* inner() { yield 3; yield 4; } async function* outer() { yield 1; yield 2; yield* inner(); yield 5; } async function f() { var s = 0; for await (const x of outer()) { s = s + x; } return s; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(15));
+    }
+
+    #[test]
+    fn test_async_gen_yield_star_return_value() {
+        // yield* evaluates to the inner generator's return value.
+        let result = compile_source_and_run(
+            "function* inner() { yield 1; return 42; } async function* outer() { var x = yield* inner(); yield x; } async function f() { var it = outer(); var a = await it.next(); var b = await it.next(); return a.value + b.value; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(43));
+    }
+
+    #[test]
+    fn test_async_gen_next_after_done_always_done() {
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); await it.next(); var r = await it.next(); return (r.done ? 1 : 0) + (r.value === undefined ? 10 : 0); } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(11));
+    }
+
+    #[test]
+    fn test_async_gen_return_on_completed_gen() {
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); await it.next(); var r = await it.return(55); return r.value + (r.done ? 1 : 0); } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(56));
+    }
+
+    #[test]
+    fn test_async_gen_throw_on_completed_gen_rejects() {
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); await it.next(); return await it.throw('late'); } f()",
+        )
+        .unwrap();
+        assert_rejected_promise_reason(result, JsValue::String("late".into()));
+    }
+
+    #[test]
+    fn test_async_gen_next_passes_value_into_yield() {
+        // The value passed to .next() becomes the result of the yield expression.
+        let result = compile_source_and_run(
+            "async function* g() { var x = yield 1; yield x + 10; } async function f() { var it = g(); await it.next(); var r = await it.next(5); return r.value; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(15));
+    }
+
+    #[test]
+    fn test_async_gen_return_from_suspended_at_start() {
+        // .return() before first .next() completes immediately.
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; yield 2; } async function f() { var it = g(); var r = await it.return(77); return r.value + (r.done ? 1 : 0); } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(78));
+    }
+
+    #[test]
+    fn test_async_gen_with_closure_captures() {
+        let result = compile_source_and_run(
+            r#"function makeGen(start) {
+                return async function*() { yield start; yield start + 1; };
+            }
+            async function f() {
+                var g = makeGen(10);
+                var it = g();
+                var a = await it.next();
+                var b = await it.next();
+                return a.value + b.value;
+            } f()"#,
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(21));
+    }
+
+    #[test]
+    fn test_async_gen_empty_generator() {
+        // Generator with no yields — first next() returns done:true.
+        let result = compile_source_and_run(
+            "async function* g() {} async function f() { var r = await g().next(); return (r.done ? 1 : 0) + (r.value === undefined ? 10 : 0); } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(11));
+    }
+
+    #[test]
+    fn test_async_gen_return_with_explicit_value() {
+        // `return value` inside async generator.
+        let result = compile_source_and_run(
+            "async function* g() { yield 1; return 99; } async function f() { var it = g(); var a = await it.next(); var b = await it.next(); return a.value + b.value + (b.done ? 1 : 0); } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(101));
+    }
+
+    #[test]
+    fn test_async_gen_return_promise_inside_body() {
+        // `return Promise.resolve(X)` — the returned promise value is awaited.
+        let result = compile_source_and_run(
+            "async function* g() { return Promise.resolve(50); } async function f() { var r = await g().next(); return r.value + (r.done ? 1 : 0); } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(51));
+    }
+
+    #[test]
+    fn test_async_gen_independent_instances() {
+        // Two instances of the same generator are independent.
+        let result = compile_source_and_run(
+            r#"async function* g() { yield 1; yield 2; }
+            async function f() {
+                var a = g(); var b = g();
+                var r1 = await a.next();
+                var r2 = await b.next();
+                var r3 = await a.next();
+                var r4 = await b.next();
+                return r1.value + r2.value + r3.value + r4.value;
+            } f()"#,
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn test_async_gen_for_await_empty() {
+        // for-await-of on an empty async generator does nothing.
+        let result = compile_source_and_run(
+            "async function* g() {} async function f() { var s = 0; for await (const x of g()) { s = s + 1; } return s; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_async_gen_yield_string_values() {
+        let result = compile_source_and_run(
+            r#"async function* g() { yield "hello"; yield "world"; }
+            async function f() {
+                var it = g();
+                var a = await it.next();
+                var b = await it.next();
+                return a.value + " " + b.value;
+            } f()"#,
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::String("hello world".into()));
+    }
+
+    #[test]
+    fn test_async_gen_yield_await_rejected_promise_propagates() {
+        let result = compile_source_and_run(
+            "async function* g() { yield await Promise.reject('bad'); } async function f() { return await g().next(); } f()",
+        )
+        .unwrap();
+        assert_rejected_promise_reason(result, JsValue::String("bad".into()));
+    }
+
+    #[test]
+    fn test_async_gen_for_await_of_yield_star_array() {
+        let result = compile_source_and_run(
+            "async function* g() { yield* [5, 6, 7]; } async function f() { var s = 0; for await (const x of g()) { s = s + x; } return s; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(18));
+    }
+
+    #[test]
+    fn test_async_gen_yield_star_empty_iterable() {
+        let result = compile_source_and_run(
+            "async function* g() { yield* []; yield 1; } async function f() { var it = g(); var r = await it.next(); return r.value; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_async_gen_nested_async_generators() {
+        let result = compile_source_and_run(
+            r#"async function* a() { yield 1; yield 2; }
+            async function* b() { yield* a(); yield 3; }
+            async function* c() { yield* b(); yield 4; }
+            async function f() {
+                var s = 0;
+                for await (const x of c()) { s = s + x; }
+                return s;
+            } f()"#,
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_async_gen_with_parameters() {
+        let result = compile_source_and_run(
+            "async function* g(a, b) { yield a; yield b; yield a + b; } async function f() { var s = 0; for await (const x of g(3, 7)) { s = s + x; } return s; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(20));
+    }
+
+    #[test]
+    fn test_async_gen_throw_and_continue_yielding() {
+        let result = compile_source_and_run(
+            r#"async function* g() {
+                try { yield 1; } catch (e) { }
+                yield 2;
+                yield 3;
+            }
+            async function f() {
+                var it = g();
+                await it.next();
+                await it.throw('x');
+                var r = await it.next();
+                return r.value;
+            } f()"#,
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_async_gen_for_await_with_yield_await() {
+        let result = compile_source_and_run(
+            "async function* g() { yield await Promise.resolve(5); yield await Promise.resolve(15); } async function f() { var s = 0; for await (const x of g()) { s = s + x; } return s; } f()",
+        )
+        .unwrap();
+        assert_fulfilled_promise_value(result, JsValue::Smi(20));
     }
 
     // ── Generator .next()/.return()/.throw() ──────────────────────────────────

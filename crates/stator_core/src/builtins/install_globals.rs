@@ -14328,6 +14328,13 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "GeneratorFunction".into(),
             finalize_ctor(make_generator_function(), "GeneratorFunction"),
         );
+        globals.insert(
+            "AsyncGeneratorFunction".into(),
+            finalize_ctor(
+                crate::builtins::async_generator::make_async_generator_function(),
+                "AsyncGeneratorFunction",
+            ),
+        );
         globals.insert("Proxy".into(), finalize_ctor(make_proxy(), "Proxy"));
         globals.insert("Reflect".into(), make_reflect());
         // ── Atomics / SharedArrayBuffer ─────────────────────────────────────
