@@ -338,6 +338,59 @@ fn enumerable_own_string_keys(value: &JsValue) -> Vec<String> {
     }
 }
 
+fn error_own_string_keys(error: &JsError) -> Vec<String> {
+    let overlay = error.props.borrow();
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for builtin in ["message", "stack"] {
+        if seen.insert(builtin.to_string()) {
+            keys.push(builtin.to_string());
+        }
+    }
+    if error.cause.is_some() && seen.insert("cause".to_string()) {
+        keys.push("cause".to_string());
+    }
+    if error.kind == ErrorKind::AggregateError && seen.insert("errors".to_string()) {
+        keys.push("errors".to_string());
+    }
+    for key in own_string_property_keys(&overlay, false) {
+        if seen.insert(key.clone()) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+fn error_descriptor_value_and_attrs(
+    error: &JsError,
+    key: &str,
+) -> Option<(JsValue, PropertyAttributes)> {
+    let overlay = error.props.borrow();
+    if let Some(value) = overlay.get(key) {
+        let mut attrs = PropertyAttributes::empty();
+        if overlay.is_writable(key) {
+            attrs |= PropertyAttributes::WRITABLE;
+        }
+        if overlay.is_enumerable(key) {
+            attrs |= PropertyAttributes::ENUMERABLE;
+        }
+        if overlay.is_configurable(key) {
+            attrs |= PropertyAttributes::CONFIGURABLE;
+        }
+        return Some((value.clone(), attrs));
+    }
+    let attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
+    match key {
+        "message" => Some((JsValue::String(error.message().to_string().into()), attrs)),
+        "stack" => Some((JsValue::String(error.stack().to_string().into()), attrs)),
+        "cause" => error.cause().cloned().map(|cause| (cause, attrs)),
+        "errors" if error.kind == ErrorKind::AggregateError => {
+            Some((JsValue::new_array(error.errors.clone()), attrs))
+        }
+        _ => None,
+    }
+}
+
 fn constructor_prototype(name: &str) -> Option<JsValue> {
     current_global_env().and_then(|globals| {
         let ctor = globals.borrow().get(name).cloned()?;
@@ -1842,17 +1895,21 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
 fn error_prototype_to_string(this: &JsValue) -> StatorResult<JsValue> {
     match this {
         JsValue::Error(e) => Ok(JsValue::String(e.to_error_string().into())),
-        JsValue::PlainObject(map) => {
-            let borrow = map.borrow();
-            let name = match borrow.get("name") {
-                Some(JsValue::String(s)) => s.to_string(),
-                Some(JsValue::Undefined) | None => "Error".to_string(),
-                Some(v) => v.to_js_string().unwrap_or_else(|_| "Error".to_string()),
+        JsValue::PlainObject(_) => {
+            let name_value = dispatch_get_property_value(this, JsValue::String("name".into()))
+                .unwrap_or(JsValue::Undefined);
+            let name = match name_value {
+                JsValue::String(s) => s.to_string(),
+                JsValue::Undefined => "Error".to_string(),
+                value => value.to_js_string().unwrap_or_else(|_| "Error".to_string()),
             };
-            let message = match borrow.get("message") {
-                Some(JsValue::String(s)) => s.to_string(),
-                Some(JsValue::Undefined) | None => String::new(),
-                Some(v) => v.to_js_string().unwrap_or_default(),
+            let message_value =
+                dispatch_get_property_value(this, JsValue::String("message".into()))
+                    .unwrap_or(JsValue::Undefined);
+            let message = match message_value {
+                JsValue::String(s) => s.to_string(),
+                JsValue::Undefined => String::new(),
+                value => value.to_js_string().unwrap_or_default(),
             };
             if name.is_empty() {
                 Ok(JsValue::String(message.into()))
@@ -5074,6 +5131,15 @@ fn make_object() -> JsValue {
                             Ok(JsValue::Undefined)
                         }
                     }
+                    JsValue::Error(error) => match error_descriptor_value_and_attrs(error, &key) {
+                        Some((value, attrs)) => Ok(data_desc(
+                            value,
+                            attrs.contains(PropertyAttributes::WRITABLE),
+                            attrs.contains(PropertyAttributes::ENUMERABLE),
+                            attrs.contains(PropertyAttributes::CONFIGURABLE),
+                        )),
+                        None => Ok(JsValue::Undefined),
+                    },
                     JsValue::Function(ba) => {
                         if key == "length" {
                             Ok(data_desc(
@@ -5214,6 +5280,12 @@ fn make_object() -> JsValue {
                         keys.push(JsValue::String("length".into()));
                         Ok(JsValue::new_array(keys))
                     }
+                    JsValue::Error(error) => Ok(JsValue::new_array(
+                        error_own_string_keys(error)
+                            .into_iter()
+                            .map(|name| JsValue::String(name.into()))
+                            .collect(),
+                    )),
                     JsValue::Function(_) => Ok(JsValue::new_array(vec![
                         JsValue::String("length".into()),
                         JsValue::String("name".into()),
@@ -12596,6 +12668,21 @@ fn make_reflect() -> JsValue {
                             .map(|index| JsValue::String(index.to_string().into()))
                             .collect();
                         keys.push(JsValue::String("length".into()));
+                        keys
+                    }
+                    JsValue::Error(error) => {
+                        let mut keys: Vec<JsValue> = error_own_string_keys(error)
+                            .into_iter()
+                            .map(|name| JsValue::String(name.into()))
+                            .collect();
+                        keys.extend(
+                            error
+                                .props
+                                .borrow()
+                                .own_symbol_keys()
+                                .into_iter()
+                                .map(JsValue::Symbol),
+                        );
                         keys
                     }
                     JsValue::Proxy(proxy) => proxy_own_keys(&proxy.borrow())?,
@@ -47371,6 +47458,343 @@ mod tests {
     fn e2e_error_stack_trace_limit_type() {
         let result = global_eval("typeof Error.stackTraceLimit").unwrap();
         assert_eq!(result, JsValue::String("number".to_string()));
+    }
+
+    fn assert_e2e_true(script: &str) {
+        let result = global_eval(script).unwrap();
+        assert_eq!(result, JsValue::Boolean(true), "script failed: {script}");
+    }
+
+    #[test]
+    fn e2e_w18a_error_instance_name() {
+        assert_e2e_true(r#"new Error("boom").name === "Error""#);
+    }
+
+    #[test]
+    fn e2e_w18a_error_instance_constructor() {
+        assert_e2e_true(r#"new Error("boom").constructor === Error"#);
+    }
+
+    #[test]
+    fn e2e_w18a_error_instanceof_chain() {
+        assert_e2e_true(r#"new Error("boom") instanceof Error"#);
+    }
+
+    #[test]
+    fn e2e_w18a_error_to_string_variants() {
+        assert_e2e_true(
+            r#"new Error("boom").toString() === "Error: boom" && new Error().toString() === "Error""#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_error_stack_and_cause() {
+        assert_e2e_true(
+            r#"let e = new Error("boom", { cause: 1 }); typeof e.stack === "string" && e.cause === 1"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_type_error_instance_name() {
+        assert_e2e_true(r#"new TypeError("boom").name === "TypeError""#);
+    }
+
+    #[test]
+    fn e2e_w18a_type_error_instance_constructor() {
+        assert_e2e_true(r#"new TypeError("boom").constructor === TypeError"#);
+    }
+
+    #[test]
+    fn e2e_w18a_type_error_instanceof_chain() {
+        assert_e2e_true(
+            r#"new TypeError("boom") instanceof TypeError && new TypeError("boom") instanceof Error"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_type_error_to_string_variants() {
+        assert_e2e_true(
+            r#"new TypeError("boom").toString() === "TypeError: boom" && new TypeError().toString() === "TypeError""#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_type_error_stack_and_cause() {
+        assert_e2e_true(
+            r#"let e = new TypeError("boom", { cause: 2 }); typeof e.stack === "string" && e.cause === 2"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_range_error_instance_name() {
+        assert_e2e_true(r#"new RangeError("boom").name === "RangeError""#);
+    }
+
+    #[test]
+    fn e2e_w18a_range_error_instance_constructor() {
+        assert_e2e_true(r#"new RangeError("boom").constructor === RangeError"#);
+    }
+
+    #[test]
+    fn e2e_w18a_range_error_instanceof_chain() {
+        assert_e2e_true(
+            r#"new RangeError("boom") instanceof RangeError && new RangeError("boom") instanceof Error"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_range_error_to_string_variants() {
+        assert_e2e_true(
+            r#"new RangeError("boom").toString() === "RangeError: boom" && new RangeError().toString() === "RangeError""#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_range_error_stack_and_cause() {
+        assert_e2e_true(
+            r#"let e = new RangeError("boom", { cause: 3 }); typeof e.stack === "string" && e.cause === 3"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_syntax_error_instance_name() {
+        assert_e2e_true(r#"new SyntaxError("boom").name === "SyntaxError""#);
+    }
+
+    #[test]
+    fn e2e_w18a_syntax_error_instance_constructor() {
+        assert_e2e_true(r#"new SyntaxError("boom").constructor === SyntaxError"#);
+    }
+
+    #[test]
+    fn e2e_w18a_syntax_error_instanceof_chain() {
+        assert_e2e_true(
+            r#"new SyntaxError("boom") instanceof SyntaxError && new SyntaxError("boom") instanceof Error"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_syntax_error_to_string_variants() {
+        assert_e2e_true(
+            r#"new SyntaxError("boom").toString() === "SyntaxError: boom" && new SyntaxError().toString() === "SyntaxError""#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_syntax_error_stack_and_cause() {
+        assert_e2e_true(
+            r#"let e = new SyntaxError("boom", { cause: 4 }); typeof e.stack === "string" && e.cause === 4"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_reference_error_instance_name() {
+        assert_e2e_true(r#"new ReferenceError("boom").name === "ReferenceError""#);
+    }
+
+    #[test]
+    fn e2e_w18a_reference_error_instance_constructor() {
+        assert_e2e_true(r#"new ReferenceError("boom").constructor === ReferenceError"#);
+    }
+
+    #[test]
+    fn e2e_w18a_reference_error_instanceof_chain() {
+        assert_e2e_true(
+            r#"new ReferenceError("boom") instanceof ReferenceError && new ReferenceError("boom") instanceof Error"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_reference_error_to_string_variants() {
+        assert_e2e_true(
+            r#"new ReferenceError("boom").toString() === "ReferenceError: boom" && new ReferenceError().toString() === "ReferenceError""#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_reference_error_stack_and_cause() {
+        assert_e2e_true(
+            r#"let e = new ReferenceError("boom", { cause: 5 }); typeof e.stack === "string" && e.cause === 5"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_uri_error_instance_name() {
+        assert_e2e_true(r#"new URIError("boom").name === "URIError""#);
+    }
+
+    #[test]
+    fn e2e_w18a_uri_error_instance_constructor() {
+        assert_e2e_true(r#"new URIError("boom").constructor === URIError"#);
+    }
+
+    #[test]
+    fn e2e_w18a_uri_error_instanceof_chain() {
+        assert_e2e_true(
+            r#"new URIError("boom") instanceof URIError && new URIError("boom") instanceof Error"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_uri_error_to_string_variants() {
+        assert_e2e_true(
+            r#"new URIError("boom").toString() === "URIError: boom" && new URIError().toString() === "URIError""#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_uri_error_stack_and_cause() {
+        assert_e2e_true(
+            r#"let e = new URIError("boom", { cause: 6 }); typeof e.stack === "string" && e.cause === 6"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_eval_error_instance_name() {
+        assert_e2e_true(r#"new EvalError("boom").name === "EvalError""#);
+    }
+
+    #[test]
+    fn e2e_w18a_eval_error_instance_constructor() {
+        assert_e2e_true(r#"new EvalError("boom").constructor === EvalError"#);
+    }
+
+    #[test]
+    fn e2e_w18a_eval_error_instanceof_chain() {
+        assert_e2e_true(
+            r#"new EvalError("boom") instanceof EvalError && new EvalError("boom") instanceof Error"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_eval_error_to_string_variants() {
+        assert_e2e_true(
+            r#"new EvalError("boom").toString() === "EvalError: boom" && new EvalError().toString() === "EvalError""#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_eval_error_stack_and_cause() {
+        assert_e2e_true(
+            r#"let e = new EvalError("boom", { cause: 7 }); typeof e.stack === "string" && e.cause === 7"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_aggregate_error_instance_name() {
+        assert_e2e_true(r#"new AggregateError([], "boom").name === "AggregateError""#);
+    }
+
+    #[test]
+    fn e2e_w18a_aggregate_error_instance_constructor() {
+        assert_e2e_true(r#"new AggregateError([], "boom").constructor === AggregateError"#);
+    }
+
+    #[test]
+    fn e2e_w18a_aggregate_error_instanceof_chain() {
+        assert_e2e_true(
+            r#"new AggregateError([], "boom") instanceof AggregateError && new AggregateError([], "boom") instanceof Error"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_aggregate_error_to_string_variants() {
+        assert_e2e_true(
+            r#"new AggregateError([], "boom").toString() === "AggregateError: boom" && new AggregateError([]).toString() === "AggregateError""#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_aggregate_error_stack_and_cause() {
+        assert_e2e_true(
+            r#"let e = new AggregateError([], "boom", { cause: 8 }); typeof e.stack === "string" && e.cause === 8"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_aggregate_error_errors_own_descriptor() {
+        assert_e2e_true(
+            r#"let e = new AggregateError([1, 2], "boom");
+               let d = Object.getOwnPropertyDescriptor(e, "errors");
+               Array.isArray(e.errors) &&
+               d !== undefined &&
+               d.value === e.errors &&
+               d.enumerable === false &&
+               d.writable === true &&
+               d.configurable === true &&
+               Object.getOwnPropertyNames(e).includes("errors") &&
+               Reflect.ownKeys(e).includes("errors")"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_error_message_own_descriptor() {
+        assert_e2e_true(
+            r#"let e = new Error("boom");
+               let d = Object.getOwnPropertyDescriptor(e, "message");
+               d !== undefined &&
+               d.value === "boom" &&
+               d.enumerable === false &&
+               d.writable === true &&
+               d.configurable === true"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_error_stack_own_descriptor() {
+        assert_e2e_true(
+            r#"let e = new TypeError("boom");
+               let d = Object.getOwnPropertyDescriptor(e, "stack");
+               d !== undefined && typeof d.value === "string" && d.enumerable === false"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_error_cause_own_descriptor() {
+        assert_e2e_true(
+            r#"let e = new SyntaxError("boom", { cause: 9 });
+               let d = Object.getOwnPropertyDescriptor(e, "cause");
+               d !== undefined &&
+               d.value === 9 &&
+               d.enumerable === false &&
+               Object.getOwnPropertyNames(e).includes("cause")"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_subclass_type_error_instanceof_chain() {
+        assert_e2e_true(
+            r#"class MyErr extends TypeError {}
+               let e = new MyErr("boom");
+               e instanceof MyErr && e instanceof TypeError && e instanceof Error"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_subclass_type_error_constructor_and_prototype() {
+        assert_e2e_true(
+            r#"class MyErr extends TypeError {}
+               let e = new MyErr("boom");
+               e.constructor === MyErr &&
+               Object.getPrototypeOf(e) === MyErr.prototype &&
+               Object.getPrototypeOf(MyErr.prototype) === TypeError.prototype"#,
+        );
+    }
+
+    #[test]
+    fn e2e_w18a_subclass_type_error_name_to_string_stack_and_cause() {
+        assert_e2e_true(
+            r#"class MyErr extends TypeError {
+                   constructor(message, cause) {
+                       super(message, { cause });
+                   }
+               }
+               let e = new MyErr("boom", 10);
+               e.name === "TypeError" &&
+               e.toString() === "TypeError: boom" &&
+               typeof e.stack === "string" &&
+               e.cause === 10"#,
+        );
     }
 
     // ── Number deep conformance e2e tests ───────────────────────────────
