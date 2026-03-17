@@ -54584,6 +54584,15 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true), "script failed: {script}");
     }
 
+    macro_rules! e2e_true_test {
+        ($name:ident, $script:expr) => {
+            #[test]
+            fn $name() {
+                assert_e2e_true($script);
+            }
+        };
+    }
+
     #[test]
     fn e2e_w18a_error_instance_name() {
         assert_e2e_true(r#"new Error("boom").name === "Error""#);
@@ -55230,6 +55239,204 @@ mod tests {
     fn e2e_w21j_type_error_to_string_format() {
         assert_e2e_true(r#"new TypeError("fail").toString() === "TypeError: fail""#);
     }
+
+    // ── w23i: error types, messages, stack traces, and toString ─────────
+
+    e2e_true_test!(
+        e2e_w23i_error_name_error,
+        r#"new Error("x").name === "Error""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_name_type_error,
+        r#"new TypeError("x").name === "TypeError""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_name_range_error,
+        r#"new RangeError("x").name === "RangeError""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_name_reference_error,
+        r#"new ReferenceError("x").name === "ReferenceError""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_name_syntax_error,
+        r#"new SyntaxError("x").name === "SyntaxError""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_name_uri_error,
+        r#"new URIError("x").name === "URIError""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_name_eval_error,
+        r#"new EvalError("x").name === "EvalError""#
+    );
+
+    e2e_true_test!(
+        e2e_w23i_error_message_exact_error,
+        r#"new Error(" punctuation: [] {} ! ").message === " punctuation: [] {} ! ""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_message_exact_type_error,
+        r#"new TypeError("two  spaces").message === "two  spaces""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_message_exact_range_error,
+        r#"new RangeError("value: -1").message === "value: -1""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_message_exact_reference_error,
+        r#"new ReferenceError("missing binding").message === "missing binding""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_message_exact_syntax_error,
+        r#"new SyntaxError("bad token near ;").message === "bad token near ;""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_message_exact_uri_error,
+        r#"new URIError("% broken").message === "% broken""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_message_exact_eval_error,
+        r#"new EvalError("eval failed softly").message === "eval failed softly""#
+    );
+
+    e2e_true_test!(
+        e2e_w23i_error_stack_is_string_without_message,
+        r#"let e = new Error(); typeof e.stack === "string""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_stack_is_string_with_empty_message,
+        r#"let e = new RangeError(""); typeof e.stack === "string""#
+    );
+    e2e_true_test!(
+        e2e_w23i_aggregate_error_stack_is_string,
+        r#"let e = new AggregateError([], "agg"); typeof e.stack === "string""#
+    );
+
+    e2e_true_test!(
+        e2e_w23i_error_to_string_error_with_message,
+        r#"new Error("boom").toString() === "Error: boom""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_to_string_error_without_message,
+        r#"new Error().toString() === "Error""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_to_string_type_error_without_message,
+        r#"new TypeError("").toString() === "TypeError""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_to_string_uses_custom_name,
+        r#"let e = new Error("boom"); e.name = "CustomName"; e.toString() === "CustomName: boom""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_to_string_uses_message_when_name_empty,
+        r#"let e = new Error("boom"); e.name = ""; e.toString() === "boom""#
+    );
+
+    e2e_true_test!(
+        e2e_w23i_eval_syntax_error_has_line_column,
+        r#"try { eval("function {"); false; } catch (e) { e instanceof SyntaxError && e.message.indexOf("at 1:") !== -1 }"#
+    );
+    e2e_true_test!(
+        e2e_w23i_eval_syntax_error_tracks_multiline_source,
+        r#"try { eval("\nlet = 1;"); false; } catch (e) { e instanceof SyntaxError && e.message.indexOf("at 2:") !== -1 }"#
+    );
+    e2e_true_test!(
+        e2e_w23i_eval_syntax_error_stack_mentions_syntax_error,
+        r#"try { eval("if ("); false; } catch (e) { typeof e.stack === "string" && e.stack.indexOf("SyntaxError: at 1:") === 0 }"#
+    );
+
+    e2e_true_test!(
+        e2e_w23i_type_error_message_not_a_function_primitive,
+        r#"try { (1)(); false; } catch (e) { e instanceof TypeError && e.message.indexOf("not a function") !== -1 }"#
+    );
+    e2e_true_test!(
+        e2e_w23i_type_error_message_not_a_function_object,
+        r#"try { ({})() ; false; } catch (e) { e instanceof TypeError && e.message.indexOf("not a function") !== -1 }"#
+    );
+    e2e_true_test!(
+        e2e_w23i_type_error_message_not_an_object,
+        r#"try { Reflect.get(1, "x"); false; } catch (e) { e instanceof TypeError && e.message.indexOf("not an object") !== -1 }"#
+    );
+    e2e_true_test!(
+        e2e_w23i_type_error_message_cannot_read_property_null,
+        r#"try { null.foo; false; } catch (e) { e instanceof TypeError && e.message.indexOf("reading 'foo'") !== -1 }"#
+    );
+    e2e_true_test!(
+        e2e_w23i_type_error_message_cannot_read_property_undefined,
+        r#"try { let x; x["bar"]; false; } catch (e) { e instanceof TypeError && e.message.indexOf("reading 'bar'") !== -1 }"#
+    );
+
+    e2e_true_test!(
+        e2e_w23i_range_error_invalid_array_length_constructor,
+        r#"try { new Array(-1); false; } catch (e) { e instanceof RangeError && e.message === "Invalid array length" }"#
+    );
+    e2e_true_test!(
+        e2e_w23i_range_error_invalid_array_length_assignment,
+        r#"try { let a = []; a.length = -1; false; } catch (e) { e instanceof RangeError && e.message === "Invalid array length" }"#
+    );
+    e2e_true_test!(
+        e2e_w23i_range_error_to_fixed_precision,
+        r#"try { (1).toFixed(101); false; } catch (e) { e instanceof RangeError && e.message.indexOf("toFixed()") !== -1 && e.message.indexOf("0 and 100") !== -1 }"#
+    );
+    e2e_true_test!(
+        e2e_w23i_range_error_stack_overflow,
+        r#"try { (function f() { return f(); })(); false; } catch (e) { e instanceof RangeError && e.message === "Maximum call stack size exceeded" }"#
+    );
+
+    e2e_true_test!(
+        e2e_w23i_reference_error_undeclared_variable_access,
+        r#"try { missingBinding; false; } catch (e) { e instanceof ReferenceError && e.message === "missingBinding is not defined" }"#
+    );
+    e2e_true_test!(
+        e2e_w23i_reference_error_tdz_violation,
+        r#"try { valueBeforeInit; let valueBeforeInit = 1; false; } catch (e) { e instanceof ReferenceError && e.message === "Cannot access 'valueBeforeInit' before initialization" }"#
+    );
+    e2e_true_test!(
+        e2e_w23i_reference_error_this_before_super,
+        r#"class Base {} class Derived extends Base { constructor() { this.x = 1; super(); } } try { new Derived(); false; } catch (e) { e instanceof ReferenceError && e.message.indexOf("before accessing 'this'") !== -1 }"#
+    );
+
+    e2e_true_test!(
+        e2e_w23i_rethrow_preserves_original_stack_for_error_object,
+        r#"let firstStack = ""; let sameObject = false; let firstError; try { try { throw new Error("boom"); } catch (e) { firstError = e; firstStack = e.stack; throw e; } } catch (e) { sameObject = e === firstError; sameObject && firstStack === e.stack && e.message === "boom"; }"#
+    );
+    e2e_true_test!(
+        e2e_w23i_rethrow_preserves_original_stack_for_engine_error,
+        r#"let firstStack = ""; try { try { null.boom; } catch (e) { firstStack = e.stack; throw e; } } catch (e) { e instanceof TypeError && firstStack === e.stack && e.message.indexOf("reading 'boom'") !== -1 }"#
+    );
+
+    e2e_true_test!(
+        e2e_w23i_error_cause_can_chain_error_objects,
+        r#"let inner = new Error("inner"); let outer = new Error("outer", { cause: inner }); outer.cause === inner && outer.cause.message === "inner""#
+    );
+    e2e_true_test!(
+        e2e_w23i_type_error_cause_can_chain_error_objects,
+        r#"let inner = new Error("root"); let outer = new TypeError("wrap", { cause: inner }); outer.cause === inner && outer.cause.message === "root""#
+    );
+    e2e_true_test!(
+        e2e_w23i_error_cause_preserves_non_error_values,
+        r#"let outer = new Error("outer", { cause: 123 }); outer.cause === 123"#
+    );
+    e2e_true_test!(
+        e2e_w23i_aggregate_error_cause_can_chain_error_objects,
+        r#"let inner = new Error("inner"); let outer = new AggregateError([inner], "outer", { cause: inner }); outer.cause === inner && outer.errors[0] === inner"#
+    );
+
+    e2e_true_test!(
+        e2e_w23i_custom_error_subclass_name_override_in_to_string,
+        r#"class MyError extends Error { constructor(message) { super(message); this.name = "MyError"; } } new MyError("boom").toString() === "MyError: boom""#
+    );
+    e2e_true_test!(
+        e2e_w23i_custom_type_error_subclass_prototype_name_override_in_to_string,
+        r#"class FancyTypeError extends TypeError {} FancyTypeError.prototype.name = "FancyTypeError"; new FancyTypeError("boom").toString() === "FancyTypeError: boom""#
+    );
+
+    e2e_true_test!(
+        e2e_w23i_aggregate_error_prototype_name_exact,
+        r#"AggregateError.prototype.name === "AggregateError""#
+    );
 
     // ── Number deep conformance e2e tests ───────────────────────────────
 
