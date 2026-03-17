@@ -168,6 +168,7 @@
 mod dispatch;
 mod map_set_conformance_tests;
 mod numeric_conformance_tests;
+mod regexp_conformance_tests;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;

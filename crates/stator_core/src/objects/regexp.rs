@@ -724,10 +724,18 @@ fn build_match(input: &str, mat: &regress::Match, has_indices: bool) -> RegExpMa
         .map(|cap| cap.as_ref().map(|r| input[r.clone()].to_string()))
         .collect();
 
-    let named_groups: HashMap<String, Option<String>> = mat
-        .named_groups()
-        .map(|(name, range)| (name.to_string(), range.map(|r| input[r].to_string())))
-        .collect();
+    let mut named_groups = HashMap::new();
+    for (name, range) in mat.named_groups() {
+        let value = range.map(|r| input[r].to_string());
+        named_groups
+            .entry(name.to_string())
+            .and_modify(|existing: &mut Option<String>| {
+                if existing.is_none() && value.is_some() {
+                    *existing = value.clone();
+                }
+            })
+            .or_insert(value);
+    }
 
     let indices = if has_indices {
         let mut pairs = Vec::with_capacity(1 + mat.captures.len());
@@ -735,10 +743,12 @@ fn build_match(input: &str, mat: &regress::Match, has_indices: bool) -> RegExpMa
         for cap in &mat.captures {
             pairs.push(cap.as_ref().map(|r| (r.start, r.end)));
         }
-        let groups: HashMap<String, (usize, usize)> = mat
-            .named_groups()
-            .filter_map(|(name, range)| range.map(|r| (name.to_string(), (r.start, r.end))))
-            .collect();
+        let mut groups = HashMap::new();
+        for (name, range) in mat.named_groups() {
+            if let Some(r) = range {
+                groups.entry(name.to_string()).or_insert((r.start, r.end));
+            }
+        }
         Some(MatchIndices { pairs, groups })
     } else {
         None
@@ -1474,6 +1484,14 @@ mod tests {
         let re = JsRegExp::new(r"\p{L}+", "v").unwrap();
         assert!(re.test("hello"));
         assert!(!re.test("123"));
+    }
+
+    #[test]
+    fn test_v_flag_unicode_accessor_is_true() {
+        let re = JsRegExp::new("a", "v").unwrap();
+        assert!(re.flags().contains(RegExpFlags::UNICODE_SETS));
+        assert!(!re.flags().contains(RegExpFlags::UNICODE));
+        assert!(build_regress_flags(re.flags()).unicode);
     }
 
     #[test]

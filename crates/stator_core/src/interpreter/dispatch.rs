@@ -4504,132 +4504,16 @@ fn handle_create_reg_exp_literal(
         flags_str.push('u');
     }
     if flags_val & 0x20 != 0 {
+        flags_str.push('v');
+    }
+    if flags_val & 0x40 != 0 {
         flags_str.push('y');
     }
-    // Build a proper RegExp object backed by JsRegExp.
+    if flags_val & 0x80 != 0 {
+        flags_str.push('d');
+    }
     let re = crate::objects::regexp::JsRegExp::new(&pattern, &flags_str)?;
-    let re_rc = Rc::new(RefCell::new(re));
-    let mut map = PropertyMap::new();
-    map.insert("__is_regexp__".to_string(), JsValue::Boolean(true));
-    map.insert(
-        "source".to_string(),
-        JsValue::String(pattern.clone().into()),
-    );
-    map.insert(
-        "flags".to_string(),
-        JsValue::String(flags_str.clone().into()),
-    );
-    map.insert(
-        "global".to_string(),
-        JsValue::Boolean(flags_str.contains('g')),
-    );
-    map.insert(
-        "ignoreCase".to_string(),
-        JsValue::Boolean(flags_str.contains('i')),
-    );
-    map.insert(
-        "multiline".to_string(),
-        JsValue::Boolean(flags_str.contains('m')),
-    );
-    map.insert(
-        "dotAll".to_string(),
-        JsValue::Boolean(flags_str.contains('s')),
-    );
-    map.insert(
-        "unicode".to_string(),
-        JsValue::Boolean(flags_str.contains('u')),
-    );
-    map.insert(
-        "sticky".to_string(),
-        JsValue::Boolean(flags_str.contains('y')),
-    );
-    // test(str)
-    {
-        let r = Rc::clone(&re_rc);
-        map.insert(
-            "test".to_string(),
-            JsValue::NativeFunction(Rc::new(move |args| {
-                let input = match args.first() {
-                    Some(v) => v.to_js_string()?,
-                    None => String::new(),
-                };
-                Ok(JsValue::Boolean(r.borrow().test(&input)))
-            })),
-        );
-    }
-    // exec(str)
-    {
-        let r = Rc::clone(&re_rc);
-        map.insert(
-            "exec".to_string(),
-            JsValue::NativeFunction(Rc::new(move |args| {
-                let input = match args.first() {
-                    Some(v) => v.to_js_string()?,
-                    None => String::new(),
-                };
-                match r.borrow().exec(&input) {
-                    Some(m) => {
-                        let mut props = PropertyMap::new();
-                        props.insert("0".to_string(), JsValue::String(m.matched.clone().into()));
-                        for (i, g) in m.captures.iter().enumerate() {
-                            props.insert(
-                                (i + 1).to_string(),
-                                match g {
-                                    Some(s) => JsValue::String(s.clone().into()),
-                                    None => JsValue::Undefined,
-                                },
-                            );
-                        }
-                        props.insert_with_attrs(
-                            "length".to_string(),
-                            JsValue::Smi((1 + m.captures.len()) as i32),
-                            PropertyAttributes::WRITABLE,
-                        );
-                        props.insert("index".to_string(), JsValue::Smi(m.index as i32));
-                        props.insert("input".to_string(), JsValue::String(m.input.clone().into()));
-                        if m.named_groups.is_empty() {
-                            props.insert("groups".to_string(), JsValue::Undefined);
-                        } else {
-                            let mut groups = PropertyMap::new();
-                            groups.insert("__proto__".to_string(), JsValue::Null);
-                            for (k, v) in &m.named_groups {
-                                groups.insert(
-                                    k.clone(),
-                                    match v {
-                                        Some(s) => JsValue::String(s.clone().into()),
-                                        None => JsValue::Undefined,
-                                    },
-                                );
-                            }
-                            props.insert(
-                                "groups".to_string(),
-                                JsValue::PlainObject(Rc::new(RefCell::new(groups))),
-                            );
-                        }
-                        props.insert_with_attrs(
-                            "__is_array__".to_string(),
-                            JsValue::Boolean(true),
-                            PropertyAttributes::empty(),
-                        );
-                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
-                    }
-                    None => Ok(JsValue::Null),
-                }
-            })),
-        );
-    }
-    // toString()
-    {
-        let p = pattern.clone();
-        let f = flags_str.clone();
-        map.insert(
-            "toString".to_string(),
-            JsValue::NativeFunction(Rc::new(move |_args| {
-                Ok(JsValue::String(format!("/{p}/{f}").into()))
-            })),
-        );
-    }
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+    ctx.frame.accumulator = crate::builtins::regexp::wrap_regexp(re);
     Ok(DispatchAction::Continue)
 }
 
