@@ -318,6 +318,47 @@ fn lookup_global_constructor(name: &str) -> JsValue {
     })
 }
 
+fn global_constructor_prototype(name: &str) -> Option<JsValue> {
+    match lookup_global_constructor(name) {
+        JsValue::PlainObject(map) => map.borrow().get("prototype").cloned(),
+        _ => None,
+    }
+}
+
+fn generator_function_prototype() -> Option<JsValue> {
+    global_constructor_prototype("GeneratorFunction")
+}
+
+pub(super) fn default_generator_object_prototype() -> Option<JsValue> {
+    generator_function_prototype().and_then(|proto| {
+        let value = proto_lookup(&proto, "prototype");
+        if matches!(value, JsValue::Undefined) {
+            None
+        } else {
+            Some(value)
+        }
+    })
+}
+
+fn generator_object_prototype(state: &Rc<RefCell<GeneratorState>>) -> Option<JsValue> {
+    state
+        .borrow()
+        .prototype
+        .clone()
+        .or_else(default_generator_object_prototype)
+}
+
+pub(super) fn init_generator_state_prototype(
+    state: &Rc<RefCell<GeneratorState>>,
+    ba: &Rc<BytecodeArray>,
+) {
+    let prototype = match fn_props_get(ba, "prototype") {
+        value @ (JsValue::PlainObject(_) | JsValue::Object(_)) => Some(value),
+        _ => default_generator_object_prototype(),
+    };
+    state.borrow_mut().prototype = prototype;
+}
+
 /// Return the current thread's active global environment, if any.
 pub(crate) fn current_global_env() -> Option<Rc<RefCell<HashMap<String, JsValue>>>> {
     CURRENT_GLOBALS.with(|g| g.borrow().clone())
@@ -2292,7 +2333,9 @@ pub(super) fn dispatch_call(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                frame.accumulator = JsValue::Generator(GeneratorState::new((**ba).clone()));
+                let state = GeneratorState::new((**ba).clone());
+                init_generator_state_prototype(&state, ba);
+                frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
                 // Async (non-generator) function: drive the internal generator
                 // to completion and return a Promise.
@@ -2361,7 +2404,9 @@ pub(super) fn dispatch_call_property(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                frame.accumulator = JsValue::Generator(GeneratorState::new((**ba).clone()));
+                let state = GeneratorState::new((**ba).clone());
+                init_generator_state_prototype(&state, ba);
+                frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
                 frame.accumulator = Interpreter::run_async_function((**ba).clone(), args)?;
             } else {
@@ -4950,6 +4995,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
     if let JsValue::Generator(gs) = obj {
         let gs = Rc::clone(gs);
         let is_async_generator = gs.borrow().bytecode_array.is_async();
+        let proto = generator_object_prototype(&gs);
         return match key {
             "next" => {
                 let gs = gs.clone();
@@ -5010,7 +5056,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let generator = obj.clone();
                 JsValue::NativeFunction(Rc::new(move |_args| Ok(generator.clone())))
             }
-            _ => JsValue::Undefined,
+            "__proto__" => proto.clone().unwrap_or(JsValue::Null),
+            _ => {
+                if let Some(proto) = proto {
+                    proto_lookup_chain(&proto, key, obj)
+                } else {
+                    JsValue::Undefined
+                }
+            }
         };
     }
     // Handle JsValue::Iterator — expose next/return/@@iterator so that
@@ -5088,6 +5141,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         if !matches!(val, JsValue::Undefined) {
             return val;
         }
+        let function_proto = if ba.is_generator() {
+            generator_function_prototype()
+        } else {
+            None
+        };
         // Built-in Function.prototype methods.
         match key {
             "call" => {
@@ -5181,7 +5239,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     ))
                 }));
             }
-            "constructor" => return lookup_global_constructor("Function"),
+            "constructor" => {
+                return if ba.is_generator() {
+                    lookup_global_constructor("GeneratorFunction")
+                } else {
+                    lookup_global_constructor("Function")
+                };
+            }
             "hasOwnProperty" => {
                 let ba = Rc::clone(ba);
                 return JsValue::NativeFunction(Rc::new(move |args| {
@@ -5224,7 +5288,18 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     ))
                 }));
             }
+            "__proto__" => {
+                return function_proto
+                    .or_else(|| global_constructor_prototype("Function"))
+                    .unwrap_or(JsValue::Null);
+            }
             _ => {}
+        }
+        if let Some(proto) = function_proto {
+            let inherited = proto_lookup_chain(&proto, key, obj);
+            if !matches!(inherited, JsValue::Undefined) {
+                return inherited;
+            }
         }
     }
     // Same for NativeFunction.
@@ -5585,7 +5660,9 @@ pub fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult
             // Generator functions return a suspended generator object instead
             // of executing the body (§27.3.3.1).
             if ba.is_generator() {
-                return Ok(JsValue::Generator(GeneratorState::new((**ba).clone())));
+                let state = GeneratorState::new((**ba).clone());
+                init_generator_state_prototype(&state, ba);
+                return Ok(JsValue::Generator(state));
             }
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
@@ -5626,7 +5703,9 @@ pub fn dispatch_call_with_this(
             // Generator functions return a suspended generator object instead
             // of executing the body (§27.3.3.1).
             if ba.is_generator() {
-                return Ok(JsValue::Generator(GeneratorState::new((**ba).clone())));
+                let state = GeneratorState::new((**ba).clone());
+                init_generator_state_prototype(&state, ba);
+                return Ok(JsValue::Generator(state));
             }
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {

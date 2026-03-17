@@ -5336,6 +5336,115 @@ impl FunctionCompiler {
     /// caller.  In async generators, delegation uses `GetAsyncIterator` so
     /// both async and sync iterables are supported.
     fn compile_yield_star(&mut self, expr: &crate::parser::ast::Expr) -> StatorResult<()> {
+        if !self.is_async {
+            self.compile_expr(expr)?;
+
+            let iterable_reg = self.allocator.new_local();
+            self.emit_star(iterable_reg);
+            let load_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+            let call_slot = self.alloc_slot(FeedbackSlotKind::Call);
+            self.emit(Instruction::new_unchecked(
+                Opcode::GetIterator,
+                vec![to_reg_op(iterable_reg), load_slot, call_slot],
+            ));
+
+            let iter_reg = self.allocator.new_local();
+            self.emit_star(iter_reg);
+            let sent_reg = self.allocator.new_local();
+            let result_reg = self.allocator.new_local();
+            let method_reg = self.allocator.new_local();
+            let value_reg = self.allocator.new_local();
+
+            self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+            self.emit_star(sent_reg);
+
+            let next_idx = self.add_string("next");
+            let done_idx = self.add_string("done");
+            let value_idx = self.add_string("value");
+
+            let loop_lbl = self.new_label();
+            let done_lbl = self.new_label();
+            let dummy = Operand::Register(0);
+
+            self.bind_label(loop_lbl);
+
+            let next_load_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    to_reg_op(iter_reg),
+                    Operand::ConstantPoolIdx(next_idx),
+                    next_load_slot,
+                ],
+            ));
+            self.emit_star(method_reg);
+
+            let next_call_slot = self.alloc_slot(FeedbackSlotKind::Call);
+            self.emit(Instruction::new_unchecked(
+                Opcode::CallProperty1,
+                vec![
+                    to_reg_op(method_reg),
+                    to_reg_op(iter_reg),
+                    to_reg_op(sent_reg),
+                    next_call_slot,
+                ],
+            ));
+            self.emit_star(result_reg);
+
+            let done_load_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    to_reg_op(result_reg),
+                    Operand::ConstantPoolIdx(done_idx),
+                    done_load_slot,
+                ],
+            ));
+            self.emit_jump_if_true_to(done_lbl);
+
+            let value_load_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    to_reg_op(result_reg),
+                    Operand::ConstantPoolIdx(value_idx),
+                    value_load_slot,
+                ],
+            ));
+            self.emit_star(value_reg);
+            self.emit_ldar(value_reg);
+
+            let suspend_id = self.yield_suspend_id;
+            self.yield_suspend_id += 1;
+            self.emit(Instruction::new_unchecked(
+                Opcode::SuspendGenerator,
+                vec![
+                    dummy,
+                    dummy,
+                    Operand::RegisterCount(0),
+                    Operand::Immediate(suspend_id as i32),
+                ],
+            ));
+            self.emit(Instruction::new_unchecked(
+                Opcode::ResumeGenerator,
+                vec![dummy, dummy, Operand::RegisterCount(0)],
+            ));
+            self.emit_star(sent_reg);
+            self.emit_jump_loop_to(loop_lbl);
+
+            self.bind_label(done_lbl);
+            let final_value_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    to_reg_op(result_reg),
+                    Operand::ConstantPoolIdx(value_idx),
+                    final_value_slot,
+                ],
+            ));
+            return Ok(());
+        }
+
         // Evaluate the inner iterable → acc.
         self.compile_expr(expr)?;
 

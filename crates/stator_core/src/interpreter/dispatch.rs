@@ -1192,6 +1192,11 @@ fn handle_create_closure(
         let func_val = JsValue::Function(Rc::clone(&func_rc));
         let mut proto = PropertyMap::new();
         proto.insert("constructor".to_string(), func_val);
+        if func_rc.is_generator()
+            && let Some(generator_proto) = super::default_generator_object_prototype()
+        {
+            proto.insert("__proto__".to_string(), generator_proto);
+        }
         fn_props_set(
             &func_rc,
             "prototype".to_string(),
@@ -1220,7 +1225,9 @@ fn handle_call_any_receiver(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                ctx.frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
+                let state = GeneratorState::new((*ba).clone());
+                super::init_generator_state_prototype(&state, &ba);
+                ctx.frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
                 ctx.frame.accumulator = Interpreter::run_async_function((*ba).clone(), args)?;
@@ -1312,7 +1319,9 @@ fn handle_tail_call(
                 // fall back to a normal call.
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
                 if ba.is_generator() {
-                    ctx.frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
+                    let state = GeneratorState::new((*ba).clone());
+                    super::init_generator_state_prototype(&state, &ba);
+                    ctx.frame.accumulator = JsValue::Generator(state);
                 } else {
                     ctx.frame.accumulator = Interpreter::run_async_function((*ba).clone(), args)?;
                 }
@@ -1393,7 +1402,9 @@ fn handle_call_undefined_receiver0(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                ctx.frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
+                let state = GeneratorState::new((*ba).clone());
+                super::init_generator_state_prototype(&state, &ba);
+                ctx.frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
                 ctx.frame.accumulator = Interpreter::run_async_function((*ba).clone(), vec![])?;
             } else {
@@ -1491,7 +1502,9 @@ fn handle_call_undefined_receiver1(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                ctx.frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
+                let state = GeneratorState::new((*ba).clone());
+                super::init_generator_state_prototype(&state, &ba);
+                ctx.frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 ctx.frame.accumulator = Interpreter::run_async_function((*ba).clone(), vec![arg1])?;
@@ -1595,7 +1608,9 @@ fn handle_call_undefined_receiver2(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                ctx.frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
+                let state = GeneratorState::new((*ba).clone());
+                super::init_generator_state_prototype(&state, &ba);
+                ctx.frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
@@ -3413,16 +3428,15 @@ fn handle_iterator_close(
         }
         // Close a generator by marking it as completed (§27.5.3.4).
         JsValue::Generator(gs) => {
+            let result = Interpreter::generator_return(gs, JsValue::Undefined)?;
             if gs.borrow().bytecode_array.is_async() {
                 let queue = crate::builtins::promise::MicrotaskQueue::new();
-                let result = Interpreter::generator_return(gs, JsValue::Undefined)?;
                 settle_async_iterator_result(result, &queue)
                     .map_err(super::async_iterator_reason_to_error)?;
-            } else {
-                let mut state = gs.borrow_mut();
-                if state.status != GeneratorStatus::Completed {
-                    state.status = GeneratorStatus::Completed;
-                }
+            } else if !result.is_object_like() {
+                return Err(StatorError::TypeError(
+                    "Iterator .return() result is not an object".into(),
+                ));
             }
         }
         // NativeIterator has no .return() — nothing to do.
@@ -6028,7 +6042,9 @@ fn handle_call_direct_eval(
         match callee {
             JsValue::Function(ba) => {
                 if ba.is_generator() {
-                    ctx.frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
+                    let state = GeneratorState::new((*ba).clone());
+                    super::init_generator_state_prototype(&state, &ba);
+                    ctx.frame.accumulator = JsValue::Generator(state);
                 } else {
                     let mut callee_frame = InterpreterFrame::new_with_globals(
                         (*ba).clone(),
