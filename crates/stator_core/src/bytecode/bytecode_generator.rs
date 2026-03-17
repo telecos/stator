@@ -1482,16 +1482,26 @@ impl FunctionCompiler {
         ));
         // Bind the name in the current scope (accumulator holds the closure).
         if let Some(id) = &decl.id {
-            let reg = self.define_local(&id.name);
-            self.emit_star(reg);
+            let reg = if self.is_eval_scope {
+                None
+            } else {
+                let reg = self.define_local(&id.name);
+                self.emit_star(reg);
+                Some(reg)
+            };
+            if self.is_eval_scope {
+                self.compile_ident_store(&id.name)?;
+            }
             // Top-level function declarations are also stored as globals so
             // that recursive calls via `LdaGlobal` can find them.
             if self.is_program {
                 let name_idx = self.add_string(&id.name);
                 let sta_slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
-                // Re-load the value from the local register first so the
-                // accumulator holds the function when StaGlobal executes.
-                self.emit_ldar(reg);
+                if let Some(reg) = reg {
+                    // Re-load the value from the local register first so the
+                    // accumulator holds the function when StaGlobal executes.
+                    self.emit_ldar(reg);
+                }
                 self.emit(Instruction::new_unchecked(
                     Opcode::StaGlobal,
                     vec![Operand::ConstantPoolIdx(name_idx), sta_slot],
@@ -2885,7 +2895,7 @@ impl FunctionCompiler {
             }
         } else {
             let name_idx = self.add_string(name);
-            if self.with_depth > 0 {
+            if self.with_depth > 0 || self.is_eval_scope {
                 self.emit(Instruction::new_unchecked(
                     Opcode::LdaLookupSlot,
                     vec![Operand::ConstantPoolIdx(name_idx)],
@@ -2920,7 +2930,7 @@ impl FunctionCompiler {
             }
         } else {
             let name_idx = self.add_string(name);
-            if self.with_depth > 0 {
+            if self.with_depth > 0 || self.is_eval_scope {
                 self.emit(Instruction::new_unchecked(
                     Opcode::LdaLookupSlotInsideTypeof,
                     vec![Operand::ConstantPoolIdx(name_idx)],
@@ -2967,7 +2977,7 @@ impl FunctionCompiler {
             }
         } else {
             let name_idx = self.add_string(name);
-            if self.with_depth > 0 {
+            if self.with_depth > 0 || self.is_eval_scope {
                 self.emit(Instruction::new_unchecked(
                     Opcode::StaLookupSlot,
                     vec![Operand::ConstantPoolIdx(name_idx), Operand::Flag(0)],
@@ -5983,6 +5993,15 @@ impl FunctionCompiler {
         let frame_size = self.allocator.frame_size();
         let bytes = encode(&self.instructions);
         let feedback_metadata = FeedbackMetadata::new(self.slot_kinds);
+        let binding_registers = self
+            .scopes
+            .iter()
+            .flat_map(|scope| {
+                scope
+                    .iter()
+                    .map(|(name, binding)| (name.clone(), binding.reg.0))
+            })
+            .collect();
         let ba = BytecodeArray::new(
             bytes,
             self.constant_pool,
@@ -5996,6 +6015,7 @@ impl FunctionCompiler {
             .with_generator_flag(self.is_generator)
             .with_async_flag(self.is_async)
             .with_module_flag(self.is_module)
+            .with_binding_registers(binding_registers)
             .with_strict_flag(self.is_strict))
     }
 }

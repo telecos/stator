@@ -5998,8 +5998,17 @@ fn handle_call_direct_eval(
                 return Ok(DispatchAction::Continue);
             }
         };
-        ctx.frame.accumulator =
-            crate::builtins::global::global_eval_direct(&source, Rc::clone(&ctx.frame.global_env))?;
+        let direct_eval_scope = build_direct_eval_scope(ctx.frame)?;
+        ctx.frame.accumulator = crate::builtins::global::global_eval_direct_with_scope(
+            &source,
+            Rc::clone(&ctx.frame.global_env),
+            direct_eval_scope
+                .as_ref()
+                .map(|(context, _scope_map)| context.clone()),
+        )?;
+        if let Some((_, scope_map)) = direct_eval_scope {
+            sync_direct_eval_scope(ctx.frame, &scope_map)?;
+        }
     } else {
         // Callee was reassigned — fall through to normal call.
         match callee {
@@ -6042,6 +6051,52 @@ fn handle_call_direct_eval(
         }
     }
     Ok(DispatchAction::Continue)
+}
+
+fn build_direct_eval_scope(
+    frame: &mut InterpreterFrame,
+) -> StatorResult<Option<(JsValue, Rc<RefCell<PropertyMap>>)>> {
+    if frame.bytecode_array.binding_registers().is_empty() && frame.context.is_none() {
+        return Ok(None);
+    }
+
+    let mut scope_map = PropertyMap::new();
+    let bindings: Vec<(String, i32)> = frame
+        .bytecode_array
+        .binding_registers()
+        .iter()
+        .map(|(name, reg)| (name.clone(), *reg))
+        .collect();
+    for (name, reg) in bindings {
+        scope_map.insert(name, frame.read_reg(reg as u32)?.cheap_clone());
+    }
+    let scope_map = Rc::new(RefCell::new(scope_map));
+    let parent = match &frame.context {
+        Some(JsValue::Context(context)) => Some(Rc::clone(context)),
+        _ => None,
+    };
+    let eval_context = JsContext::new(1, parent);
+    eval_context.borrow_mut().slots[0] = JsValue::PlainObject(Rc::clone(&scope_map));
+    Ok(Some((JsValue::Context(eval_context), scope_map)))
+}
+
+fn sync_direct_eval_scope(
+    frame: &mut InterpreterFrame,
+    scope_map: &Rc<RefCell<PropertyMap>>,
+) -> StatorResult<()> {
+    let scope = scope_map.borrow();
+    let bindings: Vec<(String, i32)> = frame
+        .bytecode_array
+        .binding_registers()
+        .iter()
+        .map(|(name, reg)| (name.clone(), *reg))
+        .collect();
+    for (name, reg) in bindings {
+        if let Some(value) = scope.get(&name).cloned() {
+            frame.write_reg(reg as u32, value)?;
+        }
+    }
+    Ok(())
 }
 
 /// Load `new.target` into the accumulator.
