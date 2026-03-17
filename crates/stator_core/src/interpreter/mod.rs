@@ -170,6 +170,7 @@ mod dispatch;
 mod dynamic_import_conformance_tests;
 mod map_set_conformance_tests;
 mod numeric_conformance_tests;
+mod temporal_conformance_tests;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
