@@ -82,10 +82,10 @@ use crate::builtins::number::{
     number_reformat_exponential, number_to_exponential, number_to_precision,
 };
 use crate::builtins::proxy::{
-    ProxyHandler, proxy_define_property, proxy_delete_property, proxy_get,
-    proxy_get_own_property_descriptor, proxy_get_prototype_of, proxy_get_with_receiver, proxy_has,
-    proxy_is_extensible, proxy_new, proxy_new_callable, proxy_own_keys, proxy_prevent_extensions,
-    proxy_revocable, proxy_revoke, proxy_set_prototype_of, proxy_set_with_receiver,
+    ProxyHandler, proxy_define_property, proxy_delete_property, proxy_get_own_property_descriptor,
+    proxy_get_prototype_of, proxy_get_with_receiver, proxy_has, proxy_is_extensible, proxy_new,
+    proxy_new_callable, proxy_own_keys, proxy_prevent_extensions, proxy_revocable, proxy_revoke,
+    proxy_set_prototype_of, proxy_set_with_receiver,
 };
 use crate::builtins::regexp::regexp_construct;
 use crate::builtins::set::{
@@ -2633,6 +2633,9 @@ fn json_stringify_property_list(replacer: Option<&JsValue>) -> Vec<String> {
     let Some(replacer) = replacer else {
         return Vec::new();
     };
+    if !is_js_array(replacer) {
+        return Vec::new();
+    }
 
     let (elements, _) = to_array_like_elements(replacer);
     let mut properties = Vec::new();
@@ -2653,16 +2656,8 @@ fn json_stringify_property_list(replacer: Option<&JsValue>) -> Vec<String> {
 }
 
 /// Read a JSON-visible property from `holder`.
-fn json_get_property(holder: &JsValue, key: &str) -> JsValue {
-    match holder {
-        JsValue::Array(items) => key
-            .parse::<usize>()
-            .ok()
-            .and_then(|index| items.borrow().get(index).cloned())
-            .unwrap_or(JsValue::Undefined),
-        JsValue::PlainObject(map) => map.borrow().get(key).cloned().unwrap_or(JsValue::Undefined),
-        _ => JsValue::Undefined,
-    }
+fn json_get_property(holder: &JsValue, key: &str) -> StatorResult<JsValue> {
+    dispatch_get_property_value(holder, JsValue::String(key.to_string().into()))
 }
 
 /// Return a stable identity key for circular JSON detection.
@@ -2676,11 +2671,12 @@ fn json_identity_key(value: &JsValue) -> Option<usize> {
 }
 
 /// Return the callable `toJSON` method for `value`, if present.
-fn json_get_to_json(value: &JsValue) -> Option<JsValue> {
-    match value {
-        JsValue::PlainObject(map) => map.borrow().get("toJSON").cloned().filter(is_callable),
-        _ => None,
+fn json_get_to_json(value: &JsValue) -> StatorResult<Option<JsValue>> {
+    if matches!(value, JsValue::Undefined | JsValue::Null | JsValue::TheHole) {
+        return Ok(None);
     }
+    let candidate = json_get_property(value, "toJSON")?;
+    Ok(is_callable(&candidate).then_some(candidate))
 }
 
 /// Serialize a property using the ECMAScript `JSON.stringify` algorithm.
@@ -2693,9 +2689,9 @@ fn json_serialize_property(
     depth: usize,
     in_progress: &mut HashSet<usize>,
 ) -> StatorResult<Option<String>> {
-    let mut value = json_get_property(holder, key);
+    let mut value = json_get_property(holder, key)?;
 
-    if let Some(to_json) = json_get_to_json(&value) {
+    if let Some(to_json) = json_get_to_json(&value)? {
         value = call_callback_with_this(
             &to_json,
             value.clone(),
@@ -2769,6 +2765,7 @@ fn json_serialize_value(
             }
 
             let result = (|| {
+                let holder = JsValue::Proxy(Rc::clone(proxy));
                 let keys = proxy_own_keys(&proxy.borrow())?;
                 let key_strings: Vec<String> = keys
                     .iter()
@@ -2790,12 +2787,11 @@ fn json_serialize_value(
 
                 let mut parts = Vec::new();
                 for key in keys {
-                    let prop_val = proxy_get(&proxy.borrow(), &key)?;
-                    // Build a temporary holder for json_serialize_value.
-                    let child = json_serialize_value(
-                        &prop_val,
+                    let child = json_serialize_property(
+                        &holder,
+                        &key,
                         replacer_fn,
-                        None,
+                        property_list,
                         indent,
                         depth + 1,
                         in_progress,
@@ -3043,7 +3039,7 @@ fn make_json() -> JsValue {
 /// Walk a `JsValue` tree bottom-up, calling `reviver(key, value)` at each
 /// node — the ECMAScript `InternalizeJSONProperty` algorithm (§25.5.1.1).
 fn apply_js_reviver(holder: &JsValue, key: &str, reviver: &JsValue) -> StatorResult<JsValue> {
-    let value = json_get_property(holder, key);
+    let value = json_get_property(holder, key)?;
     let value = match value {
         JsValue::PlainObject(map) => {
             let keys: Vec<String> = map.borrow().keys().cloned().collect();
@@ -27131,6 +27127,381 @@ mod tests {
     fn e2e_json_parse_unicode_basic_escape() {
         let result = global_eval(r#"JSON.parse("\"\u0041\"")"#).unwrap();
         assert_eq!(result, JsValue::String("A".into()));
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_root_key_is_empty_string() {
+        assert_eval_true(
+            r#"
+            var seen = false;
+            JSON.parse('{"a":1}', function(key, value) {
+                if (key === "") seen = true;
+                return value;
+            });
+            seen
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_root_this_is_wrapper_object() {
+        assert_eval_true(
+            r#"
+            var ok = false;
+            JSON.parse('{"a":1}', function(key, value) {
+                if (key === "") ok = this[""].a === 1;
+                return value;
+            });
+            ok
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_can_replace_root_with_number() {
+        let result = global_eval(
+            r#"
+            JSON.parse('{"a":1}', function(key, value) {
+                return key === "" ? 99 : value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_can_replace_root_with_object() {
+        assert_eval_true(
+            r#"
+            var parsed = JSON.parse('{"a":1}', function(key, value) {
+                return key === "" ? { wrapped: value.a + 1 } : value;
+            });
+            parsed.wrapped === 2
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_root_returning_undefined_returns_undefined() {
+        let result = global_eval(
+            r#"
+            JSON.parse('{"a":1}', function(key, value) {
+                return key === "" ? undefined : value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_root_key_is_empty_string() {
+        assert_eval_true(
+            r#"
+            var seen = false;
+            JSON.stringify({ a: 1 }, function(key, value) {
+                if (key === "") seen = true;
+                return value;
+            });
+            seen
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_root_this_is_wrapper_object() {
+        assert_eval_true(
+            r#"
+            var ok = false;
+            JSON.stringify({ a: 1 }, function(key, value) {
+                if (key === "") ok = this[""] === value;
+                return value;
+            });
+            ok
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_can_omit_root() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({ a: 1 }, function(key, value) {
+                return key === "" ? undefined : value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_root_function_returns_undefined() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({ a: 1 }, function(key, value) {
+                return key === "" ? function() {} : value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_root_symbol_returns_undefined() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({ a: 1 }, function(key, value) {
+                return key === "" ? Symbol("root") : value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_root_bigint_throws() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({ a: 1 }, function(key, value) {
+                return key === "" ? 1n : value;
+            })
+            "#,
+        );
+        assert!(matches!(result, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_array_ignores_non_array_object() {
+        let result =
+            global_eval(r#"JSON.stringify({ a: 1, b: 2 }, { 0: "b", length: 1 })"#).unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":1,"b":2}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_array_deduplicates_entries() {
+        let result = global_eval(r#"JSON.stringify({ a: 1, b: 2 }, ["b", "a", "b"])"#).unwrap();
+        assert_eq!(result, JsValue::String(r#"{"b":2,"a":1}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_array_can_include_empty_string_key() {
+        let result = global_eval(r#"JSON.stringify({ "": 1, a: 2 }, [""])"#).unwrap();
+        assert_eq!(result, JsValue::String(r#"{"":1}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_array_reads_inherited_property_values() {
+        let result = global_eval(
+            r#"
+            var proto = { b: 2 };
+            var obj = Object.create(proto);
+            obj.a = 1;
+            JSON.stringify(obj, ["b"])
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"b":2}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_space_zero_number_is_compact() {
+        let result = global_eval("JSON.stringify({ a: { b: 1 } }, null, 0)").unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":{"b":1}}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_space_negative_number_is_compact() {
+        let result = global_eval("JSON.stringify({ a: { b: 1 } }, null, -4)").unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":{"b":1}}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_space_string_prefixes_each_level() {
+        let result = global_eval(r#"JSON.stringify({ a: { b: 1 } }, null, "--")"#).unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("{\n--\"a\": {\n----\"b\": 1\n--}\n}".into())
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_to_json_inherited_from_prototype() {
+        let result = global_eval(
+            r#"
+            var proto = {
+                toJSON: function(key) {
+                    return key === "" ? 7 : { from: key };
+                }
+            };
+            var obj = Object.create(proto);
+            obj.a = 1;
+            JSON.stringify(obj)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("7".into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_to_json_on_proxy() {
+        let result = global_eval(
+            r#"
+            var proxy = new Proxy({ a: 1 }, {
+                get: function(target, prop) {
+                    if (prop === "toJSON") {
+                        return function(key) { return { b: target.a + 1, key: key }; };
+                    }
+                    return target[prop];
+                }
+            });
+            JSON.stringify(proxy)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"b":2,"key":""}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_nested_proxy_to_json_receives_property_key() {
+        let result = global_eval(
+            r#"
+            var proxy = new Proxy({}, {
+                get: function(_target, prop) {
+                    if (prop === "toJSON") {
+                        return function(key) { return { from: key }; };
+                    }
+                    return undefined;
+                }
+            });
+            JSON.stringify({ inner: proxy })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::String(r#"{"inner":{"from":"inner"}}"#.into())
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_symbol_root_returns_undefined() {
+        let result = global_eval(r#"JSON.stringify(Symbol("root"))"#).unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_json_stringify_symbol_omitted_from_object() {
+        let result = global_eval(r#"JSON.stringify({ keep: 1, drop: Symbol("x") })"#).unwrap();
+        assert_eq!(result, JsValue::String(r#"{"keep":1}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_symbol_in_array_becomes_null() {
+        let result = global_eval(r#"JSON.stringify([1, Symbol("x"), 3])"#).unwrap();
+        assert_eq!(result, JsValue::String("[1,null,3]".into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_undefined_function_and_symbol_in_array_become_null() {
+        let result =
+            global_eval(r#"JSON.stringify([undefined, function() {}, Symbol("x")])"#).unwrap();
+        assert_eq!(result, JsValue::String("[null,null,null]".into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_nested_symbol_value_is_omitted() {
+        let result =
+            global_eval(r#"JSON.stringify({ outer: { keep: 1, drop: Symbol("x") } })"#).unwrap();
+        assert_eq!(result, JsValue::String(r#"{"outer":{"keep":1}}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_bigint_returned_from_to_json_throws() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({
+                toJSON: function() {
+                    return 1n;
+                }
+            })
+            "#,
+        );
+        assert!(matches!(result, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn e2e_json_stringify_bigint_returned_from_proxy_to_json_throws() {
+        let result = global_eval(
+            r#"
+            JSON.stringify(new Proxy({}, {
+                get: function(_target, prop) {
+                    if (prop === "toJSON") {
+                        return function() { return 1n; };
+                    }
+                    return undefined;
+                }
+            }))
+            "#,
+        );
+        assert!(matches!(result, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn e2e_json_stringify_array_hole_uses_prototype_value() {
+        assert_eval_true(
+            r#"
+            Array.prototype[1] = 7;
+            var out = JSON.stringify([1, , 3]);
+            delete Array.prototype[1];
+            out === "[1,7,3]"
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_array_on_proxy_reads_property_values() {
+        let result = global_eval(
+            r#"
+            var proxy = new Proxy({}, {
+                get: function(_target, prop) {
+                    return prop === "a" ? 1 : undefined;
+                },
+                ownKeys: function() {
+                    return ["a"];
+                }
+            });
+            JSON.stringify(proxy, ["a"])
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":1}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_numeric_precision_safe_integer_round_trips() {
+        assert_eval_true("JSON.parse(JSON.stringify(9007199254740991)) === 9007199254740991");
+    }
+
+    #[test]
+    fn e2e_json_stringify_numeric_precision_fraction_preserves_text() {
+        let result = global_eval("JSON.stringify(0.1)").unwrap();
+        assert_eq!(result, JsValue::String("0.1".into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_numeric_precision_negative_zero_becomes_zero() {
+        let result = global_eval("JSON.stringify(-0)").unwrap();
+        assert_eq!(result, JsValue::String("0".into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_numeric_precision_large_exponent_uses_json_number_text() {
+        let result = global_eval("JSON.stringify(1e21)").unwrap();
+        assert_eq!(result, JsValue::String("1e+21".into()));
     }
 
     // ── typeof conformance ───────────────────────────────────────────────────
