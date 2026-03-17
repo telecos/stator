@@ -56442,4 +56442,434 @@ mod tests {
              Reflect.defineProperty(o, 'x', { value: 2 }) === false",
         );
     }
+
+    // ---------------------------------------------------------------
+    // Exotic object behaviors conformance (w21f)
+    // ---------------------------------------------------------------
+
+    // --- 1. String exotic objects ---
+
+    /// String exotic: indexed property access on new String("abc").
+    #[test]
+    fn e2e_w21f_string_exotic_indexed_access() {
+        assert_e2e_true(
+            r#"var s = new String("abc"); s[0] === "a" && s[1] === "b" && s[2] === "c""#,
+        );
+    }
+
+    /// String exotic: .length is own property.
+    #[test]
+    fn e2e_w21f_string_exotic_length() {
+        assert_e2e_true(r#"var s = new String("hello"); s.length === 5"#);
+    }
+
+    /// String exotic: typeof wrapper is "object".
+    #[test]
+    fn e2e_w21f_string_exotic_typeof() {
+        assert_e2e_true(r#"typeof new String("abc") === "object""#);
+    }
+
+    /// String exotic: ownKeys returns indices then "length".
+    #[test]
+    fn e2e_w21f_string_exotic_own_keys() {
+        assert_e2e_true(
+            r#"var s = new String("ab"); var k = Object.getOwnPropertyNames(s); k[0] === "0" && k[1] === "1" && k[k.length - 1] === "length""#,
+        );
+    }
+
+    /// String exotic: indexed properties are not writable.
+    #[test]
+    fn e2e_w21f_string_exotic_index_not_writable() {
+        assert_e2e_true(
+            r#"var s = new String("abc"); var d = Object.getOwnPropertyDescriptor(s, "0"); d.writable === false && d.enumerable === true"#,
+        );
+    }
+
+    // --- 2. Arguments exotic (non-strict) ---
+
+    /// Arguments in sloppy mode: arguments reflects parameters.
+    #[test]
+    fn e2e_w21f_arguments_sloppy_reflects_params() {
+        assert_e2e_true(
+            "function f(a, b) { return arguments[0] === a && arguments[1] === b; } f(10, 20)",
+        );
+    }
+
+    /// Arguments: arguments.length matches actual args count.
+    #[test]
+    fn e2e_w21f_arguments_length() {
+        assert_e2e_true("function f() { return arguments.length; } f(1, 2, 3) === 3");
+    }
+
+    /// Arguments: callee in sloppy mode refers to function itself.
+    #[test]
+    fn e2e_w21f_arguments_callee_sloppy() {
+        assert_e2e_true("function f() { return arguments.callee === f; } f()");
+    }
+
+    /// Arguments: Symbol.iterator makes arguments iterable.
+    #[test]
+    fn e2e_w21f_arguments_symbol_iterator() {
+        assert_e2e_true(
+            "function f() { var sum = 0; for (var x of arguments) sum += x; return sum; } f(1, 2, 3) === 6",
+        );
+    }
+
+    /// Arguments in sloppy mode: mutation of param reflects in arguments.
+    #[test]
+    fn e2e_w21f_arguments_sloppy_param_mutation() {
+        assert_e2e_true("function f(a) { a = 99; return arguments[0] === 99; } f(1)");
+    }
+
+    /// Arguments in sloppy mode: mutation of arguments[0] reflects in param.
+    #[test]
+    fn e2e_w21f_arguments_sloppy_arg_mutation() {
+        assert_e2e_true("function f(a) { arguments[0] = 42; return a === 42; } f(1)");
+    }
+
+    // --- 3. Arguments in strict mode ---
+
+    /// Strict mode: arguments.callee throws TypeError.
+    #[test]
+    fn e2e_w21f_arguments_strict_callee_throws() {
+        assert_e2e_true(
+            r#""use strict"; function f() { try { arguments.callee; return false; } catch(e) { return e instanceof TypeError; } } f()"#,
+        );
+    }
+
+    /// Strict mode: arguments is not mapped to parameters.
+    #[test]
+    fn e2e_w21f_arguments_strict_no_mapping() {
+        assert_e2e_true(
+            r#""use strict"; function f(a) { a = 99; return arguments[0] !== 99; } f(1)"#,
+        );
+    }
+
+    /// Strict mode: arguments reverse mapping also absent.
+    #[test]
+    fn e2e_w21f_arguments_strict_no_reverse_mapping() {
+        assert_e2e_true(
+            r#""use strict"; function f(a) { arguments[0] = 42; return a !== 42; } f(1)"#,
+        );
+    }
+
+    // --- 4. Bound functions ---
+
+    /// bind: bound function preserves thisArg.
+    #[test]
+    fn e2e_w21f_bind_this_arg() {
+        assert_e2e_true(
+            "var obj = { x: 42 }; function f() { return this.x; } var bf = f.bind(obj); bf() === 42",
+        );
+    }
+
+    /// bind: bound function pre-fills arguments.
+    #[test]
+    fn e2e_w21f_bind_partial_args() {
+        assert_e2e_true(
+            "function add(a, b) { return a + b; } var add5 = add.bind(null, 5); add5(3) === 8",
+        );
+    }
+
+    /// bind: .name is "bound X".
+    #[test]
+    fn e2e_w21f_bind_name() {
+        assert_e2e_true(r#"function foo() {} var bf = foo.bind(null); bf.name === "bound foo""#);
+    }
+
+    /// bind: .length is adjusted by bound args.
+    #[test]
+    fn e2e_w21f_bind_length() {
+        assert_e2e_true("function f(a, b, c) {} var bf = f.bind(null, 1); bf.length === 2");
+    }
+
+    /// bind: instanceof works with bound function.
+    #[test]
+    fn e2e_w21f_bind_instanceof() {
+        assert_e2e_true(
+            "function Foo() {} var BF = Foo.bind(null); var obj = new BF(); obj instanceof Foo",
+        );
+    }
+
+    // --- 5. Bound function as constructor ---
+
+    /// new on bound function ignores thisArg.
+    #[test]
+    fn e2e_w21f_bound_new_ignores_this_arg() {
+        assert_e2e_true(
+            "function Ctor(x) { this.x = x; } \
+             var BC = Ctor.bind({ x: 999 }, 42); \
+             var obj = new BC(); \
+             obj.x === 42",
+        );
+    }
+
+    /// new on bound function passes bound args.
+    #[test]
+    fn e2e_w21f_bound_new_bound_args() {
+        assert_e2e_true(
+            "function Ctor(a, b) { this.sum = a + b; } \
+             var BC = Ctor.bind(null, 10); \
+             var obj = new BC(20); \
+             obj.sum === 30",
+        );
+    }
+
+    /// new on double-bound function.
+    #[test]
+    fn e2e_w21f_bound_new_double_bind() {
+        assert_e2e_true(
+            "function Ctor(a, b, c) { this.r = a + b + c; } \
+             var B1 = Ctor.bind(null, 1); \
+             var B2 = B1.bind(null, 2); \
+             var obj = new B2(3); \
+             obj.r === 6",
+        );
+    }
+
+    // --- 6. Integer-indexed exotic (TypedArray) ---
+
+    /// TypedArray: element access by index.
+    #[test]
+    fn e2e_w21f_typed_array_index_access() {
+        assert_e2e_true("var ta = new Uint8Array([10, 20, 30]); ta[0] === 10 && ta[2] === 30");
+    }
+
+    /// TypedArray: out-of-bounds index returns undefined, not prototype chain.
+    #[test]
+    fn e2e_w21f_typed_array_oob_undefined() {
+        assert_e2e_true("var ta = new Uint8Array(3); ta[100] === undefined");
+    }
+
+    /// TypedArray: setting out-of-bounds index is silently ignored.
+    #[test]
+    fn e2e_w21f_typed_array_oob_set_ignored() {
+        assert_e2e_true(
+            "var ta = new Uint8Array(2); ta[5] = 99; ta.length === 2 && ta[5] === undefined",
+        );
+    }
+
+    /// TypedArray: numeric index doesn't go to prototype.
+    #[test]
+    fn e2e_w21f_typed_array_no_proto_index() {
+        assert_e2e_true(
+            "var proto = Uint8Array.prototype; Object.defineProperty(proto, '0', { value: 777, configurable: true }); \
+             var ta = new Uint8Array(1); var result = ta[0] === 0; \
+             delete proto['0']; result",
+        );
+    }
+
+    // --- 7. Array exotic ---
+
+    /// Array: setting .length truncates elements.
+    #[test]
+    fn e2e_w21f_array_length_truncates() {
+        assert_e2e_true(
+            "var a = [1, 2, 3, 4, 5]; a.length = 2; a.length === 2 && a[2] === undefined",
+        );
+    }
+
+    /// Array: assigning to integer index auto-extends length.
+    #[test]
+    fn e2e_w21f_array_index_extends_length() {
+        assert_e2e_true("var a = []; a[9] = 'x'; a.length === 10");
+    }
+
+    /// Array: setting .length to 0 clears array.
+    #[test]
+    fn e2e_w21f_array_length_zero_clears() {
+        assert_e2e_true("var a = [1, 2, 3]; a.length = 0; a.length === 0 && a[0] === undefined");
+    }
+
+    /// Array: Object.keys on sparse array only shows defined indices.
+    #[test]
+    fn e2e_w21f_array_sparse_keys() {
+        assert_e2e_true(
+            r#"var a = []; a[2] = "x"; var k = Object.keys(a); k.length === 1 && k[0] === "2""#,
+        );
+    }
+
+    // --- 8. Proxy as prototype ---
+
+    /// Proxy as prototype: get trap intercepts property access.
+    #[test]
+    fn e2e_w21f_proxy_as_prototype_get() {
+        assert_e2e_true(
+            "var handler = { get: function(t, p) { return p === 'x' ? 42 : undefined; } }; \
+             var proto = new Proxy({}, handler); \
+             var obj = Object.create(proto); \
+             obj.x === 42",
+        );
+    }
+
+    /// Proxy as prototype: has trap intercepts 'in' operator.
+    #[test]
+    fn e2e_w21f_proxy_as_prototype_has() {
+        assert_e2e_true(
+            "var handler = { has: function(t, p) { return p === 'secret'; } }; \
+             var proto = new Proxy({}, handler); \
+             var obj = Object.create(proto); \
+             'secret' in obj",
+        );
+    }
+
+    /// Proxy: set trap is invoked.
+    #[test]
+    fn e2e_w21f_proxy_set_trap() {
+        assert_e2e_true(
+            "var log = []; \
+             var p = new Proxy({}, { set: function(t, k, v) { log.push(k); t[k] = v; return true; } }); \
+             p.a = 1; \
+             log[0] === 'a' && p.a === 1",
+        );
+    }
+
+    /// Proxy: apply trap for function proxy.
+    #[test]
+    fn e2e_w21f_proxy_apply_trap() {
+        assert_e2e_true(
+            "var p = new Proxy(function(x) { return x * 2; }, { \
+                 apply: function(t, thisArg, args) { return t.apply(thisArg, args) + 100; } \
+             }); \
+             p(5) === 110",
+        );
+    }
+
+    // --- 9. Revoked proxy throws TypeError ---
+
+    /// Revoked proxy: get throws TypeError.
+    #[test]
+    fn e2e_w21f_revoked_proxy_get_throws() {
+        assert_e2e_true(
+            "var r = Proxy.revocable({}, {}); r.revoke(); \
+             try { r.proxy.x; false; } catch(e) { e instanceof TypeError; }",
+        );
+    }
+
+    /// Revoked proxy: set throws TypeError.
+    #[test]
+    fn e2e_w21f_revoked_proxy_set_throws() {
+        assert_e2e_true(
+            "var r = Proxy.revocable({}, {}); r.revoke(); \
+             try { r.proxy.x = 1; false; } catch(e) { e instanceof TypeError; }",
+        );
+    }
+
+    /// Revoked proxy: has throws TypeError.
+    #[test]
+    fn e2e_w21f_revoked_proxy_has_throws() {
+        assert_e2e_true(
+            "var r = Proxy.revocable({}, {}); r.revoke(); \
+             try { 'x' in r.proxy; false; } catch(e) { e instanceof TypeError; }",
+        );
+    }
+
+    /// Revoked proxy: deleteProperty throws TypeError.
+    #[test]
+    fn e2e_w21f_revoked_proxy_delete_throws() {
+        assert_e2e_true(
+            "var r = Proxy.revocable({}, {}); r.revoke(); \
+             try { delete r.proxy.x; false; } catch(e) { e instanceof TypeError; }",
+        );
+    }
+
+    /// Revoked proxy: ownKeys throws TypeError.
+    #[test]
+    fn e2e_w21f_revoked_proxy_ownkeys_throws() {
+        assert_e2e_true(
+            "var r = Proxy.revocable({}, {}); r.revoke(); \
+             try { Object.keys(r.proxy); false; } catch(e) { e instanceof TypeError; }",
+        );
+    }
+
+    // --- 10. arguments.length is own, deletable ---
+
+    /// arguments.length is an own property.
+    #[test]
+    fn e2e_w21f_arguments_length_own() {
+        assert_e2e_true("function f() { return arguments.hasOwnProperty('length'); } f(1, 2)");
+    }
+
+    /// arguments.length is deletable.
+    #[test]
+    fn e2e_w21f_arguments_length_deletable() {
+        assert_e2e_true(
+            "function f() { delete arguments.length; return arguments.length === undefined; } f(1, 2)",
+        );
+    }
+
+    /// arguments.length reflects actual argument count, not formal params.
+    #[test]
+    fn e2e_w21f_arguments_length_actual_count() {
+        assert_e2e_true("function f(a) { return arguments.length; } f(1, 2, 3) === 3");
+    }
+
+    /// arguments: extra args beyond params accessible.
+    #[test]
+    fn e2e_w21f_arguments_extra_args() {
+        assert_e2e_true(
+            "function f(a) { return arguments[1] + arguments[2]; } f(1, 10, 20) === 30",
+        );
+    }
+
+    // --- Additional exotic edge cases ---
+
+    /// String exotic: valueOf returns primitive.
+    #[test]
+    fn e2e_w21f_string_exotic_valueof() {
+        assert_e2e_true(r#"var s = new String("hello"); s.valueOf() === "hello""#);
+    }
+
+    /// Bound function: bind of bind preserves .name chain.
+    #[test]
+    fn e2e_w21f_bind_of_bind_name() {
+        assert_e2e_true(
+            r#"function bar() {} var b1 = bar.bind(null); var b2 = b1.bind(null); b2.name === "bound bound bar""#,
+        );
+    }
+
+    /// Array: deleting element doesn't change length.
+    #[test]
+    fn e2e_w21f_array_delete_no_length_change() {
+        assert_e2e_true("var a = [1, 2, 3]; delete a[1]; a.length === 3 && a[1] === undefined");
+    }
+
+    /// Proxy construct trap.
+    #[test]
+    fn e2e_w21f_proxy_construct_trap() {
+        assert_e2e_true(
+            "function Foo(x) { this.x = x; } \
+             var P = new Proxy(Foo, { \
+                 construct: function(target, args) { return { x: args[0] * 10 }; } \
+             }); \
+             new P(3).x === 30",
+        );
+    }
+
+    /// bind: length is 0 when all params are bound.
+    #[test]
+    fn e2e_w21f_bind_length_zero_all_bound() {
+        assert_e2e_true("function f(a, b) {} var bf = f.bind(null, 1, 2); bf.length === 0");
+    }
+
+    /// bind: length doesn't go negative.
+    #[test]
+    fn e2e_w21f_bind_length_no_negative() {
+        assert_e2e_true("function f(a) {} var bf = f.bind(null, 1, 2, 3); bf.length === 0");
+    }
+
+    /// Array exotic: length is own property descriptor.
+    #[test]
+    fn e2e_w21f_array_length_own_descriptor() {
+        assert_e2e_true(
+            "var a = [1, 2]; var d = Object.getOwnPropertyDescriptor(a, 'length'); \
+             d.value === 2 && d.writable === true && d.enumerable === false && d.configurable === false",
+        );
+    }
+
+    /// TypedArray: .length reflects buffer size.
+    #[test]
+    fn e2e_w21f_typed_array_length() {
+        assert_e2e_true("var ta = new Int32Array(5); ta.length === 5");
+    }
 }
