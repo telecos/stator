@@ -8035,6 +8035,13 @@ fn make_iterator() -> JsValue {
         }),
     );
 
+    // §27.1.2 Iterator.prototype[@@toStringTag] = "Iterator"
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("Iterator".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+
     proto.make_all_non_enumerable();
     props.insert(
         "prototype".into(),
@@ -8200,6 +8207,13 @@ fn make_async_iterator() -> JsValue {
             }),
         );
     }
+
+    // §27.1.4.2 AsyncIterator.prototype[@@toStringTag] = "AsyncIterator"
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("AsyncIterator".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
 
     proto.make_all_non_enumerable();
     props.insert(
@@ -9249,6 +9263,9 @@ fn make_function() -> JsValue {
 
         // ── Function.prototype ──────────────────────────────────────────────
         let mut proto = PropertyMap::new();
+
+        // §20.2.3 Function.prototype is itself callable and returns undefined.
+        proto.insert("__call__".into(), native(|_args| Ok(JsValue::Undefined)));
 
         // Function.prototype.call(thisArg, ...args)
         proto.insert(
@@ -10743,6 +10760,12 @@ fn make_promise() -> JsValue {
         prototype.insert("then".into(), prototype_then.clone());
         prototype.insert("catch".into(), prototype_catch.clone());
         prototype.insert("finally".into(), prototype_finally.clone());
+        // §27.2.5.5 Promise.prototype[@@toStringTag] = "Promise"
+        prototype.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("Promise".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
         prototype.make_all_non_enumerable();
         let prototype_rc = Rc::new(RefCell::new(prototype));
         props.insert(
@@ -12849,6 +12872,13 @@ fn make_reflect() -> JsValue {
             }),
         );
 
+        // §26.1.14 Reflect[@@toStringTag] = "Reflect"
+        props.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("Reflect".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
         props.make_all_non_enumerable();
         JsValue::PlainObject(Rc::new(RefCell::new(props)))
     })
@@ -13182,7 +13212,12 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
             Ok(make_buffer_instance(Rc::new(RefCell::new(sliced))))
         }),
     );
-    proto.insert("@@toStringTag".into(), JsValue::String(display_name.into()));
+    // §25.1.6.14 / §25.2.5.7 ArrayBuffer.prototype[@@toStringTag]
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String(display_name.into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
     proto.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(proto)))
 }
@@ -13465,7 +13500,12 @@ fn make_dataview() -> JsValue {
     dataview_proto_setter!("setBigUint64", 2, dataview_set_biguint64, |v: &JsValue| {
         Ok::<u64, StatorError>(dataview_bigint_argument(v)? as u64)
     });
-    prototype.insert("@@toStringTag".into(), JsValue::String("DataView".into()));
+    // §25.3.4.4 DataView.prototype[@@toStringTag] = "DataView"
+    prototype.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("DataView".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
     prototype.make_all_non_enumerable();
 
     let mut props = PropertyMap::new();
@@ -13536,7 +13576,12 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
     );
 
     let mut prototype = PropertyMap::new();
-    prototype.insert("@@toStringTag".into(), JsValue::String(kind.name().into()));
+    // §23.2.3.32 %TypedArray%.prototype[@@toStringTag]
+    prototype.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String(kind.name().into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
     prototype.make_all_non_enumerable();
     props.insert(
         "prototype".into(),
@@ -53768,5 +53813,372 @@ mod tests {
     fn e2e_array_reduce_right_empty_with_initial() {
         let r = global_eval("[].reduceRight(function(a, b) { return a + b; }, 99)").unwrap();
         assert_eq!(r, JsValue::Smi(99));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Prototype chain audit & @@toStringTag conformance tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── 1. Array prototype chain ────────────────────────────────────────
+
+    /// Array.prototype.__proto__ === Object.prototype
+    #[test]
+    fn e2e_array_proto_chain_to_object() {
+        assert_eval_true("Object.getPrototypeOf(Array.prototype) === Object.prototype");
+    }
+
+    /// Array.__proto__ === Function.prototype
+    #[test]
+    fn e2e_array_ctor_proto_is_function_prototype() {
+        assert_eval_true("Object.getPrototypeOf(Array) === Function.prototype");
+    }
+
+    // ── 2. X.prototype.constructor === X for all builtins ───────────────
+
+    #[test]
+    fn e2e_array_prototype_constructor() {
+        assert_eval_true("Array.prototype.constructor === Array");
+    }
+
+    #[test]
+    fn e2e_object_prototype_constructor() {
+        assert_eval_true("Object.prototype.constructor === Object");
+    }
+
+    #[test]
+    fn e2e_function_prototype_constructor() {
+        assert_eval_true("Function.prototype.constructor === Function");
+    }
+
+    #[test]
+    fn e2e_map_prototype_constructor() {
+        assert_eval_true("Map.prototype.constructor === Map");
+    }
+
+    #[test]
+    fn e2e_set_prototype_constructor() {
+        assert_eval_true("Set.prototype.constructor === Set");
+    }
+
+    #[test]
+    fn e2e_promise_prototype_constructor() {
+        assert_eval_true("Promise.prototype.constructor === Promise");
+    }
+
+    #[test]
+    fn e2e_regexp_prototype_constructor() {
+        assert_eval_true("RegExp.prototype.constructor === RegExp");
+    }
+
+    #[test]
+    fn e2e_date_prototype_constructor() {
+        assert_eval_true("Date.prototype.constructor === Date");
+    }
+
+    #[test]
+    fn e2e_error_prototype_constructor() {
+        assert_eval_true("Error.prototype.constructor === Error");
+    }
+
+    #[test]
+    fn e2e_typeerror_prototype_constructor() {
+        assert_eval_true("TypeError.prototype.constructor === TypeError");
+    }
+
+    #[test]
+    fn e2e_rangeerror_prototype_constructor() {
+        assert_eval_true("RangeError.prototype.constructor === RangeError");
+    }
+
+    #[test]
+    fn e2e_referenceerror_prototype_constructor() {
+        assert_eval_true("ReferenceError.prototype.constructor === ReferenceError");
+    }
+
+    #[test]
+    fn e2e_syntaxerror_prototype_constructor() {
+        assert_eval_true("SyntaxError.prototype.constructor === SyntaxError");
+    }
+
+    #[test]
+    fn e2e_weakmap_prototype_constructor() {
+        assert_eval_true("WeakMap.prototype.constructor === WeakMap");
+    }
+
+    #[test]
+    fn e2e_weakset_prototype_constructor() {
+        assert_eval_true("WeakSet.prototype.constructor === WeakSet");
+    }
+
+    #[test]
+    fn e2e_number_prototype_constructor() {
+        assert_eval_true("Number.prototype.constructor === Number");
+    }
+
+    #[test]
+    fn e2e_boolean_prototype_constructor() {
+        assert_eval_true("Boolean.prototype.constructor === Boolean");
+    }
+
+    #[test]
+    fn e2e_symbol_prototype_constructor() {
+        assert_eval_true("Symbol.prototype.constructor === Symbol");
+    }
+
+    #[test]
+    fn e2e_string_prototype_constructor() {
+        assert_eval_true("String.prototype.constructor === String");
+    }
+
+    #[test]
+    fn e2e_arraybuffer_prototype_constructor() {
+        assert_eval_true("ArrayBuffer.prototype.constructor === ArrayBuffer");
+    }
+
+    #[test]
+    fn e2e_dataview_prototype_constructor() {
+        assert_eval_true("DataView.prototype.constructor === DataView");
+    }
+
+    // ── 3. Symbol.toStringTag on built-in prototypes ────────────────────
+
+    #[test]
+    fn e2e_map_prototype_to_string_tag() {
+        assert_eval_true("Map.prototype[Symbol.toStringTag] === 'Map'");
+    }
+
+    #[test]
+    fn e2e_set_prototype_to_string_tag() {
+        assert_eval_true("Set.prototype[Symbol.toStringTag] === 'Set'");
+    }
+
+    #[test]
+    fn e2e_weakmap_prototype_to_string_tag() {
+        assert_eval_true("WeakMap.prototype[Symbol.toStringTag] === 'WeakMap'");
+    }
+
+    #[test]
+    fn e2e_weakset_prototype_to_string_tag() {
+        assert_eval_true("WeakSet.prototype[Symbol.toStringTag] === 'WeakSet'");
+    }
+
+    #[test]
+    fn e2e_promise_prototype_to_string_tag() {
+        assert_eval_true("Promise.prototype[Symbol.toStringTag] === 'Promise'");
+    }
+
+    #[test]
+    fn e2e_arraybuffer_prototype_to_string_tag() {
+        assert_eval_true("ArrayBuffer.prototype[Symbol.toStringTag] === 'ArrayBuffer'");
+    }
+
+    #[test]
+    fn e2e_dataview_prototype_to_string_tag() {
+        assert_eval_true("DataView.prototype[Symbol.toStringTag] === 'DataView'");
+    }
+
+    #[test]
+    fn e2e_iterator_prototype_to_string_tag() {
+        assert_eval_true("Iterator.prototype[Symbol.toStringTag] === 'Iterator'");
+    }
+
+    #[test]
+    fn e2e_async_iterator_prototype_to_string_tag() {
+        assert_eval_true("AsyncIterator.prototype[Symbol.toStringTag] === 'AsyncIterator'");
+    }
+
+    #[test]
+    fn e2e_symbol_prototype_to_string_tag() {
+        assert_eval_true("Symbol.prototype[Symbol.toStringTag] === 'Symbol'");
+    }
+
+    // ── 4. Object.prototype.toString uses @@toStringTag ─────────────────
+
+    #[test]
+    fn e2e_tostring_map_instance() {
+        assert_eval_true("Object.prototype.toString.call(new Map()) === '[object Map]'");
+    }
+
+    #[test]
+    fn e2e_tostring_set_instance() {
+        assert_eval_true("Object.prototype.toString.call(new Set()) === '[object Set]'");
+    }
+
+    #[test]
+    fn e2e_tostring_math() {
+        assert_eval_true("Object.prototype.toString.call(Math) === '[object Math]'");
+    }
+
+    #[test]
+    fn e2e_tostring_json() {
+        assert_eval_true("Object.prototype.toString.call(JSON) === '[object JSON]'");
+    }
+
+    #[test]
+    fn e2e_tostring_reflect() {
+        assert_eval_true("Object.prototype.toString.call(Reflect) === '[object Reflect]'");
+    }
+
+    #[test]
+    fn e2e_tostring_promise_instance() {
+        assert_eval_true(
+            "Object.prototype.toString.call(Promise.resolve(1)) === '[object Promise]'",
+        );
+    }
+
+    #[test]
+    fn e2e_tostring_arraybuffer_instance() {
+        assert_eval_true(
+            "Object.prototype.toString.call(new ArrayBuffer(8)) === '[object ArrayBuffer]'",
+        );
+    }
+
+    #[test]
+    fn e2e_tostring_dataview_instance() {
+        assert_eval_true(
+            "Object.prototype.toString.call(new DataView(new ArrayBuffer(8))) === '[object DataView]'",
+        );
+    }
+
+    #[test]
+    fn e2e_tostring_uint8array_instance() {
+        assert_eval_true(
+            "Object.prototype.toString.call(new Uint8Array(4)) === '[object Uint8Array]'",
+        );
+    }
+
+    #[test]
+    fn e2e_tostring_int32array_instance() {
+        assert_eval_true(
+            "Object.prototype.toString.call(new Int32Array(4)) === '[object Int32Array]'",
+        );
+    }
+
+    #[test]
+    fn e2e_tostring_float64array_instance() {
+        assert_eval_true(
+            "Object.prototype.toString.call(new Float64Array(2)) === '[object Float64Array]'",
+        );
+    }
+
+    // ── 5. Built-in methods are non-enumerable ──────────────────────────
+
+    #[test]
+    fn e2e_array_push_non_enumerable() {
+        assert_eval_true("!Object.getOwnPropertyDescriptor(Array.prototype, 'push').enumerable");
+    }
+
+    #[test]
+    fn e2e_object_keys_non_enumerable() {
+        assert_eval_true("!Object.getOwnPropertyDescriptor(Object, 'keys').enumerable");
+    }
+
+    // ── 6. Built-in prototypes are ordinary objects ─────────────────────
+
+    #[test]
+    fn e2e_array_prototype_is_object() {
+        assert_eval_true("typeof Array.prototype === 'object'");
+    }
+
+    #[test]
+    fn e2e_map_prototype_is_object() {
+        assert_eval_true("typeof Map.prototype === 'object'");
+    }
+
+    // ── 7. Function.prototype is callable ───────────────────────────────
+
+    #[test]
+    fn e2e_function_prototype_is_callable() {
+        assert_eval_true("typeof Function.prototype === 'function'");
+    }
+
+    #[test]
+    fn e2e_function_prototype_returns_undefined() {
+        assert_eval_true("Function.prototype() === undefined");
+    }
+
+    // ── 8. Object.getPrototypeOf(Object.prototype) === null ─────────────
+
+    #[test]
+    fn e2e_object_prototype_proto_is_null() {
+        assert_eval_true("Object.getPrototypeOf(Object.prototype) === null");
+    }
+
+    // ── 9. TypedArray hierarchy ─────────────────────────────────────────
+
+    #[test]
+    fn e2e_uint8array_prototype_to_string_tag() {
+        assert_eval_true("Uint8Array.prototype[Symbol.toStringTag] === 'Uint8Array'");
+    }
+
+    #[test]
+    fn e2e_int8array_prototype_to_string_tag() {
+        assert_eval_true("Int8Array.prototype[Symbol.toStringTag] === 'Int8Array'");
+    }
+
+    #[test]
+    fn e2e_float32array_prototype_to_string_tag() {
+        assert_eval_true("Float32Array.prototype[Symbol.toStringTag] === 'Float32Array'");
+    }
+
+    // ── 10. Namespace toStringTags ──────────────────────────────────────
+
+    #[test]
+    fn e2e_math_to_string_tag() {
+        assert_eval_true("Math[Symbol.toStringTag] === 'Math'");
+    }
+
+    #[test]
+    fn e2e_json_to_string_tag() {
+        assert_eval_true("JSON[Symbol.toStringTag] === 'JSON'");
+    }
+
+    #[test]
+    fn e2e_reflect_to_string_tag() {
+        assert_eval_true("Reflect[Symbol.toStringTag] === 'Reflect'");
+    }
+
+    #[test]
+    fn e2e_atomics_to_string_tag() {
+        assert_eval_true("Atomics[Symbol.toStringTag] === 'Atomics'");
+    }
+
+    // ── 11. Error subtype prototype chains ──────────────────────────────
+
+    #[test]
+    fn e2e_typeerror_proto_chain() {
+        assert_eval_true("Object.getPrototypeOf(TypeError.prototype) === Error.prototype");
+    }
+
+    #[test]
+    fn e2e_rangeerror_proto_chain() {
+        assert_eval_true("Object.getPrototypeOf(RangeError.prototype) === Error.prototype");
+    }
+
+    // ── 12. Constructor __proto__ chains ─────────────────────────────────
+
+    #[test]
+    fn e2e_map_ctor_proto_is_function_prototype() {
+        assert_eval_true("Object.getPrototypeOf(Map) === Function.prototype");
+    }
+
+    #[test]
+    fn e2e_set_ctor_proto_is_function_prototype() {
+        assert_eval_true("Object.getPrototypeOf(Set) === Function.prototype");
+    }
+
+    #[test]
+    fn e2e_promise_ctor_proto_is_function_prototype() {
+        assert_eval_true("Object.getPrototypeOf(Promise) === Function.prototype");
+    }
+
+    #[test]
+    fn e2e_date_ctor_proto_is_function_prototype() {
+        assert_eval_true("Object.getPrototypeOf(Date) === Function.prototype");
+    }
+
+    #[test]
+    fn e2e_regexp_ctor_proto_is_function_prototype() {
+        assert_eval_true("Object.getPrototypeOf(RegExp) === Function.prototype");
     }
 }
