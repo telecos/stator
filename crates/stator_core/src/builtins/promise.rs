@@ -47,6 +47,13 @@ type MicrotaskQueueInner = Rc<RefCell<VecDeque<Box<dyn FnOnce()>>>>;
 /// reject it.
 pub type PromiseHandler = Box<dyn Fn(JsValue) -> Result<JsValue, JsValue>>;
 
+/// A callback used by [`promise_finally`] and related functions.
+///
+/// Returns `Ok(value)` to continue with a fulfillment value that should be
+/// assimilated before the original promise outcome is restored, or `Err(reason)`
+/// to reject the downstream promise immediately.
+pub type PromiseFinallyHandler = Box<dyn Fn() -> Result<JsValue, JsValue>>;
+
 // ── Thread-local active microtask queue ───────────────────────────────────────
 
 thread_local! {
@@ -535,6 +542,21 @@ where
     p
 }
 
+/// ECMAScript `Promise.try(fn, ...args)`.
+///
+/// Calls `callable(args)` synchronously:
+/// - `Ok(value)` resolves the returned promise with `value`.
+/// - `Err(reason)` rejects the returned promise with `reason`.
+pub fn promise_try<F>(callable: F, args: Vec<JsValue>, queue: &MicrotaskQueue) -> JsPromise
+where
+    F: FnOnce(Vec<JsValue>) -> Result<JsValue, JsValue>,
+{
+    match callable(args) {
+        Ok(value) => promise_resolve(value, queue),
+        Err(reason) => promise_reject(reason, queue),
+    }
+}
+
 // ── Static: Promise.resolve / Promise.reject ───────────────────────────────────
 
 /// ECMAScript §27.2.4.5 `Promise.resolve(value)`.
@@ -705,7 +727,8 @@ pub(crate) fn promise_catch_with_result(
 ///
 /// Calls `onFinally()` regardless of the settlement outcome:
 ///
-/// - `onFinally` returns `Ok(())` → the original value or rejection reason
+/// - `onFinally` returns `Ok(value)` → `value` is assimilated like
+///   `Promise.resolve(value)`, then the original value or rejection reason
 ///   passes through unchanged.
 /// - `onFinally` returns `Err(r)` → the returned promise is rejected with `r`.
 ///
@@ -719,14 +742,21 @@ pub(crate) fn promise_catch_with_result(
 /// let ran = std::rc::Rc::new(std::cell::Cell::new(false));
 /// let ran2 = std::rc::Rc::clone(&ran);
 /// let p = promise_resolve(JsValue::Smi(1), &queue);
-/// let p2 = promise_finally(&p, Box::new(move || { ran2.set(true); Ok(()) }), &queue);
+/// let p2 = promise_finally(
+///     &p,
+///     Box::new(move || {
+///         ran2.set(true);
+///         Ok(JsValue::Undefined)
+///     }),
+///     &queue,
+/// );
 /// queue.drain();
 /// assert!(ran.get());
 /// assert_eq!(p2.value(), Some(JsValue::Smi(1)));
 /// ```
 pub fn promise_finally(
     promise: &JsPromise,
-    on_finally: Box<dyn Fn() -> Result<(), JsValue>>,
+    on_finally: PromiseFinallyHandler,
     queue: &MicrotaskQueue,
 ) -> JsPromise {
     promise_finally_with_result(promise, on_finally, JsPromise::new_pending(), queue)
@@ -734,24 +764,73 @@ pub fn promise_finally(
 
 pub(crate) fn promise_finally_with_result(
     promise: &JsPromise,
-    on_finally: Box<dyn Fn() -> Result<(), JsValue>>,
+    on_finally: PromiseFinallyHandler,
     result_promise: JsPromise,
     queue: &MicrotaskQueue,
 ) -> JsPromise {
     let on_finally = Rc::new(on_finally);
-    let on_finally_f = Rc::clone(&on_finally);
-    let on_fulfilled = Some(Box::new(move |v: JsValue| match on_finally_f() {
-        Ok(()) => Ok(v),
-        Err(e) => Err(e),
-    }) as PromiseHandler);
+    let p2_fulfill = result_promise.clone();
+    let queue_fulfill = queue.clone();
+    let on_finally_fulfill = Rc::clone(&on_finally);
+    let fulfill_reaction: Box<dyn FnOnce(JsValue)> = Box::new(move |value| {
+        let original = Ok(value);
+        match on_finally_fulfill() {
+            Ok(finalizer_value) => {
+                settle_promise_finally(finalizer_value, original, &p2_fulfill, &queue_fulfill)
+            }
+            Err(reason) => p2_fulfill.reject(reason, &queue_fulfill),
+        }
+    });
 
-    let on_finally_r = Rc::clone(&on_finally);
-    let on_rejected = Some(Box::new(move |r: JsValue| match on_finally_r() {
-        Ok(()) => Err(r),
-        Err(e) => Err(e),
-    }) as PromiseHandler);
+    let p2_reject = result_promise.clone();
+    let queue_reject = queue.clone();
+    let on_finally_reject = Rc::clone(&on_finally);
+    let reject_reaction: Box<dyn FnOnce(JsValue)> = Box::new(move |reason| {
+        let original = Err(reason);
+        match on_finally_reject() {
+            Ok(finalizer_value) => {
+                settle_promise_finally(finalizer_value, original, &p2_reject, &queue_reject)
+            }
+            Err(finalizer_reason) => p2_reject.reject(finalizer_reason, &queue_reject),
+        }
+    });
 
-    promise_then_with_result(promise, on_fulfilled, on_rejected, result_promise, queue)
+    promise.add_reactions(fulfill_reaction, reject_reaction, queue);
+    result_promise
+}
+
+fn settle_promise_finally(
+    finalizer_value: JsValue,
+    original: Result<JsValue, JsValue>,
+    result_promise: &JsPromise,
+    queue: &MicrotaskQueue,
+) {
+    if let JsValue::Promise(cleanup_promise) = &finalizer_value
+        && cleanup_promise == result_promise
+    {
+        result_promise.reject(
+            JsValue::String("TypeError: promise cannot resolve itself".into()),
+            queue,
+        );
+        return;
+    }
+
+    let cleanup_promise = promise_resolve(finalizer_value, queue);
+    let original_for_cleanup = original.clone();
+    let cleanup_target = result_promise.clone();
+    let cleanup_queue = queue.clone();
+    let cleanup_reaction: Box<dyn FnOnce(JsValue)> =
+        Box::new(move |_| match &original_for_cleanup {
+            Ok(value) => cleanup_target.resolve(value.clone(), &cleanup_queue),
+            Err(reason) => cleanup_target.reject(reason.clone(), &cleanup_queue),
+        });
+
+    let reject_target = result_promise.clone();
+    let reject_queue = queue.clone();
+    let reject_reaction: Box<dyn FnOnce(JsValue)> =
+        Box::new(move |reason| reject_target.reject(reason, &reject_queue));
+
+    cleanup_promise.add_reactions(cleanup_reaction, reject_reaction, queue);
 }
 
 // ── Static: Promise.all ───────────────────────────────────────────────────────
@@ -1378,7 +1457,7 @@ mod tests {
             &p,
             Box::new(move || {
                 *ran2.borrow_mut() = true;
-                Ok(())
+                Ok(JsValue::Undefined)
             }),
             &queue,
         );
@@ -1397,7 +1476,7 @@ mod tests {
             &p,
             Box::new(move || {
                 *ran2.borrow_mut() = true;
-                Ok(())
+                Ok(JsValue::Undefined)
             }),
             &queue,
         );
@@ -1868,7 +1947,7 @@ mod tests {
     fn test_promise_finally_passes_through_fulfilled_value() {
         let queue = MicrotaskQueue::new();
         let p = promise_resolve(JsValue::Smi(42), &queue);
-        let p2 = promise_finally(&p, Box::new(|| Ok(())), &queue);
+        let p2 = promise_finally(&p, Box::new(|| Ok(JsValue::Undefined)), &queue);
         queue.drain();
         assert!(p2.is_fulfilled());
         assert_eq!(p2.value(), Some(JsValue::Smi(42)));
@@ -1878,10 +1957,120 @@ mod tests {
     fn test_promise_finally_passes_through_rejected_reason() {
         let queue = MicrotaskQueue::new();
         let p = promise_reject(JsValue::String("fail".into()), &queue);
-        let p2 = promise_finally(&p, Box::new(|| Ok(())), &queue);
+        let p2 = promise_finally(&p, Box::new(|| Ok(JsValue::Undefined)), &queue);
         queue.drain();
         assert!(p2.is_rejected());
         assert_eq!(p2.reason(), Some(JsValue::String("fail".into())));
+    }
+
+    #[test]
+    fn test_promise_try_resolves_return_value() {
+        let queue = MicrotaskQueue::new();
+        let p = promise_try(
+            |args| {
+                assert_eq!(args, vec![JsValue::Smi(2), JsValue::Smi(3)]);
+                Ok(JsValue::Smi(5))
+            },
+            vec![JsValue::Smi(2), JsValue::Smi(3)],
+            &queue,
+        );
+        queue.drain();
+        assert!(p.is_fulfilled());
+        assert_eq!(p.value(), Some(JsValue::Smi(5)));
+    }
+
+    #[test]
+    fn test_promise_try_rejects_thrown_reason() {
+        let queue = MicrotaskQueue::new();
+        let p = promise_try(
+            |_args| Err(JsValue::String("boom".into())),
+            vec![JsValue::Smi(1)],
+            &queue,
+        );
+        queue.drain();
+        assert!(p.is_rejected());
+        assert_eq!(p.reason(), Some(JsValue::String("boom".into())));
+    }
+
+    #[test]
+    fn test_promise_finally_waits_for_returned_promise_before_fulfill() {
+        let queue = MicrotaskQueue::new();
+        let cleanup = promise_with_resolvers(&queue);
+        let observed: Rc<RefCell<Vec<JsValue>>> = Rc::new(RefCell::new(Vec::new()));
+        let observed_cleanup = Rc::clone(&observed);
+        let observed_value = Rc::clone(&observed);
+        let result = promise_finally(
+            &promise_resolve(JsValue::Smi(7), &queue),
+            Box::new(move || {
+                observed_cleanup
+                    .borrow_mut()
+                    .push(JsValue::String("cleanup".into()));
+                Ok(JsValue::Promise(cleanup.promise.clone()))
+            }),
+            &queue,
+        );
+        promise_then(
+            &result,
+            Some(Box::new(move |value| {
+                observed_value.borrow_mut().push(value.clone());
+                Ok(value)
+            })),
+            None,
+            &queue,
+        );
+
+        queue.drain();
+        assert_eq!(*observed.borrow(), vec![JsValue::String("cleanup".into())]);
+        assert!(result.is_pending());
+
+        (cleanup.resolve)(JsValue::Undefined);
+        queue.drain();
+        assert_eq!(
+            *observed.borrow(),
+            vec![JsValue::String("cleanup".into()), JsValue::Smi(7)]
+        );
+        assert_eq!(result.value(), Some(JsValue::Smi(7)));
+    }
+
+    #[test]
+    fn test_promise_finally_waits_for_returned_promise_before_reject() {
+        let queue = MicrotaskQueue::new();
+        let cleanup = promise_with_resolvers(&queue);
+        let result = promise_finally(
+            &promise_reject(JsValue::String("fail".into()), &queue),
+            Box::new(move || Ok(JsValue::Promise(cleanup.promise.clone()))),
+            &queue,
+        );
+
+        queue.drain();
+        assert!(result.is_pending());
+
+        (cleanup.resolve)(JsValue::Undefined);
+        queue.drain();
+        assert!(result.is_rejected());
+        assert_eq!(result.reason(), Some(JsValue::String("fail".into())));
+    }
+
+    #[test]
+    fn test_promise_finally_rejects_with_returned_thenable_reason() {
+        let queue = MicrotaskQueue::new();
+        let cleanup = promise_with_resolvers(&queue);
+        let result = promise_finally(
+            &promise_resolve(JsValue::Smi(1), &queue),
+            Box::new(move || Ok(JsValue::Promise(cleanup.promise.clone()))),
+            &queue,
+        );
+
+        queue.drain();
+        assert!(result.is_pending());
+
+        (cleanup.reject)(JsValue::String("cleanup failed".into()));
+        queue.drain();
+        assert!(result.is_rejected());
+        assert_eq!(
+            result.reason(),
+            Some(JsValue::String("cleanup failed".into()))
+        );
     }
 
     // ── Edge cases: Promise.all with mixed values ───────────────────────────

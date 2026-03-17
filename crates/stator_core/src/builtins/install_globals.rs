@@ -2004,29 +2004,29 @@ fn promise_finally_method(queue: &crate::builtins::promise::MicrotaskQueue) -> J
                 ));
             }
         };
-        let callback: Box<dyn Fn() -> Result<(), JsValue>> = match args.get(1) {
+        let callback: crate::builtins::promise::PromiseFinallyHandler = match args.get(1) {
             Some(JsValue::NativeFunction(f)) => {
                 let f = Rc::clone(f);
                 Box::new(move || match f(vec![]) {
-                    Ok(_) => Ok(()),
+                    Ok(value) => Ok(value),
                     Err(e) => Err(JsValue::String(e.to_string().into())),
                 })
             }
             Some(v @ JsValue::Function(_)) | Some(v @ JsValue::Proxy(_)) => {
                 let callee = v.clone();
                 Box::new(move || match dispatch_call_value(&callee, vec![]) {
-                    Ok(_) => Ok(()),
+                    Ok(value) => Ok(value),
                     Err(e) => Err(JsValue::String(e.to_string().into())),
                 })
             }
             Some(JsValue::PlainObject(map)) if map.borrow().contains_key("__call__") => {
                 let callee = JsValue::PlainObject(Rc::clone(map));
                 Box::new(move || match dispatch_call_value(&callee, vec![]) {
-                    Ok(_) => Ok(()),
+                    Ok(value) => Ok(value),
                     Err(e) => Err(JsValue::String(e.to_string().into())),
                 })
             }
-            _ => Box::new(|| Ok(())),
+            _ => Box::new(|| Ok(JsValue::Undefined)),
         };
         let result_promise = promise_species_result(&promise)?;
         Ok(JsValue::Promise(
@@ -10376,7 +10376,7 @@ fn make_promise() -> JsValue {
     stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         use crate::builtins::promise::{
             MicrotaskQueue, install_active_microtask_queue, promise_all, promise_all_settled,
-            promise_any, promise_new, promise_race, promise_reject, promise_resolve,
+            promise_any, promise_new, promise_race, promise_reject, promise_resolve, promise_try,
             promise_with_resolvers,
         };
 
@@ -10461,6 +10461,26 @@ fn make_promise() -> JsValue {
                 native(move |args| {
                     let reason = args.first().cloned().unwrap_or(JsValue::Undefined);
                     Ok(JsValue::Promise(promise_reject(reason, &q)))
+                }),
+            );
+        }
+
+        // ── Promise.try(fn, ...args) ──────────────────────────────────────────
+        {
+            let q = queue.clone();
+            props.insert(
+                "try".into(),
+                native(move |args| {
+                    let callable = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let call_args = args.get(1..).map_or_else(Vec::new, |rest| rest.to_vec());
+                    Ok(JsValue::Promise(promise_try(
+                        move |call_args| match dispatch_call_value(&callable, call_args) {
+                            Ok(value) => Ok(value),
+                            Err(error) => Err(JsValue::String(error.to_string().into())),
+                        },
+                        call_args,
+                        &q,
+                    )))
                 }),
             );
         }
@@ -22966,6 +22986,202 @@ mod tests {
         drain_active_microtask_queue();
         let result2 = global_eval("JSON.stringify(log)").unwrap();
         assert_eq!(result2, JsValue::String("[1,2,3,4,5]".into()));
+    }
+
+    // -- 81. Promise.try resolves synchronous return values
+    #[test]
+    fn e2e_promise_try_resolves_return_value() {
+        let _ = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.try(function(a, b) {
+                out = "called";
+                return a + b;
+            }, 2, 3).then(function(value) {
+                out = out + ":" + value;
+            });
+            "#,
+        );
+        let result = global_eval("out").unwrap();
+        assert_eq!(result, JsValue::String("called:5".into()));
+    }
+
+    // -- 82. Promise.try rejects synchronous throws
+    #[test]
+    fn e2e_promise_try_rejects_thrown_value() {
+        let _ = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.try(function() {
+                throw "boom";
+            }).catch(function(reason) {
+                out = reason;
+            });
+            "#,
+        );
+        let result = global_eval("typeof out").unwrap();
+        assert_eq!(result, JsValue::String("string".into()));
+    }
+
+    // -- 83. Promise.try assimilates returned thenables
+    #[test]
+    fn e2e_promise_try_assimilates_thenable() {
+        let _ = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.try(function() {
+                return {
+                    then: function(resolve) {
+                        resolve(41);
+                    }
+                };
+            }).then(function(value) {
+                out = value + 1;
+            });
+            "#,
+        );
+        let result = global_eval("out").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    // -- 84. then skips non-callable fulfillment handlers
+    #[test]
+    fn e2e_promise_then_skips_non_callable_fulfillment_handler() {
+        let _ = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.resolve(9)
+                .then(123)
+                .then(function(value) { out = value; });
+            "#,
+        );
+        let result = global_eval("out").unwrap();
+        assert_eq!(result, JsValue::Smi(9));
+    }
+
+    // -- 85. then skips non-callable rejection handlers
+    #[test]
+    fn e2e_promise_then_skips_non_callable_rejection_handler() {
+        let _ = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.reject("nope")
+                .then(undefined, 123)
+                .catch(function(reason) { out = reason; });
+            "#,
+        );
+        let result = global_eval("out").unwrap();
+        assert_eq!(result, JsValue::String("nope".into()));
+    }
+
+    // -- 86. catch skips non-callable handlers like then(undefined, handler)
+    #[test]
+    fn e2e_promise_catch_skips_non_callable_handler() {
+        let _ = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.reject("kept")
+                .catch(0)
+                .catch(function(reason) { out = reason; });
+            "#,
+        );
+        let result = global_eval("out").unwrap();
+        assert_eq!(result, JsValue::String("kept".into()));
+    }
+
+    // -- 87. finally callback receives no arguments
+    #[test]
+    fn e2e_promise_finally_receives_no_arguments() {
+        let _ = eval_with_microtasks(
+            r#"
+            var out = -1;
+            Promise.resolve(1).finally(function() {
+                out = arguments.length;
+            });
+            "#,
+        );
+        let result = global_eval("out").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    // -- 88. finally waits for returned promise before continuing
+    #[test]
+    fn e2e_promise_finally_waits_for_returned_promise() {
+        let _ = eval_with_microtasks(
+            r#"
+            var steps = [];
+            var cleanup = Promise.withResolvers();
+            Promise.resolve("value")
+                .finally(function() {
+                    steps.push("cleanup");
+                    return cleanup.promise;
+                })
+                .then(function(value) {
+                    steps.push(value);
+                });
+            steps.push("after-finally");
+            "#,
+        );
+        let before = global_eval("JSON.stringify(steps)").unwrap();
+        assert_eq!(
+            before,
+            JsValue::String(r#"["cleanup","after-finally"]"#.into())
+        );
+
+        let _ = eval_with_microtasks("cleanup.resolve();");
+        let after = global_eval("JSON.stringify(steps)").unwrap();
+        assert_eq!(
+            after,
+            JsValue::String(r#"["cleanup","after-finally","value"]"#.into())
+        );
+    }
+
+    // -- 89. finally preserves rejection after returned promise fulfills
+    #[test]
+    fn e2e_promise_finally_preserves_rejection_after_returned_promise() {
+        let _ = eval_with_microtasks(
+            r#"
+            var cleanup = Promise.withResolvers();
+            var out = "";
+            Promise.reject("reason")
+                .finally(function() {
+                    return cleanup.promise;
+                })
+                .catch(function(reason) {
+                    out = reason;
+                });
+            "#,
+        );
+        let pending = global_eval("out").unwrap();
+        assert_eq!(pending, JsValue::String(String::new().into()));
+
+        let _ = eval_with_microtasks("cleanup.resolve();");
+        let result = global_eval("out").unwrap();
+        assert_eq!(result, JsValue::String("reason".into()));
+    }
+
+    // -- 90. finally rejects with returned thenable rejection
+    #[test]
+    fn e2e_promise_finally_rejects_with_returned_thenable_reason() {
+        let _ = eval_with_microtasks(
+            r#"
+            var cleanup = Promise.withResolvers();
+            var out = "";
+            Promise.resolve("value")
+                .finally(function() {
+                    return cleanup.promise;
+                })
+                .catch(function(reason) {
+                    out = reason;
+                });
+            "#,
+        );
+        let pending = global_eval("out").unwrap();
+        assert_eq!(pending, JsValue::String(String::new().into()));
+
+        let _ = eval_with_microtasks("cleanup.reject('cleanup failed');");
+        let result = global_eval("out").unwrap();
+        assert_eq!(result, JsValue::String("cleanup failed".into()));
     }
 
     // ── eval: direct vs indirect (end-to-end) ───────────────────────────────
