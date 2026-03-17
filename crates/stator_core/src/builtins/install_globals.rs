@@ -34,7 +34,9 @@ use crate::builtins::date::{
     date_to_locale_date_string, date_to_locale_string, date_to_locale_time_string, date_to_string,
     date_to_time_string, date_to_utc_string, date_utc, date_value_of,
 };
-use crate::builtins::error::{ErrorKind, JsError};
+use crate::builtins::error::{
+    ErrorKind, JsError, capture_stack_trace, error_capture_stack_trace, get_stack_trace_limit,
+};
 use crate::builtins::finalization_registry::{
     finalization_registry_drain, finalization_registry_new, finalization_registry_notify,
     finalization_registry_register, finalization_registry_unregister,
@@ -159,14 +161,139 @@ fn extract_cause(options: Option<&JsValue>) -> Option<JsValue> {
     }
 }
 
-/// Build the `AggregateError` constructor.
+/// §20.5.3.4 `Error.prototype.toString()` algorithm.
+///
+/// Works for both `JsValue::Error` and `JsValue::PlainObject` `this` values.
+/// Returns the spec-mandated `"name: message"` string, with special-casing
+/// for empty or undefined `name` / `message`.
+fn error_prototype_to_string(this: &JsValue) -> StatorResult<JsValue> {
+    match this {
+        JsValue::Error(e) => Ok(JsValue::String(e.to_error_string())),
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            let name = match borrow.get("name") {
+                Some(JsValue::String(s)) => s.to_string(),
+                Some(JsValue::Undefined) | None => "Error".to_string(),
+                Some(v) => v.to_js_string().unwrap_or_else(|_| "Error".to_string()),
+            };
+            let message = match borrow.get("message") {
+                Some(JsValue::String(s)) => s.to_string(),
+                Some(JsValue::Undefined) | None => String::new(),
+                Some(v) => v.to_js_string().unwrap_or_default(),
+            };
+            if name.is_empty() {
+                Ok(JsValue::String(message))
+            } else if message.is_empty() {
+                Ok(JsValue::String(name))
+            } else {
+                Ok(JsValue::String(format!("{name}: {message}")))
+            }
+        }
+        _ => Ok(JsValue::String("Error".to_string())),
+    }
+}
+
+/// Check whether `value` is an instance of an error constructor.
+///
+/// For `JsValue::Error` variants, fast-path on the `ErrorKind`.
+/// For `PlainObject` instances (e.g. custom subclasses), walk the
+/// `__proto__` chain looking for `prototype`.
+fn error_instanceof(value: &JsValue, prototype: &JsValue, kind: Option<ErrorKind>) -> bool {
+    match (value, kind) {
+        // Any JsValue::Error is instanceof Error (kind == None).
+        (JsValue::Error(_), None) => true,
+        // JsValue::Error with matching kind.
+        (JsValue::Error(err), Some(k)) if err.kind == k => true,
+        // Fall back to prototype chain walk for PlainObject instances.
+        _ => has_prototype_in_chain(value, prototype),
+    }
+}
+
+/// Walk the `__proto__` chain of `value` looking for `target` (by Rc identity).
+fn has_prototype_in_chain(value: &JsValue, target: &JsValue) -> bool {
+    let mut current = value.clone();
+    for _ in 0..256 {
+        match &current {
+            JsValue::PlainObject(map) => {
+                if let JsValue::PlainObject(t) = target
+                    && Rc::ptr_eq(map, t)
+                {
+                    return true;
+                }
+                let next = map.borrow().get("__proto__").cloned();
+                match next {
+                    Some(v) => current = v,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Build a PlainObject error constructor with `__call__`, `name`, `prototype`,
+/// and `@@hasInstance` for a specific `ErrorKind`.
+///
+/// `error_proto` is `Error.prototype` and `error_ctor` is the `Error`
+/// constructor so that the correct prototype chains are established:
+///   - `NativeError.prototype.__proto__` → `Error.prototype`
+///   - `NativeError.__proto__` → `Error`
+fn make_error_constructor_object(
+    kind: ErrorKind,
+    error_proto: &JsValue,
+    error_ctor: &JsValue,
+) -> JsValue {
+    let mut props = PropertyMap::new();
+    let mut proto = PropertyMap::new();
+    proto.insert("name".into(), JsValue::String(kind.as_name().to_string()));
+    proto.insert("message".into(), JsValue::String(String::new()));
+    proto.insert(
+        "toString".into(),
+        native(move |args| {
+            let this = args.first().unwrap_or(&JsValue::Undefined);
+            error_prototype_to_string(this)
+        }),
+    );
+    proto.insert("__proto__".into(), error_proto.clone());
+    let err_proto_rc = Rc::new(RefCell::new(proto));
+    let err_proto_val = JsValue::PlainObject(err_proto_rc.clone());
+
+    props.insert("__call__".into(), make_error_constructor(kind));
+    props.insert("name".into(), JsValue::String(kind.as_name().to_string()));
+    props.insert("@@hasInstance".into(), {
+        let proto_for_instanceof = err_proto_val.clone();
+        native(move |args| {
+            let val = args.first().unwrap_or(&JsValue::Undefined);
+            Ok(JsValue::Boolean(error_instanceof(
+                val,
+                &proto_for_instanceof,
+                Some(kind),
+            )))
+        })
+    });
+    // §20.5.6.1 NativeError.__proto__ → Error (constructor chain)
+    props.insert("__proto__".into(), error_ctor.clone());
+    props.insert("prototype".into(), err_proto_val);
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    // §20.5.6.2 NativeError.prototype.constructor
+    err_proto_rc
+        .borrow_mut()
+        .insert("constructor".into(), ctor.clone());
+    ctor
+}
+
+/// Build the `AggregateError` constructor object.
 ///
 /// Signature: `AggregateError(errors, message [, options])`.
 ///
 /// The `errors` argument is consumed as an `Array`; the optional `options`
 /// object may contain a `cause` property (ES2022).
-fn make_aggregate_error_constructor() -> JsValue {
-    native(|args| {
+///
+/// Returns a `PlainObject` with `__call__`, `name`, `@@hasInstance`, and a
+/// `prototype` that carries `name`, `message`, `toString`, and `constructor`.
+fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue) -> JsValue {
+    let call = native(|args| {
         // First arg: errors (iterable — we accept Array).
         let errors_val = args.first().unwrap_or(&JsValue::Undefined);
         let inner_errors: Vec<Rc<JsError>> = match errors_val {
@@ -191,37 +318,148 @@ fn make_aggregate_error_constructor() -> JsValue {
         // Third arg: optional options object with `cause`.
         err.cause = extract_cause(args.get(2));
         Ok(JsValue::Error(Rc::new(err)))
-    })
+    });
+
+    let mut proto = PropertyMap::new();
+    proto.insert("name".into(), JsValue::String("AggregateError".to_string()));
+    proto.insert("message".into(), JsValue::String(String::new()));
+    proto.insert(
+        "toString".into(),
+        native(|args| {
+            let this = args.first().unwrap_or(&JsValue::Undefined);
+            error_prototype_to_string(this)
+        }),
+    );
+    proto.insert("__proto__".into(), error_proto.clone());
+    let proto_rc = Rc::new(RefCell::new(proto));
+    let proto_val = JsValue::PlainObject(proto_rc.clone());
+
+    let mut props = PropertyMap::new();
+    props.insert("__call__".into(), call);
+    props.insert("name".into(), JsValue::String("AggregateError".to_string()));
+    props.insert("@@hasInstance".into(), {
+        let proto_for_instanceof = proto_val.clone();
+        native(move |args| {
+            let val = args.first().unwrap_or(&JsValue::Undefined);
+            Ok(JsValue::Boolean(error_instanceof(
+                val,
+                &proto_for_instanceof,
+                Some(ErrorKind::AggregateError),
+            )))
+        })
+    });
+    props.insert("__proto__".into(), error_ctor.clone());
+    props.insert("prototype".into(), proto_val);
+    let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+    // §20.5.6.2 AggregateError.prototype.constructor
+    proto_rc
+        .borrow_mut()
+        .insert("constructor".into(), ctor.clone());
+    ctor
 }
 
 /// Register all ECMAScript error constructors in the global environment.
+///
+/// The `Error` constructor additionally exposes the V8-compatible
+/// `Error.captureStackTrace(target)` and `Error.stackTraceLimit` extensions.
 fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
-    globals.insert("Error".into(), make_error_constructor(ErrorKind::Error));
+    // The `Error` constructor is a PlainObject so it can carry static methods.
+    let mut error_props = PropertyMap::new();
+    error_props.insert("__call__".into(), make_error_constructor(ErrorKind::Error));
+    error_props.insert("name".into(), JsValue::String("Error".into()));
+    // V8 extension: Error.captureStackTrace(targetObject [, constructorOpt])
+    error_props.insert(
+        "captureStackTrace".into(),
+        native(|args| {
+            let target = args.first().cloned().unwrap_or(JsValue::Undefined);
+            match target {
+                JsValue::Error(e) => {
+                    let mut cloned = (*e).clone();
+                    error_capture_stack_trace(&mut cloned, None);
+                }
+                JsValue::PlainObject(ref map) => {
+                    let stack_str = capture_stack_trace("Error", "");
+                    map.borrow_mut()
+                        .insert("stack".to_string(), JsValue::String(stack_str));
+                }
+                _ => {}
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    // V8 extension: Error.stackTraceLimit
+    error_props.insert(
+        "stackTraceLimit".into(),
+        JsValue::Smi(get_stack_trace_limit() as i32),
+    );
+
+    // ── Error.prototype ─────────────────────────────────────────────────
+    let error_proto_rc = {
+        let mut proto = PropertyMap::new();
+        proto.insert("name".into(), JsValue::String("Error".into()));
+        proto.insert("message".into(), JsValue::String(String::new()));
+        proto.insert(
+            "toString".into(),
+            native(|args| {
+                let this = args.first().unwrap_or(&JsValue::Undefined);
+                error_prototype_to_string(this)
+            }),
+        );
+        Rc::new(RefCell::new(proto))
+    };
+    error_props.insert("@@hasInstance".into(), {
+        let error_proto_for_instanceof = JsValue::PlainObject(error_proto_rc.clone());
+        native(move |args| {
+            let val = args.first().unwrap_or(&JsValue::Undefined);
+            Ok(JsValue::Boolean(error_instanceof(
+                val,
+                &error_proto_for_instanceof,
+                None,
+            )))
+        })
+    });
+    error_props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(error_proto_rc.clone()),
+    );
+
+    let error_val = JsValue::PlainObject(Rc::new(RefCell::new(error_props)));
+    globals.insert("Error".into(), error_val.clone());
+
+    let error_proto_val = JsValue::PlainObject(error_proto_rc.clone());
+    // Error.prototype.constructor
+    error_proto_rc
+        .borrow_mut()
+        .insert("constructor".into(), error_val.clone());
+
     globals.insert(
         "TypeError".into(),
-        make_error_constructor(ErrorKind::TypeError),
+        make_error_constructor_object(ErrorKind::TypeError, &error_proto_val, &error_val),
     );
     globals.insert(
         "RangeError".into(),
-        make_error_constructor(ErrorKind::RangeError),
+        make_error_constructor_object(ErrorKind::RangeError, &error_proto_val, &error_val),
     );
     globals.insert(
         "ReferenceError".into(),
-        make_error_constructor(ErrorKind::ReferenceError),
+        make_error_constructor_object(ErrorKind::ReferenceError, &error_proto_val, &error_val),
     );
     globals.insert(
         "SyntaxError".into(),
-        make_error_constructor(ErrorKind::SyntaxError),
+        make_error_constructor_object(ErrorKind::SyntaxError, &error_proto_val, &error_val),
     );
     globals.insert(
         "URIError".into(),
-        make_error_constructor(ErrorKind::URIError),
+        make_error_constructor_object(ErrorKind::URIError, &error_proto_val, &error_val),
     );
     globals.insert(
         "EvalError".into(),
-        make_error_constructor(ErrorKind::EvalError),
+        make_error_constructor_object(ErrorKind::EvalError, &error_proto_val, &error_val),
     );
-    globals.insert("AggregateError".into(), make_aggregate_error_constructor());
+    globals.insert(
+        "AggregateError".into(),
+        make_aggregate_error_constructor(&error_proto_val, &error_val),
+    );
 }
 
 /// Convert an `f64` to the most compact `JsValue` representation.
@@ -5694,7 +5932,7 @@ fn require_object_arg(args: &[JsValue], idx: usize, name: &str) -> StatorResult<
 
 /// Build the `ArrayBuffer` constructor object.
 fn make_arraybuffer() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // ArrayBuffer(byteLength)
     props.insert(
@@ -5723,7 +5961,7 @@ fn make_arraybuffer() -> JsValue {
 
 /// Build the `DataView` constructor object.
 fn make_dataview() -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     props.insert(
         "__call__".into(),
@@ -5921,7 +6159,7 @@ fn num_value<T: Into<f64>>(v: T) -> JsValue {
 
 /// Build a typed-array constructor for the given `TypedArrayKind`.
 fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
-    let mut props: HashMap<String, JsValue> = HashMap::new();
+    let mut props = PropertyMap::new();
 
     // BYTES_PER_ELEMENT
     props.insert(
@@ -6001,7 +6239,7 @@ fn make_typed_array_instance(
 ) -> JsValue {
     let _ = kind;
     let typed_array_val = JsValue::TypedArray(Rc::clone(&inner));
-    let mut obj: HashMap<String, JsValue> = HashMap::new();
+    let mut obj = PropertyMap::new();
 
     // BYTES_PER_ELEMENT
     {
@@ -10445,5 +10683,333 @@ mod tests {
     fn e2e_type_error_to_string_empty_message() {
         let result = global_eval(r#"var e = new TypeError(); e.toString()"#).unwrap();
         assert_eq!(result, JsValue::String("TypeError".to_string()));
+    }
+
+    // ── Error.cause and subtype conformance tests ────────────────────────
+
+    /// Error with cause: `new Error("x", { cause: 42 }).cause` → 42
+    #[test]
+    fn e2e_error_cause_number() {
+        let result = global_eval(r#"new Error("x", { cause: 42 }).cause"#).unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Error with cause: string value
+    #[test]
+    fn e2e_error_cause_string() {
+        let result = global_eval(r#"new Error("x", { cause: "root" }).cause"#).unwrap();
+        assert_eq!(result, JsValue::String("root".to_string()));
+    }
+
+    /// Error with cause: another error
+    #[test]
+    fn e2e_error_cause_is_error() {
+        let result = global_eval(
+            r#"var inner = new Error("inner"); var outer = new Error("outer", { cause: inner }); outer.cause.message"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("inner".to_string()));
+    }
+
+    /// TypeError supports cause option
+    #[test]
+    fn e2e_type_error_cause() {
+        let result = global_eval(r#"new TypeError("bad", { cause: "reason" }).cause"#).unwrap();
+        assert_eq!(result, JsValue::String("reason".to_string()));
+    }
+
+    /// RangeError supports cause option
+    #[test]
+    fn e2e_range_error_cause() {
+        let result = global_eval(r#"new RangeError("oor", { cause: 99 }).cause"#).unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    /// ReferenceError supports cause option
+    #[test]
+    fn e2e_reference_error_cause() {
+        let result = global_eval(r#"new ReferenceError("x", { cause: null }).cause"#).unwrap();
+        assert_eq!(result, JsValue::Null);
+    }
+
+    /// SyntaxError supports cause option
+    #[test]
+    fn e2e_syntax_error_cause() {
+        let result = global_eval(r#"new SyntaxError("bad", { cause: false }).cause"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// URIError supports cause option
+    #[test]
+    fn e2e_uri_error_cause() {
+        let result = global_eval(r#"new URIError("bad", { cause: true }).cause"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// EvalError supports cause option
+    #[test]
+    fn e2e_eval_error_cause() {
+        let result = global_eval(r#"new EvalError("bad", { cause: 0 }).cause"#).unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// AggregateError supports cause option (third arg)
+    #[test]
+    fn e2e_aggregate_error_cause() {
+        let result =
+            global_eval(r#"new AggregateError([], "msg", { cause: "root" }).cause"#).unwrap();
+        assert_eq!(result, JsValue::String("root".to_string()));
+    }
+
+    /// AggregateError .errors returns an array
+    #[test]
+    fn e2e_aggregate_error_errors_length() {
+        let result = global_eval(
+            r#"var e = new AggregateError([new Error("a"), new Error("b")], "two"); e.errors.length"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// AggregateError .errors[0] is an Error
+    #[test]
+    fn e2e_aggregate_error_errors_element_name() {
+        let result = global_eval(
+            r#"var e = new AggregateError([new TypeError("t")], "one"); e.errors[0].name"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("TypeError".to_string()));
+    }
+
+    /// AggregateError empty errors
+    #[test]
+    fn e2e_aggregate_error_empty_errors() {
+        let result = global_eval(r#"new AggregateError([], "none").errors.length"#).unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// Error.prototype.name default is "Error"
+    #[test]
+    fn e2e_error_prototype_name_default() {
+        let result = global_eval("Error.prototype.name").unwrap();
+        assert_eq!(result, JsValue::String("Error".to_string()));
+    }
+
+    /// Error.prototype.message default is ""
+    #[test]
+    fn e2e_error_prototype_message_default() {
+        let result = global_eval("Error.prototype.message").unwrap();
+        assert_eq!(result, JsValue::String(String::new()));
+    }
+
+    /// TypeError.prototype.name is "TypeError"
+    #[test]
+    fn e2e_type_error_prototype_name() {
+        let result = global_eval("TypeError.prototype.name").unwrap();
+        assert_eq!(result, JsValue::String("TypeError".to_string()));
+    }
+
+    /// RangeError.prototype.name is "RangeError"
+    #[test]
+    fn e2e_range_error_prototype_name() {
+        let result = global_eval("RangeError.prototype.name").unwrap();
+        assert_eq!(result, JsValue::String("RangeError".to_string()));
+    }
+
+    /// SyntaxError.prototype.name is "SyntaxError"
+    #[test]
+    fn e2e_syntax_error_prototype_name() {
+        let result = global_eval("SyntaxError.prototype.name").unwrap();
+        assert_eq!(result, JsValue::String("SyntaxError".to_string()));
+    }
+
+    /// ReferenceError.prototype.name is "ReferenceError"
+    #[test]
+    fn e2e_reference_error_prototype_name() {
+        let result = global_eval("ReferenceError.prototype.name").unwrap();
+        assert_eq!(result, JsValue::String("ReferenceError".to_string()));
+    }
+
+    /// URIError.prototype.name is "URIError"
+    #[test]
+    fn e2e_uri_error_prototype_name() {
+        let result = global_eval("URIError.prototype.name").unwrap();
+        assert_eq!(result, JsValue::String("URIError".to_string()));
+    }
+
+    /// EvalError.prototype.name is "EvalError"
+    #[test]
+    fn e2e_eval_error_prototype_name() {
+        let result = global_eval("EvalError.prototype.name").unwrap();
+        assert_eq!(result, JsValue::String("EvalError".to_string()));
+    }
+
+    /// AggregateError.prototype.name is "AggregateError"
+    #[test]
+    fn e2e_aggregate_error_prototype_name() {
+        let result = global_eval("AggregateError.prototype.name").unwrap();
+        assert_eq!(result, JsValue::String("AggregateError".to_string()));
+    }
+
+    /// Error.prototype.toString exists and is a function
+    #[test]
+    fn e2e_error_prototype_tostring_exists() {
+        let result = global_eval("typeof Error.prototype.toString").unwrap();
+        assert_eq!(result, JsValue::String("function".to_string()));
+    }
+
+    /// `new Error("msg").toString()` uses toString from prototype
+    #[test]
+    fn e2e_error_tostring_coercion() {
+        let result = global_eval(r#"var e = new Error("fail"); "" + e"#).unwrap();
+        assert_eq!(result, JsValue::String("Error: fail".to_string()));
+    }
+
+    /// `new RangeError("x").toString()` → "RangeError: x"
+    #[test]
+    fn e2e_range_error_tostring() {
+        let result = global_eval(r#"new RangeError("x").toString()"#).unwrap();
+        assert_eq!(result, JsValue::String("RangeError: x".to_string()));
+    }
+
+    /// `new SyntaxError("y").toString()` → "SyntaxError: y"
+    #[test]
+    fn e2e_syntax_error_tostring() {
+        let result = global_eval(r#"new SyntaxError("y").toString()"#).unwrap();
+        assert_eq!(result, JsValue::String("SyntaxError: y".to_string()));
+    }
+
+    /// `new ReferenceError("z").toString()` → "ReferenceError: z"
+    #[test]
+    fn e2e_reference_error_tostring() {
+        let result = global_eval(r#"new ReferenceError("z").toString()"#).unwrap();
+        assert_eq!(result, JsValue::String("ReferenceError: z".to_string()));
+    }
+
+    /// `new AggregateError([], "a").toString()` → "AggregateError: a"
+    #[test]
+    fn e2e_aggregate_error_tostring() {
+        let result = global_eval(r#"new AggregateError([], "a").toString()"#).unwrap();
+        assert_eq!(result, JsValue::String("AggregateError: a".to_string()));
+    }
+
+    /// `new Error("").toString()` → "Error" (empty message)
+    #[test]
+    fn e2e_error_tostring_empty_message() {
+        let result = global_eval(r#"new Error("").toString()"#).unwrap();
+        assert_eq!(result, JsValue::String("Error".to_string()));
+    }
+
+    /// instanceof: `new Error() instanceof Error` → true
+    #[test]
+    fn e2e_error_instanceof_error() {
+        let result = global_eval(r#"new Error("x") instanceof Error"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// instanceof: `new TypeError() instanceof TypeError` → true
+    #[test]
+    fn e2e_type_error_instanceof_type_error() {
+        let result = global_eval(r#"new TypeError("x") instanceof TypeError"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// instanceof: `new TypeError() instanceof Error` → true (subtype)
+    #[test]
+    fn e2e_type_error_instanceof_error() {
+        let result = global_eval(r#"new TypeError("x") instanceof Error"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// instanceof: `new RangeError() instanceof RangeError` → true
+    #[test]
+    fn e2e_range_error_instanceof_range_error() {
+        let result = global_eval(r#"new RangeError("x") instanceof RangeError"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// instanceof: `new RangeError() instanceof Error` → true (subtype)
+    #[test]
+    fn e2e_range_error_instanceof_error() {
+        let result = global_eval(r#"new RangeError("x") instanceof Error"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// instanceof: `new AggregateError([]) instanceof AggregateError` → true
+    #[test]
+    fn e2e_aggregate_error_instanceof_aggregate() {
+        let result =
+            global_eval(r#"new AggregateError([], "x") instanceof AggregateError"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// instanceof: `new AggregateError([]) instanceof Error` → true
+    #[test]
+    fn e2e_aggregate_error_instanceof_error() {
+        let result = global_eval(r#"new AggregateError([], "x") instanceof Error"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// instanceof negative: `new Error() instanceof TypeError` → false
+    #[test]
+    fn e2e_error_not_instanceof_type_error() {
+        let result = global_eval(r#"new Error("x") instanceof TypeError"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// instanceof negative: `42 instanceof Error` → false
+    #[test]
+    fn e2e_number_not_instanceof_error() {
+        let result = global_eval("42 instanceof Error").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    /// Error constructor: `.name` property on constructor object
+    #[test]
+    fn e2e_error_constructor_name() {
+        let result = global_eval("Error.name").unwrap();
+        assert_eq!(result, JsValue::String("Error".to_string()));
+    }
+
+    /// TypeError constructor: `.name` property
+    #[test]
+    fn e2e_type_error_constructor_name() {
+        let result = global_eval("TypeError.name").unwrap();
+        assert_eq!(result, JsValue::String("TypeError".to_string()));
+    }
+
+    /// Error.prototype.constructor === Error
+    #[test]
+    fn e2e_error_prototype_constructor_identity() {
+        let result = global_eval("Error.prototype.constructor === Error").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// TypeError.prototype.constructor === TypeError
+    #[test]
+    fn e2e_type_error_prototype_constructor_identity() {
+        let result = global_eval("TypeError.prototype.constructor === TypeError").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Error without message: `.message` → ""
+    #[test]
+    fn e2e_error_no_message_arg() {
+        let result = global_eval("new Error().message").unwrap();
+        assert_eq!(result, JsValue::String(String::new()));
+    }
+
+    /// Error.captureStackTrace exists
+    #[test]
+    fn e2e_error_capture_stack_trace_exists() {
+        let result = global_eval("typeof Error.captureStackTrace").unwrap();
+        assert_eq!(result, JsValue::String("function".to_string()));
+    }
+
+    /// Error.stackTraceLimit is a number
+    #[test]
+    fn e2e_error_stack_trace_limit_type() {
+        let result = global_eval("typeof Error.stackTraceLimit").unwrap();
+        assert_eq!(result, JsValue::String("number".to_string()));
     }
 }

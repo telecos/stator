@@ -2521,6 +2521,15 @@ fn handle_test_instance_of(
     };
     let constructor = ctx.frame.read_reg(v)?.clone();
 
+    // §7.3.21 OrdinaryHasInstance — first check @@hasInstance on the constructor.
+    if let JsValue::PlainObject(map) = &constructor
+        && let Some(JsValue::NativeFunction(f)) = map.borrow().get("@@hasInstance").cloned()
+    {
+        let result = f(vec![ctx.frame.accumulator.clone()])?;
+        ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
+        return Ok(DispatchAction::Continue);
+    }
+
     // Obtain the constructor's "prototype" property.
     let ctor_proto = match &constructor {
         JsValue::PlainObject(map) => map.borrow().get("prototype").cloned(),
