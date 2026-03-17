@@ -22,3 +22,5 @@ pub mod scanner;
 pub mod scope;
 
 pub use recursive_descent::parse;
+pub use recursive_descent::parse_module;
+pub use recursive_descent::parse_script;

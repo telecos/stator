@@ -96,6 +96,14 @@ pub struct Parser<'src> {
     /// Label stack for validating break/continue targets.
     /// Each entry is (label_name, is_iteration_label).
     labels: Vec<(String, bool)>,
+    /// `true` when the source is being parsed as an ES module (set via
+    /// [`parse_module`] or auto-detected from `import`/`export`
+    /// declarations).
+    is_module: bool,
+    /// Nesting depth of `async` function bodies.  Incremented when entering
+    /// an async function body and decremented when leaving.  Used together
+    /// with `is_module` to validate `await` usage.
+    async_function_depth: usize,
 }
 
 impl<'src> Parser<'src> {
@@ -117,6 +125,8 @@ impl<'src> Parser<'src> {
             breakable_depth: 0,
             in_nullish_coalesce: false,
             labels: Vec::new(),
+            is_module: false,
+            async_function_depth: 0,
         })
     }
 
@@ -127,7 +137,9 @@ impl<'src> Parser<'src> {
         loop {
             let tok = scanner.next_token()?;
             match tok.kind {
-                TokenKind::SingleLineComment | TokenKind::MultiLineComment => continue,
+                TokenKind::SingleLineComment
+                | TokenKind::MultiLineComment
+                | TokenKind::HashbangComment => continue,
                 _ => return Ok(tok),
             }
         }
@@ -298,12 +310,20 @@ impl<'src> Parser<'src> {
     /// [`ProgramItem::ModuleDecl`]; everything else is a
     /// [`ProgramItem::Stmt`].  When at least one module declaration is
     /// encountered the source type is set to [`SourceType::Module`].
+    ///
+    /// When `self.is_module` is `true` (set by [`parse_module`]), the parser
+    /// starts in module mode with strict semantics from the beginning.
     fn parse_program(&mut self) -> StatorResult<Program> {
         let start = self.current_span();
         let mut body = Vec::new();
-        let mut is_module = false;
-        let mut is_strict = false;
+        let mut is_module = self.is_module;
+        let mut is_strict = self.is_module;
         let mut in_directive_prologue = true;
+
+        // Module mode enables strict semantics up-front.
+        if self.is_module {
+            self.strict_mode = true;
+        }
 
         while self.peek_kind() != TokenKind::Eof {
             match self.peek_kind() {
@@ -335,6 +355,7 @@ impl<'src> Parser<'src> {
                         // Module code is always strict (ES2024 §10.2.1).
                         if !is_module {
                             is_module = true;
+                            self.is_module = true;
                             self.strict_mode = true;
                             is_strict = true;
                         }
@@ -347,6 +368,7 @@ impl<'src> Parser<'src> {
                     // Module code is always strict (ES2024 §10.2.1).
                     if !is_module {
                         is_module = true;
+                        self.is_module = true;
                         self.strict_mode = true;
                         is_strict = true;
                     }
@@ -1158,8 +1180,15 @@ impl<'src> Parser<'src> {
 
         // Save enclosing strict mode, then parse function body.
         let outer_strict = self.strict_mode;
+        let outer_async_depth = self.async_function_depth;
+        if is_async {
+            self.async_function_depth = 1;
+        } else {
+            self.async_function_depth = 0;
+        }
         let (body, fn_strict, has_use_strict) = self.parse_function_body()?;
         self.strict_mode = outer_strict;
+        self.async_function_depth = outer_async_depth;
 
         // "use strict" inside a function with non-simple parameters is an
         // early error (ES2025 §15.1.1).
@@ -1433,14 +1462,17 @@ impl<'src> Parser<'src> {
                 let outer_it = self.iteration_depth;
                 let outer_br = self.breakable_depth;
                 let outer_labels = std::mem::take(&mut self.labels);
+                let outer_async_depth = self.async_function_depth;
                 self.function_depth = 1;
                 self.iteration_depth = 0;
                 self.breakable_depth = 0;
+                self.async_function_depth = if is_async { 1 } else { 0 };
                 let body = self.parse_block();
                 self.function_depth = outer_fn;
                 self.iteration_depth = outer_it;
                 self.breakable_depth = outer_br;
                 self.labels = outer_labels;
+                self.async_function_depth = outer_async_depth;
                 let body = body?;
                 let fn_end = body.loc;
 
@@ -2503,7 +2535,7 @@ impl<'src> Parser<'src> {
                         self.bump()?; // consume `)`
                         if self.peek_kind() == TokenKind::Arrow {
                             self.bump()?; // consume `=>`
-                            let body = self.parse_arrow_body()?;
+                            let body = self.parse_arrow_body(true)?;
                             let end = self.arrow_body_loc(&body);
                             return Ok(Expr::Arrow(Box::new(ArrowExpr {
                                 loc: Self::merge_spans(start, end),
@@ -2537,7 +2569,7 @@ impl<'src> Parser<'src> {
                             pat: Pat::Ident(ident),
                             default: None,
                         }];
-                        let body = self.parse_arrow_body()?;
+                        let body = self.parse_arrow_body(true)?;
                         let end = self.arrow_body_loc(&body);
                         return Ok(Expr::Arrow(Box::new(ArrowExpr {
                             loc: Self::merge_spans(start, end),
@@ -2600,7 +2632,7 @@ impl<'src> Parser<'src> {
                 self.bump()?; // consume `)`
                 if self.peek_kind() == TokenKind::Arrow {
                     self.bump()?; // consume `=>`
-                    let body = self.parse_arrow_body()?;
+                    let body = self.parse_arrow_body(false)?;
                     let end = self.arrow_body_loc(&body);
                     return Ok(Expr::Arrow(Box::new(ArrowExpr {
                         loc: Self::merge_spans(start, end),
@@ -2645,7 +2677,7 @@ impl<'src> Parser<'src> {
                     .map(|e| self.expr_to_single_param(e))
                     .collect::<StatorResult<Vec<_>>>()?;
                 self.check_unique_params(&params)?;
-                let body = self.parse_arrow_body()?;
+                let body = self.parse_arrow_body(true)?;
                 let end = self.arrow_body_loc(&body);
                 return Ok(Expr::Arrow(Box::new(ArrowExpr {
                     loc: Self::merge_spans(start, end),
@@ -2658,7 +2690,7 @@ impl<'src> Parser<'src> {
 
             let params = self.expr_to_arrow_params(lhs)?;
             self.check_unique_params(&params)?;
-            let body = self.parse_arrow_body()?;
+            let body = self.parse_arrow_body(false)?;
             let end = self.arrow_body_loc(&body);
             return Ok(Expr::Arrow(Box::new(ArrowExpr {
                 loc: Self::merge_spans(start, end),
@@ -2949,6 +2981,14 @@ impl<'src> Parser<'src> {
             TokenKind::Void => Some(UnaryOp::Void),
             TokenKind::Delete => Some(UnaryOp::Delete),
             TokenKind::Await => {
+                // `await` is valid inside async functions and at the top level
+                // of modules (ES2022 top-level await).
+                if self.async_function_depth == 0 && !self.is_module {
+                    return Err(Self::error_at(
+                        start,
+                        "'await' is only valid in async functions and module top-level code",
+                    ));
+                }
                 self.bump()?;
                 let argument = self.parse_unary()?;
                 let end = argument.loc();
@@ -3638,14 +3678,17 @@ impl<'src> Parser<'src> {
                             let outer_it = self.iteration_depth;
                             let outer_br = self.breakable_depth;
                             let outer_labels = std::mem::take(&mut self.labels);
+                            let outer_async_depth = self.async_function_depth;
                             self.function_depth = 1;
                             self.iteration_depth = 0;
                             self.breakable_depth = 0;
+                            self.async_function_depth = 0;
                             let body = self.parse_block();
                             self.function_depth = outer_fn;
                             self.iteration_depth = outer_it;
                             self.breakable_depth = outer_br;
                             self.labels = outer_labels;
+                            self.async_function_depth = outer_async_depth;
                             let body = body?;
                             let fn_end = body.loc;
                             let fn_expr = FnExpr {
@@ -3677,14 +3720,17 @@ impl<'src> Parser<'src> {
                             let outer_it = self.iteration_depth;
                             let outer_br = self.breakable_depth;
                             let outer_labels = std::mem::take(&mut self.labels);
+                            let outer_async_depth = self.async_function_depth;
                             self.function_depth = 1;
                             self.iteration_depth = 0;
                             self.breakable_depth = 0;
+                            self.async_function_depth = if is_async_method { 1 } else { 0 };
                             let body = self.parse_block();
                             self.function_depth = outer_fn;
                             self.iteration_depth = outer_it;
                             self.breakable_depth = outer_br;
                             self.labels = outer_labels;
+                            self.async_function_depth = outer_async_depth;
                             let body = body?;
                             let fn_end = body.loc;
                             PropValue::Method(FnExpr {
@@ -3950,6 +3996,12 @@ impl<'src> Parser<'src> {
                             ),
                         ));
                     }
+                    if !self.is_module {
+                        return Err(Self::error_at(
+                            import_tok.span,
+                            "import.meta is only valid in module code",
+                        ));
+                    }
                     let end = prop_tok.span;
                     Ok(Expr::MetaProp(MetaPropExpr {
                         loc: Self::merge_spans(import_tok.span, end),
@@ -4021,8 +4073,15 @@ impl<'src> Parser<'src> {
         let params = self.parse_formal_params()?;
 
         let outer_strict = self.strict_mode;
+        let outer_async_depth = self.async_function_depth;
+        if is_async {
+            self.async_function_depth = 1;
+        } else {
+            self.async_function_depth = 0;
+        }
         let (body, fn_strict, has_use_strict) = self.parse_function_body()?;
         self.strict_mode = outer_strict;
+        self.async_function_depth = outer_async_depth;
 
         // "use strict" inside a function with non-simple parameters.
         if has_use_strict && Self::has_non_simple_params(&params) {
@@ -4174,24 +4233,35 @@ impl<'src> Parser<'src> {
 
     /// Parse the body of an arrow function: either a block `{ … }` or a
     /// concise expression body.
-    fn parse_arrow_body(&mut self) -> StatorResult<ArrowBody> {
+    fn parse_arrow_body(&mut self, is_async: bool) -> StatorResult<ArrowBody> {
         if self.peek_kind() == TokenKind::LeftBrace {
             // Arrow block body is a function context for break/continue/return.
             let outer_function_depth = self.function_depth;
             let outer_iteration_depth = self.iteration_depth;
             let outer_breakable_depth = self.breakable_depth;
             let outer_labels = std::mem::take(&mut self.labels);
+            let outer_async_depth = self.async_function_depth;
             self.function_depth = 1;
             self.iteration_depth = 0;
             self.breakable_depth = 0;
+            self.async_function_depth = if is_async { 1 } else { 0 };
             let block = self.parse_block();
             self.function_depth = outer_function_depth;
             self.iteration_depth = outer_iteration_depth;
             self.breakable_depth = outer_breakable_depth;
             self.labels = outer_labels;
+            self.async_function_depth = outer_async_depth;
             Ok(ArrowBody::Block(block?))
         } else {
-            Ok(ArrowBody::Expr(Box::new(self.parse_assignment_expr()?)))
+            // Concise arrow body — `await` is allowed in the expression if the
+            // arrow is async, but we do *not* enter a new function scope.
+            let outer_async_depth = self.async_function_depth;
+            if is_async {
+                self.async_function_depth = 1;
+            }
+            let result = self.parse_assignment_expr();
+            self.async_function_depth = outer_async_depth;
+            Ok(ArrowBody::Expr(Box::new(result?)))
         }
     }
 
@@ -4582,10 +4652,15 @@ impl<'src> Parser<'src> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Public entry point
+// Public entry points
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Parse `source` as a JavaScript script and return the root [`Program`].
+/// Parse `source` as a JavaScript program, auto-detecting script vs module
+/// mode from `import`/`export` declarations.
+///
+/// This is the default entry point for when the source type is not known in
+/// advance.  If the source contains any `import` or `export` declarations the
+/// result will have [`SourceType::Module`]; otherwise [`SourceType::Script`].
 ///
 /// # Errors
 ///
@@ -4606,6 +4681,63 @@ impl<'src> Parser<'src> {
 pub fn parse(source: &str) -> StatorResult<Program> {
     // Parser recursion (expressions, nested functions, arrow bodies) can be
     // deep for generated / minified code.  Ensure stack headroom.
+    stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, || {
+        let mut parser = Parser::new(source)?;
+        let program = parser.parse_program()?;
+        Ok(program)
+    })
+}
+
+/// Parse `source` as an ES module.
+///
+/// Module mode enables strict semantics from the start, allows top-level
+/// `import`/`export` declarations, `await` expressions at the top level
+/// (ES2022+), and `import.meta`.
+///
+/// # Errors
+///
+/// Returns a [`StatorError::SyntaxError`] on syntax errors.
+///
+/// # Example
+///
+/// ```
+/// use stator_core::parser::parse_module;
+/// use stator_core::parser::ast::SourceType;
+///
+/// let prog = parse_module("const x = await fetch('/api');").unwrap();
+/// assert_eq!(prog.source_type, SourceType::Module);
+/// assert!(prog.is_strict);
+/// ```
+pub fn parse_module(source: &str) -> StatorResult<Program> {
+    stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, || {
+        let mut parser = Parser::new(source)?;
+        parser.is_module = true;
+        let program = parser.parse_program()?;
+        Ok(program)
+    })
+}
+
+/// Parse `source` as a classic script.
+///
+/// Script mode does not allow top-level `await` (unless inside an `async`
+/// function) and `import.meta` is not available.  The source type is always
+/// [`SourceType::Script`] unless `import`/`export` declarations are
+/// encountered (which cause auto-promotion to module mode).
+///
+/// # Errors
+///
+/// Returns a [`StatorError::SyntaxError`] on syntax errors.
+///
+/// # Example
+///
+/// ```
+/// use stator_core::parser::parse_script;
+/// use stator_core::parser::ast::SourceType;
+///
+/// let prog = parse_script("var x = 42;").unwrap();
+/// assert_eq!(prog.source_type, SourceType::Script);
+/// ```
+pub fn parse_script(source: &str) -> StatorResult<Program> {
     stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, || {
         let mut parser = Parser::new(source)?;
         let program = parser.parse_program()?;
@@ -8027,7 +8159,8 @@ mod tests {
 
     #[test]
     fn test_parse_import_meta() {
-        let prog = parse("import.meta").unwrap();
+        // `import.meta` is only valid in module code.
+        let prog = parse_module("import.meta").unwrap();
         if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
             assert!(
                 matches!(expr.as_ref(), Expr::MetaProp(_)),
@@ -8041,7 +8174,7 @@ mod tests {
     #[test]
     fn test_parse_import_dot_non_meta_is_error() {
         // `import.foo` is a SyntaxError — only `import.meta` is valid.
-        let err = parse("import.foo").unwrap_err();
+        let err = parse_module("import.foo").unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("expected 'meta' after 'import.'"),
@@ -8051,9 +8184,13 @@ mod tests {
 
     #[test]
     fn test_parse_import_meta_not_module() {
-        // `import.meta` does NOT trigger module-mode detection.
-        let prog = parse("import.meta").unwrap();
-        assert_eq!(prog.source_type, SourceType::Script);
+        // `import.meta` in script mode is a SyntaxError.
+        let err = parse("import.meta").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("import.meta is only valid in module code"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -9656,5 +9793,310 @@ mod tests {
     fn test_strict_fn_body_inner_fn_inherits() {
         let result = parse("function f() { 'use strict'; function g() { with (obj) {} } }");
         assert!(result.is_err());
+    }
+
+    // ── Hashbang & module mode e2e tests ─────────────────────────────────
+
+    #[test]
+    fn test_hashbang_at_start_of_file() {
+        let prog = parse("#!/usr/bin/env node\nvar x = 1;").unwrap();
+        assert_eq!(prog.body.len(), 1);
+        assert!(matches!(prog.body[0], ProgramItem::Stmt(Stmt::VarDecl(_))));
+    }
+
+    #[test]
+    fn test_hashbang_with_module_code() {
+        let prog = parse("#!/usr/bin/env node\nimport x from 'mod';").unwrap();
+        assert_eq!(prog.source_type, SourceType::Module);
+        assert!(prog.is_strict);
+    }
+
+    #[test]
+    fn test_hashbang_only_line() {
+        let prog = parse("#!/usr/bin/env node").unwrap();
+        assert!(prog.body.is_empty());
+    }
+
+    #[test]
+    fn test_hashbang_not_at_start_is_error() {
+        // `#!` after whitespace/code is a SyntaxError.
+        let result = parse("var x;\n#!foo");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_hashbang_after_blank_line_is_error() {
+        let result = parse("\n#!/usr/bin/env node");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_module_explicit() {
+        let prog = parse_module("const x = 1;").unwrap();
+        assert_eq!(prog.source_type, SourceType::Module);
+        assert!(prog.is_strict);
+    }
+
+    #[test]
+    fn test_parse_module_with_import() {
+        let prog = parse_module("import x from 'y'; const a = x;").unwrap();
+        assert_eq!(prog.source_type, SourceType::Module);
+        assert_eq!(prog.body.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_module_with_export() {
+        let prog = parse_module("export const x = 42;").unwrap();
+        assert_eq!(prog.source_type, SourceType::Module);
+        assert!(matches!(
+            prog.body[0],
+            ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_script_explicit() {
+        let prog = parse_script("var x = 1;").unwrap();
+        assert_eq!(prog.source_type, SourceType::Script);
+        assert!(!prog.is_strict);
+    }
+
+    #[test]
+    fn test_top_level_await_in_module() {
+        let prog = parse_module("const x = await fetch('/api');").unwrap();
+        assert_eq!(prog.source_type, SourceType::Module);
+        if let ProgramItem::Stmt(Stmt::VarDecl(vd)) = &prog.body[0] {
+            assert!(matches!(
+                vd.declarators[0].init.as_deref(),
+                Some(Expr::Await(_))
+            ));
+        } else {
+            panic!("expected VarDecl");
+        }
+    }
+
+    #[test]
+    fn test_top_level_await_in_script_is_error() {
+        let result = parse("const x = await fetch('/api');");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("'await' is only valid in async functions"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_await_inside_async_fn_in_script() {
+        let prog = parse("async function f() { return await 1; }").unwrap();
+        assert_eq!(prog.source_type, SourceType::Script);
+        assert!(matches!(prog.body[0], ProgramItem::Stmt(Stmt::FnDecl(_))));
+    }
+
+    #[test]
+    fn test_import_meta_in_module_mode() {
+        let prog = parse_module("const url = import.meta.url;").unwrap();
+        assert_eq!(prog.source_type, SourceType::Module);
+    }
+
+    #[test]
+    fn test_import_meta_in_script_is_error() {
+        let result = parse_script("const url = import.meta.url;");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("import.meta is only valid in module code"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_import_meta_after_import_decl() {
+        // `import.meta` is valid once module mode is auto-detected.
+        let prog = parse("import x from 'y'; console.log(import.meta.url);").unwrap();
+        assert_eq!(prog.source_type, SourceType::Module);
+    }
+
+    #[test]
+    fn test_export_default_expression() {
+        let prog = parse_module("export default 42;").unwrap();
+        if let ProgramItem::ModuleDecl(ModuleDecl::ExportDefault(ed)) = &prog.body[0] {
+            assert!(matches!(ed.declaration, ExportDefaultExpr::Expr(_)));
+        } else {
+            panic!("expected ExportDefault");
+        }
+    }
+
+    #[test]
+    fn test_export_default_function() {
+        let prog = parse_module("export default function foo() {}").unwrap();
+        if let ProgramItem::ModuleDecl(ModuleDecl::ExportDefault(ed)) = &prog.body[0] {
+            assert!(matches!(ed.declaration, ExportDefaultExpr::Fn(_)));
+        } else {
+            panic!("expected ExportDefault function");
+        }
+    }
+
+    #[test]
+    fn test_export_default_class() {
+        let prog = parse_module("export default class C {}").unwrap();
+        if let ProgramItem::ModuleDecl(ModuleDecl::ExportDefault(ed)) = &prog.body[0] {
+            assert!(matches!(ed.declaration, ExportDefaultExpr::Class(_)));
+        } else {
+            panic!("expected ExportDefault class");
+        }
+    }
+
+    #[test]
+    fn test_export_named_with_alias() {
+        let prog = parse_module("const x = 1; export { x as y };").unwrap();
+        if let ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(en)) = &prog.body[1] {
+            assert_eq!(en.specifiers.len(), 1);
+            if let ModuleExportName::Ident(ref id) = en.specifiers[0].local {
+                assert_eq!(id.name, "x");
+            }
+            if let ModuleExportName::Ident(ref id) = en.specifiers[0].exported {
+                assert_eq!(id.name, "y");
+            }
+        } else {
+            panic!("expected ExportNamed, got {:?}", prog.body[1]);
+        }
+    }
+
+    #[test]
+    fn test_export_named_multiple_aliases() {
+        let prog = parse_module("const a = 1, b = 2; export { a as x, b as y };").unwrap();
+        if let ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(en)) = &prog.body[1] {
+            assert_eq!(en.specifiers.len(), 2);
+        } else {
+            panic!("expected ExportNamed");
+        }
+    }
+
+    #[test]
+    fn test_re_export_named() {
+        let prog = parse_module("export { x } from 'module';").unwrap();
+        if let ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(en)) = &prog.body[0] {
+            assert_eq!(en.specifiers.len(), 1);
+            assert!(en.source.is_some());
+            assert_eq!(en.source.as_ref().unwrap().value, "'module'");
+        } else {
+            panic!("expected re-export");
+        }
+    }
+
+    #[test]
+    fn test_re_export_named_with_alias() {
+        let prog = parse_module("export { x as y } from 'module';").unwrap();
+        if let ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(en)) = &prog.body[0] {
+            assert_eq!(en.specifiers.len(), 1);
+            assert!(en.source.is_some());
+        } else {
+            panic!("expected re-export with alias");
+        }
+    }
+
+    #[test]
+    fn test_re_export_all() {
+        let prog = parse_module("export * from 'module';").unwrap();
+        if let ProgramItem::ModuleDecl(ModuleDecl::ExportAll(ea)) = &prog.body[0] {
+            assert!(ea.exported.is_none());
+            assert_eq!(ea.source.value, "'module'");
+        } else {
+            panic!("expected ExportAll");
+        }
+    }
+
+    #[test]
+    fn test_re_export_all_as_namespace() {
+        let prog = parse_module("export * as ns from 'module';").unwrap();
+        if let ProgramItem::ModuleDecl(ModuleDecl::ExportAll(ea)) = &prog.body[0] {
+            assert!(ea.exported.is_some());
+            if let Some(ModuleExportName::Ident(ref id)) = ea.exported {
+                assert_eq!(id.name, "ns");
+            }
+        } else {
+            panic!("expected ExportAll with namespace alias");
+        }
+    }
+
+    #[test]
+    fn test_module_strict_with_statement_error() {
+        // Module mode is always strict — `with` is forbidden.
+        let result = parse_module("with (obj) {}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_top_level_await_bare_expression() {
+        let prog = parse_module("await 42;").unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            assert!(matches!(*es.expr, Expr::Await(_)));
+        } else {
+            panic!("expected expression statement with await");
+        }
+    }
+
+    #[test]
+    fn test_dynamic_import_in_script_mode() {
+        // Dynamic `import()` should work in script mode (no module required).
+        let prog = parse_script("import('./foo.js')").unwrap();
+        assert_eq!(prog.source_type, SourceType::Script);
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            assert!(matches!(*es.expr, Expr::Import(_)));
+        } else {
+            panic!("expected import expression");
+        }
+    }
+
+    #[test]
+    fn test_export_default_async_function() {
+        let prog = parse_module("export default async function f() {}").unwrap();
+        if let ProgramItem::ModuleDecl(ModuleDecl::ExportDefault(ed)) = &prog.body[0] {
+            if let ExportDefaultExpr::Fn(ref fd) = ed.declaration {
+                assert!(fd.is_async);
+            } else {
+                panic!("expected Fn");
+            }
+        } else {
+            panic!("expected ExportDefault");
+        }
+    }
+
+    #[test]
+    fn test_await_inside_async_arrow_in_module() {
+        let prog = parse_module("const f = async () => await 1;").unwrap();
+        assert_eq!(prog.source_type, SourceType::Module);
+    }
+
+    #[test]
+    fn test_await_inside_async_arrow_in_script() {
+        let prog = parse_script("const f = async () => await 1;").unwrap();
+        assert_eq!(prog.source_type, SourceType::Script);
+    }
+
+    #[test]
+    fn test_hashbang_scanner_token_kind() {
+        use crate::parser::scanner::{Scanner, TokenKind};
+        let mut scanner = Scanner::new("#!/usr/bin/env node\nfoo");
+        let tok = scanner.next_token().unwrap();
+        assert_eq!(tok.kind, TokenKind::HashbangComment);
+    }
+
+    #[test]
+    fn test_module_auto_detect_from_export() {
+        let prog = parse("export function f() {}").unwrap();
+        assert_eq!(prog.source_type, SourceType::Module);
+        assert!(prog.is_strict);
+    }
+
+    #[test]
+    fn test_export_var_decl() {
+        let prog = parse_module("export let x = 1, y = 2;").unwrap();
+        if let ProgramItem::ModuleDecl(ModuleDecl::ExportNamed(en)) = &prog.body[0] {
+            assert!(en.declaration.is_some());
+        } else {
+            panic!("expected ExportNamed with declaration");
+        }
     }
 }
