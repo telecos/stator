@@ -1242,7 +1242,22 @@ fn handle_call_any_receiver(
                 ctx.frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                ctx.frame.accumulator = Interpreter::run_async_function((*ba).clone(), args)?;
+                let mut callee_frame = InterpreterFrame::new_with_globals(
+                    (*ba).clone(),
+                    args,
+                    Rc::clone(&ctx.frame.global_env),
+                );
+                restore_closure_context(&mut callee_frame, &ba);
+                if ba.is_arrow() {
+                    callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                }
+                populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                push_call_frame("<anonymous>")?;
+                let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+                    Interpreter::run(&mut callee_frame)
+                });
+                pop_call_frame();
+                ctx.frame.accumulator = result?;
             } else {
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
                 // ── Tiering ──────────────────────────────────
@@ -1341,7 +1356,22 @@ fn handle_tail_call(
                     super::init_generator_state_prototype(&state, &ba);
                     ctx.frame.accumulator = JsValue::Generator(state);
                 } else {
-                    ctx.frame.accumulator = Interpreter::run_async_function((*ba).clone(), args)?;
+                    let mut callee_frame = InterpreterFrame::new_with_globals(
+                        (*ba).clone(),
+                        args,
+                        Rc::clone(&ctx.frame.global_env),
+                    );
+                    restore_closure_context(&mut callee_frame, &ba);
+                    if ba.is_arrow() {
+                        callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                    }
+                    populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                    push_call_frame("<anonymous>")?;
+                    let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+                        Interpreter::run(&mut callee_frame)
+                    });
+                    pop_call_frame();
+                    ctx.frame.accumulator = result?;
                 }
             } else {
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
@@ -1448,7 +1478,46 @@ fn handle_call_undefined_receiver0(
                 super::init_generator_state_prototype(&state, &ba);
                 ctx.frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
-                ctx.frame.accumulator = Interpreter::run_async_function((*ba).clone(), vec![])?;
+                let args: Vec<JsValue> = vec![];
+                let saved_this = if !ba.is_arrow() && ba.is_strict() {
+                    let old = ctx.frame.global_env.borrow().get("this").cloned();
+                    ctx.frame
+                        .global_env
+                        .borrow_mut()
+                        .insert("this".to_string(), JsValue::Undefined);
+                    old
+                } else {
+                    None
+                };
+                let mut callee_frame = InterpreterFrame::new_with_globals(
+                    (*ba).clone(),
+                    args,
+                    Rc::clone(&ctx.frame.global_env),
+                );
+                restore_closure_context(&mut callee_frame, &ba);
+                if ba.is_arrow() {
+                    callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                }
+                populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                push_call_frame("<anonymous>")?;
+                let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+                    Interpreter::run(&mut callee_frame)
+                });
+                pop_call_frame();
+                if !ba.is_arrow() && ba.is_strict() {
+                    match saved_this {
+                        Some(v) => {
+                            ctx.frame
+                                .global_env
+                                .borrow_mut()
+                                .insert("this".to_string(), v);
+                        }
+                        None => {
+                            ctx.frame.global_env.borrow_mut().remove("this");
+                        }
+                    }
+                }
+                ctx.frame.accumulator = result?;
             } else {
                 let args: Vec<JsValue> = vec![];
                 let count = ba.increment_invocation_count();
@@ -1552,7 +1621,46 @@ fn handle_call_undefined_receiver1(
                 ctx.frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
-                ctx.frame.accumulator = Interpreter::run_async_function((*ba).clone(), vec![arg1])?;
+                let args = vec![arg1];
+                let saved_this = if !ba.is_arrow() && ba.is_strict() {
+                    let old = ctx.frame.global_env.borrow().get("this").cloned();
+                    ctx.frame
+                        .global_env
+                        .borrow_mut()
+                        .insert("this".to_string(), JsValue::Undefined);
+                    old
+                } else {
+                    None
+                };
+                let mut callee_frame = InterpreterFrame::new_with_globals(
+                    (*ba).clone(),
+                    args,
+                    Rc::clone(&ctx.frame.global_env),
+                );
+                restore_closure_context(&mut callee_frame, &ba);
+                if ba.is_arrow() {
+                    callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                }
+                populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                push_call_frame("<anonymous>")?;
+                let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+                    Interpreter::run(&mut callee_frame)
+                });
+                pop_call_frame();
+                if !ba.is_arrow() && ba.is_strict() {
+                    match saved_this {
+                        Some(v) => {
+                            ctx.frame
+                                .global_env
+                                .borrow_mut()
+                                .insert("this".to_string(), v);
+                        }
+                        None => {
+                            ctx.frame.global_env.borrow_mut().remove("this");
+                        }
+                    }
+                }
+                ctx.frame.accumulator = result?;
             } else {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 let args = vec![arg1];
@@ -1662,8 +1770,46 @@ fn handle_call_undefined_receiver2(
             } else if ba.is_async() {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
-                ctx.frame.accumulator =
-                    Interpreter::run_async_function((*ba).clone(), vec![arg1, arg2])?;
+                let args = vec![arg1, arg2];
+                let saved_this = if !ba.is_arrow() && ba.is_strict() {
+                    let old = ctx.frame.global_env.borrow().get("this").cloned();
+                    ctx.frame
+                        .global_env
+                        .borrow_mut()
+                        .insert("this".to_string(), JsValue::Undefined);
+                    old
+                } else {
+                    None
+                };
+                let mut callee_frame = InterpreterFrame::new_with_globals(
+                    (*ba).clone(),
+                    args,
+                    Rc::clone(&ctx.frame.global_env),
+                );
+                restore_closure_context(&mut callee_frame, &ba);
+                if ba.is_arrow() {
+                    callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                }
+                populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                push_call_frame("<anonymous>")?;
+                let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+                    Interpreter::run(&mut callee_frame)
+                });
+                pop_call_frame();
+                if !ba.is_arrow() && ba.is_strict() {
+                    match saved_this {
+                        Some(v) => {
+                            ctx.frame
+                                .global_env
+                                .borrow_mut()
+                                .insert("this".to_string(), v);
+                        }
+                        None => {
+                            ctx.frame.global_env.borrow_mut().remove("this");
+                        }
+                    }
+                }
+                ctx.frame.accumulator = result?;
             } else {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 let arg2 = ctx.frame.read_reg(arg2_v)?.clone();

@@ -387,6 +387,17 @@ pub(super) fn init_generator_state_prototype(
     state.borrow_mut().prototype = prototype;
 }
 
+pub(super) fn init_generator_state_execution(
+    state: &Rc<RefCell<GeneratorState>>,
+    frame: &InterpreterFrame,
+) {
+    let mut borrow = state.borrow_mut();
+    borrow.registers = frame.registers.clone();
+    borrow.call_args = frame.call_args.clone();
+    borrow.global_env = Some(Rc::clone(&frame.global_env));
+    borrow.new_target = frame.new_target.clone();
+}
+
 /// Return the current thread's active global environment, if any.
 pub(crate) fn current_global_env() -> Option<Rc<RefCell<HashMap<String, JsValue>>>> {
     CURRENT_GLOBALS.with(|g| g.borrow().clone())
@@ -1499,7 +1510,7 @@ impl Interpreter {
             *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
         });
         if frame.bytecode_array.is_async() && frame.generator_state.is_none() {
-            return Self::run_async_function(frame.bytecode_array.clone(), vec![]);
+            return Self::run_async_frame(frame);
         }
         // Dynamically grow the native stack when headroom drops below 512 KiB.
         // Provide moderate stack growth for the interpreter loop.
@@ -1626,14 +1637,26 @@ impl Interpreter {
         state: &Rc<RefCell<GeneratorState>>,
         input: JsValue,
     ) -> StatorResult<GeneratorStep> {
-        let (status, resume_mode, bytecode_array, saved_registers, resume_pc) = {
+        let (
+            status,
+            resume_mode,
+            bytecode_array,
+            saved_registers,
+            call_args,
+            global_env,
+            resume_pc,
+            new_target,
+        ) = {
             let gs = state.borrow();
             (
                 gs.status,
                 gs.resume_mode.clone(),
                 gs.bytecode_array.clone(),
                 gs.registers.clone(),
+                gs.call_args.clone(),
+                gs.global_env.clone(),
                 gs.resume_pc,
+                gs.new_target.clone(),
             )
         };
         match status {
@@ -1660,23 +1683,25 @@ impl Interpreter {
         let mut frame = InterpreterFrame {
             bytecode_array,
             registers,
-            call_args: Vec::new(),
+            call_args,
             accumulator: input,
             pc: resume_pc,
             context: None,
             suspend_result: None,
             generator_state: Some(Rc::clone(state)),
-            global_env: CURRENT_GLOBALS.with(|g| {
-                g.borrow()
-                    .clone()
-                    .unwrap_or_else(|| Rc::new(RefCell::new(std::collections::HashMap::new())))
+            global_env: global_env.unwrap_or_else(|| {
+                CURRENT_GLOBALS.with(|g| {
+                    g.borrow()
+                        .clone()
+                        .unwrap_or_else(|| Rc::new(RefCell::new(std::collections::HashMap::new())))
+                })
             }),
             osr_loop_count: 0,
             instruction_limit: 0,
             instructions_executed: 0,
             deadline: None,
             pending_message: JsValue::Undefined,
-            new_target: JsValue::Undefined,
+            new_target,
             mono_load_cache: std::collections::HashMap::new(),
             poly_load_cache: std::collections::HashMap::new(),
             shape_load_ic: std::collections::HashMap::new(),
@@ -1746,12 +1771,22 @@ impl Interpreter {
     /// value, or already rejected if the async body threw.
     pub fn run_async_function(
         bytecode_array: BytecodeArray,
-        _args: Vec<JsValue>,
+        args: Vec<JsValue>,
     ) -> StatorResult<JsValue> {
+        let frame = if let Some(globals) = current_global_env() {
+            InterpreterFrame::new_with_globals(bytecode_array, args, globals)
+        } else {
+            InterpreterFrame::new(bytecode_array, args)
+        };
+        Self::run_async_frame(&frame)
+    }
+
+    fn run_async_frame(frame: &InterpreterFrame) -> StatorResult<JsValue> {
         use crate::builtins::promise::{MicrotaskQueue, promise_reject, promise_resolve};
 
         let queue = MicrotaskQueue::new();
-        let state = GeneratorState::new(bytecode_array);
+        let state = GeneratorState::new(frame.bytecode_array.clone());
+        init_generator_state_execution(&state, frame);
         let mut input = JsValue::Undefined;
 
         loop {
@@ -2600,9 +2635,14 @@ pub(super) fn dispatch_call(
                 init_generator_state_prototype(&state, ba);
                 frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
-                // Async (non-generator) function: drive the internal generator
-                // to completion and return a Promise.
-                frame.accumulator = Interpreter::run_async_function((**ba).clone(), args)?;
+                let mut callee_frame = InterpreterFrame::new_with_globals(
+                    (**ba).clone(),
+                    args,
+                    Rc::clone(&frame.global_env),
+                );
+                restore_closure_context(&mut callee_frame, ba);
+                populate_self_name(&mut callee_frame, ba, &JsValue::Function(Rc::clone(ba)));
+                frame.accumulator = Interpreter::run(&mut callee_frame)?;
             } else {
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
@@ -2671,7 +2711,33 @@ pub(super) fn dispatch_call_property(
                 init_generator_state_prototype(&state, ba);
                 frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
-                frame.accumulator = Interpreter::run_async_function((**ba).clone(), args)?;
+                let mut callee_frame = InterpreterFrame::new_with_globals(
+                    (**ba).clone(),
+                    args,
+                    Rc::clone(&frame.global_env),
+                );
+                restore_closure_context(&mut callee_frame, ba);
+                populate_self_name(&mut callee_frame, ba, &JsValue::Function(Rc::clone(ba)));
+                if ba.is_arrow() {
+                    callee_frame.new_target = fn_props_get(ba, ".new_target");
+                }
+                if !ba.is_arrow() {
+                    let effective_this = if !ba.is_strict() && this_val.is_nullish() {
+                        callee_frame
+                            .global_env
+                            .borrow()
+                            .get("globalThis")
+                            .cloned()
+                            .unwrap_or(JsValue::Undefined)
+                    } else {
+                        this_val
+                    };
+                    callee_frame
+                        .global_env
+                        .borrow_mut()
+                        .insert("this".to_string(), effective_this);
+                }
+                frame.accumulator = Interpreter::run(&mut callee_frame)?;
             } else {
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
@@ -14201,6 +14267,469 @@ mod tests {
         let result =
             compile_source_and_run("var obj = { async f() { return 12; } }; obj.f()").unwrap();
         assert_fulfilled_promise_value(result, JsValue::Smi(12));
+    }
+
+    fn assert_async_source_fulfilled(source: &str, expected: JsValue) {
+        let result = compile_source_and_run(source).unwrap();
+        assert_fulfilled_promise_value(result, expected);
+    }
+
+    fn assert_async_source_rejected(source: &str, expected: JsValue) {
+        let result = compile_source_and_run(source).unwrap();
+        assert_rejected_promise_reason(result, expected);
+    }
+
+    #[test]
+    fn test_async_conformance_await_non_promise_number() {
+        assert_async_source_fulfilled(
+            "async function f() { return await 42; } f()",
+            JsValue::Smi(42),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_await_non_promise_string() {
+        assert_async_source_fulfilled(
+            r#"async function f() { return await "ok"; } f()"#,
+            JsValue::String("ok".into()),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_await_non_promise_object() {
+        assert_async_source_fulfilled(
+            "async function f() { return (await { value: 7 }).value; } f()",
+            JsValue::Smi(7),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_await_non_promise_undefined() {
+        assert_async_source_fulfilled(
+            "async function f() { return await undefined; } f()",
+            JsValue::Undefined,
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_await_thenable_resolves_value() {
+        assert_async_source_fulfilled(
+            r#"async function f() { return await { then(resolve) { resolve(1); } }; } f()"#,
+            JsValue::Smi(1),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_await_thenable_resolves_nested_promise() {
+        assert_async_source_fulfilled(
+            r#"async function f() {
+                return await { then(resolve) { resolve(Promise.resolve(2)); } };
+            } f()"#,
+            JsValue::Smi(2),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_await_thenable_rejects() {
+        assert_async_source_rejected(
+            r#"async function f() {
+                return await { then(_resolve, reject) { reject("bad"); } };
+            } f()"#,
+            JsValue::String("bad".into()),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_await_thenable_rejection_caught() {
+        assert_async_source_fulfilled(
+            r#"async function f() {
+                try {
+                    await { then(_resolve, reject) { reject("boom"); } };
+                } catch (e) {
+                    return e;
+                }
+            } f()"#,
+            JsValue::String("boom".into()),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_rejected_promise_caught_by_try_catch() {
+        assert_async_source_fulfilled(
+            r#"async function f() {
+                try {
+                    await Promise.reject("nope");
+                } catch (e) {
+                    return e;
+                }
+            } f()"#,
+            JsValue::String("nope".into()),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_rejected_promise_rethrows() {
+        assert_async_source_rejected(
+            r#"async function f() {
+                try {
+                    await Promise.reject("x");
+                } catch (e) {
+                    throw e + "!";
+                }
+            } f()"#,
+            JsValue::String("x!".into()),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_async_arrow_parameter_value() {
+        assert_async_source_fulfilled("const f = async (x) => await x; f(5)", JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_async_conformance_async_arrow_parameter_promise() {
+        assert_async_source_fulfilled(
+            "const f = async (x) => await x; f(Promise.resolve(6))",
+            JsValue::Smi(6),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_async_arrow_parameter_thenable() {
+        assert_async_source_fulfilled(
+            r#"const f = async (x) => await x;
+            f({ then(resolve) { resolve(7); } })"#,
+            JsValue::Smi(7),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_async_arrow_lexical_this() {
+        assert_async_source_fulfilled(
+            r#"var obj = {
+                x: 8,
+                method: function() {
+                    var f = async () => await this.x;
+                    return f();
+                }
+            };
+            obj.method()"#,
+            JsValue::Smi(8),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_async_arrow_block_body() {
+        assert_async_source_fulfilled(
+            "const f = async (x) => { var y = await x; return y + 9; }; f(9)",
+            JsValue::Smi(18),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_async_arrow_try_catch() {
+        assert_async_source_fulfilled(
+            r#"const f = async (x) => {
+                try {
+                    return await x;
+                } catch (e) {
+                    return e;
+                }
+            };
+            f(Promise.reject("arrow"))"#,
+            JsValue::String("arrow".into()),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_async_arrow_finally_with_await() {
+        assert_async_source_fulfilled(
+            r#"const f = async () => {
+                var value = 1;
+                try {
+                    value = value + 1;
+                } finally {
+                    value = value + await Promise.resolve(2);
+                }
+                return value;
+            };
+            f()"#,
+            JsValue::Smi(4),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_async_method_awaits_parameter() {
+        assert_async_source_fulfilled(
+            "var obj = { async method(p) { return await p; } }; obj.method(9)",
+            JsValue::Smi(9),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_async_method_awaits_promise_parameter() {
+        assert_async_source_fulfilled(
+            "var obj = { async method(p) { return await p; } }; obj.method(Promise.resolve(11))",
+            JsValue::Smi(11),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_async_method_awaits_thenable_parameter() {
+        assert_async_source_fulfilled(
+            r#"var obj = { async method(p) { return await p; } };
+            obj.method({ then(resolve) { resolve(12); } })"#,
+            JsValue::Smi(12),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_async_method_preserves_this() {
+        assert_async_source_fulfilled(
+            "var obj = { x: 10, async method() { return await this.x; } }; obj.method()",
+            JsValue::Smi(10),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_try_catch_with_await() {
+        assert_async_source_fulfilled(
+            r#"async function f() {
+                try {
+                    await Promise.reject("bad");
+                } catch (e) {
+                    return await Promise.resolve(e);
+                }
+            } f()"#,
+            JsValue::String("bad".into()),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_catch_can_await_before_return() {
+        assert_async_source_fulfilled(
+            r#"async function f() {
+                try {
+                    await Promise.reject("a");
+                } catch (e) {
+                    return await Promise.resolve(e + "b");
+                }
+            } f()"#,
+            JsValue::String("ab".into()),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_finally_runs_after_await() {
+        assert_async_source_fulfilled(
+            r#"async function f() {
+                var ran = 0;
+                try {
+                    await 1;
+                    ran = 1;
+                } finally {
+                    ran = ran + await Promise.resolve(10);
+                }
+                return ran;
+            } f()"#,
+            JsValue::Smi(11),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_finally_runs_after_catch() {
+        assert_async_source_fulfilled(
+            r#"async function f() {
+                var ran = 0;
+                try {
+                    await Promise.reject("x");
+                } catch (e) {
+                    ran = 2;
+                } finally {
+                    ran = ran + await Promise.resolve(10);
+                }
+                return ran;
+            } f()"#,
+            JsValue::Smi(12),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_finally_can_override_with_throw_after_await() {
+        assert_async_source_rejected(
+            r#"async function f() {
+                try {
+                    return 1;
+                } finally {
+                    await Promise.resolve(0);
+                    throw "override";
+                }
+            } f()"#,
+            JsValue::String("override".into()),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_return_promise_unwraps() {
+        assert_async_source_fulfilled(
+            "async function f() { return Promise.resolve(13); } f()",
+            JsValue::Smi(13),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_return_thenable_unwraps() {
+        assert_async_source_fulfilled(
+            r#"async function f() { return { then(resolve) { resolve(14); } }; } f()"#,
+            JsValue::Smi(14),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_return_thenable_with_promise_unwraps() {
+        assert_async_source_fulfilled(
+            r#"async function f() {
+                return { then(resolve) { resolve(Promise.resolve(15)); } };
+            } f()"#,
+            JsValue::Smi(15),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_promise_all_destructuring() {
+        assert_async_source_fulfilled(
+            r#"async function f() {
+                var p1 = Promise.resolve(7);
+                var p2 = Promise.resolve(8);
+                const [a, b] = await Promise.all([p1, p2]);
+                return a + b;
+            } f()"#,
+            JsValue::Smi(15),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_promise_all_with_thenables() {
+        assert_async_source_fulfilled(
+            r#"async function f() {
+                const [a, b] = await Promise.all([
+                    Promise.resolve(5),
+                    { then(resolve) { resolve(11); } }
+                ]);
+                return a + b;
+            } f()"#,
+            JsValue::Smi(16),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_promise_all_in_async_arrow() {
+        assert_async_source_fulfilled(
+            r#"const f = async () => {
+                const [a, b] = await Promise.all([Promise.resolve(8), Promise.resolve(9)]);
+                return a + b;
+            };
+            f()"#,
+            JsValue::Smi(17),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_async_function_name_is_preserved() {
+        let result = compile_source_and_run("async function foo() {}; foo.name === 'foo'").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_async_conformance_for_await_of_async_iterable() {
+        assert_async_source_fulfilled(
+            r#"async function f() {
+                var iterable = {};
+                iterable[Symbol.asyncIterator] = function() {
+                    var step = 0;
+                    return {
+                        next: function() {
+                            step = step + 1;
+                            if (step === 1) return Promise.resolve({ value: 10, done: false });
+                            if (step === 2) return Promise.resolve({ value: 11, done: false });
+                            return Promise.resolve({ value: 0, done: true });
+                        }
+                    };
+                };
+                var total = 0;
+                for await (const x of iterable) { total = total + x; }
+                return total;
+            } f()"#,
+            JsValue::Smi(21),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_for_await_of_sync_iterable() {
+        assert_async_source_fulfilled(
+            "async function f() { var total = 0; for await (const x of [10, 12]) { total = total + x; } return total; } f()",
+            JsValue::Smi(22),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_for_await_of_sync_iterable_awaits_values() {
+        assert_async_source_fulfilled(
+            "async function f() { var total = 0; for await (const x of [Promise.resolve(11), 12]) { total = total + x; } return total; } f()",
+            JsValue::Smi(23),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_for_await_of_string() {
+        assert_async_source_fulfilled(
+            r#"async function f() {
+                var out = "";
+                for await (const ch of "ab") { out = out + ch; }
+                return out;
+            } f()"#,
+            JsValue::String("ab".into()),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_for_await_break_closes_sync_iterator() {
+        assert_async_source_fulfilled(
+            r#"async function f() {
+                var closed = 0;
+                var iterable = {};
+                iterable[Symbol.iterator] = function() {
+                    var step = 0;
+                    return {
+                        next: function() {
+                            step = step + 1;
+                            if (step === 1) return { value: 24, done: false };
+                            return { value: 0, done: true };
+                        },
+                        return: function() {
+                            closed = closed + 1;
+                            return { value: 0, done: true };
+                        }
+                    };
+                };
+                for await (const x of iterable) { break; }
+                return closed;
+            } f()"#,
+            JsValue::Smi(1),
+        );
+    }
+
+    #[test]
+    fn test_async_conformance_for_await_in_async_arrow() {
+        assert_async_source_fulfilled(
+            r#"const f = async () => {
+                var total = 0;
+                for await (const x of [12, 12]) { total = total + x; }
+                return total;
+            };
+            f()"#,
+            JsValue::Smi(24),
+        );
     }
 
     #[test]
