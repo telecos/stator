@@ -8,6 +8,7 @@
 #![allow(clippy::too_many_lines)]
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::builtins::string::{string_char_at, utf16_len};
@@ -6167,8 +6168,38 @@ fn handle_call_direct_eval(
                 return Ok(DispatchAction::Continue);
             }
         };
-        ctx.frame.accumulator =
-            crate::builtins::global::global_eval_direct(&source, Rc::clone(&ctx.frame.global_env))?;
+        let binding_registers = ctx.frame.bytecode_array.binding_registers().clone();
+        let original_global_names: HashSet<String> =
+            ctx.frame.global_env.borrow().keys().cloned().collect();
+        let mut eval_bindings = ctx.frame.global_env.borrow().clone();
+        for (name, reg) in &binding_registers {
+            eval_bindings.insert(name.clone(), ctx.frame.read_reg(*reg as u32)?.clone());
+        }
+        let eval_env = Rc::new(RefCell::new(eval_bindings));
+        let (result, final_env, is_strict) =
+            crate::builtins::global::global_eval_direct_with_scope_capture(
+                &source,
+                Rc::clone(&eval_env),
+                ctx.frame.context.clone(),
+            )?;
+        let final_bindings = final_env.borrow();
+        for (name, reg) in &binding_registers {
+            if let Some(value) = final_bindings.get(name) {
+                ctx.frame.write_reg(*reg as u32, value.clone())?;
+            }
+        }
+        {
+            let mut globals = ctx.frame.global_env.borrow_mut();
+            for (name, value) in final_bindings.iter() {
+                if binding_registers.contains_key(name) {
+                    continue;
+                }
+                if !is_strict || original_global_names.contains(name) {
+                    globals.insert(name.clone(), value.clone());
+                }
+            }
+        }
+        ctx.frame.accumulator = result;
     } else {
         // Callee was reassigned — fall through to normal call.
         match callee {
