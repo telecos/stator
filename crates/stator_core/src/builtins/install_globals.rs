@@ -8179,6 +8179,13 @@ fn make_iterator() -> JsValue {
         }),
     );
 
+    // §27.1.2 Iterator.prototype[@@toStringTag] = "Iterator"
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("Iterator".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+
     proto.make_all_non_enumerable();
     props.insert(
         "prototype".into(),
@@ -8344,6 +8351,13 @@ fn make_async_iterator() -> JsValue {
             }),
         );
     }
+
+    // §27.1.4.2 AsyncIterator.prototype[@@toStringTag] = "AsyncIterator"
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("AsyncIterator".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
 
     proto.make_all_non_enumerable();
     props.insert(
@@ -9393,6 +9407,9 @@ fn make_function() -> JsValue {
 
         // ── Function.prototype ──────────────────────────────────────────────
         let mut proto = PropertyMap::new();
+
+        // §20.2.3 Function.prototype is itself callable and returns undefined.
+        proto.insert("__call__".into(), native(|_args| Ok(JsValue::Undefined)));
 
         // Function.prototype.call(thisArg, ...args)
         proto.insert(
@@ -10955,6 +10972,12 @@ fn make_promise() -> JsValue {
         prototype.insert("then".into(), prototype_then.clone());
         prototype.insert("catch".into(), prototype_catch.clone());
         prototype.insert("finally".into(), prototype_finally.clone());
+        // §27.2.5.5 Promise.prototype[@@toStringTag] = "Promise"
+        prototype.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("Promise".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
         prototype.make_all_non_enumerable();
         let prototype_rc = Rc::new(RefCell::new(prototype));
         props.insert(
@@ -13045,6 +13068,13 @@ fn make_reflect() -> JsValue {
             }),
         );
 
+        // §26.1.14 Reflect[@@toStringTag] = "Reflect"
+        props.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("Reflect".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+
         props.make_all_non_enumerable();
         JsValue::PlainObject(Rc::new(RefCell::new(props)))
     })
@@ -13378,7 +13408,12 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
             Ok(make_buffer_instance(Rc::new(RefCell::new(sliced))))
         }),
     );
-    proto.insert("@@toStringTag".into(), JsValue::String(display_name.into()));
+    // §25.1.6.14 / §25.2.5.7 ArrayBuffer.prototype[@@toStringTag]
+    proto.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String(display_name.into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
     proto.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(proto)))
 }
@@ -13661,7 +13696,12 @@ fn make_dataview() -> JsValue {
     dataview_proto_setter!("setBigUint64", 2, dataview_set_biguint64, |v: &JsValue| {
         Ok::<u64, StatorError>(dataview_bigint_argument(v)? as u64)
     });
-    prototype.insert("@@toStringTag".into(), JsValue::String("DataView".into()));
+    // §25.3.4.4 DataView.prototype[@@toStringTag] = "DataView"
+    prototype.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String("DataView".into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
     prototype.make_all_non_enumerable();
 
     let mut props = PropertyMap::new();
@@ -13732,7 +13772,12 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
     );
 
     let mut prototype = PropertyMap::new();
-    prototype.insert("@@toStringTag".into(), JsValue::String(kind.name().into()));
+    // §23.2.3.32 %TypedArray%.prototype[@@toStringTag]
+    prototype.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String(kind.name().into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
     prototype.make_all_non_enumerable();
     props.insert(
         "prototype".into(),
