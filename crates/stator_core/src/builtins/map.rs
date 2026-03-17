@@ -73,8 +73,45 @@ pub enum MapIteratorKind {
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct JsMap {
-    /// Entries stored in insertion order.  Deleted entries are removed in-place.
-    entries: Vec<(JsValue, JsValue)>,
+    /// Entries stored in insertion order.
+    ///
+    /// Deleted entries are replaced with `None` tombstones so active iterators
+    /// can continue scanning forward without being invalidated and newly added
+    /// entries remain observable later in the same traversal.
+    entries: Vec<Option<(JsValue, JsValue)>>,
+    /// Number of live entries.
+    size: usize,
+}
+
+fn map_find_entry_index(map: &JsMap, key: &JsValue) -> Option<usize> {
+    map.entries
+        .iter()
+        .position(|entry| entry.as_ref().is_some_and(|(k, _)| same_value_zero(k, key)))
+}
+
+/// Return the next live entry at or after `cursor`, advancing `cursor`.
+pub fn map_next_entry(map: &JsMap, cursor: &mut usize) -> Option<(JsValue, JsValue)> {
+    while let Some(entry) = map.entries.get(*cursor) {
+        *cursor += 1;
+        if let Some((key, value)) = entry {
+            return Some((key.clone(), value.clone()));
+        }
+    }
+    None
+}
+
+/// Return the next iterator value at or after `cursor`, advancing `cursor`.
+pub fn map_next_iteration_item(
+    map: &JsMap,
+    cursor: &mut usize,
+    kind: MapIteratorKind,
+) -> Option<JsValue> {
+    let (key, value) = map_next_entry(map, cursor)?;
+    Some(match kind {
+        MapIteratorKind::Entries => JsValue::new_array(vec![key, value]),
+        MapIteratorKind::Keys => key,
+        MapIteratorKind::Values => value,
+    })
 }
 
 // ── Constructors ──────────────────────────────────────────────────────────────
@@ -146,14 +183,13 @@ pub fn map_from_iterable(pairs: Vec<(JsValue, JsValue)>) -> JsMap {
 pub fn map_set(map: &mut JsMap, key: JsValue, value: JsValue) {
     // §24.1.3.9 step 6: normalise -0 → +0.
     let key = normalize_negative_zero(key);
-    if let Some(entry) = map
-        .entries
-        .iter_mut()
-        .find(|(k, _)| same_value_zero(k, &key))
-    {
-        entry.1 = value;
+    if let Some(index) = map_find_entry_index(map, &key) {
+        if let Some((_, entry_value)) = map.entries[index].as_mut() {
+            *entry_value = value;
+        }
     } else {
-        map.entries.push((key, value));
+        map.entries.push(Some((key, value)));
+        map.size += 1;
     }
 }
 
@@ -178,6 +214,7 @@ pub fn map_set(map: &mut JsMap, key: JsValue, value: JsValue) {
 pub fn map_get(map: &JsMap, key: &JsValue) -> JsValue {
     map.entries
         .iter()
+        .filter_map(Option::as_ref)
         .find(|(k, _)| same_value_zero(k, key))
         .map(|(_, v)| v.clone())
         .unwrap_or(JsValue::Undefined)
@@ -202,7 +239,10 @@ pub fn map_get(map: &JsMap, key: &JsValue) -> JsValue {
 /// assert!(map_has(&m, &JsValue::Null));
 /// ```
 pub fn map_has(map: &JsMap, key: &JsValue) -> bool {
-    map.entries.iter().any(|(k, _)| same_value_zero(k, key))
+    map.entries
+        .iter()
+        .filter_map(Option::as_ref)
+        .any(|(k, _)| same_value_zero(k, key))
 }
 
 // ── map_delete ────────────────────────────────────────────────────────────────
@@ -225,12 +265,9 @@ pub fn map_has(map: &JsMap, key: &JsValue) -> bool {
 /// assert_eq!(map_size(&m), 0);
 /// ```
 pub fn map_delete(map: &mut JsMap, key: &JsValue) -> bool {
-    if let Some(pos) = map
-        .entries
-        .iter()
-        .position(|(k, _)| same_value_zero(k, key))
-    {
-        map.entries.remove(pos);
+    if let Some(pos) = map_find_entry_index(map, key) {
+        map.entries[pos] = None;
+        map.size -= 1;
         true
     } else {
         false
@@ -255,7 +292,10 @@ pub fn map_delete(map: &mut JsMap, key: &JsValue) -> bool {
 /// assert_eq!(map_size(&m), 0);
 /// ```
 pub fn map_clear(map: &mut JsMap) {
-    map.entries.clear();
+    for entry in &mut map.entries {
+        *entry = None;
+    }
+    map.size = 0;
 }
 
 // ── map_size ──────────────────────────────────────────────────────────────────
@@ -276,7 +316,7 @@ pub fn map_clear(map: &mut JsMap) {
 /// assert_eq!(map_size(&m), 1);
 /// ```
 pub fn map_size(map: &JsMap) -> usize {
-    map.entries.len()
+    map.size
 }
 
 // ── map_for_each ──────────────────────────────────────────────────────────────
@@ -298,7 +338,7 @@ pub fn map_size(map: &JsMap) -> usize {
 /// assert_eq!(out, vec![(JsValue::Smi(1), JsValue::String("one".into()))]);
 /// ```
 pub fn map_for_each(map: &JsMap, mut callback: impl FnMut(&JsValue, &JsValue)) {
-    for (k, v) in &map.entries {
+    for (k, v) in map.entries.iter().flatten() {
         callback(v, k);
     }
 }
@@ -321,7 +361,10 @@ pub fn map_for_each(map: &JsMap, mut callback: impl FnMut(&JsValue, &JsValue)) {
 /// assert_eq!(map_keys(&m), vec![JsValue::Smi(1), JsValue::Smi(2)]);
 /// ```
 pub fn map_keys(map: &JsMap) -> Vec<JsValue> {
-    map.entries.iter().map(|(k, _)| k.clone()).collect()
+    map.entries
+        .iter()
+        .filter_map(|entry| entry.as_ref().map(|(k, _)| k.clone()))
+        .collect()
 }
 
 // ── map_values ────────────────────────────────────────────────────────────────
@@ -345,7 +388,10 @@ pub fn map_keys(map: &JsMap) -> Vec<JsValue> {
 /// );
 /// ```
 pub fn map_values(map: &JsMap) -> Vec<JsValue> {
-    map.entries.iter().map(|(_, v)| v.clone()).collect()
+    map.entries
+        .iter()
+        .filter_map(|entry| entry.as_ref().map(|(_, v)| v.clone()))
+        .collect()
 }
 
 // ── map_entries ───────────────────────────────────────────────────────────────
@@ -368,7 +414,7 @@ pub fn map_values(map: &JsMap) -> Vec<JsValue> {
 /// );
 /// ```
 pub fn map_entries(map: &JsMap) -> Vec<(JsValue, JsValue)> {
-    map.entries.clone()
+    map.entries.iter().flatten().cloned().collect()
 }
 
 /// ECMAScript §24.1.3 `Map.prototype[@@iterator]()`.
@@ -435,10 +481,19 @@ pub fn map_create_iterator(map: &JsMap, kind: MapIteratorKind) -> JsValue {
         MapIteratorKind::Entries => map
             .entries
             .iter()
+            .flatten()
             .map(|(k, v)| JsValue::new_array(vec![k.clone(), v.clone()]))
             .collect(),
-        MapIteratorKind::Keys => map.entries.iter().map(|(k, _)| k.clone()).collect(),
-        MapIteratorKind::Values => map.entries.iter().map(|(_, v)| v.clone()).collect(),
+        MapIteratorKind::Keys => map
+            .entries
+            .iter()
+            .filter_map(|entry| entry.as_ref().map(|(k, _)| k.clone()))
+            .collect(),
+        MapIteratorKind::Values => map
+            .entries
+            .iter()
+            .filter_map(|entry| entry.as_ref().map(|(_, v)| v.clone()))
+            .collect(),
     };
     JsValue::Iterator(NativeIterator::from_items(items))
 }
