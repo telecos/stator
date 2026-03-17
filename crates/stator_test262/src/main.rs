@@ -382,17 +382,14 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "regexp-v-flag",
     // Resource management — `using` keyword not yet in the parser
     "explicit-resource-management",
-    // Atomics — waitAsync not implemented
+    // Atomics.waitAsync — promise integration not implemented
     "Atomics.waitAsync",
-    "Atomics",
     // ArrayBuffer.prototype.transfer not implemented
     "arraybuffer-transfer",
     // Float16Array typed array not implemented
     "Float16Array",
     // Tail-call optimisation not implemented in the interpreter
     "tail-call-optimization",
-    // SharedArrayBuffer — not implemented
-    "SharedArrayBuffer",
     // cross-realm — requires full realm support
     "cross-realm",
     // Symbol.species — defined but constructor integration incomplete

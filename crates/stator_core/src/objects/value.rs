@@ -1020,7 +1020,13 @@ impl JsValue {
             Self::Context(_) => "[object Context]".to_string(),
             Self::Proxy(_) => "[object Object]".to_string(),
             Self::Object(_) => "[object Object]".to_string(),
-            Self::ArrayBuffer(_) => "[object ArrayBuffer]".to_string(),
+            Self::ArrayBuffer(buf) => {
+                if buf.borrow().shared {
+                    "[object SharedArrayBuffer]".to_string()
+                } else {
+                    "[object ArrayBuffer]".to_string()
+                }
+            }
             Self::TypedArray(ta) => {
                 format!("[object {}]", ta.borrow().kind.name())
             }
@@ -1056,7 +1062,13 @@ impl JsValue {
             Self::Generator(_) => "[object Generator]".to_string(),
             Self::Iterator(_) => "[object Iterator]".to_string(),
             Self::Promise(_) => "[object Promise]".to_string(),
-            Self::ArrayBuffer(_) => "[object ArrayBuffer]".to_string(),
+            Self::ArrayBuffer(buf) => {
+                if buf.borrow().shared {
+                    "[object SharedArrayBuffer]".to_string()
+                } else {
+                    "[object ArrayBuffer]".to_string()
+                }
+            }
             Self::TypedArray(ta) => format!("[object {}]", ta.borrow().kind.name()),
             Self::DataView(_) => "[object DataView]".to_string(),
             Self::PlainObject(map) => {
