@@ -15262,7 +15262,7 @@ fn make_atomics() -> JsValue {
                 .first()
                 .map(|v| crate::builtins::util::clamped_f64_to_usize(v.to_number().unwrap_or(0.0)))
                 .unwrap_or(0);
-            Ok(JsValue::Boolean(matches!(size, 1 | 2 | 4)))
+            Ok(JsValue::Boolean(matches!(size, 1 | 2 | 4 | 8)))
         }),
     );
 
@@ -41167,7 +41167,7 @@ mod tests {
     #[test]
     fn e2e_atomics_is_lock_free_reports_supported_sizes() {
         assert_eval_true(
-            "Atomics.isLockFree(1) && Atomics.isLockFree(2) && Atomics.isLockFree(4) && !Atomics.isLockFree(8) && !Atomics.isLockFree(3)",
+            "Atomics.isLockFree(1) && Atomics.isLockFree(2) && Atomics.isLockFree(4) && Atomics.isLockFree(8) && !Atomics.isLockFree(3)",
         );
     }
 
@@ -41322,6 +41322,13 @@ mod tests {
     fn e2e_atomics_reject_non_integer_typed_arrays() {
         assert_eval_true(
             "try { Atomics.load(new Float32Array(new SharedArrayBuffer(4)), 0); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_atomics_reject_float64_typed_arrays() {
+        assert_eval_true(
+            "try { Atomics.load(new Float64Array(new SharedArrayBuffer(8)), 0); false; } catch (e) { e instanceof TypeError; }",
         );
     }
 
