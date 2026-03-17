@@ -166,6 +166,7 @@
 //! dispatches on the [`Opcode`] via an exhaustive `match`.
 
 mod dispatch;
+mod numeric_conformance_tests;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
