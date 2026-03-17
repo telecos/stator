@@ -10335,9 +10335,9 @@ fn make_regexp() -> JsValue {
                         {
                             f(vec![this.clone()])?.to_js_string()?
                         } else {
-                            match map.borrow().get("source") {
-                                Some(JsValue::String(s)) => s.to_string(),
-                                _ => "(?:)".to_string(),
+                            match map.borrow().get("source").cloned() {
+                                Some(JsValue::Undefined) | None => "(?:)".to_string(),
+                                Some(value) => value.to_js_string()?,
                             }
                         };
                         let flags = if let Some(JsValue::NativeFunction(f)) =
@@ -10345,14 +10345,16 @@ fn make_regexp() -> JsValue {
                         {
                             f(vec![this.clone()])?.to_js_string()?
                         } else {
-                            match map.borrow().get("flags") {
-                                Some(JsValue::String(s)) => s.to_string(),
-                                _ => String::new(),
+                            match map.borrow().get("flags").cloned() {
+                                Some(JsValue::Undefined) | None => String::new(),
+                                Some(value) => value.to_js_string()?,
                             }
                         };
                         Ok(JsValue::String(format!("/{source}/{flags}").into()))
                     } else {
-                        Ok(JsValue::String("/(?:)/".to_string().into()))
+                        Err(crate::error::StatorError::TypeError(
+                            "RegExp.prototype.toString requires that 'this' be an Object".into(),
+                        ))
                     }
                 }),
             );

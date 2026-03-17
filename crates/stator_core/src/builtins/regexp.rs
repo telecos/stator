@@ -261,7 +261,7 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
                 let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                 let replacement = args.get(1).unwrap_or(&JsValue::Undefined).clone();
                 let result = if is_callable(&replacement) {
-                    regexp_replace_with_callback(&re_replace, &input, &replacement)?
+                    regexp_replace_with_callback(&re_replace, &input, &replacement, &w)?
                 } else {
                     re_replace.symbol_replace(&input, &replacement.to_js_string()?)
                 };
@@ -306,11 +306,7 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
                 };
                 let parts = re_split.symbol_split(&input, limit);
                 sync_last_index_to_props(&w, &re_split);
-                let arr: Vec<JsValue> = parts
-                    .into_iter()
-                    .map(|s| JsValue::String(s.into()))
-                    .collect();
-                Ok(JsValue::new_array(arr))
+                Ok(JsValue::new_array(parts))
             })),
         );
     }
@@ -421,6 +417,7 @@ fn regexp_replace_with_callback(
     re: &JsRegExp,
     input: &str,
     replacement: &JsValue,
+    weak: &Weak<RefCell<PropertyMap>>,
 ) -> StatorResult<String> {
     let global = re.flags().contains(RegExpFlags::GLOBAL);
 
@@ -484,25 +481,7 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
     props.insert("input".into(), JsValue::String(m.input.clone().into()));
 
     // groups — null-prototype object (Object.create(null) per spec)
-    if m.named_groups.is_empty() {
-        props.insert("groups".into(), JsValue::Undefined);
-    } else {
-        let mut groups = PropertyMap::new();
-        groups.insert("__proto__".into(), JsValue::Null);
-        for (k, v) in &m.named_groups {
-            groups.insert(
-                k.clone(),
-                match v {
-                    Some(s) => JsValue::String(s.clone().into()),
-                    None => JsValue::Undefined,
-                },
-            );
-        }
-        props.insert(
-            "groups".into(),
-            JsValue::PlainObject(Rc::new(RefCell::new(groups))),
-        );
-    }
+    props.insert("groups".into(), named_groups_to_js(m));
 
     // indices (only present when /d flag was used)
     if let Some(ref idx) = m.indices {
@@ -543,6 +522,25 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
     props.insert("__is_array__".into(), JsValue::Boolean(true));
 
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+fn named_groups_to_js(m: &RegExpMatch) -> JsValue {
+    if m.named_groups.is_empty() {
+        JsValue::Undefined
+    } else {
+        let mut groups = PropertyMap::new();
+        groups.insert("__proto__".into(), JsValue::Null);
+        for (k, v) in &m.named_groups {
+            groups.insert(
+                k.clone(),
+                match v {
+                    Some(s) => JsValue::String(s.clone().into()),
+                    None => JsValue::Undefined,
+                },
+            );
+        }
+        JsValue::PlainObject(Rc::new(RefCell::new(groups)))
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -734,6 +732,91 @@ mod tests {
     }
 
     #[test]
+    fn test_symbol_match_global_resets_last_index() {
+        let re =
+            regexp_construct(&[JsValue::String("a".into()), JsValue::String("g".into())]).unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let match_fn = map.borrow().get("__symbol_match__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = match_fn {
+                let result = f(vec![JsValue::String("a_a".into())]).unwrap();
+                assert!(matches!(result, JsValue::Array(_)));
+                assert_eq!(get_smi(&re, "lastIndex"), Some(0));
+            }
+        }
+    }
+
+    #[test]
+    fn test_symbol_search_preserves_last_index() {
+        let re =
+            regexp_construct(&[JsValue::String("a".into()), JsValue::String("g".into())]).unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            map.borrow_mut().insert("lastIndex".into(), JsValue::Smi(2));
+            let search_fn = map.borrow().get("__symbol_search__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = search_fn {
+                let result = f(vec![JsValue::String("ba".into())]).unwrap();
+                assert_eq!(result, JsValue::Smi(1));
+                assert_eq!(get_smi(&re, "lastIndex"), Some(2));
+            }
+        }
+    }
+
+    #[test]
+    fn test_symbol_split_keeps_undefined_capture() {
+        let re = regexp_construct(&[JsValue::String("-(x)?".into()), JsValue::String("".into())])
+            .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let split_fn = map.borrow().get("__symbol_split__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = split_fn {
+                let result = f(vec![JsValue::String("a-b".into())]).unwrap();
+                if let JsValue::Array(items) = result {
+                    let items = items.borrow();
+                    assert_eq!(items[0], JsValue::String("a".into()));
+                    assert_eq!(items[1], JsValue::Undefined);
+                    assert_eq!(items[2], JsValue::String("b".into()));
+                } else {
+                    panic!("expected Array");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_replace_callback_receives_groups_argument() {
+        let re = regexp_construct(&[
+            JsValue::String(r"(?<y>\d{4})-(?<m>\d{2})".into()),
+            JsValue::String("".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let replace_fn = map.borrow().get("__symbol_replace__").cloned().unwrap();
+            let callback = JsValue::NativeFunction(Rc::new(|args: Vec<JsValue>| {
+                let groups = args.last().cloned().unwrap_or(JsValue::Undefined);
+                if let JsValue::PlainObject(groups) = groups {
+                    let year = groups
+                        .borrow()
+                        .get("y")
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined);
+                    let month = groups
+                        .borrow()
+                        .get("m")
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined);
+                    Ok(JsValue::String(
+                        format!("{}-{}", year.to_js_string()?, month.to_js_string()?).into(),
+                    ))
+                } else {
+                    Ok(JsValue::String("missing".into()))
+                }
+            }));
+            if let JsValue::NativeFunction(f) = replace_fn {
+                let result = f(vec![JsValue::String("2024-07".into()), callback]).unwrap();
+                assert_eq!(result, JsValue::String("2024-07".into()));
+            }
+        }
+    }
+
+    #[test]
     fn test_flag_accessors() {
         let re = regexp_construct(&[
             JsValue::String("a".into()),
@@ -831,6 +914,19 @@ mod tests {
                 // The first 'a' at index 0 should be skipped; match at index 2.
                 assert_eq!(get_smi(&result, "index"), Some(2));
                 assert_eq!(get_smi(&re, "lastIndex"), Some(3));
+            }
+        }
+    }
+
+    #[test]
+    fn test_last_index_zero_width_match_advances() {
+        let re = regexp_construct(&[JsValue::String("(?:)".into()), JsValue::String("g".into())])
+            .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let _ = f(vec![JsValue::String("ab".into())]).unwrap();
+                assert_eq!(get_smi(&re, "lastIndex"), Some(1));
             }
         }
     }
