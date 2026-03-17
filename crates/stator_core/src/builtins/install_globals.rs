@@ -14656,6 +14656,33 @@ fn make_disposable_stack() -> JsValue {
                 );
             }
 
+            // adopt(value, onDispose) — register a value with a custom callback.
+            {
+                let res = Rc::clone(&resources);
+                props.insert(
+                    "adopt".into(),
+                    native(move |args| {
+                        let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let on_dispose = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        // Wrap in an object that carries @@dispose → onDispose(value).
+                        let adopted_val = val.clone();
+                        let mut wrapper = PropertyMap::new();
+                        wrapper.insert(
+                            "@@dispose".into(),
+                            native(move |_| {
+                                if let JsValue::NativeFunction(f) = &on_dispose {
+                                    let _ = f(vec![adopted_val.clone()]);
+                                }
+                                Ok(JsValue::Undefined)
+                            }),
+                        );
+                        res.borrow_mut()
+                            .push(JsValue::PlainObject(Rc::new(RefCell::new(wrapper))));
+                        Ok(val)
+                    }),
+                );
+            }
+
             // [Symbol.dispose]() — aliases dispose() for using protocol.
             {
                 let res2 = Rc::clone(&resources);
@@ -14672,6 +14699,122 @@ fn make_disposable_stack() -> JsValue {
                             if let JsValue::PlainObject(obj) = item
                                 && let Some(JsValue::NativeFunction(f)) =
                                     obj.borrow().get("@@dispose").cloned()
+                            {
+                                let _ = f(vec![item.clone()]);
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+            }
+
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
+        })
+    })
+}
+
+/// Build the `AsyncDisposableStack` constructor.
+///
+/// `AsyncDisposableStack` manages a stack of async-disposable resources and
+/// calls their `[Symbol.asyncDispose]()` methods in reverse order when
+/// `.disposeAsync()` is called.
+#[inline(never)]
+fn make_async_disposable_stack() -> JsValue {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
+        native(|_args| {
+            let resources: Rc<RefCell<Vec<JsValue>>> = Rc::new(RefCell::new(Vec::new()));
+            let disposed: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+            let mut props = PropertyMap::new();
+
+            // use(value) — add an async-disposable resource.
+            {
+                let res = Rc::clone(&resources);
+                props.insert(
+                    "use".into(),
+                    native(move |args| {
+                        let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        res.borrow_mut().push(val.clone());
+                        Ok(val)
+                    }),
+                );
+            }
+
+            // disposed — whether the stack has been disposed.
+            {
+                let d = Rc::clone(&disposed);
+                props.insert(
+                    "disposed".into(),
+                    native(move |_args| Ok(JsValue::Boolean(*d.borrow()))),
+                );
+            }
+
+            // adopt(value, onDispose) — register a value with a custom callback.
+            {
+                let res = Rc::clone(&resources);
+                props.insert(
+                    "adopt".into(),
+                    native(move |args| {
+                        let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let on_dispose = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        let adopted_val = val.clone();
+                        let mut wrapper = PropertyMap::new();
+                        wrapper.insert(
+                            "@@asyncDispose".into(),
+                            native(move |_| {
+                                if let JsValue::NativeFunction(f) = &on_dispose {
+                                    let _ = f(vec![adopted_val.clone()]);
+                                }
+                                Ok(JsValue::Undefined)
+                            }),
+                        );
+                        res.borrow_mut()
+                            .push(JsValue::PlainObject(Rc::new(RefCell::new(wrapper))));
+                        Ok(val)
+                    }),
+                );
+            }
+
+            // disposeAsync() — dispose all resources in reverse order.
+            {
+                let res = Rc::clone(&resources);
+                let d = Rc::clone(&disposed);
+                props.insert(
+                    "disposeAsync".into(),
+                    native(move |_args| {
+                        if *d.borrow() {
+                            return Ok(JsValue::Undefined);
+                        }
+                        *d.borrow_mut() = true;
+                        let items: Vec<JsValue> = res.borrow_mut().drain(..).rev().collect();
+                        for item in &items {
+                            if let JsValue::PlainObject(obj) = item
+                                && let Some(JsValue::NativeFunction(f)) =
+                                    obj.borrow().get("@@asyncDispose").cloned()
+                            {
+                                let _ = f(vec![item.clone()]);
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+            }
+
+            // [Symbol.asyncDispose]() — aliases disposeAsync() for protocol.
+            {
+                let res2 = Rc::clone(&resources);
+                let d2 = Rc::clone(&disposed);
+                props.insert(
+                    "@@asyncDispose".into(),
+                    native(move |_args| {
+                        if *d2.borrow() {
+                            return Ok(JsValue::Undefined);
+                        }
+                        *d2.borrow_mut() = true;
+                        let items: Vec<JsValue> = res2.borrow_mut().drain(..).rev().collect();
+                        for item in &items {
+                            if let JsValue::PlainObject(obj) = item
+                                && let Some(JsValue::NativeFunction(f)) =
+                                    obj.borrow().get("@@asyncDispose").cloned()
                             {
                                 let _ = f(vec![item.clone()]);
                             }
@@ -14783,6 +14926,10 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         globals.insert(
             "DisposableStack".into(),
             finalize_ctor(make_disposable_stack(), "DisposableStack"),
+        );
+        globals.insert(
+            "AsyncDisposableStack".into(),
+            finalize_ctor(make_async_disposable_stack(), "AsyncDisposableStack"),
         );
         globals.insert("String".into(), finalize_ctor(make_string(), "String"));
     });
