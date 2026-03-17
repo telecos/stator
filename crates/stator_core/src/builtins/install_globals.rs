@@ -12372,6 +12372,42 @@ fn extract_arraybuffer(v: &JsValue) -> Option<Rc<RefCell<JsArrayBuffer>>> {
     }
 }
 
+/// Extract the `Rc<RefCell<JsTypedArray>>` from a raw `JsValue::TypedArray`
+/// *or* from a PlainObject wrapper produced by `make_typed_array_instance`.
+fn extract_typed_array(
+    v: &JsValue,
+) -> Option<Rc<RefCell<crate::builtins::typed_array::JsTypedArray>>> {
+    match v {
+        JsValue::TypedArray(inner) => Some(Rc::clone(inner)),
+        JsValue::PlainObject(map) => {
+            if let Some(JsValue::TypedArray(inner)) = map.borrow().get("__typed_array__") {
+                Some(Rc::clone(inner))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Collect source values for typed-array constructors and static methods.
+fn collect_typed_array_source_values(source: &JsValue) -> StatorResult<Vec<JsValue>> {
+    if let Some(inner) = extract_typed_array(source) {
+        let typed_array = inner.borrow();
+        return Ok((0..typed_array.length)
+            .map(|index| typed_array_get(&typed_array, index))
+            .collect());
+    }
+    match source {
+        JsValue::Array(_) | JsValue::Iterator(_) | JsValue::Generator(_) | JsValue::String(_) => {
+            collect_iterable_values(source)
+        }
+        JsValue::PlainObject(_) | JsValue::Proxy(_) => collect_iterable_values(source)
+            .or_else(|_| try_to_array_like_elements(source).map(|(elements, _)| elements)),
+        _ => Err(StatorError::TypeError("value is not iterable".into())),
+    }
+}
+
 /// Wrap a raw `JsArrayBuffer` in a `PlainObject` with `byteLength` and
 /// `slice()` so that property access works from JavaScript.
 fn make_arraybuffer_instance(buf_rc: Rc<RefCell<JsArrayBuffer>>) -> JsValue {
@@ -12699,6 +12735,14 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
         JsValue::Smi(kind.bytes_per_element() as i32),
     );
 
+    let mut prototype = PropertyMap::new();
+    prototype.insert("@@toStringTag".into(), JsValue::String(kind.name().into()));
+    prototype.make_all_non_enumerable();
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(prototype))),
+    );
+
     // Constructor: TypedArray(length) | TypedArray(array) | TypedArray(buffer, offset?, length?)
     props.insert(
         "__call__".into(),
@@ -12721,29 +12765,19 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
                     };
                     typed_array_new_from_buffer(kind, buf, offset, length)?
                 }
-                // From another TypedArray (raw)
-                Some(JsValue::TypedArray(src_rc)) => {
-                    let src = src_rc.borrow();
-                    let vals: Vec<JsValue> =
-                        (0..src.length).map(|i| typed_array_get(&src, i)).collect();
-                    typed_array_from_values(kind, &vals)?
+                // From another TypedArray / Array / iterable / array-like
+                Some(
+                    source @ (JsValue::TypedArray(_)
+                    | JsValue::Array(_)
+                    | JsValue::Iterator(_)
+                    | JsValue::Generator(_)
+                    | JsValue::String(_)
+                    | JsValue::PlainObject(_)
+                    | JsValue::Proxy(_)),
+                ) => {
+                    let values = collect_typed_array_source_values(source)?;
+                    typed_array_from_values(kind, &values)?
                 }
-                // From a wrapped TypedArray instance (PlainObject with __typed_array__)
-                Some(JsValue::PlainObject(map))
-                    if map.borrow().get("__typed_array__").is_some() =>
-                {
-                    let ta_inner = map.borrow().get("__typed_array__").unwrap().clone();
-                    if let JsValue::TypedArray(src_rc) = ta_inner {
-                        let src = src_rc.borrow();
-                        let vals: Vec<JsValue> =
-                            (0..src.length).map(|i| typed_array_get(&src, i)).collect();
-                        typed_array_from_values(kind, &vals)?
-                    } else {
-                        typed_array_new_from_length(kind, 0)
-                    }
-                }
-                // From Array
-                Some(JsValue::Array(arr)) => typed_array_from_values(kind, &arr.borrow())?,
                 // From length (number)
                 Some(v) => {
                     let len = crate::builtins::util::checked_f64_to_length(v.to_number()?)?;
@@ -12760,10 +12794,10 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
     props.insert(
         "from".into(),
         native(move |args| {
-            let source = match args.first() {
-                Some(JsValue::Array(arr)) => arr.borrow().clone(),
-                _ => Vec::new(),
-            };
+            let source = args.first().ok_or_else(|| {
+                StatorError::TypeError("TypedArray.from requires a source value".into())
+            })?;
+            let source = collect_typed_array_source_values(source)?;
             let ta = typed_array_from_values(kind, &source)?;
             let inner = Rc::new(RefCell::new(ta));
             Ok(make_typed_array_instance(kind, inner))
@@ -12798,591 +12832,677 @@ fn make_typed_array_instance(
 ) -> JsValue {
     let _ = kind;
     let typed_array_val = JsValue::TypedArray(Rc::clone(&inner));
-    let mut obj = PropertyMap::new();
+    let obj = Rc::new(RefCell::new(PropertyMap::new()));
+    let instance_value = JsValue::PlainObject(Rc::clone(&obj));
 
-    // BYTES_PER_ELEMENT
     {
-        let inner = Rc::clone(&inner);
+        let mut obj = obj.borrow_mut();
+        obj.insert(
+            "__proto__".into(),
+            constructor_prototype(inner.borrow().kind.name()).unwrap_or(JsValue::Null),
+        );
         obj.insert(
             "BYTES_PER_ELEMENT".into(),
             JsValue::Smi(inner.borrow().kind.bytes_per_element() as i32),
         );
-    }
-    // length
-    {
-        let inner = Rc::clone(&inner);
         obj.insert("length".into(), JsValue::Smi(inner.borrow().length as i32));
-    }
-    // byteLength
-    {
-        let inner = Rc::clone(&inner);
-        let ta = inner.borrow();
-        obj.insert(
-            "byteLength".into(),
-            JsValue::Smi((ta.length * ta.kind.bytes_per_element()) as i32),
-        );
-    }
-    // byteOffset
-    {
-        let inner = Rc::clone(&inner);
+        {
+            let ta = inner.borrow();
+            obj.insert(
+                "byteLength".into(),
+                JsValue::Smi((ta.length * ta.kind.bytes_per_element()) as i32),
+            );
+        }
         obj.insert(
             "byteOffset".into(),
             JsValue::Smi(inner.borrow().byte_offset as i32),
         );
-    }
-    // buffer
-    {
-        let inner = Rc::clone(&inner);
         obj.insert(
             "buffer".into(),
             make_arraybuffer_instance(Rc::clone(&inner.borrow().buffer)),
         );
-    }
-    // at(index)
-    {
-        let inner = Rc::clone(&inner);
         obj.insert(
-            "at".into(),
-            native(move |a| {
-                let idx = a
-                    .first()
-                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                    .unwrap_or(0);
-                Ok(typed_array_at(&inner.borrow(), idx))
-            }),
+            "@@toStringTag".into(),
+            JsValue::String(inner.borrow().kind.name().into()),
         );
-    }
-    // copyWithin(target, start, end?)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "copyWithin".into(),
-            native(move |a| {
-                let target = a
-                    .first()
-                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                    .unwrap_or(0);
-                let start = a
-                    .get(1)
-                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                    .unwrap_or(0);
-                let end = a
-                    .get(2)
-                    .map(|v| v.to_number().unwrap_or(inner.borrow().length as f64) as i64)
-                    .unwrap_or(inner.borrow().length as i64);
-                typed_array_copy_within(&inner.borrow(), target, start, end);
-                Ok(JsValue::Undefined)
-            }),
-        );
-    }
-    // entries()
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "entries".into(),
-            native(move |_| {
-                let items = typed_array_entries(&inner.borrow());
-                Ok(JsValue::Iterator(NativeIterator::from_items(items)))
-            }),
-        );
-    }
-    // every(callbackfn)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "every".into(),
-            native(move |a| {
-                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
-                let ta = inner.borrow();
-                for i in 0..ta.length {
-                    let v = typed_array_get(&ta, i);
-                    if let JsValue::NativeFunction(f) = &cb {
-                        let result = f(vec![v, JsValue::Smi(i as i32)])?;
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "at".into(),
+                native(move |a| {
+                    let idx = a
+                        .first()
+                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                        .unwrap_or(0);
+                    Ok(typed_array_at(&inner.borrow(), idx))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            let instance = instance_value.clone();
+            obj.insert(
+                "copyWithin".into(),
+                native(move |a| {
+                    let target = a
+                        .first()
+                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                        .unwrap_or(0);
+                    let start = a
+                        .get(1)
+                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                        .unwrap_or(0);
+                    let end = a
+                        .get(2)
+                        .map(|v| v.to_number().unwrap_or(inner.borrow().length as f64) as i64)
+                        .unwrap_or(inner.borrow().length as i64);
+                    typed_array_copy_within(&inner.borrow(), target, start, end);
+                    Ok(instance.clone())
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "entries".into(),
+                native(move |_| {
+                    let items = typed_array_entries(&inner.borrow());
+                    Ok(JsValue::Iterator(NativeIterator::from_items(items)))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            let instance = instance_value.clone();
+            obj.insert(
+                "every".into(),
+                native(move |a| {
+                    let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                    if !is_callable(&cb) {
+                        return Err(StatorError::TypeError(
+                            "TypedArray.prototype.every callback must be callable".into(),
+                        ));
+                    }
+                    let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let ta = inner.borrow();
+                    for i in 0..ta.length {
+                        let result = call_callback_with_this(
+                            &cb,
+                            this_arg.clone(),
+                            vec![
+                                typed_array_get(&ta, i),
+                                JsValue::Smi(i as i32),
+                                instance.clone(),
+                            ],
+                        )?;
                         if !result.to_boolean() {
                             return Ok(JsValue::Boolean(false));
                         }
                     }
-                }
-                Ok(JsValue::Boolean(true))
-            }),
-        );
-    }
-    // fill(value, start?, end?)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "fill".into(),
-            native(move |a| {
-                let val = a.first().unwrap_or(&JsValue::Undefined).clone();
-                let ta = inner.borrow();
-                let start = a
-                    .get(1)
-                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                    .unwrap_or(0);
-                let end = a
-                    .get(2)
-                    .map(|v| v.to_number().unwrap_or(ta.length as f64) as i64)
-                    .unwrap_or(ta.length as i64);
-                typed_array_fill(&ta, &val, start, end)?;
-                Ok(JsValue::Undefined)
-            }),
-        );
-    }
-    // filter(callbackfn)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "filter".into(),
-            native(move |a| {
-                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
-                let ta = inner.borrow();
-                let mut kept = Vec::new();
-                for i in 0..ta.length {
-                    let v = typed_array_get(&ta, i);
-                    if let JsValue::NativeFunction(f) = &cb {
-                        let result = f(vec![v.clone(), JsValue::Smi(i as i32)])?;
+                    Ok(JsValue::Boolean(true))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            let instance = instance_value.clone();
+            obj.insert(
+                "fill".into(),
+                native(move |a| {
+                    let val = a.first().unwrap_or(&JsValue::Undefined).clone();
+                    let ta = inner.borrow();
+                    let start = a
+                        .get(1)
+                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                        .unwrap_or(0);
+                    let end = a
+                        .get(2)
+                        .map(|v| v.to_number().unwrap_or(ta.length as f64) as i64)
+                        .unwrap_or(ta.length as i64);
+                    typed_array_fill(&ta, &val, start, end)?;
+                    Ok(instance.clone())
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            let instance = instance_value.clone();
+            obj.insert(
+                "filter".into(),
+                native(move |a| {
+                    let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                    if !is_callable(&cb) {
+                        return Err(StatorError::TypeError(
+                            "TypedArray.prototype.filter callback must be callable".into(),
+                        ));
+                    }
+                    let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let ta = inner.borrow();
+                    let mut kept = Vec::new();
+                    for i in 0..ta.length {
+                        let value = typed_array_get(&ta, i);
+                        let result = call_callback_with_this(
+                            &cb,
+                            this_arg.clone(),
+                            vec![value.clone(), JsValue::Smi(i as i32), instance.clone()],
+                        )?;
                         if result.to_boolean() {
-                            kept.push(v);
+                            kept.push(value);
                         }
                     }
-                }
-                let result = typed_array_from_values(ta.kind, &kept)?;
-                let inner = Rc::new(RefCell::new(result));
-                Ok(make_typed_array_instance(ta.kind, inner))
-            }),
-        );
-    }
-    // find(callbackfn)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "find".into(),
-            native(move |a| {
-                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
-                let ta = inner.borrow();
-                for i in 0..ta.length {
-                    let v = typed_array_get(&ta, i);
-                    if let JsValue::NativeFunction(f) = &cb {
-                        let result = f(vec![v.clone(), JsValue::Smi(i as i32)])?;
+                    let result = typed_array_from_values(ta.kind, &kept)?;
+                    let inner = Rc::new(RefCell::new(result));
+                    Ok(make_typed_array_instance(ta.kind, inner))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            let instance = instance_value.clone();
+            obj.insert(
+                "find".into(),
+                native(move |a| {
+                    let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                    if !is_callable(&cb) {
+                        return Err(StatorError::TypeError(
+                            "TypedArray.prototype.find callback must be callable".into(),
+                        ));
+                    }
+                    let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let ta = inner.borrow();
+                    for i in 0..ta.length {
+                        let value = typed_array_get(&ta, i);
+                        let result = call_callback_with_this(
+                            &cb,
+                            this_arg.clone(),
+                            vec![value.clone(), JsValue::Smi(i as i32), instance.clone()],
+                        )?;
                         if result.to_boolean() {
-                            return Ok(v);
+                            return Ok(value);
                         }
                     }
-                }
-                Ok(JsValue::Undefined)
-            }),
-        );
-    }
-    // findIndex(callbackfn)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "findIndex".into(),
-            native(move |a| {
-                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
-                let ta = inner.borrow();
-                for i in 0..ta.length {
-                    let v = typed_array_get(&ta, i);
-                    if let JsValue::NativeFunction(f) = &cb {
-                        let result = f(vec![v, JsValue::Smi(i as i32)])?;
-                        if result.to_boolean() {
-                            return Ok(JsValue::Smi(i as i32));
-                        }
+                    Ok(JsValue::Undefined)
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            let instance = instance_value.clone();
+            obj.insert(
+                "findIndex".into(),
+                native(move |a| {
+                    let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                    if !is_callable(&cb) {
+                        return Err(StatorError::TypeError(
+                            "TypedArray.prototype.findIndex callback must be callable".into(),
+                        ));
                     }
-                }
-                Ok(JsValue::Smi(-1))
-            }),
-        );
-    }
-    // findLast(callbackfn)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "findLast".into(),
-            native(move |a| {
-                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
-                let ta = inner.borrow();
-                for i in (0..ta.length).rev() {
-                    let v = typed_array_get(&ta, i);
-                    if let JsValue::NativeFunction(f) = &cb {
-                        let result = f(vec![v.clone(), JsValue::Smi(i as i32)])?;
-                        if result.to_boolean() {
-                            return Ok(v);
-                        }
-                    }
-                }
-                Ok(JsValue::Undefined)
-            }),
-        );
-    }
-    // findLastIndex(callbackfn)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "findLastIndex".into(),
-            native(move |a| {
-                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
-                let ta = inner.borrow();
-                for i in (0..ta.length).rev() {
-                    let v = typed_array_get(&ta, i);
-                    if let JsValue::NativeFunction(f) = &cb {
-                        let result = f(vec![v, JsValue::Smi(i as i32)])?;
+                    let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let ta = inner.borrow();
+                    for i in 0..ta.length {
+                        let result = call_callback_with_this(
+                            &cb,
+                            this_arg.clone(),
+                            vec![
+                                typed_array_get(&ta, i),
+                                JsValue::Smi(i as i32),
+                                instance.clone(),
+                            ],
+                        )?;
                         if result.to_boolean() {
                             return Ok(JsValue::Smi(i as i32));
                         }
                     }
-                }
-                Ok(JsValue::Smi(-1))
-            }),
-        );
-    }
-    // forEach(callbackfn)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "forEach".into(),
-            native(move |a| {
-                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
-                let ta = inner.borrow();
-                for i in 0..ta.length {
-                    let v = typed_array_get(&ta, i);
-                    if let JsValue::NativeFunction(f) = &cb {
-                        f(vec![v, JsValue::Smi(i as i32)])?;
+                    Ok(JsValue::Smi(-1))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            let instance = instance_value.clone();
+            obj.insert(
+                "findLast".into(),
+                native(move |a| {
+                    let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                    if !is_callable(&cb) {
+                        return Err(StatorError::TypeError(
+                            "TypedArray.prototype.findLast callback must be callable".into(),
+                        ));
                     }
-                }
-                Ok(JsValue::Undefined)
-            }),
-        );
-    }
-    // includes(searchElement, fromIndex?)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "includes".into(),
-            native(move |a| {
-                let search = a.first().unwrap_or(&JsValue::Undefined);
-                let from = a
-                    .get(1)
-                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                    .unwrap_or(0);
-                Ok(JsValue::Boolean(typed_array_includes(
-                    &inner.borrow(),
-                    search,
-                    from,
-                )))
-            }),
-        );
-    }
-    // indexOf(searchElement, fromIndex?)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "indexOf".into(),
-            native(move |a| {
-                let search = a.first().unwrap_or(&JsValue::Undefined);
-                let from = a
-                    .get(1)
-                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                    .unwrap_or(0);
-                Ok(JsValue::Smi(
-                    typed_array_index_of(&inner.borrow(), search, from) as i32,
-                ))
-            }),
-        );
-    }
-    // join(separator?)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "join".into(),
-            native(move |a| {
-                let sep = match a.first() {
-                    Some(v) if !v.is_undefined() => v.to_js_string()?,
-                    _ => ",".to_string(),
-                };
-                Ok(JsValue::String(
-                    typed_array_join(&inner.borrow(), &sep)?.into(),
-                ))
-            }),
-        );
-    }
-    // keys()
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "keys".into(),
-            native(move |_| {
-                let items = typed_array_keys(&inner.borrow());
-                Ok(JsValue::Iterator(NativeIterator::from_items(items)))
-            }),
-        );
-    }
-    // lastIndexOf(searchElement, fromIndex?)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "lastIndexOf".into(),
-            native(move |a| {
-                let search = a.first().unwrap_or(&JsValue::Undefined);
-                let ta = inner.borrow();
-                let from = a
-                    .get(1)
-                    .map(|v| v.to_number().unwrap_or(ta.length as f64 - 1.0) as i64)
-                    .unwrap_or(ta.length as i64 - 1);
-                Ok(JsValue::Smi(
-                    typed_array_last_index_of(&ta, search, from) as i32
-                ))
-            }),
-        );
-    }
-    // map(callbackfn)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "map".into(),
-            native(move |a| {
-                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
-                let ta = inner.borrow();
-                let mut mapped = Vec::with_capacity(ta.length);
-                for i in 0..ta.length {
-                    let v = typed_array_get(&ta, i);
-                    if let JsValue::NativeFunction(f) = &cb {
-                        mapped.push(f(vec![v, JsValue::Smi(i as i32)])?);
+                    let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let ta = inner.borrow();
+                    for i in (0..ta.length).rev() {
+                        let value = typed_array_get(&ta, i);
+                        let result = call_callback_with_this(
+                            &cb,
+                            this_arg.clone(),
+                            vec![value.clone(), JsValue::Smi(i as i32), instance.clone()],
+                        )?;
+                        if result.to_boolean() {
+                            return Ok(value);
+                        }
+                    }
+                    Ok(JsValue::Undefined)
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            let instance = instance_value.clone();
+            obj.insert(
+                "findLastIndex".into(),
+                native(move |a| {
+                    let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                    if !is_callable(&cb) {
+                        return Err(StatorError::TypeError(
+                            "TypedArray.prototype.findLastIndex callback must be callable".into(),
+                        ));
+                    }
+                    let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let ta = inner.borrow();
+                    for i in (0..ta.length).rev() {
+                        let result = call_callback_with_this(
+                            &cb,
+                            this_arg.clone(),
+                            vec![
+                                typed_array_get(&ta, i),
+                                JsValue::Smi(i as i32),
+                                instance.clone(),
+                            ],
+                        )?;
+                        if result.to_boolean() {
+                            return Ok(JsValue::Smi(i as i32));
+                        }
+                    }
+                    Ok(JsValue::Smi(-1))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            let instance = instance_value.clone();
+            obj.insert(
+                "forEach".into(),
+                native(move |a| {
+                    let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                    if !is_callable(&cb) {
+                        return Err(StatorError::TypeError(
+                            "TypedArray.prototype.forEach callback must be callable".into(),
+                        ));
+                    }
+                    let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let ta = inner.borrow();
+                    for i in 0..ta.length {
+                        call_callback_with_this(
+                            &cb,
+                            this_arg.clone(),
+                            vec![
+                                typed_array_get(&ta, i),
+                                JsValue::Smi(i as i32),
+                                instance.clone(),
+                            ],
+                        )?;
+                    }
+                    Ok(JsValue::Undefined)
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "includes".into(),
+                native(move |a| {
+                    let search = a.first().unwrap_or(&JsValue::Undefined);
+                    let from = a
+                        .get(1)
+                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                        .unwrap_or(0);
+                    Ok(JsValue::Boolean(typed_array_includes(
+                        &inner.borrow(),
+                        search,
+                        from,
+                    )))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "indexOf".into(),
+                native(move |a| {
+                    let search = a.first().unwrap_or(&JsValue::Undefined);
+                    let from = a
+                        .get(1)
+                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                        .unwrap_or(0);
+                    Ok(JsValue::Smi(
+                        typed_array_index_of(&inner.borrow(), search, from) as i32,
+                    ))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "join".into(),
+                native(move |a| {
+                    let sep = match a.first() {
+                        Some(v) if !v.is_undefined() => v.to_js_string()?,
+                        _ => ",".to_string(),
+                    };
+                    Ok(JsValue::String(
+                        typed_array_join(&inner.borrow(), &sep)?.into(),
+                    ))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "keys".into(),
+                native(move |_| {
+                    let items = typed_array_keys(&inner.borrow());
+                    Ok(JsValue::Iterator(NativeIterator::from_items(items)))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "lastIndexOf".into(),
+                native(move |a| {
+                    let search = a.first().unwrap_or(&JsValue::Undefined);
+                    let ta = inner.borrow();
+                    let from = a
+                        .get(1)
+                        .map(|v| v.to_number().unwrap_or(ta.length as f64 - 1.0) as i64)
+                        .unwrap_or(ta.length as i64 - 1);
+                    Ok(JsValue::Smi(
+                        typed_array_last_index_of(&ta, search, from) as i32
+                    ))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            let instance = instance_value.clone();
+            obj.insert(
+                "map".into(),
+                native(move |a| {
+                    let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                    if !is_callable(&cb) {
+                        return Err(StatorError::TypeError(
+                            "TypedArray.prototype.map callback must be callable".into(),
+                        ));
+                    }
+                    let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let ta = inner.borrow();
+                    let mut mapped = Vec::with_capacity(ta.length);
+                    for i in 0..ta.length {
+                        let mapped_value = call_callback_with_this(
+                            &cb,
+                            this_arg.clone(),
+                            vec![
+                                typed_array_get(&ta, i),
+                                JsValue::Smi(i as i32),
+                                instance.clone(),
+                            ],
+                        )?;
+                        mapped.push(mapped_value);
+                    }
+                    let result = typed_array_from_values(ta.kind, &mapped)?;
+                    let inner = Rc::new(RefCell::new(result));
+                    Ok(make_typed_array_instance(ta.kind, inner))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            let instance = instance_value.clone();
+            obj.insert(
+                "reduce".into(),
+                native(move |a| {
+                    let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                    if !is_callable(&cb) {
+                        return Err(StatorError::TypeError(
+                            "TypedArray.prototype.reduce callback must be callable".into(),
+                        ));
+                    }
+                    let ta = inner.borrow();
+                    let mut start = 0;
+                    let mut acc = if a.len() > 1 {
+                        a[1].clone()
                     } else {
-                        mapped.push(v);
+                        if ta.length == 0 {
+                            return Err(StatorError::TypeError(
+                                "Reduce of empty array with no initial value".into(),
+                            ));
+                        }
+                        start = 1;
+                        typed_array_get(&ta, 0)
+                    };
+                    for i in start..ta.length {
+                        acc = call_callback(
+                            &cb,
+                            vec![
+                                acc,
+                                typed_array_get(&ta, i),
+                                JsValue::Smi(i as i32),
+                                instance.clone(),
+                            ],
+                        )?;
                     }
-                }
-                let result = typed_array_from_values(ta.kind, &mapped)?;
-                let inner = Rc::new(RefCell::new(result));
-                Ok(make_typed_array_instance(ta.kind, inner))
-            }),
-        );
-    }
-    // reduce(callbackfn, initialValue?)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "reduce".into(),
-            native(move |a| {
-                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
-                let ta = inner.borrow();
-                let mut start = 0;
-                let mut acc = if a.len() > 1 {
-                    a[1].clone()
-                } else {
-                    if ta.length == 0 {
+                    Ok(acc)
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            let instance = instance_value.clone();
+            obj.insert(
+                "reduceRight".into(),
+                native(move |a| {
+                    let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                    if !is_callable(&cb) {
                         return Err(StatorError::TypeError(
-                            "Reduce of empty array with no initial value".into(),
+                            "TypedArray.prototype.reduceRight callback must be callable".into(),
                         ));
                     }
-                    start = 1;
-                    typed_array_get(&ta, 0)
-                };
-                for i in start..ta.length {
-                    let v = typed_array_get(&ta, i);
-                    if let JsValue::NativeFunction(f) = &cb {
-                        acc = f(vec![acc, v, JsValue::Smi(i as i32)])?;
+                    let ta = inner.borrow();
+                    let len = ta.length;
+                    let mut acc = if a.len() > 1 {
+                        a[1].clone()
+                    } else {
+                        if len == 0 {
+                            return Err(StatorError::TypeError(
+                                "Reduce of empty array with no initial value".into(),
+                            ));
+                        }
+                        typed_array_get(&ta, len - 1)
+                    };
+                    let end = if a.len() <= 1 && len > 0 {
+                        len - 1
+                    } else {
+                        len
+                    };
+                    for i in (0..end).rev() {
+                        acc = call_callback(
+                            &cb,
+                            vec![
+                                acc,
+                                typed_array_get(&ta, i),
+                                JsValue::Smi(i as i32),
+                                instance.clone(),
+                            ],
+                        )?;
                     }
-                }
-                Ok(acc)
-            }),
-        );
-    }
-    // reduceRight(callbackfn, initialValue?)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "reduceRight".into(),
-            native(move |a| {
-                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
-                let ta = inner.borrow();
-                let len = ta.length;
-                let mut acc = if a.len() > 1 {
-                    a[1].clone()
-                } else {
-                    if len == 0 {
+                    Ok(acc)
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            let instance = instance_value.clone();
+            obj.insert(
+                "reverse".into(),
+                native(move |_| {
+                    typed_array_reverse(&inner.borrow());
+                    Ok(instance.clone())
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "set".into(),
+                native(move |a| {
+                    let source = match a.first() {
+                        Some(source) => collect_typed_array_source_values(source)?,
+                        None => Vec::new(),
+                    };
+                    let offset = a
+                        .get(1)
+                        .map(|v| {
+                            crate::builtins::util::clamped_f64_to_usize(
+                                v.to_number().unwrap_or(0.0),
+                            )
+                        })
+                        .unwrap_or(0);
+                    typed_array_set_from(&inner.borrow(), &source, offset)?;
+                    Ok(JsValue::Undefined)
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "slice".into(),
+                native(move |a| {
+                    let ta = inner.borrow();
+                    let start = a
+                        .first()
+                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                        .unwrap_or(0);
+                    let end = a
+                        .get(1)
+                        .map(|v| v.to_number().unwrap_or(ta.length as f64) as i64)
+                        .unwrap_or(ta.length as i64);
+                    let result = typed_array_slice(&ta, start, end)?;
+                    let inner = Rc::new(RefCell::new(result));
+                    Ok(make_typed_array_instance(ta.kind, inner))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            let instance = instance_value.clone();
+            obj.insert(
+                "some".into(),
+                native(move |a| {
+                    let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
+                    if !is_callable(&cb) {
                         return Err(StatorError::TypeError(
-                            "Reduce of empty array with no initial value".into(),
+                            "TypedArray.prototype.some callback must be callable".into(),
                         ));
                     }
-                    typed_array_get(&ta, len - 1)
-                };
-                let end = if a.len() <= 1 && len > 0 {
-                    len - 1
-                } else {
-                    len
-                };
-                for i in (0..end).rev() {
-                    let v = typed_array_get(&ta, i);
-                    if let JsValue::NativeFunction(f) = &cb {
-                        acc = f(vec![acc, v, JsValue::Smi(i as i32)])?;
-                    }
-                }
-                Ok(acc)
-            }),
-        );
-    }
-    // reverse()
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "reverse".into(),
-            native(move |_| {
-                typed_array_reverse(&inner.borrow());
-                Ok(JsValue::Undefined)
-            }),
-        );
-    }
-    // set(source, offset?)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "set".into(),
-            native(move |a| {
-                let source: Vec<JsValue> = match a.first() {
-                    Some(JsValue::Array(arr)) => arr.borrow().clone(),
-                    Some(JsValue::TypedArray(src_rc)) => {
-                        let src = src_rc.borrow();
-                        (0..src.length).map(|i| typed_array_get(&src, i)).collect()
-                    }
-                    _ => Vec::new(),
-                };
-                let offset = a
-                    .get(1)
-                    .map(|v| {
-                        crate::builtins::util::clamped_f64_to_usize(v.to_number().unwrap_or(0.0))
-                    })
-                    .unwrap_or(0);
-                typed_array_set_from(&inner.borrow(), &source, offset)?;
-                Ok(JsValue::Undefined)
-            }),
-        );
-    }
-    // slice(start?, end?)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "slice".into(),
-            native(move |a| {
-                let ta = inner.borrow();
-                let start = a
-                    .first()
-                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                    .unwrap_or(0);
-                let end = a
-                    .get(1)
-                    .map(|v| v.to_number().unwrap_or(ta.length as f64) as i64)
-                    .unwrap_or(ta.length as i64);
-                let result = typed_array_slice(&ta, start, end)?;
-                let inner = Rc::new(RefCell::new(result));
-                Ok(make_typed_array_instance(ta.kind, inner))
-            }),
-        );
-    }
-    // some(callbackfn)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "some".into(),
-            native(move |a| {
-                let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
-                let ta = inner.borrow();
-                for i in 0..ta.length {
-                    let v = typed_array_get(&ta, i);
-                    if let JsValue::NativeFunction(f) = &cb {
-                        let result = f(vec![v, JsValue::Smi(i as i32)])?;
+                    let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let ta = inner.borrow();
+                    for i in 0..ta.length {
+                        let result = call_callback_with_this(
+                            &cb,
+                            this_arg.clone(),
+                            vec![
+                                typed_array_get(&ta, i),
+                                JsValue::Smi(i as i32),
+                                instance.clone(),
+                            ],
+                        )?;
                         if result.to_boolean() {
                             return Ok(JsValue::Boolean(true));
                         }
                     }
-                }
-                Ok(JsValue::Boolean(false))
-            }),
-        );
+                    Ok(JsValue::Boolean(false))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            let instance = instance_value.clone();
+            obj.insert(
+                "sort".into(),
+                native(move |_| {
+                    typed_array_sort(&inner.borrow());
+                    Ok(instance.clone())
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "subarray".into(),
+                native(move |a| {
+                    let ta = inner.borrow();
+                    let begin = a
+                        .first()
+                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                        .unwrap_or(0);
+                    let end = a
+                        .get(1)
+                        .map(|v| v.to_number().unwrap_or(ta.length as f64) as i64)
+                        .unwrap_or(ta.length as i64);
+                    let sub = typed_array_subarray(&ta, begin, end);
+                    let sub_inner = Rc::new(RefCell::new(sub));
+                    Ok(make_typed_array_instance(ta.kind, sub_inner))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "toLocaleString".into(),
+                native(move |_| {
+                    Ok(JsValue::String(
+                        typed_array_join(&inner.borrow(), ",")?.into(),
+                    ))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "toString".into(),
+                native(move |_| {
+                    Ok(JsValue::String(
+                        typed_array_join(&inner.borrow(), ",")?.into(),
+                    ))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "values".into(),
+                native(move |_| {
+                    let items = typed_array_values(&inner.borrow());
+                    Ok(JsValue::Iterator(NativeIterator::from_items(items)))
+                }),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "@@iterator".into(),
+                native(move |_| {
+                    let items = typed_array_values(&inner.borrow());
+                    Ok(JsValue::Iterator(NativeIterator::from_items(items)))
+                }),
+            );
+        }
+        obj.insert("__typed_array__".into(), typed_array_val);
+        obj.make_all_non_enumerable();
     }
-    // sort(comparefn?)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "sort".into(),
-            native(move |_| {
-                typed_array_sort(&inner.borrow());
-                Ok(JsValue::Undefined)
-            }),
-        );
-    }
-    // subarray(begin?, end?)
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "subarray".into(),
-            native(move |a| {
-                let ta = inner.borrow();
-                let begin = a
-                    .first()
-                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                    .unwrap_or(0);
-                let end = a
-                    .get(1)
-                    .map(|v| v.to_number().unwrap_or(ta.length as f64) as i64)
-                    .unwrap_or(ta.length as i64);
-                let sub = typed_array_subarray(&ta, begin, end);
-                let sub_inner = Rc::new(RefCell::new(sub));
-                Ok(make_typed_array_instance(ta.kind, sub_inner))
-            }),
-        );
-    }
-    // toLocaleString()
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "toLocaleString".into(),
-            native(move |_| {
-                Ok(JsValue::String(
-                    typed_array_join(&inner.borrow(), ",")?.into(),
-                ))
-            }),
-        );
-    }
-    // toString()
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "toString".into(),
-            native(move |_| {
-                Ok(JsValue::String(
-                    typed_array_join(&inner.borrow(), ",")?.into(),
-                ))
-            }),
-        );
-    }
-    // values()
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "values".into(),
-            native(move |_| {
-                let items = typed_array_values(&inner.borrow());
-                Ok(JsValue::Iterator(NativeIterator::from_items(items)))
-            }),
-        );
-    }
-    // @@iterator — same as values()
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
-            "@@iterator".into(),
-            native(move |_| {
-                let items = typed_array_values(&inner.borrow());
-                Ok(JsValue::Iterator(NativeIterator::from_items(items)))
-            }),
-        );
-    }
-    // Store the TypedArray value for identity purposes.
-    obj.insert("__typed_array__".into(), typed_array_val);
 
-    obj.make_all_non_enumerable();
-    JsValue::PlainObject(Rc::new(RefCell::new(obj)))
+    instance_value
 }
 
 // ── install_globals ──────────────────────────────────────────────────────────
@@ -30216,6 +30336,245 @@ mod tests {
     fn test_typed_array_species_returns_constructor() {
         let result = global_eval("Int32Array[Symbol.species] === Int32Array").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    macro_rules! typed_array_constructor_exists_test {
+        ($name:ident, $ctor:literal) => {
+            #[test]
+            fn $name() {
+                assert_eval_true(concat!(
+                    "typeof ",
+                    $ctor,
+                    " !== 'undefined' && ",
+                    $ctor,
+                    ".name === '",
+                    $ctor,
+                    "'"
+                ));
+            }
+        };
+    }
+
+    typed_array_constructor_exists_test!(test_typed_array_ctor_uint8_exists, "Uint8Array");
+    typed_array_constructor_exists_test!(test_typed_array_ctor_int8_exists, "Int8Array");
+    typed_array_constructor_exists_test!(test_typed_array_ctor_uint16_exists, "Uint16Array");
+    typed_array_constructor_exists_test!(test_typed_array_ctor_int16_exists, "Int16Array");
+    typed_array_constructor_exists_test!(test_typed_array_ctor_uint32_exists, "Uint32Array");
+    typed_array_constructor_exists_test!(test_typed_array_ctor_int32_exists, "Int32Array");
+    typed_array_constructor_exists_test!(test_typed_array_ctor_float32_exists, "Float32Array");
+    typed_array_constructor_exists_test!(test_typed_array_ctor_float64_exists, "Float64Array");
+    typed_array_constructor_exists_test!(
+        test_typed_array_ctor_uint8_clamped_exists,
+        "Uint8ClampedArray"
+    );
+    typed_array_constructor_exists_test!(test_typed_array_ctor_bigint64_exists, "BigInt64Array");
+    typed_array_constructor_exists_test!(test_typed_array_ctor_biguint64_exists, "BigUint64Array");
+
+    #[test]
+    fn e2e_typed_array_constructor_from_length() {
+        assert_eval_true("new Uint8Array(4).length === 4");
+    }
+
+    #[test]
+    fn e2e_typed_array_constructor_from_array() {
+        assert_eval_true("new Uint8Array([1,2,3]).join(',') === '1,2,3'");
+    }
+
+    #[test]
+    fn e2e_typed_array_constructor_from_array_like() {
+        assert_eval_true("new Uint8Array({0: 4, 1: 5, length: 2}).join(',') === '4,5'");
+    }
+
+    #[test]
+    fn e2e_typed_array_length_property() {
+        assert_eval_true("new Uint8Array([1,2,3]).length === 3");
+    }
+
+    #[test]
+    fn e2e_typed_array_byte_length_property() {
+        assert_eval_true("new Uint16Array(3).byteLength === 6");
+    }
+
+    #[test]
+    fn e2e_typed_array_byte_offset_property() {
+        assert_eval_true("new Uint16Array([1,2,3]).subarray(1).byteOffset === 2");
+    }
+
+    #[test]
+    fn e2e_typed_array_buffer_property() {
+        assert_eval_true("new Uint8Array(4).buffer.byteLength === 4");
+    }
+
+    #[test]
+    fn e2e_typed_array_set_from_array() {
+        assert_eval_true("var a = new Uint8Array(4); a.set([7,8], 1); a.join(',') === '0,7,8,0'");
+    }
+
+    #[test]
+    fn e2e_typed_array_set_from_typed_array() {
+        assert_eval_true(
+            "var src = new Uint8Array([7,8]); var dst = new Uint8Array(4); dst.set(src, 1); dst.join(',') === '0,7,8,0'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_subarray_shares_buffer() {
+        assert_eval_true(
+            "var a = new Uint8Array([1,2,3]); var sub = a.subarray(1); sub.set([9], 0); a.join(',') === '1,9,3'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_slice_copies_values() {
+        assert_eval_true(
+            "var a = new Uint8Array([1,2,3]); var s = a.slice(1); a.set([9], 1); s.join(',') === '2,3'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_copy_within_mutates() {
+        assert_eval_true(
+            "var a = new Uint8Array([1,2,3,4]); a.copyWithin(1, 0, 2) === a && a.join(',') === '1,1,2,4'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_map_uses_js_callback() {
+        assert_eval_true(
+            "var seen = 0; var result = new Uint8Array([1,2,3]).map(function(v, i, self) { seen = self.length; return v + i; }); seen === 3 && result.join(',') === '1,3,5'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_map_honors_this_arg() {
+        assert_eval_true(
+            "var ctx = { delta: 5 }; var result = new Uint8Array([1,2]).map(function(v) { return v + this.delta; }, ctx); result.join(',') === '6,7'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_filter_uses_js_callback() {
+        assert_eval_true(
+            "new Uint8Array([1,2,3,4]).filter(function(v) { return v % 2 === 0; }).join(',') === '2,4'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_filter_honors_this_arg() {
+        assert_eval_true(
+            "var ctx = { limit: 3 }; new Uint8Array([1,2,3,4]).filter(function(v) { return v > this.limit; }, ctx).join(',') === '4'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_find_uses_js_callback() {
+        assert_eval_true("new Uint8Array([1,2,3]).find(function(v) { return v > 1; }) === 2");
+    }
+
+    #[test]
+    fn e2e_typed_array_find_index_uses_js_callback() {
+        assert_eval_true("new Uint8Array([1,2,3]).findIndex(function(v) { return v > 1; }) === 1");
+    }
+
+    #[test]
+    fn e2e_typed_array_every_uses_js_callback() {
+        assert_eval_true("new Uint8Array([2,4,6]).every(function(v) { return v % 2 === 0; })");
+    }
+
+    #[test]
+    fn e2e_typed_array_some_uses_js_callback() {
+        assert_eval_true("new Uint8Array([1,2,3]).some(function(v) { return v > 2; })");
+    }
+
+    #[test]
+    fn e2e_typed_array_for_each_uses_js_callback() {
+        assert_eval_true(
+            "var sum = 0; new Uint8Array([1,2,3]).forEach(function(v, i, self) { sum += v + i + self.length; }); sum === 15",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_for_each_honors_this_arg() {
+        assert_eval_true(
+            "var total = 0; new Uint8Array([1,2,3]).forEach(function(v) { total += v * this.mult; }, { mult: 2 }); total === 12",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_reduce_uses_js_callback() {
+        assert_eval_true(
+            "new Uint8Array([1,2,3]).reduce(function(acc, v) { return acc + v; }, 0) === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_reduce_passes_receiver() {
+        assert_eval_true(
+            "new Uint8Array([1,2,3]).reduce(function(acc, v, i, self) { return acc + self.length + i + v; }, 0) === 15",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_reduce_right_uses_js_callback() {
+        assert_eval_true(
+            "new Uint8Array([1,2,3]).reduceRight(function(acc, v) { return acc * 10 + v; }, 0) === 321",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_static_from_array() {
+        assert_eval_true("Uint8Array.from([4,5,6]).join(',') === '4,5,6'");
+    }
+
+    #[test]
+    fn e2e_typed_array_static_from_array_like() {
+        assert_eval_true("Uint8Array.from({0: 4, 1: 5, length: 2}).join(',') === '4,5'");
+    }
+
+    #[test]
+    fn e2e_typed_array_static_from_typed_array() {
+        assert_eval_true("Uint8Array.from(new Uint8Array([4,5])).join(',') === '4,5'");
+    }
+
+    #[test]
+    fn e2e_typed_array_static_of() {
+        assert_eval_true("Uint8Array.of(7,8,9).join(',') === '7,8,9'");
+    }
+
+    #[test]
+    fn e2e_typed_array_to_string_tag_property() {
+        assert_eval_true("new Uint8Array(1)[Symbol.toStringTag] === 'Uint8Array'");
+    }
+
+    #[test]
+    fn e2e_typed_array_prototype_to_string_tag_property() {
+        assert_eval_true("Uint8Array.prototype[Symbol.toStringTag] === 'Uint8Array'");
+    }
+
+    #[test]
+    fn e2e_typed_array_object_to_string_uses_tag() {
+        assert_eval_true(
+            "Object.prototype.toString.call(new Float64Array(1)) === '[object Float64Array]'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_fill_returns_receiver() {
+        assert_eval_true("var a = new Uint8Array(2); a.fill(3) === a && a.join(',') === '3,3'");
+    }
+
+    #[test]
+    fn e2e_typed_array_reverse_returns_receiver() {
+        assert_eval_true(
+            "var a = new Uint8Array([1,2,3]); a.reverse() === a && a.join(',') === '3,2,1'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_sort_returns_receiver() {
+        assert_eval_true(
+            "var a = new Uint8Array([3,1,2]); a.sort() === a && a.join(',') === '1,2,3'",
+        );
     }
 
     /// `typeof Array[Symbol.species]` is `"function"` (it's the constructor).
