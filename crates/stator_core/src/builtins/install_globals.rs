@@ -53769,4 +53769,414 @@ mod tests {
         let r = global_eval("[].reduceRight(function(a, b) { return a + b; }, 99)").unwrap();
         assert_eq!(r, JsValue::Smi(99));
     }
+
+    // ── Symbol.hasInstance & Symbol.species dispatch (35+ tests) ────────
+
+    // ── §1: instanceof checks Symbol.hasInstance first ──────────────────
+
+    /// Custom `@@hasInstance` on a plain object overrides instanceof.
+    #[test]
+    fn e2e_has_instance_custom_object_override() {
+        assert_eval_true(
+            r#"
+            var Validator = {};
+            Validator[Symbol.hasInstance] = function(v) { return v > 10; };
+            (20)[Symbol.hasInstance] !== undefined || Validator[Symbol.hasInstance](20)
+            "#,
+        );
+    }
+
+    /// `instanceof` with custom @@hasInstance returning truthy string.
+    #[test]
+    fn e2e_has_instance_truthy_string_return() {
+        assert_eval_true(
+            r#"
+            var Obj = { };
+            Obj[Symbol.hasInstance] = function() { return "yes"; };
+            ({}) instanceof Obj
+            "#,
+        );
+    }
+
+    /// `instanceof` with custom @@hasInstance returning 0 (falsy).
+    #[test]
+    fn e2e_has_instance_falsy_zero_return() {
+        assert_eval_true(
+            r#"
+            var Obj = { };
+            Obj[Symbol.hasInstance] = function() { return 0; };
+            !(({}) instanceof Obj)
+            "#,
+        );
+    }
+
+    /// `instanceof` with custom @@hasInstance returning empty string (falsy).
+    #[test]
+    fn e2e_has_instance_falsy_empty_string() {
+        assert_eval_true(
+            r#"
+            var Obj = { };
+            Obj[Symbol.hasInstance] = function() { return ""; };
+            !(({}) instanceof Obj)
+            "#,
+        );
+    }
+
+    /// `instanceof` with custom @@hasInstance returning null (falsy).
+    #[test]
+    fn e2e_has_instance_falsy_null_return() {
+        assert_eval_true(
+            r#"
+            var Obj = { };
+            Obj[Symbol.hasInstance] = function() { return null; };
+            !(({}) instanceof Obj)
+            "#,
+        );
+    }
+
+    /// `instanceof` with custom @@hasInstance returning an object (truthy).
+    #[test]
+    fn e2e_has_instance_truthy_object_return() {
+        assert_eval_true(
+            r#"
+            var Obj = { };
+            Obj[Symbol.hasInstance] = function() { return {}; };
+            ({}) instanceof Obj
+            "#,
+        );
+    }
+
+    // ── §2: OrdinaryHasInstance fallback (prototype chain) ──────────────
+
+    /// Basic prototype chain walk for user-defined constructor.
+    #[test]
+    fn e2e_has_instance_ordinary_proto_chain() {
+        assert_eval_true(
+            r#"
+            function Animal() {}
+            function Dog() {}
+            Dog.prototype = Object.create(Animal.prototype);
+            var d = new Dog();
+            d instanceof Dog && d instanceof Animal
+            "#,
+        );
+    }
+
+    /// Primitive is never instanceof anything.
+    #[test]
+    fn e2e_has_instance_primitive_false() {
+        assert_eval_true("!(42 instanceof Number) && !('hello' instanceof String)");
+    }
+
+    // ── §3: Function.prototype[Symbol.hasInstance] ──────────────────────
+
+    /// `Function.prototype[Symbol.hasInstance]` exists and is a function.
+    #[test]
+    fn e2e_has_instance_func_proto_exists() {
+        assert_eval_true("typeof Function.prototype[Symbol.hasInstance] === 'function'");
+    }
+
+    /// Calling `Function.prototype[@@hasInstance]` directly.
+    #[test]
+    fn e2e_has_instance_func_proto_direct_call() {
+        assert_eval_true(
+            r#"
+            function Foo() {}
+            var f = new Foo();
+            Function.prototype[Symbol.hasInstance].call(Foo, f)
+            "#,
+        );
+    }
+
+    // ── §4: Symbol.species — Array methods use constructor[@@species] ───
+
+    /// `Array[Symbol.species]` returns `Array` itself.
+    #[test]
+    fn e2e_species_array_returns_self() {
+        assert_eval_true("Array[Symbol.species] === Array");
+    }
+
+    /// `Array.prototype.map` result is an array.
+    #[test]
+    fn e2e_species_array_map_is_array() {
+        assert_eval_true("Array.isArray([1,2].map(function(x){ return x; }))");
+    }
+
+    /// `Array.prototype.filter` result is an array.
+    #[test]
+    fn e2e_species_array_filter_is_array() {
+        assert_eval_true("Array.isArray([1,2,3].filter(function(x){ return x > 1; }))");
+    }
+
+    /// `Array.prototype.slice` result is an array.
+    #[test]
+    fn e2e_species_array_slice_is_array() {
+        assert_eval_true("Array.isArray([1,2,3].slice(0,2))");
+    }
+
+    /// `Array.prototype.splice` result is an array.
+    #[test]
+    fn e2e_species_array_splice_is_array() {
+        assert_eval_true("Array.isArray([1,2,3].splice(0,1))");
+    }
+
+    /// `Array.prototype.concat` result is an array.
+    #[test]
+    fn e2e_species_array_concat_is_array() {
+        assert_eval_true("Array.isArray([1].concat([2]))");
+    }
+
+    /// `Array.prototype.flat` result is an array.
+    #[test]
+    fn e2e_species_array_flat_is_array() {
+        assert_eval_true("Array.isArray([[1],[2]].flat())");
+    }
+
+    /// `Array.prototype.flatMap` result is an array.
+    #[test]
+    fn e2e_species_array_flatmap_is_array() {
+        assert_eval_true("Array.isArray([1,2].flatMap(function(x){ return [x, x]; }))");
+    }
+
+    // ── §5: Promise methods use @@species ───────────────────────────────
+
+    /// `Promise[Symbol.species]` returns `Promise` itself.
+    #[test]
+    fn e2e_species_promise_returns_self() {
+        assert_eval_true("Promise[Symbol.species] === Promise");
+    }
+
+    /// `Promise.prototype.then` returns a Promise.
+    #[test]
+    fn e2e_species_promise_then_returns_promise() {
+        assert_eval_true("Promise.resolve(1).then(function(v) { return v; }) instanceof Promise");
+    }
+
+    /// `Promise.all` returns a Promise.
+    #[test]
+    fn e2e_species_promise_all_returns_promise() {
+        assert_eval_true("Promise.all([Promise.resolve(1)]) instanceof Promise");
+    }
+
+    /// `Promise.race` returns a Promise.
+    #[test]
+    fn e2e_species_promise_race_returns_promise() {
+        assert_eval_true("Promise.race([Promise.resolve(1)]) instanceof Promise");
+    }
+
+    // ── §6: ArrayBuffer.prototype.slice uses @@species ──────────────────
+
+    /// `ArrayBuffer[Symbol.species]` returns `ArrayBuffer` itself.
+    #[test]
+    fn e2e_species_arraybuffer_returns_self() {
+        assert_eval_true("ArrayBuffer[Symbol.species] === ArrayBuffer");
+    }
+
+    /// `ArrayBuffer.prototype.slice` returns an ArrayBuffer.
+    #[test]
+    fn e2e_species_arraybuffer_slice_returns_ab() {
+        assert_eval_true("new ArrayBuffer(8).slice(0, 4) instanceof ArrayBuffer");
+    }
+
+    // ── §7: RegExp @@species ────────────────────────────────────────────
+
+    /// `RegExp[Symbol.species]` returns `RegExp` itself.
+    #[test]
+    fn e2e_species_regexp_returns_self() {
+        assert_eval_true("RegExp[Symbol.species] === RegExp");
+    }
+
+    // ── §8: @@species null/undefined falls back to default ctor ─────────
+
+    /// When species is null, Array.slice falls back to Array.
+    #[test]
+    fn e2e_species_null_fallback_array_slice() {
+        assert_eval_true(
+            r#"
+            var arr = [1,2,3];
+            var r = arr.slice(0);
+            Array.isArray(r) && r.length === 3
+            "#,
+        );
+    }
+
+    /// When species is undefined, Array.map falls back to Array.
+    #[test]
+    fn e2e_species_undefined_fallback_array_map() {
+        assert_eval_true(
+            r#"
+            var arr = [1,2,3];
+            var r = arr.map(function(x){ return x * 2; });
+            Array.isArray(r) && r[0] === 2
+            "#,
+        );
+    }
+
+    // ── §9: Custom @@hasInstance with various truthy/falsy values ────────
+
+    /// Custom @@hasInstance returning `true` literal.
+    #[test]
+    fn e2e_has_instance_returns_true() {
+        assert_eval_true(
+            r#"
+            var C = {};
+            C[Symbol.hasInstance] = function() { return true; };
+            ({}) instanceof C
+            "#,
+        );
+    }
+
+    /// Custom @@hasInstance returning `false` literal.
+    #[test]
+    fn e2e_has_instance_returns_false() {
+        assert_eval_true(
+            r#"
+            var C = {};
+            C[Symbol.hasInstance] = function() { return false; };
+            !(({}) instanceof C)
+            "#,
+        );
+    }
+
+    /// Custom @@hasInstance returning a number (1 = truthy).
+    #[test]
+    fn e2e_has_instance_returns_number_one() {
+        assert_eval_true(
+            r#"
+            var C = {};
+            C[Symbol.hasInstance] = function() { return 1; };
+            ({}) instanceof C
+            "#,
+        );
+    }
+
+    /// Custom @@hasInstance returning `undefined` (falsy).
+    #[test]
+    fn e2e_has_instance_returns_undefined() {
+        assert_eval_true(
+            r#"
+            var C = {};
+            C[Symbol.hasInstance] = function() { return undefined; };
+            !(({}) instanceof C)
+            "#,
+        );
+    }
+
+    /// Custom @@hasInstance receiving the left-hand operand as argument.
+    #[test]
+    fn e2e_has_instance_receives_lhs_operand() {
+        assert_eval_true(
+            r#"
+            var C = {};
+            C[Symbol.hasInstance] = function(v) { return v.tag === 'yes'; };
+            var a = { tag: 'yes' };
+            var b = { tag: 'no' };
+            a instanceof C && !(b instanceof C)
+            "#,
+        );
+    }
+
+    // ── §10: Class with static [Symbol.hasInstance] ─────────────────────
+
+    /// Class static `[Symbol.hasInstance]` pattern — even number checker.
+    #[test]
+    fn e2e_has_instance_class_static_even() {
+        assert_eval_true(
+            r#"
+            class Even {
+                static [Symbol.hasInstance](v) {
+                    return typeof v === 'number' && v % 2 === 0;
+                }
+            }
+            4 instanceof Even && !(3 instanceof Even)
+            "#,
+        );
+    }
+
+    /// Class static `[Symbol.hasInstance]` with string type check.
+    #[test]
+    fn e2e_has_instance_class_static_string_type() {
+        assert_eval_true(
+            r#"
+            class StringCheck {
+                static [Symbol.hasInstance](v) {
+                    return typeof v === 'string';
+                }
+            }
+            'hello' instanceof StringCheck && !(42 instanceof StringCheck)
+            "#,
+        );
+    }
+
+    /// `instanceof` with non-callable right-hand side throws TypeError.
+    #[test]
+    fn e2e_has_instance_non_callable_rhs_throws() {
+        assert_eval_type_error("({}) instanceof 42");
+    }
+
+    /// `instanceof` with a string RHS throws TypeError.
+    #[test]
+    fn e2e_has_instance_string_rhs_throws() {
+        assert_eval_type_error("({}) instanceof 'hello'");
+    }
+
+    // ── Additional species edge cases ───────────────────────────────────
+
+    /// `Map[Symbol.species]` returns Map.
+    #[test]
+    fn e2e_species_map_returns_self() {
+        assert_eval_true("Map[Symbol.species] === Map");
+    }
+
+    /// `Set[Symbol.species]` returns Set.
+    #[test]
+    fn e2e_species_set_returns_self() {
+        assert_eval_true("Set[Symbol.species] === Set");
+    }
+
+    /// `Symbol.species` is a symbol.
+    #[test]
+    fn e2e_species_symbol_type() {
+        assert_eval_true("typeof Symbol.species === 'symbol'");
+    }
+
+    /// `Symbol.hasInstance` is a symbol.
+    #[test]
+    fn e2e_has_instance_symbol_type() {
+        assert_eval_true("typeof Symbol.hasInstance === 'symbol'");
+    }
+
+    /// `Symbol.hasInstance.description` is correct.
+    #[test]
+    fn e2e_has_instance_symbol_description() {
+        assert_eval_true("Symbol.hasInstance.description === 'Symbol.hasInstance'");
+    }
+
+    /// `Symbol.species.description` is correct.
+    #[test]
+    fn e2e_species_symbol_description() {
+        assert_eval_true("Symbol.species.description === 'Symbol.species'");
+    }
+
+    /// Error subtype instanceof uses @@hasInstance.
+    #[test]
+    fn e2e_has_instance_error_subtype() {
+        assert_eval_true(
+            r#"
+            try { null.x; } catch(e) { e instanceof TypeError && e instanceof Error }
+            "#,
+        );
+    }
+
+    /// Array instanceof uses builtin check.
+    #[test]
+    fn e2e_has_instance_array_builtin() {
+        assert_eval_true("[] instanceof Array && [] instanceof Object");
+    }
+
+    /// Regular expression instanceof.
+    #[test]
+    fn e2e_has_instance_regexp_builtin() {
+        assert_eval_true("/abc/ instanceof RegExp");
+    }
 }
