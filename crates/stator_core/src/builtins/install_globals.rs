@@ -116,17 +116,18 @@ use crate::builtins::symbol::{
     symbol_key_for,
 };
 use crate::builtins::typed_array::{
-    JsArrayBuffer, TypedArrayKind, arraybuffer_new, arraybuffer_slice, dataview_get_bigint64,
-    dataview_get_biguint64, dataview_get_float32, dataview_get_float64, dataview_get_int8,
-    dataview_get_int16, dataview_get_int32, dataview_get_uint8, dataview_get_uint16,
-    dataview_get_uint32, dataview_new, dataview_set_bigint64, dataview_set_biguint64,
-    dataview_set_float32, dataview_set_float64, dataview_set_int8, dataview_set_int16,
-    dataview_set_int32, dataview_set_uint8, dataview_set_uint16, dataview_set_uint32,
-    typed_array_at, typed_array_copy_within, typed_array_entries, typed_array_fill,
-    typed_array_from_values, typed_array_get, typed_array_includes, typed_array_index_of,
-    typed_array_join, typed_array_keys, typed_array_last_index_of, typed_array_new_from_buffer,
-    typed_array_new_from_length, typed_array_reverse, typed_array_set_from, typed_array_slice,
-    typed_array_sort, typed_array_subarray, typed_array_values,
+    JsArrayBuffer, TypedArrayKind, arraybuffer_byte_length, arraybuffer_new, arraybuffer_slice,
+    dataview_byte_length, dataview_byte_offset, dataview_get_bigint64, dataview_get_biguint64,
+    dataview_get_float32, dataview_get_float64, dataview_get_int8, dataview_get_int16,
+    dataview_get_int32, dataview_get_uint8, dataview_get_uint16, dataview_get_uint32, dataview_new,
+    dataview_set_bigint64, dataview_set_biguint64, dataview_set_float32, dataview_set_float64,
+    dataview_set_int8, dataview_set_int16, dataview_set_int32, dataview_set_uint8,
+    dataview_set_uint16, dataview_set_uint32, typed_array_at, typed_array_copy_within,
+    typed_array_entries, typed_array_fill, typed_array_from_values, typed_array_get,
+    typed_array_includes, typed_array_index_of, typed_array_join, typed_array_keys,
+    typed_array_last_index_of, typed_array_new_from_buffer, typed_array_new_from_length,
+    typed_array_reverse, typed_array_set_from, typed_array_slice, typed_array_sort,
+    typed_array_subarray, typed_array_values,
 };
 use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new, weak_ref_new_plain};
 use crate::error::{StatorError, StatorResult};
@@ -12504,6 +12505,22 @@ fn extract_typed_array(
     }
 }
 
+/// Extract the `Rc<RefCell<JsDataView>>` from a raw `JsValue::DataView`
+/// *or* from a PlainObject wrapper produced by `make_dataview_instance`.
+fn extract_dataview(v: &JsValue) -> Option<Rc<RefCell<crate::builtins::typed_array::JsDataView>>> {
+    match v {
+        JsValue::DataView(inner) => Some(Rc::clone(inner)),
+        JsValue::PlainObject(map) => {
+            if let Some(JsValue::DataView(inner)) = map.borrow().get("__dataview__") {
+                Some(Rc::clone(inner))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Collect source values for typed-array constructors and static methods.
 fn collect_typed_array_source_values(source: &JsValue) -> StatorResult<Vec<JsValue>> {
     if let Some(inner) = extract_typed_array(source) {
@@ -12522,8 +12539,55 @@ fn collect_typed_array_source_values(source: &JsValue) -> StatorResult<Vec<JsVal
     }
 }
 
-/// Wrap a raw `JsArrayBuffer` in a `PlainObject` with `byteLength` and
-/// `slice()` so that property access works from JavaScript.
+fn incompatible_receiver(display_name: &str) -> StatorError {
+    StatorError::TypeError(format!("{display_name} called on incompatible receiver"))
+}
+
+fn make_arraybuffer_prototype() -> JsValue {
+    let mut proto = PropertyMap::new();
+    proto.insert(
+        "__get_byteLength__".into(),
+        native(|args| {
+            let receiver = args.first().unwrap_or(&JsValue::Undefined);
+            let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                return Err(incompatible_receiver("ArrayBuffer.prototype.byteLength"));
+            };
+            Ok(JsValue::Smi(
+                arraybuffer_byte_length(&buf_rc.borrow()) as i32
+            ))
+        }),
+    );
+    proto.insert(
+        "slice".into(),
+        builtin_fn("slice", 2, |args| {
+            let receiver = args.first().unwrap_or(&JsValue::Undefined);
+            let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                return Err(incompatible_receiver("ArrayBuffer.prototype.slice"));
+            };
+            let buffer = buf_rc.borrow();
+            let len = buffer.data.len() as i64;
+            let begin = args
+                .get(1)
+                .map(|v| v.to_number().unwrap_or(0.0) as i64)
+                .unwrap_or(0);
+            let end = args
+                .get(2)
+                .map(|v| v.to_number().unwrap_or(len as f64) as i64)
+                .unwrap_or(len);
+            let sliced = arraybuffer_slice(&buffer, begin, end);
+            Ok(make_arraybuffer_instance(Rc::new(RefCell::new(sliced))))
+        }),
+    );
+    proto.insert(
+        "@@toStringTag".into(),
+        JsValue::String("ArrayBuffer".into()),
+    );
+    proto.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(proto)))
+}
+
+/// Wrap a raw `JsArrayBuffer` in a `PlainObject` so that property access works
+/// from JavaScript.
 fn make_arraybuffer_instance(buf_rc: Rc<RefCell<JsArrayBuffer>>) -> JsValue {
     let mut obj = PropertyMap::new();
 
@@ -12532,33 +12596,30 @@ fn make_arraybuffer_instance(buf_rc: Rc<RefCell<JsArrayBuffer>>) -> JsValue {
         "__arraybuffer__".into(),
         JsValue::ArrayBuffer(Rc::clone(&buf_rc)),
     );
+    obj.insert(
+        "__proto__".into(),
+        constructor_prototype("ArrayBuffer").unwrap_or(JsValue::Null),
+    );
+    obj.insert(
+        "@@toStringTag".into(),
+        JsValue::String("ArrayBuffer".into()),
+    );
+    obj.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(obj)))
+}
 
-    // byteLength
-    let byte_length = buf_rc.borrow().data.len();
-    obj.insert("byteLength".into(), JsValue::Smi(byte_length as i32));
-
-    // slice(begin, end)
-    {
-        let buf = Rc::clone(&buf_rc);
-        obj.insert(
-            "slice".into(),
-            native(move |a| {
-                let b = buf.borrow();
-                let len = b.data.len() as i64;
-                let begin = a
-                    .first()
-                    .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                    .unwrap_or(0);
-                let end = a
-                    .get(1)
-                    .map(|v| v.to_number().unwrap_or(len as f64) as i64)
-                    .unwrap_or(len);
-                let sliced = arraybuffer_slice(&b, begin, end);
-                Ok(make_arraybuffer_instance(Rc::new(RefCell::new(sliced))))
-            }),
-        );
-    }
-
+fn make_dataview_instance(
+    inner: Rc<RefCell<crate::builtins::typed_array::JsDataView>>,
+    buffer_object: JsValue,
+) -> JsValue {
+    let mut obj = PropertyMap::new();
+    obj.insert("__dataview__".into(), JsValue::DataView(Rc::clone(&inner)));
+    obj.insert("__buffer_object__".into(), buffer_object);
+    obj.insert(
+        "__proto__".into(),
+        constructor_prototype("DataView").unwrap_or(JsValue::Null),
+    );
+    obj.insert("@@toStringTag".into(), JsValue::String("DataView".into()));
     obj.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(obj)))
 }
@@ -12581,13 +12642,14 @@ fn arraybuffer_is_view_rt(value: &JsValue) -> bool {
 #[inline(never)]
 fn make_arraybuffer() -> JsValue {
     let mut props = PropertyMap::new();
+    props.insert("prototype".into(), make_arraybuffer_prototype());
 
     // ArrayBuffer(byteLength)
     props.insert(
         "__call__".into(),
         native(|args| {
             let len = match args.first() {
-                Some(v) => crate::builtins::util::checked_f64_to_length(v.to_number()?)?,
+                Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
                 None => 0,
             };
             let buf = arraybuffer_new(len);
@@ -12617,12 +12679,186 @@ fn make_arraybuffer() -> JsValue {
 /// Build the `DataView` constructor object.
 #[inline(never)]
 fn make_dataview() -> JsValue {
+    let mut prototype = PropertyMap::new();
+    prototype.insert(
+        "__get_buffer__".into(),
+        native(|args| {
+            let receiver = args.first().unwrap_or(&JsValue::Undefined);
+            let Some(inner) = extract_dataview(receiver) else {
+                return Err(incompatible_receiver("DataView.prototype.buffer"));
+            };
+            if let JsValue::PlainObject(map) = receiver
+                && let Some(buffer_object) = map.borrow().get("__buffer_object__").cloned()
+            {
+                return Ok(buffer_object);
+            }
+            Ok(make_arraybuffer_instance(Rc::clone(&inner.borrow().buffer)))
+        }),
+    );
+    prototype.insert(
+        "__get_byteLength__".into(),
+        native(|args| {
+            let receiver = args.first().unwrap_or(&JsValue::Undefined);
+            let Some(inner) = extract_dataview(receiver) else {
+                return Err(incompatible_receiver("DataView.prototype.byteLength"));
+            };
+            Ok(JsValue::Smi(dataview_byte_length(&inner.borrow()) as i32))
+        }),
+    );
+    prototype.insert(
+        "__get_byteOffset__".into(),
+        native(|args| {
+            let receiver = args.first().unwrap_or(&JsValue::Undefined);
+            let Some(inner) = extract_dataview(receiver) else {
+                return Err(incompatible_receiver("DataView.prototype.byteOffset"));
+            };
+            Ok(JsValue::Smi(dataview_byte_offset(&inner.borrow()) as i32))
+        }),
+    );
+
+    macro_rules! dataview_proto_getter {
+        ($name:expr, $length:expr, $fn_get:expr) => {
+            prototype.insert(
+                $name.into(),
+                builtin_fn($name, $length, move |args| {
+                    let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                    let Some(inner) = extract_dataview(receiver) else {
+                        return Err(incompatible_receiver(concat!("DataView.prototype.", $name)));
+                    };
+                    let offset = match args.get(1) {
+                        Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
+                        None => 0,
+                    };
+                    let little_endian = args.get(2).is_some_and(JsValue::to_boolean);
+                    let value = $fn_get(&inner.borrow(), offset, little_endian)?;
+                    Ok(num_value(value))
+                }),
+            );
+        };
+    }
+
+    macro_rules! dataview_proto_setter {
+        ($name:expr, $length:expr, $fn_set:expr, $conv:expr) => {
+            prototype.insert(
+                $name.into(),
+                builtin_fn($name, $length, move |args| {
+                    let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                    let Some(inner) = extract_dataview(receiver) else {
+                        return Err(incompatible_receiver(concat!("DataView.prototype.", $name)));
+                    };
+                    let offset = match args.get(1) {
+                        Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
+                        None => 0,
+                    };
+                    let value = $conv(args.get(2).unwrap_or(&JsValue::Undefined))?;
+                    let little_endian = args.get(3).is_some_and(JsValue::to_boolean);
+                    $fn_set(&inner.borrow(), offset, value, little_endian)?;
+                    Ok(JsValue::Undefined)
+                }),
+            );
+        };
+    }
+
+    dataview_proto_getter!("getInt8", 1, dataview_get_int8);
+    dataview_proto_getter!("getUint8", 1, dataview_get_uint8);
+    dataview_proto_getter!("getInt16", 1, dataview_get_int16);
+    dataview_proto_getter!("getUint16", 1, dataview_get_uint16);
+    dataview_proto_getter!("getInt32", 1, dataview_get_int32);
+    dataview_proto_getter!("getUint32", 1, dataview_get_uint32);
+    dataview_proto_getter!("getFloat32", 1, dataview_get_float32);
+    dataview_proto_getter!("getFloat64", 1, dataview_get_float64);
+    prototype.insert(
+        "getBigInt64".into(),
+        builtin_fn("getBigInt64", 1, |args| {
+            let receiver = args.first().unwrap_or(&JsValue::Undefined);
+            let Some(inner) = extract_dataview(receiver) else {
+                return Err(incompatible_receiver("DataView.prototype.getBigInt64"));
+            };
+            let offset = match args.get(1) {
+                Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
+                None => 0,
+            };
+            let little_endian = args.get(2).is_some_and(JsValue::to_boolean);
+            let value = dataview_get_bigint64(&inner.borrow(), offset, little_endian)?;
+            Ok(JsValue::BigInt(i128::from(value)))
+        }),
+    );
+    prototype.insert(
+        "getBigUint64".into(),
+        builtin_fn("getBigUint64", 1, |args| {
+            let receiver = args.first().unwrap_or(&JsValue::Undefined);
+            let Some(inner) = extract_dataview(receiver) else {
+                return Err(incompatible_receiver("DataView.prototype.getBigUint64"));
+            };
+            let offset = match args.get(1) {
+                Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
+                None => 0,
+            };
+            let little_endian = args.get(2).is_some_and(JsValue::to_boolean);
+            let value = dataview_get_biguint64(&inner.borrow(), offset, little_endian)?;
+            Ok(JsValue::BigInt(i128::from(value)))
+        }),
+    );
+    dataview_proto_setter!("setInt8", 2, dataview_set_int8, |v: &JsValue| Ok::<
+        i8,
+        StatorError,
+    >(
+        v.to_int32()? as i8
+    ));
+    dataview_proto_setter!("setUint8", 2, dataview_set_uint8, |v: &JsValue| Ok::<
+        u8,
+        StatorError,
+    >(
+        v.to_int32()? as u8
+    ));
+    dataview_proto_setter!("setInt16", 2, dataview_set_int16, |v: &JsValue| Ok::<
+        i16,
+        StatorError,
+    >(
+        v.to_int32()? as i16
+    ));
+    dataview_proto_setter!("setUint16", 2, dataview_set_uint16, |v: &JsValue| Ok::<
+        u16,
+        StatorError,
+    >(
+        v.to_int32()? as u16
+    ));
+    dataview_proto_setter!("setInt32", 2, dataview_set_int32, |v: &JsValue| v
+        .to_int32());
+    dataview_proto_setter!("setUint32", 2, dataview_set_uint32, |v: &JsValue| v
+        .to_uint32());
+    dataview_proto_setter!("setFloat32", 2, dataview_set_float32, |v: &JsValue| {
+        Ok::<f32, StatorError>(v.to_number()? as f32)
+    });
+    dataview_proto_setter!("setFloat64", 2, dataview_set_float64, |v: &JsValue| {
+        v.to_number()
+    });
+    dataview_proto_setter!("setBigInt64", 2, dataview_set_bigint64, |v: &JsValue| {
+        match v {
+            JsValue::BigInt(n) => Ok::<i64, StatorError>(*n as i64),
+            _ => Ok(v.to_number()? as i64),
+        }
+    });
+    dataview_proto_setter!("setBigUint64", 2, dataview_set_biguint64, |v: &JsValue| {
+        match v {
+            JsValue::BigInt(n) => Ok::<u64, StatorError>(*n as u64),
+            _ => Ok(v.to_number()? as u64),
+        }
+    });
+    prototype.insert("@@toStringTag".into(), JsValue::String("DataView".into()));
+    prototype.make_all_non_enumerable();
+
     let mut props = PropertyMap::new();
+    props.insert(
+        "prototype".into(),
+        JsValue::PlainObject(Rc::new(RefCell::new(prototype))),
+    );
 
     props.insert(
         "__call__".into(),
         native(|args| {
-            let buf_rc = match args.first().and_then(extract_arraybuffer) {
+            let buffer_arg = args.first().unwrap_or(&JsValue::Undefined);
+            let buf_rc = match extract_arraybuffer(buffer_arg) {
                 Some(b) => b,
                 None => {
                     return Err(StatorError::TypeError(
@@ -12632,195 +12868,25 @@ fn make_dataview() -> JsValue {
             };
             let offset = match args.get(1) {
                 Some(v) if !v.is_undefined() => {
-                    crate::builtins::util::checked_f64_to_length(v.to_number()?)?
+                    crate::builtins::util::checked_f64_to_index(v.to_number()?)?
                 }
                 _ => 0,
             };
             let length = match args.get(2) {
-                Some(v) if !v.is_undefined() => Some(crate::builtins::util::checked_f64_to_length(
-                    v.to_number()?,
-                )?),
+                Some(v) if !v.is_undefined() => {
+                    Some(crate::builtins::util::checked_f64_to_index(v.to_number()?)?)
+                }
                 _ => None,
             };
             let dv = dataview_new(buf_rc, offset, length)?;
             let inner = Rc::new(RefCell::new(dv));
-            let mut obj = PropertyMap::new();
-
-            // __dataview__: identity marker for arraybuffer_is_view_rt()
-            obj.insert("__dataview__".into(), JsValue::DataView(Rc::clone(&inner)));
-
-            // byteLength
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "byteLength".into(),
-                    JsValue::Smi(inner.borrow().byte_length as i32),
-                );
-            }
-            // byteOffset
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "byteOffset".into(),
-                    JsValue::Smi(inner.borrow().byte_offset as i32),
-                );
-            }
-            // buffer
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "buffer".into(),
-                    make_arraybuffer_instance(Rc::clone(&inner.borrow().buffer)),
-                );
-            }
-
-            // DataView get/set methods helper macro
-            macro_rules! dv_getter {
-                ($name:expr, $fn_get:expr) => {{
-                    let inner = Rc::clone(&inner);
-                    obj.insert(
-                        $name.into(),
-                        native(move |a| {
-                            let off = a
-                                .first()
-                                .map(|v| {
-                                    crate::builtins::util::clamped_f64_to_usize(
-                                        v.to_number().unwrap_or(0.0),
-                                    )
-                                })
-                                .unwrap_or(0);
-                            let le = a.get(1).map(|v| v.to_boolean()).unwrap_or(false);
-                            let dv_ref = inner.borrow();
-                            let val = $fn_get(&dv_ref, off, le)?;
-                            Ok(num_value(val))
-                        }),
-                    );
-                }};
-            }
-
-            macro_rules! dv_setter {
-                ($name:expr, $fn_set:expr, $conv:expr) => {{
-                    let inner = Rc::clone(&inner);
-                    obj.insert(
-                        $name.into(),
-                        native(move |a| {
-                            let off = a
-                                .first()
-                                .map(|v| {
-                                    crate::builtins::util::clamped_f64_to_usize(
-                                        v.to_number().unwrap_or(0.0),
-                                    )
-                                })
-                                .unwrap_or(0);
-                            let raw_val = a.get(1).unwrap_or(&JsValue::Undefined);
-                            let le = a.get(2).map(|v| v.to_boolean()).unwrap_or(false);
-                            let dv_ref = inner.borrow();
-                            $fn_set(&dv_ref, off, $conv(raw_val)?, le)?;
-                            Ok(JsValue::Undefined)
-                        }),
-                    );
-                }};
-            }
-
-            dv_getter!("getInt8", dataview_get_int8);
-            dv_getter!("getUint8", dataview_get_uint8);
-            dv_getter!("getInt16", dataview_get_int16);
-            dv_getter!("getUint16", dataview_get_uint16);
-            dv_getter!("getInt32", dataview_get_int32);
-            dv_getter!("getUint32", dataview_get_uint32);
-            dv_getter!("getFloat32", dataview_get_float32);
-            dv_getter!("getFloat64", dataview_get_float64);
-
-            // BigInt getters return JsValue::BigInt directly.
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "getBigInt64".into(),
-                    native(move |a| {
-                        let off = a
-                            .first()
-                            .map(|v| {
-                                crate::builtins::util::clamped_f64_to_usize(
-                                    v.to_number().unwrap_or(0.0),
-                                )
-                            })
-                            .unwrap_or(0);
-                        let le = a.get(1).map(|v| v.to_boolean()).unwrap_or(false);
-                        let val = dataview_get_bigint64(&inner.borrow(), off, le)?;
-                        Ok(JsValue::BigInt(i128::from(val)))
-                    }),
-                );
-            }
-            {
-                let inner = Rc::clone(&inner);
-                obj.insert(
-                    "getBigUint64".into(),
-                    native(move |a| {
-                        let off = a
-                            .first()
-                            .map(|v| {
-                                crate::builtins::util::clamped_f64_to_usize(
-                                    v.to_number().unwrap_or(0.0),
-                                )
-                            })
-                            .unwrap_or(0);
-                        let le = a.get(1).map(|v| v.to_boolean()).unwrap_or(false);
-                        let val = dataview_get_biguint64(&inner.borrow(), off, le)?;
-                        Ok(JsValue::BigInt(i128::from(val)))
-                    }),
-                );
-            }
-
-            dv_setter!("setInt8", dataview_set_int8, |v: &JsValue| Ok::<
-                i8,
-                StatorError,
-            >(
-                v.to_int32()? as i8
-            ));
-            dv_setter!("setUint8", dataview_set_uint8, |v: &JsValue| Ok::<
-                u8,
-                StatorError,
-            >(
-                v.to_int32()? as u8
-            ));
-            dv_setter!("setInt16", dataview_set_int16, |v: &JsValue| Ok::<
-                i16,
-                StatorError,
-            >(
-                v.to_int32()? as i16
-            ));
-            dv_setter!("setUint16", dataview_set_uint16, |v: &JsValue| Ok::<
-                u16,
-                StatorError,
-            >(
-                v.to_int32()? as u16
-            ));
-            dv_setter!("setInt32", dataview_set_int32, |v: &JsValue| v.to_int32());
-            dv_setter!("setUint32", dataview_set_uint32, |v: &JsValue| v
-                .to_uint32());
-            dv_setter!("setFloat32", dataview_set_float32, |v: &JsValue| Ok::<
-                f32,
-                StatorError,
-            >(
-                v.to_number()? as f32
-            ));
-            dv_setter!("setFloat64", dataview_set_float64, |v: &JsValue| v
-                .to_number());
-            dv_setter!("setBigInt64", dataview_set_bigint64, |v: &JsValue| {
-                match v {
-                    JsValue::BigInt(n) => Ok::<i64, StatorError>(*n as i64),
-                    _ => Ok(v.to_number()? as i64),
+            let buffer_object = match buffer_arg {
+                JsValue::PlainObject(map) if map.borrow().get("__arraybuffer__").is_some() => {
+                    buffer_arg.clone()
                 }
-            });
-            dv_setter!("setBigUint64", dataview_set_biguint64, |v: &JsValue| {
-                match v {
-                    JsValue::BigInt(n) => Ok::<u64, StatorError>(*n as u64),
-                    _ => Ok(v.to_number()? as u64),
-                }
-            });
-
-            obj.make_all_non_enumerable();
-            Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
+                _ => make_arraybuffer_instance(Rc::clone(&inner.borrow().buffer)),
+            };
+            Ok(make_dataview_instance(inner, buffer_object))
         }),
     );
 
@@ -31336,6 +31402,305 @@ mod tests {
     fn test_arraybuffer_species_returns_constructor() {
         let result = global_eval("ArrayBuffer[Symbol.species] === ArrayBuffer").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_arraybuffer_constructor_allocates_length() {
+        assert_eval_true("new ArrayBuffer(6).byteLength === 6");
+    }
+
+    #[test]
+    fn e2e_arraybuffer_constructor_defaults_to_zero() {
+        assert_eval_true("new ArrayBuffer().byteLength === 0");
+    }
+
+    #[test]
+    fn e2e_arraybuffer_constructor_truncates_fractional_lengths() {
+        assert_eval_true("new ArrayBuffer(3.9).byteLength === 3");
+    }
+
+    #[test]
+    fn e2e_arraybuffer_constructor_treats_nan_as_zero() {
+        assert_eval_true("new ArrayBuffer(NaN).byteLength === 0");
+    }
+
+    #[test]
+    fn e2e_arraybuffer_constructor_rejects_negative_lengths() {
+        assert_eval_true(
+            "try { new ArrayBuffer(-1); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_byte_length_is_inherited_accessor() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4); !buf.hasOwnProperty('byteLength') && buf.byteLength === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_byte_length_descriptor_is_getter() {
+        assert_eval_true(
+            "typeof Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get === 'function'",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_slice_is_inherited_method() {
+        assert_eval_true("var buf = new ArrayBuffer(4); buf.slice === ArrayBuffer.prototype.slice");
+    }
+
+    #[test]
+    fn e2e_arraybuffer_slice_copies_requested_range() {
+        assert_eval_true(
+            "var bytes = new Uint8Array([10,20,30,40]); var sliced = bytes.buffer.slice(1, 3); new Uint8Array(sliced).join(',') === '20,30'",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_slice_supports_negative_indices() {
+        assert_eval_true(
+            "var bytes = new Uint8Array([10,20,30,40]); new Uint8Array(bytes.buffer.slice(-2)).join(',') === '30,40'",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_slice_uses_receiver() {
+        assert_eval_true(
+            "var bytes = new Uint8Array([1,2,3,4]); var slice = ArrayBuffer.prototype.slice; new Uint8Array(slice.call(bytes.buffer, 1, 3)).join(',') === '2,3'",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_slice_rejects_incompatible_receiver() {
+        assert_eval_true(
+            "try { ArrayBuffer.prototype.slice.call({}, 0); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_slice_returns_independent_copy() {
+        assert_eval_true(
+            "var bytes = new Uint8Array([1,2,3]); var sliced = bytes.buffer.slice(0); bytes[0] = 9; new Uint8Array(sliced)[0] === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_is_view_accepts_typed_arrays() {
+        assert_eval_true("ArrayBuffer.isView(new Uint8Array(2))");
+    }
+
+    #[test]
+    fn e2e_arraybuffer_is_view_accepts_dataviews() {
+        assert_eval_true("ArrayBuffer.isView(new DataView(new ArrayBuffer(2)))");
+    }
+
+    #[test]
+    fn e2e_arraybuffer_is_view_rejects_arraybuffers() {
+        assert_eval_true("!ArrayBuffer.isView(new ArrayBuffer(2))");
+    }
+
+    #[test]
+    fn e2e_arraybuffer_instances_use_constructor_prototype() {
+        assert_eval_true("Object.getPrototypeOf(new ArrayBuffer(1)) === ArrayBuffer.prototype");
+    }
+
+    #[test]
+    fn e2e_arraybuffer_to_string_tag_property_is_exposed_on_prototype() {
+        assert_eval_true("ArrayBuffer.prototype[Symbol.toStringTag] === 'ArrayBuffer'");
+    }
+
+    #[test]
+    fn e2e_arraybuffer_object_to_string_uses_arraybuffer_tag() {
+        assert_eval_true(
+            "Object.prototype.toString.call(new ArrayBuffer(1)) === '[object ArrayBuffer]'",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_constructor_uses_full_buffer_by_default() {
+        assert_eval_true("new DataView(new ArrayBuffer(8)).byteLength === 8");
+    }
+
+    #[test]
+    fn e2e_dataview_constructor_respects_offset_and_length() {
+        assert_eval_true(
+            "var view = new DataView(new ArrayBuffer(8), 2, 4); view.byteOffset === 2 && view.byteLength === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_constructor_truncates_fractional_offset() {
+        assert_eval_true("new DataView(new ArrayBuffer(8), 1.9).byteOffset === 1");
+    }
+
+    #[test]
+    fn e2e_dataview_constructor_treats_nan_offset_as_zero() {
+        assert_eval_true("new DataView(new ArrayBuffer(8), NaN).byteOffset === 0");
+    }
+
+    #[test]
+    fn e2e_dataview_constructor_rejects_negative_offset() {
+        assert_eval_true(
+            "try { new DataView(new ArrayBuffer(8), -1); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_constructor_rejects_invalid_length() {
+        assert_eval_true(
+            "try { new DataView(new ArrayBuffer(8), 4, 5); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_buffer_getter_preserves_identity() {
+        assert_eval_true("var buf = new ArrayBuffer(8); new DataView(buf).buffer === buf");
+    }
+
+    #[test]
+    fn e2e_dataview_buffer_getter_is_inherited_accessor() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(8); var view = new DataView(buf); !view.hasOwnProperty('buffer') && view.buffer === buf",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_byte_length_descriptor_is_getter() {
+        assert_eval_true(
+            "typeof Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get === 'function'",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_byte_offset_descriptor_is_getter() {
+        assert_eval_true(
+            "typeof Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset').get === 'function'",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_buffer_descriptor_is_getter() {
+        assert_eval_true(
+            "typeof Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer').get === 'function'",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_instances_use_constructor_prototype() {
+        assert_eval_true(
+            "Object.getPrototypeOf(new DataView(new ArrayBuffer(1))) === DataView.prototype",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_to_string_tag_property_is_exposed_on_prototype() {
+        assert_eval_true("DataView.prototype[Symbol.toStringTag] === 'DataView'");
+    }
+
+    #[test]
+    fn e2e_dataview_object_to_string_uses_dataview_tag() {
+        assert_eval_true(
+            "Object.prototype.toString.call(new DataView(new ArrayBuffer(1))) === '[object DataView]'",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_get_int8_and_uint8() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(2)); v.setInt8(0, -1); v.getInt8(0) === -1 && v.getUint8(0) === 255",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_get_and_set_uint16_big_endian_by_default() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(2)); v.setUint16(0, 0x1234); v.getUint16(0) === 0x1234",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_get_and_set_uint16_little_endian() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(2)); v.setUint16(0, 0x1234, true); v.getUint16(0, true) === 0x1234 && v.getUint8(0) === 0x34 && v.getUint8(1) === 0x12",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_get_and_set_int16_little_endian() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(2)); v.setInt16(0, -2, true); v.getInt16(0, true) === -2",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_get_and_set_uint32_little_endian() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(4)); v.setUint32(0, 0x01020304, true); v.getUint32(0, true) === 0x01020304 && v.getUint8(0) === 4 && v.getUint8(3) === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_get_and_set_int32_big_endian() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(4)); v.setInt32(0, -1234567); v.getInt32(0) === -1234567",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_get_and_set_float32() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(4)); v.setFloat32(0, 1.5, true); v.getFloat32(0, true) === 1.5",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_get_and_set_float64() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(8)); v.setFloat64(0, 12.25, true); v.getFloat64(0, true) === 12.25",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_prototype_methods_use_receiver() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(1)); v.setUint8(0, 99); DataView.prototype.getUint8.call(v, 0) === 99",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_prototype_methods_reject_incompatible_receiver() {
+        assert_eval_true(
+            "try { DataView.prototype.getUint8.call({}, 0); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_getters_reject_negative_offsets() {
+        assert_eval_true(
+            "try { new DataView(new ArrayBuffer(4)).getUint8(-1); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_setters_reject_negative_offsets() {
+        assert_eval_true(
+            "try { new DataView(new ArrayBuffer(4)).setUint8(-1, 1); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_getters_reject_out_of_bounds_reads() {
+        assert_eval_true(
+            "try { new DataView(new ArrayBuffer(2)).getUint32(0); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_setters_reject_out_of_bounds_writes() {
+        assert_eval_true(
+            "try { new DataView(new ArrayBuffer(2)).setUint32(0, 1); false; } catch (e) { e instanceof RangeError; }",
+        );
     }
 
     /// `Int32Array[Symbol.species]` is `Int32Array` itself.

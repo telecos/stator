@@ -53,6 +53,24 @@ pub(crate) fn checked_f64_to_length(n: f64) -> StatorResult<usize> {
     Ok(truncated as usize)
 }
 
+/// Convert an `f64` to a `usize` using ECMAScript's `ToIndex`-style rules.
+///
+/// `NaN` is treated as `0`, finite non-negative values are truncated toward
+/// zero, and negative or infinite values throw a `RangeError`.
+pub(crate) fn checked_f64_to_index(n: f64) -> StatorResult<usize> {
+    if n.is_nan() {
+        return Ok(0);
+    }
+    if n.is_infinite() || n < 0.0 {
+        return Err(StatorError::RangeError("Invalid index".to_string()));
+    }
+    let truncated = n.floor();
+    if truncated > MAX_ALLOCATION_LENGTH as f64 {
+        return Err(StatorError::RangeError("Invalid index".to_string()));
+    }
+    Ok(truncated as usize)
+}
+
 // ── SameValueZero ──────────────────────────────────────────────────────────────
 
 /// ECMAScript §7.2.11 `SameValueZero(x, y)`.
