@@ -53,7 +53,7 @@ use crate::builtins::finalization_registry::{
 };
 use crate::builtins::function::{
     function_apply, function_bound_name, function_call, function_constructor,
-    function_has_instance, function_length,
+    function_has_instance, function_length, function_to_string,
 };
 use crate::builtins::global::{
     GLOBAL_INFINITY, GLOBAL_NAN, global_decode_uri, global_decode_uri_component, global_encode_uri,
@@ -9138,6 +9138,10 @@ fn create_bound_function_object(call_fn: JsValue, name: String, length: i32) -> 
     props.insert("__call__".to_string(), call_fn);
     props.insert("name".to_string(), JsValue::String(name.into()));
     props.insert("length".to_string(), JsValue::Smi(length));
+    props.insert(
+        "source".to_string(),
+        JsValue::String(function_to_string("").into()),
+    );
     if let Some(function_proto) = function_prototype_value() {
         props.insert("__proto__".to_string(), function_proto);
     }
@@ -23098,8 +23102,225 @@ mod tests {
     #[test]
     fn e2e_function_bind_to_string_uses_native_form() {
         assert_eval_true(
-            "function named() {} named.bind(null).toString() === 'function bound named() { [native code] }'",
+            "function named() {} named.bind(null).toString() === 'function () { [native code] }'",
         );
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_function_declaration_source() {
+        assert_eval_true(
+            "function foo(a, b) { return a + b; } foo.toString() === 'function foo(a, b) { return a + b; }'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_named_function_expression_source() {
+        assert_eval_true(
+            "var f = function foo(a, b) { return a + b; }; f.toString() === 'function foo(a, b) { return a + b; }'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_anonymous_function_expression_source() {
+        assert_eval_true(
+            "var f = function(a, b) { return a + b; }; f.toString() === 'function(a, b) { return a + b; }'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_single_param_arrow_source() {
+        assert_eval_true("(x => x + 1).toString() === 'x => x + 1'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_parenthesized_arrow_source() {
+        assert_eval_true("((x) => x + 1).toString() === '(x) => x + 1'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_multi_param_arrow_source() {
+        assert_eval_true("((x, y) => x + y).toString() === '(x, y) => x + y'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_block_arrow_source() {
+        assert_eval_true("((x) => { return x + 1; }).toString() === '(x) => { return x + 1; }'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_async_arrow_source() {
+        assert_eval_true("(async x => await x).toString() === 'async x => await x'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_async_function_source() {
+        assert_eval_true("async function f() {} f.toString() === 'async function f() {}'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_generator_function_source() {
+        assert_eval_true("function* g() {} g.toString() === 'function* g() {}'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_async_generator_function_source() {
+        assert_eval_true("async function* ag() {} ag.toString() === 'async function* ag() {}'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_class_declaration_source() {
+        assert_eval_true("class Foo {} Foo.toString() === 'class Foo {}'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_class_expression_source() {
+        assert_eval_true("(class Foo {}).toString() === 'class Foo {}'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_object_method_source() {
+        assert_eval_true("({foo() {}}).foo.toString() === 'foo() {}'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_object_async_method_source() {
+        assert_eval_true("({async foo() {}}).foo.toString() === 'async foo() {}'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_object_generator_method_source() {
+        assert_eval_true("({*foo() {}}).foo.toString() === '*foo() {}'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_object_async_generator_method_source() {
+        assert_eval_true("({async *foo() {}}).foo.toString() === 'async *foo() {}'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_object_computed_symbol_method_source() {
+        assert_eval_true(
+            "({[Symbol.iterator]() {}})[Symbol.iterator].toString() === '[Symbol.iterator]() {}'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_object_computed_string_method_source() {
+        assert_eval_true("({['foo']() {}}).foo.toString() === \"['foo']() {}\"");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_object_string_named_method_source() {
+        assert_eval_true("({'foo'() {}}).foo.toString() === \"'foo'() {}\"");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_object_numeric_method_source() {
+        assert_eval_true("({1() {}})[1].toString() === '1() {}'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_object_getter_source() {
+        assert_eval_true(
+            "Object.getOwnPropertyDescriptor({get foo() {}}, 'foo').get.toString() === 'get foo() {}'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_object_setter_source() {
+        assert_eval_true(
+            "Object.getOwnPropertyDescriptor({set foo(v) {}}, 'foo').set.toString() === 'set foo(v) {}'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_class_method_source() {
+        assert_eval_true("class Foo { foo() {} } Foo.prototype.foo.toString() === 'foo() {}'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_class_async_method_source() {
+        assert_eval_true(
+            "class Foo { async foo() {} } Foo.prototype.foo.toString() === 'async foo() {}'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_class_generator_method_source() {
+        assert_eval_true("class Foo { *foo() {} } Foo.prototype.foo.toString() === '*foo() {}'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_class_async_generator_method_source() {
+        assert_eval_true(
+            "class Foo { async *foo() {} } Foo.prototype.foo.toString() === 'async *foo() {}'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_class_computed_symbol_method_source() {
+        assert_eval_true(
+            "class Foo { [Symbol.iterator]() {} } Foo.prototype[Symbol.iterator].toString() === '[Symbol.iterator]() {}'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_class_computed_string_method_source() {
+        assert_eval_true(
+            "class Foo { ['foo']() {} } Foo.prototype.foo.toString() === \"['foo']() {}\"",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_class_string_named_method_source() {
+        assert_eval_true(
+            "class Foo { 'foo'() {} } Foo.prototype.foo.toString() === \"'foo'() {}\"",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_class_getter_source() {
+        assert_eval_true(
+            "Object.getOwnPropertyDescriptor(class Foo { get foo() {} }.prototype, 'foo').get.toString() === 'get foo() {}'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_preserves_class_setter_source() {
+        assert_eval_true(
+            "Object.getOwnPropertyDescriptor(class Foo { set foo(v) {} }.prototype, 'foo').set.toString() === 'set foo(v) {}'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_uses_native_form_for_math_sin() {
+        assert_eval_true("Math.sin.toString() === 'function sin() { [native code] }'");
+    }
+
+    #[test]
+    fn e2e_function_to_string_uses_native_form_for_object_has_own_property() {
+        assert_eval_true(
+            "Object.prototype.hasOwnProperty.toString() === 'function hasOwnProperty() { [native code] }'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_uses_anonymous_native_form_for_bound_named_function() {
+        assert_eval_true(
+            "function named() {} named.bind(null).toString() === 'function () { [native code] }'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_uses_anonymous_native_form_for_bound_anonymous_function() {
+        assert_eval_true(
+            "(function() {}).bind(null).toString() === 'function () { [native code] }'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_uses_anonymous_native_form_for_bound_native_function() {
+        assert_eval_true("Math.sin.bind(null).toString() === 'function () { [native code] }'");
     }
 
     #[test]
