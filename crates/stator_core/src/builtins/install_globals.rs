@@ -10897,7 +10897,10 @@ fn make_intl() -> JsValue {
                 "prototype".into(),
                 JsValue::PlainObject(Rc::new(RefCell::new(proto))),
             );
-            JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+            finalize_ctor(
+                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
+                "NumberFormat",
+            )
         });
 
         // ── Intl.DateTimeFormat ──────────────────────────────────────────────
@@ -10947,7 +10950,10 @@ fn make_intl() -> JsValue {
                 "prototype".into(),
                 JsValue::PlainObject(Rc::new(RefCell::new(proto))),
             );
-            JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+            finalize_ctor(
+                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
+                "DateTimeFormat",
+            )
         });
 
         // ── Intl.Collator ───────────────────────────────────────────────────
@@ -10987,7 +10993,10 @@ fn make_intl() -> JsValue {
                 "prototype".into(),
                 JsValue::PlainObject(Rc::new(RefCell::new(proto))),
             );
-            JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+            finalize_ctor(
+                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
+                "Collator",
+            )
         });
 
         // ── Intl.PluralRules ────────────────────────────────────────────────
@@ -11027,7 +11036,10 @@ fn make_intl() -> JsValue {
                 "prototype".into(),
                 JsValue::PlainObject(Rc::new(RefCell::new(proto))),
             );
-            JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+            finalize_ctor(
+                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
+                "PluralRules",
+            )
         });
 
         // ── Intl.ListFormat ─────────────────────────────────────────────────
@@ -11098,7 +11110,10 @@ fn make_intl() -> JsValue {
                 "prototype".into(),
                 JsValue::PlainObject(Rc::new(RefCell::new(proto))),
             );
-            JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+            finalize_ctor(
+                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
+                "ListFormat",
+            )
         });
 
         // ── Intl.RelativeTimeFormat ─────────────────────────────────────────
@@ -11148,7 +11163,10 @@ fn make_intl() -> JsValue {
                 "prototype".into(),
                 JsValue::PlainObject(Rc::new(RefCell::new(proto))),
             );
-            JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+            finalize_ctor(
+                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
+                "RelativeTimeFormat",
+            )
         });
 
         // ── Intl.Segmenter ──────────────────────────────────────────────────
@@ -11208,7 +11226,10 @@ fn make_intl() -> JsValue {
                 "prototype".into(),
                 JsValue::PlainObject(Rc::new(RefCell::new(proto))),
             );
-            JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+            finalize_ctor(
+                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
+                "Segmenter",
+            )
         });
 
         // ── Intl.DisplayNames ───────────────────────────────────────────────
@@ -11262,7 +11283,10 @@ fn make_intl() -> JsValue {
                 "prototype".into(),
                 JsValue::PlainObject(Rc::new(RefCell::new(proto))),
             );
-            JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+            finalize_ctor(
+                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
+                "DisplayNames",
+            )
         });
 
         // ── Intl.Locale ─────────────────────────────────────────────────────
@@ -11290,7 +11314,11 @@ fn make_intl() -> JsValue {
                 }),
             );
             ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
-            JsValue::PlainObject(Rc::new(RefCell::new(ctor)))
+            ctor.insert(
+                "prototype".into(),
+                JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))),
+            );
+            finalize_ctor(JsValue::PlainObject(Rc::new(RefCell::new(ctor))), "Locale")
         });
 
         // ── Intl.getCanonicalLocales ────────────────────────────────────────
@@ -11331,6 +11359,11 @@ fn make_intl() -> JsValue {
             }),
         );
 
+        ns.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("Intl".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
         ns.make_all_non_enumerable();
         JsValue::PlainObject(Rc::new(RefCell::new(ns)))
     })
@@ -14263,6 +14296,184 @@ mod tests {
         // Base64 encoding/decoding
         assert!(globals.contains_key("btoa"));
         assert!(globals.contains_key("atob"));
+    }
+
+    #[test]
+    fn e2e_intl_exists_object() {
+        assert_eval_true("typeof Intl === 'object' && Intl !== null");
+    }
+
+    #[test]
+    fn e2e_intl_to_string_tag() {
+        assert_eval_true("Intl[Symbol.toStringTag] === 'Intl'");
+    }
+
+    #[test]
+    fn e2e_intl_object_to_string_uses_tag() {
+        assert_eval_true("Object.prototype.toString.call(Intl) === '[object Intl]'");
+    }
+
+    #[test]
+    fn e2e_intl_number_format_exists() {
+        assert_eval_true("typeof Intl.NumberFormat === 'object'");
+    }
+
+    #[test]
+    fn e2e_intl_number_format_name() {
+        assert_eval_true("Intl.NumberFormat.name === 'NumberFormat'");
+    }
+
+    #[test]
+    fn e2e_intl_number_format_prototype_constructor() {
+        assert_eval_true("Intl.NumberFormat.prototype.constructor === Intl.NumberFormat");
+    }
+
+    #[test]
+    fn e2e_intl_number_format_new_returns_string() {
+        assert_eval_true("typeof new Intl.NumberFormat().format(123) === 'string'");
+    }
+
+    #[test]
+    fn e2e_intl_number_format_formats_integer() {
+        assert_eval_true("new Intl.NumberFormat().format(123) === '123'");
+    }
+
+    #[test]
+    fn e2e_intl_number_format_call_without_new_formats() {
+        assert_eval_true("Intl.NumberFormat().format(7) === '7'");
+    }
+
+    #[test]
+    fn e2e_intl_number_format_nan() {
+        assert_eval_true("Intl.NumberFormat().format(NaN) === 'NaN'");
+    }
+
+    #[test]
+    fn e2e_intl_number_format_resolved_options_locale() {
+        assert_eval_true("Intl.NumberFormat().resolvedOptions().locale === 'en-US'");
+    }
+
+    #[test]
+    fn e2e_intl_number_format_supported_locales_of() {
+        assert_eval_true(
+            "Intl.NumberFormat.supportedLocalesOf('en-US').length === 1 && Intl.NumberFormat.supportedLocalesOf('en-US')[0] === 'en-US'",
+        );
+    }
+
+    #[test]
+    fn e2e_intl_number_format_to_parts_length() {
+        assert_eval_true("Intl.NumberFormat().formatToParts(12.5).length === 3");
+    }
+
+    #[test]
+    fn e2e_intl_date_time_format_exists() {
+        assert_eval_true("typeof Intl.DateTimeFormat === 'object'");
+    }
+
+    #[test]
+    fn e2e_intl_date_time_format_name() {
+        assert_eval_true("Intl.DateTimeFormat.name === 'DateTimeFormat'");
+    }
+
+    #[test]
+    fn e2e_intl_date_time_format_prototype_constructor() {
+        assert_eval_true("Intl.DateTimeFormat.prototype.constructor === Intl.DateTimeFormat");
+    }
+
+    #[test]
+    fn e2e_intl_date_time_format_new_returns_string() {
+        assert_eval_true("typeof new Intl.DateTimeFormat().format(0) === 'string'");
+    }
+
+    #[test]
+    fn e2e_intl_date_time_format_epoch_contains_1970() {
+        assert_eval_true("new Intl.DateTimeFormat().format(0).indexOf('1970') !== -1");
+    }
+
+    #[test]
+    fn e2e_intl_date_time_format_call_without_new_formats() {
+        assert_eval_true("Intl.DateTimeFormat().format(0).length > 0");
+    }
+
+    #[test]
+    fn e2e_intl_date_time_format_resolved_options_time_zone() {
+        assert_eval_true("Intl.DateTimeFormat().resolvedOptions().timeZone === 'UTC'");
+    }
+
+    #[test]
+    fn e2e_intl_date_time_format_to_parts_has_month() {
+        assert_eval_true(
+            "Intl.DateTimeFormat().formatToParts(0).length > 0 && Intl.DateTimeFormat().formatToParts(0)[0].type === 'month'",
+        );
+    }
+
+    #[test]
+    fn e2e_intl_collator_exists() {
+        assert_eval_true("typeof Intl.Collator === 'object'");
+    }
+
+    #[test]
+    fn e2e_intl_collator_name() {
+        assert_eval_true("Intl.Collator.name === 'Collator'");
+    }
+
+    #[test]
+    fn e2e_intl_collator_prototype_constructor() {
+        assert_eval_true("Intl.Collator.prototype.constructor === Intl.Collator");
+    }
+
+    #[test]
+    fn e2e_intl_collator_new_returns_object() {
+        assert_eval_true("typeof new Intl.Collator() === 'object'");
+    }
+
+    #[test]
+    fn e2e_intl_collator_compare_less() {
+        assert_eval_true("new Intl.Collator().compare('a', 'b') === -1");
+    }
+
+    #[test]
+    fn e2e_intl_collator_compare_equal() {
+        assert_eval_true("new Intl.Collator().compare('same', 'same') === 0");
+    }
+
+    #[test]
+    fn e2e_intl_collator_call_without_new_compare() {
+        assert_eval_true("Intl.Collator().compare('b', 'a') === 1");
+    }
+
+    #[test]
+    fn e2e_intl_collator_resolved_options_locale() {
+        assert_eval_true("Intl.Collator().resolvedOptions().locale === 'en-US'");
+    }
+
+    #[test]
+    fn e2e_intl_get_canonical_locales() {
+        assert_eval_true(
+            "Intl.getCanonicalLocales('en-US').length === 1 && Intl.getCanonicalLocales('en-US')[0] === 'en-US'",
+        );
+    }
+
+    #[test]
+    fn e2e_intl_supported_values_of_time_zone() {
+        assert_eval_true(
+            "Intl.supportedValuesOf('timeZone').length === 1 && Intl.supportedValuesOf('timeZone')[0] === 'UTC'",
+        );
+    }
+
+    #[test]
+    fn e2e_intl_locale_language() {
+        assert_eval_true("Intl.Locale('en-US').language === 'en'");
+    }
+
+    #[test]
+    fn e2e_intl_locale_base_name() {
+        assert_eval_true("new Intl.Locale('en-US').baseName === 'en-US'");
+    }
+
+    #[test]
+    fn e2e_intl_locale_name() {
+        assert_eval_true("Intl.Locale.name === 'Locale'");
     }
 
     /// Verify that the `Math` object has the expected properties.
