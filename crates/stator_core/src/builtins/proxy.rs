@@ -79,8 +79,8 @@ pub type PreventExtensionsTrap = Box<dyn Fn(&mut JsObject) -> StatorResult<bool>
 pub type OwnKeysTrap = Box<dyn Fn(&JsObject) -> StatorResult<Vec<JsValue>>>;
 /// Trap for `[[Call]](thisArg, args)` → value.
 pub type ApplyTrap = Box<dyn Fn(JsValue, Vec<JsValue>) -> StatorResult<JsValue>>;
-/// Trap for `[[Construct]](args)` → object.
-pub type ConstructTrap = Box<dyn Fn(Vec<JsValue>) -> StatorResult<JsObject>>;
+/// Trap for `[[Construct]](args, newTarget)` → object.
+pub type ConstructTrap = Box<dyn Fn(Vec<JsValue>, JsValue) -> StatorResult<JsObject>>;
 
 // ── ProxyHandler ──────────────────────────────────────────────────────────────
 
@@ -879,7 +879,8 @@ pub fn proxy_apply(
 
 /// ECMAScript §10.5.13 `[[Construct]]` for Proxy.
 ///
-/// Invokes the `construct` trap if installed.  Returns
+/// Invokes the `construct` trap if installed, passing both the
+/// `arguments_list` and the `new_target` (§10.5.13 step 7).  Returns
 /// [`StatorError::TypeError`] if no trap is installed.
 ///
 /// # Examples
@@ -890,22 +891,23 @@ pub fn proxy_apply(
 /// use stator_core::objects::value::JsValue;
 ///
 /// let mut handler = ProxyHandler::default();
-/// handler.construct = Some(Box::new(|args| {
+/// handler.construct = Some(Box::new(|args, _new_target| {
 ///     let mut o = JsObject::new();
 ///     if let Some(v) = args.first() { o.set_property("v", v.clone()).unwrap(); }
 ///     Ok(o)
 /// }));
 /// let mut proxy = proxy_new(JsObject::new(), handler);
-/// let obj = proxy_construct(&mut proxy, vec![JsValue::Smi(5)]).unwrap();
+/// let obj = proxy_construct(&mut proxy, vec![JsValue::Smi(5)], JsValue::Undefined).unwrap();
 /// assert_eq!(obj.get_property("v"), JsValue::Smi(5));
 /// ```
 pub fn proxy_construct(
     proxy: &mut JsProxy,
     arguments_list: Vec<JsValue>,
+    new_target: JsValue,
 ) -> StatorResult<JsObject> {
     proxy.check_revoked()?;
     if let Some(trap) = &proxy.handler.construct {
-        trap(arguments_list)
+        trap(arguments_list, new_target)
     } else {
         Err(StatorError::TypeError(
             "proxy_construct: target object is not constructible".to_string(),
@@ -1447,7 +1449,7 @@ mod tests {
     #[test]
     fn test_proxy_construct_with_trap() {
         let mut handler = ProxyHandler::default();
-        handler.construct = Some(Box::new(|args| {
+        handler.construct = Some(Box::new(|args, _new_target| {
             let mut o = JsObject::new();
             if let Some(v) = args.first() {
                 o.set_property("v", v.clone()).unwrap();
@@ -1455,7 +1457,7 @@ mod tests {
             Ok(o)
         }));
         let mut proxy = proxy_new(JsObject::new(), handler);
-        let obj = proxy_construct(&mut proxy, vec![JsValue::Smi(3)]).unwrap();
+        let obj = proxy_construct(&mut proxy, vec![JsValue::Smi(3)], JsValue::Undefined).unwrap();
         assert_eq!(obj.get_property("v"), JsValue::Smi(3));
     }
 
@@ -1463,7 +1465,7 @@ mod tests {
     fn test_proxy_construct_no_trap_returns_type_error() {
         let mut proxy = proxy_new(JsObject::new(), ProxyHandler::default());
         assert!(matches!(
-            proxy_construct(&mut proxy, vec![]),
+            proxy_construct(&mut proxy, vec![], JsValue::Undefined),
             Err(StatorError::TypeError(_))
         ));
     }

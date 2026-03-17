@@ -11641,12 +11641,12 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
     if is_callable(target_val) {
         let target = target_val.clone();
         let handler_this = handler_this.clone();
-        handler.construct = Some(Box::new(move |args| {
+        handler.construct = Some(Box::new(move |args, new_target| {
             if let Some(trap) = &construct_trap {
                 let result = call_proxy_handler_trap(
                     trap,
                     &handler_this,
-                    vec![target.clone(), JsValue::new_array(args)],
+                    vec![target.clone(), JsValue::new_array(args), new_target],
                 )?;
                 return match &result {
                     JsValue::PlainObject(map) => Ok(plain_object_to_js_object(map)),
