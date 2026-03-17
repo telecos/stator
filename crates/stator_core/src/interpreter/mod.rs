@@ -173,6 +173,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use crate::builtins::error::{pop_call_frame, push_call_frame};
+use crate::builtins::function::{function_bound_name, function_length, function_to_string};
 use crate::builtins::proxy::{proxy_apply, proxy_get_with_receiver, proxy_set_with_receiver};
 use crate::builtins::symbol::symbol_description;
 use crate::bytecode::bytecode_array::{
@@ -460,6 +461,59 @@ pub(crate) fn fn_props_get(ba: &Rc<BytecodeArray>, name: &str) -> JsValue {
             .and_then(|map| map.borrow().get(name).cloned())
             .unwrap_or(JsValue::Undefined)
     })
+}
+
+pub(crate) fn function_display_name(value: &JsValue) -> String {
+    match value {
+        JsValue::Function(ba) => match fn_props_get(ba, "name") {
+            JsValue::String(s) => s.to_string(),
+            _ => ba.function_name().to_string(),
+        },
+        JsValue::PlainObject(map) => match map.borrow().get("name") {
+            Some(JsValue::String(s)) => s.to_string(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+pub(crate) fn function_length_value(value: &JsValue) -> i32 {
+    match value {
+        JsValue::Function(ba) => ba.function_length() as i32,
+        JsValue::PlainObject(map) => match map.borrow().get("length") {
+            Some(JsValue::Smi(n)) => *n,
+            Some(JsValue::HeapNumber(n)) => *n as i32,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+pub(crate) fn function_to_string_value(value: &JsValue) -> String {
+    match value {
+        JsValue::Function(ba) => match fn_props_get(ba, "source") {
+            JsValue::String(source) => source.to_string(),
+            _ => match ba.source_text() {
+                Some(source) => source.to_string(),
+                None => function_to_string(&function_display_name(value)),
+            },
+        },
+        JsValue::PlainObject(map) => match map.borrow().get("source") {
+            Some(JsValue::String(source)) => source.to_string(),
+            _ => function_to_string(&function_display_name(value)),
+        },
+        JsValue::NativeFunction(_) => function_to_string(""),
+        _ => function_to_string(""),
+    }
+}
+
+pub(crate) fn set_function_name_if_missing(value: &JsValue, name: &str) {
+    if let JsValue::Function(ba) = value
+        && matches!(fn_props_get(ba, "name"), JsValue::Undefined)
+        && ba.function_name().is_empty()
+    {
+        fn_props_set(ba, "name".to_string(), JsValue::String(name.into()));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1038,6 +1092,9 @@ pub struct InterpreterFrame {
     ///
     /// Length = `bytecode_array.parameter_count() + bytecode_array.frame_size()`.
     pub registers: Vec<JsValue>,
+    /// Full argument list supplied to the current call, including extras beyond
+    /// the formal parameter count.
+    pub call_args: Vec<JsValue>,
     /// The implicit accumulator register used by most instructions.
     pub accumulator: JsValue,
     /// Program counter: index of the *next* instruction to execute in the
@@ -1112,7 +1169,7 @@ impl InterpreterFrame {
         let frame_size = bytecode_array.frame_size() as usize;
         let total_regs = param_count + frame_size;
         let mut registers = vec![JsValue::Undefined; total_regs];
-        for (i, arg) in args.into_iter().enumerate().take(param_count) {
+        for (i, arg) in args.iter().cloned().enumerate().take(param_count) {
             registers[i] = arg;
         }
         let mut global_map = HashMap::new();
@@ -1120,6 +1177,7 @@ impl InterpreterFrame {
         Self {
             bytecode_array,
             registers,
+            call_args: args,
             accumulator: JsValue::Undefined,
             pc: 0,
             context: None,
@@ -1425,6 +1483,7 @@ impl Interpreter {
         let mut frame = InterpreterFrame {
             bytecode_array,
             registers,
+            call_args: Vec::new(),
             accumulator: input,
             pc: resume_pc,
             context: None,
@@ -5174,10 +5233,20 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 _ => 0,
                             };
                             (0..len)
-                                .filter_map(|i| borrow.get(&i.to_string()).cloned())
+                                .map(|i| {
+                                    borrow
+                                        .get(&i.to_string())
+                                        .cloned()
+                                        .unwrap_or(JsValue::Undefined)
+                                })
                                 .collect()
                         }
-                        _ => vec![],
+                        Some(JsValue::Null) | Some(JsValue::Undefined) | None => vec![],
+                        _ => {
+                            return Err(StatorError::TypeError(
+                                "CreateListFromArrayLike called on non-object".into(),
+                            ));
+                        }
                     };
                     dispatch_call_with_this(&JsValue::Function(Rc::clone(&ba)), this_arg, call_args)
                 }));
@@ -5193,8 +5262,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     };
                     let ba2 = Rc::clone(&ba);
                     let bound_count = bound_args.len() as i32;
-                    let target_len = ba.parameter_count() as i32;
-                    let result_len = std::cmp::max(0, target_len - bound_count);
+                    let result_len =
+                        function_length(ba.function_length(), bound_count as u32) as i32;
+                    let target = JsValue::Function(Rc::clone(&ba));
+                    let bound_name = function_bound_name(&function_display_name(&target));
 
                     // Build bound function as a PlainObject with __call__,
                     // carrying the correct `name` and `length` per ES §20.2.3.2.
@@ -5210,32 +5281,27 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         }));
                     let mut props = PropertyMap::new();
                     props.insert("__call__".to_string(), call_fn);
-                    props.insert(
-                        "name".to_string(),
-                        JsValue::String("bound ".to_string().into()),
-                    );
+                    props.insert("name".to_string(), JsValue::String(bound_name.into()));
                     props.insert("length".to_string(), JsValue::Smi(result_len));
+                    if let Some(function_proto) = global_constructor_prototype("Function") {
+                        props.insert("__proto__".to_string(), function_proto);
+                    }
                     Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
                 }));
             }
             "name" => {
-                let n = ba.function_name();
                 return JsValue::String(
-                    if n.is_empty() {
-                        String::new()
-                    } else {
-                        n.to_owned()
-                    }
-                    .into(),
+                    function_display_name(&JsValue::Function(Rc::clone(ba))).into(),
                 );
             }
             "length" => {
-                return JsValue::Smi(ba.parameter_count() as i32);
+                return JsValue::Smi(ba.function_length() as i32);
             }
             "toString" => {
-                return JsValue::NativeFunction(Rc::new(|_args| {
+                let ba = Rc::clone(ba);
+                return JsValue::NativeFunction(Rc::new(move |_args| {
                     Ok(JsValue::String(
-                        "function () { [native code] }".to_string().into(),
+                        function_to_string_value(&JsValue::Function(Rc::clone(&ba))).into(),
                     ))
                 }));
             }
@@ -5327,10 +5393,20 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 _ => 0,
                             };
                             (0..len)
-                                .filter_map(|i| borrow.get(&i.to_string()).cloned())
+                                .map(|i| {
+                                    borrow
+                                        .get(&i.to_string())
+                                        .cloned()
+                                        .unwrap_or(JsValue::Undefined)
+                                })
                                 .collect()
                         }
-                        _ => vec![],
+                        Some(JsValue::Null) | Some(JsValue::Undefined) | None => vec![],
+                        _ => {
+                            return Err(StatorError::TypeError(
+                                "CreateListFromArrayLike called on non-object".into(),
+                            ));
+                        }
                     };
                     let mut full_args = vec![this_arg];
                     full_args.extend(call_args);
@@ -5347,21 +5423,32 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         vec![]
                     };
                     let f2 = Rc::clone(&f);
-                    Ok(JsValue::NativeFunction(Rc::new(move |call_args| {
-                        let mut all_args = vec![this_arg.clone()];
-                        all_args.extend(bound_args.clone());
-                        all_args.extend(call_args);
-                        f2(all_args)
-                    })))
+                    let mut props = PropertyMap::new();
+                    props.insert(
+                        "__call__".to_string(),
+                        JsValue::NativeFunction(Rc::new(move |call_args| {
+                            let mut all_args = vec![this_arg.clone()];
+                            all_args.extend(bound_args.clone());
+                            all_args.extend(call_args);
+                            f2(all_args)
+                        })),
+                    );
+                    props.insert(
+                        "name".to_string(),
+                        JsValue::String(function_bound_name("").into()),
+                    );
+                    props.insert("length".to_string(), JsValue::Smi(0));
+                    if let Some(function_proto) = global_constructor_prototype("Function") {
+                        props.insert("__proto__".to_string(), function_proto);
+                    }
+                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
                 }));
             }
             "name" => return JsValue::String(String::new().into()),
             "length" => return JsValue::Smi(0),
             "toString" => {
                 return JsValue::NativeFunction(Rc::new(|_args| {
-                    Ok(JsValue::String(
-                        "function () { [native code] }".to_string().into(),
-                    ))
+                    Ok(JsValue::String(function_to_string("").into()))
                 }));
             }
             "constructor" => return lookup_global_constructor("Function"),
