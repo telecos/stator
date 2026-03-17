@@ -39738,4 +39738,254 @@ mod tests {
         let result = global_eval("(-255).toString(16)").unwrap();
         assert_eq!(result, JsValue::String("-ff".to_string()));
     }
+
+    // ── Tagged template literal deep conformance ─────────────────────────
+
+    // §1 Tag function receives (strings, ...values) — strings is a frozen array
+
+    /// Tagged template: tag receives the strings object as first arg.
+    #[test]
+    fn e2e_tagged_tpl_strings_first_arg() {
+        let r = global_eval("function tag(s) { return typeof s; } tag`hello`").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    /// Tagged template: strings object is frozen.
+    #[test]
+    fn e2e_tagged_tpl_strings_frozen() {
+        assert_eval_true("function tag(s) { return Object.isFrozen(s); } tag`hello`");
+    }
+
+    /// Tagged template: strings[0] equals the cooked string.
+    #[test]
+    fn e2e_tagged_tpl_strings_cooked_value() {
+        let r = global_eval("function tag(s) { return s[0]; } tag`hello`").unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    /// Tagged template: values are passed as additional arguments.
+    #[test]
+    fn e2e_tagged_tpl_values_passed() {
+        let r = global_eval("function tag(s, v1, v2) { return v1 + ',' + v2; } tag`a${1}b${2}c`")
+            .unwrap();
+        assert_eq!(r, JsValue::String("1,2".into()));
+    }
+
+    // §2 strings.raw property — array of raw strings (no escape processing)
+
+    /// Tagged template: strings.raw exists and is an object.
+    #[test]
+    fn e2e_tagged_tpl_raw_exists() {
+        assert_eval_true("function tag(s) { return typeof s.raw === 'object'; } tag`hello`");
+    }
+
+    /// Tagged template: strings.raw is frozen.
+    #[test]
+    fn e2e_tagged_tpl_raw_frozen() {
+        assert_eval_true("function tag(s) { return Object.isFrozen(s.raw); } tag`hello`");
+    }
+
+    /// Tagged template: raw preserves backslash-n literally.
+    #[test]
+    fn e2e_tagged_tpl_raw_preserves_escapes() {
+        let r = global_eval(r#"function tag(s) { return s.raw[0]; } tag`hello\nworld`"#).unwrap();
+        assert_eq!(r, JsValue::String("hello\\nworld".into()));
+    }
+
+    /// Tagged template: cooked processes backslash-n into newline.
+    #[test]
+    fn e2e_tagged_tpl_cooked_processes_escapes() {
+        let r = global_eval(r#"function tag(s) { return s[0]; } tag`hello\nworld`"#).unwrap();
+        assert_eq!(r, JsValue::String("hello\nworld".into()));
+    }
+
+    /// Tagged template: raw length matches cooked length.
+    #[test]
+    fn e2e_tagged_tpl_raw_length_matches() {
+        assert_eval_true("function tag(s) { return s.raw.length === s.length; } tag`a${1}b${2}c`");
+    }
+
+    // §3 Template object identity — same tag call gets same frozen object
+
+    /// Same tagged template call site returns identical strings object.
+    #[test]
+    fn e2e_tagged_tpl_identity_cached() {
+        assert_eval_true(
+            "var saved; function tag(s) { if (!saved) { saved = s; return true; } return s === saved; } tag`test`; tag`test`",
+        );
+    }
+
+    // §4 String.raw as a tag — returns raw string concatenation
+
+    /// String.raw as tag function returns raw literal text.
+    #[test]
+    fn e2e_string_raw_as_tag() {
+        let r = global_eval(r#"String.raw`hello\nworld`"#).unwrap();
+        assert_eq!(r, JsValue::String("hello\\nworld".into()));
+    }
+
+    /// String.raw as tag with substitutions.
+    #[test]
+    fn e2e_string_raw_tag_with_subs() {
+        let r = global_eval(r#"var x = 42; String.raw`value is ${x} end`"#).unwrap();
+        assert_eq!(r, JsValue::String("value is 42 end".into()));
+    }
+
+    /// String.raw as tag with multiple substitutions.
+    #[test]
+    fn e2e_string_raw_tag_multi_subs() {
+        let r = global_eval(r#"var a = 1; var b = 2; String.raw`${a} + ${b} = ${a + b}`"#).unwrap();
+        assert_eq!(r, JsValue::String("1 + 2 = 3".into()));
+    }
+
+    /// String.raw with tab escape returns literal backslash-t.
+    #[test]
+    fn e2e_string_raw_tag_tab() {
+        let r = global_eval(r#"String.raw`\t`"#).unwrap();
+        assert_eq!(r, JsValue::String("\\t".into()));
+    }
+
+    // §5 Escape sequences — invalid escapes return undefined in cooked
+
+    /// Tagged template: cooked tab escape is actual tab character.
+    #[test]
+    fn e2e_tagged_tpl_cooked_tab() {
+        let r = global_eval(r#"function tag(s) { return s[0]; } tag`\t`"#).unwrap();
+        assert_eq!(r, JsValue::String("\t".into()));
+    }
+
+    /// Tagged template: raw tab escape is literal backslash-t.
+    #[test]
+    fn e2e_tagged_tpl_raw_tab() {
+        let r = global_eval(r#"function tag(s) { return s.raw[0]; } tag`\t`"#).unwrap();
+        assert_eq!(r, JsValue::String("\\t".into()));
+    }
+
+    // §6 Template literal types: no substitution, single, multiple
+
+    /// No-substitution template literal evaluates to a plain string.
+    #[test]
+    fn e2e_tpl_no_substitution() {
+        let r = global_eval("`hello world`").unwrap();
+        assert_eq!(r, JsValue::String("hello world".into()));
+    }
+
+    /// Single substitution template literal.
+    #[test]
+    fn e2e_tpl_single_substitution() {
+        let r = global_eval("var x = 5; `value: ${x}`").unwrap();
+        assert_eq!(r, JsValue::String("value: 5".into()));
+    }
+
+    /// Multiple substitution template literal.
+    #[test]
+    fn e2e_tpl_multiple_substitution() {
+        let r = global_eval("var a = 1; var b = 2; `${a} + ${b} = ${a + b}`").unwrap();
+        assert_eq!(r, JsValue::String("1 + 2 = 3".into()));
+    }
+
+    /// Tagged no-substitution: strings has length 1.
+    #[test]
+    fn e2e_tagged_tpl_no_sub_length() {
+        let r = global_eval("function tag(s) { return s.length; } tag`only`").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// Tagged single substitution: strings has length 2.
+    #[test]
+    fn e2e_tagged_tpl_single_sub_length() {
+        let r = global_eval("function tag(s) { return s.length; } tag`a${1}b`").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// Tagged multiple substitution: strings has length 3.
+    #[test]
+    fn e2e_tagged_tpl_multi_sub_length() {
+        let r = global_eval("function tag(s) { return s.length; } tag`a${1}b${2}c`").unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    // §7 Nested template literals
+
+    /// Nested template literal in expression position.
+    #[test]
+    fn e2e_tpl_nested() {
+        let r = global_eval("var x = 'inner'; `outer ${`nested ${x}`} end`").unwrap();
+        assert_eq!(r, JsValue::String("outer nested inner end".into()));
+    }
+
+    /// Double-nested template literal.
+    #[test]
+    fn e2e_tpl_double_nested() {
+        let r = global_eval("`a ${`b ${`c`}`}`").unwrap();
+        assert_eq!(r, JsValue::String("a b c".into()));
+    }
+
+    // §8 Tagged templates with method calls: obj.method`template`
+
+    /// Tagged template via object method preserves this.
+    #[test]
+    fn e2e_tagged_tpl_method_call() {
+        let r =
+            global_eval("var obj = { tag: function(s) { return s[0]; } }; obj.tag`hello`").unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    /// Tagged template via method with substitutions.
+    #[test]
+    fn e2e_tagged_tpl_method_with_subs() {
+        let r = global_eval(
+            "var obj = { tag: function(s, v) { return s[0] + v + s[1]; } }; obj.tag`a${42}b`",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a42b".into()));
+    }
+
+    // §9 Expression positions: tag`${a + b} text ${c}`
+
+    /// Tagged template with expression arithmetic.
+    #[test]
+    fn e2e_tagged_tpl_expr_arithmetic() {
+        let r = global_eval("function tag(s, v) { return v; } var a = 3; var b = 4; tag`${a + b}`")
+            .unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    /// Tagged template with multiple complex expressions.
+    #[test]
+    fn e2e_tagged_tpl_expr_complex() {
+        let r = global_eval(
+            "function tag(s, v1, v2) { return v1 + '|' + v2; } var x = 10; tag`${x * 2} and ${x > 5}`",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("20|true".into()));
+    }
+
+    /// Template literal with ternary expression.
+    #[test]
+    fn e2e_tpl_ternary_expr() {
+        let r = global_eval("var x = true; `result: ${x ? 'yes' : 'no'}`").unwrap();
+        assert_eq!(r, JsValue::String("result: yes".into()));
+    }
+
+    /// Template literal with function call expression.
+    #[test]
+    fn e2e_tpl_function_call_expr() {
+        let r =
+            global_eval("function double(n) { return n * 2; } `doubled: ${double(21)}`").unwrap();
+        assert_eq!(r, JsValue::String("doubled: 42".into()));
+    }
+
+    /// Tagged template: return value is whatever the tag returns.
+    #[test]
+    fn e2e_tagged_tpl_custom_return() {
+        let r = global_eval("function tag() { return 42; } tag`ignored`").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Tagged template: tag can return non-string.
+    #[test]
+    fn e2e_tagged_tpl_return_array() {
+        assert_eval_true("function tag(s) { return s.length; } tag`a${0}b` === 2");
+    }
 }
