@@ -312,19 +312,30 @@ pub fn math_hypot(values: &[f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
-    // Check for any infinities first (per ECMAScript spec).
+    let mut max = 0.0f64;
     for &v in values {
-        if v.is_infinite() {
+        let abs = v.abs();
+        if abs.is_infinite() {
             return f64::INFINITY;
         }
-    }
-    for &v in values {
         if v.is_nan() {
             return f64::NAN;
         }
+        if abs > max {
+            max = abs;
+        }
     }
-    let sum_sq: f64 = values.iter().map(|v| v * v).sum();
-    sum_sq.sqrt()
+    if max == 0.0 {
+        return 0.0;
+    }
+    let sum_sq: f64 = values
+        .iter()
+        .map(|value| {
+            let scaled = value / max;
+            scaled * scaled
+        })
+        .sum();
+    max * sum_sq.sqrt()
 }
 
 // ── Math.log / Math.log2 / Math.log10 ────────────────────────────────────────
@@ -541,7 +552,7 @@ pub fn math_random() -> f64 {
 /// assert_eq!(math_clz32(0.0), 32);
 /// ```
 pub fn math_clz32(x: f64) -> u32 {
-    let n = x as i64 as i32 as u32;
+    let n = f64_to_uint32(x);
     n.leading_zeros()
 }
 
@@ -563,9 +574,17 @@ pub fn math_clz32(x: f64) -> u32 {
 /// assert_eq!(math_imul(0xffffffff_u32 as f64, 5.0), -5);
 /// ```
 pub fn math_imul(a: f64, b: f64) -> i32 {
-    let a = a as i64 as i32;
-    let b = b as i64 as i32;
-    a.wrapping_mul(b)
+    let a = f64_to_uint32(a);
+    let b = f64_to_uint32(b);
+    i32::from_ne_bytes(a.wrapping_mul(b).to_ne_bytes())
+}
+
+#[inline]
+fn f64_to_uint32(n: f64) -> u32 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return 0;
+    }
+    n.trunc().rem_euclid(4_294_967_296.0) as u32
 }
 
 // ── Math.fround ───────────────────────────────────────────────────────────────

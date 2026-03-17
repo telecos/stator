@@ -2139,6 +2139,9 @@ fn install_error_constructors(globals: &mut HashMap<String, JsValue>) {
 /// Returns `Smi` for values that are exact integers in the `i32` range,
 /// `HeapNumber` for everything else (fractions, NaN, infinities, large ints).
 fn num(n: f64) -> JsValue {
+    if n == 0.0 && n.is_sign_negative() {
+        return JsValue::HeapNumber(-0.0);
+    }
     if n.fract() == 0.0
         && !n.is_nan()
         && !n.is_infinite()
@@ -14072,6 +14075,11 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
 mod tests {
     use super::*;
 
+    fn assert_eval_true(expr: &str) {
+        let result = global_eval(expr).unwrap();
+        assert_eq!(result, JsValue::Boolean(true), "{expr} => {result:?}");
+    }
+
     /// Verify that `install_globals` populates the expected keys.
     #[test]
     fn test_install_globals_keys() {
@@ -21419,6 +21427,203 @@ mod tests {
             JsValue::Smi(0) | JsValue::HeapNumber(_) => {}
             other => panic!("expected 0, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn e2e_math_sign_negative_zero() {
+        assert_eval_true("Object.is(Math.sign(-0), -0)");
+    }
+
+    #[test]
+    fn e2e_math_sign_nan() {
+        assert_eval_true("Number.isNaN(Math.sign(NaN))");
+    }
+
+    #[test]
+    fn e2e_math_sign_no_args_is_nan() {
+        assert_eval_true("Number.isNaN(Math.sign())");
+    }
+
+    #[test]
+    fn e2e_math_cbrt_negative_zero() {
+        assert_eval_true("Object.is(Math.cbrt(-0), -0)");
+    }
+
+    #[test]
+    fn e2e_math_cbrt_nan() {
+        assert_eval_true("Number.isNaN(Math.cbrt(NaN))");
+    }
+
+    #[test]
+    fn e2e_math_log2_zero_is_neg_infinity() {
+        assert_eval_true("Math.log2(0) === -Infinity");
+    }
+
+    #[test]
+    fn e2e_math_log2_negative_is_nan() {
+        assert_eval_true("Number.isNaN(Math.log2(-1))");
+    }
+
+    #[test]
+    fn e2e_math_log2_infinity() {
+        assert_eval_true("Math.log2(Infinity) === Infinity");
+    }
+
+    #[test]
+    fn e2e_math_log10_zero_is_neg_infinity() {
+        assert_eval_true("Math.log10(0) === -Infinity");
+    }
+
+    #[test]
+    fn e2e_math_log10_negative_is_nan() {
+        assert_eval_true("Number.isNaN(Math.log10(-1))");
+    }
+
+    #[test]
+    fn e2e_math_expm1_negative_zero() {
+        assert_eval_true("Object.is(Math.expm1(-0), -0)");
+    }
+
+    #[test]
+    fn e2e_math_expm1_nan() {
+        assert_eval_true("Number.isNaN(Math.expm1(NaN))");
+    }
+
+    #[test]
+    fn e2e_math_log1p_negative_zero() {
+        assert_eval_true("Object.is(Math.log1p(-0), -0)");
+    }
+
+    #[test]
+    fn e2e_math_log1p_negative_one_is_neg_infinity() {
+        assert_eval_true("Math.log1p(-1) === -Infinity");
+    }
+
+    #[test]
+    fn e2e_math_log1p_less_than_negative_one_is_nan() {
+        assert_eval_true("Number.isNaN(Math.log1p(-2))");
+    }
+
+    #[test]
+    fn e2e_math_hypot_prefers_infinity_over_nan() {
+        assert_eval_true("Math.hypot(NaN, Infinity) === Infinity");
+    }
+
+    #[test]
+    fn e2e_math_hypot_large_finite_inputs() {
+        assert_eval_true(
+            "var r = Math.hypot(1e308, 1e308); r > 1e308 && r < Infinity && r / 1e308 > 1.4 && r / 1e308 < 1.5",
+        );
+    }
+
+    #[test]
+    fn e2e_math_hypot_three_args() {
+        assert_eval_true("Math.hypot(3, 4, 12) === 13");
+    }
+
+    #[test]
+    fn e2e_math_clz32_no_args() {
+        assert_eval_true("Math.clz32() === 32");
+    }
+
+    #[test]
+    fn e2e_math_clz32_negative_one() {
+        assert_eval_true("Math.clz32(-1) === 0");
+    }
+
+    #[test]
+    fn e2e_math_clz32_wraps_32_bits() {
+        assert_eval_true("Math.clz32(4294967296) === 32");
+    }
+
+    #[test]
+    fn e2e_math_clz32_nan() {
+        assert_eval_true("Math.clz32(NaN) === 32");
+    }
+
+    #[test]
+    fn e2e_math_fround_negative_zero() {
+        assert_eval_true("Object.is(Math.fround(-0), -0)");
+    }
+
+    #[test]
+    fn e2e_math_fround_nan() {
+        assert_eval_true("Number.isNaN(Math.fround(NaN))");
+    }
+
+    #[test]
+    fn e2e_math_trunc_negative_zero() {
+        assert_eval_true("Object.is(Math.trunc(-0.123), -0)");
+    }
+
+    #[test]
+    fn e2e_math_trunc_nan() {
+        assert_eval_true("Number.isNaN(Math.trunc(NaN))");
+    }
+
+    #[test]
+    fn e2e_math_trunc_infinity() {
+        assert_eval_true("Math.trunc(Infinity) === Infinity");
+    }
+
+    #[test]
+    fn e2e_math_imul_no_args() {
+        assert_eval_true("Math.imul() === 0");
+    }
+
+    #[test]
+    fn e2e_math_imul_fractional_inputs() {
+        assert_eval_true("Math.imul(3.9, 4.9) === 12");
+    }
+
+    #[test]
+    fn e2e_math_imul_nan_is_zero() {
+        assert_eval_true("Math.imul(NaN, 7) === 0");
+    }
+
+    #[test]
+    fn e2e_math_imul_infinity_is_zero() {
+        assert_eval_true("Math.imul(Infinity, 7) === 0");
+    }
+
+    #[test]
+    fn e2e_math_max_no_args() {
+        assert_eval_true("Math.max() === -Infinity");
+    }
+
+    #[test]
+    fn e2e_math_max_nan() {
+        assert_eval_true("Number.isNaN(Math.max(1, NaN, 2))");
+    }
+
+    #[test]
+    fn e2e_math_max_prefers_positive_zero() {
+        assert_eval_true("Object.is(Math.max(-0, 0), 0)");
+    }
+
+    #[test]
+    fn e2e_math_min_no_args() {
+        assert_eval_true("Math.min() === Infinity");
+    }
+
+    #[test]
+    fn e2e_math_min_nan() {
+        assert_eval_true("Number.isNaN(Math.min(1, NaN, 2))");
+    }
+
+    #[test]
+    fn e2e_math_min_preserves_negative_zero() {
+        assert_eval_true("Object.is(Math.min(0, -0), -0)");
+    }
+
+    #[test]
+    fn e2e_math_symbol_to_string_tag() {
+        assert_eval_true("Math[Symbol.toStringTag] === 'Math'");
+    }
+
+    #[test]
+    fn e2e_math_object_to_string_tag() {
+        assert_eval_true("Object.prototype.toString.call(Math) === '[object Math]'");
     }
 
     // —— Array.prototype.with e2e tests ——————————————
