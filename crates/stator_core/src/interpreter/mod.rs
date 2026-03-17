@@ -5900,6 +5900,17 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
         }
         JsValue::Error(e) => {
             let prop_name = to_property_key(key)?;
+            // Respect non-writable and non-extensible invariants (same as
+            // PlainObject).
+            {
+                let pm = e.props.borrow();
+                if pm.contains_key(&prop_name) && !pm.is_writable(&prop_name) {
+                    return Ok(());
+                }
+                if !pm.extensible && !pm.contains_key(&prop_name) {
+                    return Ok(());
+                }
+            }
             e.props.borrow_mut().insert(prop_name, value);
         }
         _ => {}

@@ -4840,8 +4840,10 @@ fn make_object() -> JsValue {
             "freeze".into(),
             builtin_fn("freeze", 1, |args| {
                 let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
-                if let JsValue::PlainObject(map) = &obj {
-                    map.borrow_mut().freeze();
+                match &obj {
+                    JsValue::PlainObject(map) => map.borrow_mut().freeze(),
+                    JsValue::Error(e) => e.props.borrow_mut().freeze(),
+                    _ => {}
                 }
                 Ok(obj)
             }),
@@ -4852,8 +4854,10 @@ fn make_object() -> JsValue {
             "seal".into(),
             builtin_fn("seal", 1, |args| {
                 let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
-                if let JsValue::PlainObject(map) = &obj {
-                    map.borrow_mut().seal();
+                match &obj {
+                    JsValue::PlainObject(map) => map.borrow_mut().seal(),
+                    JsValue::Error(e) => e.props.borrow_mut().seal(),
+                    _ => {}
                 }
                 Ok(obj)
             }),
@@ -4866,7 +4870,11 @@ fn make_object() -> JsValue {
                 let obj = args.first().unwrap_or(&JsValue::Undefined);
                 match obj {
                     JsValue::PlainObject(map) => Ok(JsValue::Boolean(map.borrow().is_frozen())),
-                    _ => Ok(JsValue::Boolean(true)),
+                    JsValue::Error(e) => Ok(JsValue::Boolean(e.props.borrow().is_frozen())),
+                    _ if obj.is_primitive() => Ok(JsValue::Boolean(true)),
+                    // Other object types (Array, Function, etc.) are not
+                    // frozen unless the engine explicitly froze them.
+                    _ => Ok(JsValue::Boolean(false)),
                 }
             }),
         );
@@ -4878,7 +4886,9 @@ fn make_object() -> JsValue {
                 let obj = args.first().unwrap_or(&JsValue::Undefined);
                 match obj {
                     JsValue::PlainObject(map) => Ok(JsValue::Boolean(map.borrow().is_sealed())),
-                    _ => Ok(JsValue::Boolean(true)),
+                    JsValue::Error(e) => Ok(JsValue::Boolean(e.props.borrow().is_sealed())),
+                    _ if obj.is_primitive() => Ok(JsValue::Boolean(true)),
+                    _ => Ok(JsValue::Boolean(false)),
                 }
             }),
         );
@@ -5117,8 +5127,10 @@ fn make_object() -> JsValue {
             "preventExtensions".into(),
             builtin_fn("preventExtensions", 1, |args| {
                 let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
-                if let JsValue::PlainObject(map) = &obj {
-                    map.borrow_mut().extensible = false;
+                match &obj {
+                    JsValue::PlainObject(map) => map.borrow_mut().extensible = false,
+                    JsValue::Error(e) => e.props.borrow_mut().extensible = false,
+                    _ => {}
                 }
                 Ok(obj)
             }),
@@ -5131,7 +5143,10 @@ fn make_object() -> JsValue {
                 let obj = args.first().unwrap_or(&JsValue::Undefined);
                 match obj {
                     JsValue::PlainObject(map) => Ok(JsValue::Boolean(map.borrow().extensible)),
-                    _ => Ok(JsValue::Boolean(false)),
+                    JsValue::Error(e) => Ok(JsValue::Boolean(e.props.borrow().extensible)),
+                    _ if obj.is_primitive() => Ok(JsValue::Boolean(false)),
+                    // Other object types are extensible by default.
+                    _ => Ok(JsValue::Boolean(true)),
                 }
             }),
         );
@@ -34103,5 +34118,392 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::String("tdz".into()));
+    }
+
+    // ── Object.freeze / seal / preventExtensions conformance ────────────
+
+    /// Freeze prevents adding new properties to an object.
+    #[test]
+    fn test_freeze_blocks_new_property() {
+        let r = global_eval("var o = Object.freeze({a:1}); o.b = 2; typeof o.b").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// Freeze makes existing properties non-writable.
+    #[test]
+    fn test_freeze_makes_non_writable() {
+        let r = global_eval("var o = {x:10}; Object.freeze(o); o.x = 99; o.x").unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    /// Freeze returns the same object reference.
+    #[test]
+    fn test_freeze_returns_same_object() {
+        let r = global_eval("var o = {a:1}; Object.freeze(o) === o").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Freeze on an empty object makes it frozen.
+    #[test]
+    fn test_freeze_empty_object_is_frozen() {
+        let r = global_eval("Object.isFrozen(Object.freeze({}))").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Frozen object is also sealed.
+    #[test]
+    fn test_frozen_object_is_also_sealed() {
+        let r = global_eval("var o = {a:1}; Object.freeze(o); Object.isSealed(o)").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Frozen object is not extensible.
+    #[test]
+    fn test_frozen_object_not_extensible() {
+        let r = global_eval("var o = {a:1}; Object.freeze(o); Object.isExtensible(o)").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Freeze on array literal prevents element modification.
+    #[test]
+    fn test_freeze_array_literal_no_write() {
+        let r = global_eval("var a = [1,2,3]; Object.freeze(a); a[0] = 99; a[0]").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// Freeze on array literal prevents push (new property).
+    #[test]
+    fn test_freeze_array_literal_no_push() {
+        let r = global_eval(
+            "var a = [10,20]; Object.freeze(a); \
+             try { a.push(30); } catch(e) {} \
+             a.length",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// isFrozen returns true for frozen array.
+    #[test]
+    fn test_is_frozen_array_literal() {
+        let r = global_eval("var a = [1]; Object.freeze(a); Object.isFrozen(a)").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Freeze with multiple properties locks all of them.
+    #[test]
+    fn test_freeze_multiple_properties() {
+        let r = global_eval(
+            "var o = {a:1,b:2,c:3}; Object.freeze(o); o.a = 10; o.b = 20; o.c = 30; \
+             '' + o.a + o.b + o.c",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("123".into()));
+    }
+
+    /// Object.freeze on non-object primitive returns the value unchanged.
+    #[test]
+    fn test_freeze_returns_primitive_unchanged() {
+        let r = global_eval("Object.freeze('hello')").unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    /// Object.freeze on null returns null.
+    #[test]
+    fn test_freeze_null_returns_null() {
+        let r = global_eval("Object.freeze(null)").unwrap();
+        assert_eq!(r, JsValue::Null);
+    }
+
+    /// Object.freeze on undefined returns undefined.
+    #[test]
+    fn test_freeze_undefined_returns_undefined() {
+        let r = global_eval("Object.freeze(undefined)").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    /// Object.freeze on boolean returns the boolean.
+    #[test]
+    fn test_freeze_boolean_returns_boolean() {
+        let r = global_eval("Object.freeze(true)").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Object.defineProperty throws on frozen object for new property.
+    #[test]
+    fn test_freeze_define_property_new_throws() {
+        let r = global_eval(
+            "try { var o = Object.freeze({}); \
+             Object.defineProperty(o, 'x', {value:1}); 'no' } catch(e) { 'yes' }",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("yes".into()));
+    }
+
+    /// Object.defineProperty throws when changing value on frozen property.
+    #[test]
+    fn test_freeze_define_property_change_value_throws() {
+        let r = global_eval(
+            "try { var o = Object.freeze({a:1}); \
+             Object.defineProperty(o, 'a', {value:2}); 'no' } catch(e) { 'yes' }",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("yes".into()));
+    }
+
+    /// Seal returns the same object reference.
+    #[test]
+    fn test_seal_returns_same_object() {
+        let r = global_eval("var o = {a:1}; Object.seal(o) === o").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Seal allows modification of existing writable properties.
+    #[test]
+    fn test_seal_allows_write_existing() {
+        let r = global_eval("var o = {a:1}; Object.seal(o); o.a = 99; o.a").unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    /// Seal prevents adding new properties.
+    #[test]
+    fn test_seal_blocks_new_property() {
+        let r = global_eval("var o = Object.seal({a:1}); o.b = 2; typeof o.b").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// Sealed object is not extensible.
+    #[test]
+    fn test_sealed_not_extensible() {
+        let r = global_eval("var o = {a:1}; Object.seal(o); Object.isExtensible(o)").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Seal on non-object returns the value.
+    #[test]
+    fn test_seal_non_object_returns_value() {
+        let r = global_eval("Object.seal(42)").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// isSealed on empty non-extensible object returns true.
+    #[test]
+    fn test_is_sealed_empty_prevent_extensions() {
+        let r = global_eval("var o = {}; Object.preventExtensions(o); Object.isSealed(o)").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// isSealed returns false for a normal object.
+    #[test]
+    fn test_is_sealed_false_normal_object() {
+        let r = global_eval("Object.isSealed({x:1})").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// preventExtensions returns the same object.
+    #[test]
+    fn test_prevent_extensions_returns_same_object() {
+        let r = global_eval("var o = {}; Object.preventExtensions(o) === o").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// preventExtensions blocks new properties but allows modifying existing.
+    #[test]
+    fn test_prevent_extensions_modify_existing() {
+        let r = global_eval("var o = {a:1}; Object.preventExtensions(o); o.a = 42; o.a").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// preventExtensions silently ignores new property in sloppy mode.
+    #[test]
+    fn test_prevent_extensions_new_property_ignored() {
+        let r = global_eval("var o = Object.preventExtensions({}); o.x = 1; typeof o.x").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// preventExtensions on non-object returns the value.
+    #[test]
+    fn test_prevent_extensions_non_object() {
+        let r = global_eval("Object.preventExtensions('str')").unwrap();
+        assert_eq!(r, JsValue::String("str".into()));
+    }
+
+    /// isExtensible returns true for a fresh object.
+    #[test]
+    fn test_is_extensible_fresh_object() {
+        let r = global_eval("Object.isExtensible({})").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// isExtensible returns false after preventExtensions.
+    #[test]
+    fn test_is_extensible_after_prevent() {
+        let r =
+            global_eval("var o = {}; Object.preventExtensions(o); Object.isExtensible(o)").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// isExtensible returns false for primitives.
+    #[test]
+    fn test_is_extensible_primitive_false() {
+        let r = global_eval("Object.isExtensible(null)").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// isFrozen returns true for all primitive types.
+    #[test]
+    fn test_is_frozen_primitives_true() {
+        let r = global_eval(
+            "Object.isFrozen(1) && Object.isFrozen('s') && \
+             Object.isFrozen(true) && Object.isFrozen(null) && \
+             Object.isFrozen(undefined)",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// isSealed returns true for all primitive types.
+    #[test]
+    fn test_is_sealed_primitives_true() {
+        let r = global_eval(
+            "Object.isSealed(1) && Object.isSealed('s') && \
+             Object.isSealed(true) && Object.isSealed(null) && \
+             Object.isSealed(undefined)",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// isFrozen returns false for unfrozen object with properties.
+    #[test]
+    fn test_is_frozen_false_with_properties() {
+        let r = global_eval("Object.isFrozen({a:1, b:2})").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Freeze then seal is a no-op (already frozen).
+    #[test]
+    fn test_freeze_then_seal_still_frozen() {
+        let r = global_eval("var o = {a:1}; Object.freeze(o); Object.seal(o); Object.isFrozen(o)")
+            .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Seal then freeze upgrades to frozen.
+    #[test]
+    fn test_seal_then_freeze_becomes_frozen() {
+        let r = global_eval("var o = {a:1}; Object.seal(o); Object.freeze(o); Object.isFrozen(o)")
+            .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Object.getOwnPropertyDescriptor on frozen property shows correct flags.
+    #[test]
+    fn test_freeze_descriptor_flags() {
+        let r = global_eval(
+            "var o = {a:1}; Object.freeze(o); \
+             var d = Object.getOwnPropertyDescriptor(o, 'a'); \
+             d.writable + ',' + d.configurable",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("false,false".into()));
+    }
+
+    /// Object.getOwnPropertyDescriptor on sealed property shows correct flags.
+    #[test]
+    fn test_seal_descriptor_flags() {
+        let r = global_eval(
+            "var o = {a:1}; Object.seal(o); \
+             var d = Object.getOwnPropertyDescriptor(o, 'a'); \
+             d.writable + ',' + d.configurable",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true,false".into()));
+    }
+
+    /// Freeze nested object does NOT deep-freeze (shallow semantics).
+    #[test]
+    fn test_freeze_is_shallow() {
+        let r = global_eval(
+            "var inner = {x:1}; var outer = {child: inner}; \
+             Object.freeze(outer); inner.x = 99; inner.x",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    /// Object.keys still works on frozen objects.
+    #[test]
+    fn test_keys_on_frozen_object() {
+        let r =
+            global_eval("var o = {b:2, a:1}; Object.freeze(o); Object.keys(o).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("b,a".into()));
+    }
+
+    /// Object.defineProperty on sealed object rejects adding new property.
+    #[test]
+    fn test_sealed_define_property_new_throws() {
+        let r = global_eval(
+            "try { var o = Object.seal({a:1}); \
+             Object.defineProperty(o, 'b', {value:2}); 'no' } catch(e) { 'yes' }",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("yes".into()));
+    }
+
+    /// Object.defineProperty on sealed object allows changing value of writable prop.
+    #[test]
+    fn test_sealed_define_property_change_value() {
+        let r = global_eval(
+            "var o = {a:1}; Object.seal(o); \
+             Object.defineProperty(o, 'a', {value:42}); o.a",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// preventExtensions + non-configurable on all props ⇒ isSealed.
+    #[test]
+    fn test_prevent_extensions_plus_non_configurable_is_sealed() {
+        let r = global_eval(
+            "var o = {}; Object.defineProperty(o, 'a', \
+             {value:1, writable:true, configurable:false, enumerable:true}); \
+             Object.preventExtensions(o); Object.isSealed(o)",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// preventExtensions + non-configurable + non-writable ⇒ isFrozen.
+    #[test]
+    fn test_prevent_extensions_plus_non_writable_is_frozen() {
+        let r = global_eval(
+            "var o = {}; Object.defineProperty(o, 'a', \
+             {value:1, writable:false, configurable:false, enumerable:true}); \
+             Object.preventExtensions(o); Object.isFrozen(o)",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Freeze with no arguments returns undefined.
+    #[test]
+    fn test_freeze_no_args_returns_undefined() {
+        let r = global_eval("Object.freeze()").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    /// Seal with no arguments returns undefined.
+    #[test]
+    fn test_seal_no_args_returns_undefined() {
+        let r = global_eval("Object.seal()").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    /// preventExtensions with no arguments returns undefined.
+    #[test]
+    fn test_prevent_extensions_no_args_returns_undefined() {
+        let r = global_eval("Object.preventExtensions()").unwrap();
+        assert_eq!(r, JsValue::Undefined);
     }
 }
