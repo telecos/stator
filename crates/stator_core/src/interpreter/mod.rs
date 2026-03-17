@@ -408,6 +408,7 @@ pub(crate) fn plain_object_has_own_property(map: &PropertyMap, key: &str) -> boo
 }
 
 /// Returns `true` if `key` exists anywhere on `obj`'s prototype chain.
+#[allow(dead_code)]
 pub(crate) fn has_property_in_chain(obj: &JsValue, key: &str) -> bool {
     let mut current = obj.clone();
     for _ in 0..256 {
