@@ -3322,33 +3322,7 @@ impl FunctionCompiler {
                         self.compile_expr(&m.object)?;
                         let obj_reg = self.allocator.allocate_temporary();
                         self.emit_star(obj_reg);
-                        match &m.property {
-                            crate::parser::ast::MemberProp::Computed(key) => {
-                                self.compile_expr(key)?;
-                            }
-                            crate::parser::ast::MemberProp::Ident(id) => {
-                                let idx = self.add_string(&id.name);
-                                self.emit(Instruction::new_unchecked(
-                                    Opcode::LdaConstant,
-                                    vec![Operand::ConstantPoolIdx(idx)],
-                                ));
-                            }
-                            crate::parser::ast::MemberProp::Private(name) => {
-                                return Err(StatorError::SyntaxError(format!(
-                                    "private fields can not be deleted (field #{})",
-                                    name.name
-                                )));
-                            }
-                        }
-                        let delete_op = if self.is_strict {
-                            Opcode::DeletePropertyStrict
-                        } else {
-                            Opcode::DeletePropertySloppy
-                        };
-                        self.emit(Instruction::new_unchecked(
-                            delete_op,
-                            vec![to_reg_op(obj_reg)],
-                        ));
+                        self.emit_delete_property(obj_reg, &m.property)?;
                         self.allocator
                             .release_temporary(obj_reg)
                             .map_err(|e| StatorError::Internal(e.to_string()))?;
@@ -3879,7 +3853,7 @@ impl FunctionCompiler {
                 ));
             }
             crate::parser::ast::MemberProp::Computed(key) => {
-                self.compile_expr(key)?;
+                self.with_suspended_optional_chain(|this| this.compile_expr(key))?;
                 let slot = self.alloc_slot(FeedbackSlotKind::KeyedLoadProperty);
                 self.emit(Instruction::new_unchecked(
                     Opcode::LdaKeyedProperty,
@@ -3922,71 +3896,98 @@ impl FunctionCompiler {
     }
 
     /// Compile `delete obj?.prop` — short-circuit to `true` when
-    /// the base is nullish; otherwise delete normally.
+    /// the chain short-circuits; otherwise delete the final property normally.
     fn compile_delete_optional_chain(&mut self, inner: &Expr) -> StatorResult<()> {
-        // Unwrap one layer: inner should be an OptionalMember.
-        // For more complex chains (delete a?.b.c), we only support
-        // the direct OptionalMember case (delete a?.b).
+        let null_label = self.new_label();
+        let end_label = self.new_label();
+
+        let saved = self.optional_chain_null_label;
+        self.optional_chain_null_label = Some(null_label);
+
         match inner {
+            Expr::Member(m) => {
+                self.compile_expr(&m.object)?;
+                let obj_reg = self.allocator.allocate_temporary();
+                self.emit_star(obj_reg);
+                self.emit_delete_property(obj_reg, &m.property)?;
+                self.allocator
+                    .release_temporary(obj_reg)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+            }
             Expr::OptionalMember(m) => {
                 self.compile_expr(&m.object)?;
                 let obj_reg = self.allocator.allocate_temporary();
                 self.emit_star(obj_reg);
-
-                let null_label = self.new_label();
-                let end_label = self.new_label();
-
                 self.emit_ldar(obj_reg);
                 self.emit_jump(Opcode::JumpIfUndefinedOrNull, null_label);
-
-                // Object is not nullish — delete the property.
-                match &m.property {
-                    crate::parser::ast::MemberProp::Computed(key) => {
-                        self.compile_expr(key)?;
-                    }
-                    crate::parser::ast::MemberProp::Ident(id) => {
-                        let idx = self.add_string(&id.name);
-                        self.emit(Instruction::new_unchecked(
-                            Opcode::LdaConstant,
-                            vec![Operand::ConstantPoolIdx(idx)],
-                        ));
-                    }
-                    crate::parser::ast::MemberProp::Private(name) => {
-                        return Err(StatorError::SyntaxError(format!(
-                            "private fields can not be deleted (field #{})",
-                            name.name
-                        )));
-                    }
-                }
-                let delete_op = if self.is_strict {
-                    Opcode::DeletePropertyStrict
-                } else {
-                    Opcode::DeletePropertySloppy
-                };
-                self.emit(Instruction::new_unchecked(
-                    delete_op,
-                    vec![to_reg_op(obj_reg)],
-                ));
-                self.emit_jump(Opcode::Jump, end_label);
-
-                // Object is nullish — result is `true`.
-                self.bind_label(null_label);
-                self.emit(Instruction::new_unchecked(Opcode::LdaTrue, vec![]));
-                self.bind_label(end_label);
-
+                self.emit_delete_property(obj_reg, &m.property)?;
                 self.allocator
                     .release_temporary(obj_reg)
                     .map_err(|e| StatorError::Internal(e.to_string()))?;
             }
             _ => {
-                // For other shapes (e.g. `delete a?.b.c`), evaluate the
-                // chain (which may short-circuit to undefined) and then
-                // return `true` since deleting a non-reference is `true`.
-                self.compile_optional_chain(inner)?;
+                self.compile_expr(inner)?;
                 self.emit(Instruction::new_unchecked(Opcode::LdaTrue, vec![]));
+                self.optional_chain_null_label = saved;
+                self.emit_jump(Opcode::Jump, end_label);
+                self.bind_label(null_label);
+                self.emit(Instruction::new_unchecked(Opcode::LdaTrue, vec![]));
+                self.bind_label(end_label);
+                return Ok(());
             }
         }
+        self.optional_chain_null_label = saved;
+        self.emit_jump(Opcode::Jump, end_label);
+        self.bind_label(null_label);
+        self.emit(Instruction::new_unchecked(Opcode::LdaTrue, vec![]));
+        self.bind_label(end_label);
         Ok(())
+    }
+
+    fn emit_delete_property(
+        &mut self,
+        obj_reg: Register,
+        property: &crate::parser::ast::MemberProp,
+    ) -> StatorResult<()> {
+        match property {
+            crate::parser::ast::MemberProp::Computed(key) => {
+                self.with_suspended_optional_chain(|this| this.compile_expr(key))?;
+            }
+            crate::parser::ast::MemberProp::Ident(id) => {
+                let idx = self.add_string(&id.name);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaConstant,
+                    vec![Operand::ConstantPoolIdx(idx)],
+                ));
+            }
+            crate::parser::ast::MemberProp::Private(name) => {
+                return Err(StatorError::SyntaxError(format!(
+                    "private fields can not be deleted (field #{})",
+                    name.name
+                )));
+            }
+        }
+        let delete_op = if self.is_strict {
+            Opcode::DeletePropertyStrict
+        } else {
+            Opcode::DeletePropertySloppy
+        };
+        self.emit(Instruction::new_unchecked(
+            delete_op,
+            vec![to_reg_op(obj_reg)],
+        ));
+        Ok(())
+    }
+
+    fn with_suspended_optional_chain<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> StatorResult<T>,
+    ) -> StatorResult<T> {
+        let saved = self.optional_chain_null_label;
+        self.optional_chain_null_label = None;
+        let result = f(self);
+        self.optional_chain_null_label = saved;
+        result
     }
 
     /// Store the accumulator as a property of a member expression target.
@@ -4094,7 +4095,8 @@ impl FunctionCompiler {
                 .release_temporary(arr_reg)
                 .map_err(|e| StatorError::Internal(e.to_string()))?;
         } else {
-            let arg_regs = self.compile_arguments(&c.arguments)?;
+            let arg_regs =
+                self.with_suspended_optional_chain(|this| this.compile_arguments(&c.arguments))?;
 
             if is_direct_eval {
                 self.emit_call_direct_eval(callee_reg, &arg_regs)?;
@@ -4174,7 +4176,8 @@ impl FunctionCompiler {
             // Inside an OptionalChain — jump to the shared null-label.
             self.emit_jump(Opcode::JumpIfUndefinedOrNull, chain_label);
 
-            let arg_regs = self.compile_arguments(&c.arguments)?;
+            let arg_regs =
+                self.with_suspended_optional_chain(|this| this.compile_arguments(&c.arguments))?;
             self.emit_call_any_receiver(callee_reg, &arg_regs)?;
             for r in arg_regs.into_iter().rev() {
                 self.allocator
@@ -4353,7 +4356,7 @@ impl FunctionCompiler {
         self.emit_star(callee_reg);
 
         // Call with receiver.
-        let arg_regs = self.compile_arguments(args)?;
+        let arg_regs = self.with_suspended_optional_chain(|this| this.compile_arguments(args))?;
         let arg_count = arg_regs.len() as u32;
         let slot = self.alloc_slot(FeedbackSlotKind::Call);
         self.emit(Instruction::new_unchecked(
