@@ -42743,6 +42743,323 @@ mod tests {
         assert_eq!(result, JsValue::String("tdz".into()));
     }
 
+    #[test]
+    fn e2e_tdz_typeof_let_throws_reference_error() {
+        let result =
+            global_eval("function f() { try { return typeof value; } catch (e) { return e.name; } let value = 1; } f()")
+                .unwrap();
+        assert_eq!(result, JsValue::String("ReferenceError".into()));
+    }
+
+    #[test]
+    fn e2e_tdz_typeof_const_throws_reference_error() {
+        let result = global_eval(
+            "function f() { try { return typeof value; } catch (e) { return e.name; } const value = 1; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("ReferenceError".into()));
+    }
+
+    #[test]
+    fn e2e_switch_tdz_spans_entire_block_for_let() {
+        let result = global_eval(
+            "function f(tag) { switch (tag) { case 0: try { return x; } catch (e) { return e.name; } case 1: let x = 1; return x; default: return 'none'; } } f(0)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("ReferenceError".into()));
+    }
+
+    #[test]
+    fn e2e_switch_tdz_spans_entire_block_for_const() {
+        let result = global_eval(
+            "function f(tag) { switch (tag) { case 0: try { return x; } catch (e) { return e.name; } case 1: const x = 1; return x; default: return 'none'; } } f(0)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("ReferenceError".into()));
+    }
+
+    #[test]
+    fn e2e_nested_block_let_shadowing_keeps_outer_value() {
+        let result = global_eval("let x = 'outer'; { let x = 'inner'; } x").unwrap();
+        assert_eq!(result, JsValue::String("outer".into()));
+    }
+
+    #[test]
+    fn e2e_nested_block_const_shadowing_keeps_outer_value() {
+        let result = global_eval("const x = 'outer'; { const x = 'inner'; } x").unwrap();
+        assert_eq!(result, JsValue::String("outer".into()));
+    }
+
+    #[test]
+    fn e2e_var_inside_block_hoists_to_function_scope() {
+        let result =
+            global_eval("function f() { if (true) { var x = 42; } return x; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_let_inside_if_does_not_leak() {
+        let result = global_eval("if (true) { let hidden = 1; } typeof hidden").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_const_inside_if_does_not_leak() {
+        let result = global_eval("if (true) { const hidden = 1; } typeof hidden").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_closure_captures_outer_var_binding() {
+        let result = global_eval(
+            "function outer() { var x = 5; return function() { return x; }; } outer()()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_closure_captures_outer_let_binding() {
+        let result = global_eval(
+            "function outer() { let x = 6; return function() { return x; }; } outer()()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_closure_observes_var_updates() {
+        let result = global_eval(
+            "function outer() { var x = 1; var read = function() { return x; }; x = 9; return read(); } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn e2e_closure_observes_let_updates() {
+        let result = global_eval(
+            "function outer() { let x = 2; var read = function() { return x; }; x = 8; return read(); } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(8));
+    }
+
+    #[test]
+    fn e2e_closure_instances_keep_separate_var_state() {
+        let result = global_eval(
+            "function makeCounter() { var x = 0; return function() { x = x + 1; return x; }; } var a = makeCounter(); var b = makeCounter(); a() + ',' + a() + ',' + b()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1,2,1".into()));
+    }
+
+    #[test]
+    fn e2e_for_var_closures_share_final_binding() {
+        let result = global_eval(
+            "function f() { var out = []; var fns = []; for (var i = 0; i < 3; i++) { fns.push(function() { return i; }); } for (var j = 0; j < 3; j++) out.push(fns[j]()); return out.join(','); } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("3,3,3".into()));
+    }
+
+    #[test]
+    fn e2e_for_let_closures_get_fresh_bindings() {
+        let result = global_eval(
+            "function f() { var out = []; var fns = []; for (let i = 0; i < 3; i++) { fns.push(function() { return i; }); } for (var j = 0; j < 3; j++) out.push(fns[j]()); return out.join(','); } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("0,1,2".into()));
+    }
+
+    #[test]
+    fn e2e_for_let_closures_keep_iteration_assignment() {
+        let result = global_eval(
+            "function f() { var out = []; var fns = []; for (let i = 0; i < 3; i++) { i = i + 10; fns.push(function() { return i; }); } for (var j = 0; j < 3; j++) out.push(fns[j]()); return out.join(','); } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("10,11,12".into()));
+    }
+
+    #[test]
+    fn e2e_for_let_closure_inside_nested_block_uses_iteration_binding() {
+        let result = global_eval(
+            "function f() { var out = []; var fns = []; for (let i = 0; i < 3; i++) { { fns.push(function() { return i; }); } } for (var j = 0; j < 3; j++) out.push(fns[j]()); return out.join(','); } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("0,1,2".into()));
+    }
+
+    #[test]
+    fn e2e_function_decl_hoists_before_first_statement_in_function() {
+        let result = global_eval(
+            "function outer() { return inner(); function inner() { return 12; } } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(12));
+    }
+
+    #[test]
+    fn e2e_strict_block_function_is_block_scoped() {
+        let result = global_eval(
+            "function f() { 'use strict'; { function g() { return 1; } } return typeof g; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_sloppy_block_function_uses_annex_b_binding() {
+        let result = global_eval(
+            "function f() { if (true) { function g() { return 21; } } return g(); } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(21));
+    }
+
+    #[test]
+    fn e2e_const_reassignment_in_function_reports_type_error_name() {
+        let result = global_eval(
+            "function f() { const x = 1; try { x = 2; } catch (e) { return e.name; } } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("TypeError".into()));
+    }
+
+    #[test]
+    fn e2e_const_reassignment_in_block_reports_type_error_name() {
+        let result =
+            global_eval("{ const x = 1; try { x = 2; } catch (e) { x; return e.name; } }").unwrap();
+        assert_eq!(result, JsValue::String("TypeError".into()));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_param_reads_arguments_assignment() {
+        let result = global_eval("function f(a) { arguments[0] = 7; return a; } f(1)").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_arguments_mapped_arguments_reads_param_assignment() {
+        let result = global_eval("function f(a) { a = 9; return arguments[0]; } f(1)").unwrap();
+        assert_eq!(result, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn e2e_arguments_unmapped_param_ignores_arguments_assignment() {
+        let result =
+            global_eval("function f(a) { 'use strict'; arguments[0] = 7; return a; } f(1)")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_arguments_unmapped_arguments_ignore_param_assignment() {
+        let result =
+            global_eval("function f(a) { 'use strict'; a = 9; return arguments[0]; } f(1)")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_arguments_callee_sloppy_mode_returns_function_name() {
+        let result =
+            global_eval("function outer() { return arguments.callee.name; } outer()").unwrap();
+        assert_eq!(result, JsValue::String("outer".into()));
+    }
+
+    #[test]
+    fn e2e_direct_eval_reads_outer_var_binding() {
+        let result =
+            global_eval("function outer() { var x = 7; return eval('x'); } outer()").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_direct_eval_reads_outer_parameter_binding() {
+        let result = global_eval("function outer(x) { return eval('x'); } outer(13)").unwrap();
+        assert_eq!(result, JsValue::Smi(13));
+    }
+
+    #[test]
+    fn e2e_direct_eval_var_leaks_to_calling_scope() {
+        let result =
+            global_eval("function outer() { eval('var leaked = 9'); return leaked; } outer()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn e2e_direct_strict_eval_reads_outer_var_without_leaking() {
+        let result = global_eval(
+            "function outer() { var x = 4; return eval(\"'use strict'; x\"); } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn e2e_direct_strict_eval_does_not_leak_var_declaration() {
+        let result = global_eval(
+            "function outer() { eval(\"'use strict'; var hidden = 5\"); return typeof hidden; } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_direct_eval_declared_function_is_visible_in_caller_scope() {
+        let result = global_eval(
+            "function outer() { eval('function inner() { return 17; }'); return inner(); } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(17));
+    }
+
+    #[test]
+    fn e2e_direct_strict_eval_declared_function_is_not_visible_after_eval() {
+        let result = global_eval(
+            "function outer() { eval(\"'use strict'; function inner() { return 17; }\"); return typeof inner; } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_direct_eval_can_update_outer_var_through_closure_binding() {
+        let result =
+            global_eval("function outer() { var x = 1; eval('x = 11'); return x; } outer()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(11));
+    }
+
+    #[test]
+    fn e2e_nested_closure_reads_updated_outer_binding_after_eval() {
+        let result = global_eval(
+            "function outer() { var x = 1; var read = function() { return x; }; eval('x = 14'); return read(); } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(14));
+    }
+
+    #[test]
+    fn e2e_closure_can_read_function_body_let_binding() {
+        let result = global_eval(
+            "function outer() { let x = 22; return function() { return x; }; } outer()()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(22));
+    }
+
+    #[test]
+    fn e2e_function_body_let_is_in_tdz_before_declaration() {
+        let result = global_eval(
+            "function outer() { try { return x; } catch (e) { return e.name; } let x = 22; } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("ReferenceError".into()));
+    }
+
     // ── Iterator protocol deep conformance tests ────────────────────────
 
     /// Custom Symbol.iterator: for-of consumes all values.
