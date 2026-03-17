@@ -375,7 +375,13 @@ pub fn dataview_new(
     byte_offset: usize,
     byte_length: Option<usize>,
 ) -> StatorResult<JsDataView> {
-    let buf_len = buffer.borrow().data.len();
+    let buf_len = {
+        let buffer_ref = buffer.borrow();
+        if buffer_ref.detached {
+            return Err(StatorError::TypeError("ArrayBuffer is detached".into()));
+        }
+        buffer_ref.data.len()
+    };
     if byte_offset > buf_len {
         return Err(StatorError::RangeError(
             "Start offset is outside the bounds of the buffer".into(),
@@ -398,13 +404,46 @@ pub fn dataview_buffer(dv: &JsDataView) -> Rc<RefCell<JsArrayBuffer>> {
 }
 
 /// `DataView.prototype.byteLength` getter.
-pub fn dataview_byte_length(dv: &JsDataView) -> usize {
-    dv.byte_length
+pub fn dataview_byte_length(dv: &JsDataView) -> StatorResult<usize> {
+    dataview_validate_view(dv)?;
+    Ok(dv.byte_length)
 }
 
 /// `DataView.prototype.byteOffset` getter.
-pub fn dataview_byte_offset(dv: &JsDataView) -> usize {
-    dv.byte_offset
+pub fn dataview_byte_offset(dv: &JsDataView) -> StatorResult<usize> {
+    dataview_validate_view(dv)?;
+    Ok(dv.byte_offset)
+}
+
+fn dataview_validate_view(dv: &JsDataView) -> StatorResult<()> {
+    let buf = dv.buffer.borrow();
+    if buf.detached {
+        return Err(StatorError::TypeError("ArrayBuffer is detached".into()));
+    }
+    let Some(view_end) = dv.byte_offset.checked_add(dv.byte_length) else {
+        return Err(StatorError::TypeError("DataView is out of bounds".into()));
+    };
+    if view_end > buf.data.len() {
+        return Err(StatorError::TypeError("DataView is out of bounds".into()));
+    }
+    Ok(())
+}
+
+fn dataview_resolve_range(dv: &JsDataView, byte_offset: usize, size: usize) -> StatorResult<usize> {
+    dataview_validate_view(dv)?;
+    let Some(end) = byte_offset.checked_add(size) else {
+        return Err(StatorError::RangeError(
+            "Offset is outside the bounds of the DataView".into(),
+        ));
+    };
+    if end > dv.byte_length {
+        return Err(StatorError::RangeError(
+            "Offset is outside the bounds of the DataView".into(),
+        ));
+    }
+    dv.byte_offset.checked_add(byte_offset).ok_or_else(|| {
+        StatorError::RangeError("Offset is outside the bounds of the DataView".into())
+    })
 }
 
 macro_rules! dataview_get {
@@ -419,12 +458,7 @@ macro_rules! dataview_get {
             byte_offset: usize,
             little_endian: bool,
         ) -> StatorResult<$ty> {
-            let abs = dv.byte_offset + byte_offset;
-            if byte_offset + $n > dv.byte_length {
-                return Err(StatorError::RangeError(
-                    "Offset is outside the bounds of the DataView".into(),
-                ));
-            }
+            let abs = dataview_resolve_range(dv, byte_offset, $n)?;
             let buf = dv.buffer.borrow();
             let bytes: [u8; $n] = buf.data[abs..abs + $n]
                 .try_into()
@@ -451,12 +485,7 @@ macro_rules! dataview_set {
             value: $ty,
             little_endian: bool,
         ) -> StatorResult<()> {
-            let abs = dv.byte_offset + byte_offset;
-            if byte_offset + $n > dv.byte_length {
-                return Err(StatorError::RangeError(
-                    "Offset is outside the bounds of the DataView".into(),
-                ));
-            }
+            let abs = dataview_resolve_range(dv, byte_offset, $n)?;
             let bytes = if little_endian {
                 value.$write_le()
             } else {
@@ -1325,8 +1354,8 @@ mod tests {
     fn test_dataview_offset() {
         let buf = Rc::new(RefCell::new(arraybuffer_new(8)));
         let dv = dataview_new(Rc::clone(&buf), 4, Some(4)).unwrap();
-        assert_eq!(dataview_byte_offset(&dv), 4);
-        assert_eq!(dataview_byte_length(&dv), 4);
+        assert_eq!(dataview_byte_offset(&dv).unwrap(), 4);
+        assert_eq!(dataview_byte_length(&dv).unwrap(), 4);
         dataview_set_uint8(&dv, 0, 0xFF, false).unwrap();
         assert_eq!(dataview_get_uint8(&dv, 0, false).unwrap(), 0xFF);
     }
