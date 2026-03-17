@@ -104,6 +104,7 @@ use crate::builtins::string::{
     string_starts_with, string_strike, string_sub, string_substr, string_substring, string_sup,
     string_to_locale_lower_case, string_to_locale_upper_case, string_to_lower_case,
     string_to_upper_case, string_to_well_formed, string_trim, string_trim_end, string_trim_start,
+    utf16_len,
 };
 use crate::builtins::symbol::{
     SYMBOL_ASYNC_DISPOSE, SYMBOL_ASYNC_ITERATOR, SYMBOL_DISPOSE, SYMBOL_HAS_INSTANCE,
@@ -322,7 +323,7 @@ fn enumerable_own_string_keys(value: &JsValue) -> Vec<String> {
         JsValue::PlainObject(map) => own_string_property_keys(&map.borrow(), true),
         JsValue::Error(error) => own_string_property_keys(&error.props.borrow(), true),
         JsValue::Array(items) => (0..items.borrow().len()).map(|i| i.to_string()).collect(),
-        JsValue::String(s) => (0..s.chars().count()).map(|i| i.to_string()).collect(),
+        JsValue::String(s) => (0..utf16_len(s)).map(|i| i.to_string()).collect(),
         _ => Vec::new(),
     }
 }
@@ -4646,21 +4647,12 @@ fn make_object() -> JsValue {
                         }
                     }
                     JsValue::String(s) => {
-                        let char_count = s.chars().count();
+                        let length = utf16_len(s);
                         if key == "length" {
-                            Ok(data_desc(
-                                JsValue::Smi(char_count as i32),
-                                false,
-                                false,
-                                false,
-                            ))
+                            Ok(data_desc(JsValue::Smi(length as i32), false, false, false))
                         } else if let Ok(idx) = key.parse::<usize>() {
-                            if idx < char_count {
-                                let ch: String = s
-                                    .chars()
-                                    .nth(idx)
-                                    .map(|c| c.to_string())
-                                    .unwrap_or_default();
+                            if idx < length {
+                                let ch = string_char_at(s, idx as i64);
                                 Ok(data_desc(JsValue::String(ch.into()), false, true, false))
                             } else {
                                 Ok(JsValue::Undefined)
@@ -4768,7 +4760,7 @@ fn make_object() -> JsValue {
                         JsValue::String("name".into()),
                     ])),
                     JsValue::String(s) => {
-                        let mut keys: Vec<JsValue> = (0..s.chars().count())
+                        let mut keys: Vec<JsValue> = (0..utf16_len(s))
                             .map(|i| JsValue::String(i.to_string().into()))
                             .collect();
                         keys.push(JsValue::String("length".into()));
@@ -4948,7 +4940,7 @@ fn make_object() -> JsValue {
                         if key == "length" {
                             Ok(JsValue::Boolean(true))
                         } else if let Ok(idx) = key.parse::<usize>() {
-                            Ok(JsValue::Boolean(idx < s.chars().count()))
+                            Ok(JsValue::Boolean(idx < utf16_len(s)))
                         } else {
                             Ok(JsValue::Boolean(false))
                         }
