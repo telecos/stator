@@ -342,11 +342,7 @@ fn sync_last_index_from_props(weak: &Weak<RefCell<PropertyMap>>, re: &JsRegExp) 
     if let Some(rc) = weak.upgrade()
         && let Some(val) = rc.borrow().get("lastIndex").cloned()
     {
-        let idx = match val {
-            JsValue::Smi(n) => n.max(0) as usize,
-            JsValue::HeapNumber(n) if n.is_finite() => n.max(0.0) as usize,
-            _ => 0,
-        };
+        let idx = val.to_length().unwrap_or(0) as usize;
         re.set_last_index(idx);
     }
 }
@@ -392,7 +388,9 @@ fn call_replace_callback(
     input: &str,
     matched: &RegExpMatch,
 ) -> StatorResult<String> {
-    let mut args = Vec::with_capacity(3 + matched.captures.len());
+    let mut args = Vec::with_capacity(
+        4 + matched.captures.len() + usize::from(!matched.named_groups.is_empty()),
+    );
     args.push(JsValue::String(matched.matched.clone().into()));
     for capture in &matched.captures {
         match capture {
@@ -402,6 +400,20 @@ fn call_replace_callback(
     }
     args.push(JsValue::Smi(utf16_index(input, matched.index)));
     args.push(JsValue::String(input.to_string().into()));
+    if !matched.named_groups.is_empty() {
+        let mut groups = PropertyMap::new();
+        groups.insert("__proto__".into(), JsValue::Null);
+        for (key, value) in &matched.named_groups {
+            groups.insert(
+                key.clone(),
+                match value {
+                    Some(value) => JsValue::String(value.clone().into()),
+                    None => JsValue::Undefined,
+                },
+            );
+        }
+        args.push(JsValue::PlainObject(Rc::new(RefCell::new(groups))));
+    }
     dispatch_call_value(callback, args)?.to_js_string()
 }
 
@@ -410,43 +422,37 @@ fn regexp_replace_with_callback(
     input: &str,
     replacement: &JsValue,
 ) -> StatorResult<String> {
-    let stateful = re
-        .flags()
-        .intersects(RegExpFlags::GLOBAL | RegExpFlags::STICKY);
-    let mut result = String::new();
-    let mut next_source_position = 0usize;
+    let global = re.flags().contains(RegExpFlags::GLOBAL);
 
-    if stateful {
+    if global {
         re.set_last_index(0);
         let matches = re.symbol_match_all(input);
         if matches.is_empty() {
+            re.set_last_index(0);
             return Ok(input.to_string());
         }
 
-        let mut final_last_index = 0usize;
+        let mut result = String::new();
+        let mut next_source_position = 0usize;
         for matched in matches {
             let end = matched.index + matched.matched.len();
             result.push_str(&input[next_source_position..matched.index]);
             result.push_str(&call_replace_callback(replacement, input, &matched)?);
             next_source_position = end;
-            final_last_index = if end > matched.index {
-                end
-            } else {
-                matched.index + 1
-            };
         }
-        re.set_last_index(final_last_index);
+        result.push_str(&input[next_source_position..]);
+        re.set_last_index(0);
+        Ok(result)
     } else if let Some(matched) = re.exec(input) {
+        let mut result = String::new();
         let end = matched.index + matched.matched.len();
         result.push_str(&input[..matched.index]);
         result.push_str(&call_replace_callback(replacement, input, &matched)?);
-        next_source_position = end;
+        result.push_str(&input[end..]);
+        Ok(result)
     } else {
-        return Ok(input.to_string());
+        Ok(input.to_string())
     }
-
-    result.push_str(&input[next_source_position..]);
-    Ok(result)
 }
 
 /// Convert a [`RegExpMatch`] into a `JsValue::PlainObject` matching the
