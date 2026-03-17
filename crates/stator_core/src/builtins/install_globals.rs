@@ -40306,6 +40306,326 @@ mod tests {
     }
 
     #[test]
+    fn e2e_switch_uses_strict_equality_for_case_matching() {
+        let result = global_eval(
+            "var result = 'none'; switch ('1') { case 1: result = 'number'; break; case '1': result = 'string'; break; default: result = 'default'; } result",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("string".into()));
+    }
+
+    #[test]
+    fn e2e_switch_does_not_match_nan() {
+        let result =
+            global_eval("var value = 0 / 0; switch (value) { case value: 1; default: 2; }")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_switch_matches_objects_by_identity() {
+        let result = global_eval(
+            "var marker = {}; var other = {}; switch (marker) { case other: 0; case marker: 1; default: 2; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_switch_falls_through_without_break() {
+        let result = global_eval(
+            "var value = 0; switch (2) { case 1: value = 1; break; case 2: value = value + 2; case 3: value = value + 3; break; default: value = 99; } value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_switch_default_can_fall_through() {
+        let result = global_eval(
+            "var value = ''; switch (0) { case 1: value = 'one'; break; default: value = value + 'd'; case 2: value = value + '2'; case 3: value = value + '3'; break; } value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("d23".into()));
+    }
+
+    #[test]
+    fn e2e_switch_default_clause_can_be_first() {
+        let result = global_eval(
+            "var value = ''; switch (9) { default: value = 'default'; break; case 1: value = 'one'; } value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("default".into()));
+    }
+
+    #[test]
+    fn e2e_switch_default_clause_can_be_middle() {
+        let result = global_eval(
+            "var value = ''; switch (9) { case 1: value = 'one'; break; default: value = 'default'; case 3: value = value + ':three'; break; } value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("default:three".into()));
+    }
+
+    #[test]
+    fn e2e_switch_default_clause_can_be_last() {
+        let result = global_eval(
+            "var value = ''; switch (9) { case 1: value = 'one'; break; case 2: value = 'two'; break; default: value = 'default'; } value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("default".into()));
+    }
+
+    #[test]
+    fn e2e_switch_match_after_default_skips_default_when_default_is_first() {
+        let result = global_eval(
+            "var value = ''; switch (2) { default: value = value + 'd'; case 1: value = value + '1'; break; case 2: value = value + '2'; break; } value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("2".into()));
+    }
+
+    #[test]
+    fn e2e_switch_match_after_default_skips_default_when_default_is_middle() {
+        let result = global_eval(
+            "var value = ''; switch (3) { case 1: value = value + '1'; break; default: value = value + 'd'; case 3: value = value + '3'; break; } value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("3".into()));
+    }
+
+    #[test]
+    fn e2e_switch_match_before_default_falls_through_default() {
+        let result = global_eval(
+            "var value = ''; switch (1) { case 1: value = value + '1'; default: value = value + 'd'; case 2: value = value + '2'; break; } value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1d2".into()));
+    }
+
+    #[test]
+    fn e2e_switch_return_exits_function_on_case() {
+        let result = global_eval(
+            "function f(value) { switch (value) { case 1: return 'case'; default: return 'default'; } } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("case".into()));
+    }
+
+    #[test]
+    fn e2e_switch_return_exits_function_on_default() {
+        let result = global_eval(
+            "function f(value) { switch (value) { case 1: return 'case'; default: return 'default'; } } f(2)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("default".into()));
+    }
+
+    #[test]
+    fn e2e_const_in_switch_block_scoped() {
+        let result = global_eval("switch (1) { case 1: const x = 42; break; } typeof x").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_switch_duplicate_let_across_cases_is_syntax_error() {
+        let result =
+            global_eval("switch (1) { case 1: let x = 1; break; case 2: let x = 2; break; }")
+                .unwrap_err();
+        assert!(matches!(result, StatorError::SyntaxError(_)));
+    }
+
+    #[test]
+    fn e2e_switch_duplicate_const_across_cases_is_syntax_error() {
+        let result =
+            global_eval("switch (1) { case 1: const x = 1; break; case 2: const x = 2; break; }")
+                .unwrap_err();
+        assert!(matches!(result, StatorError::SyntaxError(_)));
+    }
+
+    #[test]
+    fn e2e_switch_braces_give_each_case_its_own_let_scope() {
+        let result = global_eval(
+            "function f(value) { switch (value) { case 1: { let x = 1; return x; } case 2: { let x = 2; return x; } default: return 3; } } f(2)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_switch_braces_give_each_case_its_own_const_scope() {
+        let result = global_eval(
+            "function f(value) { switch (value) { case 1: { const x = 1; return x; } case 2: { const x = 2; return x; } default: return 3; } } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_switch_case_expressions_stop_after_first_match() {
+        let result = global_eval(
+            "var log = ''; function tag(n) { log = log + n; return n; } var value = 0; switch (2) { case tag(1): value = 1; break; case tag(2): value = 2; break; case tag(3): value = 3; break; } log + ':' + value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("12:2".into()));
+    }
+
+    #[test]
+    fn e2e_switch_case_expressions_continue_in_order_past_default() {
+        let result = global_eval(
+            "var log = ''; function tag(n) { log = log + n; return n; } var value = ''; switch (3) { case tag(1): value = 'one'; break; default: value = 'default'; break; case tag(3): value = 'three'; break; } log + ':' + value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("13:three".into()));
+    }
+
+    #[test]
+    fn e2e_switch_no_match_evaluates_all_case_expressions_before_default() {
+        let result = global_eval(
+            "var log = ''; function tag(n) { log = log + n; return n; } var value = ''; switch (9) { case tag(1): value = 'one'; break; default: value = 'default'; break; case tag(2): value = 'two'; break; } log + ':' + value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("12:default".into()));
+    }
+
+    #[test]
+    fn e2e_break_inside_switch_only_exits_switch() {
+        let result = global_eval(
+            "var hits = 0; for (var i = 0; i < 3; i++) { switch (i) { case 1: break; default: hits = hits + 1; } } hits",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_break_label_can_exit_labeled_switch() {
+        let result = global_eval(
+            "var value = 0; outer: switch (2) { case 2: value = 1; break outer; value = 2; default: value = 3; } value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_switch_rejects_multiple_default_clauses() {
+        let result = global_eval("switch (1) { default: 1; default: 2; }").unwrap_err();
+        assert!(matches!(result, StatorError::SyntaxError(_)));
+    }
+
+    #[test]
+    fn e2e_label_can_target_expression_statement() {
+        let result = global_eval("done: 1 + 2; 7").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_label_can_target_if_statement() {
+        let result = global_eval(
+            "var value = 0; done: if (true) { value = 1; break done; value = 2; } value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_break_label_exits_nested_block() {
+        let result =
+            global_eval("var value = 0; outer: { value = 1; { break outer; } value = 2; } value")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_break_label_exits_outer_loop_from_inner_loop() {
+        let result = global_eval(
+            "var hits = 0; outer: for (var i = 0; i < 3; i++) { for (var j = 0; j < 3; j++) { hits = hits + 1; break outer; } } hits",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_continue_label_continues_outer_loop_from_inner_loop() {
+        let result = global_eval(
+            "var hits = 0; outer: for (var i = 0; i < 3; i++) { for (var j = 0; j < 3; j++) { hits = hits + 1; continue outer; } } hits",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_continue_label_can_target_middle_loop() {
+        let result = global_eval(
+            "var sum = 0; outer: for (var i = 0; i < 3; i++) { middle: for (var j = 0; j < 3; j++) { for (var k = 0; k < 3; k++) { if (k < 1) { sum = sum + 1; } else { continue middle; } sum = sum + 10; } } } sum",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn e2e_nested_labeled_loops_break_inner_label() {
+        let result = global_eval(
+            "var hits = 0; outer: for (var i = 0; i < 2; i++) { inner: for (var j = 0; j < 3; j++) { hits = hits + 1; break inner; } hits = hits + 10; } hits",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(22));
+    }
+
+    #[test]
+    fn e2e_nested_labeled_loops_break_outer_label() {
+        let result = global_eval(
+            "var hits = 0; outer: for (var i = 0; i < 3; i++) { middle: for (var j = 0; j < 3; j++) { hits = hits + 1; break outer; } } hits",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_labeled_block_break_exits_only_target_block() {
+        let result = global_eval(
+            "var value = 0; outer: { value = 1; inner: { value = value + 1; break inner; value = 99; } value = value + 1; } value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_labeled_block_inside_loop_breaks_only_block() {
+        let result = global_eval(
+            "var hits = 0; for (var i = 0; i < 2; i++) { block: { hits = hits + 1; break block; hits = hits + 100; } hits = hits + 10; } hits",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(22));
+    }
+
+    #[test]
+    fn e2e_label_on_switch_inside_loop_can_continue_outer_loop() {
+        let result = global_eval(
+            "var hits = 0; outer: for (var i = 0; i < 3; i++) { dispatch: switch (i) { case 0: hits = hits + 1; continue outer; case 1: hits = hits + 10; break dispatch; default: hits = hits + 100; } hits = hits + 1000; } hits",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2111));
+    }
+
+    #[test]
+    fn e2e_continue_non_loop_label_is_syntax_error() {
+        let result = global_eval("label: { continue label; }").unwrap_err();
+        assert!(matches!(result, StatorError::SyntaxError(_)));
+    }
+
+    #[test]
+    fn e2e_break_undefined_label_is_syntax_error() {
+        let result = global_eval("label: { break missing; }").unwrap_err();
+        assert!(matches!(result, StatorError::SyntaxError(_)));
+    }
+
+    #[test]
+    fn e2e_duplicate_labels_are_syntax_error() {
+        let result = global_eval("dup: dup: 1").unwrap_err();
+        assert!(matches!(result, StatorError::SyntaxError(_)));
+    }
+
+    #[test]
     fn e2e_var_hoisted_across_nested_blocks() {
         let result =
             global_eval("function f() { { { { var deep = 99; } } } return deep; } f()").unwrap();

@@ -2713,8 +2713,8 @@ impl FunctionCompiler {
 
     /// Compile a `switch (disc) { cases }` statement.
     ///
-    /// Each case is compiled as a sequence of equality-check + conditional
-    /// jumps.  Fall-through is implemented by *not* emitting an end-of-case
+    /// Case tests are evaluated in source order until the first match is
+    /// found. Fall-through is implemented by *not* emitting an end-of-case
     /// jump.
     fn compile_switch(&mut self, s: &crate::parser::ast::SwitchStmt) -> StatorResult<()> {
         let break_label = self.new_label();
@@ -2728,9 +2728,14 @@ impl FunctionCompiler {
         // Build a label for each case clause.
         let case_labels: Vec<usize> = s.cases.iter().map(|_| self.new_label()).collect();
 
-        // Emit the comparison chain.
-        let mut default_label: Option<usize> = None;
-        for (i, case) in s.cases.iter().enumerate() {
+        let default_index = s.cases.iter().position(|case| case.test.is_none());
+
+        for (i, case) in s
+            .cases
+            .iter()
+            .enumerate()
+            .take(default_index.unwrap_or(s.cases.len()))
+        {
             if let Some(test) = &case.test {
                 self.compile_expr(test)?;
                 let slot = self.alloc_slot(FeedbackSlotKind::Compare);
@@ -2739,14 +2744,22 @@ impl FunctionCompiler {
                     vec![to_reg_op(disc_reg), slot],
                 ));
                 self.emit_jump(Opcode::JumpIfTrue, case_labels[i]);
-            } else {
-                default_label = Some(case_labels[i]);
             }
         }
 
-        // If no case matched, jump to default or skip.
-        if let Some(dl) = default_label {
-            self.emit_jump(Opcode::Jump, dl);
+        if let Some(default_index) = default_index {
+            for (i, case) in s.cases.iter().enumerate().skip(default_index + 1) {
+                if let Some(test) = &case.test {
+                    self.compile_expr(test)?;
+                    let slot = self.alloc_slot(FeedbackSlotKind::Compare);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::TestEqualStrict,
+                        vec![to_reg_op(disc_reg), slot],
+                    ));
+                    self.emit_jump(Opcode::JumpIfTrue, case_labels[i]);
+                }
+            }
+            self.emit_jump(Opcode::Jump, case_labels[default_index]);
         } else {
             self.emit_jump(Opcode::Jump, end_label);
         }

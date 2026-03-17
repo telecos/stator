@@ -1076,6 +1076,7 @@ impl<'src> Parser<'src> {
 
         self.breakable_depth += 1;
         let mut cases = Vec::new();
+        let mut seen_default = false;
         while self.peek_kind() != TokenKind::RightBrace {
             if self.peek_kind() == TokenKind::Eof {
                 return Err(self.error("unexpected end of input in switch statement"));
@@ -1084,6 +1085,10 @@ impl<'src> Parser<'src> {
             let test = if self.eat(TokenKind::Case)? {
                 Some(self.parse_expr()?)
             } else if self.eat(TokenKind::Default)? {
+                if seen_default {
+                    return Err(self.error("switch statement cannot have multiple default clauses"));
+                }
+                seen_default = true;
                 None
             } else {
                 return Err(self.error("expected 'case' or 'default'"));
