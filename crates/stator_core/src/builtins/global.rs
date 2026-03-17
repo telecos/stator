@@ -468,7 +468,7 @@ pub fn global_eval_strict(
     let mut program = parse(source)?;
     rewrite_last_expr_to_return(&mut program);
 
-    let bytecode = BytecodeGenerator::compile_program(&program)?;
+    let bytecode = BytecodeGenerator::compile_program_with_source(&program, Some(source))?;
 
     // Strict eval: create a child environment that reads from the caller's
     // scope but writes new bindings to its own map, preventing leakage.
@@ -495,7 +495,7 @@ fn eval_core(
 
     let mut frame = match mode {
         EvalMode::Direct if is_strict => {
-            let bytecode = BytecodeGenerator::compile_program(&program)?;
+            let bytecode = BytecodeGenerator::compile_program_with_source(&program, Some(source))?;
             let env = caller_env.expect("direct eval requires a caller environment");
             let child_env = Rc::new(RefCell::new(env.borrow().clone()));
             let mut frame = InterpreterFrame::new_with_globals(bytecode, vec![], child_env);
@@ -505,14 +505,15 @@ fn eval_core(
         EvalMode::Direct => {
             // Direct eval: var declarations emit StaGlobal so they are
             // hoisted into the caller's variable environment.
-            let bytecode = BytecodeGenerator::compile_eval_program(&program)?;
+            let bytecode =
+                BytecodeGenerator::compile_eval_program_with_source(&program, Some(source))?;
             let env = caller_env.expect("direct eval requires a caller environment");
             let mut frame = InterpreterFrame::new_with_globals(bytecode, vec![], env);
             frame.context = caller_context;
             frame
         }
         EvalMode::Indirect => {
-            let bytecode = BytecodeGenerator::compile_program(&program)?;
+            let bytecode = BytecodeGenerator::compile_program_with_source(&program, Some(source))?;
             if let Some(env) = current_global_env() {
                 InterpreterFrame::new_with_globals(bytecode, vec![], env)
             } else {

@@ -28,7 +28,7 @@
 //! fixed-point resolution pass computes byte-level offsets and patches every
 //! jump instruction, iterating until no sizes change.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, rc::Rc};
 
 use crate::bytecode::bytecode_array::{
     BytecodeArray, ConstantPoolEntry, HandlerTableEntry, SourcePosition,
@@ -40,8 +40,8 @@ use crate::error::{StatorError, StatorResult};
 use crate::parser::ast::{
     ArrowBody, ArrowExpr, AssignOp, AssignTarget, BinaryOp, BlockStmt, ExportDefaultExpr,
     ExportNamedDecl, Expr, FnDecl, FnExpr, ForInit, ForStmt, ImportSpecifier, LogicalOp,
-    ModuleDecl, ModuleExportName, ObjectPatProp, Pat, Program, ProgramItem, SourceType, Stmt,
-    UnaryOp, UpdateOp, VarDecl, VarDeclarator, VarKind,
+    ModuleDecl, ModuleExportName, ObjectPatProp, Pat, Program, ProgramItem, SourceLocation,
+    SourceType, Stmt, UnaryOp, UpdateOp, VarDecl, VarDeclarator, VarKind,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,6 +170,8 @@ struct PrivateNameBinding {
 struct FunctionCompileOptions {
     self_name: Option<String>,
     private_names: HashMap<String, PrivateNameBinding>,
+    source_text: Option<Rc<str>>,
+    source_span: Option<SourceLocation>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -281,6 +283,8 @@ struct FunctionCompiler {
     private_names: HashMap<String, PrivateNameBinding>,
     /// Monotonic counter used to mint unique private storage/brand names.
     next_private_name_id: u32,
+    /// Original JavaScript source text for `Function.prototype.toString()`.
+    source_text: Option<Rc<str>>,
 }
 
 impl FunctionCompiler {
@@ -328,6 +332,7 @@ impl FunctionCompiler {
             with_depth: 0,
             private_names: HashMap::new(),
             next_private_name_id: 0,
+            source_text: None,
         };
         // Register simple ident params in the scope immediately; complex
         // patterns are handled by `emit_param_prologue`.
@@ -347,6 +352,13 @@ impl FunctionCompiler {
             }
         }
         Ok(compiler)
+    }
+
+    fn source_text_for_loc(&self, loc: SourceLocation) -> Option<String> {
+        let source = self.source_text.as_deref()?;
+        source
+            .get(loc.start.offset..loc.end.offset)
+            .map(str::to_owned)
     }
 
     /// Emit bytecode at function entry to handle default parameter values
@@ -1687,12 +1699,19 @@ impl FunctionCompiler {
     /// resulting [`BytecodeArray`] to the constant pool, emit `CreateClosure`,
     /// and bind the name to the resulting register.
     fn compile_fn_decl(&mut self, decl: &FnDecl) -> StatorResult<()> {
-        let func_array = compile_function(
+        let func_array = compile_function_inner(
             &decl.params,
             &decl.body,
             decl.is_generator,
             decl.is_async,
             decl.is_strict,
+            false,
+            FunctionCompileOptions {
+                self_name: None,
+                private_names: self.private_names.clone(),
+                source_text: self.source_text.clone(),
+                source_span: Some(decl.loc),
+            },
         )?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
         // Emit CreateClosure: [func_idx, slot, flags]
@@ -1743,7 +1762,12 @@ impl FunctionCompiler {
 
     /// Compile a class declaration statement.
     fn compile_class_decl(&mut self, decl: &crate::parser::ast::ClassDecl) -> StatorResult<()> {
-        self.compile_class(decl.id.as_ref(), decl.super_class.as_deref(), &decl.body)?;
+        self.compile_class(
+            decl.id.as_ref(),
+            decl.super_class.as_deref(),
+            &decl.body,
+            decl.loc,
+        )?;
         // Bind the class name in the current scope.
         if let Some(id) = &decl.id {
             let reg = self
@@ -1769,7 +1793,12 @@ impl FunctionCompiler {
     /// Compile a class expression (leaves the class constructor in the
     /// accumulator).
     fn compile_class_expr(&mut self, expr: &crate::parser::ast::ClassExpr) -> StatorResult<()> {
-        self.compile_class(expr.id.as_ref(), expr.super_class.as_deref(), &expr.body)
+        self.compile_class(
+            expr.id.as_ref(),
+            expr.super_class.as_deref(),
+            &expr.body,
+            expr.loc,
+        )
     }
 
     /// Compile the shared core of a class declaration or expression.
@@ -1782,6 +1811,7 @@ impl FunctionCompiler {
         id: Option<&crate::parser::ast::Ident>,
         super_class: Option<&Expr>,
         body: &crate::parser::ast::ClassBody,
+        class_loc: SourceLocation,
     ) -> StatorResult<()> {
         use crate::parser::ast::{ClassMember, MethodKind};
 
@@ -1824,6 +1854,11 @@ impl FunctionCompiler {
         };
         let ctor_array = if let Some(id) = id {
             ctor_array.with_function_name(&id.name)
+        } else {
+            ctor_array
+        };
+        let ctor_array = if let Some(source) = self.source_text_for_loc(class_loc) {
+            ctor_array.with_source_text(source)
         } else {
             ctor_array
         };
@@ -1991,29 +2026,36 @@ impl FunctionCompiler {
             PropKey::Computed(_) => None,
         };
 
-        // Compile the function with the correct name prefix for accessors.
         match method.kind {
             MethodKind::Get if key_name.is_some() => {
-                self.compile_fn_expr_named(
+                self.compile_fn_expr_named_with_source(
                     &method.value,
                     &format!("get {}", key_name.as_ref().unwrap()),
+                    method.loc,
                 )?;
             }
             MethodKind::Set if key_name.is_some() => {
-                self.compile_fn_expr_named(
+                self.compile_fn_expr_named_with_source(
                     &method.value,
                     &format!("set {}", key_name.as_ref().unwrap()),
+                    method.loc,
+                )?;
+            }
+            MethodKind::Method if key_name.is_some() => {
+                self.compile_fn_expr_named_with_source(
+                    &method.value,
+                    key_name.as_ref().unwrap(),
+                    method.loc,
                 )?;
             }
             _ => {
-                self.compile_fn_expr(&method.value)?;
+                self.compile_fn_expr_with_source(&method.value, method.loc)?;
             }
         }
 
         match method.kind {
             MethodKind::Method => {
                 if let Some(name) = key_name {
-                    self.compile_fn_expr(&method.value)?;
                     let name_idx = self.add_string(&name);
                     let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
                     self.emit(Instruction::new_unchecked(
@@ -2026,7 +2068,6 @@ impl FunctionCompiler {
                     ));
                 } else if let PropKey::Computed(key_expr) = &method.key {
                     let key_reg = self.compile_computed_property_key(key_expr)?;
-                    self.compile_fn_expr(&method.value)?;
                     let slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
                     self.emit(Instruction::new_unchecked(
                         Opcode::DefineKeyedOwnProperty,
@@ -2044,7 +2085,6 @@ impl FunctionCompiler {
             }
             MethodKind::Get => {
                 if let Some(name) = key_name {
-                    self.compile_fn_expr(&method.value)?;
                     let name_idx = self.add_string(&name);
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
@@ -2057,7 +2097,6 @@ impl FunctionCompiler {
                     ));
                 } else if let PropKey::Computed(key_expr) = &method.key {
                     let key_reg = self.compile_computed_property_key(key_expr)?;
-                    self.compile_fn_expr(&method.value)?;
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
                         Opcode::DefineKeyedGetterProperty,
@@ -2070,7 +2109,6 @@ impl FunctionCompiler {
             }
             MethodKind::Set => {
                 if let Some(name) = key_name {
-                    self.compile_fn_expr(&method.value)?;
                     let name_idx = self.add_string(&name);
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
@@ -2083,7 +2121,6 @@ impl FunctionCompiler {
                     ));
                 } else if let PropKey::Computed(key_expr) = &method.key {
                     let key_reg = self.compile_computed_property_key(key_expr)?;
-                    self.compile_fn_expr(&method.value)?;
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
                         Opcode::DefineKeyedSetterProperty,
@@ -2305,6 +2342,7 @@ impl FunctionCompiler {
             with_depth: 0,
             private_names: self.private_names.clone(),
             next_private_name_id: 0,
+            source_text: self.source_text.clone(),
         };
 
         let this_reg = Register::parameter(0);
@@ -4774,6 +4812,14 @@ impl FunctionCompiler {
 
     /// Compile a function expression.
     fn compile_fn_expr(&mut self, f: &FnExpr) -> StatorResult<()> {
+        self.compile_fn_expr_with_source(f, f.loc)
+    }
+
+    fn compile_fn_expr_with_source(
+        &mut self,
+        f: &FnExpr,
+        source_span: SourceLocation,
+    ) -> StatorResult<()> {
         // ES §15.2.4: named function expressions make their own name
         // visible as a read-only binding inside the function body.
         let self_name = f.id.as_ref().map(|id| id.name.as_str());
@@ -4787,6 +4833,8 @@ impl FunctionCompiler {
             FunctionCompileOptions {
                 self_name: self_name.map(str::to_owned),
                 private_names: self.private_names.clone(),
+                source_text: self.source_text.clone(),
+                source_span: Some(source_span),
             },
         )?;
         let func_array = if let Some(name) = self_name {
@@ -4806,6 +4854,15 @@ impl FunctionCompiler {
     /// Compile a function expression and set an inferred name on the
     /// resulting [`BytecodeArray`].
     fn compile_fn_expr_named(&mut self, f: &FnExpr, name: &str) -> StatorResult<()> {
+        self.compile_fn_expr_named_with_source(f, name, f.loc)
+    }
+
+    fn compile_fn_expr_named_with_source(
+        &mut self,
+        f: &FnExpr,
+        name: &str,
+        source_span: SourceLocation,
+    ) -> StatorResult<()> {
         // If the function has its own id, use it for the self-reference;
         // the `name` parameter is only the inferred external name.
         let self_name = f.id.as_ref().map(|id| id.name.as_str());
@@ -4819,6 +4876,8 @@ impl FunctionCompiler {
             FunctionCompileOptions {
                 self_name: self_name.map(str::to_owned),
                 private_names: self.private_names.clone(),
+                source_text: self.source_text.clone(),
+                source_span: Some(source_span),
             },
         )?
         .with_function_name(name);
@@ -4832,6 +4891,15 @@ impl FunctionCompiler {
     }
 
     fn compile_arrow_expr_named(&mut self, a: &ArrowExpr, name: &str) -> StatorResult<()> {
+        self.compile_arrow_expr_named_with_source(a, name, a.loc)
+    }
+
+    fn compile_arrow_expr_named_with_source(
+        &mut self,
+        a: &ArrowExpr,
+        name: &str,
+        source_span: SourceLocation,
+    ) -> StatorResult<()> {
         let body_block = match &a.body {
             ArrowBody::Block(b) => b.clone(),
             ArrowBody::Expr(expr) => {
@@ -4856,6 +4924,8 @@ impl FunctionCompiler {
             FunctionCompileOptions {
                 self_name: None,
                 private_names: self.private_names.clone(),
+                source_text: self.source_text.clone(),
+                source_span: Some(source_span),
             },
         )?
         .with_arrow_flag(true)
@@ -4885,6 +4955,14 @@ impl FunctionCompiler {
 
     /// Compile an arrow function expression.
     fn compile_arrow_expr(&mut self, a: &ArrowExpr) -> StatorResult<()> {
+        self.compile_arrow_expr_with_source(a, a.loc)
+    }
+
+    fn compile_arrow_expr_with_source(
+        &mut self,
+        a: &ArrowExpr,
+        source_span: SourceLocation,
+    ) -> StatorResult<()> {
         // Build a synthetic block body if the arrow uses a concise expression.
         let body_block = match &a.body {
             ArrowBody::Block(b) => b.clone(),
@@ -4911,6 +4989,8 @@ impl FunctionCompiler {
             FunctionCompileOptions {
                 self_name: None,
                 private_names: self.private_names.clone(),
+                source_text: self.source_text.clone(),
+                source_span: Some(source_span),
             },
         )?
         .with_arrow_flag(true);
@@ -5184,7 +5264,7 @@ impl FunctionCompiler {
             }
             PropValue::Method(fn_expr) => {
                 if let Some(ref name) = key_name {
-                    self.compile_fn_expr_named(fn_expr, name)?;
+                    self.compile_fn_expr_named_with_source(fn_expr, name, p.loc)?;
                 }
                 if let Some(name) = key_name {
                     let name_idx = self.add_string(&name);
@@ -5195,7 +5275,7 @@ impl FunctionCompiler {
                     ));
                 } else if let PropKey::Computed(key_expr) = &p.key {
                     let key_reg = self.compile_computed_property_key(key_expr)?;
-                    self.compile_fn_expr(fn_expr)?;
+                    self.compile_fn_expr_with_source(fn_expr, p.loc)?;
                     let slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
                     self.emit(Instruction::new_unchecked(
                         Opcode::DefineKeyedOwnProperty,
@@ -5213,7 +5293,7 @@ impl FunctionCompiler {
             }
             PropValue::Get(fn_expr) => {
                 if let Some(ref name) = key_name {
-                    self.compile_fn_expr_named(fn_expr, &format!("get {name}"))?;
+                    self.compile_fn_expr_named_with_source(fn_expr, &format!("get {name}"), p.loc)?;
                 }
                 if let Some(name) = key_name {
                     let name_idx = self.add_string(&name);
@@ -5224,7 +5304,7 @@ impl FunctionCompiler {
                     ));
                 } else if let PropKey::Computed(key_expr) = &p.key {
                     let key_reg = self.compile_computed_property_key(key_expr)?;
-                    self.compile_fn_expr(fn_expr)?;
+                    self.compile_fn_expr_with_source(fn_expr, p.loc)?;
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
                         Opcode::DefineKeyedGetterProperty,
@@ -5237,7 +5317,7 @@ impl FunctionCompiler {
             }
             PropValue::Set(fn_expr) => {
                 if let Some(ref name) = key_name {
-                    self.compile_fn_expr_named(fn_expr, &format!("set {name}"))?;
+                    self.compile_fn_expr_named_with_source(fn_expr, &format!("set {name}"), p.loc)?;
                 }
                 if let Some(name) = key_name {
                     let name_idx = self.add_string(&name);
@@ -5248,7 +5328,7 @@ impl FunctionCompiler {
                     ));
                 } else if let PropKey::Computed(key_expr) = &p.key {
                     let key_reg = self.compile_computed_property_key(key_expr)?;
-                    self.compile_fn_expr(fn_expr)?;
+                    self.compile_fn_expr_with_source(fn_expr, p.loc)?;
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
                         Opcode::DefineKeyedSetterProperty,
@@ -6637,6 +6717,8 @@ fn compile_function_with_private_names(
         FunctionCompileOptions {
             self_name: None,
             private_names,
+            source_text: None,
+            source_span: None,
         },
     )
 }
@@ -6661,8 +6743,11 @@ fn compile_function_inner(
     let FunctionCompileOptions {
         self_name,
         private_names,
+        source_text,
+        source_span,
     } = options;
     compiler.private_names = private_names;
+    compiler.source_text = source_text;
 
     // Generator / async / async-generator prologue: jump to the saved resume
     // point on re-entry.  Async functions are desugared to generators internally,
@@ -6727,6 +6812,7 @@ fn compile_function_inner(
             compiler.compile_stmt(stmt)?;
         }
     }
+    let source_text = source_span.and_then(|loc| compiler.source_text_for_loc(loc));
     let mut ba = compiler.finalize()?.with_function_length(
         params
             .iter()
@@ -6735,6 +6821,9 @@ fn compile_function_inner(
     );
     if let Some(reg) = self_name_reg {
         ba = ba.with_self_name_register(reg.0);
+    }
+    if let Some(source) = source_text {
+        ba = ba.with_source_text(source);
     }
     Ok(ba)
 }
@@ -6773,7 +6862,17 @@ impl BytecodeGenerator {
     /// The returned [`BytecodeArray`] represents the implicit top-level
     /// function that wraps all the program's statements.
     pub fn compile_program(program: &Program) -> StatorResult<BytecodeArray> {
+        Self::compile_program_with_source(program, None)
+    }
+
+    /// Compile a top-level [`Program`] while optionally preserving the
+    /// original source text for nested callable `toString()` results.
+    pub fn compile_program_with_source(
+        program: &Program,
+        source: Option<&str>,
+    ) -> StatorResult<BytecodeArray> {
         let mut compiler = FunctionCompiler::new(&[])?;
+        compiler.source_text = source.map(Rc::<str>::from);
         compiler.is_program = true;
         let is_module = program.source_type == SourceType::Module;
         compiler.is_module = is_module;
@@ -6838,7 +6937,17 @@ impl BytecodeGenerator {
     /// [`Opcode::StaGlobal`] so they are hoisted into the caller's
     /// variable environment.
     pub fn compile_eval_program(program: &Program) -> StatorResult<BytecodeArray> {
+        Self::compile_eval_program_with_source(program, None)
+    }
+
+    /// Compile an eval [`Program`] while optionally preserving the original
+    /// source text for nested callable `toString()` results.
+    pub fn compile_eval_program_with_source(
+        program: &Program,
+        source: Option<&str>,
+    ) -> StatorResult<BytecodeArray> {
         let mut compiler = FunctionCompiler::new(&[])?;
+        compiler.source_text = source.map(Rc::<str>::from);
         compiler.is_program = true;
         compiler.is_eval_scope = true;
         compiler.is_strict = program.is_strict;
