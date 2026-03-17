@@ -1493,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    fn test_enumerable_keys_skips_non_enumerable() {
+    fn test_enumerable_keys_skips_non_enumerable_v2() {
         let mut pm = PropertyMap::new();
         pm.insert("visible".to_string(), JsValue::Smi(1));
         pm.insert_with_attrs(
@@ -1536,7 +1536,7 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_preserves_spec_order() {
+    fn test_remove_preserves_spec_order_v2() {
         let mut pm = PropertyMap::new();
         pm.insert("1".to_string(), JsValue::Smi(1));
         pm.insert("0".to_string(), JsValue::Smi(2));

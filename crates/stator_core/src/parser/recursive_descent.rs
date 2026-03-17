@@ -10112,7 +10112,7 @@ mod tests {
     }
 
     #[test]
-    fn test_export_default_function() {
+    fn test_export_default_function_v2() {
         let prog = parse_module("export default function foo() {}").unwrap();
         if let ProgramItem::ModuleDecl(ModuleDecl::ExportDefault(ed)) = &prog.body[0] {
             assert!(matches!(ed.declaration, ExportDefaultExpr::Fn(_)));
@@ -10122,7 +10122,7 @@ mod tests {
     }
 
     #[test]
-    fn test_export_default_class() {
+    fn test_export_default_class_v2() {
         let prog = parse_module("export default class C {}").unwrap();
         if let ProgramItem::ModuleDecl(ModuleDecl::ExportDefault(ed)) = &prog.body[0] {
             assert!(matches!(ed.declaration, ExportDefaultExpr::Class(_)));
@@ -10234,7 +10234,7 @@ mod tests {
     }
 
     #[test]
-    fn test_export_default_async_function() {
+    fn test_export_default_async_function_v2() {
         let prog = parse_module("export default async function f() {}").unwrap();
         if let ProgramItem::ModuleDecl(ModuleDecl::ExportDefault(ed)) = &prog.body[0] {
             if let ExportDefaultExpr::Fn(ref fd) = ed.declaration {

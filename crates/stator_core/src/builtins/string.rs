@@ -2687,7 +2687,7 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_single_segment_no_substitution() {
+    fn test_raw_single_segment_no_substitution_v2() {
         assert_eq!(string_raw(&["hello"], &[]), "hello");
     }
 
@@ -2792,7 +2792,7 @@ mod tests {
     }
 
     #[test]
-    fn test_locale_compare_empty_strings() {
+    fn test_locale_compare_empty_strings_v2() {
         assert_eq!(string_locale_compare("", ""), 0);
     }
 

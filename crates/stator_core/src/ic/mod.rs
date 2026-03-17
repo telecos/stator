@@ -1397,7 +1397,7 @@ mod tests {
     #[test]
     fn test_property_entry_no_match_slow_mode() {
         use crate::objects::js_object::MAX_FAST_PROPERTIES;
-        let table = ShapeTable::new();
+        let _table = ShapeTable::new();
         let mut obj = JsObject::new();
         for i in 0..=MAX_FAST_PROPERTIES {
             obj.set_property(&format!("p{i}"), JsValue::Smi(0)).unwrap();
