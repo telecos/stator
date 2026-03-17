@@ -2101,6 +2101,111 @@ fn current_derived_constructor_this() -> Option<Rc<RefCell<PropertyMap>>> {
     }
 }
 
+fn current_native_receiver_this() -> Option<JsValue> {
+    let globals = current_global_env()?;
+    globals.borrow().get("this").cloned()
+}
+
+fn default_promise_constructor() -> Option<JsValue> {
+    let globals = current_global_env()?;
+    globals.borrow().get("Promise").cloned()
+}
+
+fn promise_static_constructor() -> Option<JsValue> {
+    current_native_receiver_this()
+        .filter(is_callable)
+        .or_else(default_promise_constructor)
+}
+
+fn promise_static_species_constructor(constructor: &JsValue) -> StatorResult<JsValue> {
+    let species = match constructor {
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            if let Some(getter) = borrow.get("__get_@@species__").cloned() {
+                drop(borrow);
+                dispatch_call_value(&getter, vec![constructor.clone()])?
+            } else {
+                borrow
+                    .get("@@species")
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+            }
+        }
+        JsValue::Function(_) | JsValue::NativeFunction(_) | JsValue::Proxy(_) => JsValue::Undefined,
+        _ => {
+            return Err(StatorError::TypeError(
+                "Promise constructor is not an object".into(),
+            ));
+        }
+    };
+
+    if species.is_undefined() || matches!(species, JsValue::Null) {
+        return Ok(constructor.clone());
+    }
+    if !is_callable(&species) {
+        return Err(StatorError::TypeError(
+            "Promise species constructor is not callable".into(),
+        ));
+    }
+    Ok(species)
+}
+
+fn promise_static_result(
+    constructor: Option<&JsValue>,
+) -> StatorResult<crate::builtins::promise::JsPromise> {
+    let result = crate::builtins::promise::promise_pending();
+    let Some(constructor) = constructor else {
+        return Ok(result);
+    };
+    let species = promise_static_species_constructor(constructor)?;
+    let prototype = dispatch_get_property_value(&species, JsValue::String("prototype".into()))?;
+    if prototype.is_object_like() {
+        result.set_prototype(Some(prototype));
+    } else if !matches!(prototype, JsValue::Undefined | JsValue::Null) {
+        return Err(StatorError::TypeError(
+            "Promise species prototype is not an object".into(),
+        ));
+    }
+    Ok(result)
+}
+
+fn promise_static_input_promises(
+    arg: Option<&JsValue>,
+    constructor: Option<&JsValue>,
+    queue: &crate::builtins::promise::MicrotaskQueue,
+) -> Result<Vec<crate::builtins::promise::JsPromise>, String> {
+    use crate::builtins::promise::promise_resolve;
+
+    let values = extract_promise_values(arg)?;
+    let Some(constructor) = constructor else {
+        return Ok(values
+            .into_iter()
+            .map(|value| match value {
+                JsValue::Promise(promise) => promise,
+                other => promise_resolve(other, queue),
+            })
+            .collect());
+    };
+
+    let resolve = dispatch_get_property_value(constructor, JsValue::String("resolve".into()))
+        .map_err(|error| error.to_string())?;
+    if !is_callable(&resolve) {
+        return Err("TypeError: Promise resolve is not callable".to_string());
+    }
+
+    values
+        .into_iter()
+        .map(|value| {
+            let resolved = dispatch_call_with_this(&resolve, constructor.clone(), vec![value])
+                .map_err(|error| error.to_string())?;
+            match resolved {
+                JsValue::Promise(promise) => Ok(promise),
+                _ => Err("TypeError: Promise resolve must return a promise".to_string()),
+            }
+        })
+        .collect()
+}
+
 fn promise_species_constructor(
     promise: &crate::builtins::promise::JsPromise,
 ) -> StatorResult<Option<JsValue>> {
@@ -10521,9 +10626,10 @@ fn make_string() -> JsValue {
 fn make_promise() -> JsValue {
     stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         use crate::builtins::promise::{
-            MicrotaskQueue, install_active_microtask_queue, promise_all, promise_all_settled,
-            promise_any, promise_new, promise_race, promise_reject, promise_resolve, promise_try,
-            promise_with_resolvers,
+            MicrotaskQueue, install_active_microtask_queue, promise_all_settled_with_result,
+            promise_all_with_result, promise_any_with_result, promise_new,
+            promise_race_with_result, promise_reject, promise_reject_with_result, promise_resolve,
+            promise_try, promise_with_resolvers,
         };
 
         let mut props = PropertyMap::new();
@@ -10636,12 +10742,27 @@ fn make_promise() -> JsValue {
             let q = queue.clone();
             props.insert(
                 "all".into(),
-                native(move |args| match extract_promise_array(args.first(), &q) {
-                    Ok(promises) => Ok(JsValue::Promise(promise_all(promises, &q))),
-                    Err(msg) => Ok(JsValue::Promise(promise_reject(
-                        JsValue::String(msg.into()),
-                        &q,
-                    ))),
+                native(move |args| {
+                    let constructor = promise_static_constructor();
+                    let result = match promise_static_result(constructor.as_ref()) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            return Ok(JsValue::Promise(promise_reject(
+                                JsValue::String(error.to_string().into()),
+                                &q,
+                            )));
+                        }
+                    };
+                    match promise_static_input_promises(args.first(), constructor.as_ref(), &q) {
+                        Ok(promises) => Ok(JsValue::Promise(promise_all_with_result(
+                            promises, result, &q,
+                        ))),
+                        Err(msg) => Ok(JsValue::Promise(promise_reject_with_result(
+                            JsValue::String(msg.into()),
+                            result,
+                            &q,
+                        ))),
+                    }
                 }),
             );
         }
@@ -10651,12 +10772,27 @@ fn make_promise() -> JsValue {
             let q = queue.clone();
             props.insert(
                 "allSettled".into(),
-                native(move |args| match extract_promise_array(args.first(), &q) {
-                    Ok(promises) => Ok(JsValue::Promise(promise_all_settled(promises, &q))),
-                    Err(msg) => Ok(JsValue::Promise(promise_reject(
-                        JsValue::String(msg.into()),
-                        &q,
-                    ))),
+                native(move |args| {
+                    let constructor = promise_static_constructor();
+                    let result = match promise_static_result(constructor.as_ref()) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            return Ok(JsValue::Promise(promise_reject(
+                                JsValue::String(error.to_string().into()),
+                                &q,
+                            )));
+                        }
+                    };
+                    match promise_static_input_promises(args.first(), constructor.as_ref(), &q) {
+                        Ok(promises) => Ok(JsValue::Promise(promise_all_settled_with_result(
+                            promises, result, &q,
+                        ))),
+                        Err(msg) => Ok(JsValue::Promise(promise_reject_with_result(
+                            JsValue::String(msg.into()),
+                            result,
+                            &q,
+                        ))),
+                    }
                 }),
             );
         }
@@ -10666,12 +10802,27 @@ fn make_promise() -> JsValue {
             let q = queue.clone();
             props.insert(
                 "any".into(),
-                native(move |args| match extract_promise_array(args.first(), &q) {
-                    Ok(promises) => Ok(JsValue::Promise(promise_any(promises, &q))),
-                    Err(msg) => Ok(JsValue::Promise(promise_reject(
-                        JsValue::String(msg.into()),
-                        &q,
-                    ))),
+                native(move |args| {
+                    let constructor = promise_static_constructor();
+                    let result = match promise_static_result(constructor.as_ref()) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            return Ok(JsValue::Promise(promise_reject(
+                                JsValue::String(error.to_string().into()),
+                                &q,
+                            )));
+                        }
+                    };
+                    match promise_static_input_promises(args.first(), constructor.as_ref(), &q) {
+                        Ok(promises) => Ok(JsValue::Promise(promise_any_with_result(
+                            promises, result, &q,
+                        ))),
+                        Err(msg) => Ok(JsValue::Promise(promise_reject_with_result(
+                            JsValue::String(msg.into()),
+                            result,
+                            &q,
+                        ))),
+                    }
                 }),
             );
         }
@@ -10681,12 +10832,27 @@ fn make_promise() -> JsValue {
             let q = queue.clone();
             props.insert(
                 "race".into(),
-                native(move |args| match extract_promise_array(args.first(), &q) {
-                    Ok(promises) => Ok(JsValue::Promise(promise_race(promises, &q))),
-                    Err(msg) => Ok(JsValue::Promise(promise_reject(
-                        JsValue::String(msg.into()),
-                        &q,
-                    ))),
+                native(move |args| {
+                    let constructor = promise_static_constructor();
+                    let result = match promise_static_result(constructor.as_ref()) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            return Ok(JsValue::Promise(promise_reject(
+                                JsValue::String(error.to_string().into()),
+                                &q,
+                            )));
+                        }
+                    };
+                    match promise_static_input_promises(args.first(), constructor.as_ref(), &q) {
+                        Ok(promises) => Ok(JsValue::Promise(promise_race_with_result(
+                            promises, result, &q,
+                        ))),
+                        Err(msg) => Ok(JsValue::Promise(promise_reject_with_result(
+                            JsValue::String(msg.into()),
+                            result,
+                            &q,
+                        ))),
+                    }
                 }),
             );
         }
@@ -11347,40 +11513,24 @@ fn make_bigint() -> JsValue {
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
-/// Extract a `Vec<JsPromise>` from an argument that should be a `JsValue::Array`.
-///
-/// Non-promise values in the array are wrapped with [`promise_resolve`] per spec.
-/// Returns `Err` with a descriptive message for non-iterable inputs.
-fn extract_promise_array(
-    arg: Option<&JsValue>,
-    queue: &crate::builtins::promise::MicrotaskQueue,
-) -> Result<Vec<crate::builtins::promise::JsPromise>, String> {
-    use crate::builtins::promise::promise_resolve;
+/// Extract iterable input values for Promise combinators.
+fn extract_promise_values(arg: Option<&JsValue>) -> Result<Vec<JsValue>, String> {
     match arg {
-        Some(JsValue::Array(arr)) => Ok(arr
-            .borrow()
-            .iter()
-            .map(|v| {
-                if let JsValue::Promise(p) = v {
-                    p.clone()
-                } else {
-                    promise_resolve(v.clone(), queue)
-                }
-            })
-            .collect()),
-        Some(other) => {
-            let type_name = match other {
-                JsValue::Null => "null",
-                JsValue::Undefined => "undefined",
-                JsValue::Boolean(_) => "boolean",
-                JsValue::Smi(_) | JsValue::HeapNumber(_) => "number",
-                JsValue::String(_) => "string",
-                _ => "object",
-            };
-            Err(format!(
-                "TypeError: {type_name} is not iterable (cannot read property Symbol(Symbol.iterator))"
-            ))
-        }
+        Some(value) => collect_iterable_values(value).map_err(|error| match error {
+            StatorError::TypeError(message) if message == "value is not iterable" => {
+                let type_name = match value {
+                    JsValue::Null => "null",
+                    JsValue::Undefined => "undefined",
+                    JsValue::Boolean(_) => "boolean",
+                    JsValue::Smi(_) | JsValue::HeapNumber(_) => "number",
+                    _ => "object",
+                };
+                format!(
+                    "TypeError: {type_name} is not iterable (cannot read property Symbol(Symbol.iterator))"
+                )
+            }
+            other => other.to_string(),
+        }),
         None => Err(
             "TypeError: undefined is not iterable (cannot read property Symbol(Symbol.iterator))"
                 .to_string(),
@@ -22895,7 +23045,7 @@ mod tests {
         let result = eval_with_microtasks(
             r#"
             var out = "";
-            Promise.allSettled("not-array").catch(function(r) { out = r; });
+            Promise.allSettled(42).catch(function(r) { out = r; });
             "#,
         );
         use crate::builtins::promise::drain_active_microtask_queue;
@@ -32192,13 +32342,249 @@ mod tests {
     fn e2e_promise_subclass_chain_result_still_settles() {
         assert_eval_true(
             "class SubPromise extends Promise {} \
-             var out = 0; \
-             new SubPromise(function(resolve) { resolve(2); })\
-               .then(function(v) { return v * 5; })\
-               .then(function(v) { out = v; }); \
-             out === 10",
+              var out = 0; \
+              new SubPromise(function(resolve) { resolve(2); })\
+                .then(function(v) { return v * 5; })\
+                .then(function(v) { out = v; }); \
+              out === 10",
         );
     }
+
+    macro_rules! promise_iterable_edge_test {
+        ($name:ident, $script:expr) => {
+            #[test]
+            fn $name() {
+                assert_eval_true($script);
+            }
+        };
+    }
+
+    promise_iterable_edge_test!(
+        e2e_promise_all_settled_set_iterable_mixed,
+        "var ok = false; Promise.allSettled(new Set([Promise.resolve(1), Promise.reject('x')]))\
+         .then(function(results) { ok = results.length === 2 && results[0].value === 1 && results[1].reason === 'x'; }); ok"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_all_settled_generator_iterable,
+        "function* values() { yield Promise.resolve('a'); yield Promise.reject('b'); } \
+         var out = ''; Promise.allSettled(values()).then(function(results) { out = results[0].status + '|' + results[1].reason; }); out === 'fulfilled|b'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_all_settled_string_iterable,
+        "var out = ''; Promise.allSettled('ok').then(function(results) { out = results[0].value + results[1].value; }); out === 'ok'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_all_settled_custom_iterator_iterable,
+        "var iterable = { [Symbol.iterator]: function() { var i = 0; return { next: function() { \
+             i += 1; if (i === 1) return { value: Promise.resolve('x'), done: false }; \
+             if (i === 2) return { value: Promise.reject('y'), done: false }; \
+             return { done: true }; } }; } }; \
+         var out = ''; Promise.allSettled(iterable).then(function(results) { out = results[0].value + '|' + results[1].reason; }); out === 'x|y'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_all_settled_empty_custom_iterable,
+        "var iterable = { [Symbol.iterator]: function() { return { next: function() { return { done: true }; } }; } }; \
+         var len = -1; Promise.allSettled(iterable).then(function(results) { len = results.length; }); len === 0"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_all_settled_preserves_iterator_order,
+        "function* values() { yield Promise.reject('first'); yield Promise.resolve('second'); yield 3; } \
+         var out = ''; Promise.allSettled(values()).then(function(results) { out = results[0].reason + ',' + results[1].value + ',' + results[2].value; }); out === 'first,second,3'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_all_settled_wraps_set_values,
+        "var out = ''; Promise.allSettled(new Set([1, true, 'z'])).then(function(results) { out = results[0].value + '|' + results[1].value + '|' + results[2].value; }); out === '1|true|z'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_all_settled_non_callable_resolve_rejects,
+        "class BadPromise extends Promise {} BadPromise.resolve = 1; \
+         var out = false; BadPromise.allSettled([1]).catch(function(e) { out = String(e).indexOf('callable') !== -1; }); out"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_all_settled_default_subclass_result,
+        "class SubPromise extends Promise {} var p = SubPromise.allSettled([1]); \
+         p instanceof SubPromise && Object.getPrototypeOf(p) === SubPromise.prototype"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_all_settled_species_override_to_promise,
+        "class SubPromise extends Promise { static get [Symbol.species]() { return Promise; } } \
+         var p = SubPromise.allSettled([1]); Object.getPrototypeOf(p) === Promise.prototype && Object.getPrototypeOf(p) !== SubPromise.prototype"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_all_settled_species_override_to_other_subclass,
+        "class OtherPromise extends Promise {} \
+         class SubPromise extends Promise { static get [Symbol.species]() { return OtherPromise; } } \
+         var p = SubPromise.allSettled([1]); p instanceof OtherPromise && Object.getPrototypeOf(p) === OtherPromise.prototype"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_all_settled_uses_symbol_iterator_once,
+        "var hits = 0; var iterable = {}; iterable[Symbol.iterator] = function() { hits += 1; return [1][Symbol.iterator](); }; \
+         var out = false; Promise.allSettled(iterable).then(function(results) { out = hits === 1 && results[0].value === 1; }); out"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_all_settled_non_iterable_number_rejects,
+        "var ok = false; Promise.allSettled(7).catch(function(e) { ok = String(e).indexOf('not iterable') !== -1; }); ok"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_all_settled_never_rejects_mixed_iterable,
+        "var ok = false; Promise.allSettled(new Set([Promise.reject('a'), Promise.resolve('b')]))\
+         .then(function(results) { ok = results[0].status === 'rejected' && results[1].status === 'fulfilled'; }, function() { ok = false; }); ok"
+    );
+
+    promise_iterable_edge_test!(
+        e2e_promise_any_set_iterable_first_fulfilled,
+        "var out = ''; Promise.any(new Set([Promise.reject('x'), Promise.resolve('y')])).then(function(value) { out = value; }); out === 'y'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_any_generator_iterable,
+        "function* values() { yield Promise.reject('a'); yield Promise.resolve('win'); } \
+         var out = ''; Promise.any(values()).then(function(value) { out = value; }); out === 'win'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_any_string_iterable,
+        "var out = ''; Promise.any('go').then(function(value) { out = value; }); out === 'g'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_any_custom_iterator_iterable,
+        "var iterable = { [Symbol.iterator]: function() { var i = 0; return { next: function() { \
+             i += 1; if (i === 1) return { value: Promise.reject('no'), done: false }; \
+             if (i === 2) return { value: Promise.resolve('yes'), done: false }; \
+             return { done: true }; } }; } }; \
+         var out = ''; Promise.any(iterable).then(function(value) { out = value; }); out === 'yes'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_any_empty_custom_iterable_rejects_aggregate,
+        "var iterable = { [Symbol.iterator]: function() { return { next: function() { return { done: true }; } }; } }; \
+         var ok = false; Promise.any(iterable).catch(function(e) { ok = e.name === 'AggregateError' && e.errors.length === 0; }); ok"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_any_errors_preserve_set_order,
+        "var out = ''; Promise.any(new Set([Promise.reject('a'), Promise.reject('b'), Promise.reject('c')]))\
+         .catch(function(e) { out = e.errors.join(','); }); out === 'a,b,c'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_any_wraps_set_values,
+        "var out = ''; Promise.any(new Set([Promise.reject('x'), 5])).then(function(value) { out = String(value); }); out === '5'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_any_non_callable_resolve_rejects,
+        "class BadPromise extends Promise {} BadPromise.resolve = 0; \
+         var out = false; BadPromise.any([1]).catch(function(e) { out = String(e).indexOf('callable') !== -1; }); out"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_any_default_subclass_result,
+        "class SubPromise extends Promise {} var p = SubPromise.any([1]); \
+         p instanceof SubPromise && Object.getPrototypeOf(p) === SubPromise.prototype"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_any_species_override_to_promise,
+        "class SubPromise extends Promise { static get [Symbol.species]() { return Promise; } } \
+         var p = SubPromise.any([1]); Object.getPrototypeOf(p) === Promise.prototype && Object.getPrototypeOf(p) !== SubPromise.prototype"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_any_species_override_to_other_subclass,
+        "class OtherPromise extends Promise {} \
+         class SubPromise extends Promise { static get [Symbol.species]() { return OtherPromise; } } \
+         var p = SubPromise.any([1]); p instanceof OtherPromise && Object.getPrototypeOf(p) === OtherPromise.prototype"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_any_uses_symbol_iterator_once,
+        "var hits = 0; var iterable = {}; iterable[Symbol.iterator] = function() { hits += 1; return [Promise.resolve(2)][Symbol.iterator](); }; \
+         var out = 0; Promise.any(iterable).then(function(value) { out = value; }); hits === 1 && out === 2"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_any_all_rejections_from_generator_in_errors,
+        "function* values() { yield Promise.reject('left'); yield Promise.reject('right'); } \
+         var out = ''; Promise.any(values()).catch(function(e) { out = e.errors[0] + '|' + e.errors[1]; }); out === 'left|right'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_any_non_iterable_number_rejects,
+        "var ok = false; Promise.any(9).catch(function(e) { ok = String(e).indexOf('not iterable') !== -1; }); ok"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_any_first_fulfillment_wins_in_custom_iterable,
+        "var iterable = { [Symbol.iterator]: function() { var i = 0; return { next: function() { \
+             i += 1; if (i === 1) return { value: Promise.reject('a'), done: false }; \
+             if (i === 2) return { value: 11, done: false }; \
+             if (i === 3) return { value: Promise.reject('b'), done: false }; \
+             return { done: true }; } }; } }; \
+         var out = 0; Promise.any(iterable).then(function(value) { out = value; }); out === 11"
+    );
+
+    promise_iterable_edge_test!(
+        e2e_promise_race_set_iterable_first_resolved,
+        "var out = ''; Promise.race(new Set([Promise.resolve('a'), Promise.resolve('b')])).then(function(value) { out = value; }); out === 'a'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_race_generator_iterable,
+        "function* values() { yield Promise.resolve('first'); yield Promise.resolve('second'); } \
+         var out = ''; Promise.race(values()).then(function(value) { out = value; }); out === 'first'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_race_string_iterable,
+        "var out = ''; Promise.race('xy').then(function(value) { out = value; }); out === 'x'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_race_custom_iterator_iterable,
+        "var iterable = { [Symbol.iterator]: function() { var i = 0; return { next: function() { \
+             i += 1; if (i === 1) return { value: Promise.resolve('one'), done: false }; \
+             if (i === 2) return { value: Promise.resolve('two'), done: false }; \
+             return { done: true }; } }; } }; \
+         var out = ''; Promise.race(iterable).then(function(value) { out = value; }); out === 'one'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_race_empty_custom_iterable_pending,
+        "var iterable = { [Symbol.iterator]: function() { return { next: function() { return { done: true }; } }; } }; \
+         var settled = false; Promise.race(iterable).then(function() { settled = true; }, function() { settled = true; }); settled === false"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_race_wraps_set_values,
+        "var out = 0; Promise.race(new Set([3, Promise.resolve(4)])).then(function(value) { out = value; }); out === 3"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_race_non_callable_resolve_rejects,
+        "class BadPromise extends Promise {} BadPromise.resolve = null; \
+         var out = false; BadPromise.race([1]).catch(function(e) { out = String(e).indexOf('callable') !== -1; }); out"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_race_default_subclass_result,
+        "class SubPromise extends Promise {} var p = SubPromise.race([1]); \
+         p instanceof SubPromise && Object.getPrototypeOf(p) === SubPromise.prototype"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_race_species_override_to_promise,
+        "class SubPromise extends Promise { static get [Symbol.species]() { return Promise; } } \
+         var p = SubPromise.race([1]); Object.getPrototypeOf(p) === Promise.prototype && Object.getPrototypeOf(p) !== SubPromise.prototype"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_race_species_override_to_other_subclass,
+        "class OtherPromise extends Promise {} \
+         class SubPromise extends Promise { static get [Symbol.species]() { return OtherPromise; } } \
+         var p = SubPromise.race([1]); p instanceof OtherPromise && Object.getPrototypeOf(p) === OtherPromise.prototype"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_race_uses_symbol_iterator_once,
+        "var hits = 0; var iterable = {}; iterable[Symbol.iterator] = function() { hits += 1; return [7][Symbol.iterator](); }; \
+         var out = 0; Promise.race(iterable).then(function(value) { out = value; }); hits === 1 && out === 7"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_race_first_rejection_from_custom_iterable,
+        "var iterable = { [Symbol.iterator]: function() { var i = 0; return { next: function() { \
+             i += 1; if (i === 1) return { value: Promise.reject('boom'), done: false }; \
+             if (i === 2) return { value: Promise.resolve('later'), done: false }; \
+             return { done: true }; } }; } }; \
+         var out = ''; Promise.race(iterable).catch(function(reason) { out = reason; }); out === 'boom'"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_race_plain_first_value_from_generator,
+        "function* values() { yield 12; yield Promise.resolve(99); } \
+         var out = 0; Promise.race(values()).then(function(value) { out = value; }); out === 12"
+    );
+    promise_iterable_edge_test!(
+        e2e_promise_race_non_iterable_number_rejects,
+        "var ok = false; Promise.race(5).catch(function(e) { ok = String(e).indexOf('not iterable') !== -1; }); ok"
+    );
+
     // ── Missing builtins: Object.getOwnPropertyDescriptor extended ──────
 
     /// `Object.getOwnPropertyDescriptor` returns all four data descriptor fields.

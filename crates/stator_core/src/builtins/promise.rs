@@ -602,6 +602,15 @@ pub fn promise_reject(reason: JsValue, queue: &MicrotaskQueue) -> JsPromise {
     promise_new(|_resolve, reject| reject(reason), queue)
 }
 
+pub(crate) fn promise_reject_with_result(
+    reason: JsValue,
+    p_result: JsPromise,
+    queue: &MicrotaskQueue,
+) -> JsPromise {
+    p_result.reject(reason, queue);
+    p_result
+}
+
 pub(crate) fn promise_pending() -> JsPromise {
     JsPromise::new_pending()
 }
@@ -864,15 +873,19 @@ fn settle_promise_finally(
 ///     panic!("expected Array");
 /// }
 /// ```
-pub fn promise_all(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromise {
+pub(crate) fn promise_all_with_result(
+    promises: Vec<JsPromise>,
+    p_result: JsPromise,
+    queue: &MicrotaskQueue,
+) -> JsPromise {
     let count = promises.len();
     if count == 0 {
-        return promise_resolve(JsValue::new_array(Vec::new()), queue);
+        p_result.resolve(JsValue::new_array(Vec::new()), queue);
+        return p_result;
     }
 
     let results: Rc<RefCell<Vec<Option<JsValue>>>> = Rc::new(RefCell::new(vec![None; count]));
     let remaining: Rc<RefCell<usize>> = Rc::new(RefCell::new(count));
-    let p_result = JsPromise::new_pending();
 
     for (i, p) in promises.into_iter().enumerate() {
         let results_f = Rc::clone(&results);
@@ -910,6 +923,12 @@ pub fn promise_all(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromis
     p_result
 }
 
+/// Returns a promise that fulfills with all input fulfillment values or rejects
+/// with the first rejection reason.
+pub fn promise_all(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromise {
+    promise_all_with_result(promises, JsPromise::new_pending(), queue)
+}
+
 // ── Static: Promise.allSettled ────────────────────────────────────────────────
 
 /// ECMAScript §27.2.4.2 `Promise.allSettled(promises)`.
@@ -921,15 +940,19 @@ pub fn promise_all(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromis
 /// - `{ status: "rejected",  reason }` for a rejected promise.
 ///
 /// An empty input resolves immediately with an empty array.
-pub fn promise_all_settled(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromise {
+pub(crate) fn promise_all_settled_with_result(
+    promises: Vec<JsPromise>,
+    p_result: JsPromise,
+    queue: &MicrotaskQueue,
+) -> JsPromise {
     let count = promises.len();
     if count == 0 {
-        return promise_resolve(JsValue::new_array(Vec::new()), queue);
+        p_result.resolve(JsValue::new_array(Vec::new()), queue);
+        return p_result;
     }
 
     let results: Rc<RefCell<Vec<Option<JsValue>>>> = Rc::new(RefCell::new(vec![None; count]));
     let remaining: Rc<RefCell<usize>> = Rc::new(RefCell::new(count));
-    let p_result = JsPromise::new_pending();
 
     for (i, p) in promises.into_iter().enumerate() {
         let results_f = Rc::clone(&results);
@@ -966,6 +989,11 @@ pub fn promise_all_settled(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> 
     p_result
 }
 
+/// Returns a promise that always fulfills with per-input settlement records.
+pub fn promise_all_settled(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromise {
+    promise_all_settled_with_result(promises, JsPromise::new_pending(), queue)
+}
+
 /// Decrement `remaining` and, if it reaches zero, resolve `p_result` with
 /// all collected values.
 fn settle_all_settled(
@@ -999,16 +1027,20 @@ fn settle_all_settled(
 ///
 /// An empty input rejects immediately with an `AggregateError` containing an
 /// empty errors list.
-pub fn promise_any(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromise {
+pub(crate) fn promise_any_with_result(
+    promises: Vec<JsPromise>,
+    p_result: JsPromise,
+    queue: &MicrotaskQueue,
+) -> JsPromise {
     let count = promises.len();
     if count == 0 {
         let agg = JsError::new_aggregate(Vec::new(), "All promises were rejected".to_string());
-        return promise_reject(JsValue::Error(Rc::new(agg)), queue);
+        p_result.reject(JsValue::Error(Rc::new(agg)), queue);
+        return p_result;
     }
 
     let errors: Rc<RefCell<Vec<Option<JsValue>>>> = Rc::new(RefCell::new(vec![None; count]));
     let remaining: Rc<RefCell<usize>> = Rc::new(RefCell::new(count));
-    let p_result = JsPromise::new_pending();
 
     for (i, p) in promises.into_iter().enumerate() {
         let p_result_f = p_result.clone();
@@ -1046,6 +1078,12 @@ pub fn promise_any(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromis
     p_result
 }
 
+/// Returns a promise that fulfills with the first fulfillment value or rejects
+/// with an `AggregateError` once every input rejects.
+pub fn promise_any(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromise {
+    promise_any_with_result(promises, JsPromise::new_pending(), queue)
+}
+
 // ── Static: Promise.race ──────────────────────────────────────────────────────
 
 /// ECMAScript §27.2.4.6 `Promise.race(promises)`.
@@ -1054,9 +1092,11 @@ pub fn promise_any(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromis
 /// input promise to settle.
 ///
 /// An empty input returns a forever-pending promise.
-pub fn promise_race(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromise {
-    let p_result = JsPromise::new_pending();
-
+pub(crate) fn promise_race_with_result(
+    promises: Vec<JsPromise>,
+    p_result: JsPromise,
+    queue: &MicrotaskQueue,
+) -> JsPromise {
     for p in promises {
         let p_result_f = p_result.clone();
         let q_f = queue.clone();
@@ -1077,6 +1117,11 @@ pub fn promise_race(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromi
     }
 
     p_result
+}
+
+/// Returns a promise that settles with the first settled input promise.
+pub fn promise_race(promises: Vec<JsPromise>, queue: &MicrotaskQueue) -> JsPromise {
+    promise_race_with_result(promises, JsPromise::new_pending(), queue)
 }
 
 // ── Static: Promise.withResolvers ─────────────────────────────────────────────

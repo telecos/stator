@@ -1820,13 +1820,49 @@ fn handle_call_property(
             }
         }
         JsValue::NativeFunction(f) => {
-            ctx.frame.accumulator = f(args)?;
+            let this_val = ctx.frame.read_reg(recv_v)?.clone();
+            let old_this = ctx.frame.global_env.borrow().get("this").cloned();
+            ctx.frame
+                .global_env
+                .borrow_mut()
+                .insert("this".to_string(), this_val);
+            let result = f(args);
+            match old_this {
+                Some(value) => {
+                    ctx.frame
+                        .global_env
+                        .borrow_mut()
+                        .insert("this".to_string(), value);
+                }
+                None => {
+                    ctx.frame.global_env.borrow_mut().remove("this");
+                }
+            }
+            ctx.frame.accumulator = result?;
         }
         JsValue::PlainObject(ref map) => {
             let call_val = map.borrow().get("__call__").cloned();
             match call_val {
                 Some(JsValue::NativeFunction(f)) => {
-                    ctx.frame.accumulator = f(args)?;
+                    let this_val = ctx.frame.read_reg(recv_v)?.clone();
+                    let old_this = ctx.frame.global_env.borrow().get("this").cloned();
+                    ctx.frame
+                        .global_env
+                        .borrow_mut()
+                        .insert("this".to_string(), this_val);
+                    let result = f(args);
+                    match old_this {
+                        Some(value) => {
+                            ctx.frame
+                                .global_env
+                                .borrow_mut()
+                                .insert("this".to_string(), value);
+                        }
+                        None => {
+                            ctx.frame.global_env.borrow_mut().remove("this");
+                        }
+                    }
+                    ctx.frame.accumulator = result?;
                 }
                 Some(JsValue::Function(ba)) => {
                     call_plain_object_function(ctx, &ba, map, args)?;

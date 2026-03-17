@@ -6000,7 +6000,25 @@ pub fn dispatch_call_with_this(
             pop_call_frame();
             result
         }
-        JsValue::NativeFunction(f) => f(args),
+        JsValue::NativeFunction(f) => {
+            let globals = CURRENT_GLOBALS
+                .with(|g| g.borrow().clone())
+                .ok_or_else(|| {
+                    StatorError::ReferenceError("global environment unavailable".into())
+                })?;
+            let old_this = globals.borrow().get("this").cloned();
+            globals.borrow_mut().insert("this".to_string(), this_val);
+            let result = f(args);
+            match old_this {
+                Some(value) => {
+                    globals.borrow_mut().insert("this".to_string(), value);
+                }
+                None => {
+                    globals.borrow_mut().remove("this");
+                }
+            }
+            result
+        }
         JsValue::PlainObject(map) => {
             let call_fn = map.borrow().get("__call__").cloned();
             if let Some(f) = call_fn {
