@@ -17380,6 +17380,592 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
+    // ── Map/Set deep conformance e2e tests ──────────────────────────────────
+
+    #[test]
+    fn e2e_map_constructor_empty() {
+        let r = global_eval("var m = new Map(); m.size === 0").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_constructor_with_pairs() {
+        let r = global_eval(
+            r#"
+            var m = new Map([["a", 1], ["b", 2]]);
+            m.size === 2 && m.get("a") === 1 && m.get("b") === 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_get_missing_returns_undefined() {
+        let r = global_eval("var m = new Map(); m.get('x') === undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_set_returns_map_for_chaining() {
+        let r = global_eval("var m = new Map(); m.set(1, 'a').set(2, 'b'); m.size === 2").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_has_true_and_false() {
+        let r = global_eval("var m = new Map([[1, 'a']]); m.has(1) === true && m.has(2) === false")
+            .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_delete_returns_boolean() {
+        let r = global_eval(
+            r#"
+            var m = new Map([["k", 1]]);
+            var a = m.delete("k");
+            var b = m.delete("k");
+            a === true && b === false && m.size === 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_clear_empties() {
+        let r = global_eval("var m = new Map([[1,1],[2,2]]); m.clear(); m.size === 0").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_size_getter() {
+        let r = global_eval(
+            r#"
+            var m = new Map([["a", 1]]);
+            var desc = Object.getOwnPropertyDescriptor(m, "size");
+            typeof desc.get === "function" && m.size === 1
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_foreach_callback_signature() {
+        let r = global_eval(
+            r#"
+            var m = new Map([["k", "v"]]);
+            var args = [];
+            m.forEach(function(value, key, map) {
+                args.push(value, key, map === m);
+            });
+            args[0] === "v" && args[1] === "k" && args[2] === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_keys_iterator() {
+        let r = global_eval(
+            r#"
+            var m = new Map([["a", 1], ["b", 2]]);
+            var it = m.keys();
+            it.next().value === "a" && it.next().value === "b" && it.next().done === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_values_iterator() {
+        let r = global_eval(
+            r#"
+            var m = new Map([["a", 10], ["b", 20]]);
+            var it = m.values();
+            it.next().value === 10 && it.next().value === 20 && it.next().done === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_entries_iterator() {
+        let r = global_eval(
+            r#"
+            var m = new Map([["x", 1]]);
+            var it = m.entries();
+            var e = it.next().value;
+            e[0] === "x" && e[1] === 1 && it.next().done === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_symbol_iterator_is_entries() {
+        let r = global_eval(
+            r#"
+            var m = new Map([[1, 2]]);
+            var it = m[Symbol.iterator]();
+            var e = it.next().value;
+            e[0] === 1 && e[1] === 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_nan_key_equality() {
+        let r = global_eval(
+            r#"
+            var m = new Map();
+            m.set(NaN, "val");
+            m.has(NaN) === true && m.get(NaN) === "val" && m.size === 1
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_nan_key_dedup() {
+        let r = global_eval(
+            r#"
+            var m = new Map();
+            m.set(NaN, 1);
+            m.set(NaN, 2);
+            m.size === 1 && m.get(NaN) === 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_negative_zero_normalization() {
+        let r = global_eval(
+            r#"
+            var m = new Map();
+            m.set(-0, "neg");
+            m.has(0) === true && m.get(0) === "neg" && m.size === 1
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_to_string_tag() {
+        let r = global_eval(
+            r#"
+            var m = new Map();
+            Object.prototype.toString.call(m) === "[object Map]"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_insertion_order() {
+        let r = global_eval(
+            r#"
+            var m = new Map();
+            m.set("c", 3); m.set("a", 1); m.set("b", 2);
+            var keys = [];
+            m.forEach(function(v, k) { keys.push(k); });
+            keys[0] === "c" && keys[1] === "a" && keys[2] === "b"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_set_overwrites_preserves_order() {
+        let r = global_eval(
+            r#"
+            var m = new Map([["a", 1], ["b", 2]]);
+            m.set("a", 99);
+            var it = m.keys();
+            it.next().value === "a" && it.next().value === "b" && m.get("a") === 99
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // ── Set deep conformance e2e tests ──────────────────────────────────────
+
+    #[test]
+    fn e2e_set_constructor_empty() {
+        let r = global_eval("var s = new Set(); s.size === 0").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_constructor_with_array_dedup() {
+        let r = global_eval("var s = new Set([1, 2, 3, 2, 1]); s.size === 3").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_add_returns_set_for_chaining() {
+        let r = global_eval("var s = new Set(); s.add(1).add(2).add(3); s.size === 3").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_has_true_and_false() {
+        let r = global_eval("var s = new Set([10, 20]); s.has(10) === true && s.has(30) === false")
+            .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_delete_returns_boolean() {
+        let r = global_eval(
+            r#"
+            var s = new Set([42]);
+            var a = s.delete(42);
+            var b = s.delete(42);
+            a === true && b === false && s.size === 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_clear_empties() {
+        let r = global_eval("var s = new Set([1, 2, 3]); s.clear(); s.size === 0").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_size_getter() {
+        let r = global_eval(
+            r#"
+            var s = new Set([1, 2]);
+            var desc = Object.getOwnPropertyDescriptor(s, "size");
+            typeof desc.get === "function" && s.size === 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_foreach_callback_signature() {
+        let r = global_eval(
+            r#"
+            var s = new Set(["val"]);
+            var args = [];
+            s.forEach(function(value, key, set) {
+                args.push(value, key, set === s);
+            });
+            args[0] === "val" && args[1] === "val" && args[2] === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_values_iterator() {
+        let r = global_eval(
+            r#"
+            var s = new Set(["a", "b"]);
+            var it = s.values();
+            it.next().value === "a" && it.next().value === "b" && it.next().done === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_keys_same_as_values() {
+        let r = global_eval(
+            r#"
+            var s = new Set([1]);
+            var k = s.keys().next().value;
+            var v = s.values().next().value;
+            k === v && k === 1
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_entries_value_value_pairs() {
+        let r = global_eval(
+            r#"
+            var s = new Set(["x"]);
+            var e = s.entries().next().value;
+            e[0] === "x" && e[1] === "x"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_symbol_iterator_is_values() {
+        let r = global_eval(
+            r#"
+            var s = new Set([42]);
+            var it = s[Symbol.iterator]();
+            it.next().value === 42
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_nan_dedup() {
+        let r =
+            global_eval("var s = new Set(); s.add(NaN); s.add(NaN); s.size === 1 && s.has(NaN)")
+                .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_negative_zero_normalization() {
+        let r =
+            global_eval("var s = new Set(); s.add(-0); s.has(0) === true && s.size === 1").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_to_string_tag() {
+        let r = global_eval(
+            r#"
+            var s = new Set();
+            Object.prototype.toString.call(s) === "[object Set]"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_insertion_order() {
+        let r = global_eval(
+            r#"
+            var s = new Set();
+            s.add("c"); s.add("a"); s.add("b");
+            var vals = [];
+            s.forEach(function(v) { vals.push(v); });
+            vals[0] === "c" && vals[1] === "a" && vals[2] === "b"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_re_add_after_delete_goes_to_end() {
+        let r = global_eval(
+            r#"
+            var s = new Set([1, 2, 3]);
+            s.delete(2);
+            s.add(2);
+            var it = s.values();
+            it.next().value === 1 && it.next().value === 3 && it.next().value === 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // ── WeakMap/WeakSet conformance e2e tests ───────────────────────────────
+
+    #[test]
+    fn e2e_weakmap_object_key_round_trip() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            var key = {};
+            wm.set(key, 42);
+            wm.has(key) === true && wm.get(key) === 42
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_delete_works() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            var key = {};
+            wm.set(key, "val");
+            var a = wm.delete(key);
+            var b = wm.delete(key);
+            a === true && b === false && wm.has(key) === false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_rejects_non_object_key() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            var threw = false;
+            try { wm.set(42, "val"); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_to_string_tag() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            Object.prototype.toString.call(wm) === "[object WeakMap]"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_no_size_property() {
+        let r = global_eval("var wm = new WeakMap(); wm.size === undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_object_add_has() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            var obj = {};
+            ws.add(obj);
+            ws.has(obj) === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_delete_works() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            var obj = {};
+            ws.add(obj);
+            var a = ws.delete(obj);
+            var b = ws.delete(obj);
+            a === true && b === false && ws.has(obj) === false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_rejects_non_object_value() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            var threw = false;
+            try { ws.add("string"); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_to_string_tag() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            Object.prototype.toString.call(ws) === "[object WeakSet]"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_no_size_property() {
+        let r = global_eval("var ws = new WeakSet(); ws.size === undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_constructor_from_another_map() {
+        let r = global_eval(
+            r#"
+            var m1 = new Map([["a", 1], ["b", 2]]);
+            var m2 = new Map(m1);
+            m2.size === 2 && m2.get("a") === 1 && m2.get("b") === 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_constructor_from_string() {
+        let r = global_eval(
+            r#"
+            var s = new Set("abc");
+            s.size === 3 && s.has("a") && s.has("b") && s.has("c")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_map_undefined_and_null_keys() {
+        let r = global_eval(
+            r#"
+            var m = new Map();
+            m.set(undefined, "undef");
+            m.set(null, "nil");
+            m.get(undefined) === "undef" && m.get(null) === "nil" && m.size === 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_mixed_types() {
+        let r = global_eval(
+            r#"
+            var s = new Set([1, "1", true, null, undefined]);
+            s.size === 5 && s.has(1) && s.has("1") && s.has(true) && s.has(null) && s.has(undefined)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
     // ── WeakMap constructor tests ────────────────────────────────────────────
 
     /// `WeakMap` global is a PlainObject with a `__call__` constructor.
