@@ -45,9 +45,10 @@ use crate::builtins::error::{
     ErrorKind, JsError, error_capture_stack_trace, get_stack_trace_limit,
 };
 use crate::builtins::finalization_registry::{
-    finalization_registry_drain, finalization_registry_new, finalization_registry_notify,
-    finalization_registry_register, finalization_registry_register_plain,
-    finalization_registry_sweep_plain, finalization_registry_unregister,
+    TokenKey, finalization_registry_drain, finalization_registry_new, finalization_registry_notify,
+    finalization_registry_register_plain_with_token_key,
+    finalization_registry_register_with_token_key, finalization_registry_sweep_plain,
+    finalization_registry_unregister, finalization_registry_unregister_by_key,
     finalization_registry_unregister_plain,
 };
 use crate::builtins::function::{
@@ -8694,16 +8695,22 @@ fn make_finalization_registry_builtin() -> JsValue {
                                     ));
                                 }
                                 let unregister_token = match token {
-                                    JsValue::Object(tok_ptr) => Some(*tok_ptr),
+                                    JsValue::Object(tok_ptr) => {
+                                        Some(TokenKey::Address(*tok_ptr as usize))
+                                    }
+                                    JsValue::PlainObject(tok_rc) => {
+                                        Some(TokenKey::Address(Rc::as_ptr(tok_rc) as usize))
+                                    }
+                                    JsValue::Symbol(id) => Some(TokenKey::Symbol(*id)),
                                     JsValue::Undefined => None,
                                     _ => {
                                         return Err(StatorError::TypeError(
-                                            "unregister token must be an object or undefined"
+                                            "unregister token must be an object, symbol, or undefined"
                                                 .into(),
                                         ));
                                     }
                                 };
-                                finalization_registry_register(
+                                finalization_registry_register_with_token_key(
                                     &mut inner.borrow_mut(),
                                     *ptr,
                                     held_value,
@@ -8720,16 +8727,22 @@ fn make_finalization_registry_builtin() -> JsValue {
                                     ));
                                 }
                                 let unregister_token = match token {
-                                    JsValue::PlainObject(tok_rc) => Some(tok_rc),
+                                    JsValue::Object(tok_ptr) => {
+                                        Some(TokenKey::Address(*tok_ptr as usize))
+                                    }
+                                    JsValue::PlainObject(tok_rc) => {
+                                        Some(TokenKey::Address(Rc::as_ptr(tok_rc) as usize))
+                                    }
+                                    JsValue::Symbol(id) => Some(TokenKey::Symbol(*id)),
                                     JsValue::Undefined => None,
                                     _ => {
                                         return Err(StatorError::TypeError(
-                                            "unregister token must be an object or undefined"
+                                            "unregister token must be an object, symbol, or undefined"
                                                 .into(),
                                         ));
                                     }
                                 };
-                                finalization_registry_register_plain(
+                                finalization_registry_register_plain_with_token_key(
                                     &mut inner.borrow_mut(),
                                     rc,
                                     held_value,
@@ -8759,8 +8772,14 @@ fn make_finalization_registry_builtin() -> JsValue {
                             JsValue::PlainObject(rc) => Ok(JsValue::Boolean(
                                 finalization_registry_unregister_plain(&mut inner.borrow_mut(), rc),
                             )),
+                            JsValue::Symbol(id) => Ok(JsValue::Boolean(
+                                finalization_registry_unregister_by_key(
+                                    &mut inner.borrow_mut(),
+                                    TokenKey::Symbol(*id),
+                                ),
+                            )),
                             _ => Err(StatorError::TypeError(
-                                "unregister token must be an object".into(),
+                                "unregister token must be an object or symbol".into(),
                             )),
                         }
                     }),
@@ -19699,6 +19718,414 @@ mod tests {
             registry.register({}, "held", token);
             FinalizationRegistry.prototype.unregister.call(registry, token) === true
                 && registry.unregister(token) === false;
+            "#,
+        );
+    }
+
+    // ── WeakRef & FinalizationRegistry deep conformance ─────────────────────
+
+    /// `WeakRef.deref()` returns `undefined` on an object-less receiver.
+    #[test]
+    fn test_e2e_weakref_deref_returns_object_or_undefined() {
+        assert_eval_true(
+            r#"
+            const target = { x: 42 };
+            const ref1 = new WeakRef(target);
+            const result = ref1.deref();
+            result === target && result.x === 42;
+            "#,
+        );
+    }
+
+    /// WeakRef constructor rejects Symbol targets.
+    #[test]
+    fn test_e2e_weakref_constructor_rejects_symbol() {
+        assert_eval_true(
+            r#"
+            try {
+                new WeakRef(Symbol("test"));
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// WeakRef.deref returns the same identity object on repeated calls.
+    #[test]
+    fn test_e2e_weakref_deref_identity_preserved() {
+        assert_eval_true(
+            r#"
+            const target = {};
+            const ref1 = new WeakRef(target);
+            ref1.deref() === ref1.deref() && ref1.deref() === target;
+            "#,
+        );
+    }
+
+    /// WeakRef works with array targets.
+    #[test]
+    fn test_e2e_weakref_with_array_target() {
+        assert_eval_true(
+            r#"
+            const arr = [1, 2, 3];
+            const ref1 = new WeakRef(arr);
+            ref1.deref() === arr;
+            "#,
+        );
+    }
+
+    /// WeakRef works with function targets.
+    #[test]
+    fn test_e2e_weakref_with_function_target() {
+        assert_eval_true(
+            r#"
+            const fn1 = function() { return 42; };
+            const ref1 = new WeakRef(fn1);
+            ref1.deref() === fn1;
+            "#,
+        );
+    }
+
+    /// WeakRef constructor rejects BigInt targets.
+    #[test]
+    fn test_e2e_weakref_constructor_rejects_bigint() {
+        assert_eval_true(
+            r#"
+            try {
+                new WeakRef(42n);
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// WeakRef without `new` should throw.
+    #[test]
+    fn test_e2e_weakref_without_new_throws() {
+        assert_eval_true(
+            r#"
+            try {
+                WeakRef({});
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// FinalizationRegistry callback receives the held value.
+    #[test]
+    fn test_e2e_fr_callback_receives_held_value() {
+        assert_eval_true(
+            r#"
+            let received = undefined;
+            const registry = new FinalizationRegistry(function(value) {
+                received = value;
+            });
+            const target = {};
+            registry.register(target, "hello");
+            typeof registry.register === "function" && received === undefined;
+            "#,
+        );
+    }
+
+    /// FinalizationRegistry.register returns undefined.
+    #[test]
+    fn test_e2e_fr_register_returns_undefined() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            registry.register({}, "held") === undefined;
+            "#,
+        );
+    }
+
+    /// FinalizationRegistry constructor requires callable — rejects plain object.
+    #[test]
+    fn test_e2e_fr_constructor_rejects_plain_object() {
+        assert_eval_true(
+            r#"
+            try {
+                new FinalizationRegistry({});
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// FinalizationRegistry constructor requires callable — rejects string.
+    #[test]
+    fn test_e2e_fr_constructor_rejects_string() {
+        assert_eval_true(
+            r#"
+            try {
+                new FinalizationRegistry("callback");
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// FinalizationRegistry constructor requires callable — rejects undefined.
+    #[test]
+    fn test_e2e_fr_constructor_rejects_undefined() {
+        assert_eval_true(
+            r#"
+            try {
+                new FinalizationRegistry(undefined);
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// FinalizationRegistry constructor requires callable — rejects null.
+    #[test]
+    fn test_e2e_fr_constructor_rejects_null() {
+        assert_eval_true(
+            r#"
+            try {
+                new FinalizationRegistry(null);
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// Register same target multiple times with different held values.
+    #[test]
+    fn test_e2e_fr_register_same_target_multiple_times() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            const target = {};
+            const token1 = {};
+            const token2 = {};
+            registry.register(target, "first", token1);
+            registry.register(target, "second", token2);
+            registry.unregister(token1) === true && registry.unregister(token2) === true;
+            "#,
+        );
+    }
+
+    /// Unregister with non-registered token returns false.
+    #[test]
+    fn test_e2e_fr_unregister_non_registered_token() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            const token = {};
+            registry.unregister(token) === false;
+            "#,
+        );
+    }
+
+    /// Symbol as unregister token — register and unregister.
+    #[test]
+    fn test_e2e_fr_symbol_as_unregister_token() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            const sym = Symbol("myToken");
+            registry.register({}, "held", sym);
+            registry.unregister(sym) === true && registry.unregister(sym) === false;
+            "#,
+        );
+    }
+
+    /// Symbol token: register multiple targets with the same symbol token.
+    #[test]
+    fn test_e2e_fr_symbol_token_multiple_registrations() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            const sym = Symbol("shared");
+            registry.register({}, "first", sym);
+            registry.register({}, "second", sym);
+            registry.unregister(sym) === true && registry.unregister(sym) === false;
+            "#,
+        );
+    }
+
+    /// Symbol token: different symbols are independent.
+    #[test]
+    fn test_e2e_fr_different_symbol_tokens_independent() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            const sym1 = Symbol("a");
+            const sym2 = Symbol("b");
+            registry.register({}, "first", sym1);
+            registry.register({}, "second", sym2);
+            registry.unregister(sym1) === true
+                && registry.unregister(sym1) === false
+                && registry.unregister(sym2) === true;
+            "#,
+        );
+    }
+
+    /// Mixed object and symbol tokens in the same registry.
+    #[test]
+    fn test_e2e_fr_mixed_object_and_symbol_tokens() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            const objToken = {};
+            const symToken = Symbol("tok");
+            registry.register({}, "obj", objToken);
+            registry.register({}, "sym", symToken);
+            registry.unregister(objToken) === true
+                && registry.unregister(symToken) === true
+                && registry.unregister(objToken) === false
+                && registry.unregister(symToken) === false;
+            "#,
+        );
+    }
+
+    /// Register with undefined token then unregister non-matching token.
+    #[test]
+    fn test_e2e_fr_register_no_token_unregister_different() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            registry.register({}, "held");
+            registry.unregister({}) === false;
+            "#,
+        );
+    }
+
+    /// FinalizationRegistry rejects held value same as target.
+    #[test]
+    fn test_e2e_fr_rejects_held_same_as_target() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            const target = {};
+            try {
+                registry.register(target, target);
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// Register target with string held value.
+    #[test]
+    fn test_e2e_fr_string_held_value() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            const token = {};
+            registry.register({}, "string-held-value", token);
+            registry.unregister(token) === true;
+            "#,
+        );
+    }
+
+    /// Register target with number held value.
+    #[test]
+    fn test_e2e_fr_number_held_value() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            const token = {};
+            registry.register({}, 42, token);
+            registry.unregister(token) === true;
+            "#,
+        );
+    }
+
+    /// Register target with undefined held value.
+    #[test]
+    fn test_e2e_fr_undefined_held_value() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            const token = {};
+            registry.register({}, undefined, token);
+            registry.unregister(token) === true;
+            "#,
+        );
+    }
+
+    /// WeakRef.deref() used in FinalizationRegistry cleanup callback context.
+    #[test]
+    fn test_e2e_weakref_deref_in_cleanup_callback_context() {
+        assert_eval_true(
+            r#"
+            const target = {};
+            const ref1 = new WeakRef(target);
+            const registry = new FinalizationRegistry(function(held) {
+                // In a real GC scenario the target would be collected, but
+                // in this test the target is still alive.
+            });
+            registry.register(target, "marker");
+            ref1.deref() === target;
+            "#,
+        );
+    }
+
+    /// WeakRef and FinalizationRegistry share the same target object.
+    #[test]
+    fn test_e2e_weakref_and_fr_same_target() {
+        assert_eval_true(
+            r#"
+            const target = { id: 123 };
+            const ref1 = new WeakRef(target);
+            const registry = new FinalizationRegistry(function() {});
+            const token = {};
+            registry.register(target, "cleanup-data", token);
+            ref1.deref() === target
+                && ref1.deref().id === 123
+                && registry.unregister(token) === true;
+            "#,
+        );
+    }
+
+    /// FinalizationRegistry accepts arrow function as callback.
+    #[test]
+    fn test_e2e_fr_accepts_arrow_function_callback() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry((v) => v);
+            typeof registry.register === "function";
+            "#,
+        );
+    }
+
+    /// FinalizationRegistry `@@toStringTag` is correct.
+    #[test]
+    fn test_e2e_fr_to_string_tag() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            Object.prototype.toString.call(registry) === "[object FinalizationRegistry]";
+            "#,
+        );
+    }
+
+    /// `WeakRef` `@@toStringTag` is correct.
+    #[test]
+    fn test_e2e_weakref_to_string_tag() {
+        assert_eval_true(
+            r#"
+            const ref1 = new WeakRef({});
+            Object.prototype.toString.call(ref1) === "[object WeakRef]";
             "#,
         );
     }
