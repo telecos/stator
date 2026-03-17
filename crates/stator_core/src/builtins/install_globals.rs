@@ -23,6 +23,9 @@ use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::builtins::proxy::proxy_get;
+use crate::builtins::typed_array::{
+    arraybuffer_byte_length, dataview_byte_length, dataview_byte_offset,
+};
 use std::rc::Rc;
 
 use crate::builtins::date::{
