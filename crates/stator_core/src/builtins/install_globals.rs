@@ -53417,6 +53417,284 @@ mod tests {
         r#"var out = "abac".split(/a/y); out.length === 3 && out[0] === "" && out[1] === "b" && out[2] === "c""#
     );
 
+    // ── RegExp replace/split/exec deep conformance ───────────────────────
+
+    string_symbol_dispatch_test!(
+        /// Functional replacers receive the whole match and captures.
+        e2e_regexp_replace_function_receives_match_and_captures_deep,
+        r#""12-34".replace(/(\d+)-(\d+)/, function(m, a, b) { return m + "|" + a + "|" + b; }) === "12-34|12|34""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Functional replacers receive the UTF-16 offset.
+        e2e_regexp_replace_function_receives_utf16_offset_deep,
+        r#""😀12".replace(/(\d+)/, function(m, a, off) { return a + ":" + off; }) === "😀12:2""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Functional replacers receive the original input string.
+        e2e_regexp_replace_function_receives_input_string_deep,
+        r#""ab12cd".replace(/(\d+)/, function(m, a, off, input) { return input === "ab12cd" && off === 2 ? "[" + a + "]" : "bad"; }) === "ab[12]cd""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Named-group replacers receive a null-prototype groups object.
+        e2e_regexp_replace_function_groups_null_proto_deep,
+        r#""2024-07".replace(/(?<year>\d{4})-(?<month>\d{2})/, function(m, y, mo, off, input, groups) { return Object.getPrototypeOf(groups) === null && groups.year === y && groups.month === mo ? "ok" : "bad"; }) === "ok""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Non-participating named groups are undefined in replacers.
+        e2e_regexp_replace_function_groups_undefined_entry_deep,
+        r#""a".replace(/(?<x>a)|(?<y>b)/, function(m, x, y, off, input, groups) { return groups.x === "a" && groups.y === undefined ? "ok" : "bad"; }) === "ok""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Replacers without named groups do not receive a groups argument.
+        e2e_regexp_replace_function_without_groups_argument_deep,
+        r#""12".replace(/(\d+)/, function(m, a, off, input) { return arguments.length === 4 ? "ok" : "bad"; }) === "ok""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Global functional replacement visits every match.
+        e2e_regexp_replace_function_global_visits_all_matches_deep,
+        r#""a1b2c3".replace(/(\d)/g, function(m, d, off) { return "[" + d + ":" + off + "]"; }) === "a[1:1]b[2:3]c[3:5]""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `$$` inserts a literal dollar in regexp replacement.
+        e2e_regexp_replace_substitution_dollar_dollar_deep,
+        r#""abc".replace(/b/, "$$") === "a$c""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `$&` inserts the matched text in regexp replacement.
+        e2e_regexp_replace_substitution_dollar_amp_deep,
+        r#""abc".replace(/b/, "<$&>") === "a<b>c""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// ``$``` inserts the prefix in regexp replacement.
+        e2e_regexp_replace_substitution_prefix_deep,
+        r#""abc123def".replace(/\d+/, "$`") === "abcabcdef""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `$'` inserts the suffix in regexp replacement.
+        e2e_regexp_replace_substitution_suffix_deep,
+        r#""abc123def".replace(/\d+/, "$'") === "abcdefdef""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `$1` expands the first capture in regexp replacement.
+        e2e_regexp_replace_substitution_capture_one_deep,
+        r#""abc123def".replace(/(\d)(\d)(\d)/, "[$1]") === "abc[1]def""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `$10` falls back to `$1` plus a literal `0` when capture 10 is absent.
+        e2e_regexp_replace_substitution_capture_ten_fallback_deep,
+        r#""abc123def".replace(/(\d)(\d)(\d)/, "$10") === "abc10def""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Invalid two-digit captures remain literal text.
+        e2e_regexp_replace_substitution_invalid_two_digit_capture_deep,
+        r#""abc123def".replace(/(\d)(\d)(\d)/, "$99") === "abc$99def""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `$<name>` expands named captures in regexp replacement.
+        e2e_regexp_replace_substitution_named_capture_deep,
+        r#""2024-07".replace(/(?<y>\d{4})-(?<m>\d{2})/, "$<m>/$<y>") === "07/2024""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Missing named captures produce the empty string.
+        e2e_regexp_replace_substitution_missing_named_capture_deep,
+        r#""2024-07".replace(/(?<y>\d{4})-(?<m>\d{2})/, "$<missing>") === ""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `$<name>` stays literal when the regexp has no named captures.
+        e2e_regexp_replace_substitution_named_capture_literal_without_groups_deep,
+        r#""a".replace(/a/, "$<x>") === "$<x>""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Direct `@@replace` supports global replacements.
+        e2e_regexp_symbol_replace_direct_global_deep,
+        r#"var re = /\d/g; re[Symbol.replace]("a1b2c3", "X") === "aXbXcX""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Direct `@@replace` supports functional replacers with groups.
+        e2e_regexp_symbol_replace_direct_function_named_groups_deep,
+        r#"var re = /(?<year>\d{4})-(?<month>\d{2})/; re[Symbol.replace]("2024-07", function(m, y, mo, off, input, groups) { return groups.month + "/" + groups.year + "@" + off; }) === "07/2024@0""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `String.prototype.replace` with a string search passes the match, offset, and input.
+        e2e_string_replace_function_string_search_signature_deep,
+        r#""zabz".replace("ab", function(m, off, input) { return m + ":" + off + ":" + input; }) === "zab:1:zabzz""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Direct `@@split` returns an array for basic matches.
+        e2e_regexp_symbol_split_direct_basic_deep,
+        r#"var re = /,/; var out = re[Symbol.split]("a,b,c"); Array.isArray(out) && out.length === 3 && out[0] === "a" && out[2] === "c""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Direct `@@split` honours the limit argument.
+        e2e_regexp_symbol_split_direct_limit_deep,
+        r#"var re = /,/; var out = re[Symbol.split]("a,b,c", 2); out.length === 2 && out[0] === "a" && out[1] === "b""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Direct `@@split` with limit `0` returns an empty array.
+        e2e_regexp_symbol_split_direct_zero_limit_deep,
+        r#"var re = /,/; var out = re[Symbol.split]("a,b,c", 0); Array.isArray(out) && out.length === 0"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Direct `@@split` includes capture groups in the result.
+        e2e_regexp_symbol_split_direct_captures_deep,
+        r#"var re = /(\d)/; var out = re[Symbol.split]("a1b2c"); out.length === 5 && out[1] === "1" && out[3] === "2""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Direct `@@split` includes undefined for non-participating captures.
+        e2e_regexp_symbol_split_direct_undefined_capture_deep,
+        r#"var re = /-(x)?/; var out = re[Symbol.split]("a-b"); out.length === 3 && out[0] === "a" && out[1] === undefined && out[2] === "b""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Zero-width direct `@@split` produces individual characters.
+        e2e_regexp_symbol_split_direct_zero_width_characters_deep,
+        r#"var re = /(?:)/; var out = re[Symbol.split]("ab"); out.length === 2 && out[0] === "a" && out[1] === "b""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Zero-width direct `@@split` respects the limit argument.
+        e2e_regexp_symbol_split_direct_zero_width_limit_deep,
+        r#"var re = /(?:)/; var out = re[Symbol.split]("ab", 1); out.length === 1 && out[0] === "a""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Empty input with an empty-match regexp splits to an empty array.
+        e2e_regexp_symbol_split_direct_empty_input_empty_match_deep,
+        r#"var re = /(?:)/; var out = re[Symbol.split](""); Array.isArray(out) && out.length === 0"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// No-match direct `@@split` returns the original string.
+        e2e_regexp_symbol_split_direct_no_match_deep,
+        r#"var re = /\d+/; var out = re[Symbol.split]("abc"); out.length === 1 && out[0] === "abc""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Lookahead matches can split without consuming characters.
+        e2e_regexp_symbol_split_direct_lookahead_deep,
+        r#"var re = /(?=b)/; var out = re[Symbol.split]("abc"); out.length === 2 && out[0] === "a" && out[1] === "bc""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Plain regexps are scanned sticky-style during split.
+        e2e_regexp_symbol_split_direct_plain_scans_sticky_style_deep,
+        r#"var re = /a/; var out = re[Symbol.split]("baab"); out.length === 3 && out[0] === "b" && out[1] === "" && out[2] === "b""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Sticky regexps produce the same split result.
+        e2e_regexp_symbol_split_direct_sticky_flag_deep,
+        r#"var re = /a/y; var out = re[Symbol.split]("baab"); out.length === 3 && out[0] === "b" && out[1] === "" && out[2] === "b""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Direct `@@split` preserves the original `lastIndex`.
+        e2e_regexp_symbol_split_direct_preserves_last_index_deep,
+        r#"var re = /a/g; re.lastIndex = 2; re[Symbol.split]("baab"); re.lastIndex === 2"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Capture groups count toward the split limit.
+        e2e_regexp_symbol_split_direct_capture_limit_deep,
+        r#"var re = /(\d)/; var out = re[Symbol.split]("a1b2c", 4); out.length === 4 && out[0] === "a" && out[1] === "1" && out[2] === "b" && out[3] === "2""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Splitting at the end keeps a trailing empty string.
+        e2e_regexp_symbol_split_direct_trailing_empty_deep,
+        r#"var re = /,/; var out = re[Symbol.split]("a,"); out.length === 2 && out[0] === "a" && out[1] === """#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Splitting at the start keeps a leading empty string.
+        e2e_regexp_symbol_split_direct_leading_empty_deep,
+        r#"var re = /,/; var out = re[Symbol.split](",a"); out.length === 2 && out[0] === "" && out[1] === "a""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Adjacent matches keep empty strings between separators.
+        e2e_regexp_symbol_split_direct_adjacent_matches_deep,
+        r#"var re = /,/; var out = re[Symbol.split]("a,,b"); out.length === 3 && out[0] === "a" && out[1] === "" && out[2] === "b""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Global regexps split correctly and preserve empties.
+        e2e_regexp_symbol_split_direct_global_flag_deep,
+        r#"var re = /a/g; var out = re[Symbol.split]("baab"); out.length === 3 && out[0] === "b" && out[1] === "" && out[2] === "b""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Empty-input optional matches still return an empty array.
+        e2e_regexp_symbol_split_direct_empty_input_optional_match_deep,
+        r#"var re = /a?/; var out = re[Symbol.split](""); Array.isArray(out) && out.length === 0"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Lookaheads at the start do not create an extra leading empty string.
+        e2e_regexp_symbol_split_direct_lookahead_at_start_deep,
+        r#"var re = /(?=a)/; var out = re[Symbol.split]("ab"); out.length === 1 && out[0] === "ab""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `exec` groups objects have a null prototype.
+        e2e_regexp_exec_groups_null_proto_deep,
+        r#"var m = /(?<x>a)/.exec("a"); Object.getPrototypeOf(m.groups) === null && m.groups.x === "a""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `exec` groups objects expose undefined for missing named groups.
+        e2e_regexp_exec_groups_undefined_entry_deep,
+        r#"var m = /(?<x>a)|(?<y>b)/.exec("a"); m.groups.x === "a" && m.groups.y === undefined"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `exec` with `/d` exposes an array-like indices result.
+        e2e_regexp_exec_indices_array_like_deep,
+        r#"var m = /(\d+)/d.exec("a42"); Array.isArray(m.indices) && m.indices.length === 2 && m.indices[0][0] === 1 && m.indices[0][1] === 3"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `exec` with `/d` exposes null-prototype named indices groups.
+        e2e_regexp_exec_indices_groups_null_proto_deep,
+        r#"var m = /(?<num>\d+)/d.exec("a42"); Object.getPrototypeOf(m.indices.groups) === null && m.indices.groups.num[0] === 1 && m.indices.groups.num[1] === 3"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `exec` without named groups leaves `indices.groups` undefined.
+        e2e_regexp_exec_indices_groups_undefined_deep,
+        r#"var m = /(\d+)/d.exec("a42"); m.indices.groups === undefined"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `exec` with `/d` exposes capture index pairs.
+        e2e_regexp_exec_indices_capture_pairs_deep,
+        r#"var m = /(\d+)-(\d+)/d.exec("a12-34b"); m.indices[1][0] === 1 && m.indices[1][1] === 3 && m.indices[2][0] === 4 && m.indices[2][1] === 6"#
+    );
+
     string_symbol_dispatch_test!(
         /// `String.prototype.matchAll` delegates to custom `@@matchAll`.
         e2e_string_match_all_custom_symbol_dispatch,
