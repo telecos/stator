@@ -22455,6 +22455,295 @@ mod tests {
         assert_eq!(result, JsValue::BigInt(0));
     }
 
+    // ── Optional chaining / nullish coalescing (ES2020) ───────────────────
+
+    #[test]
+    fn e2e_optional_member_null_returns_undefined() {
+        assert_eq!(
+            global_eval("let obj = null; obj?.prop").unwrap(),
+            JsValue::Undefined
+        );
+    }
+
+    #[test]
+    fn e2e_optional_member_undefined_returns_undefined() {
+        assert_eq!(
+            global_eval("let obj = undefined; obj?.prop").unwrap(),
+            JsValue::Undefined
+        );
+    }
+
+    #[test]
+    fn e2e_optional_member_existing_reads_property() {
+        assert_eq!(
+            global_eval("let obj = { prop: 7 }; obj?.prop").unwrap(),
+            JsValue::Smi(7)
+        );
+    }
+
+    #[test]
+    fn e2e_optional_computed_null_returns_undefined() {
+        assert_eq!(
+            global_eval("let obj = null; obj?.['prop']").unwrap(),
+            JsValue::Undefined
+        );
+    }
+
+    #[test]
+    fn e2e_optional_computed_short_circuits_key_expression() {
+        assert_eval_true("let hits = 0; let obj = null; obj?.[hits++]; hits === 0;");
+    }
+
+    #[test]
+    fn e2e_optional_computed_reads_present_key() {
+        assert_eq!(
+            global_eval("let obj = { prop: 9 }; obj?.['prop']").unwrap(),
+            JsValue::Smi(9)
+        );
+    }
+
+    #[test]
+    fn e2e_optional_call_null_returns_undefined() {
+        assert_eq!(
+            global_eval("let fnc = null; fnc?.()").unwrap(),
+            JsValue::Undefined
+        );
+    }
+
+    #[test]
+    fn e2e_optional_call_undefined_returns_undefined() {
+        assert_eq!(
+            global_eval("let fnc = undefined; fnc?.()").unwrap(),
+            JsValue::Undefined
+        );
+    }
+
+    #[test]
+    fn e2e_optional_call_invokes_function() {
+        assert_eq!(
+            global_eval("(function () { return 5; })?.()").unwrap(),
+            JsValue::Smi(5)
+        );
+    }
+
+    #[test]
+    fn e2e_optional_call_short_circuits_arguments() {
+        assert_eval_true("let hits = 0; let fnc = null; fnc?.(hits++); hits === 0;");
+    }
+
+    #[test]
+    fn e2e_optional_member_then_call_null_returns_undefined() {
+        assert_eq!(
+            global_eval("let obj = null; obj?.method()").unwrap(),
+            JsValue::Undefined
+        );
+    }
+
+    #[test]
+    fn e2e_optional_member_then_call_preserves_receiver() {
+        assert_eq!(
+            global_eval("let obj = { value: 7, method() { return this.value; } }; obj?.method()")
+                .unwrap(),
+            JsValue::Smi(7)
+        );
+    }
+
+    #[test]
+    fn e2e_optional_member_then_call_short_circuits_arguments() {
+        assert_eval_true("let hits = 0; let obj = null; obj?.method(hits++); hits === 0;");
+    }
+
+    #[test]
+    fn e2e_optional_chain_all_present_returns_deep_value() {
+        assert_eq!(
+            global_eval("let obj = { prop: { nested: { deep: 11 } } }; obj?.prop?.nested?.deep")
+                .unwrap(),
+            JsValue::Smi(11)
+        );
+    }
+
+    #[test]
+    fn e2e_optional_chain_null_root_returns_undefined() {
+        assert_eq!(
+            global_eval("let obj = null; obj?.prop?.nested?.deep").unwrap(),
+            JsValue::Undefined
+        );
+    }
+
+    #[test]
+    fn e2e_optional_chain_null_middle_returns_undefined() {
+        assert_eq!(
+            global_eval("let obj = { prop: null }; obj?.prop?.nested?.deep").unwrap(),
+            JsValue::Undefined
+        );
+    }
+
+    #[test]
+    fn e2e_optional_chain_short_circuits_non_optional_tail() {
+        assert_eq!(
+            global_eval("let obj = null; obj?.a.b.c").unwrap(),
+            JsValue::Undefined
+        );
+    }
+
+    #[test]
+    fn e2e_optional_chain_short_circuits_continuation_side_effects() {
+        assert_eval_true("let hits = 0; let obj = null; obj?.a[hits++].c; hits === 0;");
+    }
+
+    #[test]
+    fn e2e_optional_call_then_access_present_returns_value() {
+        assert_eq!(
+            global_eval("let obj = { method() { return { result: 13 }; } }; obj?.method()?.result")
+                .unwrap(),
+            JsValue::Smi(13)
+        );
+    }
+
+    #[test]
+    fn e2e_optional_call_then_access_null_root_returns_undefined() {
+        assert_eq!(
+            global_eval("let obj = null; obj?.method()?.result").unwrap(),
+            JsValue::Undefined
+        );
+    }
+
+    #[test]
+    fn e2e_optional_call_then_access_null_result_returns_undefined() {
+        assert_eq!(
+            global_eval("let obj = { method() { return null; } }; obj?.method()?.result").unwrap(),
+            JsValue::Undefined
+        );
+    }
+
+    #[test]
+    fn e2e_delete_optional_member_on_null_returns_true() {
+        assert_eval_true("let obj = null; delete obj?.prop;");
+    }
+
+    #[test]
+    fn e2e_delete_optional_member_deletes_existing_property() {
+        assert_eval_true("let obj = { prop: 1 }; delete obj?.prop && !('prop' in obj);");
+    }
+
+    #[test]
+    fn e2e_delete_optional_member_short_circuits_computed_key() {
+        assert_eval_true("let hits = 0; let obj = null; delete obj?.[hits++]; hits === 0;");
+    }
+
+    #[test]
+    fn e2e_delete_optional_chain_null_root_returns_true() {
+        assert_eval_true("let obj = null; delete obj?.a.b;");
+    }
+
+    #[test]
+    fn e2e_delete_optional_chain_deletes_nonoptional_tail() {
+        assert_eval_true("let obj = { a: { b: 1 } }; delete obj?.a.b && !('b' in obj.a);");
+    }
+
+    #[test]
+    fn e2e_delete_optional_nested_optional_null_middle_returns_true() {
+        assert_eval_true("let obj = { a: null }; delete obj?.a?.b;");
+    }
+
+    #[test]
+    fn e2e_delete_optional_nonoptional_tail_throws_type_error() {
+        assert_eval_true(
+            "try { delete ({ a: null })?.a.b; false; } catch (e) { e.name === 'TypeError'; }",
+        );
+    }
+
+    #[test]
+    fn e2e_nullish_coalesce_null_uses_rhs() {
+        assert_eq!(global_eval("null ?? 4").unwrap(), JsValue::Smi(4));
+    }
+
+    #[test]
+    fn e2e_nullish_coalesce_undefined_uses_rhs() {
+        assert_eq!(global_eval("undefined ?? 6").unwrap(), JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_nullish_coalesce_zero_keeps_lhs() {
+        assert_eq!(global_eval("0 ?? 9").unwrap(), JsValue::Smi(0));
+    }
+
+    #[test]
+    fn e2e_nullish_coalesce_false_keeps_lhs() {
+        assert_eq!(
+            global_eval("false ?? true").unwrap(),
+            JsValue::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn e2e_nullish_coalesce_chain_returns_first_non_nullish() {
+        assert_eq!(global_eval("null ?? 5 ?? 8").unwrap(), JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_nullish_coalesce_chain_keeps_non_nullish_head() {
+        assert_eq!(global_eval("3 ?? 5 ?? 8").unwrap(), JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_nullish_with_or_without_parentheses_is_syntax_error() {
+        assert!(matches!(
+            global_eval("1 || 2 ?? 3"),
+            Err(StatorError::SyntaxError(_))
+        ));
+    }
+
+    #[test]
+    fn e2e_or_after_nullish_without_parentheses_is_syntax_error() {
+        assert!(matches!(
+            global_eval("1 ?? 2 || 3"),
+            Err(StatorError::SyntaxError(_))
+        ));
+    }
+
+    #[test]
+    fn e2e_nullish_with_and_without_parentheses_is_syntax_error() {
+        assert!(matches!(
+            global_eval("1 && 2 ?? 3"),
+            Err(StatorError::SyntaxError(_))
+        ));
+    }
+
+    #[test]
+    fn e2e_and_after_nullish_without_parentheses_is_syntax_error() {
+        assert!(matches!(
+            global_eval("1 ?? 2 && 3"),
+            Err(StatorError::SyntaxError(_))
+        ));
+    }
+
+    #[test]
+    fn e2e_nullish_with_parenthesized_or_is_allowed() {
+        assert_eq!(global_eval("null ?? (0 || 7)").unwrap(), JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_nullish_with_parenthesized_and_is_allowed() {
+        assert_eq!(global_eval("(1 && 2) ?? 7").unwrap(), JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_optional_member_assignment_is_syntax_error() {
+        assert!(matches!(
+            global_eval("let obj = { prop: 0 }; obj?.prop = 1"),
+            Err(StatorError::SyntaxError(_))
+        ));
+    }
+
+    #[test]
+    fn e2e_optional_computed_assignment_is_syntax_error() {
+        assert!(matches!(
+            global_eval("let obj = { prop: 0 }; obj?.['prop'] = 1"),
+            Err(StatorError::SyntaxError(_))
+        ));
+    }
+
     #[test]
     fn e2e_bigint_power_of_two() {
         let result = global_eval("2n ** 32n").unwrap();
