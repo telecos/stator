@@ -32171,4 +32171,393 @@ mod tests {
         let result = global_eval("var s = new Set(null); s.size === 0").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // E2E: variable hoisting and scoping conformance
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ── var hoisting ─────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_var_hoisted_to_function_scope() {
+        // `var` inside a block is visible in the enclosing function.
+        let r = global_eval("function f() { { var x = 10; } return x; } f()").unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_var_hoisted_undefined_before_init() {
+        // Reading a hoisted var before its initialiser yields undefined.
+        let r = global_eval("function f() { var r = x; var x = 5; return r; } f()").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_var_in_for_visible_outside() {
+        let r =
+            global_eval("function f() { for (var i = 0; i < 5; i++) {} return i; } f()").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_var_in_if_visible_outside() {
+        let r = global_eval("function f() { if (true) { var x = 7; } return x; } f()").unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_var_in_while_visible_outside() {
+        let r = global_eval(
+            "function f() { var i = 0; while (i < 1) { var x = 99; i++; } return x; } f()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn e2e_var_in_try_visible_outside() {
+        let r =
+            global_eval("function f() { try { var x = 42; } catch(e) {} return x; } f()").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_var_in_catch_visible_outside() {
+        let r =
+            global_eval("function f() { try { throw 1; } catch(e) { var x = 55; } return x; } f()")
+                .unwrap();
+        assert_eq!(r, JsValue::Smi(55));
+    }
+
+    // ── duplicate var declarations ───────────────────────────────────────
+
+    #[test]
+    fn e2e_duplicate_var_allowed() {
+        // Multiple `var` for the same name is legal; last write wins.
+        let r = global_eval("function f() { var x = 1; var x = 2; return x; } f()").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_duplicate_var_no_init_keeps_value() {
+        // A second `var` without an init should NOT reset the value.
+        let r = global_eval("function f() { var x = 10; var x; return x; } f()").unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    // ── function declaration hoisting ────────────────────────────────────
+
+    #[test]
+    fn e2e_fn_decl_hoisted_before_use() {
+        let r = global_eval("var r = f(); function f() { return 42; } r").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_fn_decl_hoisted_in_function() {
+        let r = global_eval(
+            "function outer() { var r = inner(); function inner() { return 7; } return r; } outer()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_fn_decl_overrides_var_at_hoist_time() {
+        // When both `var f` and `function f()` exist, the function value
+        // wins at the start of execution (before any assignment runs).
+        let r = global_eval(
+            "function g() { var r = typeof f; var f = 5; function f() {} return r; } g()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn e2e_fn_decl_var_same_name_assignment_wins() {
+        // After the `var f = 5` assignment executes, f becomes a number.
+        let r = global_eval("function g() { function f() {} var f = 5; return f; } g()").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_multiple_fn_decls_last_wins() {
+        // Multiple function declarations — the last one wins because
+        // they are hoisted in source order.
+        let r = global_eval("function a() { return 1; } function a() { return 2; } a()").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    // ── Annex B: function declarations in blocks ─────────────────────────
+
+    #[test]
+    fn e2e_annex_b_fn_in_block_visible_after() {
+        // Non-strict: a function declared inside a block should be visible
+        // outside the block (hoisted as var to the function scope).
+        let r = global_eval(
+            "function f() { if (true) { function g() { return 88; } } return g(); } f()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(88));
+    }
+
+    #[test]
+    fn e2e_annex_b_fn_in_block_program_level() {
+        // At program level, non-strict: fn decl in block visible after.
+        let r = global_eval("if (true) { function h() { return 77; } } h()").unwrap();
+        assert_eq!(r, JsValue::Smi(77));
+    }
+
+    #[test]
+    fn e2e_annex_b_fn_in_else_block() {
+        let r = global_eval(
+            "function f() { if (false) {} else { function g() { return 33; } } return g(); } f()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(33));
+    }
+
+    // ── let / const TDZ ──────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_let_tdz_throws() {
+        let result = global_eval("x; let x = 1;");
+        assert!(
+            result.is_err(),
+            "accessing let before declaration should throw"
+        );
+    }
+
+    #[test]
+    fn e2e_const_tdz_throws() {
+        let result = global_eval("x; const x = 1;");
+        assert!(
+            result.is_err(),
+            "accessing const before declaration should throw"
+        );
+    }
+
+    #[test]
+    fn e2e_let_tdz_in_function() {
+        let result = global_eval("function f() { var r = x; let x = 1; return r; } f()");
+        assert!(result.is_err(), "let TDZ should throw inside function");
+    }
+
+    #[test]
+    fn e2e_let_tdz_typeof_throws() {
+        // typeof on a declared-but-TDZ let should still throw.
+        let result = global_eval("typeof x; let x = 1;");
+        assert!(result.is_err(), "typeof on TDZ let should throw");
+    }
+
+    #[test]
+    fn e2e_typeof_undeclared_returns_undefined() {
+        let r = global_eval("typeof noSuchVar__").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_let_tdz_in_block_shadows_outer() {
+        // Inner block `let x` should shadow the outer `let x`, and
+        // accessing before declaration should throw.
+        let r = global_eval(
+            r#"
+            let x = 10;
+            var result;
+            { try { result = x; } catch(e) { result = "error"; } let x = 20; }
+            result
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    // ── const assignment error ───────────────────────────────────────────
+
+    #[test]
+    fn e2e_const_reassignment_throws() {
+        let result = global_eval("const x = 1; x = 2;");
+        assert!(result.is_err(), "const reassignment should throw");
+    }
+
+    #[test]
+    fn e2e_const_increment_throws() {
+        let result = global_eval("const x = 1; x++;");
+        assert!(result.is_err(), "const++ should throw");
+    }
+
+    // ── let / const block scoping ────────────────────────────────────────
+
+    #[test]
+    fn e2e_let_block_scoped_not_visible_outside() {
+        let result = global_eval("{ let x = 1; } x");
+        assert!(result.is_err(), "let should be block-scoped");
+    }
+
+    #[test]
+    fn e2e_const_block_scoped_not_visible_outside() {
+        let result = global_eval("{ const x = 1; } x");
+        assert!(result.is_err(), "const should be block-scoped");
+    }
+
+    #[test]
+    fn e2e_let_separate_blocks_independent() {
+        let r =
+            global_eval("var r = 0; { let x = 10; r += x; } { let x = 20; r += x; } r").unwrap();
+        assert_eq!(r, JsValue::Smi(30));
+    }
+
+    #[test]
+    fn e2e_let_nested_blocks_shadow() {
+        let r = global_eval("let x = 1; var r; { let x = 2; { let x = 3; r = x; } } r").unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_let_in_for_not_visible_outside() {
+        let result = global_eval("for (let i = 0; i < 3; i++) {} i");
+        assert!(result.is_err(), "let in for-loop should be block-scoped");
+    }
+
+    // ── var and let coexistence ──────────────────────────────────────────
+
+    #[test]
+    fn e2e_var_and_let_coexist_in_function() {
+        let r = global_eval(
+            "function f() { var a = 1; let b = 2; { var c = 3; let d = 4; } return a + b + c; } f()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_let_same_name_different_scopes() {
+        let r = global_eval(
+            r#"
+            var r = "";
+            { let x = "a"; r += x; }
+            { let x = "b"; r += x; }
+            r
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("ab".into()));
+    }
+
+    // ── let/const in for-loop: per-iteration binding ─────────────────────
+
+    #[test]
+    fn e2e_let_for_loop_basic() {
+        // Basic let for-loop still works correctly.
+        let r = global_eval("var sum = 0; for (let i = 0; i < 5; i++) { sum += i; } sum").unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_const_in_for_of_block_scoped() {
+        // const in for-of is block-scoped per iteration.
+        let r = global_eval("var sum = 0; var arr = [1,2,3]; for (var v of arr) { sum += v; } sum")
+            .unwrap();
+        assert_eq!(r, JsValue::Smi(6));
+    }
+
+    // ── Combined / edge-case scenarios ───────────────────────────────────
+
+    #[test]
+    fn e2e_var_hoisted_across_nested_blocks() {
+        let r = global_eval("function f() { { { { var x = 100; } } } return x; } f()").unwrap();
+        assert_eq!(r, JsValue::Smi(100));
+    }
+
+    #[test]
+    fn e2e_var_for_in_visible_outside() {
+        let r = global_eval(
+            r#"
+            function f() {
+                var obj = {a: 1, b: 2};
+                for (var k in obj) {}
+                return typeof k;
+            }
+            f()
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("string".into()));
+    }
+
+    #[test]
+    fn e2e_function_declaration_in_nested_block() {
+        let r = global_eval(
+            r#"
+            function outer() {
+                { { function inner() { return 66; } } }
+                return inner();
+            }
+            outer()
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(66));
+    }
+
+    #[test]
+    fn e2e_var_in_switch_visible_outside() {
+        let r = global_eval(
+            r#"
+            function f() {
+                switch (1) { case 1: var x = 50; break; }
+                return x;
+            }
+            f()
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(50));
+    }
+
+    #[test]
+    fn e2e_let_in_switch_block_scoped() {
+        // let inside switch should not leak outside the switch block.
+        let result = global_eval("switch (1) { case 1: let x = 50; break; } x");
+        assert!(result.is_err(), "let in switch should be block-scoped");
+    }
+
+    #[test]
+    fn e2e_var_hoisting_global_level() {
+        let r = global_eval("var r = x; var x = 5; r").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_fn_decl_before_var_same_name() {
+        // A function declaration and var of the same name — the var
+        // assignment should update the value, but before that the
+        // function is available.
+        let r = global_eval(
+            r#"
+            function f() {
+                var check1 = typeof x;
+                function x() {}
+                var x = 99;
+                var check2 = typeof x;
+                return check1 + "," + check2;
+            }
+            f()
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("function,number".into()));
+    }
+
+    #[test]
+    fn e2e_let_initialisation_order() {
+        let r = global_eval("let a = 1; let b = a + 1; b").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_const_in_block_readable() {
+        let r = global_eval("var r; { const c = 42; r = c; } r").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
 }

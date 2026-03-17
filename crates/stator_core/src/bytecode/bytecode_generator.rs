@@ -1131,6 +1131,69 @@ impl FunctionCompiler {
         }
     }
 
+    /// Collect function declaration names that appear inside blocks, if-else,
+    /// loops, etc. (Annex B §B.3.2).  In non-strict mode these names also get
+    /// a `var`-like binding in the enclosing function scope so they remain
+    /// visible after the block is exited.
+    fn collect_block_fn_names(stmts: &[Stmt]) -> Vec<String> {
+        let mut names = Vec::new();
+        for stmt in stmts {
+            Self::collect_block_fn_names_in_stmt(stmt, &mut names);
+        }
+        names
+    }
+
+    /// Helper: recursively find function declarations nested inside blocks.
+    fn collect_block_fn_names_in_stmt(stmt: &Stmt, names: &mut Vec<String>) {
+        match stmt {
+            Stmt::Block(b) => {
+                for s in &b.body {
+                    if let Stmt::FnDecl(decl) = s
+                        && let Some(id) = &decl.id
+                    {
+                        names.push(id.name.clone());
+                    }
+                    Self::collect_block_fn_names_in_stmt(s, names);
+                }
+            }
+            Stmt::If(s) => {
+                Self::collect_block_fn_names_in_stmt(&s.consequent, names);
+                if let Some(alt) = &s.alternate {
+                    Self::collect_block_fn_names_in_stmt(alt, names);
+                }
+            }
+            Stmt::While(s) => Self::collect_block_fn_names_in_stmt(&s.body, names),
+            Stmt::DoWhile(s) => Self::collect_block_fn_names_in_stmt(&s.body, names),
+            Stmt::For(s) => Self::collect_block_fn_names_in_stmt(&s.body, names),
+            Stmt::ForIn(s) => Self::collect_block_fn_names_in_stmt(&s.body, names),
+            Stmt::ForOf(s) => Self::collect_block_fn_names_in_stmt(&s.body, names),
+            Stmt::Labeled(s) => Self::collect_block_fn_names_in_stmt(&s.body, names),
+            Stmt::Switch(s) => {
+                for case in &s.cases {
+                    for cs in &case.consequent {
+                        Self::collect_block_fn_names_in_stmt(cs, names);
+                    }
+                }
+            }
+            Stmt::Try(s) => {
+                for ts in &s.block.body {
+                    Self::collect_block_fn_names_in_stmt(ts, names);
+                }
+                if let Some(handler) = &s.handler {
+                    for hs in &handler.body.body {
+                        Self::collect_block_fn_names_in_stmt(hs, names);
+                    }
+                }
+                if let Some(fin) = &s.finalizer {
+                    for fs in &fin.body {
+                        Self::collect_block_fn_names_in_stmt(fs, names);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Extract identifier names from a binding pattern.
     fn collect_pat_names(pat: &Pat, names: &mut Vec<String>) {
         match pat {
@@ -1482,15 +1545,51 @@ impl FunctionCompiler {
         ));
         // Bind the name in the current scope (accumulator holds the closure).
         if let Some(id) = &decl.id {
-            let reg = self.define_local(&id.name);
+            // If a var-hoisted (or Annex B pre-hoisted) binding already
+            // exists in the function scope, reuse its register so the
+            // function declaration value is stored directly where `var`
+            // references will read it (function declarations override var).
+            let reg = if let Some(&existing) = self.scopes[0].get(&id.name) {
+                if !existing.is_const && !existing.needs_tdz_check {
+                    existing.reg
+                } else {
+                    self.define_local(&id.name)
+                }
+            } else {
+                self.define_local(&id.name)
+            };
             self.emit_star(reg);
-            // Top-level function declarations are also stored as globals so
-            // that recursive calls via `LdaGlobal` can find them.
-            if self.is_program {
+
+            // Annex B §B.3.2: In sloppy mode, function declarations inside
+            // blocks also hoist a var-like binding to the enclosing function
+            // (or global) scope so the name is visible after the block exits.
+            if !self.is_strict && self.scopes.len() > 1 {
+                let fn_reg = if let Some(&binding) = self.scopes[0].get(&id.name) {
+                    binding.reg
+                } else {
+                    self.define_function_scoped_local(&id.name)
+                };
+                // If block-scope register differs from function-scope
+                // register, copy the value.
+                if fn_reg != reg {
+                    self.emit_ldar(reg);
+                    self.emit_star(fn_reg);
+                }
+                // At program level, also update the global environment.
+                if self.is_program {
+                    let name_idx = self.add_string(&id.name);
+                    let sta_slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
+                    self.emit_ldar(reg);
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::StaGlobal,
+                        vec![Operand::ConstantPoolIdx(name_idx), sta_slot],
+                    ));
+                }
+            } else if self.is_program {
+                // Top-level function declarations are also stored as globals
+                // so that recursive calls via `LdaGlobal` can find them.
                 let name_idx = self.add_string(&id.name);
                 let sta_slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
-                // Re-load the value from the local register first so the
-                // accumulator holds the function when StaGlobal executes.
                 self.emit_ldar(reg);
                 self.emit(Instruction::new_unchecked(
                     Opcode::StaGlobal,
@@ -2198,12 +2297,32 @@ impl FunctionCompiler {
     }
 
     /// Compile a `for (init; test; update) body` statement.
+    ///
+    /// For `let`/`const` initialisers each iteration gets a fresh copy of
+    /// the loop variables so that closures capture per-iteration values
+    /// (ES §14.7.4.2 CreatePerIterationEnvironment).
     fn compile_for(&mut self, s: &ForStmt) -> StatorResult<()> {
         let loop_start = self.new_label();
         let loop_end = self.new_label();
         let continue_label = self.new_label();
 
         self.push_scope();
+
+        // Collect names for per-iteration binding (let/const only).
+        let per_iter_names: Vec<String> = if let Some(ForInit::VarDecl(decl)) = &s.init {
+            if matches!(decl.kind, VarKind::Let | VarKind::Const) {
+                let mut names = Vec::new();
+                for d in &decl.declarators {
+                    Self::collect_pat_names(&d.id, &mut names);
+                }
+                names
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        let needs_per_iteration = !per_iter_names.is_empty();
 
         // Initializer.
         if let Some(init) = &s.init {
@@ -2226,7 +2345,35 @@ impl FunctionCompiler {
             self.emit_jump(Opcode::JumpIfToBooleanFalse, loop_end);
         }
 
-        self.compile_stmt(&s.body)?;
+        if needs_per_iteration {
+            // Push an inner scope and copy each loop variable into it so
+            // closures created in the body capture the per-iteration value.
+            self.push_scope();
+            let mut pairs: Vec<(Register, Register)> = Vec::new();
+            for name in &per_iter_names {
+                let outer_scope_idx = self.scopes.len() - 2;
+                let outer_reg = self.scopes[outer_scope_idx]
+                    .get(name)
+                    .expect("loop var should exist")
+                    .reg;
+                let inner_reg = self.define_local(name);
+                self.emit_ldar(outer_reg);
+                self.emit_star(inner_reg);
+                pairs.push((outer_reg, inner_reg));
+            }
+
+            self.compile_stmt(&s.body)?;
+
+            // Copy updated values back to the outer scope before the
+            // update expression runs.
+            for &(outer_reg, inner_reg) in &pairs {
+                self.emit_ldar(inner_reg);
+                self.emit_star(outer_reg);
+            }
+            self.pop_scope();
+        } else {
+            self.compile_stmt(&s.body)?;
+        }
 
         // Update.
         self.bind_label(continue_label);
@@ -6136,6 +6283,29 @@ fn compile_function_inner(
     // instead of throwing.
     compiler.hoist_var_declarations(&body.body);
 
+    // Annex B §B.3.2: In sloppy mode, function declarations nested inside
+    // blocks also create a var-like binding in the function scope so that
+    // the name is visible after the block exits.
+    if !is_strict {
+        let annex_b_names = FunctionCompiler::collect_block_fn_names(&body.body);
+        for name in annex_b_names {
+            if compiler.scopes[0].contains_key(&name) {
+                continue; // already hoisted (parameter, var, or earlier fn)
+            }
+            let reg = compiler.allocator.new_local();
+            compiler.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+            compiler.emit_star(reg);
+            compiler.scopes[0].insert(
+                name,
+                LocalBinding {
+                    reg,
+                    is_const: false,
+                    needs_tdz_check: false,
+                },
+            );
+        }
+    }
+
     // Hoist function declarations to the top of the scope.
     for stmt in &body.body {
         if let Stmt::FnDecl(decl) = stmt {
@@ -6216,6 +6386,21 @@ impl BytecodeGenerator {
 
         // Hoist `var` declarations into the global env (set to undefined).
         compiler.hoist_var_declarations_global(&stmts_owned);
+
+        // Annex B §B.3.2: In sloppy mode, function declarations nested
+        // inside blocks also get a var-like global binding.
+        if !compiler.is_strict {
+            let annex_b_names = FunctionCompiler::collect_block_fn_names(&stmts_owned);
+            for name in annex_b_names {
+                let name_idx = compiler.add_string(&name);
+                compiler.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                let slot = compiler.alloc_slot(FeedbackSlotKind::StoreGlobal);
+                compiler.emit(Instruction::new_unchecked(
+                    Opcode::StaGlobal,
+                    vec![Operand::ConstantPoolIdx(name_idx), slot],
+                ));
+            }
+        }
 
         // Hoist `let`/`const` declarations with TDZ.
         compiler.hoist_lexical_decls(&stmts_owned);
