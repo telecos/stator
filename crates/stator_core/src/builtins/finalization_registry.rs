@@ -34,6 +34,22 @@ use crate::objects::heap_object::HeapObject;
 use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 
+// ── TokenKey ─────────────────────────────────────────────────────────────────
+
+/// Discriminated key for unregister tokens.
+///
+/// ES2023 extended `FinalizationRegistry` to accept *registered* symbols
+/// (non-well-known) as unregister tokens in addition to objects.  This enum
+/// captures both cases so that pointer-addressed tokens and symbol-ID tokens
+/// live in a single `Option<TokenKey>`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TokenKey {
+    /// An object token, stored as its raw pointer address.
+    Address(usize),
+    /// A symbol token, stored as the engine's internal symbol ID.
+    Symbol(u64),
+}
+
 // ── Registration ─────────────────────────────────────────────────────────────
 
 /// A single registration entry inside a [`JsFinalizationRegistry`].
@@ -43,8 +59,8 @@ struct Registration {
     target: usize,
     /// The value passed to the cleanup callback when the target is collected.
     held_value: JsValue,
-    /// Optional unregister token stored as a raw address (`usize`).
-    unregister_token: Option<usize>,
+    /// Optional unregister token (object address or symbol ID).
+    unregister_token: Option<TokenKey>,
 }
 
 /// A single registration entry for an Rc-managed `PlainObject` target.
@@ -54,9 +70,8 @@ struct PlainRegistration {
     target: Weak<RefCell<PropertyMap>>,
     /// The value passed to the cleanup callback when the target is collected.
     held_value: JsValue,
-    /// Optional unregister token stored as the raw pointer of an
-    /// `Rc<RefCell<PropertyMap>>` (using `Rc::as_ptr` for identity).
-    unregister_token: Option<usize>,
+    /// Optional unregister token (object address or symbol ID).
+    unregister_token: Option<TokenKey>,
 }
 
 // ── JsFinalizationRegistry ───────────────────────────────────────────────────
@@ -175,7 +190,7 @@ pub fn finalization_registry_register(
         Registration {
             target: target as usize,
             held_value,
-            unregister_token: unregister_token.map(|t| t as usize),
+            unregister_token: unregister_token.map(|t| TokenKey::Address(t as usize)),
         },
     );
     Ok(())
@@ -220,12 +235,88 @@ pub fn finalization_registry_unregister(
             "FinalizationRegistry unregister token must be an object".into(),
         ));
     }
-    let addr = token as usize;
+    let key = TokenKey::Address(token as usize);
     let before = registry.registrations.len();
     registry
         .registrations
-        .retain(|_, reg| reg.unregister_token != Some(addr));
+        .retain(|_, reg| reg.unregister_token != Some(key.clone()));
     Ok(registry.registrations.len() < before)
+}
+
+// ── finalization_registry_register_with_token_key ────────────────────────────
+
+/// Register a GC-managed target with an explicit [`TokenKey`] unregister token.
+///
+/// This is the generalised form of [`finalization_registry_register`] that
+/// accepts any [`TokenKey`] variant (object address **or** symbol ID).
+///
+/// Returns [`StatorError::TypeError`] if `target` is null.
+pub fn finalization_registry_register_with_token_key(
+    registry: &mut JsFinalizationRegistry,
+    target: *mut HeapObject,
+    held_value: JsValue,
+    unregister_token: Option<TokenKey>,
+) -> StatorResult<()> {
+    if target.is_null() {
+        return Err(StatorError::TypeError(
+            "FinalizationRegistry target must be an object".into(),
+        ));
+    }
+    let id = registry.next_id;
+    registry.next_id += 1;
+    registry.registrations.insert(
+        id,
+        Registration {
+            target: target as usize,
+            held_value,
+            unregister_token,
+        },
+    );
+    Ok(())
+}
+
+// ── finalization_registry_register_plain_with_token_key ──────────────────────
+
+/// Register an Rc-managed `PlainObject` target with an explicit [`TokenKey`].
+///
+/// This is the generalised form of [`finalization_registry_register_plain`]
+/// that accepts any [`TokenKey`] variant (object address **or** symbol ID).
+pub fn finalization_registry_register_plain_with_token_key(
+    registry: &mut JsFinalizationRegistry,
+    target: &Rc<RefCell<PropertyMap>>,
+    held_value: JsValue,
+    unregister_token: Option<TokenKey>,
+) {
+    let id = registry.next_id;
+    registry.next_id += 1;
+    registry.plain_registrations.insert(
+        id,
+        PlainRegistration {
+            target: Rc::downgrade(target),
+            held_value,
+            unregister_token,
+        },
+    );
+}
+
+// ── finalization_registry_unregister_by_key ──────────────────────────────────
+
+/// Remove all registrations (heap **and** plain) whose unregister token
+/// matches the given [`TokenKey`].
+///
+/// Returns `true` if at least one registration was removed.
+pub fn finalization_registry_unregister_by_key(
+    registry: &mut JsFinalizationRegistry,
+    token: TokenKey,
+) -> bool {
+    let before = registry.registrations.len() + registry.plain_registrations.len();
+    registry
+        .registrations
+        .retain(|_, reg| reg.unregister_token != Some(token.clone()));
+    registry
+        .plain_registrations
+        .retain(|_, reg| reg.unregister_token != Some(token.clone()));
+    (registry.registrations.len() + registry.plain_registrations.len()) < before
 }
 
 // ── finalization_registry_notify ─────────────────────────────────────────────
@@ -339,7 +430,7 @@ pub fn finalization_registry_register_plain(
         PlainRegistration {
             target: Rc::downgrade(target),
             held_value,
-            unregister_token: unregister_token.map(|t| Rc::as_ptr(t) as usize),
+            unregister_token: unregister_token.map(|t| TokenKey::Address(Rc::as_ptr(t) as usize)),
         },
     );
 }
@@ -373,11 +464,11 @@ pub fn finalization_registry_unregister_plain(
     registry: &mut JsFinalizationRegistry,
     token: &Rc<RefCell<PropertyMap>>,
 ) -> bool {
-    let addr = Rc::as_ptr(token) as usize;
+    let key = TokenKey::Address(Rc::as_ptr(token) as usize);
     let before = registry.plain_registrations.len();
     registry
         .plain_registrations
-        .retain(|_, reg| reg.unregister_token != Some(addr));
+        .retain(|_, reg| reg.unregister_token != Some(key.clone()));
     registry.plain_registrations.len() < before
 }
 
@@ -845,5 +936,127 @@ mod tests {
         assert_eq!(held, vec![JsValue::Smi(1)]);
         // b is still alive
         assert!(finalization_registry_has_registrations(&fr));
+    }
+
+    // ── TokenKey-based registration ──────────────────────────────────────────
+
+    #[test]
+    fn test_finalization_registry_register_with_symbol_token_key() {
+        let mut fr = finalization_registry_new();
+        let mut obj = HeapObject::new_null();
+        let sym_token = TokenKey::Symbol(42);
+        let result = finalization_registry_register_with_token_key(
+            &mut fr,
+            &raw mut obj,
+            JsValue::Smi(1),
+            Some(sym_token),
+        );
+        assert!(result.is_ok());
+        assert!(finalization_registry_has_registrations(&fr));
+    }
+
+    #[test]
+    fn test_finalization_registry_unregister_by_symbol_key() {
+        let mut fr = finalization_registry_new();
+        let mut obj = HeapObject::new_null();
+        let sym_key = TokenKey::Symbol(99);
+        finalization_registry_register_with_token_key(
+            &mut fr,
+            &raw mut obj,
+            JsValue::Smi(1),
+            Some(sym_key.clone()),
+        )
+        .unwrap();
+        assert!(finalization_registry_unregister_by_key(
+            &mut fr,
+            sym_key.clone()
+        ));
+        assert!(!finalization_registry_has_registrations(&fr));
+        assert!(!finalization_registry_unregister_by_key(&mut fr, sym_key));
+    }
+
+    #[test]
+    fn test_finalization_registry_symbol_token_does_not_match_address() {
+        let mut fr = finalization_registry_new();
+        let mut obj = HeapObject::new_null();
+        finalization_registry_register_with_token_key(
+            &mut fr,
+            &raw mut obj,
+            JsValue::Smi(1),
+            Some(TokenKey::Symbol(42)),
+        )
+        .unwrap();
+        assert!(!finalization_registry_unregister_by_key(
+            &mut fr,
+            TokenKey::Address(42)
+        ));
+        assert!(finalization_registry_has_registrations(&fr));
+    }
+
+    #[test]
+    fn test_finalization_registry_register_plain_with_symbol_key() {
+        let mut fr = finalization_registry_new();
+        let obj = Rc::new(RefCell::new(PropertyMap::new()));
+        let sym_key = TokenKey::Symbol(7);
+        finalization_registry_register_plain_with_token_key(
+            &mut fr,
+            &obj,
+            JsValue::Smi(77),
+            Some(sym_key.clone()),
+        );
+        assert!(finalization_registry_has_registrations(&fr));
+        assert!(finalization_registry_unregister_by_key(&mut fr, sym_key));
+        assert!(!finalization_registry_has_registrations(&fr));
+    }
+
+    #[test]
+    fn test_finalization_registry_unregister_by_key_removes_across_heap_and_plain() {
+        let mut fr = finalization_registry_new();
+        let mut obj1 = HeapObject::new_null();
+        let obj2 = Rc::new(RefCell::new(PropertyMap::new()));
+        let sym_key = TokenKey::Symbol(55);
+        finalization_registry_register_with_token_key(
+            &mut fr,
+            &raw mut obj1,
+            JsValue::Smi(1),
+            Some(sym_key.clone()),
+        )
+        .unwrap();
+        finalization_registry_register_plain_with_token_key(
+            &mut fr,
+            &obj2,
+            JsValue::Smi(2),
+            Some(sym_key.clone()),
+        );
+        assert!(finalization_registry_unregister_by_key(&mut fr, sym_key));
+        assert!(!finalization_registry_has_registrations(&fr));
+    }
+
+    #[test]
+    fn test_finalization_registry_symbol_sweep_plain_still_works() {
+        let mut fr = finalization_registry_new();
+        let obj = Rc::new(RefCell::new(PropertyMap::new()));
+        finalization_registry_register_plain_with_token_key(
+            &mut fr,
+            &obj,
+            JsValue::Smi(100),
+            Some(TokenKey::Symbol(10)),
+        );
+        drop(obj);
+        finalization_registry_sweep_plain(&mut fr);
+        let held = finalization_registry_drain(&mut fr);
+        assert_eq!(held, vec![JsValue::Smi(100)]);
+    }
+
+    #[test]
+    fn test_finalization_registry_register_with_token_key_null_target() {
+        let mut fr = finalization_registry_new();
+        let result = finalization_registry_register_with_token_key(
+            &mut fr,
+            std::ptr::null_mut(),
+            JsValue::Smi(1),
+            None,
+        );
+        assert!(result.is_err());
     }
 }
