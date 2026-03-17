@@ -33,9 +33,9 @@ use crate::builtins::date::{
     date_set_date, date_set_full_year, date_set_hours, date_set_milliseconds, date_set_minutes,
     date_set_month, date_set_seconds, date_set_time, date_set_utc_date, date_set_utc_full_year,
     date_set_utc_hours, date_set_utc_milliseconds, date_set_utc_minutes, date_set_utc_month,
-    date_set_utc_seconds, date_to_date_string, date_to_iso_string, date_to_json,
-    date_to_locale_date_string, date_to_locale_string, date_to_locale_time_string, date_to_string,
-    date_to_time_string, date_to_utc_string, date_utc, date_value_of,
+    date_set_utc_seconds, date_to_date_string, date_to_iso_string, date_to_locale_date_string,
+    date_to_locale_string, date_to_locale_time_string, date_to_string, date_to_time_string,
+    date_to_utc_string, date_utc, date_value_of,
 };
 use crate::builtins::error::{
     ErrorKind, JsError, error_capture_stack_trace, get_stack_trace_limit,
@@ -3101,8 +3101,23 @@ fn apply_js_reviver(holder: &JsValue, key: &str, reviver: &JsValue) -> StatorRes
 fn date_proto_delegate(name: &str) -> JsValue {
     let name = name.to_string();
     native(move |args| {
-        let this = args.first().unwrap_or(&JsValue::Undefined);
-        if let JsValue::PlainObject(map) = this
+        let this = args.first().cloned().unwrap_or(JsValue::Undefined);
+        if name == "toJSON" {
+            let primitive = this.to_primitive(ToPrimitiveHint::Number)?;
+            if matches!(primitive, JsValue::HeapNumber(n) if !n.is_finite()) {
+                return Ok(JsValue::Null);
+            }
+
+            let to_iso = dispatch_get_property_value(&this, JsValue::String("toISOString".into()))?;
+            if !is_callable(&to_iso) {
+                return Err(StatorError::TypeError(
+                    "toISOString is not callable".to_string(),
+                ));
+            }
+            return dispatch_call_with_this(&to_iso, this, Vec::new());
+        }
+
+        if let JsValue::PlainObject(map) = &this
             && let Some(JsValue::NativeFunction(f)) = map.borrow().get(&name).cloned()
         {
             let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
@@ -3133,10 +3148,27 @@ fn make_date() -> JsValue {
                 0 => date_construct_now(),
                 1 => {
                     let arg = args.first().unwrap();
-                    let primitive = arg.to_primitive(ToPrimitiveHint::Default)?;
-                    match primitive {
-                        JsValue::String(s) => date_parse(&s),
-                        _ => date_construct_value(primitive.to_number()?),
+                    if let JsValue::PlainObject(map) = arg
+                        && matches!(
+                            map.borrow().get("__is_date__"),
+                            Some(JsValue::Boolean(true))
+                        )
+                    {
+                        let get_time = map.borrow().get("getTime").cloned();
+                        match get_time {
+                            Some(get_time) => {
+                                let copied =
+                                    dispatch_call_with_this(&get_time, arg.clone(), Vec::new())?;
+                                date_construct_value(copied.to_number()?)
+                            }
+                            None => f64::NAN,
+                        }
+                    } else {
+                        let primitive = arg.to_primitive(ToPrimitiveHint::Default)?;
+                        match primitive {
+                            JsValue::String(s) => date_parse(&s),
+                            _ => date_construct_value(primitive.to_number()?),
+                        }
                     }
                 }
                 _ => {
@@ -3309,13 +3341,14 @@ fn make_date() -> JsValue {
 #[inline(never)]
 fn make_date_instance(t: f64) -> JsValue {
     let inner = Rc::new(RefCell::new(t));
-    let mut obj = PropertyMap::new();
+    let obj = Rc::new(RefCell::new(PropertyMap::new()));
 
     // §20.1.3.6 — identify as Date for Object.prototype.toString.
-    obj.insert("@@toStringTag".into(), JsValue::String("Date".into()));
+    obj.borrow_mut()
+        .insert("@@toStringTag".into(), JsValue::String("Date".into()));
 
     // Mark as Date instance for instanceof checks.
-    obj.insert_with_attrs(
+    obj.borrow_mut().insert_with_attrs(
         "__is_date__".into(),
         JsValue::Boolean(true),
         PropertyAttributes::empty(),
@@ -3324,14 +3357,14 @@ fn make_date_instance(t: f64) -> JsValue {
     // ── getTime / valueOf ────────────────────────────────────────────────
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getTime".into(),
             native(move |_| Ok(num(date_get_time(*inner.borrow())))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "valueOf".into(),
             native(move |_| Ok(num(date_value_of(*inner.borrow())))),
         );
@@ -3340,63 +3373,63 @@ fn make_date_instance(t: f64) -> JsValue {
     // ── Local getters ───────────────────────────────────────────────────
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getFullYear".into(),
             native(move |_| Ok(num(date_get_full_year(*inner.borrow())))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getMonth".into(),
             native(move |_| Ok(num(date_get_month(*inner.borrow())))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getDate".into(),
             native(move |_| Ok(num(date_get_date(*inner.borrow())))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getDay".into(),
             native(move |_| Ok(num(date_get_day(*inner.borrow())))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getHours".into(),
             native(move |_| Ok(num(date_get_hours(*inner.borrow())))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getMinutes".into(),
             native(move |_| Ok(num(date_get_minutes(*inner.borrow())))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getSeconds".into(),
             native(move |_| Ok(num(date_get_seconds(*inner.borrow())))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getMilliseconds".into(),
             native(move |_| Ok(num(date_get_milliseconds(*inner.borrow())))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getTimezoneOffset".into(),
             native(move |_| Ok(num(date_get_timezone_offset(*inner.borrow())))),
         );
@@ -3405,56 +3438,56 @@ fn make_date_instance(t: f64) -> JsValue {
     // ── UTC getters ─────────────────────────────────────────────────────
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getUTCFullYear".into(),
             native(move |_| Ok(num(date_get_utc_full_year(*inner.borrow())))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getUTCMonth".into(),
             native(move |_| Ok(num(date_get_utc_month(*inner.borrow())))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getUTCDate".into(),
             native(move |_| Ok(num(date_get_utc_date(*inner.borrow())))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getUTCDay".into(),
             native(move |_| Ok(num(date_get_utc_day(*inner.borrow())))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getUTCHours".into(),
             native(move |_| Ok(num(date_get_utc_hours(*inner.borrow())))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getUTCMinutes".into(),
             native(move |_| Ok(num(date_get_utc_minutes(*inner.borrow())))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getUTCSeconds".into(),
             native(move |_| Ok(num(date_get_utc_seconds(*inner.borrow())))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "getUTCMilliseconds".into(),
             native(move |_| Ok(num(date_get_utc_milliseconds(*inner.borrow())))),
         );
@@ -3463,7 +3496,7 @@ fn make_date_instance(t: f64) -> JsValue {
     // ── Local setters ───────────────────────────────────────────────────
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "setTime".into(),
             native(move |args| {
                 let v = arg_f64(&args, 0)?;
@@ -3475,7 +3508,7 @@ fn make_date_instance(t: f64) -> JsValue {
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "setMilliseconds".into(),
             native(move |args| {
                 let ms = arg_f64(&args, 0)?;
@@ -3487,7 +3520,7 @@ fn make_date_instance(t: f64) -> JsValue {
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "setSeconds".into(),
             native(move |args| {
                 let sec = arg_f64(&args, 0)?;
@@ -3504,7 +3537,7 @@ fn make_date_instance(t: f64) -> JsValue {
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "setMinutes".into(),
             native(move |args| {
                 let min = arg_f64(&args, 0)?;
@@ -3526,7 +3559,7 @@ fn make_date_instance(t: f64) -> JsValue {
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "setHours".into(),
             native(move |args| {
                 let hour = arg_f64(&args, 0)?;
@@ -3553,7 +3586,7 @@ fn make_date_instance(t: f64) -> JsValue {
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "setDate".into(),
             native(move |args| {
                 let date_val = arg_f64(&args, 0)?;
@@ -3565,7 +3598,7 @@ fn make_date_instance(t: f64) -> JsValue {
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "setMonth".into(),
             native(move |args| {
                 let month = arg_f64(&args, 0)?;
@@ -3582,7 +3615,7 @@ fn make_date_instance(t: f64) -> JsValue {
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "setFullYear".into(),
             native(move |args| {
                 let year = arg_f64(&args, 0)?;
@@ -3606,7 +3639,7 @@ fn make_date_instance(t: f64) -> JsValue {
     // ── UTC setters ─────────────────────────────────────────────────────
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "setUTCMilliseconds".into(),
             native(move |args| {
                 let ms = arg_f64(&args, 0)?;
@@ -3618,7 +3651,7 @@ fn make_date_instance(t: f64) -> JsValue {
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "setUTCSeconds".into(),
             native(move |args| {
                 let sec = arg_f64(&args, 0)?;
@@ -3635,7 +3668,7 @@ fn make_date_instance(t: f64) -> JsValue {
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "setUTCMinutes".into(),
             native(move |args| {
                 let min = arg_f64(&args, 0)?;
@@ -3657,7 +3690,7 @@ fn make_date_instance(t: f64) -> JsValue {
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "setUTCHours".into(),
             native(move |args| {
                 let hour = arg_f64(&args, 0)?;
@@ -3684,7 +3717,7 @@ fn make_date_instance(t: f64) -> JsValue {
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "setUTCDate".into(),
             native(move |args| {
                 let date_val = arg_f64(&args, 0)?;
@@ -3696,7 +3729,7 @@ fn make_date_instance(t: f64) -> JsValue {
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "setUTCMonth".into(),
             native(move |args| {
                 let month = arg_f64(&args, 0)?;
@@ -3713,7 +3746,7 @@ fn make_date_instance(t: f64) -> JsValue {
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "setUTCFullYear".into(),
             native(move |args| {
                 let year = arg_f64(&args, 0)?;
@@ -3737,59 +3770,49 @@ fn make_date_instance(t: f64) -> JsValue {
     // ── String conversion methods ───────────────────────────────────────
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "toString".into(),
             native(move |_| Ok(JsValue::String(date_to_string(*inner.borrow()).into()))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "toDateString".into(),
             native(move |_| Ok(JsValue::String(date_to_date_string(*inner.borrow()).into()))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "toTimeString".into(),
             native(move |_| Ok(JsValue::String(date_to_time_string(*inner.borrow()).into()))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "toISOString".into(),
             native(move |_| Ok(JsValue::String(date_to_iso_string(*inner.borrow())?.into()))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "toUTCString".into(),
             native(move |_| Ok(JsValue::String(date_to_utc_string(*inner.borrow()).into()))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "toGMTString".into(),
             native(move |_| Ok(JsValue::String(date_to_utc_string(*inner.borrow()).into()))),
         );
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
-            "toJSON".into(),
-            native(move |_| match date_to_json(*inner.borrow()) {
-                Some(s) => Ok(JsValue::String(s.into())),
-                None => Ok(JsValue::Null),
-            }),
-        );
-    }
-    {
-        let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "toLocaleDateString".into(),
             native(move |_| {
                 Ok(JsValue::String(
@@ -3800,7 +3823,7 @@ fn make_date_instance(t: f64) -> JsValue {
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "toLocaleString".into(),
             native(move |_| {
                 Ok(JsValue::String(
@@ -3811,7 +3834,7 @@ fn make_date_instance(t: f64) -> JsValue {
     }
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "toLocaleTimeString".into(),
             native(move |_| {
                 Ok(JsValue::String(
@@ -3824,7 +3847,7 @@ fn make_date_instance(t: f64) -> JsValue {
     // §20.4.4.45 Date.prototype[@@toPrimitive](hint)
     {
         let inner = Rc::clone(&inner);
-        obj.insert(
+        obj.borrow_mut().insert(
             "@@toPrimitive".into(),
             native(move |args| {
                 let hint = match args.first() {
@@ -3845,8 +3868,8 @@ fn make_date_instance(t: f64) -> JsValue {
         );
     }
 
-    obj.make_all_non_enumerable();
-    JsValue::PlainObject(Rc::new(RefCell::new(obj)))
+    obj.borrow_mut().make_all_non_enumerable();
+    JsValue::PlainObject(obj)
 }
 
 // ── Number constructor ───────────────────────────────────────────────────────
@@ -28926,6 +28949,375 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.prototype.toJSON` calls the receiver's `toISOString`.
+    #[test]
+    fn test_date_prototype_to_json_calls_receiver_to_iso_string() {
+        let result = global_eval(
+            r#"
+            Date.prototype.toJSON.call({
+                valueOf: function() { return 0; },
+                toISOString: function() { return 'custom-json'; }
+            }) === 'custom-json'
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Invalid numeric primitives short-circuit `Date.prototype.toJSON` to `null`.
+    #[test]
+    fn test_date_prototype_to_json_returns_null_for_non_finite_number() {
+        let result = global_eval(
+            r#"
+            Date.prototype.toJSON.call({
+                valueOf: function() { return NaN; },
+                toISOString: function() { return 'should-not-run'; }
+            }) === null
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Instance `toJSON()` uses an overridden own `toISOString` method.
+    #[test]
+    fn test_date_to_json_uses_overridden_instance_to_iso_string() {
+        let result = global_eval(
+            r#"
+            var d = new Date(0);
+            d.toISOString = function() { return 'patched'; };
+            d.toJSON() === 'patched'
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `JSON.stringify` on a Date respects an overridden `toISOString`.
+    #[test]
+    fn test_json_stringify_date_uses_overridden_to_iso_string() {
+        let result = global_eval(
+            r#"
+            var d = new Date(0);
+            d.toISOString = function() { return 'patched'; };
+            JSON.stringify(d) === '"patched"'
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `new Date(date)` preserves the exact millisecond timestamp.
+    #[test]
+    fn test_new_date_from_date_preserves_exact_milliseconds() {
+        let result = global_eval(
+            r#"
+            var src = new Date(1705321845678);
+            var copy = new Date(src);
+            copy.getTime() === 1705321845678
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.parse` accepts negative timezone offsets.
+    #[test]
+    fn test_date_parse_iso_negative_offset_value() {
+        let result = global_eval(
+            "Date.parse('2024-01-15T12:30:45.678-02:30') === Date.UTC(2024, 0, 15, 15, 0, 45, 678)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.parse` accepts ISO datetimes without seconds.
+    #[test]
+    fn test_date_parse_iso_without_seconds() {
+        let result =
+            global_eval("Date.parse('2024-01-15T12:30Z') === Date.UTC(2024, 0, 15, 12, 30, 0, 0)")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.parse('YYYY')` defaults to January 1st UTC.
+    #[test]
+    fn test_date_parse_year_only_defaults_to_january_first() {
+        let result =
+            global_eval("Date.parse('2024') === Date.UTC(2024, 0, 1, 0, 0, 0, 0)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.parse('YYYY-MM')` defaults to the first day of the month in UTC.
+    #[test]
+    fn test_date_parse_year_month_defaults_to_first_day() {
+        let result =
+            global_eval("Date.parse('2024-02') === Date.UTC(2024, 1, 1, 0, 0, 0, 0)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Fractional seconds are truncated to milliseconds.
+    #[test]
+    fn test_date_parse_fractional_seconds_truncate_after_millis() {
+        let result = global_eval(
+            "Date.parse('2024-01-15T12:30:45.6789Z') === Date.UTC(2024, 0, 15, 12, 30, 45, 678)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Leap-day ISO strings parse successfully in leap years.
+    #[test]
+    fn test_date_parse_valid_leap_day() {
+        let result = global_eval("new Date('2024-02-29T00:00:00.000Z').toISOString()").unwrap();
+        assert_eq!(result, JsValue::String("2024-02-29T00:00:00.000Z".into()));
+    }
+
+    /// Invalid ISO minutes are rejected.
+    #[test]
+    fn test_date_parse_invalid_minute_returns_nan() {
+        let result = global_eval("Number.isNaN(Date.parse('2024-01-15T12:60:00Z'))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Invalid ISO hours are rejected.
+    #[test]
+    fn test_date_parse_invalid_hour_returns_nan() {
+        let result = global_eval("Number.isNaN(Date.parse('2024-01-15T25:00:00Z'))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.UTC` normalizes overflowing months.
+    #[test]
+    fn test_date_utc_normalizes_month_overflow() {
+        let result = global_eval("Date.UTC(2024, 12, 1) === Date.UTC(2025, 0, 1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.UTC` normalizes day underflow.
+    #[test]
+    fn test_date_utc_normalizes_day_underflow() {
+        let result = global_eval("Date.UTC(2024, 0, 0) === Date.UTC(2023, 11, 31)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `getUTCDay()` reports Thursday for the Unix epoch.
+    #[test]
+    fn test_date_get_utc_day_epoch() {
+        let result = global_eval("new Date(0).getUTCDay()").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    /// `getUTCMinutes()` reads the minute component exactly.
+    #[test]
+    fn test_date_get_utc_minutes_exact() {
+        let result =
+            global_eval("new Date(Date.UTC(2024, 0, 15, 12, 34, 56, 789)).getUTCMinutes()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(34));
+    }
+
+    /// `getUTCSeconds()` reads the second component exactly.
+    #[test]
+    fn test_date_get_utc_seconds_exact() {
+        let result =
+            global_eval("new Date(Date.UTC(2024, 0, 15, 12, 34, 56, 789)).getUTCSeconds()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(56));
+    }
+
+    /// `getUTCMilliseconds()` reads the millisecond component exactly.
+    #[test]
+    fn test_date_get_utc_milliseconds_exact() {
+        let result =
+            global_eval("new Date(Date.UTC(2024, 0, 15, 12, 34, 56, 789)).getUTCMilliseconds()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(789));
+    }
+
+    /// `toUTCString()` formats the epoch in GMT.
+    #[test]
+    fn test_date_to_utc_string_epoch() {
+        let result = global_eval("new Date(0).toUTCString()").unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("Thu, 01 Jan 1970 00:00:00 GMT".into())
+        );
+    }
+
+    /// Invalid dates have `Invalid Date` for `toDateString()`.
+    #[test]
+    fn test_invalid_date_to_date_string() {
+        let result = global_eval("new Date('invalid').toDateString()").unwrap();
+        assert_eq!(result, JsValue::String("Invalid Date".into()));
+    }
+
+    /// Invalid dates have `Invalid Date` for `toTimeString()`.
+    #[test]
+    fn test_invalid_date_to_time_string() {
+        let result = global_eval("new Date('invalid').toTimeString()").unwrap();
+        assert_eq!(result, JsValue::String("Invalid Date".into()));
+    }
+
+    /// `toDateString()` includes the UTC day and month names for the epoch.
+    #[test]
+    fn test_date_to_date_string_epoch_format() {
+        let result = global_eval("new Date(0).toDateString().indexOf('Jan') >= 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `toTimeString()` includes the GMT designator.
+    #[test]
+    fn test_date_to_time_string_contains_gmt() {
+        let result = global_eval("new Date(0).toTimeString().indexOf('GMT') >= 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `setUTCMilliseconds()` updates the millisecond component.
+    #[test]
+    fn test_date_set_utc_milliseconds_updates_component() {
+        let result = global_eval(
+            r#"
+            var d = new Date(Date.UTC(2024, 0, 15, 12, 34, 56, 789));
+            d.setUTCMilliseconds(123);
+            d.getUTCMilliseconds() === 123
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `setUTCMinutes()` updates minutes, seconds, and milliseconds.
+    #[test]
+    fn test_date_set_utc_minutes_updates_optional_fields() {
+        let result = global_eval(
+            r#"
+            var d = new Date(Date.UTC(2024, 0, 15, 12, 34, 56, 789));
+            d.setUTCMinutes(1, 2, 3);
+            d.getUTCMinutes() === 1 &&
+            d.getUTCSeconds() === 2 &&
+            d.getUTCMilliseconds() === 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `setUTCHours()` updates the UTC time fields.
+    #[test]
+    fn test_date_set_utc_hours_updates_optional_fields() {
+        let result = global_eval(
+            r#"
+            var d = new Date(Date.UTC(2024, 0, 15, 12, 34, 56, 789));
+            d.setUTCHours(8, 9, 10, 11);
+            d.getUTCHours() === 8 &&
+            d.getUTCMinutes() === 9 &&
+            d.getUTCSeconds() === 10 &&
+            d.getUTCMilliseconds() === 11
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `setUTCDate()` normalizes underflow into the previous month.
+    #[test]
+    fn test_date_set_utc_date_underflow_normalizes() {
+        let result = global_eval(
+            r#"
+            var d = new Date(Date.UTC(2024, 0, 1));
+            d.setUTCDate(0);
+            d.toISOString() === '2023-12-31T00:00:00.000Z'
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `setUTCFullYear()` preserves the epoch month/day defaults on invalid dates.
+    #[test]
+    fn test_date_set_utc_full_year_invalid_defaults_from_epoch() {
+        let result = global_eval(
+            r#"
+            var d = new Date(NaN);
+            d.setUTCFullYear(2024);
+            d.toISOString() === '2024-01-01T00:00:00.000Z'
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `setMonth()` normalizes month overflow in local time.
+    #[test]
+    fn test_date_set_month_overflow_normalizes_local_fields() {
+        let result = global_eval(
+            r#"
+            var d = new Date(2024, 0, 31, 12, 0, 0, 0);
+            d.setMonth(1);
+            d.getFullYear() === 2024 &&
+            d.getMonth() === 2 &&
+            d.getDate() === 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `setDate()` normalizes underflow in local time.
+    #[test]
+    fn test_date_set_date_underflow_normalizes_local_fields() {
+        let result = global_eval(
+            r#"
+            var d = new Date(2024, 0, 1, 12, 0, 0, 0);
+            d.setDate(0);
+            d.getFullYear() === 2023 &&
+            d.getMonth() === 11 &&
+            d.getDate() === 31
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `setHours()` returns the updated timestamp.
+    #[test]
+    fn test_date_set_hours_returns_updated_timestamp() {
+        let result = global_eval(
+            r#"
+            var d = new Date(2024, 0, 15, 12, 34, 56, 789);
+            var t = d.setHours(1, 2, 3, 4);
+            t === d.getTime()
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Invalid dates have `NaN` for `valueOf()`.
+    #[test]
+    fn test_invalid_date_value_of_is_nan() {
+        let result = global_eval("Number.isNaN(new Date('invalid').valueOf())").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.now()` returns an integral millisecond count.
+    #[test]
+    fn test_date_now_is_integral_milliseconds() {
+        let result = global_eval("Date.now() % 1 === 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `toISOString()` formats extended negative years with a sign.
+    #[test]
+    fn test_date_to_iso_string_extended_negative_year() {
+        let result = global_eval("new Date(Date.UTC(-1, 0, 1)).toISOString()").unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("-000001-01-01T00:00:00.000Z".into())
+        );
     }
 
     // ── JSON built-in tests ─────────────────────────────────────────────

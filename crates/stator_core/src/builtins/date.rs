@@ -371,7 +371,23 @@ fn utc_to_local(t: f64) -> f64 {
 
 /// Convert local time milliseconds to UTC milliseconds.
 fn local_to_utc(t: f64) -> f64 {
-    t - local_tz_offset_ms(t)
+    if !t.is_finite() {
+        return t;
+    }
+
+    // The timezone offset depends on the UTC instant, not the local wall-clock
+    // time. Resolve the corresponding UTC value iteratively so dates around DST
+    // transitions use the offset in effect for the resulting instant.
+    let mut utc = t - local_tz_offset_ms(t);
+    for _ in 0..4 {
+        let next = t - local_tz_offset_ms(utc);
+        if (next - utc).abs() < 1.0 {
+            utc = next;
+            break;
+        }
+        utc = next;
+    }
+    utc
 }
 
 // ── Date.now ─────────────────────────────────────────────────────────────────
