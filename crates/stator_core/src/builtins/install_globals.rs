@@ -9740,16 +9740,20 @@ fn make_promise() -> JsValue {
 
         // ── Constructor: new Promise(executor) ─────────────────────────────────
         //
-        // The executor argument is expected to be a NativeFunction that receives
-        // two arguments: [resolve_fn, reject_fn].  Since we cannot call a JS
-        // bytecode function from here, the constructor is usable only when the
-        // executor is a NativeFunction.
+        // The executor argument must be callable and receives two arguments:
+        // [resolve_fn, reject_fn]. Both native and bytecode functions are
+        // dispatched through the ordinary callback bridge.
         {
             let q = queue.clone();
             props.insert(
                 "__call__".into(),
                 native(move |args| {
                     let executor = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    if !is_callable(&executor) {
+                        return Err(StatorError::TypeError(
+                            "Promise executor is not a function".into(),
+                        ));
+                    }
                     let p = promise_new(
                         |resolve_box, reject_box| {
                             // Wrap the resolve/reject callbacks as NativeFunctions and
@@ -9774,9 +9778,7 @@ fn make_promise() -> JsValue {
                                     Ok(JsValue::Undefined)
                                 }
                             }));
-                            if let JsValue::NativeFunction(f) = &executor
-                                && let Err(e) = f(vec![resolve_fn, reject_fn])
-                            {
+                            if let Err(e) = call_callback(&executor, vec![resolve_fn, reject_fn]) {
                                 // §27.2.3.1 step 10: If executor throws, reject.
                                 if let Some(rej) = reject_box.borrow_mut().take() {
                                     rej(JsValue::String(e.to_string().into()));
@@ -9972,9 +9974,9 @@ fn make_promise() -> JsValue {
                         }
                     };
                     let callback = match args.get(1) {
-                        Some(JsValue::NativeFunction(f)) => {
-                            let f = Rc::clone(f);
-                            Box::new(move || match f(vec![]) {
+                        Some(callback) if is_callable(callback) => {
+                            let callback = callback.clone();
+                            Box::new(move || match call_callback(&callback, vec![]) {
                                 Ok(_) => Ok(()),
                                 Err(e) => Err(JsValue::String(e.to_string().into())),
                             }) as Box<dyn Fn() -> Result<(), JsValue>>
@@ -10584,13 +10586,15 @@ fn extract_promise_array(
     }
 }
 
-/// Convert a `JsValue::NativeFunction` into a `PromiseHandler`.
+/// Convert a callable JS value into a `PromiseHandler`.
 fn extract_handler(val: &JsValue) -> Option<crate::builtins::promise::PromiseHandler> {
-    if let JsValue::NativeFunction(f) = val {
-        let f = Rc::clone(f);
-        Some(Box::new(move |v: JsValue| match f(vec![v.clone()]) {
-            Ok(result) => Ok(result),
-            Err(e) => Err(JsValue::String(e.to_string().into())),
+    if is_callable(val) {
+        let callback = val.clone();
+        Some(Box::new(move |v: JsValue| {
+            match call_callback(&callback, vec![v.clone()]) {
+                Ok(result) => Ok(result),
+                Err(e) => Err(JsValue::String(e.to_string().into())),
+            }
         }))
     } else {
         None
@@ -17344,6 +17348,53 @@ mod tests {
         }
     }
 
+    fn promise_test_globals() -> Rc<RefCell<HashMap<String, JsValue>>> {
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        Rc::new(RefCell::new(globals))
+    }
+
+    fn rewrite_last_expr_to_return_for_test(program: &mut crate::parser::ast::Program) {
+        use crate::parser::ast::{ProgramItem, ReturnStmt, Stmt};
+
+        if let Some(ProgramItem::Stmt(Stmt::Expr(expr_stmt))) = program.body.last_mut() {
+            let return_stmt = ReturnStmt {
+                loc: expr_stmt.loc,
+                argument: Some(expr_stmt.expr.clone()),
+            };
+            *program.body.last_mut().expect("program has a last item") =
+                ProgramItem::Stmt(Stmt::Return(return_stmt));
+        }
+    }
+
+    fn eval_with_globals(
+        globals: &Rc<RefCell<HashMap<String, JsValue>>>,
+        source: &str,
+    ) -> StatorResult<JsValue> {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::interpreter::{Interpreter, InterpreterFrame};
+
+        let mut program = crate::parser::recursive_descent::parse(source)?;
+        rewrite_last_expr_to_return_for_test(&mut program);
+        let bytecode = BytecodeGenerator::compile_program(&program)?;
+        let mut frame = InterpreterFrame::new_with_globals(bytecode, vec![], Rc::clone(globals));
+        Interpreter::run(&mut frame)
+    }
+
+    fn promise_value_after_microtasks(setup: &str, expr: &str) -> JsValue {
+        let globals = promise_test_globals();
+        eval_with_globals(&globals, setup).expect("setup script should run");
+        crate::builtins::promise::drain_active_microtask_queue();
+        eval_with_globals(&globals, expr).expect("assertion script should run")
+    }
+
+    fn assert_promise_bool_after_microtasks(setup: &str, expr: &str) {
+        assert_eq!(
+            promise_value_after_microtasks(setup, expr),
+            JsValue::Boolean(true)
+        );
+    }
+
     // ── eval: direct vs indirect (end-to-end) ───────────────────────────────
 
     /// Direct eval `eval("1+2")` is recognised by the bytecode generator
@@ -23244,7 +23295,7 @@ mod tests {
     /// `Promise.any` resolves with the first fulfilled value.
     #[test]
     fn e2e_promise_any_first_fulfilled() {
-        let result = global_eval(
+        assert_promise_bool_after_microtasks(
             r#"
             var result;
             Promise.any([
@@ -23252,56 +23303,48 @@ mod tests {
                 Promise.resolve(42),
                 Promise.resolve(99)
             ]).then(function(v) { result = v; });
-            result
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(42));
+            "result === 42",
+        );
     }
 
     /// `Promise.any` rejects with AggregateError when all reject.
     #[test]
     fn e2e_promise_any_all_reject() {
-        let result = global_eval(
+        assert_promise_bool_after_microtasks(
             r#"
             var name;
             Promise.any([
                 Promise.reject(1),
                 Promise.reject(2)
             ]).catch(function(e) { name = e.name; });
-            name
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::String("AggregateError".into()));
+            r#"name === "AggregateError""#,
+        );
     }
 
     /// `Promise.any` with empty array rejects with AggregateError.
     #[test]
     fn e2e_promise_any_empty_rejects() {
-        let result = global_eval(
+        assert_promise_bool_after_microtasks(
             r#"
             var name;
             Promise.any([]).catch(function(e) { name = e.name; });
-            name
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::String("AggregateError".into()));
+            r#"name === "AggregateError""#,
+        );
     }
 
     /// `Promise.any` AggregateError has correct message.
     #[test]
     fn e2e_promise_any_aggregate_error_message() {
-        let result = global_eval(
+        assert_promise_bool_after_microtasks(
             r#"
             var msg;
             Promise.any([Promise.reject(1)]).catch(function(e) { msg = e.message; });
-            msg
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::String("All promises were rejected".into()));
+            r#"msg === "All promises were rejected""#,
+        );
     }
 
     // ── Promise.race conformance ────────────────────────────────────────
@@ -23309,35 +23352,31 @@ mod tests {
     /// `Promise.race` resolves with the first settled (fulfilled).
     #[test]
     fn e2e_promise_race_first_fulfilled() {
-        let result = global_eval(
+        assert_promise_bool_after_microtasks(
             r#"
             var result;
             Promise.race([
                 Promise.resolve(10),
                 Promise.resolve(20)
             ]).then(function(v) { result = v; });
-            result
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(10));
+            "result === 10",
+        );
     }
 
     /// `Promise.race` rejects with first rejection when it settles first.
     #[test]
     fn e2e_promise_race_first_rejected() {
-        let result = global_eval(
+        assert_promise_bool_after_microtasks(
             r#"
             var reason;
             Promise.race([
                 Promise.reject("err"),
                 Promise.resolve(1)
             ]).catch(function(r) { reason = r; });
-            reason
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::String("err".into()));
+            r#"reason === "err""#,
+        );
     }
 
     // ── Promise.all edge cases ──────────────────────────────────────────
@@ -23345,29 +23384,25 @@ mod tests {
     /// `Promise.all` with non-promise values treats them as resolved.
     #[test]
     fn e2e_promise_all_non_promise_values() {
-        let result = global_eval(
+        assert_promise_bool_after_microtasks(
             r#"
             var result;
             Promise.all([1, 2, 3]).then(function(arr) { result = arr.length; });
-            result
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(3));
+            "result === 3",
+        );
     }
 
     /// `Promise.all` with empty array resolves with empty array.
     #[test]
     fn e2e_promise_all_empty_resolves() {
-        let result = global_eval(
+        assert_promise_bool_after_microtasks(
             r#"
             var result;
             Promise.all([]).then(function(arr) { result = arr.length; });
-            result
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(0));
+            "result === 0",
+        );
     }
 
     // ── Promise.prototype.finally conformance ───────────────────────────
@@ -23375,31 +23410,27 @@ mod tests {
     /// `Promise.prototype.finally` runs on resolve and passes through value.
     #[test]
     fn e2e_promise_finally_resolve_passthrough() {
-        let result = global_eval(
+        assert_promise_bool_after_microtasks(
             r#"
             var finallyRan = false;
             var result;
             Promise.resolve(42).finally(function() { finallyRan = true; }).then(function(v) { result = v; });
-            finallyRan && result === 42
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+            "finallyRan && result === 42",
+        );
     }
 
     /// `Promise.prototype.finally` runs on reject and passes through reason.
     #[test]
     fn e2e_promise_finally_reject_passthrough() {
-        let result = global_eval(
+        assert_promise_bool_after_microtasks(
             r#"
             var finallyRan = false;
             var reason;
             Promise.reject("err").finally(function() { finallyRan = true; }).catch(function(r) { reason = r; });
-            finallyRan && reason === "err"
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+            r#"finallyRan && reason === "err""#,
+        );
     }
 
     // ── Promise constructor edge cases ──────────────────────────────────
@@ -23407,24 +23438,22 @@ mod tests {
     /// Calling resolve multiple times: only first counts.
     #[test]
     fn e2e_promise_constructor_resolve_once() {
-        let result = global_eval(
+        assert_promise_bool_after_microtasks(
             r#"
             var result;
             new Promise(function(resolve, reject) {
                 resolve(1);
                 resolve(2);
             }).then(function(v) { result = v; });
-            result
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(1));
+            "result === 1",
+        );
     }
 
     /// Calling resolve then reject: only first (resolve) counts.
     #[test]
     fn e2e_promise_constructor_resolve_then_reject() {
-        let result = global_eval(
+        assert_promise_bool_after_microtasks(
             r#"
             var result;
             var caught = false;
@@ -23432,11 +23461,565 @@ mod tests {
                 resolve(1);
                 reject("err");
             }).then(function(v) { result = v; }).catch(function() { caught = true; });
-            result === 1 && !caught
+            "#,
+            "result === 1 && !caught",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_resolve_thenable_fulfilled() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var result = 0;
+            var thenable = { then: function(resolve) { resolve(42); } };
+            Promise.resolve(thenable).then(function(v) { result = v; });
+            "#,
+            "result === 42",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_resolve_thenable_nested_unwraps() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var result = 0;
+            var inner = { then: function(resolve) { resolve(99); } };
+            var outer = { then: function(resolve) { resolve(inner); } };
+            Promise.resolve(outer).then(function(v) { result = v; });
+            "#,
+            "result === 99",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_resolve_thenable_rejected() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var reason = "";
+            var thenable = { then: function(resolve, reject) { reject("boom"); } };
+            Promise.resolve(thenable).catch(function(r) { reason = r; });
+            "#,
+            r#"reason === "boom""#,
+        );
+    }
+
+    #[test]
+    fn e2e_promise_resolve_thenable_getter_throw_rejects() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var ok = false;
+            var thenable = {};
+            Object.defineProperty(thenable, "then", {
+                get: function() {
+                    throw "getter-failed";
+                }
+            });
+            Promise.resolve(thenable).catch(function(reason) {
+                ok = String(reason).indexOf("getter-failed") !== -1;
+            });
+            "#,
+            "ok",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_resolve_thenable_only_first_resolution_counts() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var result = "";
+            var thenable = {
+                then: function(resolve, reject) {
+                    resolve("first");
+                    reject("second");
+                }
+            };
+            Promise.resolve(thenable).then(function(v) { result = v; });
+            "#,
+            r#"result === "first""#,
+        );
+    }
+
+    #[test]
+    fn e2e_promise_reject_preserves_thenable_reason() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var thenable = { then: function(resolve) { resolve(1); } };
+            var same = false;
+            Promise.reject(thenable).catch(function(reason) { same = reason === thenable; });
+            "#,
+            "same",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_resolve_returns_same_promise() {
+        let result = global_eval(
+            r#"
+            var p = Promise.resolve(7);
+            Promise.resolve(p) === p
             "#,
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_promise_all_assimilates_thenable_values() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var values = "";
+            Promise.all([
+                { then: function(resolve) { resolve(1); } },
+                Promise.resolve(2),
+                3
+            ]).then(function(arr) {
+                values = arr.join(",");
+            });
+            "#,
+            r#"values === "1,2,3""#,
+        );
+    }
+
+    #[test]
+    fn e2e_promise_race_assimilates_thenable() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var result = 0;
+            Promise.race([
+                { then: function(resolve) { resolve(11); } },
+                Promise.resolve(22)
+            ]).then(function(v) {
+                result = v;
+            });
+            "#,
+            "result === 11",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_all_settled_assimilates_rejected_thenable() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var ok = false;
+            Promise.allSettled([
+                { then: function(resolve, reject) { reject("bad"); } }
+            ]).then(function(results) {
+                ok = results[0].status === "rejected" && results[0].reason === "bad";
+            });
+            "#,
+            "ok",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_then_chain_returns_value() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var result = 0;
+            Promise.resolve(2)
+                .then(function(v) { return v + 3; })
+                .then(function(v) { result = v; });
+            "#,
+            "result === 5",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_then_chain_returns_promise() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var result = 0;
+            Promise.resolve(2)
+                .then(function(v) { return Promise.resolve(v * 4); })
+                .then(function(v) { result = v; });
+            "#,
+            "result === 8",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_then_chain_returns_thenable() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var result = 0;
+            Promise.resolve(5)
+                .then(function(v) {
+                    return { then: function(resolve) { resolve(v + 1); } };
+                })
+                .then(function(v) { result = v; });
+            "#,
+            "result === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_then_chain_recovers_from_rejection() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var result = 0;
+            Promise.reject(4)
+                .then(undefined, function(reason) { return reason + 5; })
+                .then(function(v) { result = v; });
+            "#,
+            "result === 9",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_then_chain_passthrough_fulfillment() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var result = 0;
+            Promise.resolve(12)
+                .then()
+                .then(function(v) { result = v; });
+            "#,
+            "result === 12",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_then_chain_passthrough_rejection() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var reason = 0;
+            Promise.reject(13)
+                .then()
+                .catch(function(r) { reason = r; });
+            "#,
+            "reason === 13",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_then_chain_rejects_when_handler_returns_rejected_promise() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var reason = "";
+            Promise.resolve(1)
+                .then(function() { return Promise.reject("from-promise"); })
+                .catch(function(r) { reason = r; });
+            "#,
+            r#"reason === "from-promise""#,
+        );
+    }
+
+    #[test]
+    fn e2e_promise_then_chain_rejects_when_handler_returns_rejected_thenable() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var reason = "";
+            Promise.resolve(1)
+                .then(function() {
+                    return {
+                        then: function(resolve, reject) {
+                            reject("from-thenable");
+                        }
+                    };
+                })
+                .catch(function(r) { reason = r; });
+            "#,
+            r#"reason === "from-thenable""#,
+        );
+    }
+
+    #[test]
+    fn e2e_promise_then_chain_multiple_steps() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var result = 0;
+            Promise.resolve(1)
+                .then(function(v) { return v + 1; })
+                .then(function(v) { return v + 1; })
+                .then(function(v) { result = v; });
+            "#,
+            "result === 3",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_catch_alias_handles_rejection() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var reason = "";
+            Promise.reject("catch-me").catch(function(r) { reason = r; });
+            "#,
+            r#"reason === "catch-me""#,
+        );
+    }
+
+    #[test]
+    fn e2e_promise_catch_alias_bypasses_fulfillment() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var ran = false;
+            Promise.resolve(1).catch(function() { ran = true; });
+            "#,
+            "!ran",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_catch_alias_returns_chained_value() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var result = 0;
+            Promise.reject(5)
+                .catch(function(r) { return r + 2; })
+                .then(function(v) { result = v; });
+            "#,
+            "result === 7",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_catch_alias_matches_then_undefined_on_rejection() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var a = 0;
+            var b = 0;
+            Promise.reject(8).catch(function(v) { a = v; });
+            Promise.reject(9).then(undefined, function(v) { b = v; });
+            "#,
+            "a === 8 && b === 9",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_microtask_order_multiple_then_same_promise() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var log = [];
+            var p = Promise.resolve(1);
+            p.then(function() { log.push("first"); });
+            p.then(function() { log.push("second"); });
+            p.then(function() { log.push("third"); });
+            "#,
+            r#"log.join(",") === "first,second,third""#,
+        );
+    }
+
+    #[test]
+    fn e2e_promise_microtask_order_nested_then_after_current_queue() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var log = [];
+            var p = Promise.resolve(1);
+            p.then(function() {
+                log.push("a");
+            });
+            p.then(function() {
+                log.push("b");
+                Promise.resolve().then(function() { log.push("c"); });
+            });
+            p.then(function() {
+                log.push("d");
+            });
+            "#,
+            r#"log.join(",") === "a,b,d,c""#,
+        );
+    }
+
+    #[test]
+    fn e2e_promise_microtask_order_chain_interleaving() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var log = [];
+            Promise.resolve()
+                .then(function() {
+                    log.push("a");
+                    return 1;
+                })
+                .then(function() {
+                    log.push("c");
+                });
+            Promise.resolve().then(function() {
+                log.push("b");
+            });
+            "#,
+            r#"log.join(",") === "a,b,c""#,
+        );
+    }
+
+    #[test]
+    fn e2e_promise_microtask_order_preserves_registration_order_for_rejections() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var log = [];
+            var p = Promise.reject("x");
+            p.catch(function() { log.push("first"); });
+            p.catch(function() { log.push("second"); });
+            "#,
+            r#"log.join(",") === "first,second""#,
+        );
+    }
+
+    #[test]
+    fn e2e_promise_constructor_throw_rejects_promise() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var ok = false;
+            new Promise(function(resolve, reject) {
+                throw "executor-boom";
+            }).catch(function(reason) {
+                ok = String(reason).indexOf("executor-boom") !== -1;
+            });
+            "#,
+            "ok",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_constructor_throw_after_resolve_is_ignored() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var ok = false;
+            new Promise(function(resolve, reject) {
+                resolve(21);
+                throw "ignored";
+            }).then(function(v) {
+                ok = v === 21;
+            }, function() {
+                ok = false;
+            });
+            "#,
+            "ok",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_constructor_throw_after_reject_is_ignored() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var ok = false;
+            new Promise(function(resolve, reject) {
+                reject("kept");
+                throw "ignored";
+            }).catch(function(reason) {
+                ok = reason === "kept";
+            });
+            "#,
+            "ok",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_all_settled_uses_fulfilled_status_string() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var ok = false;
+            Promise.allSettled([Promise.resolve(1)]).then(function(results) {
+                ok = results[0].status === "fulfilled";
+            });
+            "#,
+            "ok",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_all_settled_uses_rejected_status_string() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var ok = false;
+            Promise.allSettled([Promise.reject("x")]).then(function(results) {
+                ok = results[0].status === "rejected";
+            });
+            "#,
+            "ok",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_all_settled_preserves_input_order() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var ok = false;
+            Promise.allSettled([
+                Promise.reject("a"),
+                Promise.resolve("b"),
+                Promise.reject("c")
+            ]).then(function(results) {
+                ok =
+                    results.length === 3 &&
+                    results[0].reason === "a" &&
+                    results[1].value === "b" &&
+                    results[2].reason === "c";
+            });
+            "#,
+            "ok",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_all_settled_sets_value_and_reason_fields_correctly() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var ok = false;
+            Promise.allSettled([
+                Promise.resolve(1),
+                Promise.reject(2)
+            ]).then(function(results) {
+                ok =
+                    results[0].value === 1 &&
+                    results[0].reason === undefined &&
+                    results[1].value === undefined &&
+                    results[1].reason === 2;
+            });
+            "#,
+            "ok",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_thenable_assimilation_through_then_chain() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var result = "";
+            Promise.resolve("seed")
+                .then(function(value) {
+                    return {
+                        then: function(resolve) {
+                            resolve(value + "-done");
+                        }
+                    };
+                })
+                .then(function(v) { result = v; });
+            "#,
+            r#"result === "seed-done""#,
+        );
+    }
+
+    #[test]
+    fn e2e_promise_thenable_assimilation_through_catch_chain() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var result = "";
+            Promise.reject("seed")
+                .catch(function(value) {
+                    return {
+                        then: function(resolve) {
+                            resolve(value + "-fixed");
+                        }
+                    };
+                })
+                .then(function(v) { result = v; });
+            "#,
+            r#"result === "seed-fixed""#,
+        );
+    }
+
+    #[test]
+    fn e2e_promise_thenable_assimilation_recursive_layers() {
+        assert_promise_bool_after_microtasks(
+            r#"
+            var result = 0;
+            var level3 = { then: function(resolve) { resolve(30); } };
+            var level2 = { then: function(resolve) { resolve(level3); } };
+            var level1 = { then: function(resolve) { resolve(level2); } };
+            Promise.resolve(level1).then(function(v) { result = v; });
+            "#,
+            "result === 30",
+        );
     }
     // ── Missing builtins: Object.getOwnPropertyDescriptor extended ──────
 

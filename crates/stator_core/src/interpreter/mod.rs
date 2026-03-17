@@ -5048,12 +5048,33 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         };
     }
     // Handle JsValue::Promise — expose then/catch/finally.
-    if let JsValue::Promise(_p) = obj {
+    if let JsValue::Promise(promise) = obj {
         return match key {
             "then" | "catch" | "finally" => {
-                // Return a no-op native function for now; full chaining is
-                // handled at a higher level by the promise builtins.
-                JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Undefined)))
+                let promise = JsValue::Promise(promise.clone());
+                let key_name = key.to_string();
+                let method_key = format!("prototype_{key}");
+                JsValue::NativeFunction(Rc::new(move |args| {
+                    let globals = current_global_env().ok_or_else(|| {
+                        StatorError::TypeError("Promise globals are not available".into())
+                    })?;
+                    let promise_ctor = globals.borrow().get("Promise").cloned();
+                    let method = match promise_ctor {
+                        Some(JsValue::PlainObject(map)) => map.borrow().get(&method_key).cloned(),
+                        _ => None,
+                    }
+                    .ok_or_else(|| {
+                        StatorError::TypeError(format!(
+                            "Promise.prototype.{} is not available",
+                            key_name
+                        ))
+                    })?;
+
+                    let mut call_args = Vec::with_capacity(args.len() + 1);
+                    call_args.push(promise.clone());
+                    call_args.extend(args);
+                    dispatch_call_value(&method, call_args)
+                }))
             }
             _ => JsValue::Undefined,
         };

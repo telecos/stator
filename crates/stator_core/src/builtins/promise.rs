@@ -32,7 +32,7 @@ use std::rc::Rc;
 
 use crate::builtins::error::JsError;
 use crate::error::StatorError;
-use crate::interpreter::dispatch_call_with_this;
+use crate::interpreter::{dispatch_call_with_this, dispatch_get_property_value};
 use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 
@@ -328,7 +328,14 @@ impl JsPromise {
             return;
         }
 
-        if let Some(then_fn) = get_thenable_method(&value) {
+        let then_fn = match get_thenable_method(&value) {
+            Ok(then_fn) => then_fn,
+            Err(reason) => {
+                self.reject(reason, queue);
+                return;
+            }
+        };
+        if let Some(then_fn) = then_fn {
             let already_called = Rc::new(Cell::new(false));
 
             let resolve_self = self.clone();
@@ -454,18 +461,28 @@ impl JsPromise {
 }
 
 fn is_thenable_callable(value: &JsValue) -> bool {
-    matches!(value, JsValue::Function(_) | JsValue::NativeFunction(_))
-        || matches!(value, JsValue::PlainObject(map) if map.borrow().contains_key("__call__"))
+    matches!(
+        value,
+        JsValue::Function(_) | JsValue::NativeFunction(_) | JsValue::Proxy(_)
+    ) || matches!(value, JsValue::PlainObject(map) if map.borrow().contains_key("__call__"))
 }
 
-fn get_thenable_method(value: &JsValue) -> Option<JsValue> {
-    match value {
-        JsValue::PlainObject(map) => map
-            .borrow()
-            .get("then")
-            .cloned()
-            .filter(is_thenable_callable),
-        _ => None,
+fn get_thenable_method(value: &JsValue) -> Result<Option<JsValue>, JsValue> {
+    if !matches!(
+        value,
+        JsValue::PlainObject(_)
+            | JsValue::Error(_)
+            | JsValue::Function(_)
+            | JsValue::NativeFunction(_)
+            | JsValue::Proxy(_)
+    ) {
+        return Ok(None);
+    }
+
+    match dispatch_get_property_value(value, JsValue::String("then".into())) {
+        Ok(then_fn) if is_thenable_callable(&then_fn) => Ok(Some(then_fn)),
+        Ok(_) => Ok(None),
+        Err(error) => Err(rejection_reason_from_error(&error)),
     }
 }
 
