@@ -283,7 +283,7 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
                 let idx = re_search.symbol_search(&input);
                 sync_last_index_to_props(&w, &re_search);
                 Ok(if idx >= 0 {
-                    JsValue::Smi(idx as i32)
+                    JsValue::Smi(utf16_index(&input, idx as usize))
                 } else {
                     JsValue::Smi(-1)
                 })
@@ -309,7 +309,10 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
                 Ok(JsValue::new_array(
                     parts
                         .into_iter()
-                        .map(|s| JsValue::String(s.into()))
+                        .map(|s| match s {
+                            Some(s) => JsValue::String(s.into()),
+                            None => JsValue::Undefined,
+                        })
                         .collect(),
                 ))
             })),
@@ -462,7 +465,7 @@ fn regexp_replace_with_callback(
 ///
 /// * Index `0` → full match (via numeric string key)
 /// * Index `1..` → capture groups
-/// * `index` → byte offset
+/// * `index` → UTF-16 code unit offset of the match start
 /// * `input` → original input string
 /// * `groups` → named groups object (or `undefined`)
 /// * `indices` → `{ 0: [s,e], 1: [s,e], …, groups: {…} }` when `/d` flag
@@ -482,7 +485,8 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
             },
         );
     }
-    props.insert("index".into(), JsValue::Smi(m.index as i32));
+    // ECMAScript specifies `index` as a UTF-16 code unit offset.
+    props.insert("index".into(), JsValue::Smi(utf16_index(&m.input, m.index)));
     props.insert("input".into(), JsValue::String(m.input.clone().into()));
 
     // groups — null-prototype object (Object.create(null) per spec)
@@ -493,9 +497,10 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
         let mut idx_props = PropertyMap::new();
         for (i, pair) in idx.pairs.iter().enumerate() {
             let val = match pair {
-                Some((s, e)) => {
-                    JsValue::new_array(vec![JsValue::Smi(*s as i32), JsValue::Smi(*e as i32)])
-                }
+                Some((s, e)) => JsValue::new_array(vec![
+                    JsValue::Smi(utf16_index(&m.input, *s)),
+                    JsValue::Smi(utf16_index(&m.input, *e)),
+                ]),
                 None => JsValue::Undefined,
             };
             idx_props.insert(i.to_string(), val);
@@ -505,7 +510,10 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
             for (k, (s, e)) in &idx.groups {
                 g.insert(
                     k.clone(),
-                    JsValue::new_array(vec![JsValue::Smi(*s as i32), JsValue::Smi(*e as i32)]),
+                    JsValue::new_array(vec![
+                        JsValue::Smi(utf16_index(&m.input, *s)),
+                        JsValue::Smi(utf16_index(&m.input, *e)),
+                    ]),
                 );
             }
             idx_props.insert(

@@ -3336,7 +3336,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 let parts = re.symbol_split(&s, limit);
                                 let items: Vec<JsValue> = parts
                                     .into_iter()
-                                    .map(|p| JsValue::String(p.into()))
+                                    .map(|p| match p {
+                                        Some(s) => JsValue::String(s.into()),
+                                        None => JsValue::Undefined,
+                                    })
                                     .collect();
                                 Ok(JsValue::new_array(items))
                             } else {
