@@ -18149,12 +18149,10 @@ mod tests {
 
     #[test]
     fn e2e_eval_indirect_no_caller_scope() {
-        // Indirect eval runs in global scope: variables defined in the
-        // outer scope should NOT be accessible.  Unknown names resolve to
-        // `undefined` (not an error) because LdaGlobal returns undefined
-        // for unbound names.
+        // Indirect eval runs in the current global scope, not the caller's
+        // local scope.
         let result = global_eval("var a = 5; (0, eval)('a')").unwrap();
-        assert_eq!(result, JsValue::Undefined);
+        assert_eq!(result, JsValue::Smi(5));
     }
 
     #[test]
@@ -18238,6 +18236,213 @@ mod tests {
     fn e2e_function_constructor_invalid_body_throws_syntax_error() {
         let result = global_eval("new Function('return {')").unwrap_err();
         assert!(matches!(result, StatorError::SyntaxError(_)));
+    }
+
+    #[test]
+    fn e2e_eval_direct_reads_function_scope_var() {
+        let result =
+            global_eval("function outer() { var x = 7; return eval('x'); } outer()").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_eval_direct_reads_parameter() {
+        let result = global_eval("function outer(x) { return eval('x'); } outer(11)").unwrap();
+        assert_eq!(result, JsValue::Smi(11));
+    }
+
+    #[test]
+    fn e2e_eval_direct_updates_function_scope_var() {
+        let result =
+            global_eval("function outer() { var x = 3; eval('x = x + 4'); return x; } outer()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_eval_direct_updates_parameter() {
+        let result =
+            global_eval("function outer(x) { eval('x = x + 2'); return x; } outer(5)").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_eval_direct_can_read_arguments_object() {
+        let result = global_eval(
+            "function outer(a, b) { return eval('arguments[0] + arguments[1]'); } outer(2, 9)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(11));
+    }
+
+    #[test]
+    fn e2e_eval_direct_var_declaration_is_observable_after_eval() {
+        let result =
+            global_eval("function outer() { eval('var y = 9'); return y; } outer()").unwrap();
+        assert_eq!(result, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn e2e_eval_direct_returns_last_expression_value() {
+        let result = global_eval("function outer() { return eval('1; 2; 3'); } outer()").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_eval_direct_returns_last_string_expression_value() {
+        let result =
+            global_eval("function outer() { return eval(\"'first'; 'second'\"); } outer()")
+                .unwrap();
+        assert_eq!(result, JsValue::String("second".into()));
+    }
+
+    #[test]
+    fn e2e_eval_direct_returns_undefined_for_non_expression_tail() {
+        let result =
+            global_eval("function outer() { return eval('var x = 1;'); } outer()").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_eval_direct_nested_reads_outer_local() {
+        let result =
+            global_eval("function outer() { var x = 12; return eval(\"eval('x + 1')\"); } outer()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(13));
+    }
+
+    #[test]
+    fn e2e_eval_direct_nested_updates_outer_local() {
+        let result = global_eval(
+            "function outer() { var x = 4; eval(\"eval('x = x + 6')\"); return x; } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_eval_direct_nested_eval_returns_inner_last_expression() {
+        let result =
+            global_eval("function outer() { return eval(\"1; eval('2; 5')\"); } outer()").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_eval_direct_syntax_error_throws_syntax_error() {
+        let result = global_eval("function outer() { return eval('function ('); } outer()");
+        assert!(matches!(result, Err(StatorError::SyntaxError(_))));
+    }
+
+    #[test]
+    fn e2e_eval_indirect_reads_global_from_function() {
+        let result = global_eval(
+            "var x = 10; function outer() { var x = 1; return (0, eval)('x'); } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_eval_indirect_can_create_global_binding() {
+        let result = global_eval(
+            "function outer() { (0, eval)('var created = 14'); return created; } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(14));
+    }
+
+    #[test]
+    fn e2e_eval_indirect_updates_existing_global_binding() {
+        let result = global_eval(
+            "var count = 2; function outer() { (0, eval)('count = count + 5'); return count; } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_eval_indirect_returns_last_expression_value() {
+        let result = global_eval("var x = 3; (0, eval)('x; x + 4')").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_eval_indirect_nested_inside_direct_uses_global_scope() {
+        let result = global_eval(
+            "var x = 20; function outer() { var x = 1; return eval(\"(0, eval)('x')\"); } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(20));
+    }
+
+    #[test]
+    fn e2e_eval_indirect_syntax_error_throws_syntax_error() {
+        let result = global_eval("(0, eval)('if (')");
+        assert!(matches!(result, Err(StatorError::SyntaxError(_))));
+    }
+
+    #[test]
+    fn e2e_function_constructor_reads_current_global_scope() {
+        let result = global_eval(
+            "var x = 41; function outer() { var x = 1; return new Function('return x + 1')(); } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_function_constructor_accepts_multiple_parameters() {
+        let result =
+            global_eval("var add = new Function('a', 'b', 'c', 'return a + b + c'); add(1, 2, 3)")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_function_constructor_body_last_return_value() {
+        let result = global_eval("new Function('a', 'b', 'return a + b')(8, 9)").unwrap();
+        assert_eq!(result, JsValue::Smi(17));
+    }
+
+    #[test]
+    fn e2e_function_constructor_can_access_current_global_this() {
+        let result =
+            global_eval("globalThis.answer = 33; new Function('return globalThis.answer')()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(33));
+    }
+
+    #[test]
+    fn e2e_function_constructor_nested_inside_eval_uses_global_scope() {
+        let result = global_eval(
+            "var x = 50; function outer() { var x = 2; return eval(\"new Function('return x')()\") } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(50));
+    }
+
+    #[test]
+    fn e2e_function_constructor_invalid_parameter_list_throws_syntax_error() {
+        let result = global_eval("new Function('a,', 'return 1')");
+        assert!(matches!(result, Err(StatorError::SyntaxError(_))));
+    }
+
+    #[test]
+    fn e2e_function_constructor_invalid_body_throws_syntax_error_via_call() {
+        let result = global_eval("Function('return {')");
+        assert!(matches!(result, Err(StatorError::SyntaxError(_))));
+    }
+
+    #[test]
+    fn e2e_eval_direct_non_string_argument_is_returned_as_is() {
+        let result = global_eval("function outer() { return eval(123); } outer()").unwrap();
+        assert_eq!(result, JsValue::Smi(123));
+    }
+
+    #[test]
+    fn e2e_eval_indirect_non_string_argument_is_returned_as_is() {
+        let result = global_eval("(0, eval)(123)").unwrap();
+        assert_eq!(result, JsValue::Smi(123));
     }
 
     #[test]

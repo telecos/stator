@@ -410,7 +410,7 @@ pub fn global_eval_direct(
     source: &str,
     caller_env: Rc<RefCell<HashMap<String, JsValue>>>,
 ) -> StatorResult<JsValue> {
-    eval_core(source, EvalMode::Direct, Some(caller_env))
+    global_eval_direct_with_scope(source, caller_env, None)
 }
 
 /// Indirect eval — ECMAScript §19.2.1.1 *PerformEval* with `direct = false`.
@@ -428,7 +428,7 @@ pub fn global_eval_direct(
 /// assert_eq!(result, JsValue::Smi(3));
 /// ```
 pub fn global_eval_indirect(source: &str) -> StatorResult<JsValue> {
-    eval_core(source, EvalMode::Indirect, None)
+    eval_core(source, EvalMode::Indirect, None, None)
 }
 
 /// Strict-mode eval — the evaluated code receives its own variable
@@ -475,9 +475,10 @@ fn eval_core(
     source: &str,
     mode: EvalMode,
     caller_env: Option<Rc<RefCell<HashMap<String, JsValue>>>>,
+    caller_context: Option<JsValue>,
 ) -> StatorResult<JsValue> {
     use crate::bytecode::bytecode_generator::BytecodeGenerator;
-    use crate::interpreter::{Interpreter, InterpreterFrame};
+    use crate::interpreter::{Interpreter, InterpreterFrame, current_global_env};
     use crate::parser::parse;
 
     let mut program = parse(source)?;
@@ -489,14 +490,28 @@ fn eval_core(
             // hoisted into the caller's variable environment.
             let bytecode = BytecodeGenerator::compile_eval_program(&program)?;
             let env = caller_env.expect("direct eval requires a caller environment");
-            InterpreterFrame::new_with_globals(bytecode, vec![], env)
+            let mut frame = InterpreterFrame::new_with_globals(bytecode, vec![], env);
+            frame.context = caller_context;
+            frame
         }
         EvalMode::Indirect => {
             let bytecode = BytecodeGenerator::compile_program(&program)?;
-            InterpreterFrame::new(bytecode, vec![])
+            if let Some(env) = current_global_env() {
+                InterpreterFrame::new_with_globals(bytecode, vec![], env)
+            } else {
+                InterpreterFrame::new(bytecode, vec![])
+            }
         }
     };
     Interpreter::run(&mut frame)
+}
+
+pub(crate) fn global_eval_direct_with_scope(
+    source: &str,
+    caller_env: Rc<RefCell<HashMap<String, JsValue>>>,
+    caller_context: Option<JsValue>,
+) -> StatorResult<JsValue> {
+    eval_core(source, EvalMode::Direct, Some(caller_env), caller_context)
 }
 
 /// If the last program item is an expression statement, rewrite it to a
