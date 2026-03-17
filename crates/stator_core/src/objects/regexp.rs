@@ -577,37 +577,46 @@ impl JsRegExp {
         }
 
         let mut parts: Vec<Option<String>> = Vec::new();
-        let mut last_end = 0_usize;
+        let mut last_end = 0usize;
         let mut search_index = 0usize;
 
-        while search_index <= input.len() {
-            let Some(mat) = self.compiled.find_from(input, search_index).next() else {
-                break;
+        // Per ECMAScript, @@split behaves like a sticky walk over the input:
+        // a match is only consumed when it starts exactly at the current
+        // search position. Otherwise we advance by one string element and try
+        // again. This matters for zero-width matches and for regexps without
+        // an explicit `y` flag.
+        while search_index < input.len() {
+            let matched = self
+                .compiled
+                .find_from(input, search_index)
+                .next()
+                .filter(|mat| mat.start() == search_index);
+
+            let Some(mat) = matched else {
+                search_index = advance_string_index(input, search_index);
+                continue;
             };
-            if mat.start() == mat.end() && mat.start() == search_index {
+
+            let match_end = mat.end();
+            if match_end == last_end {
                 search_index = advance_string_index(input, search_index);
                 continue;
             }
 
-            parts.push(Some(input[last_end..mat.start()].to_string()));
+            parts.push(Some(input[last_end..search_index].to_string()));
             if parts.len() >= lim {
-                break;
+                return parts;
             }
             for cap in &mat.captures {
                 parts.push(cap.as_ref().map(|r| input[r.clone()].to_string()));
                 if parts.len() >= lim {
-                    break;
+                    return parts;
                 }
             }
-            last_end = mat.end();
-            search_index = mat.end();
-
-            if parts.len() >= lim {
-                break;
-            }
+            last_end = match_end;
+            search_index = last_end;
         }
 
-        // Push the trailing portion (only if we haven't hit the limit).
         if parts.len() < lim {
             parts.push(Some(input[last_end..].to_string()));
         }
@@ -778,7 +787,9 @@ fn apply_replacement(replacement: &str, m: &RegExpMatch, input: &str) -> String 
                     // Named capture: $<name>
                     if let Some(end) = replacement[i + 2..].find('>') {
                         let name = &replacement[i + 2..i + 2 + end];
-                        if let Some(Some(val)) = m.named_groups.get(name) {
+                        if m.named_groups.is_empty() {
+                            out.push_str(&replacement[i..i + 3 + end]);
+                        } else if let Some(Some(val)) = m.named_groups.get(name) {
                             out.push_str(val);
                         }
                         i += 2 + end + 1; // skip $<name>
@@ -1230,6 +1241,37 @@ mod tests {
             re.symbol_split("a-b", None),
             vec![Some("a".into()), None, Some("b".into())]
         );
+    }
+
+    #[test]
+    fn test_symbol_split_zero_width_returns_characters() {
+        let re = JsRegExp::new(r"(?:)", "").unwrap();
+        assert_eq!(
+            re.symbol_split("ab", None),
+            vec![Some("a".into()), Some("b".into())]
+        );
+    }
+
+    #[test]
+    fn test_symbol_split_scans_forward_sticky_style() {
+        let re = JsRegExp::new("a", "").unwrap();
+        assert_eq!(
+            re.symbol_split("baab", None),
+            vec![Some("b".into()), Some(String::new()), Some("b".into())]
+        );
+    }
+
+    #[test]
+    fn test_apply_replacement_named_capture_is_literal_without_named_groups() {
+        let m = RegExpMatch {
+            matched: "a".into(),
+            captures: vec![],
+            named_groups: HashMap::new(),
+            index: 0,
+            input: "a".into(),
+            indices: None,
+        };
+        assert_eq!(apply_replacement("$<x>", &m, "a"), "$<x>");
     }
 
     // ── Unicode property escapes ──────────────────────────────────────────────
