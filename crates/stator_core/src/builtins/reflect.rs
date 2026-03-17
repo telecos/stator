@@ -875,4 +875,48 @@ mod tests {
         .unwrap();
         assert_eq!(obj.get_property("val"), JsValue::Smi(7));
     }
+
+    // ── Reflect.ownKeys enumeration order conformance ────────────────────────
+
+    #[test]
+    fn test_reflect_own_keys_integer_sorted() {
+        let mut obj = JsObject::new();
+        obj.set_property("2", JsValue::Smi(1)).unwrap();
+        obj.set_property("0", JsValue::Smi(2)).unwrap();
+        obj.set_property("1", JsValue::Smi(3)).unwrap();
+        let keys = reflect_own_keys(&obj);
+        assert_eq!(keys, &["0", "1", "2"]);
+    }
+
+    #[test]
+    fn test_reflect_own_keys_integers_strings_order() {
+        let mut obj = JsObject::new();
+        obj.set_property("b", JsValue::Smi(1)).unwrap();
+        obj.set_property("5", JsValue::Smi(2)).unwrap();
+        obj.set_property("a", JsValue::Smi(3)).unwrap();
+        obj.set_property("0", JsValue::Smi(4)).unwrap();
+        let keys = reflect_own_keys(&obj);
+        assert_eq!(keys, &["0", "5", "b", "a"]);
+    }
+
+    #[test]
+    fn test_reflect_own_keys_includes_non_enumerable() {
+        let mut obj = JsObject::new();
+        obj.set_property("a", JsValue::Smi(1)).unwrap();
+        obj.define_own_property(
+            "b",
+            JsValue::Smi(2),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        )
+        .unwrap();
+        let keys = reflect_own_keys(&obj);
+        assert!(keys.contains(&"a".to_string()));
+        assert!(keys.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn test_reflect_own_keys_empty() {
+        let obj = JsObject::new();
+        assert!(reflect_own_keys(&obj).is_empty());
+    }
 }

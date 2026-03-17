@@ -1851,4 +1851,34 @@ mod tests {
         .unwrap();
         assert_eq!(s, "[\n  1,\n  2\n]");
     }
+
+    // ── JSON.stringify property enumeration order conformance ─────────────
+
+    #[test]
+    fn test_stringify_plain_object_integer_keys_first() {
+        use crate::objects::property_map::PropertyMap;
+        let mut map = PropertyMap::new();
+        map.insert("b".to_string(), JsValue::Smi(1));
+        map.insert("1".to_string(), JsValue::Smi(2));
+        map.insert("a".to_string(), JsValue::Smi(3));
+        map.insert("0".to_string(), JsValue::Smi(4));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        let json = js_value_to_json(&obj).unwrap().unwrap();
+        let s = json_stringify(&json, None, None, None).unwrap().unwrap();
+        // Keys should be: "0", "1", "b", "a"
+        assert_eq!(s, r#"{"0":4,"1":2,"b":1,"a":3}"#);
+    }
+
+    #[test]
+    fn test_stringify_plain_object_sparse_indices() {
+        use crate::objects::property_map::PropertyMap;
+        let mut map = PropertyMap::new();
+        map.insert("2".to_string(), JsValue::String("c".into()));
+        map.insert("0".to_string(), JsValue::String("a".into()));
+        map.insert("1".to_string(), JsValue::String("b".into()));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        let json = js_value_to_json(&obj).unwrap().unwrap();
+        let s = json_stringify(&json, None, None, None).unwrap().unwrap();
+        assert_eq!(s, r#"{"0":"a","1":"b","2":"c"}"#);
+    }
 }

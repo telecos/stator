@@ -1632,4 +1632,50 @@ mod tests {
             Err(StatorError::TypeError(_))
         ));
     }
+
+    // ── Proxy ownKeys trap order conformance ─────────────────────────────
+
+    #[test]
+    fn test_proxy_own_keys_no_trap_follows_spec_order() {
+        let mut target = JsObject::new();
+        target.set_property("b", JsValue::Smi(1)).unwrap();
+        target.set_property("3", JsValue::Smi(2)).unwrap();
+        target.set_property("a", JsValue::Smi(3)).unwrap();
+        target.set_property("0", JsValue::Smi(4)).unwrap();
+        let proxy = proxy_new(target, ProxyHandler::default());
+        let keys = proxy_own_keys(&proxy).unwrap();
+        let key_strings: Vec<String> = keys
+            .iter()
+            .map(|k| match k {
+                JsValue::String(s) => s.to_string(),
+                _ => panic!("expected string key"),
+            })
+            .collect();
+        assert_eq!(key_strings, &["0", "3", "b", "a"]);
+    }
+
+    #[test]
+    fn test_proxy_own_keys_trap_order_respected() {
+        let mut target = JsObject::new();
+        target.set_property("a", JsValue::Smi(1)).unwrap();
+        target.set_property("b", JsValue::Smi(2)).unwrap();
+        let mut handler = ProxyHandler::default();
+        handler.own_keys = Some(Box::new(|_target| {
+            Ok(vec![
+                JsValue::String("b".into()),
+                JsValue::String("a".into()),
+            ])
+        }));
+        let proxy = proxy_new(target, handler);
+        let keys = proxy_own_keys(&proxy).unwrap();
+        let key_strings: Vec<String> = keys
+            .iter()
+            .map(|k| match k {
+                JsValue::String(s) => s.to_string(),
+                _ => panic!("expected string key"),
+            })
+            .collect();
+        // Trap order should be preserved
+        assert_eq!(key_strings, &["b", "a"]);
+    }
 }
