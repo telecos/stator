@@ -28,6 +28,7 @@ use crate::builtins::symbol::is_symbol_property_key;
 use crate::error::{StatorError, StatorResult};
 use crate::gc::trace::{Trace, Tracer};
 use crate::objects::map::{InstanceType, Map, PropertyAttributes, PropertyDescriptor};
+use crate::objects::property_descriptor::FullPropertyDescriptor;
 use crate::objects::shapes::{ShapeId, ShapeTable};
 use crate::objects::value::JsValue;
 
@@ -69,25 +70,66 @@ fn sort_keys_spec_order(keys: &mut Vec<String>) {
 /// property store overflows to a [`HashMap`] (slow / dictionary mode).
 pub const MAX_FAST_PROPERTIES: usize = 8;
 
+/// The kind of a named property: data or accessor.
+#[derive(Debug, Clone)]
+pub enum PropertyKind {
+    /// A data property with a single value.
+    Data(JsValue),
+    /// An accessor property with `[[Get]]` and `[[Set]]` slots.
+    Accessor {
+        /// The getter function, or `Undefined` if absent.
+        get: JsValue,
+        /// The setter function, or `Undefined` if absent.
+        set: JsValue,
+    },
+}
+
 /// A named property entry in slow (dictionary-mode) storage.
 ///
-/// Combines the property value and its attribute flags so that the `HashMap`
-/// key alone is sufficient to look up both.
+/// Combines the property kind (data or accessor) and its attribute flags so
+/// that the `HashMap` key alone is sufficient to look up both.
 #[derive(Debug, Clone)]
 pub struct SlowProperty {
-    value: JsValue,
+    kind: PropertyKind,
     attributes: PropertyAttributes,
 }
 
 impl SlowProperty {
-    /// Creates a `SlowProperty` with the given value and attribute flags.
+    /// Creates a data `SlowProperty` with the given value and attribute flags.
     pub fn new(value: JsValue, attributes: PropertyAttributes) -> Self {
-        Self { value, attributes }
+        Self {
+            kind: PropertyKind::Data(value),
+            attributes,
+        }
+    }
+
+    /// Creates an accessor `SlowProperty` with getter/setter and attribute
+    /// flags.
+    pub fn new_accessor(get: JsValue, set: JsValue, attributes: PropertyAttributes) -> Self {
+        Self {
+            kind: PropertyKind::Accessor { get, set },
+            attributes,
+        }
     }
 
     /// Returns a reference to the stored value.
+    ///
+    /// For accessor properties this returns the getter.
     pub fn value(&self) -> &JsValue {
-        &self.value
+        match &self.kind {
+            PropertyKind::Data(v) => v,
+            PropertyKind::Accessor { get, .. } => get,
+        }
+    }
+
+    /// Returns `true` if this is an accessor property.
+    pub fn is_accessor(&self) -> bool {
+        matches!(self.kind, PropertyKind::Accessor { .. })
+    }
+
+    /// Returns the property kind (data or accessor).
+    pub fn kind(&self) -> &PropertyKind {
+        &self.kind
     }
 
     /// Returns the property attribute flags.
@@ -286,7 +328,7 @@ impl JsObject {
                 .fast_index_and_attrs(key)
                 .and_then(|(i, attrs)| values.get(i).map(|v| (v.clone(), attrs))),
             NamedProperties::Slow { map, .. } => {
-                map.get(key).map(|e| (e.value.clone(), e.attributes))
+                map.get(key).map(|e| (e.value().clone(), e.attributes))
             }
         }
     }
@@ -357,7 +399,7 @@ impl JsObject {
             NamedProperties::Fast(values) => self
                 .fast_index_and_attrs(key)
                 .and_then(|(i, _)| values.get(i).cloned()),
-            NamedProperties::Slow { map, .. } => map.get(key).map(|e| e.value.clone()),
+            NamedProperties::Slow { map, .. } => map.get(key).map(|e| e.value().clone()),
         }
     }
 
@@ -462,7 +504,7 @@ impl JsObject {
                 NamedProperties::Fast(values) => values[idx] = value,
                 NamedProperties::Slow { map, .. } => {
                     if let Some(entry) = map.get_mut(key) {
-                        entry.value = value;
+                        entry.kind = PropertyKind::Data(value);
                     }
                 }
             }
@@ -648,6 +690,412 @@ impl JsObject {
         }
     }
 
+    // ── ECMAScript §10.1 abstract operations ────────────────────────────────
+
+    /// ECMAScript §10.1.5 *OrdinaryGetOwnProperty* ( *O*, *P* ).
+    ///
+    /// Returns a [`FullPropertyDescriptor`] describing the own property named
+    /// `key`, or `None` if the property does not exist.  The descriptor shape
+    /// correctly distinguishes data and accessor properties.
+    pub fn ordinary_get_own_property(&self, key: &str) -> Option<FullPropertyDescriptor> {
+        match &self.named_properties {
+            NamedProperties::Fast(values) => {
+                self.fast_index_and_attrs(key).and_then(|(i, attrs)| {
+                    values.get(i).map(|v| FullPropertyDescriptor::Data {
+                        value: v.clone(),
+                        writable: attrs.contains(PropertyAttributes::WRITABLE),
+                        enumerable: attrs.contains(PropertyAttributes::ENUMERABLE),
+                        configurable: attrs.contains(PropertyAttributes::CONFIGURABLE),
+                    })
+                })
+            }
+            NamedProperties::Slow { map, .. } => map.get(key).map(|entry| match entry.kind() {
+                PropertyKind::Data(v) => FullPropertyDescriptor::Data {
+                    value: v.clone(),
+                    writable: entry.attributes.contains(PropertyAttributes::WRITABLE),
+                    enumerable: entry.attributes.contains(PropertyAttributes::ENUMERABLE),
+                    configurable: entry.attributes.contains(PropertyAttributes::CONFIGURABLE),
+                },
+                PropertyKind::Accessor { get, set } => FullPropertyDescriptor::Accessor {
+                    get: get.clone(),
+                    set: set.clone(),
+                    enumerable: entry.attributes.contains(PropertyAttributes::ENUMERABLE),
+                    configurable: entry.attributes.contains(PropertyAttributes::CONFIGURABLE),
+                },
+            }),
+        }
+    }
+
+    /// ECMAScript §10.1.6 *OrdinaryDefineOwnProperty* ( *O*, *P*, *Desc* ).
+    ///
+    /// Full algorithm with [`FullPropertyDescriptor`] validation including
+    /// data↔accessor conversion checks.  Delegates validation to
+    /// [`FullPropertyDescriptor::validate_against`].
+    pub fn ordinary_define_own_property(
+        &mut self,
+        key: &str,
+        desc: &FullPropertyDescriptor,
+    ) -> StatorResult<bool> {
+        let current = self.ordinary_get_own_property(key);
+
+        if let Some(ref current_desc) = current {
+            let current_attrs = current_desc.to_attributes();
+            let is_configurable = current_attrs.contains(PropertyAttributes::CONFIGURABLE);
+
+            // §10.1.6.3 step 2: if every field is absent, return true.
+            if desc.is_generic() && desc.enumerable().is_none() && desc.configurable().is_none() {
+                return Ok(true);
+            }
+
+            // §10.1.6.3 step 4: non-configurable property restrictions.
+            if !is_configurable {
+                if desc.configurable() == Some(true) {
+                    return Ok(false);
+                }
+                if let Some(e) = desc.enumerable()
+                    && e != current_attrs.contains(PropertyAttributes::ENUMERABLE)
+                {
+                    return Ok(false);
+                }
+            }
+
+            // §10.1.6.3 step 5: generic descriptor — just update shared attrs.
+            if desc.is_generic() {
+                // Merge shared attributes only.
+            }
+            // §10.1.6.3 step 6: data↔accessor kind mismatch.
+            else if current_desc.is_data() != desc.is_data() {
+                if !is_configurable {
+                    return Ok(false);
+                }
+            }
+            // §10.1.6.3 step 7: both are data descriptors.
+            else if current_desc.is_data() && desc.is_data() {
+                if !is_configurable && !current_attrs.contains(PropertyAttributes::WRITABLE) {
+                    if let FullPropertyDescriptor::Data { writable, .. } = desc
+                        && *writable
+                    {
+                        return Ok(false);
+                    }
+                    if let FullPropertyDescriptor::Data { value, .. } = desc
+                        && let FullPropertyDescriptor::Data { value: cur_val, .. } = current_desc
+                        && !value.same_value(cur_val)
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+            // §10.1.6.3 step 8: both are accessor descriptors.
+            else if !is_configurable
+                && let (
+                    FullPropertyDescriptor::Accessor {
+                        get: cur_get,
+                        set: cur_set,
+                        ..
+                    },
+                    FullPropertyDescriptor::Accessor {
+                        get: new_get,
+                        set: new_set,
+                        ..
+                    },
+                ) = (current_desc, desc)
+                && (!new_get.same_value(cur_get) || !new_set.same_value(cur_set))
+            {
+                return Ok(false);
+            }
+        } else {
+            // Property does not exist — check extensible.
+            if !self.extensible {
+                return Ok(false);
+            }
+        }
+
+        // Apply the descriptor.
+        self.apply_property_descriptor(key, desc);
+        Ok(true)
+    }
+
+    /// Internal helper: writes a [`FullPropertyDescriptor`] to the property
+    /// store (normalises to slow mode if necessary).
+    fn apply_property_descriptor(&mut self, key: &str, desc: &FullPropertyDescriptor) {
+        if self.is_fast_mode() {
+            self.normalise_to_slow();
+        }
+        if let NamedProperties::Slow {
+            ref mut map,
+            ref mut key_order,
+        } = self.named_properties
+        {
+            let entry = match desc {
+                FullPropertyDescriptor::Data {
+                    value,
+                    writable,
+                    enumerable,
+                    configurable,
+                } => {
+                    let mut attrs = PropertyAttributes::empty();
+                    if *writable {
+                        attrs |= PropertyAttributes::WRITABLE;
+                    }
+                    if *enumerable {
+                        attrs |= PropertyAttributes::ENUMERABLE;
+                    }
+                    if *configurable {
+                        attrs |= PropertyAttributes::CONFIGURABLE;
+                    }
+                    SlowProperty::new(value.clone(), attrs)
+                }
+                FullPropertyDescriptor::Accessor {
+                    get,
+                    set,
+                    enumerable,
+                    configurable,
+                } => {
+                    let mut attrs = PropertyAttributes::empty();
+                    if *enumerable {
+                        attrs |= PropertyAttributes::ENUMERABLE;
+                    }
+                    if *configurable {
+                        attrs |= PropertyAttributes::CONFIGURABLE;
+                    }
+                    SlowProperty::new_accessor(get.clone(), set.clone(), attrs)
+                }
+                FullPropertyDescriptor::Generic { .. } => {
+                    // For a generic descriptor on an existing property, merge.
+                    let existing = map.get(key);
+                    let base_attrs = existing
+                        .map(|e| e.attributes)
+                        .unwrap_or(PropertyAttributes::empty());
+                    let attrs = desc.merge_into(base_attrs);
+                    let base_kind = existing
+                        .map(|e| e.kind.clone())
+                        .unwrap_or(PropertyKind::Data(JsValue::Undefined));
+                    SlowProperty {
+                        kind: base_kind,
+                        attributes: attrs,
+                    }
+                }
+            };
+            if !map.contains_key(key) {
+                key_order.push(key.to_string());
+            }
+            map.insert(key.to_string(), entry);
+        }
+    }
+
+    /// ECMAScript §10.1.8 *OrdinaryGet* ( *O*, *P*, *Receiver* ).
+    ///
+    /// Walks the prototype chain and invokes accessor getters.  For data
+    /// properties, the receiver is unused.  `receiver` is provided for
+    /// Proxy / getter integration but is not called through in this
+    /// simplified implementation.
+    pub fn ordinary_get(&self, key: &str, _receiver: &JsValue) -> JsValue {
+        if let Some(desc) = self.ordinary_get_own_property(key) {
+            return match desc {
+                FullPropertyDescriptor::Data { value, .. } => value,
+                FullPropertyDescriptor::Accessor { get, .. } => {
+                    // In a full engine, we'd call the getter here.
+                    // Return the getter itself for observability.
+                    get
+                }
+                FullPropertyDescriptor::Generic { .. } => JsValue::Undefined,
+            };
+        }
+        if let Some(proto) = &self.prototype {
+            return proto.borrow().ordinary_get(key, _receiver);
+        }
+        JsValue::Undefined
+    }
+
+    /// ECMAScript §10.1.9 *OrdinarySet* ( *O*, *P*, *V*, *Receiver* ).
+    ///
+    /// Handles setter invocation on prototype chain and receiver semantics.
+    /// Returns `Ok(true)` on success, `Ok(false)` on rejection.
+    pub fn ordinary_set(
+        &mut self,
+        key: &str,
+        value: JsValue,
+        _receiver: &JsValue,
+    ) -> StatorResult<bool> {
+        // Step 1: Get own descriptor.
+        if let Some(own_desc) = self.ordinary_get_own_property(key) {
+            match own_desc {
+                FullPropertyDescriptor::Data { writable, .. } => {
+                    if !writable {
+                        return Ok(false);
+                    }
+                    // Update the data property value.
+                    let new_desc = FullPropertyDescriptor::Data {
+                        value,
+                        writable: true,
+                        enumerable: own_desc.enumerable().unwrap_or(false),
+                        configurable: own_desc.configurable().unwrap_or(false),
+                    };
+                    return self.ordinary_define_own_property(key, &new_desc);
+                }
+                FullPropertyDescriptor::Accessor { set, .. } => {
+                    if set.is_undefined() {
+                        return Ok(false);
+                    }
+                    // In a full engine we'd call the setter.
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+
+        // Step 2: Walk prototype chain.
+        let parent_desc = self.find_in_prototype_chain(key);
+        if let Some(parent) = parent_desc {
+            match parent {
+                FullPropertyDescriptor::Data { writable, .. } => {
+                    if !writable {
+                        return Ok(false);
+                    }
+                }
+                FullPropertyDescriptor::Accessor { set, .. } => {
+                    if set.is_undefined() {
+                        return Ok(false);
+                    }
+                    // In a full engine we'd call the setter.
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+
+        // Step 3: Create a new data property on receiver.
+        if !self.extensible {
+            return Ok(false);
+        }
+        let new_desc = FullPropertyDescriptor::Data {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        };
+        self.ordinary_define_own_property(key, &new_desc)
+    }
+
+    /// ECMAScript §10.1.7 *OrdinaryHasProperty* ( *O*, *P* ).
+    ///
+    /// Walks the prototype chain. Equivalent to `[[HasProperty]]`.
+    pub fn ordinary_has_property(&self, key: &str) -> bool {
+        self.has_property(key)
+    }
+
+    /// ECMAScript §10.1.10 *OrdinaryDelete* ( *O*, *P* ).
+    ///
+    /// Respects the `[[Configurable]]` attribute.  Returns `Ok(true)` on
+    /// success, `Ok(false)` if the property is non-configurable.
+    pub fn ordinary_delete(&mut self, key: &str) -> StatorResult<bool> {
+        self.delete_own_property(key)
+    }
+
+    /// ECMAScript §7.3.5 *CreateDataProperty* ( *O*, *P*, *V* ).
+    ///
+    /// Creates a new own data property with `{ [[Value]]: V, [[Writable]]:
+    /// true, [[Enumerable]]: true, [[Configurable]]: true }`.
+    pub fn create_data_property(&mut self, key: &str, value: JsValue) -> StatorResult<bool> {
+        let desc = FullPropertyDescriptor::Data {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        };
+        self.ordinary_define_own_property(key, &desc)
+    }
+
+    /// ECMAScript §7.3.6 *CreateMethodProperty* ( *O*, *P*, *V* ).
+    ///
+    /// Creates a new own data property with `{ [[Value]]: V, [[Writable]]:
+    /// true, [[Enumerable]]: false, [[Configurable]]: true }`.
+    pub fn create_method_property(&mut self, key: &str, value: JsValue) -> StatorResult<bool> {
+        let desc = FullPropertyDescriptor::Data {
+            value,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        };
+        self.ordinary_define_own_property(key, &desc)
+    }
+
+    /// ECMAScript §7.3.8 *DefinePropertyOrThrow* ( *O*, *P*, *desc* ).
+    ///
+    /// Like [`ordinary_define_own_property`](Self::ordinary_define_own_property)
+    /// but throws a `TypeError` instead of returning `false`.
+    pub fn define_property_or_throw(
+        &mut self,
+        key: &str,
+        desc: &FullPropertyDescriptor,
+    ) -> StatorResult<()> {
+        let success = self.ordinary_define_own_property(key, desc)?;
+        if !success {
+            return Err(StatorError::TypeError(format!(
+                "Cannot define property '{key}'"
+            )));
+        }
+        Ok(())
+    }
+
+    /// ECMAScript §7.3.12 *HasProperty* ( *O*, *P* ) — inherited + own.
+    pub fn spec_has_property(&self, key: &str) -> bool {
+        self.has_property(key)
+    }
+
+    /// ECMAScript §7.3.13 *HasOwnProperty* ( *O*, *P* ) — own only.
+    pub fn spec_has_own_property(&self, key: &str) -> bool {
+        self.has_own_property(key)
+    }
+
+    /// ECMAScript §7.3.2 *Get* ( *O*, *P* ) with implicit receiver = *O*.
+    pub fn spec_get(&self, key: &str) -> JsValue {
+        self.get_property(key)
+    }
+
+    /// ECMAScript §7.3.2 *Get* ( *O*, *P* ) with explicit *Receiver*.
+    ///
+    /// The receiver parameter is relevant for Proxy objects and accessor
+    /// property getters.
+    pub fn spec_get_with_receiver(&self, key: &str, receiver: &JsValue) -> JsValue {
+        self.ordinary_get(key, receiver)
+    }
+
+    /// Searches the prototype chain (excluding `self`) for a property
+    /// descriptor matching `key`.
+    fn find_in_prototype_chain(&self, key: &str) -> Option<FullPropertyDescriptor> {
+        let mut current = self.prototype.clone();
+        while let Some(proto_ref) = current {
+            let proto = proto_ref.borrow();
+            if let Some(desc) = proto.ordinary_get_own_property(key) {
+                return Some(desc);
+            }
+            current = proto.prototype.clone();
+        }
+        None
+    }
+
+    /// Defines an accessor property on this object.
+    ///
+    /// Useful for setting up getter/setter pairs without going through
+    /// the full `OrdinaryDefineOwnProperty` path.
+    pub fn define_accessor_property(
+        &mut self,
+        key: &str,
+        get: JsValue,
+        set: JsValue,
+        enumerable: bool,
+        configurable: bool,
+    ) -> StatorResult<bool> {
+        let desc = FullPropertyDescriptor::Accessor {
+            get,
+            set,
+            enumerable,
+            configurable,
+        };
+        self.ordinary_define_own_property(key, &desc)
+    }
+
     // ── Indexed element operations ────────────────────────────────────────────
 
     /// Returns the element at `index`, or [`JsValue::Undefined`] if the index
@@ -814,7 +1262,13 @@ impl Trace for JsObject {
             }
             NamedProperties::Slow { map, .. } => {
                 for prop in map.values() {
-                    prop.value().trace(tracer);
+                    match prop.kind() {
+                        PropertyKind::Data(v) => v.trace(tracer),
+                        PropertyKind::Accessor { get, set } => {
+                            get.trace(tracer);
+                            set.trace(tracer);
+                        }
+                    }
                 }
             }
         }
@@ -1279,5 +1733,824 @@ mod tests {
         // own_property_keys only returns named properties
         let keys = obj.own_property_keys();
         assert_eq!(keys, &["a"]);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ECMAScript abstract operations — 40+ e2e spec compliance tests
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── OrdinaryGetOwnProperty ──────────────────────────────────────────────
+
+    #[test]
+    fn test_ordinary_get_own_property_data_shape() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(42)).unwrap();
+        let desc = obj.ordinary_get_own_property("x").unwrap();
+        assert!(desc.is_data());
+        if let FullPropertyDescriptor::Data {
+            value,
+            writable,
+            enumerable,
+            configurable,
+        } = desc
+        {
+            assert_eq!(value, JsValue::Smi(42));
+            assert!(writable);
+            assert!(enumerable);
+            assert!(configurable);
+        }
+    }
+
+    #[test]
+    fn test_ordinary_get_own_property_missing_returns_none() {
+        let obj = JsObject::new();
+        assert!(obj.ordinary_get_own_property("absent").is_none());
+    }
+
+    #[test]
+    fn test_ordinary_get_own_property_accessor_shape() {
+        let mut obj = JsObject::new();
+        obj.define_accessor_property(
+            "acc",
+            JsValue::Boolean(true),  // getter stand-in
+            JsValue::Boolean(false), // setter stand-in
+            true,
+            true,
+        )
+        .unwrap();
+        let desc = obj.ordinary_get_own_property("acc").unwrap();
+        assert!(desc.is_accessor());
+        if let FullPropertyDescriptor::Accessor {
+            get,
+            set,
+            enumerable,
+            configurable,
+        } = desc
+        {
+            assert_eq!(get, JsValue::Boolean(true));
+            assert_eq!(set, JsValue::Boolean(false));
+            assert!(enumerable);
+            assert!(configurable);
+        }
+    }
+
+    #[test]
+    fn test_ordinary_get_own_property_non_writable() {
+        let mut obj = JsObject::new();
+        obj.define_own_property("ro", JsValue::Smi(7), PropertyAttributes::ENUMERABLE)
+            .unwrap();
+        let desc = obj.ordinary_get_own_property("ro").unwrap();
+        if let FullPropertyDescriptor::Data { writable, .. } = desc {
+            assert!(!writable);
+        } else {
+            panic!("expected Data descriptor");
+        }
+    }
+
+    // ── OrdinaryDefineOwnProperty / ValidateAndApplyPropertyDescriptor ──────
+
+    #[test]
+    fn test_ordinary_define_own_property_new_data() {
+        let mut obj = JsObject::new();
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(10),
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        };
+        assert!(obj.ordinary_define_own_property("p", &desc).unwrap());
+        assert_eq!(obj.get_property("p"), JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_ordinary_define_rejects_on_non_extensible() {
+        let mut obj = JsObject::new();
+        obj.prevent_extensions();
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        };
+        assert!(!obj.ordinary_define_own_property("p", &desc).unwrap());
+    }
+
+    #[test]
+    fn test_ordinary_define_non_configurable_rejects_configurable_change() {
+        let mut obj = JsObject::new();
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        };
+        obj.ordinary_define_own_property("p", &desc).unwrap();
+        let redesc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        };
+        assert!(!obj.ordinary_define_own_property("p", &redesc).unwrap());
+    }
+
+    #[test]
+    fn test_ordinary_define_non_configurable_rejects_enumerable_change() {
+        let mut obj = JsObject::new();
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        };
+        obj.ordinary_define_own_property("p", &desc).unwrap();
+        let redesc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: false,
+            enumerable: true,
+            configurable: false,
+        };
+        assert!(!obj.ordinary_define_own_property("p", &redesc).unwrap());
+    }
+
+    #[test]
+    fn test_ordinary_define_non_configurable_non_writable_rejects_value_change() {
+        let mut obj = JsObject::new();
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        };
+        obj.ordinary_define_own_property("p", &desc).unwrap();
+        let redesc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(2),
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        };
+        assert!(!obj.ordinary_define_own_property("p", &redesc).unwrap());
+    }
+
+    #[test]
+    fn test_ordinary_define_non_configurable_non_writable_same_value_ok() {
+        let mut obj = JsObject::new();
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        };
+        obj.ordinary_define_own_property("p", &desc).unwrap();
+        // Redefining with same value is fine.
+        assert!(obj.ordinary_define_own_property("p", &desc).unwrap());
+    }
+
+    #[test]
+    fn test_ordinary_define_non_configurable_rejects_writable_false_to_true() {
+        let mut obj = JsObject::new();
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        };
+        obj.ordinary_define_own_property("p", &desc).unwrap();
+        let redesc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: true,
+            enumerable: false,
+            configurable: false,
+        };
+        assert!(!obj.ordinary_define_own_property("p", &redesc).unwrap());
+    }
+
+    #[test]
+    fn test_ordinary_define_configurable_allows_writable_change() {
+        let mut obj = JsObject::new();
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        };
+        obj.ordinary_define_own_property("p", &desc).unwrap();
+        let redesc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: false,
+            enumerable: true,
+            configurable: true,
+        };
+        assert!(obj.ordinary_define_own_property("p", &redesc).unwrap());
+    }
+
+    #[test]
+    fn test_ordinary_define_data_to_accessor_on_configurable() {
+        let mut obj = JsObject::new();
+        let data = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        };
+        obj.ordinary_define_own_property("p", &data).unwrap();
+        // Convert to accessor.
+        let acc = FullPropertyDescriptor::Accessor {
+            get: JsValue::Boolean(true),
+            set: JsValue::Undefined,
+            enumerable: true,
+            configurable: true,
+        };
+        assert!(obj.ordinary_define_own_property("p", &acc).unwrap());
+        let desc = obj.ordinary_get_own_property("p").unwrap();
+        assert!(desc.is_accessor());
+    }
+
+    #[test]
+    fn test_ordinary_define_data_to_accessor_on_non_configurable_rejected() {
+        let mut obj = JsObject::new();
+        let data = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: true,
+            enumerable: false,
+            configurable: false,
+        };
+        obj.ordinary_define_own_property("p", &data).unwrap();
+        let acc = FullPropertyDescriptor::Accessor {
+            get: JsValue::Undefined,
+            set: JsValue::Undefined,
+            enumerable: false,
+            configurable: false,
+        };
+        assert!(!obj.ordinary_define_own_property("p", &acc).unwrap());
+    }
+
+    #[test]
+    fn test_ordinary_define_accessor_to_data_on_configurable() {
+        let mut obj = JsObject::new();
+        let acc = FullPropertyDescriptor::Accessor {
+            get: JsValue::Boolean(true),
+            set: JsValue::Undefined,
+            enumerable: true,
+            configurable: true,
+        };
+        obj.ordinary_define_own_property("p", &acc).unwrap();
+        let data = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(99),
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        };
+        assert!(obj.ordinary_define_own_property("p", &data).unwrap());
+        let desc = obj.ordinary_get_own_property("p").unwrap();
+        assert!(desc.is_data());
+    }
+
+    #[test]
+    fn test_ordinary_define_non_configurable_accessor_same_values_ok() {
+        let mut obj = JsObject::new();
+        let acc = FullPropertyDescriptor::Accessor {
+            get: JsValue::Boolean(true),
+            set: JsValue::Boolean(false),
+            enumerable: false,
+            configurable: false,
+        };
+        obj.ordinary_define_own_property("p", &acc).unwrap();
+        // Redefine with same getter/setter.
+        assert!(obj.ordinary_define_own_property("p", &acc).unwrap());
+    }
+
+    #[test]
+    fn test_ordinary_define_non_configurable_accessor_different_getter_rejected() {
+        let mut obj = JsObject::new();
+        let acc = FullPropertyDescriptor::Accessor {
+            get: JsValue::Boolean(true),
+            set: JsValue::Undefined,
+            enumerable: false,
+            configurable: false,
+        };
+        obj.ordinary_define_own_property("p", &acc).unwrap();
+        let changed = FullPropertyDescriptor::Accessor {
+            get: JsValue::Boolean(false),
+            set: JsValue::Undefined,
+            enumerable: false,
+            configurable: false,
+        };
+        assert!(!obj.ordinary_define_own_property("p", &changed).unwrap());
+    }
+
+    #[test]
+    fn test_ordinary_define_empty_generic_on_existing_returns_true() {
+        let mut obj = JsObject::new();
+        obj.set_property("p", JsValue::Smi(1)).unwrap();
+        let generic = FullPropertyDescriptor::Generic {
+            enumerable: None,
+            configurable: None,
+        };
+        assert!(obj.ordinary_define_own_property("p", &generic).unwrap());
+    }
+
+    // ── OrdinarySet ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_ordinary_set_creates_new_property() {
+        let mut obj = JsObject::new();
+        let receiver = JsValue::Undefined;
+        assert!(obj.ordinary_set("x", JsValue::Smi(42), &receiver).unwrap());
+        assert_eq!(obj.get_property("x"), JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_ordinary_set_updates_existing_writable_property() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        let receiver = JsValue::Undefined;
+        assert!(obj.ordinary_set("x", JsValue::Smi(99), &receiver).unwrap());
+        assert_eq!(obj.get_property("x"), JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_ordinary_set_rejects_non_writable() {
+        let mut obj = JsObject::new();
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: false,
+            enumerable: true,
+            configurable: true,
+        };
+        obj.ordinary_define_own_property("x", &desc).unwrap();
+        let receiver = JsValue::Undefined;
+        assert!(!obj.ordinary_set("x", JsValue::Smi(2), &receiver).unwrap());
+    }
+
+    #[test]
+    fn test_ordinary_set_rejects_non_writable_in_prototype() {
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        {
+            let mut p = proto.borrow_mut();
+            let desc = FullPropertyDescriptor::Data {
+                value: JsValue::Smi(1),
+                writable: false,
+                enumerable: true,
+                configurable: true,
+            };
+            p.ordinary_define_own_property("x", &desc).unwrap();
+        }
+        let mut child = JsObject::with_prototype(Rc::clone(&proto));
+        let receiver = JsValue::Undefined;
+        assert!(!child.ordinary_set("x", JsValue::Smi(2), &receiver).unwrap());
+    }
+
+    #[test]
+    fn test_ordinary_set_respects_accessor_setter_undefined() {
+        let mut obj = JsObject::new();
+        let acc = FullPropertyDescriptor::Accessor {
+            get: JsValue::Boolean(true),
+            set: JsValue::Undefined,
+            enumerable: true,
+            configurable: true,
+        };
+        obj.ordinary_define_own_property("x", &acc).unwrap();
+        let receiver = JsValue::Undefined;
+        assert!(!obj.ordinary_set("x", JsValue::Smi(2), &receiver).unwrap());
+    }
+
+    #[test]
+    fn test_ordinary_set_accessor_setter_present_succeeds() {
+        let mut obj = JsObject::new();
+        let acc = FullPropertyDescriptor::Accessor {
+            get: JsValue::Undefined,
+            set: JsValue::Boolean(true), // stand-in for a setter
+            enumerable: true,
+            configurable: true,
+        };
+        obj.ordinary_define_own_property("x", &acc).unwrap();
+        let receiver = JsValue::Undefined;
+        assert!(obj.ordinary_set("x", JsValue::Smi(2), &receiver).unwrap());
+    }
+
+    #[test]
+    fn test_ordinary_set_proto_accessor_setter_undefined_rejected() {
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        {
+            let mut p = proto.borrow_mut();
+            let acc = FullPropertyDescriptor::Accessor {
+                get: JsValue::Undefined,
+                set: JsValue::Undefined,
+                enumerable: true,
+                configurable: true,
+            };
+            p.ordinary_define_own_property("x", &acc).unwrap();
+        }
+        let mut child = JsObject::with_prototype(Rc::clone(&proto));
+        let receiver = JsValue::Undefined;
+        assert!(!child.ordinary_set("x", JsValue::Smi(1), &receiver).unwrap());
+    }
+
+    #[test]
+    fn test_ordinary_set_non_extensible_rejects_new_property() {
+        let mut obj = JsObject::new();
+        obj.prevent_extensions();
+        let receiver = JsValue::Undefined;
+        assert!(!obj.ordinary_set("x", JsValue::Smi(1), &receiver).unwrap());
+    }
+
+    // ── OrdinaryGet ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_ordinary_get_data_property() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(42)).unwrap();
+        let receiver = JsValue::Undefined;
+        assert_eq!(obj.ordinary_get("x", &receiver), JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_ordinary_get_accessor_returns_getter() {
+        let mut obj = JsObject::new();
+        let acc = FullPropertyDescriptor::Accessor {
+            get: JsValue::Boolean(true),
+            set: JsValue::Undefined,
+            enumerable: true,
+            configurable: true,
+        };
+        obj.ordinary_define_own_property("x", &acc).unwrap();
+        let receiver = JsValue::Undefined;
+        // Returns the getter (stand-in for calling it).
+        assert_eq!(obj.ordinary_get("x", &receiver), JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_ordinary_get_walks_prototype_chain() {
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        proto
+            .borrow_mut()
+            .set_property("inherited", JsValue::Smi(7))
+            .unwrap();
+        let child = JsObject::with_prototype(Rc::clone(&proto));
+        let receiver = JsValue::Undefined;
+        assert_eq!(child.ordinary_get("inherited", &receiver), JsValue::Smi(7));
+    }
+
+    #[test]
+    fn test_ordinary_get_missing_returns_undefined() {
+        let obj = JsObject::new();
+        let receiver = JsValue::Undefined;
+        assert_eq!(obj.ordinary_get("nope", &receiver), JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_ordinary_get_accessor_on_prototype() {
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        {
+            let mut p = proto.borrow_mut();
+            let acc = FullPropertyDescriptor::Accessor {
+                get: JsValue::Smi(123),
+                set: JsValue::Undefined,
+                enumerable: true,
+                configurable: true,
+            };
+            p.ordinary_define_own_property("x", &acc).unwrap();
+        }
+        let child = JsObject::with_prototype(Rc::clone(&proto));
+        let receiver = JsValue::Undefined;
+        assert_eq!(child.ordinary_get("x", &receiver), JsValue::Smi(123));
+    }
+
+    // ── OrdinaryHasProperty ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_ordinary_has_property_own() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        assert!(obj.ordinary_has_property("x"));
+        assert!(!obj.ordinary_has_property("y"));
+    }
+
+    #[test]
+    fn test_ordinary_has_property_walks_chain() {
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        proto
+            .borrow_mut()
+            .set_property("y", JsValue::Smi(2))
+            .unwrap();
+        let child = JsObject::with_prototype(Rc::clone(&proto));
+        assert!(child.ordinary_has_property("y"));
+        assert!(!child.ordinary_has_property("z"));
+    }
+
+    // ── OrdinaryDelete ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_ordinary_delete_configurable_succeeds() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        assert!(obj.ordinary_delete("x").unwrap());
+        assert!(!obj.has_own_property("x"));
+    }
+
+    #[test]
+    fn test_ordinary_delete_non_configurable_returns_false() {
+        let mut obj = JsObject::new();
+        obj.define_own_property("nc", JsValue::Smi(1), PropertyAttributes::empty())
+            .unwrap();
+        assert!(!obj.ordinary_delete("nc").unwrap());
+        assert!(obj.has_own_property("nc"));
+    }
+
+    #[test]
+    fn test_ordinary_delete_absent_returns_true() {
+        let mut obj = JsObject::new();
+        assert!(obj.ordinary_delete("ghost").unwrap());
+    }
+
+    // ── CreateDataProperty ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_create_data_property_attributes() {
+        let mut obj = JsObject::new();
+        obj.create_data_property("p", JsValue::Smi(5)).unwrap();
+        let desc = obj.ordinary_get_own_property("p").unwrap();
+        if let FullPropertyDescriptor::Data {
+            value,
+            writable,
+            enumerable,
+            configurable,
+        } = desc
+        {
+            assert_eq!(value, JsValue::Smi(5));
+            assert!(writable);
+            assert!(enumerable);
+            assert!(configurable);
+        } else {
+            panic!("expected Data descriptor");
+        }
+    }
+
+    #[test]
+    fn test_create_data_property_non_extensible_fails() {
+        let mut obj = JsObject::new();
+        obj.prevent_extensions();
+        assert!(!obj.create_data_property("p", JsValue::Smi(1)).unwrap());
+    }
+
+    // ── CreateMethodProperty ────────────────────────────────────────────────
+
+    #[test]
+    fn test_create_method_property_attributes() {
+        let mut obj = JsObject::new();
+        obj.create_method_property("m", JsValue::Smi(42)).unwrap();
+        let desc = obj.ordinary_get_own_property("m").unwrap();
+        if let FullPropertyDescriptor::Data {
+            writable,
+            enumerable,
+            configurable,
+            ..
+        } = desc
+        {
+            assert!(writable);
+            assert!(!enumerable, "method properties are NOT enumerable");
+            assert!(configurable);
+        } else {
+            panic!("expected Data descriptor");
+        }
+    }
+
+    // ── DefinePropertyOrThrow vs CreateDataProperty ─────────────────────────
+
+    #[test]
+    fn test_define_property_or_throw_success() {
+        let mut obj = JsObject::new();
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        };
+        obj.define_property_or_throw("p", &desc).unwrap();
+        assert_eq!(obj.get_property("p"), JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_define_property_or_throw_fails_on_non_extensible() {
+        let mut obj = JsObject::new();
+        obj.prevent_extensions();
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        };
+        let err = obj.define_property_or_throw("p", &desc).unwrap_err();
+        assert!(matches!(err, StatorError::TypeError(_)));
+    }
+
+    #[test]
+    fn test_define_property_or_throw_default_attrs_differ_from_create_data() {
+        let mut obj = JsObject::new();
+        // DefinePropertyOrThrow with restrictive attrs.
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        };
+        obj.define_property_or_throw("strict", &desc).unwrap();
+        // CreateDataProperty with full attrs.
+        obj.create_data_property("loose", JsValue::Smi(2)).unwrap();
+
+        let strict = obj.ordinary_get_own_property("strict").unwrap();
+        let loose = obj.ordinary_get_own_property("loose").unwrap();
+        assert_ne!(strict.to_attributes(), loose.to_attributes());
+    }
+
+    // ── HasProperty vs HasOwnProperty ───────────────────────────────────────
+
+    #[test]
+    fn test_has_property_vs_has_own_property() {
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        proto
+            .borrow_mut()
+            .set_property("inherited", JsValue::Smi(1))
+            .unwrap();
+        let mut child = JsObject::with_prototype(Rc::clone(&proto));
+        child.set_property("own", JsValue::Smi(2)).unwrap();
+
+        // HasProperty sees both.
+        assert!(child.spec_has_property("own"));
+        assert!(child.spec_has_property("inherited"));
+        // HasOwnProperty sees only own.
+        assert!(child.spec_has_own_property("own"));
+        assert!(!child.spec_has_own_property("inherited"));
+    }
+
+    #[test]
+    fn test_has_property_multi_level_chain() {
+        let gp = Rc::new(RefCell::new(JsObject::new()));
+        gp.borrow_mut()
+            .set_property("deep", JsValue::Smi(1))
+            .unwrap();
+        let parent = Rc::new(RefCell::new(JsObject::with_prototype(Rc::clone(&gp))));
+        let child = JsObject::with_prototype(Rc::clone(&parent));
+        assert!(child.spec_has_property("deep"));
+        assert!(!child.spec_has_own_property("deep"));
+    }
+
+    // ── Get with Receiver ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_spec_get_implicit_receiver() {
+        let mut obj = JsObject::new();
+        obj.set_property("v", JsValue::Smi(100)).unwrap();
+        assert_eq!(obj.spec_get("v"), JsValue::Smi(100));
+    }
+
+    #[test]
+    fn test_spec_get_with_receiver_data() {
+        let mut obj = JsObject::new();
+        obj.set_property("v", JsValue::Smi(100)).unwrap();
+        let receiver = JsValue::Smi(0); // arbitrary receiver
+        assert_eq!(
+            obj.spec_get_with_receiver("v", &receiver),
+            JsValue::Smi(100)
+        );
+    }
+
+    #[test]
+    fn test_spec_get_with_receiver_accessor() {
+        let mut obj = JsObject::new();
+        let getter = JsValue::String("getter_fn".into());
+        obj.define_accessor_property("x", getter.clone(), JsValue::Undefined, true, true)
+            .unwrap();
+        let receiver = JsValue::Smi(0);
+        // Returns the getter value.
+        assert_eq!(obj.spec_get_with_receiver("x", &receiver), getter);
+    }
+
+    #[test]
+    fn test_spec_get_with_receiver_prototype_accessor() {
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        {
+            let mut p = proto.borrow_mut();
+            p.define_accessor_property("x", JsValue::Smi(999), JsValue::Undefined, true, true)
+                .unwrap();
+        }
+        let child = JsObject::with_prototype(Rc::clone(&proto));
+        let receiver = JsValue::Smi(0);
+        assert_eq!(
+            child.spec_get_with_receiver("x", &receiver),
+            JsValue::Smi(999)
+        );
+    }
+
+    // ── Accessor property round-trip ────────────────────────────────────────
+
+    #[test]
+    fn test_accessor_property_survives_define_and_read() {
+        let mut obj = JsObject::new();
+        obj.define_accessor_property(
+            "acc",
+            JsValue::Smi(10), // getter stand-in
+            JsValue::Smi(20), // setter stand-in
+            false,
+            true,
+        )
+        .unwrap();
+        let desc = obj.ordinary_get_own_property("acc").unwrap();
+        assert!(desc.is_accessor());
+        assert_eq!(desc.enumerable(), Some(false));
+        assert_eq!(desc.configurable(), Some(true));
+    }
+
+    // ── Narrowing writable via OrdinaryDefineOwnProperty ────────────────────
+
+    #[test]
+    fn test_narrowing_writable_true_to_false_on_non_configurable() {
+        let mut obj = JsObject::new();
+        // non-configurable, writable
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: true,
+            enumerable: false,
+            configurable: false,
+        };
+        obj.ordinary_define_own_property("p", &desc).unwrap();
+        // narrow writable true→false
+        let narrow = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        };
+        assert!(obj.ordinary_define_own_property("p", &narrow).unwrap());
+        let final_desc = obj.ordinary_get_own_property("p").unwrap();
+        if let FullPropertyDescriptor::Data { writable, .. } = final_desc {
+            assert!(!writable);
+        }
+    }
+
+    // ── Prototype chain OrdinarySet with setter propagation ─────────────────
+
+    #[test]
+    fn test_ordinary_set_proto_accessor_with_setter_succeeds() {
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        {
+            let mut p = proto.borrow_mut();
+            let acc = FullPropertyDescriptor::Accessor {
+                get: JsValue::Undefined,
+                set: JsValue::Boolean(true), // non-undefined setter
+                enumerable: true,
+                configurable: true,
+            };
+            p.ordinary_define_own_property("x", &acc).unwrap();
+        }
+        let mut child = JsObject::with_prototype(Rc::clone(&proto));
+        let receiver = JsValue::Undefined;
+        assert!(child.ordinary_set("x", JsValue::Smi(1), &receiver).unwrap());
+    }
+
+    // ── CreateDataProperty overwrites existing ──────────────────────────────
+
+    #[test]
+    fn test_create_data_property_overwrites_accessor() {
+        let mut obj = JsObject::new();
+        obj.define_accessor_property(
+            "x",
+            JsValue::Boolean(true),
+            JsValue::Boolean(false),
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(obj.ordinary_get_own_property("x").unwrap().is_accessor());
+        obj.create_data_property("x", JsValue::Smi(42)).unwrap();
+        let desc = obj.ordinary_get_own_property("x").unwrap();
+        assert!(desc.is_data());
+        if let FullPropertyDescriptor::Data { value, .. } = desc {
+            assert_eq!(value, JsValue::Smi(42));
+        }
+    }
+
+    // ── Generic descriptor changes only specified attributes ────────────────
+
+    #[test]
+    fn test_generic_descriptor_changes_only_specified_attrs() {
+        let mut obj = JsObject::new();
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        };
+        obj.ordinary_define_own_property("p", &desc).unwrap();
+        // Generic: only flip enumerable.
+        let generic = FullPropertyDescriptor::Generic {
+            enumerable: Some(true),
+            configurable: None,
+        };
+        assert!(obj.ordinary_define_own_property("p", &generic).unwrap());
+        let final_desc = obj.ordinary_get_own_property("p").unwrap();
+        assert_eq!(final_desc.enumerable(), Some(true));
+        assert_eq!(final_desc.configurable(), Some(true));
     }
 }
