@@ -42334,4 +42334,361 @@ mod tests {
              Object.hasOwn(o, 'x')",
         );
     }
+
+    // ── Getter / Setter conformance tests ────────────────────────────────
+
+    // 1. Object literal getter returns value
+    #[test]
+    fn e2e_getter_basic_object_literal() {
+        assert_eval_true("var o = { get x() { return 42; } }; o.x === 42");
+    }
+
+    // 2. Object literal setter stores value via closure
+    #[test]
+    fn e2e_setter_basic_object_literal() {
+        assert_eval_true(
+            "var o = { _v: 0, get v() { return this._v; }, set v(x) { this._v = x; } }; \
+             o.v = 10; o.v === 10",
+        );
+    }
+
+    // 3. Getter with no setter — read returns getter result
+    #[test]
+    fn e2e_getter_only_read() {
+        let r = global_eval("var o = { get x() { return 'hello'; } }; o.x").unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    // 4. Setter-only property — read returns undefined
+    #[test]
+    fn e2e_setter_only_read_returns_undefined() {
+        assert_eval_true("var o = { set x(v) { this._x = v; } }; o.x === undefined");
+    }
+
+    // 5. Setter invoked on assignment
+    #[test]
+    fn e2e_setter_invoked_on_assign() {
+        assert_eval_true(
+            "var o = { _v: 0, set v(x) { this._v = x * 2; }, get v() { return this._v; } }; \
+             o.v = 5; o.v === 10",
+        );
+    }
+
+    // 6. Getter/setter with this — correct receiver
+    #[test]
+    fn e2e_getter_setter_this_binding() {
+        assert_eval_true(
+            "var o = { name: 'world', get greeting() { return 'hello ' + this.name; } }; \
+             o.greeting === 'hello world'",
+        );
+    }
+
+    // 7. Setter with this — mutates correct receiver
+    #[test]
+    fn e2e_setter_this_mutates_receiver() {
+        assert_eval_true(
+            "var o = { _count: 0, set count(v) { this._count = v; }, get count() { return this._count; } }; \
+             o.count = 7; o._count === 7",
+        );
+    }
+
+    // 8. Object.defineProperty with get/set
+    #[test]
+    fn e2e_define_property_accessor() {
+        assert_eval_true(
+            "var o = {}; var stored = 0; \
+             Object.defineProperty(o, 'x', { \
+               get: function() { return stored; }, \
+               set: function(v) { stored = v; } \
+             }); \
+             o.x = 42; o.x === 42",
+        );
+    }
+
+    // 9. Object.defineProperty — getter only
+    #[test]
+    fn e2e_define_property_getter_only() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'pi', { get: function() { return 3.14; } }); \
+             o.pi === 3.14",
+        );
+    }
+
+    // 10. Object.getOwnPropertyDescriptor on accessor
+    #[test]
+    fn e2e_get_own_property_descriptor_accessor() {
+        assert_eval_true(
+            "var o = { get x() { return 1; } }; \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             typeof d.get === 'function' && d.set === undefined",
+        );
+    }
+
+    // 11. Object.getOwnPropertyDescriptor — enumerable/configurable
+    #[test]
+    fn e2e_descriptor_accessor_enumerable_configurable() {
+        assert_eval_true(
+            "var o = { get x() { return 1; } }; \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             d.enumerable === true && d.configurable === true",
+        );
+    }
+
+    // 12. Object.getOwnPropertyDescriptor — has no value/writable
+    #[test]
+    fn e2e_descriptor_accessor_no_value_writable() {
+        assert_eval_true(
+            "var o = { get x() { return 1; } }; \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             d.value === undefined && d.writable === undefined",
+        );
+    }
+
+    // 13. Getter/setter pair via defineProperty — descriptor reports both
+    #[test]
+    fn e2e_descriptor_getter_setter_pair() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { \
+               get: function() { return 1; }, \
+               set: function(v) {} \
+             }); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             typeof d.get === 'function' && typeof d.set === 'function'",
+        );
+    }
+
+    // 14. Class getter
+    #[test]
+    fn e2e_class_getter() {
+        assert_eval_true(
+            "class C { get x() { return 99; } } \
+             var c = new C(); c.x === 99",
+        );
+    }
+
+    // 15. Class setter
+    #[test]
+    fn e2e_class_setter() {
+        assert_eval_true(
+            "class C { \
+               constructor() { this._v = 0; } \
+               get v() { return this._v; } \
+               set v(x) { this._v = x; } \
+             } \
+             var c = new C(); c.v = 42; c.v === 42",
+        );
+    }
+
+    // 16. Class getter/setter pair — this binding
+    #[test]
+    fn e2e_class_getter_setter_this() {
+        assert_eval_true(
+            "class C { \
+               constructor() { this._name = 'init'; } \
+               get name() { return this._name; } \
+               set name(v) { this._name = v.toUpperCase(); } \
+             } \
+             var c = new C(); c.name = 'hello'; c.name === 'HELLO'",
+        );
+    }
+
+    // 17. Static getter in class
+    #[test]
+    fn e2e_class_static_getter() {
+        assert_eval_true(
+            "class C { static get answer() { return 42; } } \
+             C.answer === 42",
+        );
+    }
+
+    // 18. Static setter in class
+    #[test]
+    fn e2e_class_static_setter() {
+        assert_eval_true(
+            "class C { \
+               static get val() { return C._val || 0; } \
+               static set val(v) { C._val = v; } \
+             } \
+             C.val = 7; C.val === 7",
+        );
+    }
+
+    // 19. Inherited getter from prototype chain
+    #[test]
+    fn e2e_inherited_getter_prototype() {
+        assert_eval_true(
+            "var parent = { get x() { return 'from parent'; } }; \
+             var child = Object.create(parent); \
+             child.x === 'from parent'",
+        );
+    }
+
+    // 20. Inherited setter from prototype chain
+    #[test]
+    fn e2e_inherited_setter_prototype() {
+        assert_eval_true(
+            "var parent = { _v: 0, set v(x) { this._v = x; }, get v() { return this._v; } }; \
+             var child = Object.create(parent); \
+             child.v = 55; child._v === 55",
+        );
+    }
+
+    // 21. Inherited getter with correct this (receiver is child)
+    #[test]
+    fn e2e_inherited_getter_this_receiver() {
+        assert_eval_true(
+            "var parent = { get id() { return this._id; } }; \
+             var child = Object.create(parent); \
+             child._id = 'child-id'; \
+             child.id === 'child-id'",
+        );
+    }
+
+    // 22. Computed property getter
+    #[test]
+    fn e2e_computed_property_getter() {
+        assert_eval_true(
+            "var key = 'foo'; \
+             var o = { get [key]() { return 'bar'; } }; \
+             o.foo === 'bar'",
+        );
+    }
+
+    // 23. Computed property setter
+    #[test]
+    fn e2e_computed_property_setter() {
+        assert_eval_true(
+            "var key = 'val'; \
+             var o = { _v: 0, get [key]() { return this._v; }, set [key](x) { this._v = x; } }; \
+             o.val = 100; o.val === 100",
+        );
+    }
+
+    // 24. Getter returning different types
+    #[test]
+    fn e2e_getter_returns_object() {
+        assert_eval_true(
+            "var o = { get arr() { return [1, 2, 3]; } }; \
+             o.arr.length === 3",
+        );
+    }
+
+    // 25. Getter called every access (not cached)
+    #[test]
+    fn e2e_getter_called_every_access() {
+        assert_eval_true(
+            "var count = 0; \
+             var o = { get x() { count = count + 1; return count; } }; \
+             var a = o.x; var b = o.x; b === 2",
+        );
+    }
+
+    // 26. Setter receives correct value
+    #[test]
+    fn e2e_setter_receives_value() {
+        assert_eval_true(
+            "var received = null; \
+             var o = { set x(v) { received = v; } }; \
+             o.x = 'test'; received === 'test'",
+        );
+    }
+
+    // 27. Getter/setter .name for object literal
+    #[test]
+    fn e2e_getter_name_object_literal() {
+        assert_eval_true(
+            "var o = { get myProp() { return 1; } }; \
+             var d = Object.getOwnPropertyDescriptor(o, 'myProp'); \
+             d.get.name === 'get myProp'",
+        );
+    }
+
+    // 28. Setter .name for object literal
+    #[test]
+    fn e2e_setter_name_object_literal() {
+        assert_eval_true(
+            "var o = { set myProp(v) {} }; \
+             var d = Object.getOwnPropertyDescriptor(o, 'myProp'); \
+             d.set.name === 'set myProp'",
+        );
+    }
+
+    // 29. Class getter .name
+    #[test]
+    fn e2e_class_getter_name() {
+        assert_eval_true(
+            "class C { get myProp() { return 1; } } \
+             var d = Object.getOwnPropertyDescriptor(C.prototype, 'myProp'); \
+             d.get.name === 'get myProp'",
+        );
+    }
+
+    // 30. Class setter .name
+    #[test]
+    fn e2e_class_setter_name() {
+        assert_eval_true(
+            "class C { set myProp(v) {} } \
+             var d = Object.getOwnPropertyDescriptor(C.prototype, 'myProp'); \
+             d.set.name === 'set myProp'",
+        );
+    }
+
+    // 31. Multiple getters/setters on same object
+    #[test]
+    fn e2e_multiple_getters_setters() {
+        assert_eval_true(
+            "var o = { \
+               get a() { return 1; }, \
+               get b() { return 2; }, \
+               set c(v) { this._c = v; }, \
+               get c() { return this._c; } \
+             }; \
+             o.a === 1 && o.b === 2 && (o.c = 3, o.c === 3)",
+        );
+    }
+
+    // 32. Getter on Object.keys includes accessor names
+    #[test]
+    fn e2e_accessor_in_object_keys() {
+        assert_eval_true(
+            "var o = { get x() { return 1; }, y: 2 }; \
+             var k = Object.keys(o); \
+             k.indexOf('x') >= 0 && k.indexOf('y') >= 0",
+        );
+    }
+
+    // 33. Accessor property in for...in
+    #[test]
+    fn e2e_accessor_property_in_for_in() {
+        assert_eval_true(
+            "var o = { get x() { return 1; }, y: 2 }; \
+             var keys = []; for (var k in o) { keys.push(k); } \
+             keys.indexOf('x') >= 0 && keys.indexOf('y') >= 0",
+        );
+    }
+
+    // 34. Overriding inherited getter with own property
+    #[test]
+    fn e2e_override_inherited_getter() {
+        assert_eval_true(
+            "var parent = { get x() { return 'parent'; } }; \
+             var child = Object.create(parent); \
+             child.x = 'child'; \
+             child.x === 'child'",
+        );
+    }
+
+    // 35. Class with both instance and static getter
+    #[test]
+    fn e2e_class_instance_and_static_getter() {
+        assert_eval_true(
+            "class C { \
+               get x() { return 'instance'; } \
+               static get x() { return 'static'; } \
+             } \
+             var c = new C(); c.x === 'instance' && C.x === 'static'",
+        );
+    }
 }

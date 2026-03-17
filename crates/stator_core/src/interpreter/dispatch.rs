@@ -2910,7 +2910,7 @@ fn handle_sta_named_property(
                     return Ok(DispatchAction::Continue);
                 }
             }
-            // Check for setter accessor first.
+            // Check for setter accessor first (own object).
             let setter_key = format!("__set_{prop_name}__");
             let getter_key = format!("__get_{prop_name}__");
             let setter = map.borrow().get(&setter_key).cloned();
@@ -2918,8 +2918,8 @@ fn handle_sta_named_property(
                 dispatch_setter(&setter_fn, &obj, val)?;
                 return Ok(DispatchAction::Continue);
             }
-            // Getter-only accessor: no setter -> TypeError in strict, silent
-            // ignore in sloppy.
+            // Getter-only accessor (own): no setter -> TypeError in strict,
+            // silent ignore in sloppy.
             if map.borrow().contains_key(&getter_key) {
                 if ctx.frame.bytecode_array.is_strict() {
                     return Err(StatorError::TypeError(format!(
@@ -2927,6 +2927,32 @@ fn handle_sta_named_property(
                     )));
                 }
                 return Ok(DispatchAction::Continue);
+            }
+            // Walk the prototype chain for inherited setters/getters.
+            {
+                let mut proto = map.borrow().get("__proto__").cloned();
+                for _ in 0..256 {
+                    match proto.take() {
+                        Some(JsValue::PlainObject(p)) => {
+                            let pb = p.borrow();
+                            if let Some(s) = pb.get(&setter_key).cloned() {
+                                drop(pb);
+                                dispatch_setter(&s, &obj, val)?;
+                                return Ok(DispatchAction::Continue);
+                            }
+                            if pb.contains_key(&getter_key) {
+                                if ctx.frame.bytecode_array.is_strict() {
+                                    return Err(StatorError::TypeError(format!(
+                                        "Cannot set property {prop_name} which has only a getter"
+                                    )));
+                                }
+                                return Ok(DispatchAction::Continue);
+                            }
+                            proto = pb.get("__proto__").cloned();
+                        }
+                        _ => break,
+                    }
+                }
             }
             let pm = map.borrow();
             // Existing non-writable property: TypeError in strict mode, silently ignore in sloppy.
@@ -3080,6 +3106,32 @@ fn handle_sta_keyed_property(
                 )));
             }
             return Ok(DispatchAction::Continue);
+        }
+        // Walk prototype chain for inherited setters/getters.
+        {
+            let mut proto = map.borrow().get("__proto__").cloned();
+            for _ in 0..256 {
+                match proto.take() {
+                    Some(JsValue::PlainObject(p)) => {
+                        let pb = p.borrow();
+                        if let Some(s) = pb.get(&setter_key).cloned() {
+                            drop(pb);
+                            dispatch_setter(&s, &obj, val)?;
+                            return Ok(DispatchAction::Continue);
+                        }
+                        if pb.contains_key(&getter_key) {
+                            if ctx.frame.bytecode_array.is_strict() {
+                                return Err(StatorError::TypeError(format!(
+                                    "Cannot set property {key_str} which has only a getter"
+                                )));
+                            }
+                            return Ok(DispatchAction::Continue);
+                        }
+                        proto = pb.get("__proto__").cloned();
+                    }
+                    _ => break,
+                }
+            }
         }
         let pm = map.borrow();
         // Existing non-writable property: TypeError in strict mode.
@@ -6247,9 +6299,10 @@ fn handle_define_getter_property(
         }
         // Store getter as __get_<name>__ — the property access handler
         // checks for this convention when loading.
-        // Use insert_builtin to ensure the internal key is non-enumerable.
+        // Object-literal and class accessors are enumerable + configurable.
+        let accessor_attrs = PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE;
         map.borrow_mut()
-            .insert_builtin(format!("__get_{prop_name}__"), getter);
+            .insert_with_attrs(format!("__get_{prop_name}__"), getter, accessor_attrs);
     }
     Ok(DispatchAction::Continue)
 }
@@ -6279,8 +6332,9 @@ fn handle_define_setter_property(
         if let JsValue::Function(ba) = &setter {
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
         }
+        let accessor_attrs = PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE;
         map.borrow_mut()
-            .insert_builtin(format!("__set_{prop_name}__"), setter);
+            .insert_with_attrs(format!("__set_{prop_name}__"), setter, accessor_attrs);
     }
     Ok(DispatchAction::Continue)
 }
@@ -6304,8 +6358,9 @@ fn handle_define_keyed_getter_property(
         if let JsValue::Function(ba) = &getter {
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
         }
+        let accessor_attrs = PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE;
         map.borrow_mut()
-            .insert_builtin(format!("__get_{key_str}__"), getter);
+            .insert_with_attrs(format!("__get_{key_str}__"), getter, accessor_attrs);
     }
     Ok(DispatchAction::Continue)
 }
@@ -6329,8 +6384,9 @@ fn handle_define_keyed_setter_property(
         if let JsValue::Function(ba) = &setter {
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
         }
+        let accessor_attrs = PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE;
         map.borrow_mut()
-            .insert_builtin(format!("__set_{key_str}__"), setter);
+            .insert_with_attrs(format!("__set_{key_str}__"), setter, accessor_attrs);
     }
     Ok(DispatchAction::Continue)
 }
