@@ -1751,7 +1751,7 @@ pub(crate) fn wrap_sync_iterator_as_async_iterator(iterator: JsValue) -> JsValue
         })),
     );
 
-    let return_iterator = iterator;
+    let return_iterator = iterator.clone();
     props.borrow_mut().insert(
         "return".into(),
         JsValue::NativeFunction(Rc::new(move |args| {
@@ -1777,14 +1777,37 @@ pub(crate) fn wrap_sync_iterator_as_async_iterator(iterator: JsValue) -> JsValue
         })),
     );
 
+    // §27.1.4.4 AsyncFromSyncIteratorPrototype.throw
+    let throw_iterator = iterator;
+    props.borrow_mut().insert(
+        "throw".into(),
+        JsValue::NativeFunction(Rc::new(move |args| {
+            let throw_value = args.into_iter().next().unwrap_or(JsValue::Undefined);
+            let result = match &throw_iterator {
+                JsValue::Generator(gs) => Interpreter::generator_throw(gs, throw_value),
+                JsValue::PlainObject(map) => match map.borrow().get("throw").cloned() {
+                    Some(throw_fn) => dispatch_call_with_this(
+                        &throw_fn,
+                        throw_iterator.clone(),
+                        vec![throw_value],
+                    ),
+                    None => Err(StatorError::JsException(format!("{throw_value:?}"))),
+                },
+                _ => Err(StatorError::JsException(format!("{throw_value:?}"))),
+            };
+            async_iterator_result_promise(result)
+        })),
+    );
+
     let async_self = async_iter.clone();
     props.borrow_mut().insert(
         "@@asyncIterator".into(),
         JsValue::NativeFunction(Rc::new(move |_args| Ok(async_self.clone()))),
     );
+    let sym_key = format!("Symbol({})", crate::builtins::symbol::SYMBOL_ASYNC_ITERATOR);
     let async_self = async_iter.clone();
     props.borrow_mut().insert(
-        "Symbol(2)".into(),
+        sym_key,
         JsValue::NativeFunction(Rc::new(move |_args| Ok(async_self.clone()))),
     );
     async_iter

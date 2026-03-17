@@ -3156,13 +3156,17 @@ fn handle_get_async_iterator(
         // PlainObject with @@asyncIterator → call it first (§27.1.4.2).
         JsValue::PlainObject(ref map)
             if map.borrow().contains_key("@@asyncIterator")
-                || map.borrow().contains_key("Symbol(2)") =>
+                || map.borrow().contains_key(&format!(
+                    "Symbol({})",
+                    crate::builtins::symbol::SYMBOL_ASYNC_ITERATOR
+                )) =>
         {
+            let sym_key = format!("Symbol({})", crate::builtins::symbol::SYMBOL_ASYNC_ITERATOR);
             let iter_fn = map
                 .borrow()
                 .get("@@asyncIterator")
                 .cloned()
-                .or_else(|| map.borrow().get("Symbol(2)").cloned());
+                .or_else(|| map.borrow().get(&sym_key).cloned());
             match iter_fn {
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
                     normalize_async_iterator(dispatch_call_with_this(f, iterable.clone(), vec![])?)
@@ -3177,13 +3181,17 @@ fn handle_get_async_iterator(
         // Fall back to @@iterator (sync iterator wrapped for async).
         JsValue::PlainObject(ref map)
             if map.borrow().contains_key("@@iterator")
-                || map.borrow().contains_key("Symbol(1)") =>
+                || map.borrow().contains_key(&format!(
+                    "Symbol({})",
+                    crate::builtins::symbol::SYMBOL_ITERATOR
+                )) =>
         {
+            let sym_key = format!("Symbol({})", crate::builtins::symbol::SYMBOL_ITERATOR);
             let iter_fn = map
                 .borrow()
                 .get("@@iterator")
                 .cloned()
-                .or_else(|| map.borrow().get("Symbol(1)").cloned());
+                .or_else(|| map.borrow().get(&sym_key).cloned());
             match iter_fn {
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
                     normalize_async_iterator(dispatch_call_with_this(f, iterable.clone(), vec![])?)
