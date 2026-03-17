@@ -619,10 +619,14 @@ impl JsRegExp {
     /// Returns all successive matches as a `Vec<RegExpMatch>`, producing the
     /// same kind of result objects that [`Self::exec`] would for each match.
     /// This is the underlying implementation for `String.prototype.matchAll`.
+    ///
+    /// The search starts from `self.last_index` so callers can set it before
+    /// invoking this method to honour an existing `lastIndex` on a cloned
+    /// regexp.
     pub fn symbol_match_all(&self, input: &str) -> Vec<RegExpMatch> {
         let has_indices = self.flags.contains(RegExpFlags::HAS_INDICES);
         let mut results = Vec::new();
-        let mut start = 0_usize;
+        let mut start = self.last_index.get();
         loop {
             if start > input.len() {
                 break;
@@ -645,6 +649,18 @@ impl JsRegExp {
             }
         }
         results
+    }
+
+    /// Create a clone of this regexp for use by `[Symbol.matchAll]`.
+    ///
+    /// Per §22.2.6.9 the clone has the same pattern and flags, and its
+    /// `lastIndex` is set to `last_index`.  This avoids mutating the
+    /// original regexp's state during iteration.
+    pub fn clone_for_match_all(&self, last_index: usize) -> StatorResult<Self> {
+        let flags_str = self.flags.to_flags_string();
+        let cloned = Self::new(&self.pattern, &flags_str)?;
+        cloned.last_index.set(last_index);
+        Ok(cloned)
     }
 }
 
