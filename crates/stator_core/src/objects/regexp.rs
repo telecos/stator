@@ -552,11 +552,13 @@ impl JsRegExp {
     /// ECMAScript `RegExp.prototype[Symbol.split](string[, limit])`.
     ///
     /// Splits `input` around each match and returns the parts as a
-    /// `Vec<String>`.  Capture groups are included in the result between the
-    /// surrounding parts, matching ECMAScript semantics.
+    /// `Vec<Option<String>>`.  Capture groups are included in the result
+    /// between the surrounding parts, matching ECMAScript semantics.
+    /// Non-participating capture groups are represented as `None` (which
+    /// should be surfaced as `undefined` in JavaScript).
     ///
     /// If `limit` is `Some(0)` an empty `Vec` is returned immediately.
-    pub fn symbol_split(&self, input: &str, limit: Option<usize>) -> Vec<String> {
+    pub fn symbol_split(&self, input: &str, limit: Option<usize>) -> Vec<Option<String>> {
         let lim = limit.unwrap_or(usize::MAX);
         if lim == 0 {
             return Vec::new();
@@ -570,11 +572,11 @@ impl JsRegExp {
             return if empty_match {
                 Vec::new()
             } else {
-                vec![String::new()]
+                vec![Some(String::new())]
             };
         }
 
-        let mut parts: Vec<String> = Vec::new();
+        let mut parts: Vec<Option<String>> = Vec::new();
         let mut last_end = 0_usize;
         let mut search_index = 0usize;
 
@@ -587,15 +589,12 @@ impl JsRegExp {
                 continue;
             }
 
-            parts.push(input[last_end..mat.start()].to_string());
+            parts.push(Some(input[last_end..mat.start()].to_string()));
             if parts.len() >= lim {
                 break;
             }
             for cap in &mat.captures {
-                parts.push(
-                    cap.as_ref()
-                        .map_or(String::new(), |r| input[r.clone()].to_string()),
-                );
+                parts.push(cap.as_ref().map(|r| input[r.clone()].to_string()));
                 if parts.len() >= lim {
                     break;
                 }
@@ -610,7 +609,7 @@ impl JsRegExp {
 
         // Push the trailing portion (only if we haven't hit the limit).
         if parts.len() < lim {
-            parts.push(input[last_end..].to_string());
+            parts.push(Some(input[last_end..].to_string()));
         }
         parts
     }
@@ -1162,19 +1161,28 @@ mod tests {
     #[test]
     fn test_symbol_split_basic() {
         let re = JsRegExp::new(",", "").unwrap();
-        assert_eq!(re.symbol_split("a,b,c", None), vec!["a", "b", "c"]);
+        assert_eq!(
+            re.symbol_split("a,b,c", None),
+            vec![Some("a".into()), Some("b".into()), Some("c".into())]
+        );
     }
 
     #[test]
     fn test_symbol_split_with_limit() {
         let re = JsRegExp::new(",", "").unwrap();
-        assert_eq!(re.symbol_split("a,b,c,d", Some(2)), vec!["a", "b"]);
+        assert_eq!(
+            re.symbol_split("a,b,c,d", Some(2)),
+            vec![Some("a".into()), Some("b".into())]
+        );
     }
 
     #[test]
     fn test_symbol_split_zero_limit() {
         let re = JsRegExp::new(",", "").unwrap();
-        assert_eq!(re.symbol_split("a,b,c", Some(0)), Vec::<String>::new());
+        assert_eq!(
+            re.symbol_split("a,b,c", Some(0)),
+            Vec::<Option<String>>::new()
+        );
     }
 
     #[test]
@@ -1183,14 +1191,29 @@ mod tests {
         let re = JsRegExp::new(r"(\d+)", "").unwrap();
         assert_eq!(
             re.symbol_split("a1b2c", None),
-            vec!["a", "1", "b", "2", "c"]
+            vec![
+                Some("a".into()),
+                Some("1".into()),
+                Some("b".into()),
+                Some("2".into()),
+                Some("c".into())
+            ]
         );
     }
 
     #[test]
     fn test_symbol_split_no_match_returns_whole_string() {
         let re = JsRegExp::new(r"\d+", "").unwrap();
-        assert_eq!(re.symbol_split("abc", None), vec!["abc"]);
+        assert_eq!(re.symbol_split("abc", None), vec![Some("abc".into())]);
+    }
+
+    #[test]
+    fn test_symbol_split_nonparticipating_capture_is_none() {
+        let re = JsRegExp::new("-(x)?", "").unwrap();
+        assert_eq!(
+            re.symbol_split("a-b", None),
+            vec![Some("a".into()), None, Some("b".into())]
+        );
     }
 
     // ── Unicode property escapes ──────────────────────────────────────────────

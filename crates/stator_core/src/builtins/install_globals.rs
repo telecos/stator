@@ -42334,4 +42334,416 @@ mod tests {
              Object.hasOwn(o, 'x')",
         );
     }
+
+    // ── RegExp advanced conformance e2e tests ────────────────────────────
+
+    // ── Named capture groups ─────────────────────────────────────────────
+
+    /// Named groups: accessing groups on exec result.
+    #[test]
+    fn e2e_regexp_named_group_exec_access() {
+        assert_eval_true(
+            r#"var m = /(?<first>\w+)\s(?<last>\w+)/.exec("John Smith");
+            m.groups.first === "John" && m.groups.last === "Smith""#,
+        );
+    }
+
+    /// Named groups: captured value appears both as numbered and named.
+    #[test]
+    fn e2e_regexp_named_group_numbered_and_named() {
+        assert_eval_true(
+            r#"var m = /(?<x>a)(b)/.exec("ab");
+            m[1] === "a" && m[2] === "b" && m.groups.x === "a""#,
+        );
+    }
+
+    /// Named groups: non-participating named group is undefined.
+    #[test]
+    fn e2e_regexp_named_group_nonparticipating() {
+        assert_eval_true(
+            r#"var m = /(?<a>a)|(?<b>b)/.exec("b");
+            m.groups.a === undefined && m.groups.b === "b""#,
+        );
+    }
+
+    /// Named groups: replace with $<name>.
+    #[test]
+    fn e2e_regexp_named_group_replace_syntax() {
+        assert_eval_true(
+            r#"var r = "2024-07".replace(/(?<y>\d{4})-(?<m>\d{2})/, "$<m>/$<y>");
+            r === "07/2024""#,
+        );
+    }
+
+    // ── dotAll flag (s) ──────────────────────────────────────────────────
+
+    /// dotAll: dot matches newline with s flag.
+    #[test]
+    fn e2e_regexp_dotall_matches_newline() {
+        assert_eval_true(r#"new RegExp("a.b", "s").test("a\nb")"#);
+    }
+
+    /// dotAll: dot does NOT match newline without s flag.
+    #[test]
+    fn e2e_regexp_no_dotall_rejects_newline() {
+        assert_eval_true(r#"!new RegExp("a.b", "").test("a\nb")"#);
+    }
+
+    /// dotAll: flag accessor returns true.
+    #[test]
+    fn e2e_regexp_dotall_flag_accessor() {
+        assert_eval_true(r#"new RegExp(".", "s").dotAll === true"#);
+    }
+
+    /// dotAll: flag appears in flags string.
+    #[test]
+    fn e2e_regexp_dotall_in_flags_string() {
+        assert_eval_true(r#"new RegExp(".", "gs").flags === "gs""#);
+    }
+
+    // ── Unicode flag (u) ─────────────────────────────────────────────────
+
+    /// Unicode: \\p{L} matches word characters with u flag.
+    #[test]
+    fn e2e_regexp_unicode_property_escape() {
+        assert_eval_true(r#"new RegExp("\\p{L}+", "u").test("café")"#);
+    }
+
+    /// Unicode: flag accessor returns true.
+    #[test]
+    fn e2e_regexp_unicode_flag_accessor() {
+        assert_eval_true(r#"new RegExp(".", "u").unicode === true"#);
+    }
+
+    /// Unicode: surrogate pair handled correctly.
+    #[test]
+    fn e2e_regexp_unicode_emoji_match() {
+        assert_eval_true(
+            r#"var m = new RegExp(".", "u").exec("\u{1F600}");
+            m[0] === "\u{1F600}""#,
+        );
+    }
+
+    // ── Lookbehind assertions ────────────────────────────────────────────
+
+    /// Positive lookbehind: (?<=...) matches preceded text.
+    #[test]
+    fn e2e_regexp_positive_lookbehind() {
+        assert_eval_true(
+            r#"var m = new RegExp("(?<=\\$)\\d+").exec("price $100");
+            m[0] === "100""#,
+        );
+    }
+
+    /// Negative lookbehind: (?<!...) rejects preceded text.
+    #[test]
+    fn e2e_regexp_negative_lookbehind() {
+        assert_eval_true(
+            r#"var m = new RegExp("(?<!\\$)\\d+").exec("100 items");
+            m[0] === "100""#,
+        );
+    }
+
+    /// Positive lookbehind: no match when lookbehind fails.
+    #[test]
+    fn e2e_regexp_positive_lookbehind_no_match() {
+        assert_eval_true(r#"new RegExp("(?<=x)y").exec("ay") === null"#);
+    }
+
+    // ── RegExp.prototype.flags ───────────────────────────────────────────
+
+    /// flags: canonical order is dgimsuy.
+    #[test]
+    fn e2e_regexp_flags_canonical_order() {
+        assert_eval_true(r#"new RegExp(".", "ysmig").flags === "gimsy""#);
+    }
+
+    /// flags: single flag preserved.
+    #[test]
+    fn e2e_regexp_flags_single() {
+        assert_eval_true(r#"new RegExp(".", "i").flags === "i""#);
+    }
+
+    /// flags: empty when no flags.
+    #[test]
+    fn e2e_regexp_flags_none() {
+        assert_eval_true(r#"new RegExp(".").flags === """#);
+    }
+
+    // ── RegExp.prototype.source ──────────────────────────────────────────
+
+    /// source: returns pattern text.
+    #[test]
+    fn e2e_regexp_source_returns_pattern() {
+        assert_eval_true(r#"new RegExp("abc").source === "abc""#);
+    }
+
+    /// source: empty pattern returns "(?:)".
+    #[test]
+    fn e2e_regexp_source_empty() {
+        assert_eval_true(r#"new RegExp("").source === "(?:)""#);
+    }
+
+    /// source: forward slash is escaped.
+    #[test]
+    fn e2e_regexp_source_escapes_fwd_slash() {
+        assert_eval_true(r#"new RegExp("a/b").source === "a\\/b""#);
+    }
+
+    // ── Symbol.match ─────────────────────────────────────────────────────
+
+    /// Symbol.match: non-global returns exec-like result.
+    #[test]
+    fn e2e_regexp_symbol_match_nonglobal() {
+        assert_eval_true(
+            r#"var m = "foo 42 bar".match(/\d+/);
+            m[0] === "42" && m.index === 4"#,
+        );
+    }
+
+    /// Symbol.match: global returns all matches.
+    #[test]
+    fn e2e_regexp_symbol_match_global() {
+        assert_eval_true(
+            r#"var m = "a1 b2 c3".match(/\d+/g);
+            m.length === 3 && m[0] === "1" && m[1] === "2" && m[2] === "3""#,
+        );
+    }
+
+    /// Symbol.match: returns null on no match.
+    #[test]
+    fn e2e_regexp_symbol_match_null() {
+        assert_eval_true(r#""hello".match(/\d+/) === null"#);
+    }
+
+    // ── Symbol.replace ───────────────────────────────────────────────────
+
+    /// Symbol.replace: string replacement with capture.
+    #[test]
+    fn e2e_regexp_symbol_replace_capture() {
+        assert_eval_true(r#""2024-07".replace(/(\d{4})-(\d{2})/, "$2/$1") === "07/2024""#);
+    }
+
+    /// Symbol.replace: global replacement.
+    #[test]
+    fn e2e_regexp_symbol_replace_global() {
+        assert_eval_true(r#""a1 b2 c3".replace(/\d+/g, "N") === "aN bN cN""#);
+    }
+
+    /// Symbol.replace: $& inserts matched text.
+    #[test]
+    fn e2e_regexp_symbol_replace_dollar_amp() {
+        assert_eval_true(r#""hello".replace(/l+/, "[$&]") === "he[ll]o""#);
+    }
+
+    // ── Symbol.search ────────────────────────────────────────────────────
+
+    /// Symbol.search: returns index of first match.
+    #[test]
+    fn e2e_regexp_symbol_search_found() {
+        assert_eval_true(r#""hello world".search(/world/) === 6"#);
+    }
+
+    /// Symbol.search: returns -1 on no match.
+    #[test]
+    fn e2e_regexp_symbol_search_not_found() {
+        assert_eval_true(r#""hello".search(/xyz/) === -1"#);
+    }
+
+    // ── Symbol.split ─────────────────────────────────────────────────────
+
+    /// Symbol.split: basic split by regex.
+    #[test]
+    fn e2e_regexp_symbol_split_basic() {
+        assert_eval_true(
+            r#"var parts = "a,b,,c".split(/,/);
+            parts.length === 4 && parts[0] === "a" && parts[2] === """#,
+        );
+    }
+
+    /// Symbol.split: capture groups included in result.
+    #[test]
+    fn e2e_regexp_symbol_split_with_captures() {
+        assert_eval_true(
+            r#"var parts = "a1b2c".split(/(\d)/);
+            parts.length === 5 && parts[1] === "1" && parts[3] === "2""#,
+        );
+    }
+
+    /// Symbol.split: non-participating capture is undefined.
+    #[test]
+    fn e2e_regexp_symbol_split_undefined_capture() {
+        assert_eval_true(
+            r#"var parts = "a-b".split(/-(x)?/);
+            parts[0] === "a" && parts[1] === undefined && parts[2] === "b""#,
+        );
+    }
+
+    // ── RegExp constructor ───────────────────────────────────────────────
+
+    /// Constructor: string pattern and flags.
+    #[test]
+    fn e2e_regexp_constructor_string() {
+        assert_eval_true(
+            r#"var re = new RegExp("\\d+", "g");
+            re.source === "\\d+" && re.flags === "g" && re.global === true"#,
+        );
+    }
+
+    /// Constructor: from existing regexp preserves source.
+    #[test]
+    fn e2e_regexp_constructor_clone() {
+        assert_eval_true(
+            r#"var a = new RegExp("abc", "gi");
+            var b = new RegExp(a);
+            b.source === "abc" && b.flags === "gi""#,
+        );
+    }
+
+    /// Constructor: from existing regexp overrides flags.
+    #[test]
+    fn e2e_regexp_constructor_override_flags() {
+        assert_eval_true(
+            r#"var a = new RegExp("abc", "gi");
+            var b = new RegExp(a, "m");
+            b.flags === "m" && b.global === false && b.multiline === true"#,
+        );
+    }
+
+    /// Constructor: undefined pattern yields empty.
+    #[test]
+    fn e2e_regexp_constructor_undefined_pattern() {
+        assert_eval_true(r#"new RegExp().source === "(?:)""#);
+    }
+
+    // ── exec with lastIndex and sticky/global ────────────────────────────
+
+    /// exec: global advances lastIndex.
+    #[test]
+    fn e2e_regexp_exec_global_last_index() {
+        assert_eval_true(
+            r#"var re = /\d+/g;
+            var m1 = re.exec("a1 b2");
+            var li1 = re.lastIndex;
+            var m2 = re.exec("a1 b2");
+            m1[0] === "1" && li1 === 2 && m2[0] === "2""#,
+        );
+    }
+
+    /// exec: sticky only matches at lastIndex.
+    #[test]
+    fn e2e_regexp_exec_sticky_at_last_index() {
+        assert_eval_true(
+            r#"var re = /\d+/y;
+            re.lastIndex = 1;
+            var m = re.exec("a123");
+            m[0] === "123""#,
+        );
+    }
+
+    /// exec: sticky failure resets lastIndex to 0.
+    #[test]
+    fn e2e_regexp_exec_sticky_fail_resets() {
+        assert_eval_true(
+            r#"var re = /\d+/y;
+            re.lastIndex = 0;
+            var m = re.exec("abc");
+            m === null && re.lastIndex === 0"#,
+        );
+    }
+
+    /// exec: global exhaustion resets lastIndex.
+    #[test]
+    fn e2e_regexp_exec_global_exhaustion() {
+        assert_eval_true(
+            r#"var re = /a/g;
+            re.exec("a"); re.exec("a");
+            re.lastIndex === 0"#,
+        );
+    }
+
+    /// exec: result has correct length including captures.
+    #[test]
+    fn e2e_regexp_exec_result_length() {
+        assert_eval_true(
+            r#"var m = /(\d+)-(\d+)/.exec("12-34");
+            m.length === 3 && m[0] === "12-34" && m[1] === "12" && m[2] === "34""#,
+        );
+    }
+
+    // ── Additional conformance tests ─────────────────────────────────────
+
+    /// hasIndices (d flag): exec returns indices.
+    #[test]
+    fn e2e_regexp_has_indices_exec() {
+        assert_eval_true(
+            r#"var m = new RegExp("(\\d+)", "d").exec("abc 42 end");
+            m.indices[0][0] === 4 && m.indices[0][1] === 6 && m.indices[1][0] === 4"#,
+        );
+    }
+
+    /// hasIndices: named group indices.
+    #[test]
+    fn e2e_regexp_has_indices_named() {
+        assert_eval_true(
+            r#"var m = new RegExp("(?<num>\\d+)", "d").exec("abc 42");
+            m.indices.groups.num[0] === 4 && m.indices.groups.num[1] === 6"#,
+        );
+    }
+
+    /// RegExp.escape: escapes syntax characters.
+    #[test]
+    fn e2e_regexp_escape_syntax_chars() {
+        assert_eval_true(r#"RegExp.escape("a.b+c") === "a\\.b\\+c""#);
+    }
+
+    /// toString: returns /source/flags format.
+    #[test]
+    fn e2e_regexp_tostring_format() {
+        assert_eval_true(r#"new RegExp("abc", "gi").toString() === "/abc/gi""#);
+    }
+
+    /// test: returns boolean false for non-match.
+    #[test]
+    fn e2e_regexp_test_returns_false() {
+        assert_eval_true(r#"new RegExp("xyz").test("abc") === false"#);
+    }
+
+    /// matchAll: returns iterator of match objects with groups.
+    #[test]
+    fn e2e_regexp_matchall_named_groups() {
+        assert_eval_true(
+            r#"var results = [];
+            for (var m of "a1 b2".matchAll(/(?<letter>[a-z])(?<digit>\d)/g)) {
+                results.push(m.groups.letter + m.groups.digit);
+            }
+            results.join(",") === "a1,b2""#,
+        );
+    }
+
+    /// replaceAll with global regexp.
+    #[test]
+    fn e2e_regexp_replace_all_global() {
+        assert_eval_true(r#""aXbXc".replaceAll(/X/g, "-") === "a-b-c""#);
+    }
+
+    /// search: preserves lastIndex on global regexp.
+    #[test]
+    fn e2e_regexp_search_preserves_last_index() {
+        assert_eval_true(
+            r#"var re = /a/g;
+            re.lastIndex = 5;
+            "ba".search(re);
+            re.lastIndex === 5"#,
+        );
+    }
+
+    /// split: limit parameter respected.
+    #[test]
+    fn e2e_regexp_split_with_limit() {
+        assert_eval_true(
+            r#"var parts = "a,b,c,d".split(/,/, 2);
+            parts.length === 2 && parts[0] === "a" && parts[1] === "b""#,
+        );
+    }
 }
