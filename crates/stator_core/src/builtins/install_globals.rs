@@ -1827,6 +1827,11 @@ fn make_error_constructor(kind: ErrorKind) -> JsValue {
             ));
         }
         let mut err = JsError::new(kind, message);
+        if let Some(ref cause_val) = cause {
+            err.props
+                .borrow_mut()
+                .insert("cause".to_string(), cause_val.clone());
+        }
         err.cause = cause;
         Ok(JsValue::Error(Rc::new(err)))
     })
@@ -1937,6 +1942,14 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
             ));
         }
         let mut err = JsError::new_aggregate(inner_errors, message);
+        err.props
+            .borrow_mut()
+            .insert("errors".to_string(), JsValue::new_array(err.errors.clone()));
+        if let Some(ref cause_val) = cause {
+            err.props
+                .borrow_mut()
+                .insert("cause".to_string(), cause_val.clone());
+        }
         err.cause = cause;
         Ok(JsValue::Error(Rc::new(err)))
     });
