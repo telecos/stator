@@ -300,6 +300,270 @@ pub fn date_time_format_to_parts_js(args: &[JsValue]) -> StatorResult<JsValue> {
     Ok(JsValue::new_array(parts))
 }
 
+// ── NumberFormat.formatRange ─────────────────────────────────────────────────
+
+/// Format a numeric range as `"start – end"` (en-US stub).
+pub fn number_format_range(start: f64, end: f64) -> String {
+    format!("{} – {}", number_format(start), number_format(end))
+}
+
+/// `Intl.NumberFormat.prototype.formatRange(start, end)`.
+pub fn number_format_range_js(args: &[JsValue]) -> StatorResult<JsValue> {
+    let start = args.first().unwrap_or(&JsValue::Undefined).to_number()?;
+    let end = args.get(1).unwrap_or(&JsValue::Undefined).to_number()?;
+    Ok(JsValue::String(number_format_range(start, end).into()))
+}
+
+/// `Intl.NumberFormat.prototype.formatRangeToParts(start, end)`.
+pub fn number_format_range_to_parts_js(args: &[JsValue]) -> StatorResult<JsValue> {
+    let start = args.first().unwrap_or(&JsValue::Undefined).to_number()?;
+    let end = args.get(1).unwrap_or(&JsValue::Undefined).to_number()?;
+    let mut parts = vec![make_part("startRange", &number_format(start))];
+    parts.push(make_part("shared", " – "));
+    parts.push(make_part("endRange", &number_format(end)));
+    Ok(JsValue::new_array(parts))
+}
+
+// ── PluralRules.selectRange ─────────────────────────────────────────────────
+
+/// Select the plural category for a range (en-US: always `"other"`).
+pub fn plural_rules_select_range(start: f64, end: f64) -> &'static str {
+    // CLDR: the range plural for en is always based on the end value,
+    // but the spec says "other" for ranges in en.
+    let _ = start;
+    if end == 1.0 { "one" } else { "other" }
+}
+
+/// `Intl.PluralRules.prototype.selectRange(start, end)`.
+pub fn plural_rules_select_range_js(args: &[JsValue]) -> StatorResult<JsValue> {
+    let start = args.first().unwrap_or(&JsValue::Undefined).to_number()?;
+    let end = args.get(1).unwrap_or(&JsValue::Undefined).to_number()?;
+    Ok(JsValue::String(
+        plural_rules_select_range(start, end).to_string().into(),
+    ))
+}
+
+// ── Locale extended ─────────────────────────────────────────────────────────
+
+/// Extract the region subtag from a BCP-47 tag (e.g. `"en-US"` → `"US"`).
+pub fn locale_region(tag: &str) -> String {
+    let parts: Vec<&str> = tag.split('-').collect();
+    // Region is a 2-letter UPPER subtag or 3-digit subtag.
+    for part in &parts[1..] {
+        if (part.len() == 2 && part.chars().all(|c| c.is_ascii_uppercase()))
+            || (part.len() == 3 && part.chars().all(|c| c.is_ascii_digit()))
+        {
+            return part.to_string();
+        }
+    }
+    String::new()
+}
+
+/// Extract the script subtag (e.g. `"zh-Hans-CN"` → `"Hans"`).
+pub fn locale_script(tag: &str) -> String {
+    let parts: Vec<&str> = tag.split('-').collect();
+    // Script is a 4-letter subtag with leading uppercase.
+    for part in &parts[1..] {
+        if part.len() == 4 && part.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            return part.to_string();
+        }
+    }
+    String::new()
+}
+
+/// Stub `maximize()` — adds likely subtags (en → en-Latn-US).
+pub fn locale_maximize(tag: &str) -> String {
+    let lang = locale_language(tag);
+    let script = locale_script(tag);
+    let region = locale_region(tag);
+    let script = if script.is_empty() {
+        match lang.as_str() {
+            "zh" => "Hans",
+            "ja" => "Jpan",
+            "ko" => "Kore",
+            _ => "Latn",
+        }
+    } else {
+        &script
+    };
+    let region = if region.is_empty() {
+        match lang.as_str() {
+            "en" => "US",
+            "zh" => "CN",
+            "ja" => "JP",
+            "ko" => "KR",
+            "fr" => "FR",
+            "de" => "DE",
+            "es" => "ES",
+            _ => "001",
+        }
+    } else {
+        &region
+    };
+    format!("{lang}-{script}-{region}")
+}
+
+/// Stub `minimize()` — removes likely subtags.
+pub fn locale_minimize(tag: &str) -> String {
+    locale_language(tag)
+}
+
+// ── ListFormat.formatToParts ────────────────────────────────────────────────
+
+/// `Intl.ListFormat.prototype.formatToParts(list)` — returns `[{type, value}]`.
+pub fn list_format_to_parts_js(args: &[JsValue], list_type: &str) -> StatorResult<JsValue> {
+    let items: Vec<String> = match args.first() {
+        Some(JsValue::Array(arr)) => arr
+            .borrow()
+            .iter()
+            .map(|v| v.to_js_string())
+            .collect::<StatorResult<Vec<_>>>()?,
+        _ => Vec::new(),
+    };
+    let conjunction = if list_type == "disjunction" {
+        "or"
+    } else {
+        "and"
+    };
+    let mut parts: Vec<JsValue> = Vec::new();
+    match items.len() {
+        0 => {}
+        1 => {
+            parts.push(make_part("element", &items[0]));
+        }
+        2 => {
+            parts.push(make_part("element", &items[0]));
+            parts.push(make_part("literal", &format!(" {conjunction} ")));
+            parts.push(make_part("element", &items[1]));
+        }
+        _ => {
+            let last = items.len() - 1;
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 && i < last {
+                    parts.push(make_part("literal", ", "));
+                } else if i == last {
+                    parts.push(make_part("literal", &format!(", {conjunction} ")));
+                }
+                parts.push(make_part("element", item));
+            }
+        }
+    }
+    Ok(JsValue::new_array(parts))
+}
+
+// ── RelativeTimeFormat.formatToParts ────────────────────────────────────────
+
+/// `Intl.RelativeTimeFormat.prototype.formatToParts(value, unit)`.
+pub fn relative_time_format_to_parts_js(args: &[JsValue]) -> StatorResult<JsValue> {
+    let value = args.first().unwrap_or(&JsValue::Undefined).to_number()?;
+    let unit = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+    let abs = value.abs();
+    let plural_unit = if abs == 1.0 {
+        unit.to_string()
+    } else {
+        format!("{unit}s")
+    };
+    let mut parts: Vec<JsValue> = Vec::new();
+    if value < 0.0 {
+        parts.push(make_part("integer", &format!("{abs}")));
+        parts.push(make_part("literal", " "));
+        parts.push(make_part("unit", &plural_unit));
+        parts.push(make_part("literal", " ago"));
+    } else {
+        parts.push(make_part("literal", "in "));
+        parts.push(make_part("integer", &format!("{abs}")));
+        parts.push(make_part("literal", " "));
+        parts.push(make_part("unit", &plural_unit));
+    }
+    Ok(JsValue::new_array(parts))
+}
+
+// ── Segmenter.segment with containing() ─────────────────────────────────────
+
+/// Build a segments object with indexed segment entries and a `containing(idx)`
+/// method, conforming to the `Intl.Segmenter.prototype.segment()` contract.
+pub fn segmenter_segment_objects(input_str: &str) -> StatorResult<JsValue> {
+    let chars: Vec<String> = input_str.chars().map(|c| c.to_string()).collect();
+    let input_owned = input_str.to_string();
+    let segments: Vec<JsValue> = chars
+        .iter()
+        .enumerate()
+        .map(|(i, ch)| {
+            let mut seg = PropertyMap::new();
+            seg.insert("segment".into(), JsValue::String(ch.clone().into()));
+            seg.insert("index".into(), JsValue::Smi(i as i32));
+            seg.insert("input".into(), JsValue::String(input_owned.clone().into()));
+            JsValue::PlainObject(Rc::new(RefCell::new(seg)))
+        })
+        .collect();
+
+    let segments_clone = segments.clone();
+    let mut result = PropertyMap::new();
+    for (i, seg) in segments.iter().enumerate() {
+        result.insert(i.to_string(), seg.clone());
+    }
+    result.insert("length".into(), JsValue::Smi(segments.len() as i32));
+
+    // containing(index) method
+    result.insert(
+        "containing".into(),
+        JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+            let idx = args.first().unwrap_or(&JsValue::Undefined).to_number()? as usize;
+            Ok(segments_clone
+                .get(idx)
+                .cloned()
+                .unwrap_or(JsValue::Undefined))
+        })),
+    );
+
+    Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
+}
+
+// ── DisplayNames with type ──────────────────────────────────────────────────
+
+/// Return a display name for a code, considering the type.
+///
+/// For `"language"` codes, returns common English names for well-known codes.
+/// Falls back to returning the code itself.
+pub fn display_names_of_typed(code: &str, dn_type: &str) -> String {
+    match dn_type {
+        "language" => match code {
+            "en" => "English".to_string(),
+            "fr" => "French".to_string(),
+            "de" => "German".to_string(),
+            "es" => "Spanish".to_string(),
+            "zh" => "Chinese".to_string(),
+            "ja" => "Japanese".to_string(),
+            "ko" => "Korean".to_string(),
+            _ => code.to_string(),
+        },
+        "region" => match code {
+            "US" => "United States".to_string(),
+            "GB" => "United Kingdom".to_string(),
+            "FR" => "France".to_string(),
+            "DE" => "Germany".to_string(),
+            "JP" => "Japan".to_string(),
+            "CN" => "China".to_string(),
+            _ => code.to_string(),
+        },
+        "script" => match code {
+            "Latn" => "Latin".to_string(),
+            "Hans" => "Simplified Han".to_string(),
+            "Hant" => "Traditional Han".to_string(),
+            "Cyrl" => "Cyrillic".to_string(),
+            _ => code.to_string(),
+        },
+        "currency" => match code {
+            "USD" => "US Dollar".to_string(),
+            "EUR" => "Euro".to_string(),
+            "GBP" => "British Pound".to_string(),
+            "JPY" => "Japanese Yen".to_string(),
+            _ => code.to_string(),
+        },
+        _ => code.to_string(),
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -442,5 +706,75 @@ mod tests {
     fn test_plural_rules_select_js_value() {
         let result = plural_rules_select_js(&[JsValue::Smi(1)]).unwrap();
         assert_eq!(result, JsValue::String("one".into()));
+    }
+
+    #[test]
+    fn test_number_format_range() {
+        assert_eq!(number_format_range(1.0, 10.0), "1 – 10");
+    }
+
+    #[test]
+    fn test_number_format_range_decimals() {
+        assert_eq!(number_format_range(1.5, 2.5), "1.5 – 2.5");
+    }
+
+    #[test]
+    fn test_plural_rules_select_range_other() {
+        assert_eq!(plural_rules_select_range(1.0, 5.0), "other");
+    }
+
+    #[test]
+    fn test_plural_rules_select_range_one() {
+        assert_eq!(plural_rules_select_range(0.0, 1.0), "one");
+    }
+
+    #[test]
+    fn test_locale_region_us() {
+        assert_eq!(locale_region("en-US"), "US");
+    }
+
+    #[test]
+    fn test_locale_region_empty() {
+        assert_eq!(locale_region("en"), "");
+    }
+
+    #[test]
+    fn test_locale_script_hans() {
+        assert_eq!(locale_script("zh-Hans-CN"), "Hans");
+    }
+
+    #[test]
+    fn test_locale_script_empty() {
+        assert_eq!(locale_script("en-US"), "");
+    }
+
+    #[test]
+    fn test_locale_maximize_en() {
+        assert_eq!(locale_maximize("en"), "en-Latn-US");
+    }
+
+    #[test]
+    fn test_locale_minimize_en_us() {
+        assert_eq!(locale_minimize("en-US"), "en");
+    }
+
+    #[test]
+    fn test_display_names_of_typed_language() {
+        assert_eq!(display_names_of_typed("en", "language"), "English");
+    }
+
+    #[test]
+    fn test_display_names_of_typed_region() {
+        assert_eq!(display_names_of_typed("US", "region"), "United States");
+    }
+
+    #[test]
+    fn test_display_names_of_typed_script() {
+        assert_eq!(display_names_of_typed("Latn", "script"), "Latin");
+    }
+
+    #[test]
+    fn test_display_names_of_typed_currency() {
+        assert_eq!(display_names_of_typed("USD", "currency"), "US Dollar");
     }
 }
