@@ -2179,23 +2179,23 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
         }
         _ => return raw.to_owned(),
     };
-    let mut out = String::with_capacity(inner.len());
+    let mut units = Vec::with_capacity(inner.len());
     let mut chars = inner.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('r') => out.push('\r'),
-                Some('t') => out.push('\t'),
-                Some('b') => out.push('\u{0008}'),
-                Some('f') => out.push('\u{000C}'),
-                Some('v') => out.push('\u{000B}'),
-                Some('\\') => out.push('\\'),
-                Some('\'') => out.push('\''),
-                Some('"') => out.push('"'),
-                Some('`') => out.push('`'),
+                Some('n') => push_utf16_char(&mut units, '\n'),
+                Some('r') => push_utf16_char(&mut units, '\r'),
+                Some('t') => push_utf16_char(&mut units, '\t'),
+                Some('b') => push_utf16_char(&mut units, '\u{0008}'),
+                Some('f') => push_utf16_char(&mut units, '\u{000C}'),
+                Some('v') => push_utf16_char(&mut units, '\u{000B}'),
+                Some('\\') => push_utf16_char(&mut units, '\\'),
+                Some('\'') => push_utf16_char(&mut units, '\''),
+                Some('"') => push_utf16_char(&mut units, '"'),
+                Some('`') => push_utf16_char(&mut units, '`'),
                 Some('0') if !matches!(chars.peek(), Some('0'..='9')) => {
-                    out.push('\0');
+                    push_utf16_char(&mut units, '\0');
                 }
                 Some(d @ '0'..='7') => {
                     // Legacy octal escape — collect up to 3 octal digits.
@@ -2214,14 +2214,14 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
                         }
                     }
                     if let Some(ch) = char::from_u32(val) {
-                        out.push(ch);
+                        push_utf16_char(&mut units, ch);
                     }
                 }
                 Some('x') => {
                     // \xHH — two hex digits
                     let h = take_hex_digits(&mut chars, 2);
                     if let Some(cp) = u32::from_str_radix(&h, 16).ok().and_then(char::from_u32) {
-                        out.push(cp);
+                        push_utf16_char(&mut units, cp);
                     }
                 }
                 Some('u') => {
@@ -2240,14 +2240,15 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
                         if let Some(cp) =
                             u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
                         {
-                            out.push(cp);
+                            push_utf16_char(&mut units, cp);
                         }
                     } else {
                         // \uHHHH — exactly four hex digits
                         let h = take_hex_digits(&mut chars, 4);
-                        if let Some(cp) = u32::from_str_radix(&h, 16).ok().and_then(char::from_u32)
+                        if h.len() == 4
+                            && let Ok(unit) = u16::from_str_radix(&h, 16)
                         {
-                            out.push(cp);
+                            units.push(unit);
                         }
                     }
                 }
@@ -2262,14 +2263,14 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
                 }
                 Some('\u{2028}') | Some('\u{2029}') => {}
                 // Identity escape: any other character after `\` is itself.
-                Some(other) => out.push(other),
-                None => out.push('\\'),
+                Some(other) => push_utf16_char(&mut units, other),
+                None => push_utf16_char(&mut units, '\\'),
             }
         } else {
-            out.push(c);
+            push_utf16_char(&mut units, c);
         }
     }
-    out
+    String::from_utf16_lossy(&units)
 }
 
 /// Consume exactly `n` hex digits from the iterator, returning them as a string.
@@ -2286,6 +2287,11 @@ fn take_hex_digits(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, n: usiz
         }
     }
     hex
+}
+
+fn push_utf16_char(units: &mut Vec<u16>, ch: char) {
+    let mut buf = [0_u16; 2];
+    units.extend(ch.encode_utf16(&mut buf).iter().copied());
 }
 #[inline(always)]
 pub(super) fn number_to_jsvalue(n: f64) -> JsValue {
@@ -3742,25 +3748,13 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "normalize" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    // ES §22.1.3.13 String.prototype.normalize([form])
-                    // Determine the normalization form (default: "NFC").
                     let form = match args.first() {
                         None | Some(JsValue::Undefined) => "NFC".to_string(),
                         Some(v) => v.to_js_string()?,
                     };
-                    match form.as_str() {
-                        "NFC" | "NFD" | "NFKC" | "NFKD" => {
-                            // ASCII-only strings are already in all normalization
-                            // forms, so we can return as-is.  For non-ASCII we
-                            // also return as-is (best-effort without the
-                            // unicode-normalization crate).
-                            Ok(JsValue::String(s.clone()))
-                        }
-                        _ => Err(StatorError::RangeError(
-                            "The normalization form should be one of NFC, NFD, NFKC, NFKD."
-                                .to_string(),
-                        )),
-                    }
+                    Ok(JsValue::String(
+                        crate::builtins::string::string_normalize(&s, Some(form.as_str()))?.into(),
+                    ))
                 }));
             }
             "localeCompare" => {
@@ -16204,6 +16198,21 @@ mod tests {
         // a (1) + surrogate pair (2) + b (1) = 4 UTF-16 code units
         let s = JsValue::String("a𝄞b".to_string().into());
         assert_eq!(proto_lookup(&s, "length"), JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_decode_string_constant_braced_supplementary_plane_escape() {
+        assert_eq!(decode_string_constant(r#""\u{10FFFF}""#), "\u{10FFFF}");
+    }
+
+    #[test]
+    fn test_decode_string_constant_surrogate_pair() {
+        assert_eq!(decode_string_constant(r#""\uD83D\uDE00""#), "😀");
+    }
+
+    #[test]
+    fn test_decode_string_constant_mixed_ascii_and_surrogate_pair() {
+        assert_eq!(decode_string_constant(r#""a\uD83D\uDE00b""#), "a😀b");
     }
 
     #[test]

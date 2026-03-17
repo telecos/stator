@@ -3,6 +3,7 @@
 //! See [`Scanner`] for the main entry point.
 
 use crate::error::{StatorError, StatorResult};
+use unicode_ident::{is_xid_continue, is_xid_start};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Position / Span
@@ -365,12 +366,12 @@ fn is_js_whitespace(c: char) -> bool {
 
 /// Returns `true` for characters that may *start* a JS identifier.
 fn is_id_start(c: char) -> bool {
-    c == '$' || c == '_' || c.is_alphabetic()
+    c == '$' || c == '_' || is_xid_start(c)
 }
 
 /// Returns `true` for characters that may *continue* a JS identifier.
 fn is_id_continue(c: char) -> bool {
-    c == '$' || c == '_' || c == '\u{200C}' || c == '\u{200D}' || c.is_alphanumeric()
+    c == '$' || c == '_' || c == '\u{200C}' || c == '\u{200D}' || is_xid_continue(c)
 }
 
 /// Map an identifier string to a reserved-word/contextual-keyword
@@ -666,36 +667,9 @@ impl<'src> Scanner<'src> {
                 match c {
                     'u' => {
                         if self.peek() == Some('{') {
-                            self.advance(); // {
-                            let mut count = 0usize;
-                            while matches!(self.peek(), Some(d) if d.is_ascii_hexdigit()) {
-                                self.advance();
-                                count += 1;
-                            }
-                            if count == 0 {
-                                return Err(StatorError::SyntaxError(
-                                    "invalid Unicode escape sequence".into(),
-                                ));
-                            }
-                            if self.peek() != Some('}') {
-                                return Err(StatorError::SyntaxError(
-                                    "expected '}' in Unicode escape sequence".into(),
-                                ));
-                            }
-                            self.advance(); // }
+                            let _ = self.scan_braced_unicode_escape()?;
                         } else {
-                            for _ in 0..4 {
-                                match self.peek() {
-                                    Some(d) if d.is_ascii_hexdigit() => {
-                                        self.advance();
-                                    }
-                                    _ => {
-                                        return Err(StatorError::SyntaxError(
-                                            "invalid Unicode escape sequence".into(),
-                                        ));
-                                    }
-                                }
-                            }
+                            let _ = self.scan_fixed_unicode_escape()?;
                         }
                     }
                     'x' => {
@@ -975,12 +949,12 @@ impl<'src> Scanner<'src> {
 
     /// Scan an identifier that starts at `id_start_byte`, given that the
     /// first character `first` has already been consumed.
-    fn scan_identifier(&mut self, first: char, start: Position) -> Token {
+    fn scan_identifier(&mut self, first: char, start: Position) -> StatorResult<Token> {
         let id_start = start.offset;
         // If the first char was a backslash, we consumed `\`; handle `u` escape.
         if first == '\\' {
             // scan_unicode_escape_in_id has already advanced past `\`.
-            self.scan_unicode_escape_in_id_rest();
+            self.scan_unicode_escape_in_id_rest(false)?;
         }
         loop {
             match self.peek() {
@@ -989,7 +963,7 @@ impl<'src> Scanner<'src> {
                 }
                 Some('\\') if self.peek2() == Some('u') => {
                     self.advance(); // '\'
-                    self.scan_unicode_escape_in_id_rest();
+                    self.scan_unicode_escape_in_id_rest(true)?;
                 }
                 _ => break,
             }
@@ -1014,35 +988,91 @@ impl<'src> Scanner<'src> {
             _ => TokenValue::None,
         };
         let end = self.current_pos();
-        Token {
+        Ok(Token {
             kind,
             value,
             span: Span { start, end },
             had_line_terminator_before: false,
-        }
+        })
     }
 
     /// After consuming `\`, consume the rest of a `\uXXXX` or `\u{…}` escape.
-    fn scan_unicode_escape_in_id_rest(&mut self) {
+    fn scan_unicode_escape_in_id_rest(&mut self, continue_only: bool) -> StatorResult<char> {
         if self.peek() != Some('u') {
-            return;
+            return Err(StatorError::SyntaxError(
+                "invalid Unicode escape sequence".into(),
+            ));
         }
         self.advance(); // 'u'
-        if self.peek() == Some('{') {
-            self.advance();
-            while matches!(self.peek(), Some(c) if c.is_ascii_hexdigit()) {
-                self.advance();
-            }
-            if self.peek() == Some('}') {
-                self.advance();
-            }
+        let cp = if self.peek() == Some('{') {
+            self.scan_braced_unicode_escape()?
         } else {
-            for _ in 0..4 {
-                if matches!(self.peek(), Some(c) if c.is_ascii_hexdigit()) {
+            u32::from(self.scan_fixed_unicode_escape()?)
+        };
+        let ch = char::from_u32(cp)
+            .ok_or_else(|| StatorError::SyntaxError("invalid Unicode escape sequence".into()))?;
+        let is_valid = if continue_only {
+            is_id_continue(ch)
+        } else {
+            is_id_start(ch)
+        };
+        if !is_valid {
+            return Err(StatorError::SyntaxError(
+                "invalid Unicode escape in identifier".into(),
+            ));
+        }
+        Ok(ch)
+    }
+
+    fn scan_braced_unicode_escape(&mut self) -> StatorResult<u32> {
+        if self.peek() != Some('{') {
+            return Err(StatorError::SyntaxError(
+                "expected '{' in Unicode escape sequence".into(),
+            ));
+        }
+        self.advance(); // {
+        let mut hex = String::new();
+        while matches!(self.peek(), Some(d) if d.is_ascii_hexdigit()) {
+            hex.push(self.advance());
+        }
+        if hex.is_empty() {
+            return Err(StatorError::SyntaxError(
+                "invalid Unicode escape sequence".into(),
+            ));
+        }
+        if self.peek() != Some('}') {
+            return Err(StatorError::SyntaxError(
+                "expected '}' in Unicode escape sequence".into(),
+            ));
+        }
+        self.advance(); // }
+        let cp = u32::from_str_radix(&hex, 16)
+            .map_err(|_| StatorError::SyntaxError("invalid Unicode escape sequence".into()))?;
+        if cp > 0x10FFFF {
+            return Err(StatorError::SyntaxError(
+                "invalid Unicode escape sequence".into(),
+            ));
+        }
+        Ok(cp)
+    }
+
+    fn scan_fixed_unicode_escape(&mut self) -> StatorResult<u16> {
+        let mut hex = String::with_capacity(4);
+        for _ in 0..4 {
+            match self.peek() {
+                Some(d) if d.is_ascii_hexdigit() => {
+                    hex.push(d);
                     self.advance();
+                }
+                _ => {
+                    return Err(StatorError::SyntaxError(
+                        "invalid Unicode escape sequence".into(),
+                    ));
                 }
             }
         }
+        u16::from_str_radix(&hex, 16)
+            .map_err(|_| StatorError::SyntaxError("invalid Unicode escape sequence".into()))
     }
 
     // ── Main public API ─────────────────────────────────────────────────────
@@ -1253,20 +1283,34 @@ impl<'src> Scanner<'src> {
                     )));
                 }
                 let name_start = self.pos;
-                // Consume identifier name (without '#').
-                loop {
-                    match self.peek() {
-                        Some(nc) if is_id_continue(nc) => {
+                match self.peek() {
+                    Some('\\') if self.peek2() == Some('u') => {
+                        self.advance();
+                        self.scan_unicode_escape_in_id_rest(false)?;
+                    }
+                    Some(nc) if is_id_start(nc) => {
+                        self.advance();
+                    }
+                    _ => unreachable!("private identifier start already validated"),
+                }
+                while let Some(next) = self.peek() {
+                    match next {
+                        nc if is_id_continue(nc) => {
                             self.advance();
                         }
-                        Some('\\') if self.peek2() == Some('u') => {
+                        '\\' if self.peek2() == Some('u') => {
                             self.advance();
-                            self.scan_unicode_escape_in_id_rest();
+                            self.scan_unicode_escape_in_id_rest(true)?;
                         }
                         _ => break,
                     }
                 }
-                let name = self.source[name_start..self.pos].to_string();
+                let raw_name = self.source[name_start..self.pos].to_string();
+                let name = if raw_name.contains('\\') {
+                    decode_unicode_escapes(&raw_name)
+                } else {
+                    raw_name
+                };
                 let end = self.current_pos();
                 Token {
                     kind: TokenKind::PrivateIdentifier,
@@ -1278,7 +1322,7 @@ impl<'src> Scanner<'src> {
 
             // ── Identifiers / keywords ───────────────────────────────────
             c if is_id_start(c) => {
-                let mut tok = self.scan_identifier(c, start);
+                let mut tok = self.scan_identifier(c, start)?;
                 tok.had_line_terminator_before = had_lt;
                 self.last_significant_kind = Some(tok.kind);
                 return Ok(tok);
@@ -1286,7 +1330,7 @@ impl<'src> Scanner<'src> {
 
             // Identifier starting with unicode escape `\uXXXX`
             '\\' if self.peek() == Some('u') => {
-                let mut tok = self.scan_identifier('\\', start);
+                let mut tok = self.scan_identifier('\\', start)?;
                 tok.had_line_terminator_before = had_lt;
                 self.last_significant_kind = Some(tok.kind);
                 return Ok(tok);
@@ -2724,5 +2768,60 @@ mod tests {
         let toks = tokens(r"h\u0065llo");
         assert_eq!(toks[0].kind, TokenKind::Identifier);
         assert_eq!(toks[0].value, TokenValue::Str("hello".into()));
+    }
+
+    #[test]
+    fn test_identifier_unicode_escape_curly_ascii_letter() {
+        let toks = tokens(r"\u{61}");
+        assert_eq!(toks[0].kind, TokenKind::Identifier);
+        assert_eq!(toks[0].value, TokenValue::Str("a".into()));
+    }
+
+    #[test]
+    fn test_identifier_unicode_continue_digit() {
+        let toks = tokens("cafe٣");
+        assert_eq!(toks[0].kind, TokenKind::Identifier);
+        assert_eq!(toks[0].value, TokenValue::Str("cafe٣".into()));
+    }
+
+    #[test]
+    fn test_identifier_unicode_continue_combining_mark() {
+        let toks = tokens("a\u{0301}");
+        assert_eq!(toks[0].kind, TokenKind::Identifier);
+        assert_eq!(toks[0].value, TokenValue::Str("a\u{0301}".into()));
+    }
+
+    #[test]
+    fn test_identifier_unicode_continue_connector_punctuation() {
+        let toks = tokens("foo\u{203F}bar");
+        assert_eq!(toks[0].kind, TokenKind::Identifier);
+        assert_eq!(toks[0].value, TokenValue::Str("foo\u{203F}bar".into()));
+    }
+
+    #[test]
+    fn test_private_identifier_unicode_escape_decoded() {
+        let toks = tokens(r"#\u{61}");
+        assert_eq!(toks[0].kind, TokenKind::PrivateIdentifier);
+        assert_eq!(toks[0].value, TokenValue::Str("a".into()));
+    }
+
+    #[test]
+    fn test_identifier_invalid_unicode_start_escape_rejected() {
+        assert!(Scanner::tokenize_all(r"\u0030").is_err());
+    }
+
+    #[test]
+    fn test_identifier_invalid_unicode_continue_escape_rejected() {
+        assert!(Scanner::tokenize_all(r"a\u002D").is_err());
+    }
+
+    #[test]
+    fn test_identifier_invalid_unicode_escape_code_point_rejected() {
+        assert!(Scanner::tokenize_all(r"\u{110000}").is_err());
+    }
+
+    #[test]
+    fn test_string_unicode_escape_braced_rejects_out_of_range_code_point() {
+        assert!(Scanner::tokenize_all(r#""\u{110000}""#).is_err());
     }
 }

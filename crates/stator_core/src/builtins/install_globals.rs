@@ -14816,6 +14816,13 @@ mod tests {
         ));
     }
 
+    fn assert_eval_syntax_error(script: &str) {
+        assert!(matches!(
+            global_eval(script),
+            Err(StatorError::SyntaxError(_))
+        ));
+    }
+
     /// Verify that `install_globals` populates the expected keys.
     #[test]
     fn test_install_globals_keys() {
@@ -45730,6 +45737,201 @@ mod tests {
             r#"var m = new RegExp(".", "u").exec("\u{1F600}");
             m[0] === "\u{1F600}""#,
         );
+    }
+
+    // ── Unicode identifiers / strings / normalization / regexp conformance ─
+
+    #[test]
+    fn e2e_unicode_identifier_escape_basic() {
+        assert_eval_true(r#"var \u0061 = 1; a === 1"#);
+    }
+
+    #[test]
+    fn e2e_unicode_identifier_escape_braced_basic() {
+        assert_eval_true(r#"let \u{61} = 2; a === 2"#);
+    }
+
+    #[test]
+    fn e2e_unicode_identifier_escape_in_function_parameter() {
+        assert_eval_true(r#"function f(\u0061) { return a; } f(9) === 9"#);
+    }
+
+    #[test]
+    fn e2e_unicode_identifier_non_ascii_start() {
+        assert_eval_true("let π = 3; π === 3");
+    }
+
+    #[test]
+    fn e2e_unicode_identifier_non_ascii_digit_continue() {
+        assert_eval_true("let var١ = 7; var١ === 7");
+    }
+
+    #[test]
+    fn e2e_unicode_identifier_combining_mark_continue() {
+        assert_eval_true(r#"let cafe\u{301} = 4; cafe\u{301} === 4"#);
+    }
+
+    #[test]
+    fn e2e_unicode_identifier_connector_punctuation_continue() {
+        assert_eval_true(r#"let foo\u203Fbar = 5; foo\u203Fbar === 5"#);
+    }
+
+    #[test]
+    fn e2e_unicode_identifier_escape_decodes_keyword_spelling_to_identifier() {
+        assert_eval_true(r#"var \u0069f = 6; \u0069f === 6"#);
+    }
+
+    #[test]
+    fn e2e_unicode_identifier_invalid_start_escape_is_syntax_error() {
+        assert_eval_syntax_error(r#"var \u0030 = 1;"#);
+    }
+
+    #[test]
+    fn e2e_unicode_identifier_invalid_continue_escape_is_syntax_error() {
+        assert_eval_syntax_error(r#"var a\u002D = 1;"#);
+    }
+
+    #[test]
+    fn e2e_unicode_identifier_invalid_braced_escape_is_syntax_error() {
+        assert_eval_syntax_error(r#"var \u{110000} = 1;"#);
+    }
+
+    #[test]
+    fn e2e_string_unicode_escape_basic() {
+        assert_eval_true(r#""\u0061" === "a""#);
+    }
+
+    #[test]
+    fn e2e_string_unicode_escape_braced_basic() {
+        assert_eval_true(r#""\u{61}" === "a""#);
+    }
+
+    #[test]
+    fn e2e_string_unicode_escape_supplementary_plane() {
+        assert_eval_true(r#""\u{10FFFF}" === String.fromCodePoint(0x10FFFF)"#);
+    }
+
+    #[test]
+    fn e2e_string_unicode_escape_braced_emoji() {
+        assert_eval_true(r#""\u{1F600}" === "😀""#);
+    }
+
+    #[test]
+    fn e2e_string_unicode_escape_surrogate_pair_decodes_to_emoji() {
+        assert_eval_true(r#""\uD83D\uDE00" === "\u{1F600}""#);
+    }
+
+    #[test]
+    fn e2e_string_unicode_escape_surrogate_pair_mixed_with_bmp() {
+        assert_eval_true(r#""a\uD83D\uDE00b" === "a\u{1F600}b""#);
+    }
+
+    #[test]
+    fn e2e_string_unicode_escape_supplementary_plane_length_is_utf16() {
+        assert_eval_true(r#""\u{1F600}".length === 2"#);
+    }
+
+    #[test]
+    fn e2e_string_unicode_escape_surrogate_pair_length_is_utf16() {
+        assert_eval_true(r#""a\uD83D\uDE00b".length === 4"#);
+    }
+
+    #[test]
+    fn e2e_string_unicode_escape_out_of_range_is_syntax_error() {
+        assert_eval_syntax_error(r#""\u{110000}""#);
+    }
+
+    #[test]
+    fn e2e_string_normalize_default_composes_combining_mark() {
+        assert_eval_true(r#""e\u0301".normalize() === "\u00E9""#);
+    }
+
+    #[test]
+    fn e2e_string_normalize_nfd_decomposes_angstrom() {
+        assert_eval_true(r#""\u00C5".normalize("NFD") === "A\u030A""#);
+    }
+
+    #[test]
+    fn e2e_string_normalize_nfc_recomposes_angstrom() {
+        assert_eval_true(r#""A\u030A".normalize("NFC") === "\u00C5""#);
+    }
+
+    #[test]
+    fn e2e_string_normalize_nfkd_decomposes_ligature() {
+        assert_eval_true(r#""\uFB01".normalize("NFKD") === "fi""#);
+    }
+
+    #[test]
+    fn e2e_string_normalize_nfkc_recomposes_compatibility_character() {
+        assert_eval_true(r#""\u212B".normalize("NFKC") === "\u00C5""#);
+    }
+
+    #[test]
+    fn e2e_regexp_unicode_braced_escape_matches_ascii() {
+        assert_eval_true(r#"new RegExp("\\u{61}", "u").test("a")"#);
+    }
+
+    #[test]
+    fn e2e_regexp_unicode_braced_escape_matches_emoji() {
+        assert_eval_true(r#"new RegExp("^\\u{1F600}$", "u").test("\u{1F600}")"#);
+    }
+
+    #[test]
+    fn e2e_regexp_unicode_single_dot_matches_single_code_point() {
+        assert_eval_true(r#"new RegExp("^.$", "u").test("\u{1F600}")"#);
+    }
+
+    #[test]
+    fn e2e_regexp_unicode_exec_returns_single_emoji_code_point() {
+        assert_eval_true(
+            r#"var m = new RegExp("^.$", "u").exec("\u{1F600}");
+            m !== null && m[0] === "\u{1F600}""#,
+        );
+    }
+
+    #[test]
+    fn e2e_regexp_unicode_property_escape_long_name_letter() {
+        assert_eval_true(r#"new RegExp("\\p{Letter}+", "u").test("π")"#);
+    }
+
+    #[test]
+    fn e2e_regexp_unicode_property_escape_negated_number() {
+        assert_eval_true(r#"new RegExp("^\\P{Number}+$", "u").test("abc")"#);
+    }
+
+    #[test]
+    fn e2e_regexp_unicode_property_escape_negated_number_rejects_digits() {
+        assert_eval_true(r#"!new RegExp("^\\P{Number}+$", "u").test("١٢٣")"#);
+    }
+
+    #[test]
+    fn e2e_regexp_unicode_identity_escape_restricted() {
+        assert_eval_syntax_error(r#"new RegExp("\\q", "u")"#);
+    }
+
+    #[test]
+    fn e2e_regexp_non_unicode_identity_escape_allowed() {
+        assert_eval_true(r#"new RegExp("\\q").test("q")"#);
+    }
+
+    #[test]
+    fn e2e_regexp_unicode_sets_flag_accessor() {
+        assert_eval_true(r#"new RegExp(".", "v").unicodeSets === true"#);
+    }
+
+    #[test]
+    fn e2e_regexp_unicode_sets_flags_string() {
+        assert_eval_true(r#"new RegExp(".", "v").flags === "v""#);
+    }
+
+    #[test]
+    fn e2e_regexp_unicode_sets_does_not_set_unicode_accessor() {
+        assert_eval_true(r#"new RegExp(".", "v").unicode === false"#);
+    }
+
+    #[test]
+    fn e2e_regexp_unicode_sets_plain_pattern_still_matches() {
+        assert_eval_true(r#"new RegExp(".", "v").test("a")"#);
     }
 
     // ── Lookbehind assertions ────────────────────────────────────────────
