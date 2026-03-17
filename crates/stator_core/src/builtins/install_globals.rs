@@ -1802,6 +1802,165 @@ fn current_derived_constructor_this() -> Option<Rc<RefCell<PropertyMap>>> {
     }
 }
 
+fn promise_species_constructor(
+    promise: &crate::builtins::promise::JsPromise,
+) -> StatorResult<Option<JsValue>> {
+    let promise_value = JsValue::Promise(promise.clone());
+    let constructor =
+        dispatch_get_property_value(&promise_value, JsValue::String("constructor".into()))?;
+    if constructor.is_undefined() {
+        return Ok(None);
+    }
+
+    let species = match &constructor {
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            if let Some(getter) = borrow.get("__get_@@species__").cloned() {
+                drop(borrow);
+                dispatch_call_value(&getter, vec![constructor.clone()])?
+            } else {
+                borrow
+                    .get("@@species")
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+            }
+        }
+        JsValue::Function(_) | JsValue::NativeFunction(_) | JsValue::Proxy(_) => JsValue::Undefined,
+        _ => {
+            return Err(StatorError::TypeError(
+                "Promise constructor is not an object".into(),
+            ));
+        }
+    };
+
+    if species.is_undefined() || matches!(species, JsValue::Null) {
+        return Ok(None);
+    }
+    if !is_callable(&species) {
+        return Err(StatorError::TypeError(
+            "Promise species constructor is not callable".into(),
+        ));
+    }
+    Ok(Some(species))
+}
+
+fn promise_species_result(
+    promise: &crate::builtins::promise::JsPromise,
+) -> StatorResult<crate::builtins::promise::JsPromise> {
+    let result = crate::builtins::promise::promise_pending();
+    if let Some(species) = promise_species_constructor(promise)? {
+        let prototype = dispatch_get_property_value(&species, JsValue::String("prototype".into()))?;
+        if prototype.is_object_like() {
+            result.set_prototype(Some(prototype));
+        } else if !matches!(prototype, JsValue::Undefined | JsValue::Null) {
+            return Err(StatorError::TypeError(
+                "Promise species prototype is not an object".into(),
+            ));
+        }
+    }
+    Ok(result)
+}
+
+fn promise_then_method(queue: &crate::builtins::promise::MicrotaskQueue) -> JsValue {
+    let q = queue.clone();
+    builtin_fn("then", 2, move |args: Vec<JsValue>| {
+        let promise = match args.first() {
+            Some(JsValue::Promise(p)) => p.clone(),
+            _ => {
+                return Err(StatorError::TypeError(
+                    "Promise.prototype.then called on non-Promise".into(),
+                ));
+            }
+        };
+        let on_fulfilled = args.get(1).and_then(extract_handler);
+        let on_rejected = args.get(2).and_then(extract_handler);
+        let result_promise = promise_species_result(&promise)?;
+        Ok(JsValue::Promise(
+            crate::builtins::promise::promise_then_with_result(
+                &promise,
+                on_fulfilled,
+                on_rejected,
+                result_promise,
+                &q,
+            ),
+        ))
+    })
+}
+
+fn promise_catch_method(queue: &crate::builtins::promise::MicrotaskQueue) -> JsValue {
+    let q = queue.clone();
+    builtin_fn("catch", 1, move |args: Vec<JsValue>| {
+        let promise = match args.first() {
+            Some(JsValue::Promise(p)) => p.clone(),
+            _ => {
+                return Err(StatorError::TypeError(
+                    "Promise.prototype.catch called on non-Promise".into(),
+                ));
+            }
+        };
+        let handler = args
+            .get(1)
+            .and_then(extract_handler)
+            .unwrap_or_else(|| Box::new(Err));
+        let result_promise = promise_species_result(&promise)?;
+        Ok(JsValue::Promise(
+            crate::builtins::promise::promise_catch_with_result(
+                &promise,
+                handler,
+                result_promise,
+                &q,
+            ),
+        ))
+    })
+}
+
+fn promise_finally_method(queue: &crate::builtins::promise::MicrotaskQueue) -> JsValue {
+    let q = queue.clone();
+    builtin_fn("finally", 1, move |args: Vec<JsValue>| {
+        let promise = match args.first() {
+            Some(JsValue::Promise(p)) => p.clone(),
+            _ => {
+                return Err(StatorError::TypeError(
+                    "Promise.prototype.finally called on non-Promise".into(),
+                ));
+            }
+        };
+        let callback: Box<dyn Fn() -> Result<(), JsValue>> = match args.get(1) {
+            Some(JsValue::NativeFunction(f)) => {
+                let f = Rc::clone(f);
+                Box::new(move || match f(vec![]) {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(JsValue::String(e.to_string().into())),
+                })
+            }
+            Some(v @ JsValue::Function(_)) | Some(v @ JsValue::Proxy(_)) => {
+                let callee = v.clone();
+                Box::new(move || match dispatch_call_value(&callee, vec![]) {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(JsValue::String(e.to_string().into())),
+                })
+            }
+            Some(JsValue::PlainObject(map)) if map.borrow().contains_key("__call__") => {
+                let callee = JsValue::PlainObject(Rc::clone(map));
+                Box::new(move || match dispatch_call_value(&callee, vec![]) {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(JsValue::String(e.to_string().into())),
+                })
+            }
+            _ => Box::new(|| Ok(())),
+        };
+        let result_promise = promise_species_result(&promise)?;
+        Ok(JsValue::Promise(
+            crate::builtins::promise::promise_finally_with_result(
+                &promise,
+                callback,
+                result_promise,
+                &q,
+            ),
+        ))
+    })
+}
+
 fn initialize_error_plain_object(
     target: &Rc<RefCell<PropertyMap>>,
     kind: ErrorKind,
@@ -10220,8 +10379,8 @@ fn make_promise() -> JsValue {
     stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
         use crate::builtins::promise::{
             MicrotaskQueue, install_active_microtask_queue, promise_all, promise_all_settled,
-            promise_any, promise_catch, promise_finally, promise_new, promise_race, promise_reject,
-            promise_resolve, promise_then, promise_with_resolvers,
+            promise_any, promise_new, promise_race, promise_reject, promise_resolve,
+            promise_with_resolvers,
         };
 
         let mut props = PropertyMap::new();
@@ -10240,6 +10399,8 @@ fn make_promise() -> JsValue {
                 "__call__".into(),
                 native(move |args| {
                     let executor = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let derived_proto = current_derived_constructor_this()
+                        .and_then(|target| target.borrow().get("__proto__").cloned());
                     let p = promise_new(
                         |resolve_box, reject_box| {
                             let resolve_box = Rc::new(RefCell::new(Some(resolve_box)));
@@ -10275,6 +10436,7 @@ fn make_promise() -> JsValue {
                         },
                         &q,
                     );
+                    p.set_prototype(derived_proto);
                     Ok(JsValue::Promise(p))
                 }),
             );
@@ -10411,98 +10573,22 @@ fn make_promise() -> JsValue {
         // when called as `promise.then(...)`.
 
         // prototype.then(onFulfilled, onRejected)
-        {
-            let q = queue.clone();
-            props.insert(
-                "prototype_then".into(),
-                builtin_fn("then", 2, move |args: Vec<JsValue>| {
-                    let promise = match args.first() {
-                        Some(JsValue::Promise(p)) => p.clone(),
-                        _ => {
-                            return Err(StatorError::TypeError(
-                                "Promise.prototype.then called on non-Promise".into(),
-                            ));
-                        }
-                    };
-                    let on_fulfilled = args.get(1).and_then(|v| extract_handler(v));
-                    let on_rejected = args.get(2).and_then(|v| extract_handler(v));
-                    Ok(JsValue::Promise(promise_then(
-                        &promise,
-                        on_fulfilled,
-                        on_rejected,
-                        &q,
-                    )))
-                }),
-            );
-        }
-
-        // prototype.catch(onRejected)
-        {
-            let q = queue.clone();
-            props.insert(
-                "prototype_catch".into(),
-                builtin_fn("catch", 1, move |args: Vec<JsValue>| {
-                    let promise = match args.first() {
-                        Some(JsValue::Promise(p)) => p.clone(),
-                        _ => {
-                            return Err(StatorError::TypeError(
-                                "Promise.prototype.catch called on non-Promise".into(),
-                            ));
-                        }
-                    };
-                    let handler = args
-                        .get(1)
-                        .and_then(|v| extract_handler(v))
-                        .unwrap_or_else(|| Box::new(Err));
-                    Ok(JsValue::Promise(promise_catch(&promise, handler, &q)))
-                }),
-            );
-        }
-
-        // prototype.finally(onFinally)
-        {
-            let q = queue.clone();
-            props.insert(
-                "prototype_finally".into(),
-                builtin_fn("finally", 1, move |args: Vec<JsValue>| {
-                    let promise = match args.first() {
-                        Some(JsValue::Promise(p)) => p.clone(),
-                        _ => {
-                            return Err(StatorError::TypeError(
-                                "Promise.prototype.finally called on non-Promise".into(),
-                            ));
-                        }
-                    };
-                    let callback: Box<dyn Fn() -> Result<(), JsValue>> = match args.get(1) {
-                        Some(JsValue::NativeFunction(f)) => {
-                            let f = Rc::clone(f);
-                            Box::new(move || match f(vec![]) {
-                                Ok(_) => Ok(()),
-                                Err(e) => Err(JsValue::String(e.to_string().into())),
-                            })
-                        }
-                        Some(v @ JsValue::Function(_)) | Some(v @ JsValue::Proxy(_)) => {
-                            let callee = v.clone();
-                            Box::new(move || match dispatch_call_value(&callee, vec![]) {
-                                Ok(_) => Ok(()),
-                                Err(e) => Err(JsValue::String(e.to_string().into())),
-                            })
-                        }
-                        Some(JsValue::PlainObject(map))
-                            if map.borrow().contains_key("__call__") =>
-                        {
-                            let callee = JsValue::PlainObject(Rc::clone(map));
-                            Box::new(move || match dispatch_call_value(&callee, vec![]) {
-                                Ok(_) => Ok(()),
-                                Err(e) => Err(JsValue::String(e.to_string().into())),
-                            })
-                        }
-                        _ => Box::new(|| Ok(())),
-                    };
-                    Ok(JsValue::Promise(promise_finally(&promise, callback, &q)))
-                }),
-            );
-        }
+        let prototype_then = promise_then_method(&queue);
+        let prototype_catch = promise_catch_method(&queue);
+        let prototype_finally = promise_finally_method(&queue);
+        let mut prototype = PropertyMap::new();
+        prototype.insert("then".into(), prototype_then.clone());
+        prototype.insert("catch".into(), prototype_catch.clone());
+        prototype.insert("finally".into(), prototype_finally.clone());
+        prototype.make_all_non_enumerable();
+        let prototype_rc = Rc::new(RefCell::new(prototype));
+        props.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::clone(&prototype_rc)),
+        );
+        props.insert("prototype_then".into(), prototype_then);
+        props.insert("prototype_catch".into(), prototype_catch);
+        props.insert("prototype_finally".into(), prototype_finally);
 
         // §27.2.4.7 get Promise[@@species] — returns `this`.
         props.insert(
@@ -29538,6 +29624,368 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Promise edge-case regression tests ───────────────────────────────
+
+    #[test]
+    fn e2e_promise_with_resolvers_exists() {
+        assert_eval_true("typeof Promise.withResolvers === 'function'");
+    }
+
+    #[test]
+    fn e2e_promise_prototype_exists() {
+        assert_eval_true("typeof Promise.prototype.then === 'function'");
+    }
+
+    #[test]
+    fn e2e_promise_resolved_prototype_is_promise_prototype() {
+        assert_eval_true("Object.getPrototypeOf(Promise.resolve(1)) === Promise.prototype");
+    }
+
+    #[test]
+    fn e2e_promise_with_resolvers_promise_has_default_prototype() {
+        assert_eval_true(
+            "Object.getPrototypeOf(Promise.withResolvers().promise) === Promise.prototype",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_with_resolvers_resolve_fulfills_chain() {
+        assert_eval_true(
+            "var out = 0; var wr = Promise.withResolvers(); \
+             wr.promise.then(function(v) { out = v; }); \
+             wr.resolve(7); \
+             out === 7",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_with_resolvers_reject_rejects_chain() {
+        assert_eval_true(
+            "var out = ''; var wr = Promise.withResolvers(); \
+             wr.promise.catch(function(r) { out = r; }); \
+             wr.reject('boom'); \
+             out === 'boom'",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_with_resolvers_first_call_wins() {
+        assert_eval_true(
+            "var out = ''; var wr = Promise.withResolvers(); \
+             wr.promise.then(function(v) { out = 'ok:' + v; }, function(r) { out = 'err:' + r; }); \
+             wr.resolve(1); \
+             wr.reject('late'); \
+             wr.resolve(2); \
+             out === 'ok:1'",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_with_resolvers_resolve_assimilates_thenable() {
+        assert_eval_true(
+            "var out = 0; var wr = Promise.withResolvers(); \
+             wr.promise.then(function(v) { out = v; }); \
+             wr.resolve({ then: function(resolve) { resolve(11); } }); \
+             out === 11",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_with_resolvers_functions_are_distinct() {
+        assert_eval_true(
+            "var wr = Promise.withResolvers(); \
+             typeof wr.resolve === 'function' && typeof wr.reject === 'function' && wr.resolve !== wr.reject",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_any_empty_errors_array() {
+        assert_eval_true(
+            "var len = -1; Promise.any([]).catch(function(e) { len = e.errors.length; }); len === 0",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_any_all_rejected_errors_order() {
+        assert_eval_true(
+            "var out = ''; \
+             Promise.any([Promise.reject('a'), Promise.reject('b'), Promise.reject('c')])\
+               .catch(function(e) { out = e.errors.join(','); }); \
+             out === 'a,b,c'",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_any_all_rejected_retains_values() {
+        assert_eval_true(
+            "var out = ''; \
+             Promise.any([Promise.reject(1), Promise.reject(false), Promise.reject('x')])\
+               .catch(function(e) { out = String(e.errors[0]) + '|' + String(e.errors[1]) + '|' + e.errors[2]; }); \
+             out === '1|false|x'",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_any_non_promise_value_fulfills() {
+        assert_eval_true(
+            "var out = 0; Promise.any([Promise.reject('no'), 9]).then(function(v) { out = v; }); out === 9",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_any_first_fulfillment_wins_over_later_rejections() {
+        assert_eval_true(
+            "var out = ''; \
+             Promise.any([Promise.reject('a'), Promise.resolve('win'), Promise.reject('b')])\
+               .then(function(v) { out = v; }, function() { out = 'lose'; }); \
+             out === 'win'",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_all_settled_mixed_result_shape() {
+        assert_eval_true(
+            "var ok = false; \
+             Promise.allSettled([Promise.resolve(1), Promise.reject('x')]).then(function(results) { \
+               ok = results[0].status === 'fulfilled' && results[0].value === 1 && !('reason' in results[0]) && \
+                    results[1].status === 'rejected' && results[1].reason === 'x' && !('value' in results[1]); \
+             }); \
+             ok",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_all_settled_fulfilled_result_has_no_reason() {
+        assert_eval_true(
+            "var ok = false; \
+             Promise.allSettled([Promise.resolve(2)]).then(function(results) { ok = !('reason' in results[0]); }); \
+             ok",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_all_settled_rejected_result_has_no_value() {
+        assert_eval_true(
+            "var ok = false; \
+             Promise.allSettled([Promise.reject('no')]).then(function(results) { ok = !('value' in results[0]); }); \
+             ok",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_all_settled_wraps_non_promises() {
+        assert_eval_true(
+            "var ok = false; \
+             Promise.allSettled([1, Promise.reject('x'), true]).then(function(results) { \
+               ok = results[0].value === 1 && results[1].reason === 'x' && results[2].value === true; \
+             }); \
+             ok",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_all_settled_empty_resolves_array() {
+        assert_eval_true(
+            "var len = -1; Promise.allSettled([]).then(function(results) { len = results.length; }); len === 0",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_race_empty_remains_pending() {
+        assert_eval_true(
+            "var settled = false; \
+             Promise.race([]).then(function() { settled = true; }, function() { settled = true; }); \
+             settled === false",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_race_first_rejection_wins() {
+        assert_eval_true(
+            "var out = ''; \
+             Promise.race([Promise.reject('boom'), Promise.resolve(1)]).catch(function(r) { out = r; }); \
+             out === 'boom'",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_race_plain_value_wins() {
+        assert_eval_true(
+            "var out = 0; Promise.race([5, Promise.resolve(9)]).then(function(v) { out = v; }); out === 5",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_race_deferred_first_settlement_wins() {
+        assert_eval_true(
+            "var out = ''; \
+             var a = Promise.withResolvers(); \
+             var b = Promise.withResolvers(); \
+             Promise.race([a.promise, b.promise]).then(function(v) { out = v; }, function(r) { out = r; }); \
+             b.resolve('second'); \
+             a.resolve('first'); \
+             out === 'second'",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_all_empty_resolves_array_value() {
+        assert_eval_true(
+            "var ok = false; Promise.all([]).then(function(results) { ok = Array.isArray(results) && results.length === 0; }); ok",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_all_wraps_non_promises_exact_values() {
+        assert_eval_true(
+            "var out = ''; \
+             Promise.all([1, 'two', false]).then(function(results) { out = results.join('|'); }); \
+             out === '1|two|false'",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_all_assimilates_thenable_values() {
+        assert_eval_true(
+            "var out = 0; \
+             Promise.all([{ then: function(resolve) { resolve(4); } }, Promise.resolve(5)])\
+               .then(function(results) { out = results[0] + results[1]; }); \
+             out === 9",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_all_rejects_on_first_rejection_even_with_plain_values() {
+        assert_eval_true(
+            "var out = ''; \
+             Promise.all([1, Promise.reject('bad'), 3]).catch(function(reason) { out = reason; }); \
+             out === 'bad'",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_resolve_thenable_fulfills_value() {
+        assert_eval_true(
+            "var out = 0; Promise.resolve({ then: function(resolve) { resolve(12); } }).then(function(v) { out = v; }); out === 12",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_resolve_thenable_rejects_reason() {
+        assert_eval_true(
+            "var out = ''; Promise.resolve({ then: function(resolve, reject) { reject('no'); } }).catch(function(r) { out = r; }); out === 'no'",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_resolve_thenable_getter_throw_rejects() {
+        assert_eval_true(
+            "var out = ''; \
+             var obj = {}; \
+             Object.defineProperty(obj, 'then', { get: function() { throw 'getter'; } }); \
+             Promise.resolve(obj).catch(function(r) { out = r; }); \
+             out === 'getter'",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_resolve_plain_object_passthrough() {
+        assert_eval_true(
+            "var obj = { x: 3 }; var out = 0; Promise.resolve(obj).then(function(v) { out = v.x; }); out === 3",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_reject_keeps_promise_reason() {
+        assert_eval_true(
+            "var inner = Promise.resolve(1); var same = false; \
+             Promise.reject(inner).catch(function(reason) { same = reason === inner; }); \
+             same",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_subclass_instance_uses_subclass_prototype() {
+        assert_eval_true(
+            "class SubPromise extends Promise {} \
+             var p = new SubPromise(function(resolve) { resolve(1); }); \
+             p instanceof SubPromise && Object.getPrototypeOf(p) === SubPromise.prototype",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_then_respects_default_species_subclass() {
+        assert_eval_true(
+            "class SubPromise extends Promise {} \
+             var p = new SubPromise(function(resolve) { resolve(1); }); \
+             var chained = p.then(function(v) { return v + 1; }); \
+             chained instanceof SubPromise && Object.getPrototypeOf(chained) === SubPromise.prototype",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_catch_respects_default_species_subclass() {
+        assert_eval_true(
+            "class SubPromise extends Promise {} \
+             var p = new SubPromise(function(resolve, reject) { reject('x'); }); \
+             var chained = p.catch(function(reason) { return reason; }); \
+             chained instanceof SubPromise && Object.getPrototypeOf(chained) === SubPromise.prototype",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_finally_respects_default_species_subclass() {
+        assert_eval_true(
+            "class SubPromise extends Promise {} \
+             var p = new SubPromise(function(resolve) { resolve(1); }); \
+             var chained = p.finally(function() {}); \
+             chained instanceof SubPromise && Object.getPrototypeOf(chained) === SubPromise.prototype",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_then_respects_species_override_to_promise() {
+        assert_eval_true(
+            "class SubPromise extends Promise { static get [Symbol.species]() { return Promise; } } \
+             var p = new SubPromise(function(resolve) { resolve(1); }); \
+             var chained = p.then(function(v) { return v; }); \
+             Object.getPrototypeOf(chained) === Promise.prototype && Object.getPrototypeOf(chained) !== SubPromise.prototype",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_catch_respects_species_override_to_other_subclass() {
+        assert_eval_true(
+            "class OtherPromise extends Promise {} \
+             class SubPromise extends Promise { static get [Symbol.species]() { return OtherPromise; } } \
+             var p = new SubPromise(function(resolve, reject) { reject('x'); }); \
+             var chained = p.catch(function(reason) { return reason; }); \
+             chained instanceof OtherPromise && Object.getPrototypeOf(chained) === OtherPromise.prototype",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_finally_respects_null_species_fallback() {
+        assert_eval_true(
+            "class SubPromise extends Promise { static get [Symbol.species]() { return null; } } \
+             var p = new SubPromise(function(resolve) { resolve(1); }); \
+             var chained = p.finally(function() {}); \
+             Object.getPrototypeOf(chained) === Promise.prototype",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_subclass_chain_result_still_settles() {
+        assert_eval_true(
+            "class SubPromise extends Promise {} \
+             var out = 0; \
+             new SubPromise(function(resolve) { resolve(2); })\
+               .then(function(v) { return v * 5; })\
+               .then(function(v) { out = v; }); \
+             out === 10",
+        );
     }
     // ── Missing builtins: Object.getOwnPropertyDescriptor extended ──────
 

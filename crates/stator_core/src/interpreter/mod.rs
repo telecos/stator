@@ -410,6 +410,15 @@ pub fn dispatch_set_property_value(
 pub(crate) fn get_object_prototype(obj: &JsValue) -> Option<JsValue> {
     match obj {
         JsValue::PlainObject(map) => map.borrow().get(INTERNAL_PROTO_PROPERTY_KEY).cloned(),
+        JsValue::Promise(promise) => promise.prototype().or_else(|| {
+            let ctor = lookup_global_constructor("Promise");
+            let proto = proto_lookup(&ctor, "prototype");
+            if matches!(proto, JsValue::Undefined) {
+                None
+            } else {
+                Some(proto)
+            }
+        }),
         JsValue::Error(e) => e
             .props
             .borrow()
@@ -5270,37 +5279,11 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             _ => JsValue::Undefined,
         };
     }
-    // Handle JsValue::Promise — expose then/catch/finally.
-    if let JsValue::Promise(promise) = obj {
-        return match key {
-            "then" | "catch" | "finally" => {
-                let promise = JsValue::Promise(promise.clone());
-                let key_name = key.to_string();
-                let method_key = format!("prototype_{key}");
-                JsValue::NativeFunction(Rc::new(move |args| {
-                    let globals = current_global_env().ok_or_else(|| {
-                        StatorError::TypeError("Promise globals are not available".into())
-                    })?;
-                    let promise_ctor = globals.borrow().get("Promise").cloned();
-                    let method = match promise_ctor {
-                        Some(JsValue::PlainObject(map)) => map.borrow().get(&method_key).cloned(),
-                        _ => None,
-                    }
-                    .ok_or_else(|| {
-                        StatorError::TypeError(format!(
-                            "Promise.prototype.{} is not available",
-                            key_name
-                        ))
-                    })?;
-
-                    let mut call_args = Vec::with_capacity(args.len() + 1);
-                    call_args.push(promise.clone());
-                    call_args.extend(args);
-                    dispatch_call_value(&method, call_args)
-                }))
-            }
-            _ => JsValue::Undefined,
-        };
+    if let JsValue::Promise(_) = obj {
+        if let Some(proto) = get_object_prototype(obj) {
+            return proto_lookup_chain(&proto, key, obj);
+        }
+        return JsValue::Undefined;
     }
     // Handle JsValue::Function — look up ad-hoc properties stored in the
     // thread-local side table (e.g. `assert.sameValue`).
@@ -6023,6 +6006,11 @@ pub(super) fn wire_construct_prototype(result: JsValue, ctor_proto: &JsValue) ->
                 let mut props = e.props.borrow_mut();
                 if !props.contains_key(INTERNAL_PROTO_PROPERTY_KEY) {
                     props.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), ctor_proto.clone());
+                }
+            }
+            JsValue::Promise(promise) => {
+                if promise.prototype().is_none() {
+                    promise.set_prototype(Some(ctor_proto.clone()));
                 }
             }
             _ => {}

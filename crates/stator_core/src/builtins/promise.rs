@@ -189,6 +189,8 @@ struct PromiseInner {
     /// Whether at least one rejection handler has been attached.
     /// Used by [`UnhandledRejectionTracker`] to detect unhandled rejections.
     is_handled: bool,
+    /// Optional explicit prototype used for subclassed promises.
+    prototype: Option<JsValue>,
 }
 
 // ── JsPromise ──────────────────────────────────────────────────────────────────
@@ -254,6 +256,7 @@ impl JsPromise {
                 reject_reactions: Vec::new(),
             },
             is_handled: false,
+            prototype: None,
         })))
     }
 
@@ -284,6 +287,14 @@ impl JsPromise {
     /// Returns `true` if at least one rejection handler has been attached.
     pub fn is_handled(&self) -> bool {
         self.0.borrow().is_handled
+    }
+
+    pub(crate) fn prototype(&self) -> Option<JsValue> {
+        self.0.borrow().prototype.clone()
+    }
+
+    pub(crate) fn set_prototype(&self, prototype: Option<JsValue>) {
+        self.0.borrow_mut().prototype = prototype;
     }
 
     /// Returns the fulfillment value, or `None` if not yet fulfilled.
@@ -569,6 +580,10 @@ pub fn promise_reject(reason: JsValue, queue: &MicrotaskQueue) -> JsPromise {
     promise_new(|_resolve, reject| reject(reason), queue)
 }
 
+pub(crate) fn promise_pending() -> JsPromise {
+    JsPromise::new_pending()
+}
+
 // ── Prototype: then / catch / finally ─────────────────────────────────────────
 
 /// ECMAScript §27.2.5.4 `Promise.prototype.then(onFulfilled, onRejected)`.
@@ -603,8 +618,22 @@ pub fn promise_then(
     on_rejected: Option<PromiseHandler>,
     queue: &MicrotaskQueue,
 ) -> JsPromise {
-    let p2 = JsPromise::new_pending();
+    promise_then_with_result(
+        promise,
+        on_fulfilled,
+        on_rejected,
+        JsPromise::new_pending(),
+        queue,
+    )
+}
 
+pub(crate) fn promise_then_with_result(
+    promise: &JsPromise,
+    on_fulfilled: Option<PromiseHandler>,
+    on_rejected: Option<PromiseHandler>,
+    p2: JsPromise,
+    queue: &MicrotaskQueue,
+) -> JsPromise {
     let p2a = p2.clone();
     let qa = queue.clone();
     let fulfill_reaction: Box<dyn FnOnce(JsValue)> = Box::new(move |v| {
@@ -660,7 +689,16 @@ pub fn promise_catch(
     on_rejected: PromiseHandler,
     queue: &MicrotaskQueue,
 ) -> JsPromise {
-    promise_then(promise, None, Some(on_rejected), queue)
+    promise_catch_with_result(promise, on_rejected, JsPromise::new_pending(), queue)
+}
+
+pub(crate) fn promise_catch_with_result(
+    promise: &JsPromise,
+    on_rejected: PromiseHandler,
+    result_promise: JsPromise,
+    queue: &MicrotaskQueue,
+) -> JsPromise {
+    promise_then_with_result(promise, None, Some(on_rejected), result_promise, queue)
 }
 
 /// ECMAScript §27.2.5.3 `Promise.prototype.finally(onFinally)`.
@@ -691,6 +729,15 @@ pub fn promise_finally(
     on_finally: Box<dyn Fn() -> Result<(), JsValue>>,
     queue: &MicrotaskQueue,
 ) -> JsPromise {
+    promise_finally_with_result(promise, on_finally, JsPromise::new_pending(), queue)
+}
+
+pub(crate) fn promise_finally_with_result(
+    promise: &JsPromise,
+    on_finally: Box<dyn Fn() -> Result<(), JsValue>>,
+    result_promise: JsPromise,
+    queue: &MicrotaskQueue,
+) -> JsPromise {
     let on_finally = Rc::new(on_finally);
     let on_finally_f = Rc::clone(&on_finally);
     let on_fulfilled = Some(Box::new(move |v: JsValue| match on_finally_f() {
@@ -704,7 +751,7 @@ pub fn promise_finally(
         Err(e) => Err(e),
     }) as PromiseHandler);
 
-    promise_then(promise, on_fulfilled, on_rejected, queue)
+    promise_then_with_result(promise, on_fulfilled, on_rejected, result_promise, queue)
 }
 
 // ── Static: Promise.all ───────────────────────────────────────────────────────
