@@ -111,6 +111,12 @@ impl GeneratorStatus {
 pub struct GeneratorState {
     /// Bytecode for the generator function body.
     pub bytecode_array: BytecodeArray,
+    /// Prototype for the generator object returned by the call.
+    ///
+    /// This is usually the callee's own `.prototype` object, falling back to
+    /// the intrinsic `%GeneratorPrototype%` when no per-function prototype is
+    /// available.
+    pub prototype: Option<JsValue>,
     /// Saved register file at the point of suspension (empty before the
     /// first [`crate::bytecode::bytecodes::Opcode::SuspendGenerator`]).
     pub registers: Vec<JsValue>,
@@ -129,6 +135,7 @@ impl GeneratorState {
     pub fn new(bytecode_array: BytecodeArray) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
             bytecode_array,
+            prototype: None,
             registers: Vec::new(),
             resume_pc: 0,
             status: GeneratorStatus::SuspendedAtStart,
@@ -995,7 +1002,14 @@ impl JsValue {
             Self::Symbol(_) => "[object Symbol]".to_string(),
             Self::BigInt(_) => "[object BigInt]".to_string(),
             Self::Array(_) => "[object Array]".to_string(),
-            Self::Function(_) | Self::NativeFunction(_) => "[object Function]".to_string(),
+            Self::Function(ba) => {
+                if ba.is_generator() {
+                    "[object GeneratorFunction]".to_string()
+                } else {
+                    "[object Function]".to_string()
+                }
+            }
+            Self::NativeFunction(_) => "[object Function]".to_string(),
             Self::Error(_) => "[object Error]".to_string(),
             Self::Generator(_) => "[object Generator]".to_string(),
             Self::Iterator(_) => "[object Iterator]".to_string(),
@@ -1271,6 +1285,9 @@ impl Trace for JsValue {
                 }
             }
             Self::Generator(state) => {
+                if let Some(proto) = &state.borrow().prototype {
+                    proto.trace(tracer);
+                }
                 for reg in &state.borrow().registers {
                     reg.trace(tracer);
                 }
