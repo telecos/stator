@@ -880,6 +880,11 @@ impl FunctionCompiler {
             .unwrap_or_else(|| self.resolve_private_storage_key(name))
     }
 
+    fn resolve_private_kind_key(&self, name: &str) -> String {
+        self.resolve_private_storage_key(name)
+            .replacen(".private.", ".private.kind.", 1)
+    }
+
     fn build_class_private_names(
         &mut self,
         body: &crate::parser::ast::ClassBody,
@@ -2170,6 +2175,29 @@ impl FunctionCompiler {
             MethodKind::Constructor => {} // handled in compile_class
         }
 
+        if let PropKey::Private(id) = &method.key {
+            let kind_name = match method.kind {
+                MethodKind::Method => "method",
+                MethodKind::Get | MethodKind::Set => "accessor",
+                MethodKind::Constructor => unreachable!("constructors are not private methods"),
+            };
+            let kind_idx = self.add_string(kind_name);
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaConstant,
+                vec![Operand::ConstantPoolIdx(kind_idx)],
+            ));
+            let kind_key_idx = self.add_string(&self.resolve_private_kind_key(&id.name));
+            let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+            self.emit(Instruction::new_unchecked(
+                Opcode::DefineNamedOwnProperty,
+                vec![
+                    to_reg_op(target_reg),
+                    Operand::ConstantPoolIdx(kind_key_idx),
+                    slot,
+                ],
+            ));
+        }
+
         Ok(())
     }
 
@@ -2256,6 +2284,21 @@ impl FunctionCompiler {
                         to_reg_op(class_reg),
                         Operand::ConstantPoolIdx(name_idx),
                         slot,
+                    ],
+                ));
+                let kind_idx = self.add_string("field");
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaConstant,
+                    vec![Operand::ConstantPoolIdx(kind_idx)],
+                ));
+                let kind_key_idx = self.add_string(&self.resolve_private_kind_key(&id.name));
+                let kind_slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::DefineNamedOwnProperty,
+                    vec![
+                        to_reg_op(class_reg),
+                        Operand::ConstantPoolIdx(kind_key_idx),
+                        kind_slot,
                     ],
                 ));
             }
@@ -2569,6 +2612,21 @@ impl FunctionCompiler {
                             to_reg_op(this_reg),
                             Operand::ConstantPoolIdx(name_idx),
                             slot,
+                        ],
+                    ));
+                    let kind_idx = ic.add_string("field");
+                    ic.emit(Instruction::new_unchecked(
+                        Opcode::LdaConstant,
+                        vec![Operand::ConstantPoolIdx(kind_idx)],
+                    ));
+                    let kind_key_idx = ic.add_string(&ic.resolve_private_kind_key(&id.name));
+                    let kind_slot = ic.alloc_slot(FeedbackSlotKind::StoreProperty);
+                    ic.emit(Instruction::new_unchecked(
+                        Opcode::DefineNamedOwnProperty,
+                        vec![
+                            to_reg_op(this_reg),
+                            Operand::ConstantPoolIdx(kind_key_idx),
+                            kind_slot,
                         ],
                     ));
                 }
