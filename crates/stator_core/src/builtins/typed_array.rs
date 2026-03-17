@@ -99,6 +99,8 @@ impl TypedArrayKind {
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct JsArrayBuffer {
+    /// Whether this buffer represents a `SharedArrayBuffer`.
+    pub shared: bool,
     /// Raw byte storage.
     pub data: Vec<u8>,
 }
@@ -117,6 +119,17 @@ pub struct JsArrayBuffer {
 /// ```
 pub fn arraybuffer_new(byte_length: usize) -> JsArrayBuffer {
     JsArrayBuffer {
+        shared: false,
+        data: vec![0u8; byte_length],
+    }
+}
+
+/// ECMAScript §25.2.3.1 `new SharedArrayBuffer(byteLength)`.
+///
+/// Creates a new zero-filled shared buffer with the given byte length.
+pub fn shared_arraybuffer_new(byte_length: usize) -> JsArrayBuffer {
+    JsArrayBuffer {
+        shared: true,
         data: vec![0u8; byte_length],
     }
 }
@@ -159,6 +172,7 @@ pub fn arraybuffer_slice(buf: &JsArrayBuffer, begin: i64, end: i64) -> JsArrayBu
     let fin = clamp_index(end, len) as usize;
     let fin = cmp::max(start, fin);
     JsArrayBuffer {
+        shared: buf.shared,
         data: buf.data[start..fin].to_vec(),
     }
 }
