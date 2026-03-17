@@ -59611,4 +59611,408 @@ mod tests {
     fn e2e_w21f_typed_array_length() {
         assert_e2e_true("var ta = new Int32Array(5); ta.length === 5");
     }
+
+    // ---------------------------------------------------------------
+    // Tail-position forms and control-flow completion-value tests
+    // ---------------------------------------------------------------
+
+    /// Ternary: true branch is tail position.
+    #[test]
+    fn e2e_w22h_ternary_true_branch_tail() {
+        let result = global_eval("function f() { return true ? 42 : 99; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Ternary: false branch is tail position.
+    #[test]
+    fn e2e_w22h_ternary_false_branch_tail() {
+        let result = global_eval("function f() { return false ? 42 : 99; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    /// Ternary with function calls in both branches.
+    #[test]
+    fn e2e_w22h_ternary_call_both_branches() {
+        let result = global_eval(
+            "function a() { return 10; } function b() { return 20; } \
+             function f(c) { return c ? a() : b(); } f(true) + f(false)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    /// Logical AND: right side is tail position when left is truthy.
+    #[test]
+    fn e2e_w22h_logical_and_tail_truthy() {
+        let result = global_eval("function f() { return 1 && 42; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Logical AND: short-circuits on falsy left.
+    #[test]
+    fn e2e_w22h_logical_and_tail_falsy() {
+        let result = global_eval("function f() { return 0 && 42; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// Logical OR: right side is tail position when left is falsy.
+    #[test]
+    fn e2e_w22h_logical_or_tail_falsy() {
+        let result = global_eval("function f() { return 0 || 42; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Logical OR: short-circuits on truthy left.
+    #[test]
+    fn e2e_w22h_logical_or_tail_truthy() {
+        let result = global_eval("function f() { return 1 || 42; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// Nullish coalescing: right side when left is null.
+    #[test]
+    fn e2e_w22h_nullish_coalesce_null() {
+        let result = global_eval("function f() { return null ?? 42; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Nullish coalescing: right side when left is undefined.
+    #[test]
+    fn e2e_w22h_nullish_coalesce_undefined() {
+        let result = global_eval("function f() { return undefined ?? 42; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Nullish coalescing: left side when non-nullish (0 is non-nullish).
+    #[test]
+    fn e2e_w22h_nullish_coalesce_zero() {
+        let result = global_eval("function f() { return 0 ?? 42; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// Comma: last expression is tail position.
+    #[test]
+    fn e2e_w22h_comma_tail_position() {
+        let result = global_eval("function f() { return (1, 2, 42); } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Comma with side effects: all expressions evaluated, last returned.
+    #[test]
+    fn e2e_w22h_comma_side_effects() {
+        let result = global_eval(
+            "var x = 0; function f() { return (x = 10, x = x + 5, x); } \
+             var r = f(); r === 15 && x === 15",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Direct eval in tail position.
+    #[test]
+    fn e2e_w22h_eval_tail_position() {
+        let result = global_eval(r#"function f() { return eval("42"); } f()"#).unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Direct eval calling a function in tail position.
+    #[test]
+    fn e2e_w22h_eval_call_tail_position() {
+        let result =
+            global_eval(r#"function g() { return 99; } function f() { return eval("g()"); } f()"#)
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    /// try/catch: completion value is from try block when no error.
+    #[test]
+    fn e2e_w22h_try_catch_completion_no_error() {
+        let result = global_eval("try { 1 } catch(e) { 2 }").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// try/catch: completion value is from catch block when error thrown.
+    #[test]
+    fn e2e_w22h_try_catch_completion_with_error() {
+        let result = global_eval("try { throw 'err'; } catch(e) { 2 }").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// try/finally: finally does NOT override the completion value.
+    #[test]
+    fn e2e_w22h_try_finally_completion_value() {
+        let result = global_eval("try { 1 } finally { 3 }").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// try/catch/finally: finally does NOT override completion value.
+    #[test]
+    fn e2e_w22h_try_catch_finally_completion() {
+        let result = global_eval("try { 1 } catch(e) { 2 } finally { 3 }").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// try/catch/finally with thrown error: catch value is kept, finally doesn't override.
+    #[test]
+    fn e2e_w22h_try_catch_finally_thrown() {
+        let result = global_eval("try { throw 'err'; } catch(e) { 2 } finally { 3 }").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// finally side effects run but don't change the completion value.
+    #[test]
+    fn e2e_w22h_finally_side_effects() {
+        let result = global_eval(
+            "var x = 0; var r = (function() { try { return 1; } finally { x = 99; } })(); \
+             r === 1 && x === 99",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Nested try/finally: inner finally runs before outer.
+    #[test]
+    fn e2e_w22h_nested_try_finally_order() {
+        let result = global_eval(
+            r#"var log = "";
+            try {
+                try { log += "a"; } finally { log += "b"; }
+                log += "c";
+            } finally { log += "d"; }
+            log"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("abcd".to_string()));
+    }
+
+    /// Nested try/finally with throw: inner finally runs before outer catch.
+    #[test]
+    fn e2e_w22h_nested_try_finally_throw() {
+        let result = global_eval(
+            r#"var log = "";
+            try {
+                try { throw "err"; } finally { log += "inner"; }
+            } catch(e) { log += "catch"; } finally { log += "outer"; }
+            log"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("innercatchouter".to_string()));
+    }
+
+    /// Labeled block with break propagates completion value.
+    #[test]
+    fn e2e_w22h_labeled_break_completion() {
+        let result = global_eval("var x = 0; lbl: { x = 1; break lbl; x = 2; } x").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// Labeled nested blocks: break exits only the named block.
+    #[test]
+    fn e2e_w22h_labeled_nested_break() {
+        let result = global_eval(
+            r#"var log = "";
+            outer: { log += "a"; inner: { log += "b"; break outer; log += "c"; } log += "d"; }
+            log"#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("ab".to_string()));
+    }
+
+    /// Switch: basic completion value from matching case.
+    #[test]
+    fn e2e_w22h_switch_completion_basic() {
+        let result =
+            global_eval("var r = 0; switch(2) { case 1: r = 1; break; case 2: r = 2; break; } r")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// Switch: fall-through accumulates side effects.
+    #[test]
+    fn e2e_w22h_switch_fall_through() {
+        let result = global_eval(
+            "var r = 0; switch(1) { case 1: r = r + 1; case 2: r = r + 10; break; case 3: r = r + 100; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(11));
+    }
+
+    /// Switch: default clause as fallback.
+    #[test]
+    fn e2e_w22h_switch_default_fallback() {
+        let result = global_eval(
+            "var r = 0; switch(99) { case 1: r = 1; break; default: r = 42; break; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Switch: default falls through to next case.
+    #[test]
+    fn e2e_w22h_switch_default_fall_through() {
+        let result = global_eval(
+            "var r = 0; switch(99) { default: r = r + 1; case 1: r = r + 10; break; case 2: r = 100; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(11));
+    }
+
+    /// Switch: no matching case and no default yields no side effects.
+    #[test]
+    fn e2e_w22h_switch_no_match() {
+        let result =
+            global_eval("var r = 0; switch(99) { case 1: r = 1; case 2: r = 2; } r").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// do-while: completion value is the body result.
+    #[test]
+    fn e2e_w22h_do_while_completion() {
+        let result = global_eval("var r = 0; do { r = 42; } while (false); r").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// do-while: multiple iterations accumulate.
+    #[test]
+    fn e2e_w22h_do_while_multiple_iterations() {
+        let result =
+            global_eval("var r = 0; var i = 0; do { r = r + 1; i = i + 1; } while (i < 5); r")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// if/else: true branch completion value.
+    #[test]
+    fn e2e_w22h_if_else_true_branch() {
+        let result =
+            global_eval("function f() { if (true) { return 1; } else { return 2; } } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// if/else: false branch completion value.
+    #[test]
+    fn e2e_w22h_if_else_false_branch() {
+        let result =
+            global_eval("function f() { if (false) { return 1; } else { return 2; } } f()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// if without else: completion is body when true.
+    #[test]
+    fn e2e_w22h_if_no_else_true() {
+        let result = global_eval("if (true) { 1 }").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// if without else: completion is undefined when false.
+    #[test]
+    fn e2e_w22h_if_no_else_false() {
+        let result = global_eval("if (false) { 1 }").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// Empty statement: completion is undefined.
+    #[test]
+    fn e2e_w22h_empty_statement_completion() {
+        let result = global_eval("if (true) ;").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// Empty block: completion is undefined.
+    #[test]
+    fn e2e_w22h_empty_block_completion() {
+        let result = global_eval("{}").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    /// for loop: completion value is last expression evaluated in body.
+    #[test]
+    fn e2e_w22h_for_loop_completion() {
+        let result =
+            global_eval("var r = 0; for (var i = 0; i < 5; i++) { r = r + 1; } r").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// for loop with break: completion value reflects early exit.
+    #[test]
+    fn e2e_w22h_for_loop_break() {
+        let result =
+            global_eval("var r = 0; for (var i = 0; i < 10; i++) { if (i === 3) break; r = i; } r")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// for loop: zero iterations means no body evaluation.
+    #[test]
+    fn e2e_w22h_for_loop_zero_iterations() {
+        let result = global_eval("var r = 99; for (var i = 0; i < 0; i++) { r = 0; } r").unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    /// Chained ternaries in tail position.
+    #[test]
+    fn e2e_w22h_chained_ternary_tail() {
+        let result = global_eval(
+            "function f(x) { return x === 1 ? 'a' : x === 2 ? 'b' : 'c'; } \
+             f(1) + f(2) + f(3)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("abc".to_string()));
+    }
+
+    /// Logical AND with function call on right side in tail position.
+    #[test]
+    fn e2e_w22h_logical_and_call_tail() {
+        let result =
+            global_eval("function g() { return 77; } function f() { return true && g(); } f()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(77));
+    }
+
+    /// Logical OR with function call on right side in tail position.
+    #[test]
+    fn e2e_w22h_logical_or_call_tail() {
+        let result =
+            global_eval("function g() { return 88; } function f() { return false || g(); } f()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(88));
+    }
+
+    /// Nullish coalescing with function call on right side in tail position.
+    #[test]
+    fn e2e_w22h_nullish_coalesce_call_tail() {
+        let result =
+            global_eval("function g() { return 66; } function f() { return null ?? g(); } f()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(66));
+    }
+
+    /// Comma with function call as last expression in tail position.
+    #[test]
+    fn e2e_w22h_comma_call_tail() {
+        let result =
+            global_eval("function g() { return 55; } function f() { return (1, 2, g()); } f()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(55));
+    }
+
+    /// while loop: completion value after iterations.
+    #[test]
+    fn e2e_w22h_while_loop_completion() {
+        let result =
+            global_eval("var r = 0; var i = 0; while (i < 4) { r = r + 1; i = i + 1; } r").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    /// Nested if/else completion values.
+    #[test]
+    fn e2e_w22h_nested_if_else_completion() {
+        let result = global_eval(
+            "function f(a, b) { if (a) { if (b) { return 1; } else { return 2; } } else { return 3; } } \
+             f(true, true) * 100 + f(true, false) * 10 + f(false, false)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(123));
+    }
 }
