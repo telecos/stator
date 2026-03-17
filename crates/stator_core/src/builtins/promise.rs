@@ -96,6 +96,21 @@ pub fn drain_active_microtask_queue() -> usize {
     })
 }
 
+/// Enqueue a task onto the thread-local active microtask queue.
+///
+/// Returns `true` when an active queue exists and the task was enqueued, or
+/// `false` when no queue has been installed for the current thread.
+pub fn enqueue_active_microtask(task: Box<dyn FnOnce()>) -> bool {
+    ACTIVE_MTQ.with(|cell| {
+        if let Some(q) = cell.borrow().as_ref() {
+            q.enqueue(task);
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// Clear the thread-local active microtask queue reference.
 ///
 /// Call this when tearing down globals to avoid stale references.

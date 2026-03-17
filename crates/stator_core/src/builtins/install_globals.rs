@@ -136,7 +136,9 @@ use crate::builtins::typed_array::{
     typed_array_new_from_length, typed_array_reverse, typed_array_set, typed_array_set_from,
     typed_array_slice, typed_array_sort, typed_array_subarray, typed_array_values,
 };
-use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new, weak_ref_new_plain};
+use crate::builtins::weak_ref::{
+    weak_ref_deref, weak_ref_new, weak_ref_new_plain, weak_ref_new_symbol,
+};
 use crate::error::{StatorError, StatorResult};
 use crate::interpreter::{
     current_global_env, dispatch_call_value, dispatch_call_with_this, dispatch_construct_call,
@@ -9066,8 +9068,8 @@ fn make_weak_set_builtin() -> JsValue {
 ///
 /// The returned `PlainObject` provides a `__call__` constructor that creates
 /// a new `WeakRef` instance with hidden per-instance state and a shared
-/// `WeakRef.prototype.deref` method. The target must be an object;
-/// non-object targets cause a `TypeError`.
+/// `WeakRef.prototype.deref` method. The target must be an object or a
+/// non-registered symbol; other values cause a `TypeError`.
 #[inline(never)]
 fn make_weak_ref_builtin() -> JsValue {
     let mut props = PropertyMap::new();
@@ -9079,9 +9081,10 @@ fn make_weak_ref_builtin() -> JsValue {
             let wr = match target {
                 JsValue::Object(ptr) => weak_ref_new(*ptr)?,
                 JsValue::PlainObject(rc) => weak_ref_new_plain(rc),
+                JsValue::Symbol(id) => weak_ref_new_symbol(*id)?,
                 _ => {
                     return Err(StatorError::TypeError(
-                        "WeakRef target must be an object".into(),
+                        "WeakRef target must be an object or non-registered symbol".into(),
                     ));
                 }
             };
@@ -9307,12 +9310,30 @@ fn make_finalization_registry_builtin() -> JsValue {
             // __notify__ — internal GC hook exposed for testing
             {
                 let inner = Rc::clone(&inner);
+                let cb = Rc::clone(&callback);
                 obj.insert(
                     "__finalization_registry_notify__".into(),
                     native(move |a| {
                         let target = a.first().unwrap_or(&JsValue::Undefined);
                         if let JsValue::Object(ptr) = target {
                             finalization_registry_notify(&mut inner.borrow_mut(), *ptr);
+                            let registry = Rc::clone(&inner);
+                            let callback = Rc::clone(&cb);
+                            if !crate::builtins::promise::enqueue_active_microtask(Box::new(
+                                move || {
+                                    let held_values =
+                                        finalization_registry_drain(&mut registry.borrow_mut());
+                                    for held in held_values {
+                                        let _ = dispatch_call_value(callback.as_ref(), vec![held]);
+                                    }
+                                },
+                            )) {
+                                let held_values =
+                                    finalization_registry_drain(&mut inner.borrow_mut());
+                                for held in held_values {
+                                    let _ = dispatch_call_value(cb.as_ref(), vec![held]);
+                                }
+                            }
                         }
                         Ok(JsValue::Undefined)
                     }),
@@ -22427,13 +22448,25 @@ mod tests {
         );
     }
 
-    /// WeakRef constructor rejects Symbol targets.
+    /// WeakRef constructor accepts non-registered symbol targets.
     #[test]
-    fn test_e2e_weakref_constructor_rejects_symbol() {
+    fn test_e2e_weakref_constructor_accepts_non_registered_symbol() {
+        assert_eval_true(
+            r#"
+            const symbol = Symbol("test");
+            const ref1 = new WeakRef(symbol);
+            ref1.deref() === symbol;
+            "#,
+        );
+    }
+
+    /// WeakRef constructor rejects registered symbol targets.
+    #[test]
+    fn test_e2e_weakref_constructor_rejects_registered_symbol() {
         assert_eval_true(
             r#"
             try {
-                new WeakRef(Symbol("test"));
+                new WeakRef(Symbol.for("test"));
                 false;
             } catch (e) {
                 true;
@@ -22474,6 +22507,23 @@ mod tests {
             const fn1 = function() { return 42; };
             const ref1 = new WeakRef(fn1);
             ref1.deref() === fn1;
+            "#,
+        );
+    }
+
+    /// WeakRef prototype exposes the required `@@toStringTag`.
+    #[test]
+    fn test_e2e_weakref_prototype_to_string_tag() {
+        assert_eval_true(r#"WeakRef.prototype[Symbol.toStringTag] === "WeakRef""#);
+    }
+
+    /// WeakRef prototype constructor points back to the constructor.
+    #[test]
+    fn test_e2e_weakref_prototype_constructor() {
+        assert_eval_true(
+            r#"
+            const ref1 = new WeakRef({});
+            WeakRef.prototype.constructor === WeakRef && ref1.constructor === WeakRef;
             "#,
         );
     }
@@ -22809,6 +22859,26 @@ mod tests {
         );
     }
 
+    /// FinalizationRegistry prototype exposes the required `@@toStringTag`.
+    #[test]
+    fn test_e2e_fr_prototype_to_string_tag() {
+        assert_eval_true(
+            r#"FinalizationRegistry.prototype[Symbol.toStringTag] === "FinalizationRegistry""#,
+        );
+    }
+
+    /// FinalizationRegistry prototype constructor points back to the constructor.
+    #[test]
+    fn test_e2e_fr_prototype_constructor() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            FinalizationRegistry.prototype.constructor === FinalizationRegistry
+                && registry.constructor === FinalizationRegistry;
+            "#,
+        );
+    }
+
     /// `WeakRef` `@@toStringTag` is correct.
     #[test]
     fn test_e2e_weakref_to_string_tag() {
@@ -22816,6 +22886,99 @@ mod tests {
             r#"
             const ref1 = new WeakRef({});
             Object.prototype.toString.call(ref1) === "[object WeakRef]";
+            "#,
+        );
+    }
+
+    /// FinalizationRegistry cleanup callbacks run asynchronously after notify.
+    #[test]
+    fn test_e2e_fr_notify_schedules_async_cleanup_callback() {
+        let result = eval_with_microtasks(
+            r#"
+            const log = [];
+            const registry = new FinalizationRegistry(function(value) {
+                log.push("cleanup:" + value);
+            });
+            const target = {};
+            registry.register(target, "held");
+            registry.__notify__(target);
+            log.push("sync");
+            log
+            "#,
+        );
+        match result {
+            JsValue::Array(items) => {
+                let values = items.borrow();
+                assert_eq!(
+                    values.as_slice(),
+                    &[
+                        JsValue::String("sync".into()),
+                        JsValue::String("cleanup:held".into()),
+                    ]
+                );
+            }
+            other => panic!("expected array result, got {other:?}"),
+        }
+    }
+
+    /// FinalizationRegistry notify does not run cleanup callbacks before microtasks drain.
+    #[test]
+    fn test_e2e_fr_notify_defers_cleanup_until_microtasks() {
+        assert_eval_true(
+            r#"
+            const log = [];
+            const registry = new FinalizationRegistry(function(value) {
+                log.push(value);
+            });
+            const target = {};
+            registry.register(target, "held");
+            registry.__notify__(target);
+            log.length === 0;
+            "#,
+        );
+    }
+
+    /// FinalizationRegistry delivers every held value for a collected target.
+    #[test]
+    fn test_e2e_fr_notify_delivers_multiple_registrations() {
+        let result = eval_with_microtasks(
+            r#"
+            const log = [];
+            const registry = new FinalizationRegistry(function(value) {
+                log.push(value);
+            });
+            const target = {};
+            registry.register(target, "first");
+            registry.register(target, "second");
+            registry.__notify__(target);
+            log
+            "#,
+        );
+        match result {
+            JsValue::Array(items) => {
+                let values = items.borrow();
+                assert_eq!(
+                    values.as_slice(),
+                    &[
+                        JsValue::String("first".into()),
+                        JsValue::String("second".into()),
+                    ]
+                );
+            }
+            other => panic!("expected array result, got {other:?}"),
+        }
+    }
+
+    /// FinalizationRegistry unregister removes all registrations sharing a symbol token.
+    #[test]
+    fn test_e2e_fr_unregister_removes_all_symbol_token_registrations() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            const token = Symbol("shared");
+            registry.register({}, "first", token);
+            registry.register({}, "second", token);
+            registry.unregister(token) === true && registry.unregister(token) === false;
             "#,
         );
     }

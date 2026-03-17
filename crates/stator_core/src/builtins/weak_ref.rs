@@ -27,6 +27,7 @@
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
+use crate::builtins::symbol::symbol_key_for;
 use crate::error::{StatorError, StatorResult};
 use crate::objects::heap_object::HeapObject;
 use crate::objects::property_map::PropertyMap;
@@ -42,6 +43,8 @@ pub(crate) enum WeakTarget {
     Plain(Weak<RefCell<PropertyMap>>),
     /// A GC-managed `HeapObject`: raw pointer cleared by the GC sweep phase.
     Heap(Option<*mut HeapObject>),
+    /// A non-registered symbol target. Registered symbols are rejected.
+    Symbol(Option<u64>),
 }
 
 // ── JsWeakRef ────────────────────────────────────────────────────────────────
@@ -126,6 +129,33 @@ pub fn weak_ref_new_plain(rc: &Rc<RefCell<PropertyMap>>) -> JsWeakRef {
     }
 }
 
+/// ECMAScript §26.1.1.1 `new WeakRef(target)` for non-registered symbols.
+///
+/// Registered symbols created through `Symbol.for()` are rejected because they
+/// are globally shared and therefore invalid weak targets.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::symbol::symbol_create;
+/// use stator_core::builtins::weak_ref::{weak_ref_deref, weak_ref_new_symbol};
+/// use stator_core::objects::value::JsValue;
+///
+/// let symbol_id = symbol_create(Some("local".into()));
+/// let wr = weak_ref_new_symbol(symbol_id).unwrap();
+/// assert_eq!(weak_ref_deref(&wr), JsValue::Symbol(symbol_id));
+/// ```
+pub fn weak_ref_new_symbol(symbol_id: u64) -> StatorResult<JsWeakRef> {
+    if symbol_key_for(symbol_id).is_some() {
+        return Err(StatorError::TypeError(
+            "WeakRef target must be an object or non-registered symbol".into(),
+        ));
+    }
+    Ok(JsWeakRef {
+        target: WeakTarget::Symbol(Some(symbol_id)),
+    })
+}
+
 // ── weak_ref_deref ───────────────────────────────────────────────────────────
 
 /// ECMAScript §26.1.3.2 `WeakRef.prototype.deref()`.
@@ -156,6 +186,8 @@ pub fn weak_ref_deref(wr: &JsWeakRef) -> JsValue {
         },
         WeakTarget::Heap(Some(ptr)) => JsValue::Object(*ptr),
         WeakTarget::Heap(None) => JsValue::Undefined,
+        WeakTarget::Symbol(Some(symbol_id)) => JsValue::Symbol(*symbol_id),
+        WeakTarget::Symbol(None) => JsValue::Undefined,
     }
 }
 
@@ -189,6 +221,9 @@ pub fn weak_ref_clear(wr: &mut JsWeakRef) {
         WeakTarget::Heap(opt) => {
             *opt = None;
         }
+        WeakTarget::Symbol(symbol_id) => {
+            *symbol_id = None;
+        }
     }
 }
 
@@ -212,6 +247,7 @@ pub fn weak_ref_has_target(wr: &JsWeakRef) -> bool {
     match &wr.target {
         WeakTarget::Plain(weak) => weak.strong_count() > 0,
         WeakTarget::Heap(opt) => opt.is_some(),
+        WeakTarget::Symbol(symbol_id) => symbol_id.is_some(),
     }
 }
 
@@ -220,6 +256,7 @@ pub fn weak_ref_has_target(wr: &JsWeakRef) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builtins::symbol::{symbol_create, symbol_for};
 
     // ── Heap target: Construction ────────────────────────────────────────────
 
@@ -430,5 +467,27 @@ mod tests {
         let v2 = weak_ref_deref(&wr);
         assert!(matches!(v1, JsValue::PlainObject(_)));
         assert!(matches!(v2, JsValue::PlainObject(_)));
+    }
+
+    #[test]
+    fn test_weak_ref_new_symbol_accepts_non_registered_symbol() {
+        let symbol_id = symbol_create(Some("local".into()));
+        let wr = weak_ref_new_symbol(symbol_id).unwrap();
+        assert_eq!(weak_ref_deref(&wr), JsValue::Symbol(symbol_id));
+    }
+
+    #[test]
+    fn test_weak_ref_new_symbol_rejects_registered_symbol() {
+        let symbol_id = symbol_for("shared");
+        let err = weak_ref_new_symbol(symbol_id).unwrap_err();
+        assert!(matches!(err, StatorError::TypeError(_)));
+    }
+
+    #[test]
+    fn test_weak_ref_clear_symbol_target_returns_undefined() {
+        let symbol_id = symbol_create(Some("clearable".into()));
+        let mut wr = weak_ref_new_symbol(symbol_id).unwrap();
+        weak_ref_clear(&mut wr);
+        assert_eq!(weak_ref_deref(&wr), JsValue::Undefined);
     }
 }
