@@ -9990,10 +9990,10 @@ fn make_promise() -> JsValue {
 
         // ── Constructor: new Promise(executor) ─────────────────────────────────
         //
-        // The executor argument is expected to be a NativeFunction that receives
-        // two arguments: [resolve_fn, reject_fn].  Since we cannot call a JS
-        // bytecode function from here, the constructor is usable only when the
-        // executor is a NativeFunction.
+        // §27.2.3.1: The executor is called synchronously with (resolve, reject).
+        // Supports any callable type (NativeFunction, bytecode Function, Proxy,
+        // PlainObject with __call__).  Resolve/reject are idempotent — only the
+        // first invocation takes effect.
         {
             let q = queue.clone();
             props.insert(
@@ -10002,8 +10002,6 @@ fn make_promise() -> JsValue {
                     let executor = args.first().cloned().unwrap_or(JsValue::Undefined);
                     let p = promise_new(
                         |resolve_box, reject_box| {
-                            // Wrap the resolve/reject callbacks as NativeFunctions and
-                            // pass them to the executor.
                             let resolve_box = Rc::new(RefCell::new(Some(resolve_box)));
                             let reject_box = Rc::new(RefCell::new(Some(reject_box)));
                             let resolve_fn = JsValue::NativeFunction(Rc::new({
@@ -10024,8 +10022,10 @@ fn make_promise() -> JsValue {
                                     Ok(JsValue::Undefined)
                                 }
                             }));
-                            if let JsValue::NativeFunction(f) = &executor
-                                && let Err(e) = f(vec![resolve_fn, reject_fn])
+                            // Call the executor with any callable type via the
+                            // interpreter dispatch, not just NativeFunction.
+                            if let Err(e) =
+                                dispatch_call_value(&executor, vec![resolve_fn, reject_fn])
                             {
                                 // §27.2.3.1 step 10: If executor throws, reject.
                                 if let Some(rej) = reject_box.borrow_mut().take() {
@@ -10071,9 +10071,12 @@ fn make_promise() -> JsValue {
             let q = queue.clone();
             props.insert(
                 "all".into(),
-                native(move |args| {
-                    let promises = extract_promise_array(args.first(), &q);
-                    Ok(JsValue::Promise(promise_all(promises, &q)))
+                native(move |args| match extract_promise_array(args.first(), &q) {
+                    Ok(promises) => Ok(JsValue::Promise(promise_all(promises, &q))),
+                    Err(msg) => Ok(JsValue::Promise(promise_reject(
+                        JsValue::String(msg.into()),
+                        &q,
+                    ))),
                 }),
             );
         }
@@ -10083,9 +10086,12 @@ fn make_promise() -> JsValue {
             let q = queue.clone();
             props.insert(
                 "allSettled".into(),
-                native(move |args| {
-                    let promises = extract_promise_array(args.first(), &q);
-                    Ok(JsValue::Promise(promise_all_settled(promises, &q)))
+                native(move |args| match extract_promise_array(args.first(), &q) {
+                    Ok(promises) => Ok(JsValue::Promise(promise_all_settled(promises, &q))),
+                    Err(msg) => Ok(JsValue::Promise(promise_reject(
+                        JsValue::String(msg.into()),
+                        &q,
+                    ))),
                 }),
             );
         }
@@ -10095,9 +10101,12 @@ fn make_promise() -> JsValue {
             let q = queue.clone();
             props.insert(
                 "any".into(),
-                native(move |args| {
-                    let promises = extract_promise_array(args.first(), &q);
-                    Ok(JsValue::Promise(promise_any(promises, &q)))
+                native(move |args| match extract_promise_array(args.first(), &q) {
+                    Ok(promises) => Ok(JsValue::Promise(promise_any(promises, &q))),
+                    Err(msg) => Ok(JsValue::Promise(promise_reject(
+                        JsValue::String(msg.into()),
+                        &q,
+                    ))),
                 }),
             );
         }
@@ -10107,9 +10116,12 @@ fn make_promise() -> JsValue {
             let q = queue.clone();
             props.insert(
                 "race".into(),
-                native(move |args| {
-                    let promises = extract_promise_array(args.first(), &q);
-                    Ok(JsValue::Promise(promise_race(promises, &q)))
+                native(move |args| match extract_promise_array(args.first(), &q) {
+                    Ok(promises) => Ok(JsValue::Promise(promise_race(promises, &q))),
+                    Err(msg) => Ok(JsValue::Promise(promise_reject(
+                        JsValue::String(msg.into()),
+                        &q,
+                    ))),
                 }),
             );
         }
@@ -10221,15 +10233,31 @@ fn make_promise() -> JsValue {
                             ));
                         }
                     };
-                    let callback = match args.get(1) {
+                    let callback: Box<dyn Fn() -> Result<(), JsValue>> = match args.get(1) {
                         Some(JsValue::NativeFunction(f)) => {
                             let f = Rc::clone(f);
                             Box::new(move || match f(vec![]) {
                                 Ok(_) => Ok(()),
                                 Err(e) => Err(JsValue::String(e.to_string().into())),
-                            }) as Box<dyn Fn() -> Result<(), JsValue>>
+                            })
                         }
-                        _ => Box::new(|| Ok(())) as Box<dyn Fn() -> Result<(), JsValue>>,
+                        Some(v @ JsValue::Function(_)) | Some(v @ JsValue::Proxy(_)) => {
+                            let callee = v.clone();
+                            Box::new(move || match dispatch_call_value(&callee, vec![]) {
+                                Ok(_) => Ok(()),
+                                Err(e) => Err(JsValue::String(e.to_string().into())),
+                            })
+                        }
+                        Some(JsValue::PlainObject(map))
+                            if map.borrow().contains_key("__call__") =>
+                        {
+                            let callee = JsValue::PlainObject(Rc::clone(map));
+                            Box::new(move || match dispatch_call_value(&callee, vec![]) {
+                                Ok(_) => Ok(()),
+                                Err(e) => Err(JsValue::String(e.to_string().into())),
+                            })
+                        }
+                        _ => Box::new(|| Ok(())),
                     };
                     Ok(JsValue::Promise(promise_finally(&promise, callback, &q)))
                 }),
@@ -10815,13 +10843,14 @@ fn make_bigint() -> JsValue {
 /// Extract a `Vec<JsPromise>` from an argument that should be a `JsValue::Array`.
 ///
 /// Non-promise values in the array are wrapped with [`promise_resolve`] per spec.
+/// Returns `Err` with a descriptive message for non-iterable inputs.
 fn extract_promise_array(
     arg: Option<&JsValue>,
     queue: &crate::builtins::promise::MicrotaskQueue,
-) -> Vec<crate::builtins::promise::JsPromise> {
+) -> Result<Vec<crate::builtins::promise::JsPromise>, String> {
     use crate::builtins::promise::promise_resolve;
     match arg {
-        Some(JsValue::Array(arr)) => arr
+        Some(JsValue::Array(arr)) => Ok(arr
             .borrow()
             .iter()
             .map(|v| {
@@ -10831,21 +10860,59 @@ fn extract_promise_array(
                     promise_resolve(v.clone(), queue)
                 }
             })
-            .collect(),
-        _ => Vec::new(),
+            .collect()),
+        Some(other) => {
+            let type_name = match other {
+                JsValue::Null => "null",
+                JsValue::Undefined => "undefined",
+                JsValue::Boolean(_) => "boolean",
+                JsValue::Smi(_) | JsValue::HeapNumber(_) => "number",
+                JsValue::String(_) => "string",
+                _ => "object",
+            };
+            Err(format!(
+                "TypeError: {type_name} is not iterable (cannot read property Symbol(Symbol.iterator))"
+            ))
+        }
+        None => Err(
+            "TypeError: undefined is not iterable (cannot read property Symbol(Symbol.iterator))"
+                .to_string(),
+        ),
     }
 }
 
-/// Convert a `JsValue::NativeFunction` into a `PromiseHandler`.
+/// Convert a callable [`JsValue`] into a [`PromiseHandler`].
+///
+/// Supports `NativeFunction`, bytecode `Function`, `Proxy` and `PlainObject`
+/// with `__call__` — all types that `dispatch_call_value` can invoke.
 fn extract_handler(val: &JsValue) -> Option<crate::builtins::promise::PromiseHandler> {
-    if let JsValue::NativeFunction(f) = val {
-        let f = Rc::clone(f);
-        Some(Box::new(move |v: JsValue| match f(vec![v.clone()]) {
-            Ok(result) => Ok(result),
-            Err(e) => Err(JsValue::String(e.to_string().into())),
-        }))
-    } else {
-        None
+    match val {
+        JsValue::NativeFunction(f) => {
+            let f = Rc::clone(f);
+            Some(Box::new(move |v: JsValue| match f(vec![v.clone()]) {
+                Ok(result) => Ok(result),
+                Err(e) => Err(JsValue::String(e.to_string().into())),
+            }))
+        }
+        JsValue::Function(_) | JsValue::Proxy(_) => {
+            let callee = val.clone();
+            Some(Box::new(move |v: JsValue| {
+                match dispatch_call_value(&callee, vec![v.clone()]) {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsValue::String(e.to_string().into())),
+                }
+            }))
+        }
+        JsValue::PlainObject(map) if map.borrow().contains_key("__call__") => {
+            let callee = val.clone();
+            Some(Box::new(move |v: JsValue| {
+                match dispatch_call_value(&callee, vec![v.clone()]) {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(JsValue::String(e.to_string().into())),
+                }
+            }))
+        }
+        _ => None,
     }
 }
 
@@ -19937,6 +20004,791 @@ mod tests {
         drain_active_microtask_queue();
         let result2 = global_eval("out").unwrap();
         assert_eq!(result2, JsValue::String("1,two,true".into()));
+    }
+
+    // -- 38. Promise.resolve with undefined
+    #[test]
+    fn e2e_promise_resolve_undefined() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "unset";
+            Promise.resolve(undefined).then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Undefined);
+    }
+
+    // -- 39. Promise.resolve with null
+    #[test]
+    fn e2e_promise_resolve_null() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "unset";
+            Promise.resolve(null).then(function(v) { out = (v === null) ? "null" : "other"; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("null".into()));
+    }
+
+    // -- 40. Promise.reject with undefined
+    #[test]
+    fn e2e_promise_reject_undefined() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "unset";
+            Promise.reject(undefined).catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Undefined);
+    }
+
+    // -- 41. Constructor: resolve is idempotent (second call ignored)
+    #[test]
+    fn e2e_promise_constructor_resolve_idempotent() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            new Promise(function(resolve) { resolve(1); resolve(2); })
+                .then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(1));
+    }
+
+    // -- 42. Constructor: reject is idempotent
+    #[test]
+    fn e2e_promise_constructor_reject_idempotent() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            new Promise(function(resolve, reject) { reject("a"); reject("b"); })
+                .catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("a".into()));
+    }
+
+    // -- 43. Constructor: resolve then reject — resolve wins
+    #[test]
+    fn e2e_promise_constructor_resolve_then_reject() {
+        let result = eval_with_microtasks(
+            r#"
+            var fulfilled = false;
+            var rejected = false;
+            new Promise(function(resolve, reject) { resolve(1); reject("x"); })
+                .then(function() { fulfilled = true; }, function() { rejected = true; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let f = global_eval("fulfilled").unwrap();
+        let r = global_eval("rejected").unwrap();
+        assert_eq!(f, JsValue::Boolean(true));
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    // -- 44. Promise.all with single element
+    #[test]
+    fn e2e_promise_all_single_element() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.all([Promise.resolve(42)]).then(function(arr) { out = arr[0]; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(42));
+    }
+
+    // -- 45. Promise.all result is array with correct length
+    #[test]
+    fn e2e_promise_all_result_length() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.all([1, 2, 3, 4, 5]).then(function(arr) { out = arr.length; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(5));
+    }
+
+    // -- 46. Promise.race with first rejection wins over later fulfillments
+    #[test]
+    fn e2e_promise_race_rejection_wins() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.race([
+                Promise.reject("err"),
+                Promise.resolve(1)
+            ]).catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("err".into()));
+    }
+
+    // -- 47. Promise.race with empty array stays pending forever
+    #[test]
+    fn e2e_promise_race_empty_stays_pending() {
+        use crate::builtins::promise::{MicrotaskQueue, promise_race};
+        let q = MicrotaskQueue::new();
+        let p = promise_race(vec![], &q);
+        q.drain();
+        assert!(p.is_pending());
+    }
+
+    // -- 48. Promise.any with empty array rejects
+    #[test]
+    fn e2e_promise_any_empty_rejects() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.any([]).catch(function(e) { out = e.message; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        if let JsValue::String(s) = &result2 {
+            assert!(
+                s.contains("All promises were rejected"),
+                "expected AggregateError message, got: {s}"
+            );
+        } else {
+            panic!("expected string, got: {:?}", result2);
+        }
+    }
+
+    // -- 49. Promise.any with single fulfillment
+    #[test]
+    fn e2e_promise_any_single_fulfillment() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.any([Promise.resolve(55)]).then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(55));
+    }
+
+    // -- 50. Promise.allSettled preserves order
+    #[test]
+    fn e2e_promise_all_settled_preserves_order() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.allSettled([
+                Promise.reject("x"),
+                Promise.resolve("y"),
+                Promise.reject("z")
+            ]).then(function(results) {
+                out = results[0].status + ":" + results[0].reason
+                    + "," + results[1].status + ":" + results[1].value
+                    + "," + results[2].status + ":" + results[2].reason;
+            });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(
+            result2,
+            JsValue::String("rejected:x,fulfilled:y,rejected:z".into())
+        );
+    }
+
+    // -- 51. Promise.allSettled with all fulfilled
+    #[test]
+    fn e2e_promise_all_settled_all_fulfilled() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.allSettled([
+                Promise.resolve(1),
+                Promise.resolve(2)
+            ]).then(function(results) {
+                out = results[0].status + "," + results[1].status;
+            });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("fulfilled,fulfilled".into()));
+    }
+
+    // -- 52. Promise.allSettled with all rejected
+    #[test]
+    fn e2e_promise_all_settled_all_rejected() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.allSettled([
+                Promise.reject("a"),
+                Promise.reject("b")
+            ]).then(function(results) {
+                out = results[0].status + "," + results[1].status;
+            });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("rejected,rejected".into()));
+    }
+
+    // -- 53. then handler throw rejects downstream
+    #[test]
+    fn e2e_promise_then_throw_rejects() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.resolve(1)
+                .then(function() { throw "boom"; })
+                .catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("typeof out").unwrap();
+        assert_eq!(result2, JsValue::String("string".into()));
+    }
+
+    // -- 54. Promise.resolve identity: already-resolved promise returned as-is
+    #[test]
+    fn e2e_promise_resolve_identity_strict() {
+        let result = eval_with_microtasks(
+            r#"
+            var p = Promise.resolve(10);
+            var p2 = Promise.resolve(p);
+            p === p2;
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // -- 55. Promise.reject does NOT unwrap — rejected with a promise value
+    #[test]
+    fn e2e_promise_reject_does_not_unwrap() {
+        let result = eval_with_microtasks(
+            r#"
+            var inner = Promise.resolve(1);
+            var out = false;
+            Promise.reject(inner).catch(function(r) {
+                out = (r === inner);
+            });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Boolean(true));
+    }
+
+    // -- 56. Multiple .then on same resolved promise
+    #[test]
+    fn e2e_promise_multiple_then_on_same() {
+        let result = eval_with_microtasks(
+            r#"
+            var log = [];
+            var p = Promise.resolve("x");
+            p.then(function(v) { log.push("a:" + v); });
+            p.then(function(v) { log.push("b:" + v); });
+            p.then(function(v) { log.push("c:" + v); });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("JSON.stringify(log)").unwrap();
+        assert_eq!(result2, JsValue::String(r#"["a:x","b:x","c:x"]"#.into()));
+    }
+
+    // -- 57. Promise.all rejects only once (first rejection only)
+    #[test]
+    fn e2e_promise_all_rejects_only_once() {
+        let result = eval_with_microtasks(
+            r#"
+            var count = 0;
+            Promise.all([
+                Promise.reject("a"),
+                Promise.reject("b"),
+                Promise.reject("c")
+            ]).catch(function(r) { count = count + 1; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("count").unwrap();
+        assert_eq!(result2, JsValue::Smi(1));
+    }
+
+    // -- 58. Promise.race with single element
+    #[test]
+    fn e2e_promise_race_single_element() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.race([Promise.resolve(88)]).then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(88));
+    }
+
+    // -- 59. Promise.finally preserves fulfillment value through chain
+    #[test]
+    fn e2e_promise_finally_preserves_value_chain() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.resolve(10)
+                .finally(function() {})
+                .finally(function() {})
+                .then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(10));
+    }
+
+    // -- 60. Promise.finally preserves rejection through chain
+    #[test]
+    fn e2e_promise_finally_preserves_rejection_chain() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.reject("err")
+                .finally(function() {})
+                .catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("err".into()));
+    }
+
+    // -- 61. Thenable assimilation in Promise.all
+    #[test]
+    fn e2e_promise_all_with_thenable() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            var thenable = { then: function(resolve) { resolve(77); } };
+            Promise.all([Promise.resolve(1), thenable]).then(function(arr) {
+                out = arr[0] + "," + arr[1];
+            });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("1,77".into()));
+    }
+
+    // -- 62. Chained promise resolution: then returning rejected promise
+    #[test]
+    fn e2e_promise_then_returns_rejected_promise() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.resolve(1)
+                .then(function() { return Promise.reject("inner_err"); })
+                .catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("inner_err".into()));
+    }
+
+    // -- 63. Promise.all preserves sparse fulfillment order
+    #[test]
+    fn e2e_promise_all_order_preserved() {
+        use crate::builtins::promise::{MicrotaskQueue, promise_all, promise_with_resolvers};
+        let q = MicrotaskQueue::new();
+        let wr1 = promise_with_resolvers(&q);
+        let wr2 = promise_with_resolvers(&q);
+        let wr3 = promise_with_resolvers(&q);
+        let p = promise_all(
+            vec![
+                wr1.promise.clone(),
+                wr2.promise.clone(),
+                wr3.promise.clone(),
+            ],
+            &q,
+        );
+        // Resolve in reverse order
+        (wr3.resolve)(JsValue::Smi(30));
+        (wr1.resolve)(JsValue::Smi(10));
+        (wr2.resolve)(JsValue::Smi(20));
+        q.drain();
+        if let Some(JsValue::Array(arr)) = p.value() {
+            assert_eq!(
+                *arr.borrow(),
+                vec![JsValue::Smi(10), JsValue::Smi(20), JsValue::Smi(30)]
+            );
+        } else {
+            panic!("expected Array");
+        }
+    }
+
+    // -- 64. Promise self-resolution detection via then return
+    #[test]
+    fn e2e_promise_self_resolution_via_api() {
+        use crate::builtins::promise::{MicrotaskQueue, promise_with_resolvers};
+        let q = MicrotaskQueue::new();
+        let wr = promise_with_resolvers(&q);
+        let pc = wr.promise.clone();
+        (wr.resolve)(JsValue::Promise(pc));
+        q.drain();
+        assert!(wr.promise.is_rejected());
+    }
+
+    // -- 65. Thenable that rejects
+    #[test]
+    fn e2e_promise_thenable_reject_via_api() {
+        use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
+        let q = MicrotaskQueue::new();
+        let thenable_map = {
+            let q2 = q.clone();
+            let mut map = PropertyMap::new();
+            map.insert(
+                "then".into(),
+                JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+                    if let Some(JsValue::NativeFunction(reject)) = args.get(1) {
+                        reject(vec![JsValue::String("thenable_err".into())])?;
+                    }
+                    Ok(JsValue::Undefined)
+                })),
+            );
+            JsValue::PlainObject(Rc::new(RefCell::new(map)))
+        };
+        let p = promise_resolve(thenable_map, &q);
+        q.drain();
+        assert!(p.is_rejected());
+        assert_eq!(p.reason(), Some(JsValue::String("thenable_err".into())));
+    }
+
+    // -- 66. Thenable idempotent: only first call to resolve/reject counts
+    #[test]
+    fn e2e_promise_thenable_idempotent_via_api() {
+        use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
+        let q = MicrotaskQueue::new();
+        let thenable_map = {
+            let mut map = PropertyMap::new();
+            map.insert(
+                "then".into(),
+                JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+                    if let Some(JsValue::NativeFunction(resolve)) = args.first() {
+                        resolve(vec![JsValue::Smi(1)])?;
+                        resolve(vec![JsValue::Smi(2)])?;
+                    }
+                    if let Some(JsValue::NativeFunction(reject)) = args.get(1) {
+                        reject(vec![JsValue::Smi(3)])?;
+                    }
+                    Ok(JsValue::Undefined)
+                })),
+            );
+            JsValue::PlainObject(Rc::new(RefCell::new(map)))
+        };
+        let p = promise_resolve(thenable_map, &q);
+        q.drain();
+        assert!(p.is_fulfilled());
+        assert_eq!(p.value(), Some(JsValue::Smi(1)));
+    }
+
+    // -- 67. Promise.withResolvers reject end-to-end
+    #[test]
+    fn e2e_promise_with_resolvers_reject_e2e() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            var wr = Promise.withResolvers();
+            wr.promise.catch(function(r) { out = r; });
+            wr.reject("wr_err");
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("wr_err".into()));
+    }
+
+    // -- 68. Promise.all with mixed promises and values
+    #[test]
+    fn e2e_promise_all_mixed_types() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.all([Promise.resolve("a"), "b", Promise.resolve("c")])
+                .then(function(arr) { out = arr.join("-"); });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("a-b-c".into()));
+    }
+
+    // -- 69. Promise.race with mixed values
+    #[test]
+    fn e2e_promise_race_with_plain_value() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.race([42]).then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(42));
+    }
+
+    // -- 70. Deep then chain with alternating success/failure
+    #[test]
+    fn e2e_promise_deep_chain_alternating() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.resolve("start")
+                .then(function(v) { throw "e1"; })
+                .catch(function(r) { return "recovered"; })
+                .then(function(v) { return v + "!"; })
+                .then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("recovered!".into()));
+    }
+
+    // -- 71. Promise.allSettled single element fulfilled
+    #[test]
+    fn e2e_promise_all_settled_single_fulfilled() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.allSettled([Promise.resolve(42)]).then(function(results) {
+                out = results[0].status + ":" + results[0].value;
+            });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("fulfilled:42".into()));
+    }
+
+    // -- 72. Promise.allSettled single element rejected
+    #[test]
+    fn e2e_promise_all_settled_single_rejected() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.allSettled([Promise.reject("no")]).then(function(results) {
+                out = results[0].status + ":" + results[0].reason;
+            });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("rejected:no".into()));
+    }
+
+    // -- 73. Promise.any with last promise fulfilling
+    #[test]
+    fn e2e_promise_any_last_fulfills() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.any([
+                Promise.reject("a"),
+                Promise.reject("b"),
+                Promise.resolve(3)
+            ]).then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(3));
+    }
+
+    // -- 74. Promise.resolve with boolean
+    #[test]
+    fn e2e_promise_resolve_boolean() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.resolve(false).then(function(v) { out = typeof v + ":" + v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("boolean:false".into()));
+    }
+
+    // -- 75. Catch handler can re-throw to propagate rejection
+    #[test]
+    fn e2e_promise_catch_rethrow() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.reject("original")
+                .catch(function(r) { throw "rethrown"; })
+                .catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("typeof out").unwrap();
+        assert_eq!(result2, JsValue::String("string".into()));
+    }
+
+    // ── Promise: API-level conformance tests ──────────────────────────────
+
+    // -- 76. Promise.all with deferred resolution
+    #[test]
+    fn e2e_promise_all_deferred() {
+        use crate::builtins::promise::{
+            MicrotaskQueue, promise_all, promise_resolve, promise_with_resolvers,
+        };
+        let q = MicrotaskQueue::new();
+        let wr = promise_with_resolvers(&q);
+        let p = promise_all(
+            vec![promise_resolve(JsValue::Smi(1), &q), wr.promise.clone()],
+            &q,
+        );
+        q.drain();
+        // Still pending because wr.promise is not resolved yet
+        assert!(p.is_pending());
+        (wr.resolve)(JsValue::Smi(2));
+        q.drain();
+        if let Some(JsValue::Array(arr)) = p.value() {
+            assert_eq!(*arr.borrow(), vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        } else {
+            panic!("expected Array");
+        }
+    }
+
+    // -- 77. Promise.race with deferred — first to settle wins
+    #[test]
+    fn e2e_promise_race_deferred() {
+        use crate::builtins::promise::{MicrotaskQueue, promise_race, promise_with_resolvers};
+        let q = MicrotaskQueue::new();
+        let wr1 = promise_with_resolvers(&q);
+        let wr2 = promise_with_resolvers(&q);
+        let p = promise_race(vec![wr1.promise.clone(), wr2.promise.clone()], &q);
+        assert!(p.is_pending());
+        (wr2.resolve)(JsValue::Smi(99));
+        q.drain();
+        assert!(p.is_fulfilled());
+        assert_eq!(p.value(), Some(JsValue::Smi(99)));
+    }
+
+    // -- 78. Promise.any deferred — first fulfill wins
+    #[test]
+    fn e2e_promise_any_deferred() {
+        use crate::builtins::promise::{MicrotaskQueue, promise_any, promise_with_resolvers};
+        let q = MicrotaskQueue::new();
+        let wr1 = promise_with_resolvers(&q);
+        let wr2 = promise_with_resolvers(&q);
+        let p = promise_any(vec![wr1.promise.clone(), wr2.promise.clone()], &q);
+        assert!(p.is_pending());
+        (wr1.reject)(JsValue::String("no1".into()));
+        q.drain();
+        assert!(p.is_pending());
+        (wr2.resolve)(JsValue::Smi(7));
+        q.drain();
+        assert!(p.is_fulfilled());
+        assert_eq!(p.value(), Some(JsValue::Smi(7)));
+    }
+
+    // -- 79. Promise.allSettled deferred
+    #[test]
+    fn e2e_promise_all_settled_deferred() {
+        use crate::builtins::promise::{
+            MicrotaskQueue, promise_all_settled, promise_with_resolvers,
+        };
+        let q = MicrotaskQueue::new();
+        let wr = promise_with_resolvers(&q);
+        let p = promise_all_settled(vec![wr.promise.clone()], &q);
+        assert!(p.is_pending());
+        (wr.reject)(JsValue::String("fail".into()));
+        q.drain();
+        assert!(p.is_fulfilled());
+        if let Some(JsValue::Array(arr)) = p.value() {
+            if let JsValue::PlainObject(obj) = &arr.borrow()[0] {
+                let m = obj.borrow();
+                assert_eq!(m.get("status"), Some(&JsValue::String("rejected".into())));
+                assert_eq!(m.get("reason"), Some(&JsValue::String("fail".into())));
+            } else {
+                panic!("expected PlainObject");
+            }
+        } else {
+            panic!("expected Array");
+        }
+    }
+
+    // -- 80. Microtask queue is FIFO across interleaved enqueues
+    #[test]
+    fn e2e_promise_microtask_deep_interleave() {
+        let result = eval_with_microtasks(
+            r#"
+            var log = [];
+            Promise.resolve().then(function() {
+                log.push(1);
+                Promise.resolve().then(function() {
+                    log.push(3);
+                    Promise.resolve().then(function() { log.push(5); });
+                });
+            });
+            Promise.resolve().then(function() {
+                log.push(2);
+                Promise.resolve().then(function() { log.push(4); });
+            });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("JSON.stringify(log)").unwrap();
+        assert_eq!(result2, JsValue::String("[1,2,3,4,5]".into()));
     }
 
     // ── eval: direct vs indirect (end-to-end) ───────────────────────────────
