@@ -165,6 +165,7 @@
 //! one [`Instruction`] per iteration, advances the program counter, then
 //! dispatches on the [`Opcode`] via an exhaustive `match`.
 
+mod cross_cutting_conformance_tests;
 mod dispatch;
 mod map_set_conformance_tests;
 mod numeric_conformance_tests;
