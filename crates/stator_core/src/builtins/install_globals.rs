@@ -14363,6 +14363,33 @@ fn make_disposable_stack() -> JsValue {
                 );
             }
 
+            // adopt(value, onDispose) — register a value with a custom callback.
+            {
+                let res = Rc::clone(&resources);
+                props.insert(
+                    "adopt".into(),
+                    native(move |args| {
+                        let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let on_dispose = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        // Wrap in an object that carries @@dispose → onDispose(value).
+                        let adopted_val = val.clone();
+                        let mut wrapper = PropertyMap::new();
+                        wrapper.insert(
+                            "@@dispose".into(),
+                            native(move |_| {
+                                if let JsValue::NativeFunction(f) = &on_dispose {
+                                    let _ = f(vec![adopted_val.clone()]);
+                                }
+                                Ok(JsValue::Undefined)
+                            }),
+                        );
+                        res.borrow_mut()
+                            .push(JsValue::PlainObject(Rc::new(RefCell::new(wrapper))));
+                        Ok(val)
+                    }),
+                );
+            }
+
             // [Symbol.dispose]() — aliases dispose() for using protocol.
             {
                 let res2 = Rc::clone(&resources);
@@ -14379,6 +14406,122 @@ fn make_disposable_stack() -> JsValue {
                             if let JsValue::PlainObject(obj) = item
                                 && let Some(JsValue::NativeFunction(f)) =
                                     obj.borrow().get("@@dispose").cloned()
+                            {
+                                let _ = f(vec![item.clone()]);
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+            }
+
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
+        })
+    })
+}
+
+/// Build the `AsyncDisposableStack` constructor.
+///
+/// `AsyncDisposableStack` manages a stack of async-disposable resources and
+/// calls their `[Symbol.asyncDispose]()` methods in reverse order when
+/// `.disposeAsync()` is called.
+#[inline(never)]
+fn make_async_disposable_stack() -> JsValue {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
+        native(|_args| {
+            let resources: Rc<RefCell<Vec<JsValue>>> = Rc::new(RefCell::new(Vec::new()));
+            let disposed: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+            let mut props = PropertyMap::new();
+
+            // use(value) — add an async-disposable resource.
+            {
+                let res = Rc::clone(&resources);
+                props.insert(
+                    "use".into(),
+                    native(move |args| {
+                        let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        res.borrow_mut().push(val.clone());
+                        Ok(val)
+                    }),
+                );
+            }
+
+            // disposed — whether the stack has been disposed.
+            {
+                let d = Rc::clone(&disposed);
+                props.insert(
+                    "disposed".into(),
+                    native(move |_args| Ok(JsValue::Boolean(*d.borrow()))),
+                );
+            }
+
+            // adopt(value, onDispose) — register a value with a custom callback.
+            {
+                let res = Rc::clone(&resources);
+                props.insert(
+                    "adopt".into(),
+                    native(move |args| {
+                        let val = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let on_dispose = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        let adopted_val = val.clone();
+                        let mut wrapper = PropertyMap::new();
+                        wrapper.insert(
+                            "@@asyncDispose".into(),
+                            native(move |_| {
+                                if let JsValue::NativeFunction(f) = &on_dispose {
+                                    let _ = f(vec![adopted_val.clone()]);
+                                }
+                                Ok(JsValue::Undefined)
+                            }),
+                        );
+                        res.borrow_mut()
+                            .push(JsValue::PlainObject(Rc::new(RefCell::new(wrapper))));
+                        Ok(val)
+                    }),
+                );
+            }
+
+            // disposeAsync() — dispose all resources in reverse order.
+            {
+                let res = Rc::clone(&resources);
+                let d = Rc::clone(&disposed);
+                props.insert(
+                    "disposeAsync".into(),
+                    native(move |_args| {
+                        if *d.borrow() {
+                            return Ok(JsValue::Undefined);
+                        }
+                        *d.borrow_mut() = true;
+                        let items: Vec<JsValue> = res.borrow_mut().drain(..).rev().collect();
+                        for item in &items {
+                            if let JsValue::PlainObject(obj) = item
+                                && let Some(JsValue::NativeFunction(f)) =
+                                    obj.borrow().get("@@asyncDispose").cloned()
+                            {
+                                let _ = f(vec![item.clone()]);
+                            }
+                        }
+                        Ok(JsValue::Undefined)
+                    }),
+                );
+            }
+
+            // [Symbol.asyncDispose]() — aliases disposeAsync() for protocol.
+            {
+                let res2 = Rc::clone(&resources);
+                let d2 = Rc::clone(&disposed);
+                props.insert(
+                    "@@asyncDispose".into(),
+                    native(move |_args| {
+                        if *d2.borrow() {
+                            return Ok(JsValue::Undefined);
+                        }
+                        *d2.borrow_mut() = true;
+                        let items: Vec<JsValue> = res2.borrow_mut().drain(..).rev().collect();
+                        for item in &items {
+                            if let JsValue::PlainObject(obj) = item
+                                && let Some(JsValue::NativeFunction(f)) =
+                                    obj.borrow().get("@@asyncDispose").cloned()
                             {
                                 let _ = f(vec![item.clone()]);
                             }
@@ -14490,6 +14633,10 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         globals.insert(
             "DisposableStack".into(),
             finalize_ctor(make_disposable_stack(), "DisposableStack"),
+        );
+        globals.insert(
+            "AsyncDisposableStack".into(),
+            finalize_ctor(make_async_disposable_stack(), "AsyncDisposableStack"),
         );
         globals.insert("String".into(), finalize_ctor(make_string(), "String"));
     });
@@ -47512,5 +47659,254 @@ mod tests {
     #[test]
     fn e2e_wk_has_instance_not_in_symbol_for_registry() {
         assert_eval_true("Symbol.keyFor(Symbol.hasInstance) === undefined");
+    }
+
+    // ── Explicit resource management e2e tests ──────────────────────────
+
+    #[test]
+    fn e2e_disposable_stack_typeof() {
+        assert_eval_true("typeof DisposableStack === 'function'");
+    }
+
+    #[test]
+    fn e2e_disposable_stack_creates_instance() {
+        assert_eval_true("typeof new DisposableStack() === 'object'");
+    }
+
+    #[test]
+    fn e2e_disposable_stack_disposed_initially_false() {
+        assert_eval_true("new DisposableStack().disposed() === false");
+    }
+
+    #[test]
+    fn e2e_disposable_stack_disposed_after_dispose() {
+        assert_eval_true("var s = new DisposableStack(); s.dispose(); s.disposed() === true");
+    }
+
+    #[test]
+    fn e2e_disposable_stack_use_returns_value() {
+        let result = global_eval("var s = new DisposableStack(); s.use(42)").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_disposable_stack_dispose_is_idempotent() {
+        assert_eval_true(
+            "var s = new DisposableStack(); s.dispose(); s.dispose(); s.disposed() === true",
+        );
+    }
+
+    #[test]
+    fn e2e_disposable_stack_adopt_returns_value() {
+        let result = global_eval(
+            r#"
+            var s = new DisposableStack();
+            s.adopt(99, function(v) {})
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn e2e_disposable_stack_adopt_calls_callback() {
+        assert_eval_true(
+            r#"
+            var called = false;
+            var s = new DisposableStack();
+            s.adopt(1, function(v) { called = true; });
+            s.dispose();
+            called === true
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_disposable_stack_adopt_passes_value() {
+        let result = global_eval(
+            r#"
+            var captured;
+            var s = new DisposableStack();
+            s.adopt(42, function(v) { captured = v; });
+            s.dispose();
+            captured
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_disposable_stack_dispose_calls_in_reverse() {
+        let result = global_eval(
+            r#"
+            var log = "";
+            var s = new DisposableStack();
+            var a = { [Symbol.dispose]() { log += "a"; } };
+            var b = { [Symbol.dispose]() { log += "b"; } };
+            s.use(a);
+            s.use(b);
+            s.dispose();
+            log
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("ba".into()));
+    }
+
+    #[test]
+    fn e2e_async_disposable_stack_typeof() {
+        assert_eval_true("typeof AsyncDisposableStack === 'function'");
+    }
+
+    #[test]
+    fn e2e_async_disposable_stack_creates_instance() {
+        assert_eval_true("typeof new AsyncDisposableStack() === 'object'");
+    }
+
+    #[test]
+    fn e2e_async_disposable_stack_disposed_initially_false() {
+        assert_eval_true("new AsyncDisposableStack().disposed() === false");
+    }
+
+    #[test]
+    fn e2e_async_disposable_stack_disposed_after_dispose() {
+        assert_eval_true(
+            "var s = new AsyncDisposableStack(); s.disposeAsync(); s.disposed() === true",
+        );
+    }
+
+    #[test]
+    fn e2e_async_disposable_stack_use_returns_value() {
+        let result = global_eval("var s = new AsyncDisposableStack(); s.use(77)").unwrap();
+        assert_eq!(result, JsValue::Smi(77));
+    }
+
+    #[test]
+    fn e2e_async_disposable_stack_dispose_is_idempotent() {
+        assert_eval_true(
+            "var s = new AsyncDisposableStack(); s.disposeAsync(); s.disposeAsync(); s.disposed() === true",
+        );
+    }
+
+    #[test]
+    fn e2e_async_disposable_stack_adopt_returns_value() {
+        let result = global_eval(
+            r#"
+            var s = new AsyncDisposableStack();
+            s.adopt(55, function(v) {})
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(55));
+    }
+
+    #[test]
+    fn e2e_async_disposable_stack_adopt_calls_callback() {
+        assert_eval_true(
+            r#"
+            var called = false;
+            var s = new AsyncDisposableStack();
+            s.adopt(1, function(v) { called = true; });
+            s.disposeAsync();
+            called === true
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_suppressed_error_is_constructor() {
+        assert_eval_true("typeof SuppressedError === 'function'");
+    }
+
+    #[test]
+    fn e2e_suppressed_error_creates_instance() {
+        assert_eval_true("typeof new SuppressedError() === 'object'");
+    }
+
+    #[test]
+    fn e2e_suppressed_error_has_name() {
+        let result = global_eval("new SuppressedError().name").unwrap();
+        assert_eq!(result, JsValue::String("SuppressedError".into()));
+    }
+
+    #[test]
+    fn e2e_suppressed_error_stores_error_property() {
+        let result = global_eval("new SuppressedError('err1', 'sup1', 'msg').error").unwrap();
+        assert_eq!(result, JsValue::String("err1".into()));
+    }
+
+    #[test]
+    fn e2e_suppressed_error_stores_suppressed_property() {
+        let result = global_eval("new SuppressedError('err1', 'sup1', 'msg').suppressed").unwrap();
+        assert_eq!(result, JsValue::String("sup1".into()));
+    }
+
+    #[test]
+    fn e2e_suppressed_error_stores_message() {
+        let result = global_eval("new SuppressedError('e', 's', 'hello').message").unwrap();
+        assert_eq!(result, JsValue::String("hello".into()));
+    }
+
+    #[test]
+    fn e2e_suppressed_error_default_message_empty() {
+        let result = global_eval("new SuppressedError('e', 's').message").unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    #[test]
+    fn e2e_using_declaration_basic() {
+        let result = global_eval(
+            r#"
+            var disposed = false;
+            {
+                using x = { [Symbol.dispose]() { disposed = true; } };
+            }
+            disposed
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_using_declaration_value_accessible() {
+        let result = global_eval(
+            r#"
+            var result;
+            {
+                using x = { value: 42, [Symbol.dispose]() {} };
+                result = x.value;
+            }
+            result
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_symbol_dispose_is_well_known() {
+        assert_eval_true("Symbol.dispose !== undefined");
+    }
+
+    #[test]
+    fn e2e_symbol_async_dispose_is_well_known() {
+        assert_eval_true("Symbol.asyncDispose !== undefined");
+    }
+
+    #[test]
+    fn e2e_symbol_dispose_not_equal_async_dispose() {
+        assert_eval_true("Symbol.dispose !== Symbol.asyncDispose");
+    }
+
+    #[test]
+    fn e2e_symbol_dispose_is_unique() {
+        assert_eval_true("Symbol.dispose === Symbol.dispose");
+    }
+
+    #[test]
+    fn e2e_symbol_async_dispose_is_unique() {
+        assert_eval_true("Symbol.asyncDispose === Symbol.asyncDispose");
     }
 }
