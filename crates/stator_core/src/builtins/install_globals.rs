@@ -22,7 +22,6 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::builtins::proxy::proxy_get;
 use crate::builtins::typed_array::{
     arraybuffer_byte_length, dataview_byte_length, dataview_byte_offset,
 };
@@ -139,8 +138,8 @@ use crate::error::{StatorError, StatorResult};
 use crate::interpreter::{
     current_global_env, dispatch_call_value, dispatch_call_with_this, dispatch_construct_call,
     dispatch_get_property_value, dispatch_set_property_value, function_display_name,
-    function_length_value, function_to_string_value, get_object_prototype, has_prototype_in_chain,
-    ordinary_set_prototype_of, plain_object_has_own_property,
+    function_length_value, function_to_string_value, get_object_prototype, has_property_in_chain,
+    has_prototype_in_chain, ordinary_set_prototype_of, plain_object_has_own_property,
 };
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
@@ -406,17 +405,8 @@ fn string_raw_segments(raw: &JsValue) -> StatorResult<Vec<String>> {
 fn array_like_length(val: &JsValue) -> StatorResult<usize> {
     match val {
         JsValue::Array(items) => Ok(items.borrow().len()),
-        JsValue::PlainObject(map) => {
-            let borrow = map.borrow();
-            let len = borrow
-                .get("length")
-                .map(JsValue::to_length)
-                .transpose()?
-                .unwrap_or(0);
-            Ok(len.min(usize::MAX as u64) as usize)
-        }
-        JsValue::Proxy(proxy) => {
-            let len = proxy_get(&proxy.borrow(), "length")?
+        JsValue::PlainObject(_) | JsValue::Proxy(_) => {
+            let len = dispatch_get_property_value(val, JsValue::String("length".into()))?
                 .to_length()?
                 .min(usize::MAX as u64);
             Ok(len as usize)
@@ -425,11 +415,14 @@ fn array_like_length(val: &JsValue) -> StatorResult<usize> {
     }
 }
 
-/// Return whether an array-like value has an own indexed property at `index`.
+/// Return whether an array-like value has an indexed property at `index`.
 fn array_like_has_index(val: &JsValue, index: usize) -> bool {
     match val {
-        JsValue::Array(items) => index < items.borrow().len(),
-        JsValue::PlainObject(map) => map.borrow().contains_key(&index.to_string()),
+        JsValue::Array(items) => items
+            .borrow()
+            .get(index)
+            .is_some_and(|value| !value.is_the_hole()),
+        JsValue::PlainObject(_) => has_property_in_chain(val, &index.to_string()),
         JsValue::Proxy(proxy) => proxy_has(&proxy.borrow(), &index.to_string()).unwrap_or(false),
         _ => false,
     }
@@ -442,14 +435,11 @@ fn array_like_get_index(val: &JsValue, index: usize) -> JsValue {
             .borrow()
             .get(index)
             .cloned()
+            .filter(|value| !value.is_the_hole())
             .unwrap_or(JsValue::Undefined),
-        JsValue::PlainObject(map) => map
-            .borrow()
-            .get(&index.to_string())
-            .cloned()
-            .unwrap_or(JsValue::Undefined),
-        JsValue::Proxy(proxy) => {
-            proxy_get(&proxy.borrow(), &index.to_string()).unwrap_or(JsValue::Undefined)
+        JsValue::PlainObject(_) | JsValue::Proxy(_) => {
+            dispatch_get_property_value(val, JsValue::String(index.to_string().into()))
+                .unwrap_or(JsValue::Undefined)
         }
         _ => JsValue::Undefined,
     }
@@ -461,7 +451,7 @@ fn array_like_set_index(val: &JsValue, index: usize, value: JsValue) {
         JsValue::Array(items) => {
             let mut borrow = items.borrow_mut();
             if index >= borrow.len() {
-                borrow.resize(index + 1, JsValue::Undefined);
+                borrow.resize(index + 1, JsValue::TheHole);
             }
             borrow[index] = value;
         }
@@ -497,7 +487,7 @@ fn array_like_delete_index(val: &JsValue, index: usize) {
         JsValue::Array(items) => {
             let mut borrow = items.borrow_mut();
             if index < borrow.len() {
-                borrow[index] = JsValue::Undefined;
+                borrow[index] = JsValue::TheHole;
             }
         }
         JsValue::PlainObject(map) => {
@@ -519,7 +509,7 @@ fn array_like_set_length(val: &JsValue, new_len: usize) {
             if new_len < borrow.len() {
                 borrow.truncate(new_len);
             } else {
-                borrow.resize(new_len, JsValue::Undefined);
+                borrow.resize(new_len, JsValue::TheHole);
             }
         }
         JsValue::PlainObject(map) => {
@@ -547,6 +537,20 @@ fn array_like_set_length(val: &JsValue, new_len: usize) {
         }
         _ => {}
     }
+}
+
+/// Snapshot an array-like value into optional slots where `None` represents a hole.
+fn array_like_slots(val: &JsValue) -> StatorResult<Vec<Option<JsValue>>> {
+    let len = array_like_length(val)?;
+    let mut slots = Vec::with_capacity(len);
+    for index in 0..len {
+        if array_like_has_index(val, index) {
+            slots.push(Some(array_like_get_index(val, index)));
+        } else {
+            slots.push(None);
+        }
+    }
+    Ok(slots)
 }
 
 /// Apply a hole-aware indexed layout back onto an array-like value.
@@ -5912,28 +5916,13 @@ fn make_array() -> JsValue {
             builtin_fn("push", 1, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                match arr {
-                    JsValue::Array(items) => {
-                        let mut vec = items.borrow_mut();
-                        vec.extend_from_slice(&args[1..]);
-                        Ok(JsValue::Smi(vec.len() as i32))
-                    }
-                    JsValue::PlainObject(map) => {
-                        let mut borrow = map.borrow_mut();
-                        let len = match borrow.get("length") {
-                            Some(JsValue::Smi(n)) => *n as usize,
-                            Some(JsValue::HeapNumber(n)) => *n as usize,
-                            _ => 0,
-                        };
-                        for (i, item) in args.iter().skip(1).enumerate() {
-                            borrow.insert((len + i).to_string(), item.clone());
-                        }
-                        let new_len = len + args.len() - 1;
-                        borrow.insert("length".to_string(), JsValue::Smi(new_len as i32));
-                        Ok(JsValue::Smi(new_len as i32))
-                    }
-                    _ => Ok(JsValue::Undefined),
+                let len = array_like_length(arr)?;
+                for (offset, item) in args.iter().skip(1).enumerate() {
+                    array_like_set_index(arr, len + offset, item.clone());
                 }
+                let new_len = len + args.len().saturating_sub(1);
+                array_like_set_length(arr, new_len);
+                Ok(JsValue::Smi(new_len as i32))
             }),
         );
 
@@ -5943,11 +5932,20 @@ fn make_array() -> JsValue {
             builtin_fn("pop", 0, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                if let JsValue::Array(items) = arr {
-                    Ok(items.borrow_mut().pop().unwrap_or(JsValue::Undefined))
-                } else {
-                    Ok(JsValue::Undefined)
+                let len = array_like_length(arr)?;
+                if len == 0 {
+                    array_like_set_length(arr, 0);
+                    return Ok(JsValue::Undefined);
                 }
+                let index = len - 1;
+                let value = if array_like_has_index(arr, index) {
+                    array_like_get_index(arr, index)
+                } else {
+                    JsValue::Undefined
+                };
+                array_like_delete_index(arr, index);
+                array_like_set_length(arr, index);
+                Ok(value)
             }),
         );
 
@@ -6106,8 +6104,8 @@ fn make_array() -> JsValue {
             builtin_fn("slice", 2, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                let (elements, len) = to_array_like_elements(arr);
-                let len = len as i64;
+                let slots = array_like_slots(arr)?;
+                let len = slots.len() as i64;
                 let start = args
                     .get(1)
                     .unwrap_or(&JsValue::Smi(0))
@@ -6127,12 +6125,17 @@ fn make_array() -> JsValue {
                 } else {
                     end.min(len)
                 } as usize;
-                let sliced: Vec<JsValue> = elements[s..e].to_vec();
+                let sliced = slots[s..e].to_vec();
                 // §23.1.3.25 ArraySpeciesCreate
                 if let Some(result) = array_species_create(arr, sliced.len())? {
                     return Ok(result);
                 }
-                Ok(JsValue::new_array(sliced))
+                Ok(JsValue::new_array(
+                    sliced
+                        .into_iter()
+                        .map(|slot| slot.unwrap_or(JsValue::TheHole))
+                        .collect(),
+                ))
             }),
         );
 
@@ -6506,7 +6509,7 @@ fn make_array() -> JsValue {
                 let mut result = Vec::with_capacity(len);
                 for i in 0..len {
                     if !array_like_has_index(arr, i) {
-                        result.push(JsValue::Undefined);
+                        result.push(JsValue::TheHole);
                         continue;
                     }
                     let mapped = call_callback_with_this(
@@ -40036,6 +40039,427 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::String("x,y".into()));
+    }
+
+    // ── Generic Array.prototype / array-like receiver tests ─────────────────
+
+    #[test]
+    fn test_array_generic_slice_plain_object() {
+        let result =
+            global_eval("Array.prototype.slice.call({0:'a',1:'b',length:2}).join(',')").unwrap();
+        assert_eq!(result, JsValue::String("a,b".into()));
+    }
+
+    #[test]
+    fn test_array_generic_slice_proxy() {
+        let result = global_eval(
+            "var target = {0:'a',1:'b',length:2}; \
+             Array.prototype.slice.call(new Proxy(target, {})).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,b".into()));
+    }
+
+    #[test]
+    fn test_array_generic_slice_inherited_properties() {
+        let result = global_eval(
+            "var proto = {0:'a',1:'b',length:2}; \
+             Array.prototype.slice.call(Object.create(proto)).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,b".into()));
+    }
+
+    #[test]
+    fn test_array_generic_slice_arguments() {
+        let result = global_eval(
+            "function f() { return Array.prototype.slice.call(arguments).join(','); } \
+             f('a', 'b', 'c')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,b,c".into()));
+    }
+
+    #[test]
+    fn test_array_generic_slice_preserves_sparse_holes() {
+        let result = global_eval(
+            "var out = Array.prototype.slice.call({0:'a',2:'c',length:3}); \
+             out.length === 3 && !(1 in out) && out[1] === undefined",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_push_plain_object() {
+        let result = global_eval(
+            "var o = {0:'a', length:1}; \
+             Array.prototype.push.call(o, 'b', 'c') === 3 && \
+             o.length === 3 && o[1] === 'b' && o[2] === 'c'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_push_proxy() {
+        let result = global_eval(
+            "var target = {length:0}; \
+             Array.prototype.push.call(new Proxy(target, {}), 'x', 'y'); \
+             target.length === 2 && target[0] === 'x' && target[1] === 'y'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_push_without_length() {
+        let result = global_eval(
+            "var o = {}; \
+             Array.prototype.push.call(o, 'x') === 1 && o.length === 1 && o[0] === 'x'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_pop_plain_object() {
+        let result = global_eval(
+            "var o = {0:'a',1:'b',length:2}; \
+             Array.prototype.pop.call(o) === 'b' && o.length === 1 && !(1 in o)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_pop_proxy() {
+        let result = global_eval(
+            "var target = {0:'a',1:'b',length:2}; \
+             Array.prototype.pop.call(new Proxy(target, {})) === 'b' && \
+             target.length === 1 && !(1 in target)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_pop_empty_resets_length() {
+        let result = global_eval(
+            "var o = {length:0}; \
+             Array.prototype.pop.call(o) === undefined && o.length === 0",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_for_each_plain_object() {
+        let result = global_eval(
+            "var seen = []; \
+             Array.prototype.forEach.call({0:'a',1:'b',length:2}, function(v, i) { seen.push(i + ':' + v); }); \
+             seen.join('|') === '0:a|1:b'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_for_each_skips_holes() {
+        let result = global_eval(
+            "var seen = []; \
+             Array.prototype.forEach.call({0:'a',2:'c',length:3}, function(v, i) { seen.push(i + ':' + v); }); \
+             seen.join('|') === '0:a|2:c'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_for_each_this_arg() {
+        let result = global_eval(
+            "var total = 0; \
+             var ctx = { mult: 3 }; \
+             Array.prototype.forEach.call({0:1,1:2,length:2}, function(v) { total += v * this.mult; }, ctx); \
+             total === 9",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_map_plain_object() {
+        let result = global_eval(
+            "Array.prototype.map.call({0:1,1:2,length:2}, function(v) { return v * 2; }).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("2,4".into()));
+    }
+
+    #[test]
+    fn test_array_generic_map_preserves_holes() {
+        let result = global_eval(
+            "var out = Array.prototype.map.call({0:1,2:3,length:3}, function(v) { return v * 2; }); \
+             out.length === 3 && out[0] === 2 && !(1 in out) && out[2] === 6",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_map_callback_arguments() {
+        let result = global_eval(
+            "var receiver = {0:'a',1:'b',length:2}; \
+             var seen = Array.prototype.map.call(receiver, function(v, i, array) { \
+               return i + ':' + v + ':' + (array === receiver); \
+             }); \
+             seen.join('|') === '0:a:true|1:b:true'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_filter_plain_object() {
+        let result = global_eval(
+            "Array.prototype.filter.call({0:1,1:2,2:3,length:3}, function(v) { return v >= 2; }).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("2,3".into()));
+    }
+
+    #[test]
+    fn test_array_generic_filter_skips_holes() {
+        let result = global_eval(
+            "var seen = []; \
+             var out = Array.prototype.filter.call({0:1,2:3,length:3}, function(v, i) { seen.push(i); return true; }); \
+             seen.join(',') === '0,2' && out.join(',') === '1,3'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_filter_this_arg() {
+        let result = global_eval(
+            "var ctx = { min: 2 }; \
+             Array.prototype.filter.call({0:1,1:2,2:3,length:3}, function(v) { return v >= this.min; }, ctx).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("2,3".into()));
+    }
+
+    #[test]
+    fn test_array_from_arguments_object() {
+        let result = global_eval(
+            "function f() { return Array.from(arguments).join(','); } \
+             f('a', 'b', 'c')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,b,c".into()));
+    }
+
+    #[test]
+    fn test_array_from_proxy_array_like_generic() {
+        let result = global_eval(
+            "var target = {0:'a',1:'b',length:2}; \
+             Array.from(new Proxy(target, {})).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,b".into()));
+    }
+
+    #[test]
+    fn test_array_from_inherited_array_like() {
+        let result = global_eval(
+            "var proto = {0:'a',1:'b',length:2}; \
+             Array.from(Object.create(proto)).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a,b".into()));
+    }
+
+    #[test]
+    fn test_array_from_sparse_array_like_fills_undefined() {
+        let result = global_eval(
+            "var out = Array.from({0:'a',2:'c',length:3}); \
+             out.length === 3 && out[1] === undefined && (1 in out)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_from_array_like_map_this_arg() {
+        let result = global_eval(
+            "var ctx = { suffix: '!' }; \
+             Array.from({0:'a',1:'b',length:2}, function(v, i) { return v + this.suffix + i; }, ctx).join(',')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("a!0,b!1".into()));
+    }
+
+    #[test]
+    fn test_array_generic_index_of_plain_object() {
+        let result =
+            global_eval("Array.prototype.indexOf.call({0:'a',1:'b',length:2}, 'b')").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_array_generic_index_of_skips_holes() {
+        let result =
+            global_eval("Array.prototype.indexOf.call({1: undefined, length: 3}, undefined)")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_array_generic_index_of_negative_from_index() {
+        let result =
+            global_eval("Array.prototype.indexOf.call({0:'a',1:'b',2:'a',length:3}, 'a', -1)")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_array_generic_includes_plain_object() {
+        let result =
+            global_eval("Array.prototype.includes.call({0:'a',1:'b',length:2}, 'b')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_includes_hole_as_undefined() {
+        let result =
+            global_eval("Array.prototype.includes.call({0:'a',2:'c',length:3}, undefined)")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_includes_negative_from_index() {
+        let result =
+            global_eval("Array.prototype.includes.call({0:'a',1:'b',2:'c',length:3}, 'b', -2)")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_sort_plain_object() {
+        let result = global_eval(
+            "var o = {0:'b',1:'a',length:2}; \
+             Array.prototype.sort.call(o); \
+             o[0] === 'a' && o[1] === 'b' && o.length === 2",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_sort_sparse_preserves_holes() {
+        let result = global_eval(
+            "var o = {1:'b',2:'a',length:3}; \
+             Array.prototype.sort.call(o); \
+             o[0] === 'a' && o[1] === 'b' && !(2 in o) && o.length === 3",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_sort_proxy() {
+        let result = global_eval(
+            "var target = {0:'c',1:'a',2:'b',length:3}; \
+             Array.prototype.sort.call(new Proxy(target, {})); \
+             target[0] === 'a' && target[1] === 'b' && target[2] === 'c'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_generic_map_arguments_receiver() {
+        let result = global_eval(
+            "function f() { \
+               return Array.prototype.map.call(arguments, function(v, i) { return v + i; }).join(','); \
+             } \
+             f(1, 2, 3)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1,3,5".into()));
+    }
+
+    #[test]
+    fn test_array_generic_includes_arguments_receiver() {
+        let result = global_eval(
+            "function f() { return Array.prototype.includes.call(arguments, 'b'); } \
+             f('a', 'b', 'c')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_typed_array_map_non_generic_receiver() {
+        let result = global_eval(
+            "try { Uint8Array.prototype.map.call({0: 1, length: 1}, function(v) { return v; }); false; } \
+             catch (e) { e instanceof TypeError; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_typed_array_slice_non_generic_receiver() {
+        let result = global_eval(
+            "try { Uint8Array.prototype.slice.call([1, 2], 0); false; } \
+             catch (e) { e instanceof TypeError; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_sparse_array_for_each_skips_holes() {
+        let result = global_eval(
+            "var count = 0; \
+             [,,,].forEach(function() { count++; }); \
+             count === 0",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_sparse_array_map_preserves_holes() {
+        let result = global_eval(
+            "var out = [1,,3].map(function(v) { return v * 2; }); \
+             out.length === 3 && out[0] === 2 && !(1 in out) && out[2] === 6",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_sparse_array_slice_preserves_holes() {
+        let result = global_eval(
+            "var out = [,'a',, 'b'].slice(0, 3); \
+             out.length === 3 && !(0 in out) && out[1] === 'a' && !(2 in out)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_sparse_array_length_growth_creates_holes() {
+        let result = global_eval(
+            "var a = [1]; \
+             a.length = 3; \
+             a.length === 3 && !(1 in a) && !(2 in a) && a[1] === undefined",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 
     /// `Array.of` preserves argument order.

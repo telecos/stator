@@ -3207,7 +3207,18 @@ fn handle_get_iterator(
     let iterable = ctx.frame.read_reg(iter_v)?.clone();
     ctx.frame.accumulator = match iterable {
         JsValue::Array(items) => {
-            let items_vec: Vec<JsValue> = items.borrow().clone();
+            let items_vec: Vec<JsValue> = items
+                .borrow()
+                .iter()
+                .cloned()
+                .map(|value| {
+                    if value.is_the_hole() {
+                        JsValue::Undefined
+                    } else {
+                        value
+                    }
+                })
+                .collect();
             JsValue::Iterator(NativeIterator::from_items(items_vec))
         }
         JsValue::String(ref s) => JsValue::Iterator(NativeIterator::from_string(s)),
@@ -4722,7 +4733,10 @@ fn handle_test_in(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
             {
                 true
             } else if let Some(idx) = to_array_index(key) {
-                idx < items.borrow().len()
+                items
+                    .borrow()
+                    .get(idx)
+                    .is_some_and(|value| !value.is_the_hole())
             } else {
                 // Check Array.prototype / Object.prototype methods.
                 let prop = to_property_key(key)?;

@@ -5640,7 +5640,7 @@ fn array_literal_proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         let mut elements = Vec::with_capacity(len);
         for i in 0..len {
             let k = i.to_string();
-            elements.push(borrow.get(&k).cloned().unwrap_or(JsValue::Undefined));
+            elements.push(borrow.get(&k).cloned().unwrap_or(JsValue::TheHole));
         }
         drop(borrow);
         // Build a real JsValue::Array and lookup on it.
@@ -5681,7 +5681,9 @@ fn array_literal_proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     }
                     // Insert new elements.
                     for (i, v) in elems.iter().enumerate() {
-                        m.insert(i.to_string(), v.clone());
+                        if !v.is_the_hole() {
+                            m.insert(i.to_string(), v.clone());
+                        }
                     }
                     m.insert("length".to_string(), JsValue::Smi(elems.len() as i32));
                     Ok(ret)
@@ -6066,6 +6068,7 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
                     .borrow()
                     .get(idx)
                     .cloned()
+                    .filter(|value| !value.is_the_hole())
                     .unwrap_or(JsValue::Undefined));
             }
             // Named property — delegate to proto_lookup for method access.
@@ -6229,13 +6232,13 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
                 if (new_len_u32 as usize) < current_len {
                     v.truncate(new_len_u32 as usize);
                 } else {
-                    v.resize(new_len_u32 as usize, JsValue::Undefined);
+                    v.resize(new_len_u32 as usize, JsValue::TheHole);
                 }
             } else if let Some(idx) = to_array_index(key) {
                 let mut v = arr.borrow_mut();
                 // Extend the array if needed
                 if idx >= v.len() {
-                    v.resize(idx + 1, JsValue::Undefined);
+                    v.resize(idx + 1, JsValue::TheHole);
                 }
                 v[idx] = value;
             }
