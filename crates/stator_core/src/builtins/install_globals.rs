@@ -38,8 +38,8 @@ use crate::builtins::date::{
     date_set_month, date_set_seconds, date_set_time, date_set_utc_date, date_set_utc_full_year,
     date_set_utc_hours, date_set_utc_milliseconds, date_set_utc_minutes, date_set_utc_month,
     date_set_utc_seconds, date_to_date_string, date_to_iso_string, date_to_locale_date_string,
-    date_to_locale_string, date_to_locale_time_string, date_to_string, date_to_time_string,
-    date_to_utc_string, date_utc, date_value_of,
+    date_to_locale_string, date_to_locale_time_string, date_to_primitive, date_to_string,
+    date_to_time_string, date_to_utc_string, date_utc, date_value_of,
 };
 use crate::builtins::error::{
     ErrorKind, JsError, error_capture_stack_trace, get_stack_trace_limit,
@@ -4151,16 +4151,7 @@ fn make_date_instance(t: f64) -> JsValue {
                     Some(JsValue::String(s)) => s.to_string(),
                     _ => "default".to_string(),
                 };
-                match hint.as_str() {
-                    "number" => Ok(num(date_value_of(*inner.borrow()))),
-                    // "string" and "default" both return the string representation
-                    "string" | "default" => {
-                        Ok(JsValue::String(date_to_string(*inner.borrow()).into()))
-                    }
-                    _ => Err(StatorError::TypeError(
-                        "Invalid hint for Date.prototype[@@toPrimitive]".into(),
-                    )),
-                }
+                date_to_primitive(*inner.borrow(), &hint)
             }),
         );
     }
@@ -33278,6 +33269,70 @@ mod tests {
             result,
             JsValue::String("-000001-01-01T00:00:00.000Z".into())
         );
+    }
+
+    /// `Date.parse()` accepts canonical signed extended ISO years.
+    #[test]
+    fn test_date_parse_signed_extended_year() {
+        let result = global_eval(
+            "Date.parse('+010000-01-01T00:00:00.000Z') === Date.UTC(10000, 0, 1, 0, 0, 0, 0)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.parse()` rejects non-canonical signed year widths.
+    #[test]
+    fn test_date_parse_rejects_non_canonical_signed_year_width() {
+        let result = global_eval("Number.isNaN(Date.parse('+2024-01-15T12:30:00Z'))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.parse()` rejects unsigned years wider than four digits.
+    #[test]
+    fn test_date_parse_rejects_non_canonical_unsigned_year_width() {
+        let result = global_eval("Number.isNaN(Date.parse('02024-01-15T12:30:00Z'))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.prototype[Symbol.toPrimitive]` uses `toString` for the `string` hint.
+    #[test]
+    fn test_date_symbol_to_primitive_string_hint_uses_to_string() {
+        let result = global_eval(
+            "Date.prototype[Symbol.toPrimitive].call(new Date(0), 'string') === new Date(0).toString()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.prototype[Symbol.toPrimitive]` uses `toString` for the `default` hint.
+    #[test]
+    fn test_date_symbol_to_primitive_default_hint_uses_to_string() {
+        let result = global_eval(
+            "Date.prototype[Symbol.toPrimitive].call(new Date(0), 'default') === new Date(0).toString()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.prototype[Symbol.toPrimitive]` uses `valueOf` for the `number` hint.
+    #[test]
+    fn test_date_symbol_to_primitive_number_hint_uses_value_of() {
+        let result = global_eval(
+            "Date.prototype[Symbol.toPrimitive].call(new Date(1234), 'number') === 1234",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.prototype[Symbol.toPrimitive]` rejects invalid hints.
+    #[test]
+    fn test_date_symbol_to_primitive_invalid_hint_throws_type_error() {
+        let result = global_eval(
+            "try { Date.prototype[Symbol.toPrimitive].call(new Date(0), 'nope'); false; } catch (e) { e.name === 'TypeError'; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 
     // ── JSON built-in tests ─────────────────────────────────────────────

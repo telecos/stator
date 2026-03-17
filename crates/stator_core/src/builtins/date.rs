@@ -16,6 +16,7 @@
 //! * ECMAScript 2025 Language Specification §21.4 — *Date Objects*
 
 use crate::error::{StatorError, StatorResult};
+use crate::objects::value::JsValue;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -591,25 +592,24 @@ fn parse_iso_year(s: &str) -> Option<(f64, usize)> {
         return None;
     }
 
-    let (sign, start) = if bytes[0] == b'+' || bytes[0] == b'-' {
-        (if bytes[0] == b'+' { 1.0 } else { -1.0 }, 1)
+    let (sign, start, digits) = if bytes[0] == b'+' || bytes[0] == b'-' {
+        (if bytes[0] == b'+' { 1.0 } else { -1.0 }, 1, 6)
     } else {
-        (1.0, 0)
+        (1.0, 0, 4)
     };
 
-    // Collect digits
-    let mut pos = start;
-    while pos < bytes.len() && bytes[pos].is_ascii_digit() {
-        pos += 1;
-    }
-
-    if pos == start {
+    let end = start + digits;
+    if end > bytes.len() || !bytes[start..end].iter().all(u8::is_ascii_digit) {
         return None;
     }
 
-    let year_str = &s[start..pos];
+    if end < bytes.len() && bytes[end].is_ascii_digit() {
+        return None;
+    }
+
+    let year_str = &s[start..end];
     let year: f64 = year_str.parse().ok()?;
-    Some((sign * year, pos))
+    Some((sign * year, end))
 }
 
 /// Parse exactly two ASCII digits at the given position.
@@ -1427,19 +1427,24 @@ pub fn date_value_of(t: f64) -> f64 {
 ///
 /// For `"string"` or `"default"` hints, returns the string representation.
 /// For `"number"` hint, returns the time value.
-pub fn date_to_primitive(t: f64, hint: &str) -> StatorResult<String> {
+pub fn date_to_primitive(t: f64, hint: &str) -> StatorResult<JsValue> {
     match hint {
-        "number" => Ok(if t.is_nan() {
-            "NaN".to_string()
-        } else {
-            let v = t as i64;
-            if (v as f64) == t {
-                v.to_string()
+        "number" => Ok(
+            if t.is_finite()
+                && t != 0.0
+                && t.fract() == 0.0
+                && t >= f64::from(i32::MIN)
+                && t <= f64::from(i32::MAX)
+            {
+                JsValue::Smi(t as i32)
             } else {
-                t.to_string()
-            }
-        }),
-        _ => Ok(date_to_string(t)),
+                JsValue::HeapNumber(t)
+            },
+        ),
+        "string" | "default" => Ok(JsValue::String(date_to_string(t).into())),
+        _ => Err(StatorError::TypeError(
+            "Invalid hint for Date.prototype[@@toPrimitive]".into(),
+        )),
     }
 }
 
@@ -1665,5 +1670,53 @@ mod tests {
         assert_eq!(date_get_utc_date(t), 15.0);
         assert_eq!(date_get_utc_hours(t), 10.0);
         assert_eq!(date_get_utc_minutes(t), 30.0);
+    }
+
+    #[test]
+    fn test_date_parse_iso_signed_extended_year() {
+        let t = date_parse("+010000-01-01T00:00:00.000Z");
+        assert_eq!(
+            date_to_iso_string(t).unwrap(),
+            "+010000-01-01T00:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn test_date_parse_iso_rejects_non_canonical_year_width() {
+        assert!(date_parse("+2024-01-15T12:30:00Z").is_nan());
+        assert!(date_parse("02024-01-15T12:30:00Z").is_nan());
+    }
+
+    #[test]
+    fn test_date_to_primitive_string_and_default_use_to_string() {
+        let expected = date_to_string(0.0);
+        assert_eq!(
+            date_to_primitive(0.0, "string").unwrap(),
+            JsValue::String(expected.clone().into())
+        );
+        assert_eq!(
+            date_to_primitive(0.0, "default").unwrap(),
+            JsValue::String(expected.into())
+        );
+    }
+
+    #[test]
+    fn test_date_to_primitive_number_returns_numeric_value() {
+        assert_eq!(
+            date_to_primitive(1234.0, "number").unwrap(),
+            JsValue::Smi(1234)
+        );
+        match date_to_primitive(f64::NAN, "number").unwrap() {
+            JsValue::HeapNumber(n) => assert!(n.is_nan()),
+            other => panic!("expected NaN heap number, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_date_to_primitive_invalid_hint_throws() {
+        assert!(matches!(
+            date_to_primitive(0.0, "invalid"),
+            Err(StatorError::TypeError(_))
+        ));
     }
 }
