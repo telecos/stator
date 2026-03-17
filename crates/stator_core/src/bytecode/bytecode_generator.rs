@@ -5238,6 +5238,23 @@ impl FunctionCompiler {
                 .map_err(|e| StatorError::Internal(e.to_string()))?;
         }
 
+        if !a.elements.is_empty() {
+            let len_slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+            let length_name = self.add_string("length");
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaSmi,
+                vec![Operand::Immediate(a.elements.len() as i32)],
+            ));
+            self.emit(Instruction::new_unchecked(
+                Opcode::StaNamedProperty,
+                vec![
+                    to_reg_op(arr_reg),
+                    Operand::ConstantPoolIdx(length_name),
+                    len_slot,
+                ],
+            ));
+        }
+
         // Reload the array into accumulator.
         self.emit_ldar(arr_reg);
         self.allocator
