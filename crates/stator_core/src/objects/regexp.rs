@@ -458,6 +458,7 @@ impl JsRegExp {
                     }
                 }
             }
+            self.last_index.set(0);
             if matches.is_empty() {
                 None
             } else {
@@ -525,6 +526,9 @@ impl JsRegExp {
         }
         // Append the remainder of the input.
         result.push_str(&input[last_end..]);
+        if global {
+            self.last_index.set(0);
+        }
         result
     }
 
@@ -535,7 +539,10 @@ impl JsRegExp {
     pub fn symbol_search(&self, input: &str) -> i64 {
         let saved = self.last_index.get();
         self.last_index.set(0);
-        let result = self.compiled.find(input).map_or(-1, |m| m.start() as i64);
+        let result = self
+            .compiled
+            .find(input)
+            .map_or(-1, |m| input[..m.start()].encode_utf16().count() as i64);
         self.last_index.set(saved);
         result
     }
@@ -589,7 +596,7 @@ impl JsRegExp {
     pub fn symbol_match_all(&self, input: &str) -> Vec<RegExpMatch> {
         let has_indices = self.flags.contains(RegExpFlags::HAS_INDICES);
         let mut results = Vec::new();
-        let mut start = 0_usize;
+        let mut start = self.last_index.get();
         loop {
             if start > input.len() {
                 break;

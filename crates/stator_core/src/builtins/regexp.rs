@@ -302,7 +302,7 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
                 let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                 let limit = match args.get(1) {
                     Some(JsValue::Undefined) | None => None,
-                    Some(v) => Some(crate::builtins::util::clamped_f64_to_usize(v.to_number()?)),
+                    Some(v) => Some(v.to_uint32()? as usize),
                 };
                 let parts = re_split.symbol_split(&input, limit);
                 sync_last_index_to_props(&w, &re_split);
@@ -392,7 +392,7 @@ fn call_replace_callback(
     input: &str,
     matched: &RegExpMatch,
 ) -> StatorResult<String> {
-    let mut args = Vec::with_capacity(3 + matched.captures.len());
+    let mut args = Vec::with_capacity(4 + matched.captures.len());
     args.push(JsValue::String(matched.matched.clone().into()));
     for capture in &matched.captures {
         match capture {
@@ -402,6 +402,9 @@ fn call_replace_callback(
     }
     args.push(JsValue::Smi(utf16_index(input, matched.index)));
     args.push(JsValue::String(input.to_string().into()));
+    if !matched.named_groups.is_empty() {
+        args.push(named_groups_to_js_value(&matched.named_groups));
+    }
     dispatch_call_value(callback, args)?.to_js_string()
 }
 
@@ -423,19 +426,13 @@ fn regexp_replace_with_callback(
             return Ok(input.to_string());
         }
 
-        let mut final_last_index = 0usize;
         for matched in matches {
             let end = matched.index + matched.matched.len();
             result.push_str(&input[next_source_position..matched.index]);
             result.push_str(&call_replace_callback(replacement, input, &matched)?);
             next_source_position = end;
-            final_last_index = if end > matched.index {
-                end
-            } else {
-                matched.index + 1
-            };
         }
-        re.set_last_index(final_last_index);
+        re.set_last_index(0);
     } else if let Some(matched) = re.exec(input) {
         let end = matched.index + matched.matched.len();
         result.push_str(&input[..matched.index]);
@@ -474,7 +471,7 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
             },
         );
     }
-    props.insert("index".into(), JsValue::Smi(m.index as i32));
+    props.insert("index".into(), JsValue::Smi(utf16_index(&m.input, m.index)));
     props.insert("input".into(), JsValue::String(m.input.clone().into()));
 
     // groups — null-prototype object (Object.create(null) per spec)
@@ -503,9 +500,10 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
         let mut idx_props = PropertyMap::new();
         for (i, pair) in idx.pairs.iter().enumerate() {
             let val = match pair {
-                Some((s, e)) => {
-                    JsValue::new_array(vec![JsValue::Smi(*s as i32), JsValue::Smi(*e as i32)])
-                }
+                Some((s, e)) => JsValue::new_array(vec![
+                    JsValue::Smi(utf16_index(&m.input, *s)),
+                    JsValue::Smi(utf16_index(&m.input, *e)),
+                ]),
                 None => JsValue::Undefined,
             };
             idx_props.insert(i.to_string(), val);
@@ -515,7 +513,10 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
             for (k, (s, e)) in &idx.groups {
                 g.insert(
                     k.clone(),
-                    JsValue::new_array(vec![JsValue::Smi(*s as i32), JsValue::Smi(*e as i32)]),
+                    JsValue::new_array(vec![
+                        JsValue::Smi(utf16_index(&m.input, *s)),
+                        JsValue::Smi(utf16_index(&m.input, *e)),
+                    ]),
                 );
             }
             idx_props.insert(
@@ -537,6 +538,23 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
     props.insert("__is_array__".into(), JsValue::Boolean(true));
 
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+fn named_groups_to_js_value(
+    named_groups: &std::collections::HashMap<String, Option<String>>,
+) -> JsValue {
+    let mut groups = PropertyMap::new();
+    groups.insert("__proto__".into(), JsValue::Null);
+    for (key, value) in named_groups {
+        groups.insert(
+            key.clone(),
+            match value {
+                Some(value) => JsValue::String(value.clone().into()),
+                None => JsValue::Undefined,
+            },
+        );
+    }
+    JsValue::PlainObject(Rc::new(RefCell::new(groups)))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
