@@ -43,11 +43,13 @@
 //! * ECMAScript 2025 Language Specification §10.5 — *Proxy Object Internal Methods*
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::error::{StatorError, StatorResult};
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
+use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 
 // ── Type aliases for trap closures ────────────────────────────────────────────
@@ -65,12 +67,11 @@ pub type DefinePropertyTrap =
     Box<dyn Fn(&mut JsObject, &str, JsValue, PropertyAttributes) -> StatorResult<bool>>;
 /// Trap for `[[GetOwnProperty]](target, key)`.
 pub type GetOwnPropertyDescriptorTrap =
-    Box<dyn Fn(&JsObject, &str) -> Option<(JsValue, PropertyAttributes)>>;
+    Box<dyn Fn(&JsObject, &str) -> StatorResult<Option<(JsValue, PropertyAttributes)>>>;
 /// Trap for `[[GetPrototypeOf]](target)`.
-pub type GetPrototypeOfTrap = Box<dyn Fn(&JsObject) -> Option<Rc<RefCell<JsObject>>>>;
+pub type GetPrototypeOfTrap = Box<dyn Fn(&JsObject) -> StatorResult<JsValue>>;
 /// Trap for `[[SetPrototypeOf]](target, proto)` → boolean.
-pub type SetPrototypeOfTrap =
-    Box<dyn Fn(&mut JsObject, Option<Rc<RefCell<JsObject>>>) -> StatorResult<bool>>;
+pub type SetPrototypeOfTrap = Box<dyn Fn(&mut JsObject, JsValue) -> StatorResult<bool>>;
 /// Trap for `[[IsExtensible]](target)` → boolean.
 pub type IsExtensibleTrap = Box<dyn Fn(&JsObject) -> StatorResult<bool>>;
 /// Trap for `[[PreventExtensions]](target)` → boolean.
@@ -80,7 +81,7 @@ pub type OwnKeysTrap = Box<dyn Fn(&JsObject) -> StatorResult<Vec<JsValue>>>;
 /// Trap for `[[Call]](thisArg, args)` → value.
 pub type ApplyTrap = Box<dyn Fn(JsValue, Vec<JsValue>) -> StatorResult<JsValue>>;
 /// Trap for `[[Construct]](args, newTarget)` → object.
-pub type ConstructTrap = Box<dyn Fn(Vec<JsValue>, JsValue) -> StatorResult<JsObject>>;
+pub type ConstructTrap = Box<dyn Fn(Vec<JsValue>, JsValue) -> StatorResult<JsValue>>;
 
 // ── ProxyHandler ──────────────────────────────────────────────────────────────
 
@@ -165,6 +166,8 @@ pub struct JsProxy {
     pub(crate) target: JsObject,
     /// The handler holding optional traps.
     pub(crate) handler: ProxyHandler,
+    /// The original JavaScript target value for host-created proxies.
+    pub(crate) target_value: Option<JsValue>,
     /// Whether this proxy has been revoked.
     revoked: bool,
     /// Whether the proxy's target is callable (`[[Call]]` internal method).
@@ -193,6 +196,7 @@ pub fn proxy_new(target: JsObject, handler: ProxyHandler) -> JsProxy {
     JsProxy {
         target,
         handler,
+        target_value: None,
         revoked: false,
         callable: false,
     }
@@ -206,6 +210,7 @@ pub fn proxy_new_callable(target: JsObject, handler: ProxyHandler) -> JsProxy {
     JsProxy {
         target,
         handler,
+        target_value: None,
         revoked: false,
         callable: true,
     }
@@ -267,6 +272,127 @@ impl JsProxy {
             Ok(())
         }
     }
+
+    fn target_is_extensible(&self) -> bool {
+        match &self.target_value {
+            Some(JsValue::PlainObject(map)) => map.borrow().extensible,
+            Some(JsValue::Error(error)) => error.props.borrow().extensible,
+            _ => self.target.is_extensible(),
+        }
+    }
+
+    fn target_prototype_value(&self) -> JsValue {
+        match &self.target_value {
+            Some(JsValue::PlainObject(map)) => map
+                .borrow()
+                .get("__proto__")
+                .cloned()
+                .unwrap_or(JsValue::Null),
+            Some(JsValue::Error(error)) => error
+                .props
+                .borrow()
+                .get("__proto__")
+                .cloned()
+                .unwrap_or(JsValue::Null),
+            _ => JsValue::Null,
+        }
+    }
+
+    fn target_own_property_descriptor(&self, key: &str) -> Option<(JsValue, PropertyAttributes)> {
+        match &self.target_value {
+            Some(JsValue::PlainObject(map)) => {
+                plain_visible_own_property_descriptor(&map.borrow(), key)
+            }
+            Some(JsValue::Error(error)) => {
+                plain_visible_own_property_descriptor(&error.props.borrow(), key)
+            }
+            _ => self.target.get_own_property_descriptor(key),
+        }
+    }
+
+    fn target_has_own_property(&self, key: &str) -> bool {
+        self.target_own_property_descriptor(key).is_some()
+    }
+
+    fn target_own_property_keys(&self) -> Vec<String> {
+        match &self.target_value {
+            Some(JsValue::PlainObject(map)) => plain_visible_own_property_keys(&map.borrow()),
+            Some(JsValue::Error(error)) => plain_visible_own_property_keys(&error.props.borrow()),
+            _ => self.target.own_property_keys(),
+        }
+    }
+}
+
+fn accessor_property_name(key: &str) -> Option<&str> {
+    if let Some(rest) = key
+        .strip_prefix("__get_")
+        .or_else(|| key.strip_prefix("__set_"))
+    {
+        rest.strip_suffix("__")
+    } else {
+        None
+    }
+}
+
+fn plain_visible_own_property_descriptor(
+    map: &PropertyMap,
+    key: &str,
+) -> Option<(JsValue, PropertyAttributes)> {
+    if let Some(value) = map.get(key).cloned() {
+        let mut attrs = PropertyAttributes::empty();
+        if map.is_writable(key) {
+            attrs |= PropertyAttributes::WRITABLE;
+        }
+        if map.is_enumerable(key) {
+            attrs |= PropertyAttributes::ENUMERABLE;
+        }
+        if map.is_configurable(key) {
+            attrs |= PropertyAttributes::CONFIGURABLE;
+        }
+        return Some((value, attrs));
+    }
+
+    let getter_key = format!("__get_{key}__");
+    let setter_key = format!("__set_{key}__");
+    if map.contains_key(&getter_key) || map.contains_key(&setter_key) {
+        let attr_key = if map.contains_key(&getter_key) {
+            getter_key.as_str()
+        } else {
+            setter_key.as_str()
+        };
+        let mut attrs = PropertyAttributes::empty();
+        if map.is_enumerable(attr_key) {
+            attrs |= PropertyAttributes::ENUMERABLE;
+        }
+        if map.is_configurable(attr_key) {
+            attrs |= PropertyAttributes::CONFIGURABLE;
+        }
+        return Some((JsValue::Undefined, attrs));
+    }
+
+    None
+}
+
+fn plain_visible_own_property_keys(map: &PropertyMap) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+
+    for raw_key in map.keys() {
+        if raw_key == "__proto__" {
+            continue;
+        }
+        if let Some(name) = accessor_property_name(raw_key) {
+            if seen.insert(name.to_string()) {
+                keys.push(name.to_string());
+            }
+            continue;
+        }
+        if seen.insert(raw_key.clone()) {
+            keys.push(raw_key.clone());
+        }
+    }
+
+    keys
 }
 
 // ── proxy_get ─────────────────────────────────────────────────────────────────
@@ -311,7 +437,7 @@ pub fn proxy_get_with_receiver(
     };
     // Invariant §10.5.8 step 11: non-configurable + non-writable target property
     // must equal the trap result.
-    if let Some((target_val, attrs)) = proxy.target.get_own_property_descriptor(key)
+    if let Some((target_val, attrs)) = proxy.target_own_property_descriptor(key)
         && !attrs.contains(PropertyAttributes::CONFIGURABLE)
         && !attrs.contains(PropertyAttributes::WRITABLE)
         && trap_result != target_val
@@ -360,7 +486,7 @@ pub fn proxy_set_with_receiver(
         // Invariant §10.5.9 step 11: if the target property is non-configurable
         // and non-writable, the trap must not successfully set a different value.
         if result
-            && let Some((target_val, attrs)) = proxy.target.get_own_property_descriptor(key)
+            && let Some((target_val, attrs)) = proxy.target_own_property_descriptor(key)
             && !attrs.contains(PropertyAttributes::CONFIGURABLE)
             && !attrs.contains(PropertyAttributes::WRITABLE)
             && value != target_val
@@ -410,16 +536,14 @@ pub fn proxy_has(proxy: &JsProxy, key: &str) -> StatorResult<bool> {
     // Invariant §10.5.7 step 10: trap may not return false for a non-configurable
     // own property of the target.
     if !result {
-        if let Some((_, attrs)) = proxy.target.get_own_property_descriptor(key)
+        if let Some((_, attrs)) = proxy.target_own_property_descriptor(key)
             && !attrs.contains(PropertyAttributes::CONFIGURABLE)
         {
             return Err(StatorError::TypeError(format!(
                 "Proxy has trap returned false for non-configurable property '{key}'"
             )));
         }
-        // Invariant §10.5.7 step 11: trap may not return false when the target is
-        // non-extensible and owns the property.
-        if !proxy.target.is_extensible() && proxy.target.has_own_property(key) {
+        if !proxy.target_is_extensible() && proxy.target_has_own_property(key) {
             return Err(StatorError::TypeError(format!(
                 "Proxy has trap returned false for existing property '{key}' \
                  on a non-extensible target"
@@ -458,7 +582,7 @@ pub fn proxy_delete_property(proxy: &mut JsProxy, key: &str) -> StatorResult<boo
     };
     // Invariant §10.5.10 step 11: trap may not return true for a non-configurable property.
     if result
-        && let Some((_, attrs)) = proxy.target.get_own_property_descriptor(key)
+        && let Some((_, attrs)) = proxy.target_own_property_descriptor(key)
         && !attrs.contains(PropertyAttributes::CONFIGURABLE)
     {
         return Err(StatorError::TypeError(format!(
@@ -500,23 +624,27 @@ pub fn proxy_define_property(
 ) -> StatorResult<bool> {
     proxy.check_revoked()?;
     if let Some(trap) = &proxy.handler.define_property {
-        let result = trap(&mut proxy.target, key, value, attributes)?;
+        let result = trap(&mut proxy.target, key, value.clone(), attributes)?;
         if result {
             // Invariant §10.5.6 step 19: if the target has a non-configurable
             // property, the trap cannot redefine it as configurable.
-            if let Some((_, target_attrs)) = proxy.target.get_own_property_descriptor(key)
+            if let Some((target_val, target_attrs)) = proxy.target_own_property_descriptor(key)
                 && !target_attrs.contains(PropertyAttributes::CONFIGURABLE)
-                && attributes.contains(PropertyAttributes::CONFIGURABLE)
+                && (attributes.contains(PropertyAttributes::CONFIGURABLE)
+                    || attributes.contains(PropertyAttributes::ENUMERABLE)
+                        != target_attrs.contains(PropertyAttributes::ENUMERABLE)
+                    || (!target_attrs.contains(PropertyAttributes::WRITABLE)
+                        && (attributes.contains(PropertyAttributes::WRITABLE)
+                            || value != target_val)))
             {
                 return Err(StatorError::TypeError(format!(
-                    "Proxy defineProperty trap cannot make non-configurable \
-                     property '{key}' configurable"
+                    "Proxy defineProperty trap cannot report an incompatible \
+                     descriptor for non-configurable property '{key}'"
                 )));
             }
             // Invariant §10.5.6 step 20: cannot add a new property if the
             // target is non-extensible.
-            if !proxy.target.is_extensible()
-                && proxy.target.get_own_property_descriptor(key).is_none()
+            if !proxy.target_is_extensible() && proxy.target_own_property_descriptor(key).is_none()
             {
                 return Err(StatorError::TypeError(format!(
                     "Proxy defineProperty trap cannot add property '{key}' \
@@ -562,16 +690,16 @@ pub fn proxy_get_own_property_descriptor(
 ) -> StatorResult<Option<(JsValue, PropertyAttributes)>> {
     proxy.check_revoked()?;
     let result = if let Some(trap) = &proxy.handler.get_own_property_descriptor {
-        trap(&proxy.target, key)
+        trap(&proxy.target, key)?
     } else {
-        return Ok(proxy.target.get_own_property_descriptor(key));
+        return Ok(proxy.target_own_property_descriptor(key));
     };
     // Invariant §10.5.5 step 16: if the trap says undefined but the target has
     // a non-configurable property, that is a violation.
-    let target_desc = proxy.target.get_own_property_descriptor(key);
+    let target_desc = proxy.target_own_property_descriptor(key);
     if result.is_none() {
         if let Some((_, attrs)) = &target_desc
-            && (!attrs.contains(PropertyAttributes::CONFIGURABLE) || !proxy.target.is_extensible())
+            && (!attrs.contains(PropertyAttributes::CONFIGURABLE) || !proxy.target_is_extensible())
         {
             return Err(StatorError::TypeError(format!(
                 "Proxy getOwnPropertyDescriptor trap returned undefined \
@@ -579,16 +707,23 @@ pub fn proxy_get_own_property_descriptor(
             )));
         }
     } else if let Some((_, trap_attrs)) = &result {
-        if let Some((_, target_attrs)) = target_desc {
+        if let Some((target_val, target_attrs)) = target_desc {
             if !target_attrs.contains(PropertyAttributes::CONFIGURABLE)
-                && trap_attrs.contains(PropertyAttributes::CONFIGURABLE)
+                && (trap_attrs.contains(PropertyAttributes::CONFIGURABLE)
+                    || trap_attrs.contains(PropertyAttributes::ENUMERABLE)
+                        != target_attrs.contains(PropertyAttributes::ENUMERABLE)
+                    || (!target_attrs.contains(PropertyAttributes::WRITABLE)
+                        && (trap_attrs.contains(PropertyAttributes::WRITABLE)
+                            || result
+                                .as_ref()
+                                .is_some_and(|(trap_val, _)| *trap_val != target_val))))
             {
                 return Err(StatorError::TypeError(format!(
                     "Proxy getOwnPropertyDescriptor trap reported incompatible \
                      descriptor for non-configurable property '{key}'"
                 )));
             }
-        } else if !proxy.target.is_extensible() {
+        } else if !proxy.target_is_extensible() {
             return Err(StatorError::TypeError(format!(
                 "Proxy getOwnPropertyDescriptor trap reported a new property \
                  '{key}' on a non-extensible target"
@@ -612,32 +747,29 @@ pub fn proxy_get_own_property_descriptor(
 ///
 /// let target = JsObject::new();
 /// let proxy = proxy_new(target, ProxyHandler::default());
-/// assert!(proxy_get_prototype_of(&proxy).unwrap().is_none());
+/// assert_eq!(proxy_get_prototype_of(&proxy).unwrap(), JsValue::Null);
 /// ```
-pub fn proxy_get_prototype_of(proxy: &JsProxy) -> StatorResult<Option<Rc<RefCell<JsObject>>>> {
+pub fn proxy_get_prototype_of(proxy: &JsProxy) -> StatorResult<JsValue> {
     proxy.check_revoked()?;
     if let Some(trap) = &proxy.handler.get_prototype_of {
-        let result = trap(&proxy.target);
+        let result = trap(&proxy.target)?;
+        if !matches!(result, JsValue::Null) && !result.is_object_like() {
+            return Err(StatorError::TypeError(
+                "Proxy getPrototypeOf trap must return an object or null".to_string(),
+            ));
+        }
         // Invariant §10.5.1 step 9: if the target is non-extensible, the trap
         // must return the target's actual prototype.
-        if !proxy.target.is_extensible() {
-            let target_proto = proxy.target.prototype().cloned();
-            let same = match (&result, &target_proto) {
-                (None, None) => true,
-                (Some(a), Some(b)) => Rc::ptr_eq(a, b),
-                _ => false,
-            };
-            if !same {
-                return Err(StatorError::TypeError(
-                    "Proxy getPrototypeOf trap returned a different prototype \
-                     than the non-extensible target's prototype"
-                        .to_string(),
-                ));
-            }
+        if !proxy.target_is_extensible() && !result.same_value(&proxy.target_prototype_value()) {
+            return Err(StatorError::TypeError(
+                "Proxy getPrototypeOf trap returned a different prototype \
+                 than the non-extensible target's prototype"
+                    .to_string(),
+            ));
         }
         Ok(result)
     } else {
-        Ok(proxy.target.prototype().cloned())
+        Ok(proxy.target_prototype_value())
     }
 }
 
@@ -650,45 +782,50 @@ pub fn proxy_get_prototype_of(proxy: &JsProxy) -> StatorResult<Option<Rc<RefCell
 /// # Examples
 ///
 /// ```
-/// use std::cell::RefCell;
-/// use std::rc::Rc;
 /// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_set_prototype_of};
 /// use stator_core::objects::js_object::JsObject;
+/// use stator_core::objects::value::JsValue;
 ///
 /// let target = JsObject::new();
 /// let mut proxy = proxy_new(target, ProxyHandler::default());
-/// let proto = Rc::new(RefCell::new(JsObject::new()));
-/// assert!(proxy_set_prototype_of(&mut proxy, Some(proto)).unwrap());
+/// assert!(proxy_set_prototype_of(
+///     &mut proxy,
+///     JsValue::Null
+/// ).unwrap());
 /// ```
-pub fn proxy_set_prototype_of(
-    proxy: &mut JsProxy,
-    proto: Option<Rc<RefCell<JsObject>>>,
-) -> StatorResult<bool> {
+pub fn proxy_set_prototype_of(proxy: &mut JsProxy, proto: JsValue) -> StatorResult<bool> {
     proxy.check_revoked()?;
     if let Some(trap) = &proxy.handler.set_prototype_of {
         let result = trap(&mut proxy.target, proto.clone())?;
         // Invariant §10.5.2 step 12: if the trap returns true and the target
         // is non-extensible, the provided prototype must be the same as the
         // target's current prototype.
-        if result && !proxy.target.is_extensible() {
-            let target_proto = proxy.target.prototype().cloned();
-            let same = match (&proto, &target_proto) {
-                (None, None) => true,
-                (Some(a), Some(b)) => Rc::ptr_eq(a, b),
-                _ => false,
-            };
-            if !same {
-                return Err(StatorError::TypeError(
-                    "Proxy setPrototypeOf trap returned true for a non-extensible \
-                     target with a different prototype"
-                        .to_string(),
-                ));
-            }
+        if result
+            && !proxy.target_is_extensible()
+            && !proto.same_value(&proxy.target_prototype_value())
+        {
+            return Err(StatorError::TypeError(
+                "Proxy setPrototypeOf trap returned true for a non-extensible \
+                 target with a different prototype"
+                    .to_string(),
+            ));
         }
         Ok(result)
     } else {
         use crate::builtins::object::object_set_prototype_of;
-        Ok(object_set_prototype_of(&mut proxy.target, proto).is_ok())
+        if matches!(proto, JsValue::Null) {
+            Ok(object_set_prototype_of(&mut proxy.target, None).is_ok())
+        } else if proto.is_object_like() {
+            Ok(object_set_prototype_of(
+                &mut proxy.target,
+                Some(Rc::new(RefCell::new(JsObject::new()))),
+            )
+            .is_ok())
+        } else {
+            Err(StatorError::TypeError(
+                "Object prototype may only be an Object or null".to_string(),
+            ))
+        }
     }
 }
 
@@ -718,7 +855,7 @@ pub fn proxy_is_extensible(proxy: &JsProxy) -> StatorResult<bool> {
         return Ok(proxy.target.is_extensible());
     };
     // Invariant §10.5.3 step 7: result must match target.
-    let target_ext = proxy.target.is_extensible();
+    let target_ext = proxy.target_is_extensible();
     if result != target_ext {
         return Err(StatorError::TypeError(format!(
             "Proxy isExtensible trap returned {} but target is {}",
@@ -757,7 +894,7 @@ pub fn proxy_prevent_extensions(proxy: &mut JsProxy) -> StatorResult<bool> {
     };
     // Invariant §10.5.4 step 8: trap may only return true if target is
     // already non-extensible.
-    if result && proxy.target.is_extensible() {
+    if result && proxy.target_is_extensible() {
         return Err(StatorError::TypeError(
             "Proxy preventExtensions trap returned true but target is still extensible".to_string(),
         ));
@@ -813,10 +950,29 @@ pub fn proxy_own_keys(proxy: &JsProxy) -> StatorResult<Vec<JsValue>> {
         .iter()
         .map(normalize_key)
         .collect::<StatorResult<Vec<_>>>()?;
+    let mut seen = HashSet::new();
+    for key in &normalized_result {
+        if !seen.insert(key.clone()) {
+            return Err(StatorError::TypeError(format!(
+                "Proxy ownKeys trap returned duplicate key '{key}'"
+            )));
+        }
+    }
+
+    let target_keys = proxy.target_own_property_keys();
+    for tk in &target_keys {
+        if let Some((_, attrs)) = proxy.target_own_property_descriptor(tk)
+            && !attrs.contains(PropertyAttributes::CONFIGURABLE)
+            && !normalized_result.contains(tk)
+        {
+            return Err(StatorError::TypeError(format!(
+                "Proxy ownKeys trap omitted non-configurable own key '{tk}'"
+            )));
+        }
+    }
     // Invariant §10.5.11 step 26/27: when target is non-extensible, result must
     // exactly cover all target own keys.
-    if !proxy.target.is_extensible() {
-        let target_keys = proxy.target.own_property_keys();
+    if !proxy.target_is_extensible() {
         for tk in &target_keys {
             if !normalized_result.contains(tk) {
                 return Err(StatorError::TypeError(format!(
@@ -892,22 +1048,28 @@ pub fn proxy_apply(
 ///
 /// let mut handler = ProxyHandler::default();
 /// handler.construct = Some(Box::new(|args, _new_target| {
-///     let mut o = JsObject::new();
-///     if let Some(v) = args.first() { o.set_property("v", v.clone()).unwrap(); }
-///     Ok(o)
+///     let mut o = PropertyMap::new();
+///     if let Some(v) = args.first() { o.insert("v".to_string(), v.clone()); }
+///     Ok(JsValue::PlainObject(Rc::new(RefCell::new(o))))
 /// }));
 /// let mut proxy = proxy_new(JsObject::new(), handler);
 /// let obj = proxy_construct(&mut proxy, vec![JsValue::Smi(5)], JsValue::Undefined).unwrap();
-/// assert_eq!(obj.get_property("v"), JsValue::Smi(5));
+/// assert!(matches!(obj, JsValue::PlainObject(_)));
 /// ```
 pub fn proxy_construct(
     proxy: &mut JsProxy,
     arguments_list: Vec<JsValue>,
     new_target: JsValue,
-) -> StatorResult<JsObject> {
+) -> StatorResult<JsValue> {
     proxy.check_revoked()?;
     if let Some(trap) = &proxy.handler.construct {
-        trap(arguments_list, new_target)
+        let result = trap(arguments_list, new_target)?;
+        if !result.is_object_like() {
+            return Err(StatorError::TypeError(
+                "proxy_construct: construct trap must return an object".to_string(),
+            ));
+        }
+        Ok(result)
     } else {
         Err(StatorError::TypeError(
             "proxy_construct: target object is not constructible".to_string(),
@@ -1239,7 +1401,7 @@ mod tests {
             .define_own_property("nc", JsValue::Smi(1), PropertyAttributes::WRITABLE)
             .unwrap();
         let mut handler = ProxyHandler::default();
-        handler.get_own_property_descriptor = Some(Box::new(|_t, _k| None));
+        handler.get_own_property_descriptor = Some(Box::new(|_t, _k| Ok(None)));
         let proxy = proxy_new(target, handler);
         assert!(matches!(
             proxy_get_own_property_descriptor(&proxy, "nc"),
@@ -1252,17 +1414,17 @@ mod tests {
     #[test]
     fn test_proxy_get_prototype_of_no_trap_no_prototype() {
         let proxy = proxy_new(JsObject::new(), ProxyHandler::default());
-        assert!(proxy_get_prototype_of(&proxy).unwrap().is_none());
+        assert_eq!(proxy_get_prototype_of(&proxy).unwrap(), JsValue::Null);
     }
 
     #[test]
     fn test_proxy_get_prototype_of_trap_overrides() {
-        let proto = Rc::new(RefCell::new(JsObject::new()));
-        let proto_clone = Rc::clone(&proto);
+        let proto = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+        let proto_clone = proto.clone();
         let mut handler = ProxyHandler::default();
-        handler.get_prototype_of = Some(Box::new(move |_t| Some(Rc::clone(&proto_clone))));
+        handler.get_prototype_of = Some(Box::new(move |_t| Ok(proto_clone.clone())));
         let proxy = proxy_new(JsObject::new(), handler);
-        assert!(proxy_get_prototype_of(&proxy).unwrap().is_some());
+        assert!(proxy_get_prototype_of(&proxy).unwrap().same_value(&proto));
     }
 
     #[test]
@@ -1270,10 +1432,10 @@ mod tests {
         // Non-extensible target with no prototype; trap returns Some → violation.
         let mut target = JsObject::new();
         target.prevent_extensions();
-        let proto = Rc::new(RefCell::new(JsObject::new()));
-        let proto_clone = Rc::clone(&proto);
+        let proto = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+        let proto_clone = proto.clone();
         let mut handler = ProxyHandler::default();
-        handler.get_prototype_of = Some(Box::new(move |_t| Some(Rc::clone(&proto_clone))));
+        handler.get_prototype_of = Some(Box::new(move |_t| Ok(proto_clone.clone())));
         let proxy = proxy_new(target, handler);
         assert!(matches!(
             proxy_get_prototype_of(&proxy),
@@ -1283,15 +1445,13 @@ mod tests {
 
     #[test]
     fn test_proxy_get_prototype_of_invariant_non_extensible_same_ok() {
-        // Non-extensible target with a prototype; trap returns the same → OK.
-        let proto = Rc::new(RefCell::new(JsObject::new()));
-        let mut target = JsObject::with_prototype(Rc::clone(&proto));
+        // Non-extensible target with null prototype; trap returns the same → OK.
+        let mut target = JsObject::new();
         target.prevent_extensions();
-        let proto_clone = Rc::clone(&proto);
         let mut handler = ProxyHandler::default();
-        handler.get_prototype_of = Some(Box::new(move |_t| Some(Rc::clone(&proto_clone))));
+        handler.get_prototype_of = Some(Box::new(move |_t| Ok(JsValue::Null)));
         let proxy = proxy_new(target, handler);
-        assert!(proxy_get_prototype_of(&proxy).unwrap().is_some());
+        assert_eq!(proxy_get_prototype_of(&proxy).unwrap(), JsValue::Null);
     }
 
     // ── proxy_set_prototype_of ────────────────────────────────────────────────
@@ -1299,8 +1459,8 @@ mod tests {
     #[test]
     fn test_proxy_set_prototype_of_no_trap() {
         let mut proxy = proxy_new(JsObject::new(), ProxyHandler::default());
-        let proto = Rc::new(RefCell::new(JsObject::new()));
-        assert!(proxy_set_prototype_of(&mut proxy, Some(Rc::clone(&proto))).unwrap());
+        let proto = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+        assert!(proxy_set_prototype_of(&mut proxy, proto).unwrap());
         assert!(proxy.target.prototype().is_some());
     }
 
@@ -1312,9 +1472,9 @@ mod tests {
         let mut handler = ProxyHandler::default();
         handler.set_prototype_of = Some(Box::new(|_t, _p| Ok(true)));
         let mut proxy = proxy_new(target, handler);
-        let new_proto = Rc::new(RefCell::new(JsObject::new()));
+        let new_proto = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
         assert!(matches!(
-            proxy_set_prototype_of(&mut proxy, Some(new_proto)),
+            proxy_set_prototype_of(&mut proxy, new_proto),
             Err(StatorError::TypeError(_))
         ));
     }
@@ -1327,7 +1487,7 @@ mod tests {
         let mut handler = ProxyHandler::default();
         handler.set_prototype_of = Some(Box::new(|_t, _p| Ok(true)));
         let mut proxy = proxy_new(target, handler);
-        assert!(proxy_set_prototype_of(&mut proxy, None).unwrap());
+        assert!(proxy_set_prototype_of(&mut proxy, JsValue::Null).unwrap());
     }
 
     // ── proxy_is_extensible ───────────────────────────────────────────────────
@@ -1450,15 +1610,18 @@ mod tests {
     fn test_proxy_construct_with_trap() {
         let mut handler = ProxyHandler::default();
         handler.construct = Some(Box::new(|args, _new_target| {
-            let mut o = JsObject::new();
+            let mut o = PropertyMap::new();
             if let Some(v) = args.first() {
-                o.set_property("v", v.clone()).unwrap();
+                o.insert("v".to_string(), v.clone());
             }
-            Ok(o)
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(o))))
         }));
         let mut proxy = proxy_new(JsObject::new(), handler);
         let obj = proxy_construct(&mut proxy, vec![JsValue::Smi(3)], JsValue::Undefined).unwrap();
-        assert_eq!(obj.get_property("v"), JsValue::Smi(3));
+        let JsValue::PlainObject(map) = obj else {
+            panic!("expected plain object");
+        };
+        assert_eq!(map.borrow().get("v"), Some(&JsValue::Smi(3)));
     }
 
     #[test]
