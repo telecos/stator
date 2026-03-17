@@ -5929,6 +5929,10 @@ pub fn dispatch_call_with_this(
             };
             restore_closure_context(&mut frame, ba);
             populate_self_name(&mut frame, ba, &JsValue::Function(Rc::clone(ba)));
+            // Arrow functions inherit lexical `new.target` from their defining scope.
+            if ba.is_arrow() {
+                frame.new_target = fn_props_get(ba, ".new_target");
+            }
             // Arrow functions use lexical `this` — do NOT override.
             if !ba.is_arrow() {
                 // ES §10.2.1.2: in sloppy mode, null/undefined `this` → globalThis.
@@ -5961,6 +5965,46 @@ pub fn dispatch_call_with_this(
             }
         }
         JsValue::Proxy(proxy) => proxy_apply(&mut proxy.borrow_mut(), this_val, args),
+        _ => Err(StatorError::TypeError("value is not a function".into())),
+    }
+}
+
+/// Like [`dispatch_call_with_this`] but additionally sets `new.target` on the
+/// callee frame.  Used by `Reflect.construct` to implement the three-argument
+/// form where the `newTarget` is not the same as the called constructor.
+pub fn dispatch_construct_call(
+    callee: &JsValue,
+    this_val: JsValue,
+    args: Vec<JsValue>,
+    new_target: JsValue,
+) -> StatorResult<JsValue> {
+    match callee {
+        JsValue::Function(ba) => {
+            push_call_frame("<anonymous>")?;
+            let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
+                InterpreterFrame::new_with_globals((**ba).clone(), args, globals)
+            } else {
+                InterpreterFrame::new((**ba).clone(), args)
+            };
+            restore_closure_context(&mut frame, ba);
+            populate_self_name(&mut frame, ba, &JsValue::Function(Rc::clone(ba)));
+            frame.new_target = new_target;
+            frame
+                .global_env
+                .borrow_mut()
+                .insert("this".to_string(), this_val);
+            let result = Interpreter::run(&mut frame);
+            pop_call_frame();
+            result
+        }
+        JsValue::PlainObject(map) => {
+            let call_fn = map.borrow().get("__call__").cloned();
+            if let Some(f) = call_fn {
+                dispatch_construct_call(&f, this_val, args, new_target)
+            } else {
+                Err(StatorError::TypeError("object is not a function".into()))
+            }
+        }
         _ => Err(StatorError::TypeError("value is not a function".into())),
     }
 }
