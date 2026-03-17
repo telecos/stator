@@ -1035,28 +1035,48 @@ fn plain_delete_property(map: &Rc<RefCell<PropertyMap>>, key: &str) -> bool {
 }
 
 fn plain_own_keys(map: &PropertyMap) -> Vec<JsValue> {
-    let mut keys = Vec::new();
+    let mut string_parts: Vec<JsValue> = Vec::new();
+    let mut symbols: Vec<JsValue> = Vec::new();
     let mut seen = HashSet::new();
     for key in map.keys() {
         if key == "__proto__" {
             continue;
         }
         if let Some(symbol) = property_key_to_symbol(key) {
-            keys.push(JsValue::Symbol(symbol));
+            symbols.push(JsValue::Symbol(symbol));
             continue;
         }
         if let Some(name) = accessor_property_name(key) {
             if seen.insert(name.to_string()) {
-                keys.push(JsValue::String(name.to_string().into()));
+                string_parts.push(JsValue::String(name.to_string().into()));
             }
             continue;
         }
         if is_internal_accessor_key(key) {
             continue;
         }
-        keys.push(JsValue::String(key.clone().into()));
+        string_parts.push(JsValue::String(key.clone().into()));
     }
-    keys
+    // ES spec ordering: integer indices ascending, then string keys in
+    // insertion order, then symbols in insertion order.
+    let mut integer_keys: Vec<(u32, JsValue)> = Vec::new();
+    let mut rest_keys: Vec<JsValue> = Vec::new();
+    for k in string_parts {
+        if let JsValue::String(ref s) = k
+            && let Some(idx) = parse_integer_index_key(s)
+        {
+            integer_keys.push((idx, k));
+            continue;
+        }
+        rest_keys.push(k);
+    }
+    integer_keys.sort_by_key(|(idx, _)| *idx);
+    integer_keys
+        .into_iter()
+        .map(|(_, v)| v)
+        .chain(rest_keys)
+        .chain(symbols)
+        .collect()
 }
 
 /// ECMAScript §23.1.3.1 step 5.b — check `@@isConcatSpreadable`.
@@ -4719,14 +4739,14 @@ fn make_object() -> JsValue {
                 match obj {
                     JsValue::PlainObject(map) => {
                         let borrow = map.borrow();
-                        let mut names: Vec<JsValue> = Vec::new();
+                        let mut names: Vec<String> = Vec::new();
                         let mut seen = std::collections::HashSet::new();
                         for k in borrow.keys() {
                             if let Some(prop) =
                                 k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
                             {
                                 if seen.insert(prop.to_string()) {
-                                    names.push(JsValue::String(prop.to_string().into()));
+                                    names.push(prop.to_string());
                                 }
                                 continue;
                             }
@@ -4734,7 +4754,7 @@ fn make_object() -> JsValue {
                                 k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
                             {
                                 if seen.insert(prop.to_string()) {
-                                    names.push(JsValue::String(prop.to_string().into()));
+                                    names.push(prop.to_string());
                                 }
                                 continue;
                             }
@@ -4742,10 +4762,27 @@ fn make_object() -> JsValue {
                                 continue;
                             }
                             if seen.insert(k.clone()) {
-                                names.push(JsValue::String(k.clone().into()));
+                                names.push(k.clone());
                             }
                         }
-                        Ok(JsValue::new_array(names))
+                        // ES spec ordering: integer indices ascending, then
+                        // string keys in insertion order.
+                        let mut integer_keys: Vec<(u32, String)> = Vec::new();
+                        let mut string_keys: Vec<String> = Vec::new();
+                        for name in names {
+                            if let Some(idx) = parse_integer_index_key(&name) {
+                                integer_keys.push((idx, name));
+                            } else {
+                                string_keys.push(name);
+                            }
+                        }
+                        integer_keys.sort_by_key(|(idx, _)| *idx);
+                        let sorted: Vec<JsValue> = integer_keys
+                            .into_iter()
+                            .map(|(_, s)| JsValue::String(s.into()))
+                            .chain(string_keys.into_iter().map(|s| JsValue::String(s.into())))
+                            .collect();
+                        Ok(JsValue::new_array(sorted))
                     }
                     JsValue::Array(items) => {
                         let len = items.borrow().len();
