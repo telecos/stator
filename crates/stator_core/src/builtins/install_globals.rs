@@ -1510,24 +1510,41 @@ fn from_entries_pair(entry: &JsValue) -> StatorResult<(String, JsValue)> {
     }
 }
 
-/// If `value` is a RegExp `PlainObject` (has `__is_regexp__`), invoke the
-/// given `__symbol_*__` method with the supplied arguments and return the
-/// result.  Otherwise return `None` so the caller can fall through to the
-/// plain-string implementation.
-fn try_regexp_symbol(
+/// If `value` exposes a string-protocol symbol method, invoke it with `value`
+/// as `this` and the supplied arguments.
+///
+/// The engine stores built-in RegExp methods in hidden `__symbol_*__` slots,
+/// while user code can define the corresponding well-known symbol property
+/// (`Symbol.match`, `Symbol.replace`, …). This helper checks both forms so
+/// `String.prototype.*` can delegate to built-ins and custom objects alike.
+///
+/// Returns `None` when the protocol method is absent or explicitly
+/// `undefined`/`null`, so callers can fall back to the plain-string path.
+fn try_string_protocol_method(
     value: &JsValue,
-    symbol_key: &str,
+    symbol: u64,
+    hidden_symbol_key: &str,
     args: Vec<JsValue>,
 ) -> Option<StatorResult<JsValue>> {
-    if let JsValue::PlainObject(map) = value {
-        let borrow = map.borrow();
-        let is_re = matches!(borrow.get("__is_regexp__"), Some(JsValue::Boolean(true)));
-        if is_re && let Some(JsValue::NativeFunction(f)) = borrow.get(symbol_key).cloned() {
-            drop(borrow);
-            return Some(f(args));
-        }
+    if matches!(value, JsValue::Undefined | JsValue::Null) {
+        return None;
     }
-    None
+
+    match dispatch_get_property_value(value, JsValue::Symbol(symbol)) {
+        Ok(method) if !matches!(method, JsValue::Undefined | JsValue::Null) => {
+            return Some(dispatch_call_with_this(&method, value.clone(), args));
+        }
+        Ok(_) => {}
+        Err(err) => return Some(Err(err)),
+    }
+
+    match dispatch_get_property_value(value, JsValue::String(hidden_symbol_key.into())) {
+        Ok(method) if !matches!(method, JsValue::Undefined | JsValue::Null) => {
+            Some(dispatch_call_with_this(&method, value.clone(), args))
+        }
+        Ok(_) => None,
+        Err(err) => Some(Err(err)),
+    }
 }
 
 /// ES2025 §7.3.45 `GetSetRecord` materialised for Set composition methods.
@@ -9908,14 +9925,16 @@ fn make_string() -> JsValue {
             native(|args| {
                 let s = require_coercible_string(&args)?;
                 let sep_arg = args.get(1).unwrap_or(&JsValue::Undefined);
-                // Delegate to RegExp[@@split] when separator is a regexp.
-                if let Some(result) = try_regexp_symbol(sep_arg, "__symbol_split__", {
-                    let mut a = vec![JsValue::String(s.clone().into())];
-                    if let Some(lim) = args.get(2) {
-                        a.push(lim.clone());
-                    }
-                    a
-                }) {
+                // Delegate to `separator[@@split]` when present.
+                if let Some(result) =
+                    try_string_protocol_method(sep_arg, SYMBOL_SPLIT, "__symbol_split__", {
+                        let mut a = vec![JsValue::String(s.clone().into())];
+                        if let Some(lim) = args.get(2) {
+                            a.push(lim.clone());
+                        }
+                        a
+                    })
+                {
                     return result;
                 }
                 let sep = match sep_arg {
@@ -9941,9 +9960,10 @@ fn make_string() -> JsValue {
             native(|args| {
                 let s = require_coercible_string(&args)?;
                 let search_arg = args.get(1).unwrap_or(&JsValue::Undefined);
-                // Delegate to RegExp[@@replace] when searchValue is a regexp.
-                if let Some(result) = try_regexp_symbol(
+                // Delegate to `searchValue[@@replace]` when present.
+                if let Some(result) = try_string_protocol_method(
                     search_arg,
+                    SYMBOL_REPLACE,
                     "__symbol_replace__",
                     vec![
                         JsValue::String(s.clone().into()),
@@ -10083,9 +10103,10 @@ fn make_string() -> JsValue {
             native(|args| {
                 let s = require_coercible_string(&args)?;
                 let pattern_arg = args.get(1).unwrap_or(&JsValue::Undefined);
-                // Delegate to RegExp[@@match] when argument is a regexp.
-                if let Some(result) = try_regexp_symbol(
+                // Delegate to `regexp[@@match]` when present.
+                if let Some(result) = try_string_protocol_method(
                     pattern_arg,
+                    SYMBOL_MATCH,
                     "__symbol_match__",
                     vec![JsValue::String(s.clone().into())],
                 ) {
@@ -10126,9 +10147,10 @@ fn make_string() -> JsValue {
                     ));
                 }
 
-                // Delegate to RegExp[@@matchAll] when argument is a regexp.
-                if let Some(result) = try_regexp_symbol(
+                // Delegate to `regexp[@@matchAll]` when present.
+                if let Some(result) = try_string_protocol_method(
                     pattern_arg,
+                    SYMBOL_MATCH_ALL,
                     "__symbol_match_all__",
                     vec![JsValue::String(s.clone().into())],
                 ) {
@@ -10143,8 +10165,9 @@ fn make_string() -> JsValue {
                     JsValue::String(pattern.into()),
                     JsValue::String("g".into()),
                 ])?;
-                if let Some(result) = try_regexp_symbol(
+                if let Some(result) = try_string_protocol_method(
                     &re_val,
+                    SYMBOL_MATCH_ALL,
                     "__symbol_match_all__",
                     vec![JsValue::String(s.into())],
                 ) {
@@ -10257,9 +10280,10 @@ fn make_string() -> JsValue {
             native(|args| {
                 let s = require_coercible_string(&args)?;
                 let pattern_arg = args.get(1).unwrap_or(&JsValue::Undefined);
-                // Delegate to RegExp[@@search] when argument is a regexp.
-                if let Some(result) = try_regexp_symbol(
+                // Delegate to `regexp[@@search]` when present.
+                if let Some(result) = try_string_protocol_method(
                     pattern_arg,
+                    SYMBOL_SEARCH,
                     "__symbol_search__",
                     vec![JsValue::String(s.clone().into())],
                 ) {
@@ -51695,6 +51719,306 @@ mod tests {
             parts[0] === "a" && parts[1] === undefined && parts[2] === "b""#,
         );
     }
+
+    macro_rules! string_symbol_dispatch_test {
+        ($(#[$meta:meta])* $name:ident, $script:expr) => {
+            $(#[$meta])*
+            #[test]
+            fn $name() {
+                assert_eval_true($script);
+            }
+        };
+    }
+
+    // ── String protocol dispatch e2e tests ─────────────────────────────────
+
+    string_symbol_dispatch_test!(
+        /// `String.prototype.match` delegates to custom `@@match`.
+        e2e_string_match_custom_symbol_dispatch,
+        r#"var matcher = {}; Object.defineProperty(matcher, Symbol.match, { value: function(s) { return "ok:" + s; } }); "abc".match(matcher) === "ok:abc""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Custom `@@match` receives the source string.
+        e2e_string_match_custom_symbol_receives_input,
+        r#"var seen = ""; var matcher = {}; Object.defineProperty(matcher, Symbol.match, { value: function(s) { seen = s; return null; } }); "abc".match(matcher) === null && seen === "abc""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Custom `@@match` receives the matcher as `this`.
+        e2e_string_match_custom_symbol_this_binding,
+        r#"var matcher = {}; Object.defineProperty(matcher, Symbol.match, { value: function(s) { return this === matcher && s === "abc"; } }); "abc".match(matcher) === true"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Inherited `@@match` participates in `String.prototype.match`.
+        e2e_string_match_custom_symbol_inherited,
+        r#"var proto = {}; Object.defineProperty(proto, Symbol.match, { value: function(s) { return "proto:" + s; } }); var matcher = Object.create(proto); "abc".match(matcher) === "proto:abc""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Non-callable `@@match` throws.
+        e2e_string_match_custom_symbol_non_callable_throws,
+        r#"var matcher = {}; Object.defineProperty(matcher, Symbol.match, { value: 123 }); try { "abc".match(matcher); false; } catch (e) { e instanceof TypeError; }"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `undefined` `@@match` falls back to string coercion.
+        e2e_string_match_custom_symbol_undefined_falls_back,
+        r#"var matcher = { toString: function() { return "b"; } }; Object.defineProperty(matcher, Symbol.match, { value: undefined }); var m = "abc".match(matcher); m[0] === "b" && m.index === 1"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `String.prototype.replace` delegates to custom `@@replace`.
+        e2e_string_replace_custom_symbol_dispatch,
+        r#"var replacer = {}; Object.defineProperty(replacer, Symbol.replace, { value: function(s, r) { return "R:" + s + ":" + r; } }); "abc".replace(replacer, "X") === "R:abc:X""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Custom `@@replace` receives a string replacement.
+        e2e_string_replace_custom_symbol_receives_string_replacement,
+        r#"var seen = ""; var replacer = {}; Object.defineProperty(replacer, Symbol.replace, { value: function(s, r) { seen = r; return s; } }); "abc".replace(replacer, "X") === "abc" && seen === "X""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Custom `@@replace` receives a functional replacer unchanged.
+        e2e_string_replace_custom_symbol_receives_function_replacement,
+        r#"var fn = function() {}; var ok = false; var replacer = {}; Object.defineProperty(replacer, Symbol.replace, { value: function(s, r) { ok = r === fn && s === "abc"; return "done"; } }); "abc".replace(replacer, fn) === "done" && ok"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Custom `@@replace` receives the replacer as `this`.
+        e2e_string_replace_custom_symbol_this_binding,
+        r#"var replacer = {}; Object.defineProperty(replacer, Symbol.replace, { value: function(s, r) { return this === replacer && s === "abc" && r === "X"; } }); "abc".replace(replacer, "X") === true"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Inherited `@@replace` participates in `String.prototype.replace`.
+        e2e_string_replace_custom_symbol_inherited,
+        r#"var proto = {}; Object.defineProperty(proto, Symbol.replace, { value: function(s, r) { return s + ":" + r; } }); var replacer = Object.create(proto); "abc".replace(replacer, "X") === "abc:X""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Non-callable `@@replace` throws.
+        e2e_string_replace_custom_symbol_non_callable_throws,
+        r#"var replacer = {}; Object.defineProperty(replacer, Symbol.replace, { value: 123 }); try { "abc".replace(replacer, "X"); false; } catch (e) { e instanceof TypeError; }"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `undefined` `@@replace` falls back to string coercion.
+        e2e_string_replace_custom_symbol_undefined_falls_back,
+        r#"var replacer = { toString: function() { return "b"; } }; Object.defineProperty(replacer, Symbol.replace, { value: undefined }); "abca".replace(replacer, "X") === "aXca""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Functional regexp replacement receives capture, index, and input.
+        e2e_regexp_replace_function_receives_capture_index_input,
+        r#""abc123".replace(/(\d+)/, function(m, d, idx, input) { return d + ":" + idx + ":" + input; }) === "abc123:3:abc123""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Functional regexp replacement receives named groups.
+        e2e_regexp_replace_function_receives_named_groups,
+        r#""2024-07".replace(/(?<y>\d{4})-(?<m>\d{2})/, function(m, y, mo, idx, input, groups) { return groups.m + "/" + groups.y; }) === "07/2024""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `$1` substitutions use captured groups.
+        e2e_regexp_replace_dollar_1_substitution,
+        r#""abc123".replace(/(\d)(\d)(\d)/, "$3$2$1") === "abc321""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `$&` substitutions use the matched text.
+        e2e_regexp_replace_dollar_ampersand_substitution,
+        r#""hello".replace(/l+/, "<$&>") === "he<ll>o""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// ``$``` substitutions use the prefix.
+        e2e_regexp_replace_dollar_backtick_substitution,
+        r#""abc123def".replace(/\d+/, "$`") === "abcabcdef""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `$'` substitutions use the suffix.
+        e2e_regexp_replace_dollar_quote_substitution,
+        r#""abc123def".replace(/\d+/, "$'") === "abcdefdef""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `$<name>` substitutions use named captures.
+        e2e_regexp_replace_named_group_string_substitution,
+        r#""2024-07".replace(/(?<y>\d{4})-(?<m>\d{2})/, "$<m>/$<y>") === "07/2024""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Global functional regexp replacement visits each match.
+        e2e_regexp_replace_global_functional_replacer,
+        r#""a1 b2".replace(/\d/g, function(m) { return "[" + m + "]"; }) === "a[1] b[2]""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `String.prototype.search` delegates to custom `@@search`.
+        e2e_string_search_custom_symbol_dispatch,
+        r#"var searcher = {}; Object.defineProperty(searcher, Symbol.search, { value: function(s) { return 7; } }); "abc".search(searcher) === 7"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Custom `@@search` receives the source string.
+        e2e_string_search_custom_symbol_receives_input,
+        r#"var seen = ""; var searcher = {}; Object.defineProperty(searcher, Symbol.search, { value: function(s) { seen = s; return -1; } }); "abc".search(searcher) === -1 && seen === "abc""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Custom `@@search` receives the searcher as `this`.
+        e2e_string_search_custom_symbol_this_binding,
+        r#"var searcher = {}; Object.defineProperty(searcher, Symbol.search, { value: function(s) { return this === searcher && s === "abc"; } }); "abc".search(searcher) === true"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Inherited `@@search` participates in `String.prototype.search`.
+        e2e_string_search_custom_symbol_inherited,
+        r#"var proto = {}; Object.defineProperty(proto, Symbol.search, { value: function(s) { return s.length; } }); var searcher = Object.create(proto); "abc".search(searcher) === 3"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Non-callable `@@search` throws.
+        e2e_string_search_custom_symbol_non_callable_throws,
+        r#"var searcher = {}; Object.defineProperty(searcher, Symbol.search, { value: 123 }); try { "abc".search(searcher); false; } catch (e) { e instanceof TypeError; }"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `undefined` `@@search` falls back to string coercion.
+        e2e_string_search_custom_symbol_undefined_falls_back,
+        r#"var searcher = { toString: function() { return "b"; } }; Object.defineProperty(searcher, Symbol.search, { value: undefined }); "abc".search(searcher) === 1"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// RegExp search preserves the original `lastIndex`.
+        e2e_string_search_regexp_preserves_last_index,
+        r#"var re = /a/g; re.lastIndex = 2; "aba".search(re) === 0 && re.lastIndex === 2"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// RegExp search reports UTF-16 indices.
+        e2e_string_search_regexp_reports_utf16_index,
+        r#""😀a".search(/a/) === 2"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `String.prototype.split` delegates to custom `@@split`.
+        e2e_string_split_custom_symbol_dispatch,
+        r#"var splitter = {}; Object.defineProperty(splitter, Symbol.split, { value: function(s, limit) { return ["x", String(limit), s]; } }); var out = "abc".split(splitter, 5); Array.isArray(out) && out.length === 3 && out[0] === "x" && out[1] === "5" && out[2] === "abc""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Custom `@@split` receives the limit argument.
+        e2e_string_split_custom_symbol_receives_limit,
+        r#"var got = 0; var splitter = {}; Object.defineProperty(splitter, Symbol.split, { value: function(s, limit) { got = limit; return []; } }); "abc".split(splitter, 7).length === 0 && got === 7"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Custom `@@split` receives the splitter as `this`.
+        e2e_string_split_custom_symbol_this_binding,
+        r#"var splitter = {}; Object.defineProperty(splitter, Symbol.split, { value: function(s, limit) { return this === splitter && s === "abc" && limit === 3 ? ["ok"] : ["bad"]; } }); "abc".split(splitter, 3)[0] === "ok""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Inherited `@@split` participates in `String.prototype.split`.
+        e2e_string_split_custom_symbol_inherited,
+        r#"var proto = {}; Object.defineProperty(proto, Symbol.split, { value: function(s, limit) { return [s, String(limit)]; } }); var splitter = Object.create(proto); var out = "abc".split(splitter, 2); out.length === 2 && out[0] === "abc" && out[1] === "2""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Non-callable `@@split` throws.
+        e2e_string_split_custom_symbol_non_callable_throws,
+        r#"var splitter = {}; Object.defineProperty(splitter, Symbol.split, { value: 123 }); try { "abc".split(splitter); false; } catch (e) { e instanceof TypeError; }"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `undefined` `@@split` falls back to string coercion.
+        e2e_string_split_custom_symbol_undefined_falls_back,
+        r#"var splitter = { toString: function() { return "b"; } }; Object.defineProperty(splitter, Symbol.split, { value: undefined }); var out = "abcb".split(splitter); out.length === 3 && out[0] === "a" && out[1] === "c" && out[2] === """#
+    );
+
+    string_symbol_dispatch_test!(
+        /// RegExp split honours the limit argument.
+        e2e_string_split_regexp_limit,
+        r#"var out = "a,b,c".split(/,/, 2); out.length === 2 && out[0] === "a" && out[1] === "b""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// RegExp split with limit `0` returns an empty array.
+        e2e_string_split_regexp_zero_limit,
+        r#"var out = "a,b,c".split(/,/, 0); Array.isArray(out) && out.length === 0"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// RegExp split includes capture groups.
+        e2e_string_split_regexp_includes_captures,
+        r#"var out = "a1b2c".split(/(\d)/); out.length === 5 && out[1] === "1" && out[3] === "2""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Zero-width regexp split produces individual characters.
+        e2e_string_split_regexp_zero_width_characters,
+        r#"var out = "ab".split(/(?:)/); out.length === 2 && out[0] === "a" && out[1] === "b""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// RegExp split ignores the original `lastIndex`.
+        e2e_string_split_regexp_ignores_last_index,
+        r#"var re = /,/g; re.lastIndex = 2; var out = "a,b,c".split(re); out.length === 3 && out[0] === "a" && out[2] === "c" && re.lastIndex === 2"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Sticky regexps participate correctly in split.
+        e2e_string_split_regexp_sticky_behavior,
+        r#"var out = "abac".split(/a/y); out.length === 3 && out[0] === "" && out[1] === "b" && out[2] === "c""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `String.prototype.matchAll` delegates to custom `@@matchAll`.
+        e2e_string_match_all_custom_symbol_dispatch,
+        r#"var matcher = {}; Object.defineProperty(matcher, Symbol.matchAll, { value: function(s) { return [s, s.toUpperCase()][Symbol.iterator](); } }); var out = Array.from("ab".matchAll(matcher)); out.length === 2 && out[0] === "ab" && out[1] === "AB""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Custom `@@matchAll` receives the matcher as `this`.
+        e2e_string_match_all_custom_symbol_this_binding,
+        r#"var matcher = {}; Object.defineProperty(matcher, Symbol.matchAll, { value: function(s) { return [this === matcher && s === "ab"][Symbol.iterator](); } }); Array.from("ab".matchAll(matcher))[0] === true"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Inherited `@@matchAll` participates in `String.prototype.matchAll`.
+        e2e_string_match_all_custom_symbol_inherited,
+        r#"var proto = {}; Object.defineProperty(proto, Symbol.matchAll, { value: function(s) { return [s.length][Symbol.iterator](); } }); var matcher = Object.create(proto); Array.from("abcd".matchAll(matcher))[0] === 4"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Non-callable `@@matchAll` throws.
+        e2e_string_match_all_custom_symbol_non_callable_throws,
+        r#"var matcher = {}; Object.defineProperty(matcher, Symbol.matchAll, { value: 123 }); try { Array.from("ab".matchAll(matcher)); false; } catch (e) { e instanceof TypeError; }"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// `undefined` `@@matchAll` falls back to string coercion.
+        e2e_string_match_all_custom_symbol_undefined_falls_back,
+        r#"var matcher = { toString: function() { return "a"; } }; Object.defineProperty(matcher, Symbol.matchAll, { value: undefined }); Array.from("aba".matchAll(matcher)).length === 2"#
+    );
+
+    string_symbol_dispatch_test!(
+        /// Custom `@@matchAll` does not require a global regexp.
+        e2e_string_match_all_custom_symbol_no_global_requirement,
+        r#"var matcher = {}; Object.defineProperty(matcher, Symbol.matchAll, { value: function(s) { return [s + "!"][Symbol.iterator](); } }); Array.from("ab".matchAll(matcher))[0] === "ab!""#
+    );
+
+    string_symbol_dispatch_test!(
+        /// RegExp `matchAll` preserves the original `lastIndex`.
+        e2e_string_match_all_regexp_preserves_last_index,
+        r#"var re = /a/g; re.lastIndex = 1; var out = Array.from("baaa".matchAll(re)); re.lastIndex === 1 && out.length === 3 && out[0].index === 1 && out[2].index === 3"#
+    );
 
     // ── RegExp constructor ───────────────────────────────────────────────
 
