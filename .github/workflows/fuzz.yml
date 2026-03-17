@@ -66,8 +66,7 @@ jobs:
             ${{ runner.os }}-cargo-fuzz-
 
       - name: Install cargo-fuzz
-        if: steps.cache-cargo-fuzz.outputs.cache-hit != 'true'
-        run: cargo install cargo-fuzz
+        run: command -v cargo-fuzz || cargo install cargo-fuzz
 
       - name: Build fuzz target
         run: cargo +nightly fuzz build ${{ matrix.target }}
