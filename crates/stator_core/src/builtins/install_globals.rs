@@ -1029,27 +1029,46 @@ fn plain_delete_property(map: &Rc<RefCell<PropertyMap>>, key: &str) -> bool {
 }
 
 fn plain_own_keys(map: &PropertyMap) -> Vec<JsValue> {
-    let mut keys = Vec::new();
+    let mut index_keys: Vec<(u64, JsValue)> = Vec::new();
+    let mut string_keys: Vec<JsValue> = Vec::new();
+    let mut symbol_keys: Vec<JsValue> = Vec::new();
     let mut seen = HashSet::new();
     for key in map.keys() {
         if key == "__proto__" {
             continue;
         }
         if let Some(symbol) = property_key_to_symbol(key) {
-            keys.push(JsValue::Symbol(symbol));
+            symbol_keys.push(JsValue::Symbol(symbol));
             continue;
         }
         if let Some(name) = accessor_property_name(key) {
             if seen.insert(name.to_string()) {
-                keys.push(JsValue::String(name.to_string().into()));
+                if let Ok(idx) = name.parse::<u64>()
+                    && name == idx.to_string()
+                {
+                    index_keys.push((idx, JsValue::String(name.to_string().into())));
+                    continue;
+                }
+                string_keys.push(JsValue::String(name.to_string().into()));
             }
             continue;
         }
         if is_internal_accessor_key(key) {
             continue;
         }
-        keys.push(JsValue::String(key.clone().into()));
+        // ECMAScript §10.1.11.1: integer indices come first, sorted numerically.
+        if let Ok(idx) = key.parse::<u64>()
+            && *key == idx.to_string()
+        {
+            index_keys.push((idx, JsValue::String(key.clone().into())));
+            continue;
+        }
+        string_keys.push(JsValue::String(key.clone().into()));
     }
+    index_keys.sort_by_key(|(idx, _)| *idx);
+    let mut keys: Vec<JsValue> = index_keys.into_iter().map(|(_, v)| v).collect();
+    keys.extend(string_keys);
+    keys.extend(symbol_keys);
     keys
 }
 
@@ -11539,12 +11558,12 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
     if is_callable(target_val) {
         let target = target_val.clone();
         let handler_this = handler_this.clone();
-        handler.construct = Some(Box::new(move |args| {
+        handler.construct = Some(Box::new(move |args, new_target| {
             if let Some(trap) = &construct_trap {
                 let result = call_proxy_handler_trap(
                     trap,
                     &handler_this,
-                    vec![target.clone(), JsValue::new_array(args)],
+                    vec![target.clone(), JsValue::new_array(args), new_target],
                 )?;
                 return match &result {
                     JsValue::PlainObject(map) => Ok(plain_object_to_js_object(map)),
@@ -32170,5 +32189,629 @@ mod tests {
     fn e2e_set_constructor_null_creates_empty() {
         let result = global_eval("var s = new Set(null); s.size === 0").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Proxy + Reflect integration e2e tests ───────────────────────────────
+
+    /// Reflect.ownKeys returns integer indices first, sorted numerically.
+    #[test]
+    fn e2e_reflect_own_keys_integer_string_symbol_ordering() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj["b"] = 1;
+            obj[2] = 2;
+            obj["a"] = 3;
+            obj[0] = 4;
+            var keys = Reflect.ownKeys(obj);
+            keys[0] + "," + keys[1] + "," + keys[2] + "," + keys[3];
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,2,b,a".into()));
+    }
+
+    /// Reflect.ownKeys places symbols after all string keys.
+    #[test]
+    fn e2e_reflect_own_keys_symbols_last() {
+        let r = global_eval(
+            r#"
+            var s = Symbol("s");
+            var obj = {};
+            obj[s] = 1;
+            obj["a"] = 2;
+            obj[0] = 3;
+            var keys = Reflect.ownKeys(obj);
+            keys[0] === "0" && keys[1] === "a" && keys[2] === s;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.apply uses the provided thisArg.
+    #[test]
+    fn e2e_reflect_apply_this_binding_method() {
+        let r = global_eval(
+            r#"
+            var obj = { multiplier: 3, calc: function(x) { return this.multiplier * x; } };
+            Reflect.apply(obj.calc, { multiplier: 5 }, [4]);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(20));
+    }
+
+    /// Reflect.apply with empty arguments list.
+    #[test]
+    fn e2e_reflect_apply_empty_args() {
+        let r = global_eval(
+            r#"
+            function f() { return 42; }
+            Reflect.apply(f, undefined, []);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Reflect.construct with newTarget sets prototype correctly.
+    #[test]
+    fn e2e_reflect_construct_new_target_separate_prototype() {
+        let r = global_eval(
+            r#"
+            function A(x) { this.x = x; }
+            function B() {}
+            B.prototype.kind = "B";
+            var obj = Reflect.construct(A, [10], B);
+            obj.x === 10 && Object.getPrototypeOf(obj) === B.prototype;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.construct without newTarget defaults to target.
+    #[test]
+    fn e2e_reflect_construct_default_new_target() {
+        let r = global_eval(
+            r#"
+            function Foo(v) { this.v = v; }
+            Foo.prototype.tag = "foo";
+            var obj = Reflect.construct(Foo, [7]);
+            obj.v === 7 && Object.getPrototypeOf(obj) === Foo.prototype;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.defineProperty returns boolean true on success.
+    #[test]
+    fn e2e_reflect_define_property_returns_true() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            var result = Reflect.defineProperty(obj, "k", { value: 1, writable: true, configurable: true });
+            result === true && obj.k === 1;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.defineProperty returns false for non-extensible target.
+    #[test]
+    fn e2e_reflect_define_property_returns_false_non_extensible() {
+        let r = global_eval(
+            r#"
+            var obj = Object.preventExtensions({});
+            Reflect.defineProperty(obj, "k", { value: 1 });
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Reflect.get with receiver uses receiver as `this` for getter.
+    #[test]
+    fn e2e_reflect_get_receiver_used_for_getter_chain() {
+        let r = global_eval(
+            r#"
+            var base = {};
+            Object.defineProperty(base, "x", {
+                get: function() { return this.val * 2; },
+                configurable: true
+            });
+            Reflect.get(base, "x", { val: 21 });
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Reflect.set with a separate receiver stores on the receiver.
+    #[test]
+    fn e2e_reflect_set_receiver_stores_on_receiver() {
+        let r = global_eval(
+            r#"
+            var target = {};
+            var receiver = {};
+            Reflect.set(target, "k", 77, receiver);
+            receiver.k === 77 && target.k === undefined;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Proxy handler forwarding get to Reflect.get.
+    #[test]
+    fn e2e_proxy_handler_forwarding_get_to_reflect() {
+        let r = global_eval(
+            r#"
+            var target = { x: 5 };
+            var handler = {
+                get: function(t, k, r) { return Reflect.get(t, k, r); }
+            };
+            var p = new Proxy(target, handler);
+            p.x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    /// Proxy handler forwarding set to Reflect.set.
+    #[test]
+    fn e2e_proxy_handler_forwarding_set_to_reflect() {
+        let r = global_eval(
+            r#"
+            var target = {};
+            var handler = {
+                set: function(t, k, v, r) { return Reflect.set(t, k, v, r); }
+            };
+            var p = new Proxy(target, handler);
+            p.y = 42;
+            target.y;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Proxy handler forwarding has to Reflect.has.
+    #[test]
+    fn e2e_proxy_handler_forwarding_has_to_reflect() {
+        let r = global_eval(
+            r#"
+            var target = { a: 1 };
+            var handler = {
+                has: function(t, k) { return Reflect.has(t, k); }
+            };
+            var p = new Proxy(target, handler);
+            ("a" in p) && !("z" in p);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Proxy handler forwarding deleteProperty to Reflect.deleteProperty.
+    #[test]
+    fn e2e_proxy_handler_forwarding_delete_to_reflect() {
+        let r = global_eval(
+            r#"
+            var target = { a: 1 };
+            var handler = {
+                deleteProperty: function(t, k) { return Reflect.deleteProperty(t, k); }
+            };
+            var p = new Proxy(target, handler);
+            delete p.a;
+            target.a === undefined;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Proxy handler forwarding ownKeys to Reflect.ownKeys.
+    #[test]
+    fn e2e_proxy_handler_forwarding_own_keys_to_reflect() {
+        let r = global_eval(
+            r#"
+            var target = { a: 1, b: 2 };
+            var handler = {
+                ownKeys: function(t) { return Reflect.ownKeys(t); }
+            };
+            var p = new Proxy(target, handler);
+            Reflect.ownKeys(p).length;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// Proxy.revocable: post-revoke get throws TypeError.
+    #[test]
+    fn e2e_proxy_revocable_post_revoke_get_throws() {
+        let r = global_eval(
+            r#"
+            var rev = Proxy.revocable({ x: 1 }, {});
+            rev.revoke();
+            try { rev.proxy.x; "no"; } catch (e) { e instanceof TypeError; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Proxy.revocable: post-revoke set throws TypeError.
+    #[test]
+    fn e2e_proxy_revocable_post_revoke_set_throws() {
+        let r = global_eval(
+            r#"
+            var rev = Proxy.revocable({}, {});
+            rev.revoke();
+            try { rev.proxy.x = 1; "no"; } catch (e) { e instanceof TypeError; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Proxy.revocable: post-revoke `in` throws TypeError.
+    #[test]
+    fn e2e_proxy_revocable_post_revoke_has_throws() {
+        let r = global_eval(
+            r#"
+            var rev = Proxy.revocable({}, {});
+            rev.revoke();
+            try { "x" in rev.proxy; "no"; } catch (e) { e instanceof TypeError; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Proxy.revocable: post-revoke delete throws TypeError.
+    #[test]
+    fn e2e_proxy_revocable_post_revoke_delete_throws() {
+        let r = global_eval(
+            r#"
+            var rev = Proxy.revocable({ x: 1 }, {});
+            rev.revoke();
+            try { delete rev.proxy.x; "no"; } catch (e) { e instanceof TypeError; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Proxy.revocable: post-revoke Reflect.ownKeys throws.
+    #[test]
+    fn e2e_proxy_revocable_post_revoke_own_keys_throws() {
+        let r = global_eval(
+            r#"
+            var rev = Proxy.revocable({}, {});
+            rev.revoke();
+            try { Reflect.ownKeys(rev.proxy); "no"; } catch (e) { e instanceof TypeError; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Proxy.revocable: post-revoke Reflect.defineProperty throws.
+    #[test]
+    fn e2e_proxy_revocable_post_revoke_define_property_throws() {
+        let r = global_eval(
+            r#"
+            var rev = Proxy.revocable({}, {});
+            rev.revoke();
+            try { Reflect.defineProperty(rev.proxy, "x", { value: 1 }); "no"; } catch (e) { e instanceof TypeError; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Nested proxy: inner proxy get trap is invoked through outer proxy.
+    #[test]
+    fn e2e_nested_proxy_get() {
+        let r = global_eval(
+            r#"
+            var target = { x: 1 };
+            var inner = new Proxy(target, {
+                get: function(t, k) { return t[k] + 10; }
+            });
+            var outer = new Proxy(inner, {});
+            outer.x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(11));
+    }
+
+    /// Nested proxy: outer trap wraps inner trap.
+    #[test]
+    fn e2e_nested_proxy_both_traps() {
+        let r = global_eval(
+            r#"
+            var target = { x: 1 };
+            var inner = new Proxy(target, {
+                get: function(t, k) { return t[k] * 2; }
+            });
+            var outer = new Proxy(inner, {
+                get: function(t, k) { return t[k] + 100; }
+            });
+            outer.x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(102));
+    }
+
+    /// Nested proxy: set propagates through.
+    #[test]
+    fn e2e_nested_proxy_set() {
+        let r = global_eval(
+            r#"
+            var target = {};
+            var inner = new Proxy(target, {});
+            var outer = new Proxy(inner, {});
+            outer.x = 99;
+            target.x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    /// Nested proxy: has check works through layers.
+    #[test]
+    fn e2e_nested_proxy_has() {
+        let r = global_eval(
+            r#"
+            var target = { a: 1 };
+            var inner = new Proxy(target, {});
+            var outer = new Proxy(inner, {});
+            ("a" in outer) && !("b" in outer);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Nested proxy: apply trap on callable proxy.
+    #[test]
+    fn e2e_nested_proxy_apply() {
+        let r = global_eval(
+            r#"
+            var fn = function(x) { return x + 1; };
+            var inner = new Proxy(fn, {});
+            var outer = new Proxy(inner, {
+                apply: function(t, thisArg, args) { return t(args[0]) + 100; }
+            });
+            outer(5);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(106));
+    }
+
+    /// Proxy construct trap receives newTarget argument.
+    #[test]
+    fn e2e_proxy_construct_trap_receives_new_target() {
+        let r = global_eval(
+            r#"
+            var receivedNewTarget = null;
+            function Base(x) { this.x = x; }
+            var handler = {
+                construct: function(target, args, newTarget) {
+                    receivedNewTarget = newTarget;
+                    return { x: args[0] };
+                }
+            };
+            var P = new Proxy(Base, handler);
+            new P(1);
+            receivedNewTarget === P;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Proxy: typeof proxy on callable target returns "function".
+    #[test]
+    fn e2e_proxy_typeof_callable() {
+        let r = global_eval(
+            r#"
+            var p = new Proxy(function(){}, {});
+            typeof p;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// Proxy: typeof proxy on non-callable target returns "object".
+    #[test]
+    fn e2e_proxy_typeof_non_callable() {
+        let r = global_eval(
+            r#"
+            var p = new Proxy({}, {});
+            typeof p;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    /// Reflect.get on non-object throws TypeError.
+    #[test]
+    fn e2e_reflect_get_non_object_throws() {
+        let r = global_eval(
+            r#"try { Reflect.get(42, "x"); "no"; } catch (e) { e instanceof TypeError; }"#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.set on non-object throws TypeError.
+    #[test]
+    fn e2e_reflect_set_non_object_throws() {
+        let r = global_eval(
+            r#"try { Reflect.set(42, "x", 1); "no"; } catch (e) { e instanceof TypeError; }"#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.has on non-object throws TypeError.
+    #[test]
+    fn e2e_reflect_has_non_object_throws() {
+        let r = global_eval(
+            r#"try { Reflect.has(42, "x"); "no"; } catch (e) { e instanceof TypeError; }"#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Proxy get trap combined with Reflect.get as default.
+    #[test]
+    fn e2e_proxy_logging_handler_with_reflect() {
+        let r = global_eval(
+            r#"
+            var log = [];
+            var target = { a: 1, b: 2 };
+            var handler = {
+                get: function(t, k, r) {
+                    log.push(k);
+                    return Reflect.get(t, k, r);
+                }
+            };
+            var p = new Proxy(target, handler);
+            var sum = p.a + p.b;
+            log.length === 2 && sum === 3;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Proxy set trap combined with Reflect.set for validation.
+    #[test]
+    fn e2e_proxy_validation_handler_with_reflect() {
+        let r = global_eval(
+            r#"
+            var target = {};
+            var handler = {
+                set: function(t, k, v, r) {
+                    if (typeof v !== "number") return false;
+                    return Reflect.set(t, k, v, r);
+                }
+            };
+            var p = new Proxy(target, handler);
+            Reflect.set(p, "x", 42) && !Reflect.set(p, "y", "bad") && target.x === 42 && target.y === undefined;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.ownKeys on array returns index keys then "length".
+    #[test]
+    fn e2e_reflect_own_keys_array() {
+        let r = global_eval(
+            r#"
+            var keys = Reflect.ownKeys([10, 20, 30]);
+            keys[0] + "," + keys[1] + "," + keys[2] + "," + keys[3];
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,1,2,length".into()));
+    }
+
+    /// Proxy get trap returning undefined for missing property.
+    #[test]
+    fn e2e_proxy_get_trap_undefined_missing() {
+        let r = global_eval(
+            r#"
+            var p = new Proxy({}, {
+                get: function(t, k) {
+                    if (k in t) return t[k];
+                    return undefined;
+                }
+            });
+            p.missing === undefined;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Nested proxy with revocation: revoking inner causes outer to throw.
+    #[test]
+    fn e2e_nested_proxy_inner_revoked() {
+        let r = global_eval(
+            r#"
+            var rev = Proxy.revocable({ x: 1 }, {});
+            var outer = new Proxy(rev.proxy, {});
+            var before = outer.x;
+            rev.revoke();
+            try { outer.x; "no"; } catch (e) { before === 1 && e instanceof TypeError; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.apply preserves strict mode this.
+    #[test]
+    fn e2e_reflect_apply_strict_this() {
+        let r = global_eval(
+            r#"
+            function f() { "use strict"; return this; }
+            Reflect.apply(f, null, []) === null;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Proxy handler forwarding defineProperty to Reflect.
+    #[test]
+    fn e2e_proxy_handler_forwarding_define_property_to_reflect() {
+        let r = global_eval(
+            r#"
+            var target = {};
+            var handler = {
+                defineProperty: function(t, k, d) {
+                    return Reflect.defineProperty(t, k, d);
+                }
+            };
+            var p = new Proxy(target, handler);
+            Reflect.defineProperty(p, "x", { value: 55, writable: true, configurable: true });
+            target.x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(55));
+    }
+
+    /// Proxy delete then get returns undefined.
+    #[test]
+    fn e2e_proxy_delete_then_get_undefined() {
+        let r = global_eval(
+            r#"
+            var target = { a: 1 };
+            var p = new Proxy(target, {});
+            delete p.a;
+            p.a === undefined;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
     }
 }
