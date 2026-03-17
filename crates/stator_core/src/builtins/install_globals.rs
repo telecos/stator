@@ -4549,7 +4549,15 @@ fn make_boolean() -> JsValue {
             let val = args.first().unwrap_or(&JsValue::Undefined);
             match val {
                 JsValue::Boolean(b) => Ok(JsValue::String(b.to_string().into())),
-                _ => Ok(JsValue::String("false".to_string().into())),
+                JsValue::PlainObject(map) => match map.borrow().get("[[PrimitiveValue]]") {
+                    Some(JsValue::Boolean(b)) => Ok(JsValue::String(b.to_string().into())),
+                    _ => Err(StatorError::TypeError(
+                        "Boolean.prototype.toString requires that 'this' be a Boolean".into(),
+                    )),
+                },
+                _ => Err(StatorError::TypeError(
+                    "Boolean.prototype.toString requires that 'this' be a Boolean".into(),
+                )),
             }
         }),
     );
@@ -4559,7 +4567,15 @@ fn make_boolean() -> JsValue {
             let val = args.first().unwrap_or(&JsValue::Undefined);
             match val {
                 JsValue::Boolean(b) => Ok(JsValue::Boolean(*b)),
-                _ => Ok(JsValue::Boolean(false)),
+                JsValue::PlainObject(map) => match map.borrow().get("[[PrimitiveValue]]") {
+                    Some(JsValue::Boolean(b)) => Ok(JsValue::Boolean(*b)),
+                    _ => Err(StatorError::TypeError(
+                        "Boolean.prototype.valueOf requires that 'this' be a Boolean".into(),
+                    )),
+                },
+                _ => Err(StatorError::TypeError(
+                    "Boolean.prototype.valueOf requires that 'this' be a Boolean".into(),
+                )),
             }
         }),
     );
@@ -4704,6 +4720,13 @@ fn make_number() -> JsValue {
                 match args.first().unwrap_or(&JsValue::Undefined) {
                     JsValue::Smi(n) => Ok(*n as f64),
                     JsValue::HeapNumber(n) => Ok(*n),
+                    JsValue::PlainObject(map) => match map.borrow().get("[[PrimitiveValue]]") {
+                        Some(JsValue::Smi(n)) => Ok(*n as f64),
+                        Some(JsValue::HeapNumber(n)) => Ok(*n),
+                        _ => Err(crate::error::StatorError::TypeError(
+                            "Number.prototype method requires that 'this' be a Number".to_string(),
+                        )),
+                    },
                     _ => Err(crate::error::StatorError::TypeError(
                         "Number.prototype method requires that 'this' be a Number".to_string(),
                     )),
@@ -7900,10 +7923,16 @@ fn make_symbol() -> JsValue {
         fn symbol_this_id(this: &JsValue) -> Option<u64> {
             match this {
                 JsValue::Symbol(id) => Some(*id),
-                JsValue::PlainObject(map) => match map.borrow().get("__wrapped__") {
-                    Some(JsValue::Symbol(id)) => Some(*id),
-                    _ => None,
-                },
+                JsValue::PlainObject(map) => {
+                    let borrow = map.borrow();
+                    match borrow
+                        .get("__wrapped__")
+                        .or_else(|| borrow.get("[[PrimitiveValue]]"))
+                    {
+                        Some(JsValue::Symbol(id)) => Some(*id),
+                        _ => None,
+                    }
+                }
                 _ => None,
             }
         }
@@ -31820,6 +31849,240 @@ mod tests {
         } else {
             panic!("expected String, got {result:?}");
         }
+    }
+
+    // ── Primitive auto-boxing and wrapper object tests ───────────────────
+
+    #[test]
+    fn e2e_string_primitive_to_upper_case_autoboxes() {
+        assert_eval_true("'hello'.toUpperCase() === 'HELLO'");
+    }
+
+    #[test]
+    fn e2e_string_primitive_to_lower_case_autoboxes() {
+        assert_eval_true("'HELLO'.toLowerCase() === 'hello'");
+    }
+
+    #[test]
+    fn e2e_string_primitive_char_at_autoboxes() {
+        assert_eval_true("'hello'.charAt(1) === 'e'");
+    }
+
+    #[test]
+    fn e2e_string_prototype_call_on_primitive() {
+        assert_eval_true("String.prototype.toUpperCase.call('boxed') === 'BOXED'");
+    }
+
+    #[test]
+    fn e2e_string_value_of_call_on_primitive() {
+        assert_eval_true("String.prototype.valueOf.call('abc') === 'abc'");
+    }
+
+    #[test]
+    fn e2e_string_wrapper_typeof_is_object() {
+        assert_eval_true("typeof new String('abc') === 'object'");
+    }
+
+    #[test]
+    fn e2e_string_primitive_typeof_is_string() {
+        assert_eval_true("typeof 'abc' === 'string'");
+    }
+
+    #[test]
+    fn e2e_string_wrapper_value_of_returns_primitive() {
+        assert_eval_true("new String('abc').valueOf() === 'abc'");
+    }
+
+    #[test]
+    fn e2e_string_wrapper_to_string_returns_primitive_text() {
+        assert_eval_true("new String('abc').toString() === 'abc'");
+    }
+
+    #[test]
+    fn e2e_string_wrapper_is_instance_of_string() {
+        assert_eval_true("new String('abc') instanceof String");
+    }
+
+    #[test]
+    fn e2e_object_string_wrapper_typeof_is_object() {
+        assert_eval_true("typeof Object('hello') === 'object'");
+    }
+
+    #[test]
+    fn e2e_object_string_wrapper_value_of_returns_primitive() {
+        assert_eval_true("Object('hello').valueOf() === 'hello'");
+    }
+
+    #[test]
+    fn e2e_object_string_wrapper_is_instance_of_string() {
+        assert_eval_true("Object('hello') instanceof String");
+    }
+
+    #[test]
+    fn e2e_number_primitive_to_string_hex_autoboxes() {
+        assert_eval_true("(42).toString(16) === '2a'");
+    }
+
+    #[test]
+    fn e2e_number_primitive_to_string_default_autoboxes() {
+        assert_eval_true("(42).toString() === '42'");
+    }
+
+    #[test]
+    fn e2e_number_prototype_to_string_call_on_primitive() {
+        assert_eval_true("Number.prototype.toString.call(255, 16) === 'ff'");
+    }
+
+    #[test]
+    fn e2e_number_prototype_to_string_call_on_wrapper() {
+        assert_eval_true("Number.prototype.toString.call(new Number(255), 16) === 'ff'");
+    }
+
+    #[test]
+    fn e2e_number_wrapper_typeof_is_object() {
+        assert_eval_true("typeof new Number(42) === 'object'");
+    }
+
+    #[test]
+    fn e2e_number_wrapper_value_of_returns_primitive() {
+        assert_eval_true("new Number(42).valueOf() === 42");
+    }
+
+    #[test]
+    fn e2e_number_wrapper_is_instance_of_number() {
+        assert_eval_true("new Number(42) instanceof Number");
+    }
+
+    #[test]
+    fn e2e_object_number_wrapper_typeof_is_object() {
+        assert_eval_true("typeof Object(42) === 'object'");
+    }
+
+    #[test]
+    fn e2e_object_number_wrapper_value_of_returns_primitive() {
+        assert_eval_true("Object(42).valueOf() === 42");
+    }
+
+    #[test]
+    fn e2e_object_number_wrapper_is_instance_of_number() {
+        assert_eval_true("Object(42) instanceof Number");
+    }
+
+    #[test]
+    fn e2e_boolean_primitive_to_string_true_autoboxes() {
+        assert_eval_true("true.toString() === 'true'");
+    }
+
+    #[test]
+    fn e2e_boolean_primitive_to_string_false_autoboxes() {
+        assert_eval_true("false.toString() === 'false'");
+    }
+
+    #[test]
+    fn e2e_boolean_prototype_to_string_call_on_primitive() {
+        assert_eval_true("Boolean.prototype.toString.call(true) === 'true'");
+    }
+
+    #[test]
+    fn e2e_boolean_prototype_to_string_call_on_wrapper() {
+        assert_eval_true("Boolean.prototype.toString.call(new Boolean(true)) === 'true'");
+    }
+
+    #[test]
+    fn e2e_boolean_wrapper_typeof_is_object() {
+        assert_eval_true("typeof new Boolean(false) === 'object'");
+    }
+
+    #[test]
+    fn e2e_boolean_wrapper_value_of_returns_primitive() {
+        assert_eval_true("new Boolean(false).valueOf() === false");
+    }
+
+    #[test]
+    fn e2e_boolean_wrapper_is_truthy() {
+        assert_eval_true("var hit = false; if (new Boolean(false)) { hit = true; } hit");
+    }
+
+    #[test]
+    fn e2e_object_boolean_wrapper_is_instance_of_boolean() {
+        assert_eval_true("Object(true) instanceof Boolean");
+    }
+
+    #[test]
+    fn e2e_object_boolean_wrapper_value_of_returns_primitive() {
+        assert_eval_true("Object(false).valueOf() === false");
+    }
+
+    #[test]
+    fn e2e_symbol_primitive_to_string_autoboxes() {
+        assert_eval_true("Symbol('s').toString() === 'Symbol(s)'");
+    }
+
+    #[test]
+    fn e2e_symbol_prototype_to_string_call_on_primitive() {
+        assert_eval_true("Symbol.prototype.toString.call(Symbol('s')) === 'Symbol(s)'");
+    }
+
+    #[test]
+    fn e2e_object_symbol_wrapper_value_of_returns_same_symbol() {
+        assert_eval_true("var s = Symbol('s'); Object(s).valueOf() === s");
+    }
+
+    #[test]
+    fn e2e_object_symbol_wrapper_is_instance_of_symbol() {
+        assert_eval_true("var s = Symbol('s'); Object(s) instanceof Symbol");
+    }
+
+    #[test]
+    fn e2e_object_prototype_to_string_tags_string_primitive() {
+        assert_eval_true("Object.prototype.toString.call('x') === '[object String]'");
+    }
+
+    #[test]
+    fn e2e_object_prototype_to_string_tags_number_primitive() {
+        assert_eval_true("Object.prototype.toString.call(42) === '[object Number]'");
+    }
+
+    #[test]
+    fn e2e_object_prototype_to_string_tags_boolean_primitive() {
+        assert_eval_true("Object.prototype.toString.call(true) === '[object Boolean]'");
+    }
+
+    #[test]
+    fn e2e_object_prototype_to_string_tags_string_wrapper() {
+        assert_eval_true("Object.prototype.toString.call(new String('x')) === '[object String]'");
+    }
+
+    #[test]
+    fn e2e_object_prototype_to_string_tags_number_wrapper() {
+        assert_eval_true("Object.prototype.toString.call(new Number(42)) === '[object Number]'");
+    }
+
+    #[test]
+    fn e2e_object_prototype_to_string_tags_boolean_wrapper() {
+        assert_eval_true(
+            "Object.prototype.toString.call(new Boolean(false)) === '[object Boolean]'",
+        );
+    }
+
+    #[test]
+    fn e2e_string_wrapper_exposes_length() {
+        assert_eval_true("new String('hello').length === 5");
+    }
+
+    #[test]
+    fn e2e_string_wrapper_exposes_indexed_chars() {
+        assert_eval_true("new String('hello')[1] === 'e'");
+    }
+
+    #[test]
+    fn e2e_null_to_string_throws_type_error() {
+        assert_eval_type_error("null.toString()");
+    }
+
+    #[test]
+    fn e2e_undefined_to_string_throws_type_error() {
+        assert_eval_type_error("undefined.toString()");
     }
 
     // ── String.prototype.replaceAll edge cases ──────────────────────────

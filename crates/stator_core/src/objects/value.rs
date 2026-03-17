@@ -41,6 +41,7 @@ use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::error::{StatorError, StatorResult};
 use crate::gc::trace::{Trace, Tracer};
 use crate::objects::heap_object::HeapObject;
+use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -928,6 +929,9 @@ impl JsValue {
                 let string_for_to_string = string_value.clone();
                 let mut map = PropertyMap::new();
                 map.insert("[[PrimitiveValue]]".to_string(), primitive_value);
+                if matches!(self, Self::Symbol(_)) {
+                    map.insert("__wrapped__".to_string(), self.clone());
+                }
                 map.insert(
                     "@@toStringTag".to_string(),
                     JsValue::String(to_string_tag.to_string().into()),
@@ -940,7 +944,48 @@ impl JsValue {
                     "toString".to_string(),
                     JsValue::NativeFunction(Rc::new(move |_| Ok(string_for_to_string.clone()))),
                 );
+                if let Self::String(s) = self {
+                    map.insert_with_attrs(
+                        "length".to_string(),
+                        JsValue::Smi(s.encode_utf16().count() as i32),
+                        PropertyAttributes::empty(),
+                    );
+                    let utf16: Vec<u16> = s.encode_utf16().collect();
+                    for (index, unit) in utf16.iter().enumerate() {
+                        let ch = String::from_utf16_lossy(std::slice::from_ref(unit));
+                        map.insert(index.to_string(), JsValue::String(ch.into()));
+                    }
+                }
+                let ctor_name = match self {
+                    Self::Boolean(_) => Some("Boolean"),
+                    Self::Smi(_) | Self::HeapNumber(_) => Some("Number"),
+                    Self::String(_) => Some("String"),
+                    Self::Symbol(_) => Some("Symbol"),
+                    Self::BigInt(_) => Some("BigInt"),
+                    _ => None,
+                };
+                if let Some(ctor_name) = ctor_name
+                    && let Some(globals) = crate::interpreter::current_global_env()
+                {
+                    let prototype = {
+                        let globals = globals.borrow();
+                        globals.get(ctor_name).and_then(|ctor| match ctor {
+                            JsValue::PlainObject(map) => map.borrow().get("prototype").cloned(),
+                            _ => None,
+                        })
+                    };
+                    if let Some(prototype) = prototype {
+                        map.insert("__proto__".to_string(), prototype);
+                    }
+                }
                 map.make_all_non_enumerable();
+                if matches!(self, Self::String(_)) {
+                    for raw_key in map.keys().cloned().collect::<Vec<_>>() {
+                        if raw_key.chars().all(|ch| ch.is_ascii_digit()) {
+                            map.set_enumerable(&raw_key, true);
+                        }
+                    }
+                }
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(map))))
             }
             // Object-like types return themselves.

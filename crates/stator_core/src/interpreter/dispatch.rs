@@ -18,15 +18,15 @@ use crate::objects::property_map::PropertyMap;
 use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
     PropertyIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, concat_rc_strs,
-    constant_pool_jump_delta, constant_to_value, decode_string_constant, dispatch_call_property,
-    dispatch_call_value, dispatch_call_with_this, dispatch_getter, dispatch_setter,
-    err_bad_operand, error_message_from_value, extract_context, find_handler, fn_props_get,
-    fn_props_set, has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load,
-    keyed_store, maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan,
+    constant_pool_jump_delta, constant_to_value, construct_builtin_result, decode_string_constant,
+    dispatch_call_property, dispatch_call_value, dispatch_call_with_this, dispatch_getter,
+    dispatch_setter, err_bad_operand, error_message_from_value, extract_context, find_handler,
+    fn_props_get, fn_props_set, has_prototype_in_chain, is_js_receiver, js_add, js_less_than,
+    keyed_load, keyed_store, maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan,
     normalize_async_iterator, number_to_jsvalue, plain_object_to_array_items, populate_self_name,
     proto_lookup, resolve_jump, restore_closure_context, set_function_name_if_missing,
     set_pending_exception, settle_async_iterator_result, strict_eq, to_array_index, to_bigint,
-    to_property_key, try_execute_best_jit, walk_context_chain, wire_construct_prototype,
+    to_property_key, try_execute_best_jit, walk_context_chain,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -2482,7 +2482,7 @@ fn handle_construct(
         JsValue::NativeFunction(f) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
             let val = f(args)?;
-            ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
+            ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
         }
         JsValue::PlainObject(ref map) => {
             // Objects marked with `__no_construct__` (e.g. Symbol) are
@@ -2497,7 +2497,7 @@ fn handle_construct(
                 Some(JsValue::NativeFunction(f)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
                     let val = f(args)?;
-                    ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
+                    ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
                 }
                 Some(JsValue::Function(ba)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
@@ -2580,7 +2580,7 @@ fn handle_construct_with_spread(
         }
         JsValue::NativeFunction(f) => {
             let val = f(args)?;
-            ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
+            ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
         }
         JsValue::PlainObject(ref map) => {
             if map.borrow().get("__no_construct__").is_some() {
@@ -2592,7 +2592,7 @@ fn handle_construct_with_spread(
             match call_val {
                 Some(JsValue::NativeFunction(f)) => {
                     let val = f(args)?;
-                    ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
+                    ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
                 }
                 Some(JsValue::Function(ba)) => {
                     construct_class_from_plain_object(ctx, &ba, map, &ctor_proto, args)?;
@@ -6356,7 +6356,7 @@ fn handle_construct_forward_all_args(
         }
         JsValue::NativeFunction(f) => {
             let val = f(args)?;
-            ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
+            ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
         }
         JsValue::PlainObject(ref map) => {
             if map.borrow().get("__no_construct__").is_some() {
@@ -6368,7 +6368,7 @@ fn handle_construct_forward_all_args(
             match call_val {
                 Some(JsValue::NativeFunction(f)) => {
                     let val = f(args)?;
-                    ctx.frame.accumulator = wire_construct_prototype(val, &ctor_proto);
+                    ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
                 }
                 Some(JsValue::Function(ba)) => {
                     construct_class_from_plain_object(ctx, &ba, map, &ctor_proto, args)?;
