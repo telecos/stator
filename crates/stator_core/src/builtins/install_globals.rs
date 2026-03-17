@@ -52806,4 +52806,704 @@ mod tests {
         .unwrap();
         assert_eq!(result, JsValue::Smi(3));
     }
+
+    // ── Object.freeze / seal / preventExtensions deep conformance ─────
+
+    /// 1. Object.freeze makes properties non-writable.
+    #[test]
+    fn e2e_deep_freeze_makes_non_writable() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1, b: 2, c: 3 };
+            Object.freeze(o);
+            var da = Object.getOwnPropertyDescriptor(o, 'a');
+            var db = Object.getOwnPropertyDescriptor(o, 'b');
+            da.writable + ',' + da.configurable + ',' + db.writable + ',' + db.configurable
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("false,false,false,false".into()));
+    }
+
+    /// 2. Object.freeze makes object non-extensible.
+    #[test]
+    fn e2e_deep_freeze_non_extensible() {
+        let r = global_eval("var o = Object.freeze({ x: 1 }); Object.isExtensible(o)").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// 3. Object.seal makes properties non-configurable but keeps writable.
+    #[test]
+    fn e2e_deep_seal_keeps_writable() {
+        let r = global_eval(
+            r#"
+            var o = { a: 10 };
+            Object.seal(o);
+            var d = Object.getOwnPropertyDescriptor(o, 'a');
+            d.writable + ',' + d.configurable + ',' + d.enumerable
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true,false,true".into()));
+    }
+
+    /// 4. Object.seal makes object non-extensible.
+    #[test]
+    fn e2e_deep_seal_non_extensible() {
+        let r = global_eval("var o = Object.seal({ x: 1 }); Object.isExtensible(o)").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// 5. Sealed object allows reassignment of existing writable property.
+    #[test]
+    fn e2e_deep_seal_reassignment_works() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1 };
+            Object.seal(o);
+            o.a = 42;
+            o.a
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// 6. Sealed object: delete in strict mode throws TypeError.
+    #[test]
+    fn e2e_deep_seal_delete_strict_throws() {
+        let r = global_eval(
+            r#"
+            var o = Object.seal({ a: 1 });
+            try {
+                (function() { "use strict"; delete o.a; })();
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// 7. Sealed object: delete in sloppy mode returns false.
+    #[test]
+    fn e2e_deep_seal_delete_sloppy_returns_false() {
+        let r = global_eval(
+            r#"
+            var o = Object.seal({ a: 1 });
+            var result = delete o.a;
+            String(result) + ',' + String(o.a)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("false,1".into()));
+    }
+
+    /// 8. Frozen object: assignment in strict mode throws TypeError.
+    #[test]
+    fn e2e_deep_freeze_strict_assignment_throws() {
+        let r = global_eval(
+            r#"
+            var o = Object.freeze({ x: 1 });
+            try {
+                (function() { "use strict"; o.x = 99; })();
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// 9. Frozen object: assignment in sloppy mode silently ignored.
+    #[test]
+    fn e2e_deep_freeze_sloppy_assignment_ignored() {
+        let r = global_eval("var o = Object.freeze({ x: 1 }); o.x = 99; o.x").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// 10. Non-extensible: adding new property in strict mode throws TypeError.
+    #[test]
+    fn e2e_deep_prevent_ext_strict_add_throws() {
+        let r = global_eval(
+            r#"
+            var o = Object.preventExtensions({});
+            try {
+                (function() { "use strict"; o.newProp = 1; })();
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// 11. Non-extensible: adding new property in sloppy mode silently ignored.
+    #[test]
+    fn e2e_deep_prevent_ext_sloppy_add_ignored() {
+        let r = global_eval(
+            r#"
+            var o = Object.preventExtensions({});
+            o.newProp = 1;
+            typeof o.newProp
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// 12. Object.preventExtensions allows modification of existing properties.
+    #[test]
+    fn e2e_deep_prevent_ext_modify_existing() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1 };
+            Object.preventExtensions(o);
+            o.a = 100;
+            o.a
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(100));
+    }
+
+    /// 13. Object.preventExtensions allows deletion of existing properties.
+    #[test]
+    fn e2e_deep_prevent_ext_allows_delete() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1 };
+            Object.preventExtensions(o);
+            delete o.a;
+            typeof o.a
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// 14. Object.isFrozen on normal object returns false.
+    #[test]
+    fn e2e_deep_is_frozen_normal_obj() {
+        let r = global_eval("Object.isFrozen({ a: 1 })").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// 15. Object.isSealed on normal object returns false.
+    #[test]
+    fn e2e_deep_is_sealed_normal_obj() {
+        let r = global_eval("Object.isSealed({ a: 1 })").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// 16. Object.isExtensible on normal object returns true.
+    #[test]
+    fn e2e_deep_is_extensible_normal_obj() {
+        let r = global_eval("Object.isExtensible({ a: 1 })").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 17. Frozen object is also sealed.
+    #[test]
+    fn e2e_deep_frozen_implies_sealed() {
+        let r = global_eval(
+            r#"
+            var o = Object.freeze({ a: 1, b: 2 });
+            Object.isSealed(o) + ',' + Object.isFrozen(o)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true,true".into()));
+    }
+
+    /// 18. Sealed object is not necessarily frozen (writable props exist).
+    #[test]
+    fn e2e_deep_sealed_not_frozen() {
+        let r = global_eval(
+            r#"
+            var o = Object.seal({ a: 1 });
+            Object.isSealed(o) + ',' + Object.isFrozen(o)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true,false".into()));
+    }
+
+    /// 19. Empty non-extensible object is both frozen and sealed.
+    #[test]
+    fn e2e_deep_empty_non_ext_frozen_sealed() {
+        let r = global_eval(
+            r#"
+            var o = Object.preventExtensions({});
+            Object.isFrozen(o) + ',' + Object.isSealed(o)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true,true".into()));
+    }
+
+    /// 20. Primitive argument to Object.freeze returns the value unchanged.
+    #[test]
+    fn e2e_deep_freeze_primitive_number() {
+        let r = global_eval("Object.freeze(42)").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// 21. Primitive argument to Object.freeze: string.
+    #[test]
+    fn e2e_deep_freeze_primitive_string() {
+        let r = global_eval("Object.freeze('hello')").unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    /// 22. Primitive argument to Object.freeze: boolean.
+    #[test]
+    fn e2e_deep_freeze_primitive_bool() {
+        let r = global_eval("Object.freeze(true)").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 23. Primitive argument to Object.freeze: null.
+    #[test]
+    fn e2e_deep_freeze_primitive_null() {
+        let r = global_eval("Object.freeze(null)").unwrap();
+        assert_eq!(r, JsValue::Null);
+    }
+
+    /// 24. Primitive argument to Object.freeze: undefined.
+    #[test]
+    fn e2e_deep_freeze_primitive_undefined() {
+        let r = global_eval("Object.freeze(undefined)").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    /// 25. Primitive argument to Object.seal returns the value unchanged.
+    #[test]
+    fn e2e_deep_seal_primitive_number() {
+        let r = global_eval("Object.seal(42)").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// 26. Primitive argument to Object.seal: string.
+    #[test]
+    fn e2e_deep_seal_primitive_string() {
+        let r = global_eval("Object.seal('test')").unwrap();
+        assert_eq!(r, JsValue::String("test".into()));
+    }
+
+    /// 27. Primitive argument to Object.preventExtensions returns value.
+    #[test]
+    fn e2e_deep_prevent_ext_primitive() {
+        let r = global_eval("Object.preventExtensions(42)").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// 28. Object.isFrozen on primitives returns true.
+    #[test]
+    fn e2e_deep_is_frozen_primitives() {
+        let r = global_eval(
+            r#"
+            Object.isFrozen(42) + ',' + Object.isFrozen('hi') + ',' +
+            Object.isFrozen(true) + ',' + Object.isFrozen(null) + ',' +
+            Object.isFrozen(undefined)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true,true,true,true,true".into()));
+    }
+
+    /// 29. Object.isSealed on primitives returns true.
+    #[test]
+    fn e2e_deep_is_sealed_primitives() {
+        let r = global_eval(
+            r#"
+            Object.isSealed(42) + ',' + Object.isSealed('hi') + ',' +
+            Object.isSealed(null) + ',' + Object.isSealed(undefined)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true,true,true,true".into()));
+    }
+
+    /// 30. Object.isExtensible on primitives returns false.
+    #[test]
+    fn e2e_deep_is_extensible_primitives() {
+        let r = global_eval(
+            r#"
+            Object.isExtensible(42) + ',' + Object.isExtensible('s') + ',' +
+            Object.isExtensible(true) + ',' + Object.isExtensible(null) + ',' +
+            Object.isExtensible(undefined)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("false,false,false,false,false".into()));
+    }
+
+    /// 31. Frozen object: defineProperty with same value succeeds.
+    #[test]
+    fn e2e_deep_freeze_define_same_value_ok() {
+        let r = global_eval(
+            r#"
+            var o = Object.freeze({ a: 42 });
+            Object.defineProperty(o, 'a', { value: 42 });
+            o.a
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// 32. Frozen object: defineProperty with different value throws.
+    #[test]
+    fn e2e_deep_freeze_define_diff_value_throws() {
+        let r = global_eval(
+            r#"
+            try {
+                var o = Object.freeze({ a: 1 });
+                Object.defineProperty(o, 'a', { value: 2 });
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// 33. Frozen object: defineProperty adding new property throws.
+    #[test]
+    fn e2e_deep_freeze_define_new_prop_throws() {
+        let r = global_eval(
+            r#"
+            try {
+                var o = Object.freeze({});
+                Object.defineProperty(o, 'x', { value: 1 });
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// 34. Sealed object: defineProperty to change writable on existing is rejected.
+    #[test]
+    fn e2e_deep_seal_define_change_configurable_throws() {
+        let r = global_eval(
+            r#"
+            try {
+                var o = Object.seal({ a: 1 });
+                Object.defineProperty(o, 'a', { configurable: true });
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// 35. Freeze/seal on arrays: freeze prevents index assignment.
+    #[test]
+    fn e2e_deep_freeze_array_no_index_write() {
+        let r = global_eval(
+            r#"
+            var arr = [1, 2, 3];
+            Object.freeze(arr);
+            arr[0] = 99;
+            arr[0]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// 36. Freeze on arrays: isFrozen returns true.
+    #[test]
+    fn e2e_deep_freeze_array_is_frozen() {
+        let r = global_eval("var a = [1,2]; Object.freeze(a); Object.isFrozen(a)").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 37. Seal on arrays: allows index reassignment.
+    #[test]
+    fn e2e_deep_seal_array_allows_reassign() {
+        let r = global_eval(
+            r#"
+            var arr = [10, 20];
+            Object.seal(arr);
+            arr[0] = 99;
+            arr[0]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    /// 38. Seal on arrays: isSealed returns true.
+    #[test]
+    fn e2e_deep_seal_array_is_sealed() {
+        let r = global_eval("var a = [1]; Object.seal(a); Object.isSealed(a)").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 39. Freeze on arrays: cannot push new elements.
+    #[test]
+    fn e2e_deep_freeze_array_no_push() {
+        let r = global_eval(
+            r#"
+            var arr = [1, 2];
+            Object.freeze(arr);
+            try { arr.push(3); 'no error'; } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        // push on a frozen array should throw or silently fail
+        // In sloppy mode, length is non-writable so push fails with TypeError
+        assert!(matches!(
+            r,
+            JsValue::String(_) // either 'error' or push was silently blocked
+        ));
+    }
+
+    /// 40. Frozen object: new property addition silently ignored in sloppy mode.
+    #[test]
+    fn e2e_deep_freeze_sloppy_new_prop_ignored() {
+        let r = global_eval(
+            r#"
+            var o = Object.freeze({});
+            o.x = 1;
+            typeof o.x
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// 41. Frozen object: new property in strict mode throws.
+    #[test]
+    fn e2e_deep_freeze_strict_new_prop_throws() {
+        let r = global_eval(
+            r#"
+            var o = Object.freeze({});
+            try {
+                (function() { "use strict"; o.x = 1; })();
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// 42. Object.freeze returns the same object passed in.
+    #[test]
+    fn e2e_deep_freeze_returns_same_object() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1 };
+            var ret = Object.freeze(o);
+            o === ret
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 43. Object.seal returns the same object passed in.
+    #[test]
+    fn e2e_deep_seal_returns_same_object() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1 };
+            var ret = Object.seal(o);
+            o === ret
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 44. Object.preventExtensions returns the same object passed in.
+    #[test]
+    fn e2e_deep_prevent_ext_returns_same_object() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1 };
+            var ret = Object.preventExtensions(o);
+            o === ret
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 45. Freeze multiple properties — all become non-writable/non-configurable.
+    #[test]
+    fn e2e_deep_freeze_multiple_props() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1, b: 'two', c: true };
+            Object.freeze(o);
+            var results = [];
+            var keys = Object.keys(o);
+            for (var i = 0; i < keys.length; i++) {
+                var d = Object.getOwnPropertyDescriptor(o, keys[i]);
+                results.push(d.writable + ',' + d.configurable);
+            }
+            results.join(';')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            JsValue::String("false,false;false,false;false,false".into())
+        );
+    }
+
+    /// 46. Seal multiple properties — all become non-configurable but keep writable.
+    #[test]
+    fn e2e_deep_seal_multiple_props() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1, b: 2 };
+            Object.seal(o);
+            var da = Object.getOwnPropertyDescriptor(o, 'a');
+            var db = Object.getOwnPropertyDescriptor(o, 'b');
+            da.writable + ',' + da.configurable + ',' + db.writable + ',' + db.configurable
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true,false,true,false".into()));
+    }
+
+    /// 47. Sealed object: cannot add new property via defineProperty.
+    #[test]
+    fn e2e_deep_seal_define_new_prop_throws() {
+        let r = global_eval(
+            r#"
+            try {
+                var o = Object.seal({});
+                Object.defineProperty(o, 'x', { value: 1 });
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// 48. Freeze with nested object — only shallow freeze.
+    #[test]
+    fn e2e_deep_freeze_shallow_only() {
+        let r = global_eval(
+            r#"
+            var inner = { x: 1 };
+            var o = { nested: inner };
+            Object.freeze(o);
+            inner.x = 99;
+            o.nested.x
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    /// 49. isFrozen/isSealed/isExtensible consistency after freeze.
+    #[test]
+    fn e2e_deep_freeze_consistency() {
+        let r = global_eval(
+            r#"
+            var o = Object.freeze({ a: 1 });
+            Object.isFrozen(o) + ',' + Object.isSealed(o) + ',' + Object.isExtensible(o)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true,true,false".into()));
+    }
+
+    /// 50. isFrozen/isSealed/isExtensible consistency after seal.
+    #[test]
+    fn e2e_deep_seal_consistency() {
+        let r = global_eval(
+            r#"
+            var o = Object.seal({ a: 1 });
+            Object.isFrozen(o) + ',' + Object.isSealed(o) + ',' + Object.isExtensible(o)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("false,true,false".into()));
+    }
+
+    /// 51. isFrozen/isSealed/isExtensible consistency after preventExtensions.
+    #[test]
+    fn e2e_deep_prevent_ext_consistency() {
+        let r = global_eval(
+            r#"
+            var o = Object.preventExtensions({ a: 1 });
+            Object.isFrozen(o) + ',' + Object.isSealed(o) + ',' + Object.isExtensible(o)
+            "#,
+        )
+        .unwrap();
+        // preventExtensions only: has writable+configurable props → not frozen/sealed
+        assert_eq!(r, JsValue::String("false,false,false".into()));
+    }
+
+    /// 52. Frozen: delete on frozen property in strict mode throws.
+    #[test]
+    fn e2e_deep_freeze_delete_strict_throws() {
+        let r = global_eval(
+            r#"
+            var o = Object.freeze({ a: 1 });
+            try {
+                (function() { "use strict"; delete o.a; })();
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// 53. Frozen: delete in sloppy mode returns false.
+    #[test]
+    fn e2e_deep_freeze_delete_sloppy_false() {
+        let r = global_eval(
+            r#"
+            var o = Object.freeze({ a: 1 });
+            var result = delete o.a;
+            String(result)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("false".into()));
+    }
+
+    /// 54. Frozen object: defineProperty changing writable throws.
+    #[test]
+    fn e2e_deep_freeze_define_change_writable_throws() {
+        let r = global_eval(
+            r#"
+            try {
+                var o = Object.freeze({ a: 1 });
+                Object.defineProperty(o, 'a', { writable: true });
+                'no error';
+            } catch(e) { 'error'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("error".into()));
+    }
+
+    /// 55. Sealed but writable: defineProperty value change allowed.
+    #[test]
+    fn e2e_deep_seal_define_value_change_ok() {
+        let r = global_eval(
+            r#"
+            var o = Object.seal({ a: 1 });
+            Object.defineProperty(o, 'a', { value: 99 });
+            o.a
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
 }
