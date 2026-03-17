@@ -175,6 +175,7 @@ use std::time::Instant;
 
 use crate::builtins::error::{pop_call_frame, push_call_frame};
 use crate::builtins::function::{function_bound_name, function_length, function_to_string};
+use crate::builtins::iterator::get_bound_iterator_method;
 use crate::builtins::proxy::{proxy_apply, proxy_get_with_receiver, proxy_set_with_receiver};
 use crate::builtins::symbol::symbol_description;
 use crate::bytecode::bytecode_array::{
@@ -2879,6 +2880,15 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             drop(borrow);
             return JsValue::Undefined;
         }
+        if explicit_proto.is_none()
+            && borrow.get("next").is_some_and(|next| {
+                matches!(next, JsValue::Function(_) | JsValue::NativeFunction(_))
+            })
+            && let Some(method) = get_bound_iterator_method(obj, key)
+        {
+            drop(borrow);
+            return method;
+        }
         // Object.prototype methods for internal plain objects without an
         // explicit `__proto__` slot.
         if explicit_proto.is_none() {
@@ -5226,6 +5236,9 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
             "__proto__" => proto.clone().unwrap_or(JsValue::Null),
             _ => {
+                if let Some(method) = get_bound_iterator_method(obj, key) {
+                    return method;
+                }
                 if let Some(proto) = proto {
                     proto_lookup_chain(&proto, key, obj)
                 } else {
@@ -5267,7 +5280,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 let iter = obj.clone();
                 JsValue::NativeFunction(Rc::new(move |_args| Ok(iter.clone())))
             }
-            _ => JsValue::Undefined,
+            _ => get_bound_iterator_method(obj, key).unwrap_or(JsValue::Undefined),
         };
     }
     // Handle JsValue::Promise — expose then/catch/finally.

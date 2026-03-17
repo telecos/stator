@@ -7551,7 +7551,12 @@ fn make_iterator() -> JsValue {
                 .unwrap_or(&JsValue::Undefined)
                 .to_number()
                 .unwrap_or(0.0);
-            iterator_take(iter, limit.max(0.0) as usize)
+            if limit.is_sign_negative() {
+                return Err(StatorError::RangeError(
+                    "Iterator.prototype.take limit must be non-negative".into(),
+                ));
+            }
+            iterator_take(iter, limit as usize)
         }),
     );
     proto.insert(
@@ -7563,7 +7568,12 @@ fn make_iterator() -> JsValue {
                 .unwrap_or(&JsValue::Undefined)
                 .to_number()
                 .unwrap_or(0.0);
-            iterator_drop(iter, count.max(0.0) as usize)
+            if count.is_sign_negative() {
+                return Err(StatorError::RangeError(
+                    "Iterator.prototype.drop count must be non-negative".into(),
+                ));
+            }
+            iterator_drop(iter, count as usize)
         }),
     );
     proto.insert(
@@ -14847,6 +14857,13 @@ mod tests {
         ));
     }
 
+    fn assert_eval_range_error(script: &str) {
+        assert!(matches!(
+            global_eval(script),
+            Err(StatorError::RangeError(_))
+        ));
+    }
+
     /// Verify that `install_globals` populates the expected keys.
     #[test]
     fn test_install_globals_keys() {
@@ -18022,6 +18039,277 @@ mod tests {
         } else {
             panic!("Iterator should be a PlainObject");
         }
+    }
+
+    #[test]
+    fn e2e_iterator_from_array_to_array() {
+        assert_eval_true(
+            "var out = Iterator.from([1, 2, 3]).toArray(); out.length === 3 && out[0] === 1 && out[2] === 3",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_from_string_to_array() {
+        assert_eval_true(
+            "var out = Iterator.from('ab').toArray(); out.length === 2 && out[0] === 'a' && out[1] === 'b'",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_from_native_iterator_returns_same() {
+        assert_eval_true("var iter = [1, 2][Symbol.iterator](); Iterator.from(iter) === iter");
+    }
+
+    #[test]
+    fn e2e_iterator_from_generator_to_array() {
+        assert_eval_true(
+            "function* gen() { yield 1; yield 2; yield 3; } var out = Iterator.from(gen()).toArray(); out.length === 3 && out[1] === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_from_custom_iterator_like_to_array() {
+        assert_eval_true(
+            "var i = 0; var iter = Iterator.from({ next: function() { return i < 3 ? { value: i++, done: false } : { done: true }; } }); var out = iter.toArray(); out.length === 3 && out[0] === 0 && out[2] === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_from_custom_iterable_to_array() {
+        assert_eval_true(
+            "var obj = {}; obj[Symbol.iterator] = function() { var i = 1; return { next: function() { return i <= 3 ? { value: i++ * 10, done: false } : { done: true }; } }; }; var out = Iterator.from(obj).toArray(); out.length === 3 && out[0] === 10 && out[2] === 30",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_from_non_iterable_throws_type_error() {
+        assert_eval_type_error("Iterator.from(123)");
+    }
+
+    #[test]
+    fn e2e_iterator_map_transforms_values() {
+        assert_eval_true(
+            "var out = Iterator.from([1, 2, 3]).map(function(v) { return v * 2; }).toArray(); out.length === 3 && out[0] === 2 && out[2] === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_map_passes_index() {
+        assert_eval_true(
+            "var out = Iterator.from([10, 10, 10]).map(function(v, i) { return v + i; }).toArray(); out[0] === 10 && out[1] === 11 && out[2] === 12",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_map_chainable() {
+        assert_eval_true(
+            "var out = Iterator.from([1, 2, 3]).map(function(v) { return v + 1; }).map(function(v) { return v * 3; }).toArray(); out[0] === 6 && out[2] === 12",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_map_callback_must_be_function() {
+        assert_eval_type_error("Iterator.from([1]).map(0)");
+    }
+
+    #[test]
+    fn e2e_iterator_filter_keeps_matching_values() {
+        assert_eval_true(
+            "var out = Iterator.from([1, 2, 3, 4]).filter(function(v) { return v % 2 === 0; }).toArray(); out.length === 2 && out[0] === 2 && out[1] === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_filter_passes_index() {
+        assert_eval_true(
+            "var out = Iterator.from([5, 5, 5, 5]).filter(function(v, i) { return i % 2 === 0; }).toArray(); out.length === 2 && out[0] === 5 && out[1] === 5",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_filter_chainable() {
+        assert_eval_true(
+            "var out = Iterator.from([1, 2, 3, 4, 5]).filter(function(v) { return v > 1; }).filter(function(v) { return v < 5; }).toArray(); out.length === 3 && out[0] === 2 && out[2] === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_take_limits_results() {
+        assert_eval_true(
+            "var out = Iterator.from([1, 2, 3, 4]).take(2).toArray(); out.length === 2 && out[0] === 1 && out[1] === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_take_zero_is_empty() {
+        assert_eval_true("Iterator.from([1, 2, 3]).take(0).toArray().length === 0");
+    }
+
+    #[test]
+    fn e2e_iterator_take_negative_throws_range_error() {
+        assert_eval_range_error("Iterator.from([1, 2, 3]).take(-1)");
+    }
+
+    #[test]
+    fn e2e_iterator_drop_skips_prefix() {
+        assert_eval_true(
+            "var out = Iterator.from([1, 2, 3, 4]).drop(2).toArray(); out.length === 2 && out[0] === 3 && out[1] === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_drop_allows_zero() {
+        assert_eval_true(
+            "var out = Iterator.from([7, 8]).drop(0).toArray(); out.length === 2 && out[0] === 7 && out[1] === 8",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_drop_negative_throws_range_error() {
+        assert_eval_range_error("Iterator.from([1, 2, 3]).drop(-1)");
+    }
+
+    #[test]
+    fn e2e_iterator_for_each_accumulates_values() {
+        assert_eval_true(
+            "var sum = 0; var ret = Iterator.from([1, 2, 3]).forEach(function(v) { sum += v; }); ret === undefined && sum === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_for_each_consumes_iterator() {
+        assert_eval_true(
+            "var iter = Iterator.from([1, 2, 3]); iter.forEach(function() {}); iter.next().done === true",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_to_array_collects_values() {
+        assert_eval_true(
+            "var out = Iterator.from([4, 5, 6]).toArray(); out.length === 3 && out[0] === 4 && out[2] === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_to_array_consumes_iterator() {
+        assert_eval_true(
+            "var iter = Iterator.from([9, 10]); var out = iter.toArray(); out.length === 2 && iter.next().done === true",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_reduce_with_initial_value() {
+        assert_eval_true(
+            "Iterator.from([1, 2, 3]).reduce(function(acc, v) { return acc + v; }, 10) === 16",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_reduce_without_initial_value() {
+        assert_eval_true(
+            "Iterator.from([1, 2, 3]).reduce(function(acc, v) { return acc + v; }) === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_reduce_empty_without_initial_throws_type_error() {
+        assert_eval_type_error("Iterator.from([]).reduce(function(acc, v) { return acc + v; })");
+    }
+
+    #[test]
+    fn e2e_iterator_reduce_passes_index() {
+        assert_eval_true(
+            "Iterator.from([5, 5, 5]).reduce(function(acc, v, i) { return acc + i; }, 0) === 3",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_some_returns_true_for_match() {
+        assert_eval_true("Iterator.from([1, 2, 3]).some(function(v) { return v === 2; }) === true");
+    }
+
+    #[test]
+    fn e2e_iterator_some_short_circuits() {
+        assert_eval_true(
+            "var seen = 0; var result = Iterator.from([1, 2, 3, 4]).some(function(v) { seen++; return v === 2; }); result === true && seen === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_every_returns_true_when_all_match() {
+        assert_eval_true(
+            "Iterator.from([2, 4, 6]).every(function(v) { return v % 2 === 0; }) === true",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_every_short_circuits_on_false() {
+        assert_eval_true(
+            "var seen = 0; var result = Iterator.from([2, 4, 5, 6]).every(function(v) { seen++; return v % 2 === 0; }); result === false && seen === 3",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_find_returns_first_match() {
+        assert_eval_true(
+            "Iterator.from([1, 3, 4, 6]).find(function(v) { return v % 2 === 0; }) === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_find_returns_undefined_when_missing() {
+        assert_eval_true(
+            "Iterator.from([1, 3, 5]).find(function(v) { return v % 2 === 0; }) === undefined",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_methods_exist_on_native_iterators() {
+        assert_eval_true(
+            "typeof [1, 2][Symbol.iterator]().map === 'function' && typeof [1, 2][Symbol.iterator]().toArray === 'function'",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_methods_exist_on_generator_objects() {
+        assert_eval_true(
+            "function* gen() { yield 1; } var iter = gen(); typeof iter.map === 'function' && typeof iter.find === 'function'",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_generator_map_to_array() {
+        assert_eval_true(
+            "function* gen() { yield 2; yield 4; } var out = gen().map(function(v) { return v / 2; }).toArray(); out.length === 2 && out[0] === 1 && out[1] === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_from_next_only_object_supports_helpers() {
+        assert_eval_true(
+            "var i = 0; var iter = Iterator.from({ next: function() { return i < 4 ? { value: i++, done: false } : { done: true }; } }); var out = iter.map(function(v) { return v + 10; }).filter(function(v) { return v % 2 === 0; }).toArray(); out.length === 2 && out[0] === 10 && out[1] === 12",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_helper_chaining_map_filter_take_drop() {
+        assert_eval_true(
+            "var out = Iterator.from([1, 2, 3, 4, 5, 6]).map(function(v) { return v * 2; }).filter(function(v) { return v % 3 !== 0; }).drop(1).take(2).toArray(); out.length === 2 && out[0] === 8 && out[1] === 10",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_map_consumes_source_iterator() {
+        assert_eval_true(
+            "var iter = Iterator.from([1, 2, 3]); var mapped = iter.map(function(v) { return v * 2; }); mapped.toArray()[0] === 2 && iter.next().done === true",
+        );
+    }
+
+    #[test]
+    fn e2e_iterator_filter_consumes_source_iterator() {
+        assert_eval_true(
+            "var iter = Iterator.from([1, 2, 3]); var filtered = iter.filter(function(v) { return v > 1; }); filtered.toArray().length === 2 && iter.next().done === true",
+        );
     }
 
     // ── globalThis tests ────────────────────────────────────────────────────
