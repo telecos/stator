@@ -2072,7 +2072,7 @@ fn construct_class_from_plain_object(
 
     // 3. Expose parent constructor as "super" for `super()` calls.
     let is_derived = if let Some(parent) = class_map.borrow().get("__proto__").cloned()
-        && !matches!(parent, JsValue::Undefined | JsValue::Null)
+        && !matches!(parent, JsValue::Undefined)
     {
         callee_frame
             .global_env
@@ -6131,7 +6131,14 @@ fn handle_create_class(
     let proto: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
 
     // 5. Wire `extends` — set up prototype chain.
-    if !matches!(super_val, JsValue::Undefined | JsValue::Null) {
+    if matches!(super_val, JsValue::Null) {
+        // `class Foo extends null {}` — prototype has no parent chain
+        // (instances will NOT inherit from Object.prototype).
+        // Mark class as derived so the constructor semantics are correct.
+        class_obj
+            .borrow_mut()
+            .insert("__proto__".to_string(), JsValue::Null);
+    } else if !matches!(super_val, JsValue::Undefined) {
         // class Foo extends Bar {}
         // proto.__proto__ = super_val.prototype
         let super_proto = proto_lookup(&super_val, "prototype");

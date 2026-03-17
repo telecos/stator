@@ -36517,4 +36517,464 @@ mod tests {
         let result = global_eval("typeof Error.stackTraceLimit").unwrap();
         assert_eq!(result, JsValue::String("number".to_string()));
     }
+
+    // ── Deep class conformance ──────────────────────────────────────────
+
+    // -- Class .name property --
+
+    /// Class declaration `.name` equals declared identifier.
+    #[test]
+    fn e2e_class_name_property_declaration() {
+        let r = global_eval("class Foo {} Foo.name").unwrap();
+        assert_eq!(r, JsValue::String("Foo".into()));
+    }
+
+    /// Class expression `.name` equals internal identifier.
+    #[test]
+    fn e2e_class_name_property_expression() {
+        let r = global_eval("var C = class Bar {}; C.name").unwrap();
+        assert_eq!(r, JsValue::String("Bar".into()));
+    }
+
+    /// Derived class preserves its own `.name`.
+    #[test]
+    fn e2e_class_name_property_derived() {
+        let r = global_eval("class Base {} class Child extends Base {} Child.name").unwrap();
+        assert_eq!(r, JsValue::String("Child".into()));
+    }
+
+    // -- Static fields + static blocks initialization order --
+
+    /// Static fields and static blocks execute in declaration order.
+    #[test]
+    fn e2e_class_static_init_order() {
+        let r = global_eval(
+            "var log = []; \
+             class Foo { \
+                static a = log.push('a'); \
+                static { log.push('block1'); } \
+                static b = log.push('b'); \
+                static { log.push('block2'); } \
+             } \
+             log.join(',')",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a,block1,b,block2".into()));
+    }
+
+    /// Static block can read earlier static field.
+    #[test]
+    fn e2e_class_static_block_reads_field() {
+        let r = global_eval("class Foo { static x = 10; static { this.y = this.x * 2; } } Foo.y")
+            .unwrap();
+        assert_eq!(r, JsValue::Smi(20));
+    }
+
+    /// Multiple static blocks see cumulative state.
+    #[test]
+    fn e2e_class_static_blocks_cumulative() {
+        let r = global_eval(
+            "class C { \
+                static v = 1; \
+                static { this.v = this.v + 10; } \
+                static { this.v = this.v + 100; } \
+             } C.v",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(111));
+    }
+
+    // -- Private instance fields --
+
+    /// Private field with computed initializer.
+    #[test]
+    fn e2e_private_field_computed_init() {
+        let r = global_eval("class Foo { #x = 2 + 3; get() { return this.#x; } } new Foo().get()")
+            .unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    /// Private field is per-instance (isolation).
+    #[test]
+    fn e2e_private_field_instance_isolation() {
+        let r = global_eval(
+            "class C { #v = 0; inc() { this.#v++; return this.#v; } } \
+             var a = new C(); var b = new C(); a.inc(); a.inc(); b.inc(); a.inc()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// Private field is not visible via Object.keys.
+    #[test]
+    fn e2e_private_field_hidden_from_keys() {
+        let r = global_eval(
+            "class Foo { #secret = 1; pub = 2; } \
+             JSON.stringify(Object.keys(new Foo()))",
+        )
+        .unwrap();
+        // Only public field should appear
+        assert!(matches!(r, JsValue::String(ref s) if !s.contains("secret")));
+    }
+
+    // -- Private methods --
+
+    /// Private method is callable from a public method.
+    #[test]
+    fn e2e_private_method_callable() {
+        let r = global_eval(
+            "class Foo { #add(a,b) { return a+b; } sum() { return this.#add(3,4); } } \
+             new Foo().sum()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    /// Private method can access private field.
+    #[test]
+    fn e2e_private_method_accesses_private_field() {
+        let r = global_eval(
+            "class Foo { #x = 5; #dbl() { return this.#x * 2; } run() { return this.#dbl(); } } \
+             new Foo().run()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    /// Static private field accessed from static method.
+    #[test]
+    fn e2e_static_private_field_access() {
+        let r = global_eval("class C { static #n = 42; static get() { return C.#n; } } C.get()")
+            .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    // -- new.target --
+
+    /// `new.target` is the constructor being invoked.
+    #[test]
+    fn e2e_new_target_is_constructor() {
+        let r = global_eval(
+            "class A { constructor() { this.nt = new.target; } } \
+             new A().nt === A",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `new.target` in derived class reflects child, not parent.
+    #[test]
+    fn e2e_new_target_reflects_child() {
+        let r = global_eval(
+            "class Base { constructor() { this.isChild = new.target === Child; } } \
+             class Child extends Base { constructor() { super(); } } \
+             new Child().isChild",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `new.target` is undefined when called as a normal function.
+    #[test]
+    fn e2e_new_target_undefined_normal_call() {
+        let r = global_eval("function f() { return typeof new.target; } f()").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    // -- super() in derived constructors --
+
+    /// Derived constructor can set properties after super().
+    #[test]
+    fn e2e_derived_ctor_set_after_super() {
+        let r = global_eval(
+            "class Base { constructor() { this.a = 1; } } \
+             class Child extends Base { constructor() { super(); this.b = 2; } } \
+             var c = new Child(); c.a + c.b",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// Derived constructor forwards arguments through super().
+    #[test]
+    fn e2e_derived_ctor_forwards_args() {
+        let r = global_eval(
+            "class Base { constructor(x,y) { this.sum = x+y; } } \
+             class Child extends Base { constructor(x,y) { super(x,y); } } \
+             new Child(3,4).sum",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    /// Default derived constructor auto-forwards arguments.
+    #[test]
+    fn e2e_default_derived_ctor_auto_forwards() {
+        let r = global_eval(
+            "class Base { constructor(v) { this.v = v; } } \
+             class Child extends Base {} \
+             new Child(99).v",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    // -- super.method() in methods --
+
+    /// super.method() calls parent prototype method.
+    #[test]
+    fn e2e_super_method_calls_parent() {
+        let r = global_eval(
+            "class A { greet() { return 'hi'; } } \
+             class B extends A { greet() { return super.greet() + '!'; } } \
+             new B().greet()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("hi!".into()));
+    }
+
+    /// super.method() preserves `this` as the current instance.
+    #[test]
+    fn e2e_super_method_preserves_this() {
+        let r = global_eval(
+            "class A { val() { return this.x; } } \
+             class B extends A { constructor() { super(); this.x = 7; } \
+             read() { return super.val(); } } \
+             new B().read()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    /// super in static method calls parent static.
+    #[test]
+    fn e2e_super_static_method() {
+        let r = global_eval(
+            "class A { static foo() { return 10; } } \
+             class B extends A { static bar() { return super.foo() + 5; } } \
+             B.bar()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(15));
+    }
+
+    // -- Computed property names --
+
+    /// Computed method name from variable.
+    #[test]
+    fn e2e_class_computed_method_name() {
+        let r = global_eval(
+            "var name = 'hello'; \
+             class Foo { [name]() { return 42; } } \
+             new Foo().hello()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Computed static field name.
+    #[test]
+    fn e2e_class_computed_static_field() {
+        let r = global_eval("var key = 'x'; class Foo { static [key] = 99; } Foo.x").unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    /// Computed instance field name.
+    #[test]
+    fn e2e_class_computed_instance_field() {
+        let r = global_eval("var key = 'val'; class Foo { [key] = 5; } new Foo().val").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    // -- Class extends expressions --
+
+    /// `extends f()` evaluates the expression at class creation time.
+    #[test]
+    fn e2e_class_extends_expression_evaluated() {
+        let r = global_eval(
+            "class Base { x() { return 1; } } \
+             function getBase() { return Base; } \
+             class C extends getBase() {} \
+             new C().x()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// `extends null` creates a class with no prototype chain.
+    #[test]
+    fn e2e_class_extends_null_typeof() {
+        let r = global_eval(
+            "class Foo extends null { \
+                constructor() { return Object.create(new.target.prototype); } \
+             } \
+             typeof Foo.prototype",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    // -- Class expressions --
+
+    /// Named class expression: name not visible outside.
+    #[test]
+    fn e2e_class_expr_name_not_leaked() {
+        let r = global_eval("var F = class Inner {}; typeof Inner").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// Anonymous class expression assigned to variable works.
+    #[test]
+    fn e2e_class_expr_anonymous() {
+        let r =
+            global_eval("var Foo = class { greet() { return 'ok'; } }; new Foo().greet()").unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
+    }
+
+    /// Class expression can be used inline in `new`.
+    #[test]
+    fn e2e_class_expr_inline_new() {
+        let r = global_eval("new (class { val() { return 7; } })().val()").unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    // -- Constructor return behavior --
+
+    /// Explicit object return overrides `this`.
+    #[test]
+    fn e2e_ctor_return_object_overrides() {
+        let r =
+            global_eval("class Foo { constructor() { this.a = 1; return { b: 2 }; } } new Foo().b")
+                .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// Primitive return keeps `this`.
+    #[test]
+    fn e2e_ctor_return_primitive_keeps_this() {
+        let r = global_eval("class Foo { constructor() { this.a = 1; return 42; } } new Foo().a")
+            .unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    // -- Inheritance chains --
+
+    /// Three-level inheritance chain: grandchild inherits from base.
+    #[test]
+    fn e2e_class_three_level_inheritance() {
+        let r = global_eval(
+            "class A { x() { return 1; } } \
+             class B extends A { y() { return 2; } } \
+             class C extends B { z() { return 3; } } \
+             var c = new C(); c.x() + c.y() + c.z()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(6));
+    }
+
+    /// `instanceof` works across inheritance chain.
+    #[test]
+    fn e2e_class_instanceof_chain() {
+        let r = global_eval(
+            "class A {} class B extends A {} class C extends B {} \
+             var c = new C(); c instanceof A && c instanceof B && c instanceof C",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Method override in child shadows parent.
+    #[test]
+    fn e2e_class_method_override() {
+        let r = global_eval(
+            "class A { val() { return 1; } } \
+             class B extends A { val() { return 2; } } \
+             new B().val()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    // -- Getters and setters in classes --
+
+    /// Getter defined in class works.
+    #[test]
+    fn e2e_class_getter_basic() {
+        let r = global_eval("class Foo { get x() { return 42; } } new Foo().x").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Setter defined in class works.
+    #[test]
+    fn e2e_class_setter_basic() {
+        let r = global_eval(
+            "class Foo { set x(v) { this._x = v; } } \
+             var f = new Foo(); f.x = 10; f._x",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    /// Getter/setter pair round-trips.
+    #[test]
+    fn e2e_class_getter_setter_pair() {
+        let r = global_eval(
+            "class Box { #v = 0; get val() { return this.#v; } set val(v) { this.#v = v; } } \
+             var b = new Box(); b.val = 55; b.val",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(55));
+    }
+
+    // -- Instance fields --
+
+    /// Instance field is initialized per instance.
+    #[test]
+    fn e2e_class_instance_field_per_instance() {
+        let r = global_eval(
+            "class C { x = 0; inc() { this.x++; return this.x; } } \
+             var a = new C(); var b = new C(); a.inc(); a.inc(); b.inc()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// Instance field initializer runs after super() in derived class.
+    #[test]
+    fn e2e_class_instance_field_after_super() {
+        let r = global_eval(
+            "class Base { constructor() { this.a = 1; } } \
+             class Child extends Base { b = this.a + 10; } \
+             new Child().b",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(11));
+    }
+
+    // -- Misc conformance --
+
+    /// typeof a class is 'function'.
+    #[test]
+    fn e2e_class_typeof_is_function() {
+        let r = global_eval("class Foo {} typeof Foo").unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// Class with no constructor can be instantiated.
+    #[test]
+    fn e2e_class_no_ctor_instantiable() {
+        let r = global_eval("class Foo { x = 5; } new Foo().x").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    /// Static and instance members coexist.
+    #[test]
+    fn e2e_class_static_instance_coexist() {
+        let r = global_eval(
+            "class Foo { static s = 1; i = 2; } \
+             Foo.s + new Foo().i",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
 }
