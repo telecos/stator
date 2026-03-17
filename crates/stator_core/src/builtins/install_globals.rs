@@ -357,18 +357,127 @@ fn own_string_property_keys(map: &PropertyMap, enumerable_only: bool) -> Vec<Str
         .collect()
 }
 
-fn enumerable_own_string_keys(value: &JsValue) -> Vec<String> {
+fn own_property_name_strings(value: &JsValue) -> StatorResult<Vec<String>> {
     match value {
-        JsValue::PlainObject(map) => own_string_property_keys(&map.borrow(), true),
-        JsValue::Error(error) => own_string_property_keys(&error.props.borrow(), true),
-        JsValue::Array(items) => items
+        JsValue::PlainObject(map) => Ok(own_string_property_keys(&map.borrow(), false)),
+        JsValue::Error(error) => Ok(error_own_string_keys(error)),
+        JsValue::Array(items) => {
+            let len = items.borrow().len();
+            let mut keys: Vec<String> = (0..len).map(|i| i.to_string()).collect();
+            keys.push("length".to_string());
+            Ok(keys)
+        }
+        JsValue::Function(_) => Ok(vec!["length".to_string(), "name".to_string()]),
+        JsValue::String(s) => {
+            let mut keys: Vec<String> = (0..utf16_len(s)).map(|i| i.to_string()).collect();
+            keys.push("length".to_string());
+            Ok(keys)
+        }
+        JsValue::Proxy(proxy) => Ok(proxy_own_keys(&proxy.borrow())?
+            .into_iter()
+            .filter_map(|key| match key {
+                JsValue::String(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect()),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn enumerable_own_string_keys(value: &JsValue) -> StatorResult<Vec<String>> {
+    match value {
+        JsValue::PlainObject(map) => Ok(own_string_property_keys(&map.borrow(), true)),
+        JsValue::Error(error) => Ok(own_string_property_keys(&error.props.borrow(), true)),
+        JsValue::Array(items) => Ok(items
             .borrow()
             .iter()
             .enumerate()
             .filter_map(|(index, value)| (!value.is_the_hole()).then_some(index.to_string()))
-            .collect(),
-        JsValue::String(s) => (0..utf16_len(s)).map(|i| i.to_string()).collect(),
-        _ => Vec::new(),
+            .collect()),
+        JsValue::String(s) => Ok((0..utf16_len(s)).map(|i| i.to_string()).collect()),
+        JsValue::Proxy(proxy) => {
+            let mut keys = Vec::new();
+            for key in proxy_own_keys(&proxy.borrow())? {
+                let JsValue::String(name) = key else {
+                    continue;
+                };
+                if let Some((_, attrs)) =
+                    proxy_get_own_property_descriptor(&proxy.borrow(), name.as_ref())?
+                    && attrs.contains(PropertyAttributes::ENUMERABLE)
+                {
+                    keys.push(name.to_string());
+                }
+            }
+            Ok(keys)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn own_property_symbol_values(value: &JsValue) -> StatorResult<Vec<JsValue>> {
+    match value {
+        JsValue::PlainObject(map) => Ok(map
+            .borrow()
+            .own_symbol_keys()
+            .into_iter()
+            .map(JsValue::Symbol)
+            .collect()),
+        JsValue::Error(error) => Ok(error
+            .props
+            .borrow()
+            .own_symbol_keys()
+            .into_iter()
+            .map(JsValue::Symbol)
+            .collect()),
+        JsValue::Proxy(proxy) => Ok(proxy_own_keys(&proxy.borrow())?
+            .into_iter()
+            .filter(|key| matches!(key, JsValue::Symbol(_)))
+            .collect()),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn enumerable_own_symbol_keys(value: &JsValue) -> StatorResult<Vec<u64>> {
+    match value {
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            Ok(borrow
+                .own_symbol_keys()
+                .into_iter()
+                .filter(|symbol| {
+                    let key = crate::builtins::symbol::symbol_to_property_key(*symbol);
+                    borrow.is_enumerable(&key)
+                })
+                .collect())
+        }
+        JsValue::Error(error) => {
+            let borrow = error.props.borrow();
+            Ok(borrow
+                .own_symbol_keys()
+                .into_iter()
+                .filter(|symbol| {
+                    let key = crate::builtins::symbol::symbol_to_property_key(*symbol);
+                    borrow.is_enumerable(&key)
+                })
+                .collect())
+        }
+        JsValue::Proxy(proxy) => {
+            let mut keys = Vec::new();
+            for key in proxy_own_keys(&proxy.borrow())? {
+                let JsValue::Symbol(symbol) = key else {
+                    continue;
+                };
+                let prop_key = crate::builtins::symbol::symbol_to_property_key(symbol);
+                if let Some((_, attrs)) =
+                    proxy_get_own_property_descriptor(&proxy.borrow(), &prop_key)?
+                    && attrs.contains(PropertyAttributes::ENUMERABLE)
+                {
+                    keys.push(symbol);
+                }
+            }
+            Ok(keys)
+        }
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -3462,15 +3571,7 @@ fn json_serialize_value(
 
             let result = (|| {
                 let holder = JsValue::Proxy(Rc::clone(proxy));
-                let keys = proxy_own_keys(&proxy.borrow())?;
-                let key_strings: Vec<String> = keys
-                    .iter()
-                    .filter_map(|k| match k {
-                        JsValue::String(s) => Some(s.to_string()),
-                        JsValue::Smi(n) => Some(n.to_string()),
-                        _ => None,
-                    })
-                    .collect();
+                let key_strings = enumerable_own_string_keys(&holder)?;
                 let use_indent = !indent.is_empty();
                 let inner_indent = indent.repeat(depth + 1);
                 let outer_indent = indent.repeat(depth);
@@ -4962,7 +5063,7 @@ fn make_object() -> JsValue {
                         "Cannot convert undefined or null to object".into(),
                     ));
                 }
-                let keys = enumerable_own_string_keys(val)
+                let keys = enumerable_own_string_keys(val)?
                     .into_iter()
                     .map(|key| JsValue::String(key.into()))
                     .collect();
@@ -4979,7 +5080,7 @@ fn make_object() -> JsValue {
                     ));
                 }
                 let mut values = Vec::new();
-                for key in enumerable_own_string_keys(val) {
+                for key in enumerable_own_string_keys(val)? {
                     values.push(dispatch_get_property_value(
                         val,
                         JsValue::String(key.into()),
@@ -4998,7 +5099,7 @@ fn make_object() -> JsValue {
                     ));
                 }
                 let mut entries = Vec::new();
-                for key in enumerable_own_string_keys(val) {
+                for key in enumerable_own_string_keys(val)? {
                     let value =
                         dispatch_get_property_value(val, JsValue::String(key.clone().into()))?;
                     entries.push(JsValue::new_array(vec![JsValue::String(key.into()), value]));
@@ -5561,81 +5662,11 @@ fn make_object() -> JsValue {
                         "Cannot convert undefined or null to object".into(),
                     ));
                 }
-                match obj {
-                    JsValue::PlainObject(map) => {
-                        let borrow = map.borrow();
-                        let mut names: Vec<String> = Vec::new();
-                        let mut seen = std::collections::HashSet::new();
-                        for k in borrow.keys() {
-                            if let Some(prop) =
-                                k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
-                            {
-                                if seen.insert(prop.to_string()) {
-                                    names.push(prop.to_string());
-                                }
-                                continue;
-                            }
-                            if let Some(prop) =
-                                k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
-                            {
-                                if seen.insert(prop.to_string()) {
-                                    names.push(prop.to_string());
-                                }
-                                continue;
-                            }
-                            if k.starts_with("__") || k.starts_with('#') {
-                                continue;
-                            }
-                            if seen.insert(k.clone()) {
-                                names.push(k.clone());
-                            }
-                        }
-                        // ES spec ordering: integer indices ascending, then
-                        // string keys in insertion order.
-                        let mut integer_keys: Vec<(u32, String)> = Vec::new();
-                        let mut string_keys: Vec<String> = Vec::new();
-                        for name in names {
-                            if let Some(idx) = parse_integer_index_key(&name) {
-                                integer_keys.push((idx, name));
-                            } else {
-                                string_keys.push(name);
-                            }
-                        }
-                        integer_keys.sort_by_key(|(idx, _)| *idx);
-                        let sorted: Vec<JsValue> = integer_keys
-                            .into_iter()
-                            .map(|(_, s)| JsValue::String(s.into()))
-                            .chain(string_keys.into_iter().map(|s| JsValue::String(s.into())))
-                            .collect();
-                        Ok(JsValue::new_array(sorted))
-                    }
-                    JsValue::Array(items) => {
-                        let len = items.borrow().len();
-                        let mut keys: Vec<JsValue> = (0..len)
-                            .map(|i| JsValue::String(i.to_string().into()))
-                            .collect();
-                        keys.push(JsValue::String("length".into()));
-                        Ok(JsValue::new_array(keys))
-                    }
-                    JsValue::Error(error) => Ok(JsValue::new_array(
-                        error_own_string_keys(error)
-                            .into_iter()
-                            .map(|name| JsValue::String(name.into()))
-                            .collect(),
-                    )),
-                    JsValue::Function(_) => Ok(JsValue::new_array(vec![
-                        JsValue::String("length".into()),
-                        JsValue::String("name".into()),
-                    ])),
-                    JsValue::String(s) => {
-                        let mut keys: Vec<JsValue> = (0..utf16_len(s))
-                            .map(|i| JsValue::String(i.to_string().into()))
-                            .collect();
-                        keys.push(JsValue::String("length".into()));
-                        Ok(JsValue::new_array(keys))
-                    }
-                    _ => Ok(JsValue::new_array(vec![])),
-                }
+                let names = own_property_name_strings(obj)?
+                    .into_iter()
+                    .map(|name| JsValue::String(name.into()))
+                    .collect();
+                Ok(JsValue::new_array(names))
             }),
         );
 
@@ -5655,7 +5686,7 @@ fn make_object() -> JsValue {
                         continue;
                     }
                     // Copy enumerable own string-keyed properties.
-                    for key in enumerable_own_string_keys(source) {
+                    for key in enumerable_own_string_keys(source)? {
                         let value = dispatch_get_property_value(
                             source,
                             JsValue::String(key.clone().into()),
@@ -5663,20 +5694,9 @@ fn make_object() -> JsValue {
                         dispatch_set_property_value(&target, JsValue::String(key.into()), value)?;
                     }
                     // Copy enumerable own symbol-keyed properties.
-                    if let JsValue::PlainObject(map) = source {
-                        let borrow = map.borrow();
-                        for sym_id in borrow.own_symbol_keys() {
-                            let prop_key = crate::builtins::symbol::symbol_to_property_key(sym_id);
-                            if borrow.is_enumerable(&prop_key)
-                                && let Some(val) = borrow.get(&prop_key)
-                            {
-                                dispatch_set_property_value(
-                                    &target,
-                                    JsValue::Symbol(sym_id),
-                                    val.clone(),
-                                )?;
-                            }
-                        }
+                    for sym_id in enumerable_own_symbol_keys(source)? {
+                        let value = dispatch_get_property_value(source, JsValue::Symbol(sym_id))?;
+                        dispatch_set_property_value(&target, JsValue::Symbol(sym_id), value)?;
                     }
                 }
                 Ok(target)
@@ -6151,17 +6171,7 @@ fn make_object() -> JsValue {
                         "Cannot convert undefined or null to object".into(),
                     ));
                 }
-                if let JsValue::PlainObject(map) = obj {
-                    let symbols = map
-                        .borrow()
-                        .own_symbol_keys()
-                        .into_iter()
-                        .map(JsValue::Symbol)
-                        .collect();
-                    Ok(JsValue::new_array(symbols))
-                } else {
-                    Ok(JsValue::new_array(vec![]))
-                }
+                Ok(JsValue::new_array(own_property_symbol_values(obj)?))
             }),
         );
 
@@ -6212,6 +6222,13 @@ fn make_object() -> JsValue {
                         let borrow = map.borrow();
                         let exists = borrow.contains_key(&prop) && prop != "__proto__";
                         let enumerable = exists && borrow.is_enumerable(&prop);
+                        Ok(JsValue::Boolean(enumerable))
+                    }
+                    JsValue::Proxy(proxy) => {
+                        let enumerable = proxy_get_own_property_descriptor(&proxy.borrow(), &prop)?
+                            .is_some_and(|(_, attrs)| {
+                                attrs.contains(PropertyAttributes::ENUMERABLE)
+                            });
                         Ok(JsValue::Boolean(enumerable))
                     }
                     _ => Ok(JsValue::Boolean(false)),
@@ -44338,6 +44355,336 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::String("0,5,z,a".into()));
+    }
+
+    #[test]
+    fn e2e_object_keys_integer_indices_before_strings() {
+        assert_eval_true(
+            r#"var o = {}; o.b = 1; o[2] = 2; o.a = 3; o[0] = 4; Object.keys(o).join(',') === '0,2,b,a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_keys_skips_non_enumerable_without_reordering() {
+        assert_eval_true(
+            r#"var o = {}; o.b = 1; Object.defineProperty(o, 'hidden', { value: 2, enumerable: false }); o.a = 3; Object.keys(o).join(',') === 'b,a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_keys_uses_canonical_integer_index_detection() {
+        assert_eval_true(
+            r#"var o = {}; o['01'] = 1; o['1'] = 2; o['-1'] = 3; o['1.5'] = 4; o['0'] = 5; o['42'] = 6; Object.keys(o).join(',') === '0,1,42,01,-1,1.5'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_keys_string_reinsert_moves_to_end() {
+        assert_eval_true(
+            r#"var o = { a: 1, b: 2 }; delete o.a; o.a = 3; Object.keys(o).join(',') === 'b,a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_keys_integer_reinsert_remains_numeric_order() {
+        assert_eval_true(
+            r#"var o = {}; o[2] = 1; o[1] = 2; delete o[1]; o[1] = 3; Object.keys(o).join(',') === '1,2'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_get_own_property_names_matches_key_order_plus_non_enumerable() {
+        assert_eval_true(
+            r#"var o = {}; o.b = 1; Object.defineProperty(o, 'a', { value: 2, enumerable: false }); o[2] = 3; o[0] = 4; Object.getOwnPropertyNames(o).join(',') === '0,2,b,a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_get_own_property_names_uses_canonical_integer_detection() {
+        assert_eval_true(
+            r#"var o = {}; Object.defineProperty(o, '01', { value: 1, enumerable: false }); Object.defineProperty(o, '1', { value: 2, enumerable: false }); o.a = 3; Object.getOwnPropertyNames(o).join(',') === '1,01,a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_get_own_property_names_on_array_orders_indices_before_length() {
+        assert_eval_true(r#"Object.getOwnPropertyNames([10, 20]).join(',') === '0,1,length'"#);
+    }
+
+    #[test]
+    fn e2e_object_get_own_property_symbols_preserves_insertion_order() {
+        assert_eval_true(
+            r#"var s1 = Symbol('a'); var s2 = Symbol('b'); var o = {}; o[s1] = 1; o.x = 2; o[s2] = 3; var syms = Object.getOwnPropertySymbols(o); syms.length === 2 && syms[0] === s1 && syms[1] === s2"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_get_own_property_symbols_ignores_strings() {
+        assert_eval_true(
+            r#"var s = Symbol('s'); var o = { visible: 1 }; o[s] = 2; var syms = Object.getOwnPropertySymbols(o); syms.length === 1 && syms[0] === s"#,
+        );
+    }
+
+    #[test]
+    fn e2e_reflect_own_keys_orders_plain_keys_by_spec() {
+        assert_eval_true(
+            r#"var s = Symbol('s'); var o = {}; o.b = 1; o[2] = 2; o[s] = 3; o.a = 4; o[0] = 5; var keys = Reflect.ownKeys(o); keys.length === 5 && keys[0] === '0' && keys[1] === '2' && keys[2] === 'b' && keys[3] === 'a' && keys[4] === s"#,
+        );
+    }
+
+    #[test]
+    fn e2e_reflect_own_keys_includes_non_enumerables_before_symbols() {
+        assert_eval_true(
+            r#"var s = Symbol('s'); var o = {}; Object.defineProperty(o, 'hidden', { value: 1, enumerable: false }); o[s] = 2; var keys = Reflect.ownKeys(o); keys.length === 2 && keys[0] === 'hidden' && keys[1] === s"#,
+        );
+    }
+
+    #[test]
+    fn e2e_reflect_own_keys_proxy_preserves_trap_string_order() {
+        assert_eval_true(
+            r#"var p = new Proxy({}, { ownKeys: function() { return ['b', 'a']; } }); var keys = Reflect.ownKeys(p); keys.length === 2 && keys[0] === 'b' && keys[1] === 'a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_reflect_own_keys_proxy_preserves_integer_like_trap_order() {
+        assert_eval_true(
+            r#"var p = new Proxy({}, { ownKeys: function() { return ['2', '0', 'a']; } }); var keys = Reflect.ownKeys(p); keys.length === 3 && keys[0] === '2' && keys[1] === '0' && keys[2] === 'a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_reflect_own_keys_proxy_preserves_symbol_trap_order() {
+        assert_eval_true(
+            r#"var s = Symbol('s'); var p = new Proxy({}, { ownKeys: function() { return [s, 'a']; } }); var keys = Reflect.ownKeys(p); keys.length === 2 && keys[0] === s && keys[1] === 'a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_orders_own_integer_indices_before_strings() {
+        assert_eval_true(
+            r#"var o = {}; o.b = 1; o[2] = 2; o.a = 3; o[0] = 4; var out = []; for (var k in o) out.push(k); out.join(',') === '0,2,b,a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_enumerates_own_before_inherited() {
+        assert_eval_true(
+            r#"var p = {}; p[1] = 1; p.a = 2; var o = Object.create(p); o[0] = 3; o.b = 4; var out = []; for (var k in o) out.push(k); out.join(',') === '0,b,1,a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_non_enumerable_own_property_shadows_inherited_enumerable() {
+        assert_eval_true(
+            r#"var p = { x: 1 }; var o = Object.create(p); Object.defineProperty(o, 'x', { value: 2, enumerable: false }); var out = []; for (var k in o) out.push(k); out.length === 0"#,
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_uses_spec_order_on_inherited_object() {
+        assert_eval_true(
+            r#"var p = {}; p[2] = 1; p[1] = 2; p.a = 3; var o = Object.create(p); var out = []; for (var k in o) out.push(k); out.join(',') === '1,2,a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_skips_symbol_keys() {
+        assert_eval_true(
+            r#"var s = Symbol('s'); var o = { a: 1 }; o[s] = 2; var out = []; for (var k in o) out.push(k); out.join(',') === 'a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_uses_spec_property_order() {
+        assert_eval_true(
+            r#"var o = {}; o.b = 1; o[2] = 2; o.a = 3; o[0] = 4; JSON.stringify(o) === '{"0":4,"2":2,"b":1,"a":3}'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_skips_non_enumerable_properties() {
+        assert_eval_true(
+            r#"var o = {}; o.b = 1; Object.defineProperty(o, 'hidden', { value: 2, enumerable: false }); o.a = 3; JSON.stringify(o) === '{"b":1,"a":3}'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_skips_symbol_properties() {
+        assert_eval_true(
+            r#"var s = Symbol('s'); var o = { a: 1 }; o[s] = 2; JSON.stringify(o) === '{"a":1}'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_preserves_nested_object_order() {
+        assert_eval_true(
+            r#"var inner = {}; inner.b = 1; inner[0] = 2; var outer = {}; outer.z = inner; outer.a = 3; JSON.stringify(outer) === '{"z":{"0":2,"b":1},"a":3}'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_proxy_uses_enumerable_trap_order() {
+        assert_eval_true(
+            r#"var target = {}; Object.defineProperty(target, 'hidden', { value: 1, enumerable: false }); target.b = 2; target.a = 3; var p = new Proxy(target, { ownKeys: function() { return ['hidden', 'b', 'a']; } }); JSON.stringify(p) === '{"b":2,"a":3}'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_assign_copies_string_keys_in_source_order() {
+        assert_eval_true(
+            r#"var t = {}; Object.assign(t, { b: 1, a: 2 }); Object.keys(t).join(',') === 'b,a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_assign_copies_integer_keys_before_strings() {
+        assert_eval_true(
+            r#"var t = {}; var s = {}; s.b = 1; s[2] = 2; s.a = 3; s[0] = 4; Object.assign(t, s); Reflect.ownKeys(t).join(',') === '0,2,b,a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_assign_copies_symbol_keys_in_insertion_order() {
+        assert_eval_true(
+            r#"var s1 = Symbol('a'); var s2 = Symbol('b'); var src = {}; src[s1] = 1; src.a = 2; src[s2] = 3; var dst = Object.assign({}, src); var syms = Object.getOwnPropertySymbols(dst); syms.length === 2 && syms[0] === s1 && syms[1] === s2 && dst.a === 2"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_assign_proxy_source_preserves_trap_order_for_enumerables() {
+        assert_eval_true(
+            r#"var s = Symbol('s'); var log = []; var source = {}; Object.defineProperty(source, s, { enumerable: true, get: function() { log.push('s'); return 3; } }); Object.defineProperty(source, 'hidden', { value: 1, enumerable: false }); Object.defineProperty(source, 'a', { enumerable: true, get: function() { log.push('a'); return 2; } }); var p = new Proxy(source, { ownKeys: function() { return [s, 'hidden', 'a']; } }); Object.assign({}, p); log.join(',') === 's,a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_entries_matches_object_keys_order() {
+        assert_eval_true(
+            r#"var o = {}; o.b = 1; o[1] = 2; o.a = 3; var entries = Object.entries(o); entries.length === 3 && entries[0][0] === '1' && entries[1][0] === 'b' && entries[2][0] === 'a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_values_matches_object_keys_order() {
+        assert_eval_true(
+            r#"var o = {}; o.b = 1; o[1] = 2; o.a = 3; Object.values(o).join(',') === '2,1,3'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_entries_uses_canonical_integer_index_detection() {
+        assert_eval_true(
+            r#"var o = {}; o['01'] = 1; o['1'] = 2; o.a = 3; var entries = Object.entries(o); entries.length === 3 && entries[0][0] === '1' && entries[1][0] === '01' && entries[2][0] === 'a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_values_skip_non_enumerables() {
+        assert_eval_true(
+            r#"var o = { a: 1 }; Object.defineProperty(o, 'hidden', { value: 2, enumerable: false }); Object.values(o).join(',') === '1'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_keys_proxy_preserves_trap_order_for_enumerables() {
+        assert_eval_true(
+            r#"var target = {}; Object.defineProperty(target, 'hidden', { value: 1, enumerable: false }); target.a = 2; target.b = 3; var p = new Proxy(target, { ownKeys: function() { return ['b', 'hidden', 'a']; } }); Object.keys(p).join(',') === 'b,a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_keys_proxy_preserves_integer_like_trap_order() {
+        assert_eval_true(
+            r#"var target = {}; target[0] = 1; target[2] = 2; var p = new Proxy(target, { ownKeys: function() { return ['2', '0']; } }); Object.keys(p).join(',') === '2,0'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_get_own_property_names_proxy_preserves_trap_order() {
+        assert_eval_true(
+            r#"var target = {}; Object.defineProperty(target, 'hidden', { value: 1, enumerable: false }); target.a = 2; var p = new Proxy(target, { ownKeys: function() { return ['a', 'hidden']; } }); Object.getOwnPropertyNames(p).join(',') === 'a,hidden'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_get_own_property_symbols_proxy_preserves_trap_order() {
+        assert_eval_true(
+            r#"var s1 = Symbol('a'); var s2 = Symbol('b'); var p = new Proxy({}, { ownKeys: function() { return [s2, s1]; } }); var syms = Object.getOwnPropertySymbols(p); syms.length === 2 && syms[0] === s2 && syms[1] === s1"#,
+        );
+    }
+
+    #[test]
+    fn e2e_property_is_enumerable_proxy_false_for_non_enumerable() {
+        assert_eval_true(
+            r#"var target = {}; Object.defineProperty(target, 'a', { value: 1, enumerable: false }); var p = new Proxy(target, {}); Object.prototype.propertyIsEnumerable.call(p, 'a') === false"#,
+        );
+    }
+
+    #[test]
+    fn e2e_property_is_enumerable_proxy_true_for_enumerable() {
+        assert_eval_true(
+            r#"var target = { a: 1 }; var p = new Proxy(target, {}); Object.prototype.propertyIsEnumerable.call(p, 'a') === true"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_entries_proxy_preserves_trap_order() {
+        assert_eval_true(
+            r#"var target = { a: 2, b: 3 }; var p = new Proxy(target, { ownKeys: function() { return ['b', 'a']; } }); var entries = Object.entries(p); entries.length === 2 && entries[0][0] === 'b' && entries[1][0] === 'a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_object_values_proxy_preserves_trap_order() {
+        assert_eval_true(
+            r#"var target = { a: 2, b: 3 }; var p = new Proxy(target, { ownKeys: function() { return ['b', 'a']; } }); Object.values(p).join(',') === '3,2'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_proxy_preserves_integer_like_trap_order() {
+        assert_eval_true(
+            r#"var target = { 0: 1, 2: 3 }; var p = new Proxy(target, { ownKeys: function() { return ['2', '0']; } }); JSON.stringify(p) === '{"2":3,"0":1}'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_map_keys_preserve_insertion_order() {
+        assert_eval_true(r#"Array.from(new Map([['b', 1], ['a', 2]]).keys()).join(',') === 'b,a'"#);
+    }
+
+    #[test]
+    fn e2e_map_set_existing_key_does_not_move_order() {
+        assert_eval_true(
+            r#"var m = new Map([['a', 1], ['b', 2]]); m.set('a', 3); Array.from(m.keys()).join(',') === 'a,b'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_map_delete_and_readd_appends_to_end() {
+        assert_eval_true(
+            r#"var m = new Map([['a', 1], ['b', 2]]); m.delete('a'); m.set('a', 3); Array.from(m.keys()).join(',') === 'b,a'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_set_values_preserve_insertion_order() {
+        assert_eval_true(r#"Array.from(new Set(['b', 'a']).values()).join(',') === 'b,a'"#);
+    }
+
+    #[test]
+    fn e2e_set_add_existing_value_does_not_move_order() {
+        assert_eval_true(
+            r#"var s = new Set(['a', 'b']); s.add('a'); Array.from(s.values()).join(',') === 'a,b'"#,
+        );
+    }
+
+    #[test]
+    fn e2e_set_delete_and_readd_appends_to_end() {
+        assert_eval_true(
+            r#"var s = new Set(['a', 'b']); s.delete('a'); s.add('a'); Array.from(s.values()).join(',') === 'b,a'"#,
+        );
     }
 
     #[test]
