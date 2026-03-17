@@ -278,6 +278,7 @@ fn visible_string_property_name(raw_key: &str) -> Option<String> {
     Some(visible.to_string())
 }
 
+#[allow(dead_code)]
 fn utf16_code_unit_len(s: &str) -> usize {
     s.encode_utf16().count()
 }
