@@ -20,6 +20,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+
+use crate::builtins::proxy::proxy_get;
 use std::rc::Rc;
 
 use crate::builtins::date::{
