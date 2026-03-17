@@ -76,6 +76,84 @@ pub fn array_from(items: impl IntoIterator<Item = JsValue>) -> JsArray {
     arr
 }
 
+// ── Array.from (with mapFn) ──────────────────────────────────────────────────
+
+/// ECMAScript §23.1.2.1 `Array.from(iterable, mapFn)`.
+///
+/// Creates a new [`JsArray`] from any Rust iterable of [`JsValue`]s, applying
+/// `map_fn(element, index)` to each element before inserting it.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::array::array_from_with_map_fn;
+/// use stator_core::objects::value::JsValue;
+///
+/// let arr = array_from_with_map_fn(
+///     [JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
+///     |v, _i| if let JsValue::Smi(n) = v { JsValue::Smi(n * 2) } else { v },
+/// );
+/// assert_eq!(arr.length(), 3);
+/// assert_eq!(arr.get(0), JsValue::Smi(2));
+/// assert_eq!(arr.get(2), JsValue::Smi(6));
+/// ```
+pub fn array_from_with_map_fn(
+    items: impl IntoIterator<Item = JsValue>,
+    mut map_fn: impl FnMut(JsValue, u32) -> JsValue,
+) -> JsArray {
+    let mut arr = JsArray::new();
+    for (i, v) in items.into_iter().enumerate() {
+        arr.push(map_fn(v, i as u32));
+    }
+    arr
+}
+
+// ── Array.fromAsync ──────────────────────────────────────────────────────────
+
+/// ECMAScript §23.1.2.1.1 `Array.fromAsync(asyncIterable, mapFn?)`.
+///
+/// Creates a new [`JsArray`] from an iterable (sync or async) and wraps the
+/// result in a resolved [`JsPromise`].  When an optional `map_fn` is provided,
+/// each element is mapped through `map_fn(element, index)` before insertion.
+///
+/// This is a simplified synchronous-collection implementation that handles the
+/// common case where the iterable yields items synchronously.  True async
+/// iterables that depend on I/O scheduling would need the full event-loop;
+/// this version collects eagerly and resolves immediately.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::array::array_from_async;
+/// use stator_core::builtins::promise::{MicrotaskQueue, PromiseState};
+/// use stator_core::objects::value::JsValue;
+///
+/// let queue = MicrotaskQueue::new();
+/// let p = array_from_async(
+///     vec![JsValue::Smi(1), JsValue::Smi(2)],
+///     None::<fn(JsValue, u32) -> JsValue>,
+///     &queue,
+/// );
+/// queue.drain();
+/// if let PromiseState::Fulfilled(JsValue::Array(arr)) = p.state() {
+///     assert_eq!(arr.borrow().len(), 2);
+/// } else {
+///     panic!("expected fulfilled promise with array");
+/// }
+/// ```
+pub fn array_from_async(
+    items: impl IntoIterator<Item = JsValue>,
+    map_fn: Option<impl FnMut(JsValue, u32) -> JsValue>,
+    queue: &crate::builtins::promise::MicrotaskQueue,
+) -> crate::builtins::promise::JsPromise {
+    let result = match map_fn {
+        Some(mf) => array_from_with_map_fn(items, mf),
+        None => array_from(items),
+    };
+    let arr_value = JsValue::new_array(crate::builtins::array::array_values(&result));
+    crate::builtins::promise::promise_resolve(arr_value, queue)
+}
+
 // ── Array.of ──────────────────────────────────────────────────────────────────
 
 /// ECMAScript §23.1.2.3 `Array.of(...items)`.
@@ -1980,5 +2058,186 @@ mod tests {
             array_with(&arr, 5, JsValue::Smi(1)),
             Err(StatorError::RangeError(_))
         ));
+    }
+
+    // ── array_from_with_map_fn ────────────────────────────────────────────────
+
+    #[test]
+    fn test_array_from_with_map_fn_doubles() {
+        let arr = array_from_with_map_fn(
+            vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
+            |v, _| {
+                if let JsValue::Smi(n) = v {
+                    JsValue::Smi(n * 2)
+                } else {
+                    v
+                }
+            },
+        );
+        assert_eq!(arr.length(), 3);
+        assert_eq!(arr.get(0), JsValue::Smi(2));
+        assert_eq!(arr.get(1), JsValue::Smi(4));
+        assert_eq!(arr.get(2), JsValue::Smi(6));
+    }
+
+    #[test]
+    fn test_array_from_with_map_fn_uses_index() {
+        let arr = array_from_with_map_fn(vec![JsValue::Smi(10), JsValue::Smi(20)], |_, i| {
+            JsValue::Smi(i as i32)
+        });
+        assert_eq!(arr.get(0), JsValue::Smi(0));
+        assert_eq!(arr.get(1), JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_array_from_with_map_fn_empty() {
+        let arr = array_from_with_map_fn(Vec::<JsValue>::new(), |v, _| v);
+        assert_eq!(arr.length(), 0);
+    }
+
+    // ── array_from_async ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_array_from_async_basic() {
+        use crate::builtins::promise::{MicrotaskQueue, PromiseState};
+
+        let queue = MicrotaskQueue::new();
+        let p = array_from_async(
+            vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
+            None::<fn(JsValue, u32) -> JsValue>,
+            &queue,
+        );
+        queue.drain();
+        match p.state() {
+            PromiseState::Fulfilled(JsValue::Array(arr)) => {
+                assert_eq!(arr.borrow().len(), 3);
+                assert_eq!(arr.borrow()[0], JsValue::Smi(1));
+            }
+            other => panic!("expected fulfilled array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_array_from_async_empty() {
+        use crate::builtins::promise::{MicrotaskQueue, PromiseState};
+
+        let queue = MicrotaskQueue::new();
+        let p = array_from_async(
+            Vec::<JsValue>::new(),
+            None::<fn(JsValue, u32) -> JsValue>,
+            &queue,
+        );
+        queue.drain();
+        match p.state() {
+            PromiseState::Fulfilled(JsValue::Array(arr)) => {
+                assert_eq!(arr.borrow().len(), 0);
+            }
+            other => panic!("expected fulfilled empty array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_array_from_async_with_map_fn() {
+        use crate::builtins::promise::{MicrotaskQueue, PromiseState};
+
+        let queue = MicrotaskQueue::new();
+        let p = array_from_async(
+            vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
+            Some(|v: JsValue, _i: u32| {
+                if let JsValue::Smi(n) = v {
+                    JsValue::Smi(n * 10)
+                } else {
+                    v
+                }
+            }),
+            &queue,
+        );
+        queue.drain();
+        match p.state() {
+            PromiseState::Fulfilled(JsValue::Array(arr)) => {
+                let borrowed = arr.borrow();
+                assert_eq!(borrowed.len(), 3);
+                assert_eq!(borrowed[0], JsValue::Smi(10));
+                assert_eq!(borrowed[1], JsValue::Smi(20));
+                assert_eq!(borrowed[2], JsValue::Smi(30));
+            }
+            other => panic!("expected fulfilled array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_array_from_async_with_map_fn_uses_index() {
+        use crate::builtins::promise::{MicrotaskQueue, PromiseState};
+
+        let queue = MicrotaskQueue::new();
+        let p = array_from_async(
+            vec![JsValue::Smi(100), JsValue::Smi(200)],
+            Some(|_v: JsValue, i: u32| JsValue::Smi(i as i32)),
+            &queue,
+        );
+        queue.drain();
+        match p.state() {
+            PromiseState::Fulfilled(JsValue::Array(arr)) => {
+                let borrowed = arr.borrow();
+                assert_eq!(borrowed[0], JsValue::Smi(0));
+                assert_eq!(borrowed[1], JsValue::Smi(1));
+            }
+            other => panic!("expected fulfilled array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_array_from_async_returns_promise() {
+        use crate::builtins::promise::MicrotaskQueue;
+
+        let queue = MicrotaskQueue::new();
+        let p = array_from_async(
+            vec![JsValue::Smi(1)],
+            None::<fn(JsValue, u32) -> JsValue>,
+            &queue,
+        );
+        // Even before drain, it's a fulfilled promise (sync collection).
+        assert!(p.is_fulfilled());
+    }
+
+    #[test]
+    fn test_array_from_async_sync_iterable_strings() {
+        use crate::builtins::promise::{MicrotaskQueue, PromiseState};
+
+        let queue = MicrotaskQueue::new();
+        let items = vec![
+            JsValue::String("a".into()),
+            JsValue::String("b".into()),
+            JsValue::String("c".into()),
+        ];
+        let p = array_from_async(items, None::<fn(JsValue, u32) -> JsValue>, &queue);
+        queue.drain();
+        match p.state() {
+            PromiseState::Fulfilled(JsValue::Array(arr)) => {
+                assert_eq!(arr.borrow().len(), 3);
+                assert_eq!(arr.borrow()[0], JsValue::String("a".into()));
+            }
+            other => panic!("expected fulfilled array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_array_from_async_sparse_undefined() {
+        use crate::builtins::promise::{MicrotaskQueue, PromiseState};
+
+        let queue = MicrotaskQueue::new();
+        let items = vec![JsValue::Undefined, JsValue::Smi(1), JsValue::Undefined];
+        let p = array_from_async(items, None::<fn(JsValue, u32) -> JsValue>, &queue);
+        queue.drain();
+        match p.state() {
+            PromiseState::Fulfilled(JsValue::Array(arr)) => {
+                let b = arr.borrow();
+                assert_eq!(b.len(), 3);
+                assert_eq!(b[0], JsValue::Undefined);
+                assert_eq!(b[1], JsValue::Smi(1));
+                assert_eq!(b[2], JsValue::Undefined);
+            }
+            other => panic!("expected fulfilled array, got {other:?}"),
+        }
     }
 }

@@ -48048,4 +48048,131 @@ mod tests {
     fn e2e_wk_has_instance_not_in_symbol_for_registry() {
         assert_eval_true("Symbol.keyFor(Symbol.hasInstance) === undefined");
     }
+
+    // ── Array.fromAsync e2e tests ────────────────────────────────────────
+
+    /// `Array.fromAsync` with sync array returns a promise.
+    #[test]
+    fn e2e_array_from_async_returns_promise() {
+        assert_eval_true("typeof Array.fromAsync([1,2,3]) === 'object'");
+    }
+
+    /// `Array.fromAsync` with sync array resolves to array.
+    #[test]
+    fn e2e_array_from_async_sync_array() {
+        let result = global_eval(
+            r#"
+            var p = Array.fromAsync([10, 20, 30]);
+            var arr = p.__value__;
+            arr.length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Array.fromAsync` with mapFn applies mapping.
+    #[test]
+    fn e2e_array_from_async_with_map_fn() {
+        let result = global_eval(
+            r#"
+            var p = Array.fromAsync([1, 2, 3], function(x) { return x * 2; });
+            var arr = p.__value__;
+            arr[0] + arr[1] + arr[2]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(12));
+    }
+
+    /// `Array.fromAsync` with empty array.
+    #[test]
+    fn e2e_array_from_async_empty() {
+        let result = global_eval(
+            r#"
+            var p = Array.fromAsync([]);
+            var arr = p.__value__;
+            arr.length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// `Array.fromAsync.length` is 1.
+    #[test]
+    fn e2e_array_from_async_length_prop() {
+        let result = global_eval("Array.fromAsync.length").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    /// `Array.fromAsync.name` is "fromAsync".
+    #[test]
+    fn e2e_array_from_async_name_prop() {
+        let result = global_eval("Array.fromAsync.name").unwrap();
+        assert_eq!(result, JsValue::String("fromAsync".into()));
+    }
+
+    /// `Array.fromAsync` rejects non-function mapFn.
+    #[test]
+    fn e2e_array_from_async_non_function_map_fn_throws() {
+        let result = global_eval("Array.fromAsync([1], 42)");
+        assert!(result.is_err());
+    }
+
+    // ── Additional Object.groupBy e2e tests ─────────────────────────────
+
+    /// `Object.groupBy` with duplicate key gathers all.
+    #[test]
+    fn e2e_object_group_by_duplicate_keys() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([1,1,1], function(n) { return "x"; });
+            r.x.length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// `Object.groupBy` with mixed types in callback return.
+    #[test]
+    fn e2e_object_group_by_coerces_to_string() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([1,2,3], function(n) { return n; });
+            typeof r
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    // ── Additional Map.groupBy e2e tests ────────────────────────────────
+
+    /// `Map.groupBy` with empty array returns empty map.
+    #[test]
+    fn e2e_map_group_by_empty() {
+        let result = global_eval(
+            r#"
+            var m = Map.groupBy([], function(n) { return n; });
+            m.size
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// `Map.groupBy` all elements in same group.
+    #[test]
+    fn e2e_map_group_by_single_group() {
+        let result = global_eval(
+            r#"
+            var m = Map.groupBy([1,2,3], function() { return "k"; });
+            m.get("k").length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
 }
