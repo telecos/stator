@@ -34264,6 +34264,528 @@ mod tests {
         assert_eq!(r, JsValue::Smi(99));
     }
 
+    // ── Reflect deep conformance e2e tests ──────────────────────────────
+
+    /// Reflect.apply passes `this` to arrow-like native functions.
+    #[test]
+    fn e2e_reflect_apply_string_concat() {
+        let r = global_eval(r#"Reflect.apply(String.prototype.toUpperCase, "abc", [])"#).unwrap();
+        assert_eq!(r, JsValue::String("ABC".into()));
+    }
+
+    /// Reflect.apply with empty args list returns function default.
+    #[test]
+    fn e2e_reflect_apply_no_args() {
+        let r = global_eval(
+            r#"
+            function f() { return 42; }
+            Reflect.apply(f, undefined, []);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Reflect.apply throws TypeError for non-object argumentsList.
+    #[test]
+    fn e2e_reflect_apply_non_object_args_throws() {
+        let r = global_eval(
+            r#"try { Reflect.apply(function(){}, null, "bad"); "no"; } catch(e) { "ok"; }"#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
+    }
+
+    /// Reflect.construct with zero arguments.
+    #[test]
+    fn e2e_reflect_construct_zero_args() {
+        let r = global_eval(
+            r#"
+            function Empty() { this.ok = true; }
+            Reflect.construct(Empty, []).ok;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.construct creates distinct instances.
+    #[test]
+    fn e2e_reflect_construct_distinct_instances() {
+        let r = global_eval(
+            r#"
+            function Obj() {}
+            var a = Reflect.construct(Obj, []);
+            var b = Reflect.construct(Obj, []);
+            a !== b;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.construct with Array constructor.
+    #[test]
+    fn e2e_reflect_construct_array() {
+        let r = global_eval(
+            r#"
+            var arr = Reflect.construct(Array, [1, 2, 3]);
+            arr.length;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// Reflect.defineProperty returns true and value is accessible.
+    #[test]
+    fn e2e_reflect_define_property_value_accessible() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Reflect.defineProperty(obj, "x", { value: 55, writable: true, enumerable: true, configurable: true });
+            obj.x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(55));
+    }
+
+    /// Reflect.defineProperty with enumerable false hides from Object.keys.
+    #[test]
+    fn e2e_reflect_define_property_non_enumerable() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Reflect.defineProperty(obj, "hidden", { value: 1, enumerable: false, configurable: true });
+            Object.keys(obj).length;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Reflect.defineProperty non-writable prevents assignment.
+    #[test]
+    fn e2e_reflect_define_property_non_writable() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Reflect.defineProperty(obj, "x", { value: 5, writable: false, configurable: true });
+            obj.x = 99;
+            obj.x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    /// Reflect.deleteProperty after defineProperty with configurable: true.
+    #[test]
+    fn e2e_reflect_delete_configurable_defined_property() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Reflect.defineProperty(obj, "x", { value: 1, configurable: true });
+            Reflect.deleteProperty(obj, "x") && !("x" in obj);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.get returns undefined for numeric key on plain object.
+    #[test]
+    fn e2e_reflect_get_numeric_key() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[0] = "zero";
+            Reflect.get(obj, 0);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("zero".into()));
+    }
+
+    /// Reflect.get on array returns element.
+    #[test]
+    fn e2e_reflect_get_array_element() {
+        let r = global_eval(r#"Reflect.get([10, 20, 30], 1)"#).unwrap();
+        assert_eq!(r, JsValue::Smi(20));
+    }
+
+    /// Reflect.get on array returns length.
+    #[test]
+    fn e2e_reflect_get_array_length() {
+        let r = global_eval(r#"Reflect.get([1, 2, 3], "length")"#).unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// Reflect.set on array element.
+    #[test]
+    fn e2e_reflect_set_array_element() {
+        let r = global_eval(
+            r#"
+            var arr = [1, 2, 3];
+            Reflect.set(arr, 1, 42);
+            arr[1];
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Reflect.has returns true for array index.
+    #[test]
+    fn e2e_reflect_has_array_index() {
+        let r = global_eval(r#"Reflect.has([10, 20], 0)"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.has returns true for "length" on array.
+    #[test]
+    fn e2e_reflect_has_array_length() {
+        let r = global_eval(r#"Reflect.has([1], "length")"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.has checks prototype chain for toString.
+    #[test]
+    fn e2e_reflect_has_inherited_tostring() {
+        let r = global_eval(r#"Reflect.has({}, "toString")"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.ownKeys returns integer keys in numeric order first.
+    #[test]
+    fn e2e_reflect_own_keys_numeric_ordering() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj["b"] = 1;
+            obj["2"] = 1;
+            obj["a"] = 1;
+            obj["0"] = 1;
+            Reflect.ownKeys(obj).join(",");
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,2,b,a".into()));
+    }
+
+    /// Reflect.ownKeys on empty object returns empty array.
+    #[test]
+    fn e2e_reflect_own_keys_empty_object() {
+        let r = global_eval(r#"Reflect.ownKeys({}).length"#).unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Reflect.getOwnPropertyDescriptor reports writable correctly.
+    #[test]
+    fn e2e_reflect_gopd_writable_field() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Reflect.defineProperty(obj, "x", { value: 1, writable: false, configurable: true, enumerable: true });
+            Reflect.getOwnPropertyDescriptor(obj, "x").writable;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Reflect.getOwnPropertyDescriptor reports enumerable correctly.
+    #[test]
+    fn e2e_reflect_gopd_enumerable_field() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Reflect.defineProperty(obj, "x", { value: 1, writable: true, configurable: true, enumerable: false });
+            Reflect.getOwnPropertyDescriptor(obj, "x").enumerable;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Reflect.getOwnPropertyDescriptor reports configurable correctly.
+    #[test]
+    fn e2e_reflect_gopd_configurable_field() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Reflect.defineProperty(obj, "x", { value: 1, writable: true, configurable: true, enumerable: true });
+            Reflect.getOwnPropertyDescriptor(obj, "x").configurable;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.getPrototypeOf on function returns Function.prototype.
+    #[test]
+    fn e2e_reflect_get_prototype_of_function() {
+        let r =
+            global_eval(r#"Reflect.getPrototypeOf(function(){}) === Function.prototype"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.setPrototypeOf to null removes prototype.
+    #[test]
+    fn e2e_reflect_set_prototype_of_null() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Reflect.setPrototypeOf(obj, null);
+            Reflect.getPrototypeOf(obj) === null;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.setPrototypeOf cyclic chain is rejected.
+    #[test]
+    fn e2e_reflect_set_prototype_of_cyclic_rejected() {
+        let r = global_eval(
+            r#"
+            var a = {};
+            var b = {};
+            Reflect.setPrototypeOf(a, b);
+            Reflect.setPrototypeOf(b, a);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Reflect.isExtensible on frozen object returns false.
+    #[test]
+    fn e2e_reflect_is_extensible_frozen() {
+        let r = global_eval(r#"Reflect.isExtensible(Object.freeze({}))"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Reflect.preventExtensions is idempotent.
+    #[test]
+    fn e2e_reflect_prevent_extensions_idempotent() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Reflect.preventExtensions(obj);
+            Reflect.preventExtensions(obj);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.preventExtensions blocks new property addition.
+    #[test]
+    fn e2e_reflect_prevent_extensions_blocks_new_props() {
+        let r = global_eval(
+            r#"
+            var obj = { x: 1 };
+            Reflect.preventExtensions(obj);
+            Reflect.set(obj, "y", 2);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Reflect.set on non-extensible with existing writable property succeeds.
+    #[test]
+    fn e2e_reflect_set_non_extensible_existing_writable() {
+        let r = global_eval(
+            r#"
+            var obj = { x: 1 };
+            Object.preventExtensions(obj);
+            Reflect.set(obj, "x", 2) && obj.x === 2;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Reflect.get with receiver on accessor calls getter with receiver this.
+    #[test]
+    fn e2e_reflect_get_accessor_receiver_deep() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Object.defineProperty(obj, "x", {
+                get: function () { return this.val * 2; },
+                configurable: true
+            });
+            Reflect.get(obj, "x", { val: 21 });
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// Reflect.set with receiver on accessor calls setter on receiver.
+    #[test]
+    fn e2e_reflect_set_accessor_receiver_deep() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Object.defineProperty(obj, "x", {
+                set: function (v) { this.stored = v + 1; },
+                configurable: true
+            });
+            var recv = {};
+            Reflect.set(obj, "x", 10, recv);
+            recv.stored;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(11));
+    }
+
+    /// Reflect.get returns undefined on non-object target throws TypeError.
+    #[test]
+    fn e2e_reflect_get_non_object_throws() {
+        let r = global_eval(r#"try { Reflect.get(42, "x"); "no"; } catch (e) { "ok"; }"#).unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
+    }
+
+    /// Reflect.set on non-object target throws TypeError.
+    #[test]
+    fn e2e_reflect_set_non_object_throws() {
+        let r =
+            global_eval(r#"try { Reflect.set(42, "x", 1); "no"; } catch (e) { "ok"; }"#).unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
+    }
+
+    /// Reflect.has on non-object target throws TypeError.
+    #[test]
+    fn e2e_reflect_has_non_object_throws() {
+        let r = global_eval(r#"try { Reflect.has(42, "x"); "no"; } catch (e) { "ok"; }"#).unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
+    }
+
+    /// Reflect.deleteProperty on non-object throws TypeError.
+    #[test]
+    fn e2e_reflect_delete_property_non_object_throws() {
+        let r =
+            global_eval(r#"try { Reflect.deleteProperty(42, "x"); "no"; } catch (e) { "ok"; }"#)
+                .unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
+    }
+
+    /// Reflect.defineProperty on non-object throws TypeError.
+    #[test]
+    fn e2e_reflect_define_property_non_object_throws() {
+        let r = global_eval(
+            r#"try { Reflect.defineProperty(42, "x", { value: 1 }); "no"; } catch (e) { "ok"; }"#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
+    }
+
+    /// Reflect.ownKeys on non-object throws TypeError.
+    #[test]
+    fn e2e_reflect_own_keys_non_object_throws() {
+        let r = global_eval(r#"try { Reflect.ownKeys(42); "no"; } catch (e) { "ok"; }"#).unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
+    }
+
+    /// Reflect.getPrototypeOf on non-object throws TypeError.
+    #[test]
+    fn e2e_reflect_get_prototype_of_non_object_throws() {
+        let r = global_eval(r#"try { Reflect.getPrototypeOf(42); "no"; } catch (e) { "ok"; }"#)
+            .unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
+    }
+
+    /// Reflect.setPrototypeOf on non-object throws TypeError.
+    #[test]
+    fn e2e_reflect_set_prototype_of_non_object_throws() {
+        let r = global_eval(r#"try { Reflect.setPrototypeOf(42, {}); "no"; } catch (e) { "ok"; }"#)
+            .unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
+    }
+
+    /// Reflect.isExtensible on non-object throws TypeError.
+    #[test]
+    fn e2e_reflect_is_extensible_non_object_throws() {
+        let r =
+            global_eval(r#"try { Reflect.isExtensible(42); "no"; } catch (e) { "ok"; }"#).unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
+    }
+
+    /// Reflect.preventExtensions on non-object throws TypeError.
+    #[test]
+    fn e2e_reflect_prevent_extensions_non_object_throws() {
+        let r = global_eval(r#"try { Reflect.preventExtensions(42); "no"; } catch (e) { "ok"; }"#)
+            .unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
+    }
+
+    /// Reflect.getOwnPropertyDescriptor on non-object throws TypeError.
+    #[test]
+    fn e2e_reflect_gopd_non_object_throws() {
+        let r = global_eval(
+            r#"try { Reflect.getOwnPropertyDescriptor(42, "x"); "no"; } catch (e) { "ok"; }"#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
+    }
+
+    /// Reflect.construct non-constructor newTarget throws TypeError.
+    #[test]
+    fn e2e_reflect_construct_non_constructor_new_target_throws() {
+        let r = global_eval(
+            r#"try { Reflect.construct(function(){}, [], 42); "no"; } catch (e) { "ok"; }"#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
+    }
+
+    /// Reflect.apply uses this binding for method call.
+    #[test]
+    fn e2e_reflect_apply_method_this() {
+        let r = global_eval(
+            r#"
+            var obj = { x: 10, getX: function() { return this.x; } };
+            Reflect.apply(obj.getX, { x: 99 }, []);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    /// Reflect.set returns true as boolean type.
+    #[test]
+    fn e2e_reflect_set_return_type_boolean() {
+        let r = global_eval(r#"typeof Reflect.set({}, "x", 1)"#).unwrap();
+        assert_eq!(r, JsValue::String("boolean".into()));
+    }
+
+    /// Reflect.has returns boolean type.
+    #[test]
+    fn e2e_reflect_has_return_type_boolean() {
+        let r = global_eval(r#"typeof Reflect.has({}, "x")"#).unwrap();
+        assert_eq!(r, JsValue::String("boolean".into()));
+    }
+
+    /// Reflect.defineProperty returns boolean type.
+    #[test]
+    fn e2e_reflect_define_property_return_type_boolean() {
+        let r = global_eval(r#"typeof Reflect.defineProperty({}, "x", { value: 1 })"#).unwrap();
+        assert_eq!(r, JsValue::String("boolean".into()));
+    }
+
+    /// Reflect.deleteProperty returns boolean type.
+    #[test]
+    fn e2e_reflect_delete_property_return_type_boolean() {
+        let r = global_eval(r#"typeof Reflect.deleteProperty({}, "x")"#).unwrap();
+        assert_eq!(r, JsValue::String("boolean".into()));
+    }
+
     // ── Property descriptor conformance e2e tests ───────────────────────
 
     /// Mixed descriptor (both accessor and data fields) throws TypeError.
