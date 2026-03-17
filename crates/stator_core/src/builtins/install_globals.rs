@@ -86,7 +86,8 @@ use crate::builtins::math::{
     math_tan, math_tanh, math_trunc,
 };
 use crate::builtins::number::{
-    number_reformat_exponential, number_to_exponential, number_to_fixed, number_to_precision,
+    number_is_safe_integer, number_reformat_exponential, number_to_exponential, number_to_fixed,
+    number_to_precision,
 };
 use crate::builtins::proxy::{
     ProxyHandler, proxy_define_property, proxy_delete_property, proxy_get_own_property_descriptor,
@@ -4284,9 +4285,7 @@ fn make_number() -> JsValue {
                 let val = args.first().unwrap_or(&JsValue::Undefined);
                 let result = match val {
                     JsValue::Smi(_) => true,
-                    JsValue::HeapNumber(n) => {
-                        n.is_finite() && n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0
-                    }
+                    JsValue::HeapNumber(n) => number_is_safe_integer(*n),
                     _ => false,
                 };
                 Ok(JsValue::Boolean(result))
@@ -4415,17 +4414,16 @@ fn make_number() -> JsValue {
                 "toFixed".into(),
                 native(|args| {
                     let n = this_number_value(&args)?;
-                    let f_raw = match args.get(1) {
+                    let digits = match args.get(1) {
                         None | Some(JsValue::Undefined) => 0.0,
-                        Some(v) => v.to_number().unwrap_or(0.0),
+                        Some(value) => value.to_integer_or_infinity()?,
                     };
-                    let f = f_raw.floor() as i64;
-                    if !(0..=100).contains(&f) {
+                    if !digits.is_finite() || !(0.0..=100.0).contains(&digits) {
                         return Err(StatorError::RangeError(
                             "toFixed() digits argument must be between 0 and 100".to_string(),
                         ));
                     }
-                    Ok(JsValue::String(number_to_fixed(n, f as u32)?.into()))
+                    Ok(JsValue::String(number_to_fixed(n, digits as u32)?.into()))
                 }),
             );
 
@@ -4435,19 +4433,17 @@ fn make_number() -> JsValue {
                 native(|args| {
                     let n = this_number_value(&args)?;
                     let digits = match args.get(1) {
-                        Some(JsValue::Smi(d)) => Some((*d).clamp(0, 100) as u32),
-                        Some(JsValue::HeapNumber(d)) => {
-                            let v = d.floor() as i64;
-                            if !(0..=100).contains(&v) {
+                        None | Some(JsValue::Undefined) => None,
+                        Some(value) => {
+                            let digits = value.to_integer_or_infinity()?;
+                            if !digits.is_finite() || !(0.0..=100.0).contains(&digits) {
                                 return Err(StatorError::RangeError(
                                     "toExponential() fractionDigits must be between 0 and 100"
                                         .to_string(),
                                 ));
                             }
-                            Some(v as u32)
+                            Some(digits as u32)
                         }
-                        Some(JsValue::Undefined) | None => None,
-                        _ => None,
                     };
                     match digits {
                         Some(d) => Ok(JsValue::String(number_to_exponential(n, d)?.into())),
@@ -4482,14 +4478,15 @@ fn make_number() -> JsValue {
                             ))
                         }
                         Some(v) => {
-                            let p = v.to_number()?;
-                            let pi = p.floor() as i64;
-                            if !(1..=100).contains(&pi) {
+                            let precision = v.to_integer_or_infinity()?;
+                            if !precision.is_finite() || !(1.0..=100.0).contains(&precision) {
                                 return Err(StatorError::RangeError(
                                     "toPrecision() argument must be between 1 and 100".to_string(),
                                 ));
                             }
-                            Ok(JsValue::String(number_to_precision(n, pi as u32)?.into()))
+                            Ok(JsValue::String(
+                                number_to_precision(n, precision as u32)?.into(),
+                            ))
                         }
                     }
                 }),
@@ -47683,6 +47680,336 @@ mod tests {
     fn e2e_to_fixed_negative_zero() {
         let result = global_eval("(-0).toFixed(1)").unwrap();
         assert_eq!(result, JsValue::String("0.0".to_string()));
+    }
+
+    // ── Deep Number / Math numeric conformance tests ────────────────────────
+
+    #[test]
+    fn e2e_number_epsilon_exact_value() {
+        assert_eval_true("Number.EPSILON === 2.220446049250313e-16");
+    }
+
+    #[test]
+    fn e2e_number_max_value_exact_value() {
+        assert_eval_true("Number.MAX_VALUE === 1.7976931348623157e+308");
+    }
+
+    #[test]
+    fn e2e_number_min_value_exact_value() {
+        assert_eval_true("Number.MIN_VALUE === 5e-324");
+    }
+
+    #[test]
+    fn e2e_number_max_safe_integer_exact_value() {
+        assert_eval_true("Number.MAX_SAFE_INTEGER === 9007199254740991");
+    }
+
+    #[test]
+    fn e2e_number_min_safe_integer_exact_value() {
+        assert_eval_true("Number.MIN_SAFE_INTEGER === -9007199254740991");
+    }
+
+    #[test]
+    fn e2e_number_is_safe_integer_max_boundary() {
+        assert_eval_true("Number.isSafeInteger(Number.MAX_SAFE_INTEGER) === true");
+    }
+
+    #[test]
+    fn e2e_number_is_safe_integer_min_boundary() {
+        assert_eval_true("Number.isSafeInteger(Number.MIN_SAFE_INTEGER) === true");
+    }
+
+    #[test]
+    fn e2e_number_is_safe_integer_above_max_boundary() {
+        assert_eval_true("Number.isSafeInteger(Number.MAX_SAFE_INTEGER + 1) === false");
+    }
+
+    #[test]
+    fn e2e_number_is_safe_integer_below_min_boundary() {
+        assert_eval_true("Number.isSafeInteger(Number.MIN_SAFE_INTEGER - 1) === false");
+    }
+
+    #[test]
+    fn e2e_number_is_safe_integer_negative_zero() {
+        assert_eval_true("Number.isSafeInteger(-0) === true");
+    }
+
+    #[test]
+    fn e2e_to_fixed_rounds_exact_half_up() {
+        assert_eval_true("(1.25).toFixed(1) === '1.3'");
+    }
+
+    #[test]
+    fn e2e_to_fixed_rounds_negative_exact_half_up() {
+        assert_eval_true("(-1.25).toFixed(1) === '-1.3'");
+    }
+
+    #[test]
+    fn e2e_to_fixed_small_fraction_rounds_down_to_zero() {
+        assert_eval_true("(0.00008).toFixed(3) === '0.000'");
+    }
+
+    #[test]
+    fn e2e_to_fixed_negative_small_fraction_preserves_sign() {
+        assert_eval_true("(-0.00008).toFixed(3) === '-0.000'");
+    }
+
+    #[test]
+    fn e2e_to_fixed_coerces_string_digits() {
+        assert_eval_true("(1).toFixed('2') === '1.00'");
+    }
+
+    #[test]
+    fn e2e_to_fixed_truncates_negative_fractional_digits_toward_zero() {
+        assert_eval_true("(1.2).toFixed(-0.9) === '1'");
+    }
+
+    #[test]
+    fn e2e_to_fixed_rejects_infinite_digits() {
+        assert_eval_true(
+            "try { (1).toFixed(Infinity); false } catch (e) { e instanceof RangeError }",
+        );
+    }
+
+    #[test]
+    fn e2e_to_fixed_large_number_uses_to_string() {
+        assert_eval_true("(1e21).toFixed(0) === '1e+21'");
+    }
+
+    #[test]
+    fn e2e_to_fixed_binary_rounding_case_one() {
+        assert_eval_true("(1.005).toFixed(2) === '1.00'");
+    }
+
+    #[test]
+    fn e2e_to_fixed_binary_rounding_case_two() {
+        assert_eval_true("(0.615).toFixed(2) === '0.62'");
+    }
+
+    #[test]
+    fn e2e_to_fixed_large_integer_precision_case() {
+        assert_eval_true("(1000000000000000128).toFixed(0) === '1000000000000000128'");
+    }
+
+    #[test]
+    fn e2e_to_exponential_rounds_exact_half_up() {
+        assert_eval_true("(1.25).toExponential(1) === '1.3e+0'");
+    }
+
+    #[test]
+    fn e2e_to_exponential_rounds_negative_exact_half_up() {
+        assert_eval_true("(-1.25).toExponential(1) === '-1.3e+0'");
+    }
+
+    #[test]
+    fn e2e_to_exponential_rounding_carries_into_exponent() {
+        assert_eval_true("(99.5).toExponential(1) === '1.0e+2'");
+    }
+
+    #[test]
+    fn e2e_to_exponential_zero_fraction_digits() {
+        assert_eval_true("(0).toExponential(0) === '0e+0'");
+    }
+
+    #[test]
+    fn e2e_to_exponential_negative_zero_has_no_sign() {
+        assert_eval_true("(-0).toExponential(2) === '0.00e+0'");
+    }
+
+    #[test]
+    fn e2e_to_exponential_coerces_string_digits() {
+        assert_eval_true("(1).toExponential('2') === '1.00e+0'");
+    }
+
+    #[test]
+    fn e2e_to_exponential_truncates_fractional_digits_toward_zero() {
+        assert_eval_true("(1).toExponential(-0.9) === '1e+0'");
+    }
+
+    #[test]
+    fn e2e_to_exponential_rejects_infinite_digits() {
+        assert_eval_true(
+            "try { (1).toExponential(Infinity); false } catch (e) { e instanceof RangeError }",
+        );
+    }
+
+    #[test]
+    fn e2e_to_exponential_nan_no_arg() {
+        assert_eval_true("NaN.toExponential() === 'NaN'");
+    }
+
+    #[test]
+    fn e2e_to_exponential_shortest_form_no_arg() {
+        assert_eval_true("(123.456).toExponential() === '1.23456e+2'");
+    }
+
+    #[test]
+    fn e2e_to_precision_uses_exponential_below_negative_six_exponent() {
+        assert_eval_true("(1e-7).toPrecision(1) === '1e-7'");
+    }
+
+    #[test]
+    fn e2e_to_precision_uses_fixed_at_negative_six_exponent() {
+        assert_eval_true("(1e-6).toPrecision(1) === '0.000001'");
+    }
+
+    #[test]
+    fn e2e_to_precision_small_fraction_keeps_significant_digits() {
+        assert_eval_true("(0.000123).toPrecision(2) === '0.00012'");
+    }
+
+    #[test]
+    fn e2e_to_precision_rounds_exact_half_up() {
+        assert_eval_true("(12.5).toPrecision(2) === '13'");
+    }
+
+    #[test]
+    fn e2e_to_precision_rounding_carries_into_exponent() {
+        assert_eval_true("(99.5).toPrecision(2) === '1.0e+2'");
+    }
+
+    #[test]
+    fn e2e_to_precision_single_digit_hundred() {
+        assert_eval_true("(100).toPrecision(1) === '1e+2'");
+    }
+
+    #[test]
+    fn e2e_to_precision_preserves_trailing_zeroes() {
+        assert_eval_true("(100).toPrecision(3) === '100'");
+    }
+
+    #[test]
+    fn e2e_to_precision_zero_padding() {
+        assert_eval_true("(0).toPrecision(4) === '0.000'");
+    }
+
+    #[test]
+    fn e2e_to_precision_coerces_string_precision() {
+        assert_eval_true("(1).toPrecision('2') === '1.0'");
+    }
+
+    #[test]
+    fn e2e_to_precision_rejects_fractional_precision_below_one() {
+        assert_eval_true(
+            "try { (1).toPrecision(-0.9); false } catch (e) { e instanceof RangeError }",
+        );
+    }
+
+    #[test]
+    fn e2e_to_precision_rejects_infinite_precision() {
+        assert_eval_true(
+            "try { (1).toPrecision(Infinity); false } catch (e) { e instanceof RangeError }",
+        );
+    }
+
+    #[test]
+    fn e2e_math_fround_matches_float32_rounding() {
+        assert_eval_true("Math.fround(1.337) === 1.3370000123977661");
+    }
+
+    #[test]
+    fn e2e_math_fround_preserves_negative_zero() {
+        assert_eval_true("Object.is(Math.fround(-0), -0)");
+    }
+
+    #[test]
+    fn e2e_math_fround_nan_is_nan() {
+        assert_eval_true("Number.isNaN(Math.fround(NaN))");
+    }
+
+    #[test]
+    fn e2e_math_cbrt_basic() {
+        assert_eval_true("Math.cbrt(27) === 3");
+    }
+
+    #[test]
+    fn e2e_math_cbrt_preserves_negative_zero() {
+        assert_eval_true("Object.is(Math.cbrt(-0), -0)");
+    }
+
+    #[test]
+    fn e2e_math_log2_basic() {
+        assert_eval_true("Math.log2(8) === 3");
+    }
+
+    #[test]
+    fn e2e_math_log10_basic() {
+        assert_eval_true("Math.log10(1000) === 3");
+    }
+
+    #[test]
+    fn e2e_math_log1p_negative_one() {
+        assert_eval_true("Math.log1p(-1) === -Infinity");
+    }
+
+    #[test]
+    fn e2e_math_expm1_zero() {
+        assert_eval_true("Math.expm1(0) === 0");
+    }
+
+    #[test]
+    fn e2e_math_sinh_zero() {
+        assert_eval_true("Math.sinh(0) === 0");
+    }
+
+    #[test]
+    fn e2e_math_cosh_zero() {
+        assert_eval_true("Math.cosh(0) === 1");
+    }
+
+    #[test]
+    fn e2e_math_tanh_zero() {
+        assert_eval_true("Math.tanh(0) === 0");
+    }
+
+    #[test]
+    fn e2e_math_asinh_preserves_negative_zero() {
+        assert_eval_true("Object.is(Math.asinh(-0), -0)");
+    }
+
+    #[test]
+    fn e2e_math_acosh_one() {
+        assert_eval_true("Math.acosh(1) === 0");
+    }
+
+    #[test]
+    fn e2e_math_atanh_preserves_negative_zero() {
+        assert_eval_true("Object.is(Math.atanh(-0), -0)");
+    }
+
+    #[test]
+    fn e2e_math_sign_negative_value() {
+        assert_eval_true("Math.sign(-5) === -1");
+    }
+
+    #[test]
+    fn e2e_math_sign_negative_zero() {
+        assert_eval_true("Object.is(Math.sign(-0), -0)");
+    }
+
+    #[test]
+    fn e2e_math_sign_positive_zero() {
+        assert_eval_true("Object.is(Math.sign(0), 0)");
+    }
+
+    #[test]
+    fn e2e_math_sign_nan_is_nan() {
+        assert_eval_true("Number.isNaN(Math.sign(NaN))");
+    }
+
+    #[test]
+    fn e2e_math_trunc_positive_value() {
+        assert_eval_true("Math.trunc(13.9) === 13");
+    }
+
+    #[test]
+    fn e2e_math_trunc_negative_value() {
+        assert_eval_true("Math.trunc(-13.9) === -13");
+    }
+
+    #[test]
+    fn e2e_math_trunc_negative_fraction_returns_negative_zero() {
+        assert_eval_true("Object.is(Math.trunc(-0.9), -0)");
     }
 
     /// Negative number toString(16).
