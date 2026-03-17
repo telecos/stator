@@ -2416,9 +2416,6 @@ pub(super) fn js_less_than(lhs: &JsValue, rhs: &JsValue) -> StatorResult<bool> {
     if let (JsValue::Smi(a), JsValue::Smi(b)) = (lhs, rhs) {
         return Ok(a < b);
     }
-    if let (JsValue::String(a), JsValue::String(b)) = (lhs, rhs) {
-        return Ok(a < b);
-    }
     // Full spec: §7.2.14 IsLessThan(x, y, true)
     // Returns None for undefined (NaN cases) → map to false
     Ok(JsValue::abstract_relational_comparison(lhs, rhs, true)?.unwrap_or(false))
