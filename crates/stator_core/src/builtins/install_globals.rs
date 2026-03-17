@@ -96,9 +96,8 @@ use crate::builtins::proxy::{
 };
 use crate::builtins::regexp::{regexp_construct, regexp_static_get};
 use crate::builtins::set::{
-    SetIteratorKind, set_add, set_clear, set_create_iterator, set_delete, set_difference,
-    set_from_iterable, set_has, set_intersection, set_is_disjoint_from, set_is_subset_of,
-    set_is_superset_of, set_new, set_size, set_symmetric_difference, set_union, set_values,
+    SetIteratorKind, set_add, set_clear, set_create_iterator, set_delete, set_from_iterable,
+    set_has, set_new, set_size, set_values,
 };
 use crate::builtins::string::{
     string_anchor, string_at, string_big, string_blink, string_bold, string_char_at,
@@ -1341,40 +1340,64 @@ fn try_regexp_symbol(
     None
 }
 
-/// Extract a [`JsSet`] from a Set-like `PlainObject` by calling its `keys()`
-/// or `values()` method and collecting the resulting iterator.
-///
-/// Per ES2025 §7.3.45 `GetSetRecord`, the spec uses `.keys()` to iterate the
-/// other set.  We also fall back to `.values()` and `@@iterator` for
-/// compatibility with Map-like and other iterable objects.
-fn extract_set_from_arg(arg: &JsValue) -> StatorResult<crate::builtins::set::JsSet> {
-    use crate::builtins::iterator::iterator_next;
-    if let JsValue::PlainObject(map) = arg {
-        let borrow = map.borrow();
-        // Try keys() first (spec-compliant for Set composition methods),
-        // then values(), then @@iterator as fallbacks.
-        let iter_fn = borrow
-            .get("keys")
-            .or_else(|| borrow.get("values"))
-            .or_else(|| borrow.get("@@iterator"))
-            .cloned();
-        if let Some(JsValue::NativeFunction(f)) = iter_fn {
-            let iter = f(vec![])?;
-            drop(borrow);
-            let mut items = Vec::new();
-            loop {
-                let rec = iterator_next(&iter)?;
-                if rec.done {
-                    break;
-                }
-                items.push(rec.value);
-            }
-            return Ok(set_from_iterable(items));
-        }
+/// ES2025 §7.3.45 `GetSetRecord` materialised for Set composition methods.
+#[derive(Clone)]
+struct SetLikeRecord {
+    object: JsValue,
+    size: usize,
+    has: JsValue,
+    keys: JsValue,
+}
+
+fn invalid_set_like_arg() -> StatorError {
+    StatorError::TypeError("argument is not a Set-like object".into())
+}
+
+fn get_set_like_property(arg: &JsValue, key: &str) -> StatorResult<JsValue> {
+    dispatch_get_property_value(arg, JsValue::String(key.into()))
+}
+
+fn get_set_like_record(arg: &JsValue) -> StatorResult<SetLikeRecord> {
+    let has = get_set_like_property(arg, "has")?;
+    if !is_callable(&has) {
+        return Err(invalid_set_like_arg());
     }
-    Err(StatorError::TypeError(
-        "argument is not a Set-like object".into(),
-    ))
+
+    let size_value = get_set_like_property(arg, "size")?;
+    if matches!(size_value, JsValue::Undefined) {
+        return Err(invalid_set_like_arg());
+    }
+    let size = crate::builtins::util::checked_f64_to_length(size_value.to_number()?)?;
+
+    let keys = ["keys", "values", "@@iterator"]
+        .into_iter()
+        .map(|name| get_set_like_property(arg, name).map(|value| (name, value)))
+        .find_map(|result| match result {
+            Ok((_, value)) if is_callable(&value) => Some(Ok(value)),
+            Ok(_) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .transpose()?
+        .ok_or_else(invalid_set_like_arg)?;
+
+    Ok(SetLikeRecord {
+        object: arg.clone(),
+        size,
+        has,
+        keys,
+    })
+}
+
+fn iterate_set_like_keys(record: &SetLikeRecord) -> StatorResult<Vec<JsValue>> {
+    let iter = dispatch_call_with_this(&record.keys, record.object.clone(), vec![])?;
+    iterator_to_vec(&iter)
+}
+
+fn set_like_has(record: &SetLikeRecord, value: &JsValue) -> StatorResult<bool> {
+    Ok(
+        dispatch_call_with_this(&record.has, record.object.clone(), vec![value.clone()])?
+            .to_boolean(),
+    )
 }
 
 /// Build a full `Map` instance (PlainObject with map methods) from a [`JsMap`].
@@ -1652,8 +1675,13 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
             "union".into(),
             native(move |a| {
                 let other_val = a.first().unwrap_or(&JsValue::Undefined);
-                let other_set = extract_set_from_arg(other_val)?;
-                let result = set_union(&inner.borrow(), &other_set);
+                let other = get_set_like_record(other_val)?;
+                let mut result = inner.borrow().clone();
+                for value in iterate_set_like_keys(&other)? {
+                    if !set_has(&result, &value) {
+                        set_add(&mut result, value);
+                    }
+                }
                 build_set_instance(result)
             }),
         );
@@ -1665,8 +1693,16 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
             "intersection".into(),
             native(move |a| {
                 let other_val = a.first().unwrap_or(&JsValue::Undefined);
-                let other_set = extract_set_from_arg(other_val)?;
-                let result = set_intersection(&inner.borrow(), &other_set);
+                let other = get_set_like_record(other_val)?;
+                let this_set = inner.borrow();
+                let mut result = set_new();
+                if other.size != 0 {
+                    for value in set_values(&this_set) {
+                        if set_like_has(&other, &value)? {
+                            set_add(&mut result, value);
+                        }
+                    }
+                }
                 build_set_instance(result)
             }),
         );
@@ -1678,8 +1714,14 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
             "difference".into(),
             native(move |a| {
                 let other_val = a.first().unwrap_or(&JsValue::Undefined);
-                let other_set = extract_set_from_arg(other_val)?;
-                let result = set_difference(&inner.borrow(), &other_set);
+                let other = get_set_like_record(other_val)?;
+                let this_set = inner.borrow();
+                let mut result = set_new();
+                for value in set_values(&this_set) {
+                    if !set_like_has(&other, &value)? {
+                        set_add(&mut result, value);
+                    }
+                }
                 build_set_instance(result)
             }),
         );
@@ -1691,8 +1733,20 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
             "symmetricDifference".into(),
             native(move |a| {
                 let other_val = a.first().unwrap_or(&JsValue::Undefined);
-                let other_set = extract_set_from_arg(other_val)?;
-                let result = set_symmetric_difference(&inner.borrow(), &other_set);
+                let other = get_set_like_record(other_val)?;
+                let this_set = inner.borrow();
+                let this_values = set_values(&this_set);
+                let mut result = set_new();
+                for value in &this_values {
+                    if !set_like_has(&other, value)? {
+                        set_add(&mut result, value.clone());
+                    }
+                }
+                for value in iterate_set_like_keys(&other)? {
+                    if !set_has(&this_set, &value) {
+                        set_add(&mut result, value);
+                    }
+                }
                 build_set_instance(result)
             }),
         );
@@ -1704,11 +1758,17 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
             "isSubsetOf".into(),
             native(move |a| {
                 let other_val = a.first().unwrap_or(&JsValue::Undefined);
-                let other_set = extract_set_from_arg(other_val)?;
-                Ok(JsValue::Boolean(set_is_subset_of(
-                    &inner.borrow(),
-                    &other_set,
-                )))
+                let other = get_set_like_record(other_val)?;
+                let this_set = inner.borrow();
+                if set_size(&this_set) > other.size {
+                    return Ok(JsValue::Boolean(false));
+                }
+                for value in set_values(&this_set) {
+                    if !set_like_has(&other, &value)? {
+                        return Ok(JsValue::Boolean(false));
+                    }
+                }
+                Ok(JsValue::Boolean(true))
             }),
         );
     }
@@ -1719,11 +1779,17 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
             "isSupersetOf".into(),
             native(move |a| {
                 let other_val = a.first().unwrap_or(&JsValue::Undefined);
-                let other_set = extract_set_from_arg(other_val)?;
-                Ok(JsValue::Boolean(set_is_superset_of(
-                    &inner.borrow(),
-                    &other_set,
-                )))
+                let other = get_set_like_record(other_val)?;
+                let this_set = inner.borrow();
+                if set_size(&this_set) < other.size {
+                    return Ok(JsValue::Boolean(false));
+                }
+                for value in iterate_set_like_keys(&other)? {
+                    if !set_has(&this_set, &value) {
+                        return Ok(JsValue::Boolean(false));
+                    }
+                }
+                Ok(JsValue::Boolean(true))
             }),
         );
     }
@@ -1734,11 +1800,22 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
             "isDisjointFrom".into(),
             native(move |a| {
                 let other_val = a.first().unwrap_or(&JsValue::Undefined);
-                let other_set = extract_set_from_arg(other_val)?;
-                Ok(JsValue::Boolean(set_is_disjoint_from(
-                    &inner.borrow(),
-                    &other_set,
-                )))
+                let other = get_set_like_record(other_val)?;
+                let this_set = inner.borrow();
+                if set_size(&this_set) <= other.size {
+                    for value in set_values(&this_set) {
+                        if set_like_has(&other, &value)? {
+                            return Ok(JsValue::Boolean(false));
+                        }
+                    }
+                } else {
+                    for value in iterate_set_like_keys(&other)? {
+                        if set_has(&this_set, &value) {
+                            return Ok(JsValue::Boolean(false));
+                        }
+                    }
+                }
+                Ok(JsValue::Boolean(true))
             }),
         );
     }
@@ -42425,6 +42502,464 @@ mod tests {
     fn e2e_set_constructor_null_creates_empty() {
         let result = global_eval("var s = new Set(null); s.size === 0").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Set composition methods (ES2025) ────────────────────────────────
+
+    #[test]
+    fn e2e_set_union_basic() {
+        assert_eval_true(
+            "var r = new Set([1, 2]).union(new Set([2, 3])); r.size === 3 && r.has(1) && r.has(2) && r.has(3)",
+        );
+    }
+
+    #[test]
+    fn e2e_set_union_preserves_insertion_order() {
+        assert_eval_true(
+            "var out = []; new Set([3, 1]).union(new Set([1, 2])).forEach(function(v) { out.push(v); }); out.join(',') === '3,1,2'",
+        );
+    }
+
+    #[test]
+    fn e2e_set_union_returns_new_set_without_mutating_receiver() {
+        assert_eval_true(
+            "var a = new Set([1, 2]); var r = a.union(new Set([2, 3])); r !== a && a.size === 2 && !a.has(3) && r.size === 3 && r.has(3)",
+        );
+    }
+
+    #[test]
+    fn e2e_set_union_accepts_map_keys() {
+        assert_eval_true(
+            "var r = new Set(['a']).union(new Map([['b', 1], ['a', 2]])); r.size === 2 && r.has('a') && r.has('b')",
+        );
+    }
+
+    #[test]
+    fn e2e_set_union_accepts_custom_set_like() {
+        assert_eval_true(
+            r#"
+            function iter(items) {
+                var i = 0;
+                return { next: function() {
+                    if (i < items.length) return { value: items[i++], done: false };
+                    return { done: true };
+                }};
+            }
+            var other = {
+                data: [2, 4],
+                get size() { return this.data.length; },
+                has: function(v) { return v === 2 || v === 4; },
+                keys: function() { return iter(this.data); }
+            };
+            var r = new Set([1, 2]).union(other);
+            r.size === 3 && r.has(1) && r.has(2) && r.has(4)
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_set_union_uses_keys_iterator() {
+        assert_eval_true(
+            r#"
+            function iter(items) {
+                var i = 0;
+                return { next: function() {
+                    if (i < items.length) return { value: items[i++], done: false };
+                    return { done: true };
+                }};
+            }
+            var other = {
+                get size() { return 2; },
+                has: function(v) { return v === 2 || v === 5; },
+                keys: function() { return iter([2, 5]); }
+            };
+            var r = new Set([1, 2]).union(other);
+            r.size === 3 && r.has(5)
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_set_intersection_basic() {
+        assert_eval_true(
+            "var r = new Set([1, 2, 3]).intersection(new Set([2, 4, 3])); r.size === 2 && r.has(2) && r.has(3)",
+        );
+    }
+
+    #[test]
+    fn e2e_set_intersection_preserves_receiver_order() {
+        assert_eval_true(
+            "var out = []; new Set([3, 1, 2]).intersection(new Set([2, 3])).forEach(function(v) { out.push(v); }); out.join(',') === '3,2'",
+        );
+    }
+
+    #[test]
+    fn e2e_set_intersection_accepts_map_keys() {
+        assert_eval_true(
+            "var r = new Set(['x', 'y', 'z']).intersection(new Map([['y', 1], ['x', 2]])); r.size === 2 && r.has('x') && r.has('y') && !r.has('z')",
+        );
+    }
+
+    #[test]
+    fn e2e_set_intersection_accepts_custom_set_like() {
+        assert_eval_true(
+            r#"
+            var receiverSeen = false;
+            var other = {
+                get size() { return 2; },
+                has: function(v) { receiverSeen = receiverSeen || this === other; return v === 2 || v === 4; },
+                keys: function() { return { next: function() { return { done: true }; } }; }
+            };
+            var r = new Set([1, 2, 4]).intersection(other);
+            receiverSeen && r.size === 2 && r.has(2) && r.has(4)
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_set_intersection_with_empty_other_is_empty() {
+        assert_eval_true("new Set([1, 2]).intersection(new Set()).size === 0");
+    }
+
+    #[test]
+    fn e2e_set_difference_basic() {
+        assert_eval_true(
+            "var r = new Set([1, 2, 3]).difference(new Set([2, 4])); r.size === 2 && r.has(1) && r.has(3) && !r.has(2)",
+        );
+    }
+
+    #[test]
+    fn e2e_set_difference_preserves_receiver_order() {
+        assert_eval_true(
+            "var out = []; new Set([3, 1, 2]).difference(new Set([2])).forEach(function(v) { out.push(v); }); out.join(',') === '3,1'",
+        );
+    }
+
+    #[test]
+    fn e2e_set_difference_accepts_map_keys() {
+        assert_eval_true(
+            "var r = new Set(['a', 'b', 'c']).difference(new Map([['b', 1], ['x', 2]])); r.size === 2 && r.has('a') && r.has('c') && !r.has('b')",
+        );
+    }
+
+    #[test]
+    fn e2e_set_difference_accepts_custom_set_like() {
+        assert_eval_true(
+            r#"
+            var other = {
+                get size() { return 1; },
+                has: function(v) { return v === 2; },
+                keys: function() { return { next: function() { return { done: true }; } }; }
+            };
+            var r = new Set([1, 2, 3]).difference(other);
+            r.size === 2 && r.has(1) && r.has(3) && !r.has(2)
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_set_difference_does_not_mutate_receiver() {
+        assert_eval_true(
+            "var a = new Set([1, 2, 3]); var r = a.difference(new Set([2])); a.size === 3 && a.has(2) && r.size === 2 && !r.has(2)",
+        );
+    }
+
+    #[test]
+    fn e2e_set_symmetric_difference_basic() {
+        assert_eval_true(
+            "var r = new Set([1, 2, 3]).symmetricDifference(new Set([2, 4])); r.size === 3 && r.has(1) && r.has(3) && r.has(4) && !r.has(2)",
+        );
+    }
+
+    #[test]
+    fn e2e_set_symmetric_difference_preserves_expected_order() {
+        assert_eval_true(
+            "var out = []; new Set([3, 1, 2]).symmetricDifference(new Set([2, 4, 5])).forEach(function(v) { out.push(v); }); out.join(',') === '3,1,4,5'",
+        );
+    }
+
+    #[test]
+    fn e2e_set_symmetric_difference_accepts_map_keys() {
+        assert_eval_true(
+            "var r = new Set(['a', 'b']).symmetricDifference(new Map([['b', 1], ['c', 2]])); r.size === 2 && r.has('a') && r.has('c') && !r.has('b')",
+        );
+    }
+
+    #[test]
+    fn e2e_set_symmetric_difference_accepts_custom_set_like() {
+        assert_eval_true(
+            r#"
+            function iter(items) {
+                var i = 0;
+                return { next: function() {
+                    if (i < items.length) return { value: items[i++], done: false };
+                    return { done: true };
+                }};
+            }
+            var other = {
+                data: [2, 4],
+                get size() { return this.data.length; },
+                has: function(v) { return v === 2 || v === 4; },
+                keys: function() { return iter(this.data); }
+            };
+            var r = new Set([1, 2, 3]).symmetricDifference(other);
+            r.size === 3 && r.has(1) && r.has(3) && r.has(4)
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_set_symmetric_difference_does_not_mutate_receiver() {
+        assert_eval_true(
+            "var a = new Set([1, 2]); var r = a.symmetricDifference(new Set([2, 3])); a.size === 2 && a.has(2) && r.size === 2 && r.has(1) && r.has(3)",
+        );
+    }
+
+    #[test]
+    fn e2e_set_symmetric_difference_deduplicates_other_iterator_values() {
+        assert_eval_true(
+            r#"
+            function iter(items) {
+                var i = 0;
+                return { next: function() {
+                    if (i < items.length) return { value: items[i++], done: false };
+                    return { done: true };
+                }};
+            }
+            var other = {
+                get size() { return 3; },
+                has: function(v) { return v === 2 || v === 4; },
+                keys: function() { return iter([2, 4, 4]); }
+            };
+            var r = new Set([1, 2]).symmetricDifference(other);
+            r.size === 2 && r.has(1) && r.has(4)
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_set_is_subset_of_true() {
+        assert_eval_true("new Set([1, 2]).isSubsetOf(new Set([1, 2, 3])) === true");
+    }
+
+    #[test]
+    fn e2e_set_is_subset_of_false() {
+        assert_eval_true("new Set([1, 4]).isSubsetOf(new Set([1, 2, 3])) === false");
+    }
+
+    #[test]
+    fn e2e_set_is_subset_of_accepts_map_keys() {
+        assert_eval_true(
+            "new Set(['a', 'b']).isSubsetOf(new Map([['a', 1], ['b', 2], ['c', 3]])) === true",
+        );
+    }
+
+    #[test]
+    fn e2e_set_is_subset_of_accepts_custom_set_like() {
+        assert_eval_true(
+            r#"
+            var other = {
+                get size() { return 3; },
+                has: function(v) { return v === 1 || v === 2 || v === 3; },
+                keys: function() { return { next: function() { return { done: true }; } }; }
+            };
+            new Set([1, 3]).isSubsetOf(other) === true
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_set_is_subset_of_uses_size_short_circuit() {
+        assert_eval_true(
+            r#"
+            var hasCalls = 0;
+            var other = {
+                get size() { return 1; },
+                has: function(v) { hasCalls++; return true; },
+                keys: function() { return { next: function() { return { done: true }; } }; }
+            };
+            new Set([1, 2]).isSubsetOf(other) === false && hasCalls === 0
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_set_is_superset_of_true() {
+        assert_eval_true("new Set([1, 2, 3]).isSupersetOf(new Set([1, 3])) === true");
+    }
+
+    #[test]
+    fn e2e_set_is_superset_of_false() {
+        assert_eval_true("new Set([1, 2]).isSupersetOf(new Set([1, 3])) === false");
+    }
+
+    #[test]
+    fn e2e_set_is_superset_of_accepts_map_keys() {
+        assert_eval_true(
+            "new Set(['a', 'b', 'c']).isSupersetOf(new Map([['a', 1], ['c', 2]])) === true",
+        );
+    }
+
+    #[test]
+    fn e2e_set_is_superset_of_accepts_custom_set_like() {
+        assert_eval_true(
+            r#"
+            function iter(items) {
+                var i = 0;
+                return { next: function() {
+                    if (i < items.length) return { value: items[i++], done: false };
+                    return { done: true };
+                }};
+            }
+            var other = {
+                data: [2, 3],
+                get size() { return this.data.length; },
+                has: function(v) { return v === 2 || v === 3; },
+                keys: function() { return iter(this.data); }
+            };
+            new Set([1, 2, 3]).isSupersetOf(other) === true
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_set_is_superset_of_uses_size_short_circuit() {
+        assert_eval_true(
+            r#"
+            var keysCalls = 0;
+            var other = {
+                get size() { return 3; },
+                has: function(v) { return true; },
+                keys: function() { keysCalls++; return { next: function() { return { done: true }; } }; }
+            };
+            new Set([1, 2]).isSupersetOf(other) === false && keysCalls === 0
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_set_is_disjoint_from_true() {
+        assert_eval_true("new Set([1, 2]).isDisjointFrom(new Set([3, 4])) === true");
+    }
+
+    #[test]
+    fn e2e_set_is_disjoint_from_false() {
+        assert_eval_true("new Set([1, 2]).isDisjointFrom(new Set([2, 4])) === false");
+    }
+
+    #[test]
+    fn e2e_set_is_disjoint_from_accepts_map_keys() {
+        assert_eval_true(
+            "new Set(['a', 'b']).isDisjointFrom(new Map([['c', 1], ['d', 2]])) === true",
+        );
+    }
+
+    #[test]
+    fn e2e_set_is_disjoint_from_accepts_custom_set_like() {
+        assert_eval_true(
+            r#"
+            var other = {
+                get size() { return 2; },
+                has: function(v) { return v === 4 || v === 5; },
+                keys: function() {
+                    var i = 4;
+                    return { next: function() {
+                        if (i <= 5) return { value: i++, done: false };
+                        return { done: true };
+                    }};
+                }
+            };
+            new Set([1, 2, 3]).isDisjointFrom(other) === true
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_set_is_disjoint_from_uses_smaller_receiver_branch() {
+        assert_eval_true(
+            r#"
+            var hasCalls = 0;
+            var keysCalls = 0;
+            var other = {
+                get size() { return 3; },
+                has: function(v) { hasCalls++; return false; },
+                keys: function() { keysCalls++; return { next: function() { return { done: true }; } }; }
+            };
+            new Set([1, 2]).isDisjointFrom(other) === true && hasCalls === 2 && keysCalls === 0
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_set_is_disjoint_from_uses_smaller_other_branch() {
+        assert_eval_true(
+            r#"
+            var hasCalls = 0;
+            var keysCalls = 0;
+            var other = {
+                get size() { return 1; },
+                has: function(v) { hasCalls++; return false; },
+                keys: function() {
+                    keysCalls++;
+                    var done = false;
+                    return { next: function() {
+                        if (!done) { done = true; return { value: 5, done: false }; }
+                        return { done: true };
+                    }};
+                }
+            };
+            new Set([1, 2, 3]).isDisjointFrom(other) === true && hasCalls === 0 && keysCalls === 1
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_set_union_requires_has_property() {
+        assert_eval_type_error(
+            "new Set([1]).union({ size: 0, keys: function() { return { next: function() { return { done: true }; } }; } })",
+        );
+    }
+
+    #[test]
+    fn e2e_set_intersection_requires_size_property() {
+        assert_eval_type_error(
+            "new Set([1]).intersection({ has: function() { return false; }, keys: function() { return { next: function() { return { done: true }; } }; } })",
+        );
+    }
+
+    #[test]
+    fn e2e_set_difference_requires_callable_has() {
+        assert_eval_type_error(
+            "new Set([1]).difference({ size: 0, has: 1, keys: function() { return { next: function() { return { done: true }; } }; } })",
+        );
+    }
+
+    #[test]
+    fn e2e_set_symmetric_difference_requires_keys_iterator() {
+        assert_eval_type_error(
+            "new Set([1]).symmetricDifference({ size: 0, has: function() { return false; } })",
+        );
+    }
+
+    #[test]
+    fn e2e_set_is_subset_of_requires_has_property() {
+        assert_eval_type_error(
+            "new Set([1]).isSubsetOf({ size: 0, keys: function() { return { next: function() { return { done: true }; } }; } })",
+        );
+    }
+
+    #[test]
+    fn e2e_set_is_superset_of_requires_size_property() {
+        assert_eval_type_error(
+            "new Set([1]).isSupersetOf({ has: function() { return false; }, keys: function() { return { next: function() { return { done: true }; } }; } })",
+        );
+    }
+
+    #[test]
+    fn e2e_set_is_disjoint_from_requires_callable_has() {
+        assert_eval_type_error(
+            "new Set([1]).isDisjointFrom({ size: 0, has: null, keys: function() { return { next: function() { return { done: true }; } }; } })",
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════
