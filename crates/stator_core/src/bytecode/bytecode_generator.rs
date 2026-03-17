@@ -176,6 +176,15 @@ struct FunctionCompileOptions {
     source_span: Option<SourceLocation>,
 }
 
+const CLASS_STATIC_INITIALIZER_SLOT_NAME: &str = "__class_static_initializer__";
+const CLASS_INSTANCE_FIELD_KEY_PREFIX: &str = "__class_field_key_";
+const CLASS_INSTANCE_FIELD_OWNER_NAME: &str = ".class_initializer_class";
+
+struct InstanceFieldInitializer<'a> {
+    prop: &'a crate::parser::ast::PropertyDef,
+    computed_key_name: Option<String>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // FunctionCompiler
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1912,7 +1921,9 @@ impl FunctionCompiler {
         ));
         self.emit_star(proto_reg);
 
-        // 5. Compile each class member.
+        // 5. Compile each class member in source order.
+        let mut instance_fields: Vec<InstanceFieldInitializer<'_>> = Vec::new();
+        let mut next_instance_field_key = 0usize;
         for member in &body.body {
             match member {
                 ClassMember::Method(m) if m.kind != MethodKind::Constructor => {
@@ -1925,19 +1936,42 @@ impl FunctionCompiler {
                 ClassMember::StaticBlock(sb) => {
                     self.compile_class_static_block(class_reg, sb)?;
                 }
-                _ => {} // instance fields + constructor handled separately
+                ClassMember::Property(p) => {
+                    let computed_key_name = match &p.key {
+                        crate::parser::ast::PropKey::Computed(key_expr) => {
+                            let key_reg = self.compile_computed_property_key(key_expr)?;
+                            let key_name = format!(
+                                "{CLASS_INSTANCE_FIELD_KEY_PREFIX}{next_instance_field_key}"
+                            );
+                            next_instance_field_key += 1;
+                            let key_name_idx = self.add_string(&key_name);
+                            let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+                            self.emit_ldar(key_reg);
+                            self.emit(Instruction::new_unchecked(
+                                Opcode::DefineNamedOwnProperty,
+                                vec![
+                                    to_reg_op(class_reg),
+                                    Operand::ConstantPoolIdx(key_name_idx),
+                                    slot,
+                                ],
+                            ));
+                            self.allocator
+                                .release_temporary(key_reg)
+                                .map_err(|e| StatorError::Internal(e.to_string()))?;
+                            Some(key_name)
+                        }
+                        _ => None,
+                    };
+                    instance_fields.push(InstanceFieldInitializer {
+                        prop: p,
+                        computed_key_name,
+                    });
+                }
+                _ => {} // constructor handled separately
             }
         }
 
         // 6. Compile instance-field initializer (if any instance fields exist).
-        let instance_fields: Vec<&crate::parser::ast::PropertyDef> = body
-            .body
-            .iter()
-            .filter_map(|m| match m {
-                ClassMember::Property(p) if !p.is_static => Some(p),
-                _ => None,
-            })
-            .collect();
         let has_instance_private_names = self
             .private_names
             .values()
@@ -2148,13 +2182,15 @@ impl FunctionCompiler {
     ) -> StatorResult<()> {
         use crate::parser::ast::PropKey;
 
+        let computed_key_reg = if let PropKey::Computed(key_expr) = &prop.key {
+            Some(self.compile_computed_property_key(key_expr)?)
+        } else {
+            None
+        };
+        self.compile_class_value_with_receiver(class_reg, prop.value.as_deref(), prop.loc)?;
+
         match &prop.key {
             PropKey::Ident(id) => {
-                if let Some(value) = &prop.value {
-                    self.compile_expr(value)?;
-                } else {
-                    self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
-                }
                 let name_idx = self.add_string(&id.name);
                 let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
                 self.emit(Instruction::new_unchecked(
@@ -2167,11 +2203,6 @@ impl FunctionCompiler {
                 ));
             }
             PropKey::Str(s) => {
-                if let Some(value) = &prop.value {
-                    self.compile_expr(value)?;
-                } else {
-                    self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
-                }
                 let name_idx = self.add_string(&s.value);
                 let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
                 self.emit(Instruction::new_unchecked(
@@ -2184,11 +2215,6 @@ impl FunctionCompiler {
                 ));
             }
             PropKey::Num(n) => {
-                if let Some(value) = &prop.value {
-                    self.compile_expr(value)?;
-                } else {
-                    self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
-                }
                 let name = if n.value.fract() == 0.0 && n.value.is_finite() && n.value >= 0.0 {
                     format!("{}", n.value as u64)
                 } else {
@@ -2205,13 +2231,8 @@ impl FunctionCompiler {
                     ],
                 ));
             }
-            PropKey::Computed(key_expr) => {
-                let key_reg = self.compile_computed_property_key(key_expr)?;
-                if let Some(value) = &prop.value {
-                    self.compile_expr(value)?;
-                } else {
-                    self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
-                }
+            PropKey::Computed(_) => {
+                let key_reg = computed_key_reg.expect("computed key register missing");
                 let slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
                 self.emit(Instruction::new_unchecked(
                     Opcode::DefineKeyedOwnProperty,
@@ -2227,11 +2248,6 @@ impl FunctionCompiler {
                     .map_err(|e| StatorError::Internal(e.to_string()))?;
             }
             PropKey::Private(id) => {
-                if let Some(value) = &prop.value {
-                    self.compile_expr(value)?;
-                } else {
-                    self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
-                }
                 let name_idx = self.add_string(&self.resolve_private_storage_key(&id.name));
                 let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
                 self.emit(Instruction::new_unchecked(
@@ -2271,6 +2287,73 @@ impl FunctionCompiler {
             Opcode::CreateClosure,
             vec![Operand::ConstantPoolIdx(pool_idx), slot, Operand::Flag(0)],
         ));
+        let hidden_name_idx = self.add_string(CLASS_STATIC_INITIALIZER_SLOT_NAME);
+        let hidden_slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+        self.emit(Instruction::new_unchecked(
+            Opcode::DefineNamedOwnProperty,
+            vec![
+                to_reg_op(class_reg),
+                Operand::ConstantPoolIdx(hidden_name_idx),
+                hidden_slot,
+            ],
+        ));
+        let callee_reg = self.allocator.allocate_temporary();
+        self.emit_star(callee_reg);
+        let call_slot = self.alloc_slot(FeedbackSlotKind::Call);
+        self.emit(Instruction::new_unchecked(
+            Opcode::CallProperty,
+            vec![
+                to_reg_op(callee_reg),
+                to_reg_op(class_reg),
+                Operand::RegisterCount(0),
+                call_slot,
+            ],
+        ));
+        self.allocator
+            .release_temporary(callee_reg)
+            .map_err(|e| StatorError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    fn compile_class_value_with_receiver(
+        &mut self,
+        class_reg: Register,
+        value: Option<&Expr>,
+        loc: SourceLocation,
+    ) -> StatorResult<()> {
+        use crate::parser::ast::{BlockStmt, ReturnStmt, Stmt};
+
+        let body = BlockStmt {
+            loc,
+            body: vec![Stmt::Return(ReturnStmt {
+                loc,
+                argument: value.map(|expr| Box::new(expr.clone())),
+            })],
+        };
+        let value_array = compile_function_with_private_names(
+            &[],
+            &body,
+            false,
+            false,
+            true,
+            self.private_names.clone(),
+        )?;
+        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(value_array)));
+        let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
+        self.emit(Instruction::new_unchecked(
+            Opcode::CreateClosure,
+            vec![Operand::ConstantPoolIdx(pool_idx), slot, Operand::Flag(0)],
+        ));
+        let hidden_name_idx = self.add_string(CLASS_STATIC_INITIALIZER_SLOT_NAME);
+        let hidden_slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+        self.emit(Instruction::new_unchecked(
+            Opcode::DefineNamedOwnProperty,
+            vec![
+                to_reg_op(class_reg),
+                Operand::ConstantPoolIdx(hidden_name_idx),
+                hidden_slot,
+            ],
+        ));
         let callee_reg = self.allocator.allocate_temporary();
         self.emit_star(callee_reg);
         let call_slot = self.alloc_slot(FeedbackSlotKind::Call);
@@ -2296,7 +2379,7 @@ impl FunctionCompiler {
     fn compile_instance_field_initializer(
         &mut self,
         class_reg: Register,
-        fields: &[&crate::parser::ast::PropertyDef],
+        fields: &[InstanceFieldInitializer<'_>],
     ) -> StatorResult<()> {
         use crate::parser::ast::PropKey;
 
@@ -2368,9 +2451,9 @@ impl FunctionCompiler {
 
         for field in fields {
             // Define the property on `this`.
-            match &field.key {
+            match &field.prop.key {
                 PropKey::Ident(id) => {
-                    if let Some(value) = &field.value {
+                    if let Some(value) = &field.prop.value {
                         ic.compile_expr(value)?;
                     } else {
                         ic.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
@@ -2387,7 +2470,7 @@ impl FunctionCompiler {
                     ));
                 }
                 PropKey::Str(s) => {
-                    if let Some(value) = &field.value {
+                    if let Some(value) = &field.prop.value {
                         ic.compile_expr(value)?;
                     } else {
                         ic.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
@@ -2404,7 +2487,7 @@ impl FunctionCompiler {
                     ));
                 }
                 PropKey::Num(n) => {
-                    if let Some(value) = &field.value {
+                    if let Some(value) = &field.prop.value {
                         ic.compile_expr(value)?;
                     } else {
                         ic.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
@@ -2425,9 +2508,35 @@ impl FunctionCompiler {
                         ],
                     ));
                 }
-                PropKey::Computed(key_expr) => {
-                    let key_reg = ic.compile_computed_property_key(key_expr)?;
-                    if let Some(value) = &field.value {
+                PropKey::Computed(_) => {
+                    let owner_name_idx = ic.add_string(CLASS_INSTANCE_FIELD_OWNER_NAME);
+                    let owner_slot = ic.alloc_slot(FeedbackSlotKind::LoadGlobal);
+                    ic.emit(Instruction::new_unchecked(
+                        Opcode::LdaGlobal,
+                        vec![Operand::ConstantPoolIdx(owner_name_idx), owner_slot],
+                    ));
+                    let owner_reg = ic.allocator.allocate_temporary();
+                    ic.emit_star(owner_reg);
+                    let key_name = field
+                        .computed_key_name
+                        .as_ref()
+                        .expect("computed instance field missing cached key name");
+                    let key_name_idx = ic.add_string(key_name);
+                    let key_slot = ic.alloc_slot(FeedbackSlotKind::LoadProperty);
+                    ic.emit(Instruction::new_unchecked(
+                        Opcode::LdaNamedProperty,
+                        vec![
+                            to_reg_op(owner_reg),
+                            Operand::ConstantPoolIdx(key_name_idx),
+                            key_slot,
+                        ],
+                    ));
+                    let key_reg = ic.allocator.allocate_temporary();
+                    ic.emit_star(key_reg);
+                    ic.allocator
+                        .release_temporary(owner_reg)
+                        .map_err(|e| StatorError::Internal(e.to_string()))?;
+                    if let Some(value) = &field.prop.value {
                         ic.compile_expr(value)?;
                     } else {
                         ic.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
@@ -2447,7 +2556,7 @@ impl FunctionCompiler {
                         .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
                 PropKey::Private(id) => {
-                    if let Some(value) = &field.value {
+                    if let Some(value) = &field.prop.value {
                         ic.compile_expr(value)?;
                     } else {
                         ic.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));

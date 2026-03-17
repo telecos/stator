@@ -2179,14 +2179,23 @@ fn construct_class_from_plain_object(
             );
             restore_closure_context(&mut init_frame, &init_ba);
             init_frame.new_target = new_target.clone();
+            {
+                let mut globals = init_frame.global_env.borrow_mut();
+                globals.insert("this".to_string(), this.clone());
+                globals.insert(
+                    ".class_initializer_class".to_string(),
+                    JsValue::PlainObject(Rc::clone(class_map)),
+                );
+            }
+            push_call_frame("<field_init>")?;
+            let result =
+                stacker::maybe_grow(64 * 1024, 1024 * 1024, || Interpreter::run(&mut init_frame));
+            pop_call_frame();
             init_frame
                 .global_env
                 .borrow_mut()
-                .insert("this".to_string(), this.clone());
-            push_call_frame("<field_init>")?;
-            let _ =
-                stacker::maybe_grow(64 * 1024, 1024 * 1024, || Interpreter::run(&mut init_frame));
-            pop_call_frame();
+                .remove(".class_initializer_class");
+            result?;
         }
         Ok(())
     };
@@ -6993,6 +7002,11 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
 mod tests {
     use crate::objects::value::JsValue;
 
+    fn assert_eval_true(source: &str) {
+        let result = crate::builtins::global::global_eval(source).unwrap();
+        assert_eq!(result, JsValue::Boolean(true), "source: {source}");
+    }
+
     #[test]
     fn test_typeof_generator() {
         let result =
@@ -8380,6 +8394,241 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_class_static_block_runs_during_definition() {
+        assert_eval_true(
+            "var log = []; class C { static { log.push('block'); } } log.join(',') === 'block'",
+        );
+    }
+
+    #[test]
+    fn test_class_static_block_binds_this_to_constructor() {
+        assert_eval_true("class C { static { this.answer = 42; } } C.answer === 42");
+    }
+
+    #[test]
+    fn test_class_static_block_this_identity_matches_class() {
+        assert_eval_true("class C { static ok = false; static { this.ok = this === C; } } C.ok");
+    }
+
+    #[test]
+    fn test_class_multiple_static_blocks_follow_source_order() {
+        assert_eval_true(
+            "var log = []; class C { static { log.push('a'); } static { log.push('b'); } static { log.push('c'); } } log.join(',') === 'a,b,c'",
+        );
+    }
+
+    #[test]
+    fn test_class_static_blocks_interleave_with_static_fields() {
+        assert_eval_true(
+            "var log = []; class C { static a = log.push('a'); static { log.push('b'); } static c = log.push('c'); static { log.push('d'); } } log.join(',') === 'a,b,c,d'",
+        );
+    }
+
+    #[test]
+    fn test_class_static_block_reads_prior_static_field() {
+        assert_eval_true("class C { static x = 1; static { this.y = this.x + 1; } } C.y === 2");
+    }
+
+    #[test]
+    fn test_class_static_block_updates_static_field_before_later_field() {
+        assert_eval_true(
+            "class C { static x = 1; static { this.x += 1; } static y = this.x + 1; } C.x === 2 && C.y === 3",
+        );
+    }
+
+    #[test]
+    fn test_class_static_field_initializer_uses_class_this() {
+        assert_eval_true("class C { static x = 7; static y = this.x + 1; } C.y === 8");
+    }
+
+    #[test]
+    fn test_class_static_field_initializer_sees_prior_block_updates() {
+        assert_eval_true(
+            "class C { static x = 1; static { this.x = 5; } static y = this.x; } C.y === 5",
+        );
+    }
+
+    #[test]
+    fn test_class_static_block_reads_private_static_field() {
+        assert_eval_true(
+            "class C { static #x = 10; static y = 0; static { this.y = this.#x; } } C.y === 10",
+        );
+    }
+
+    #[test]
+    fn test_class_static_block_calls_private_static_method() {
+        assert_eval_true(
+            "class C { static #value() { return 9; } static y = 0; static { this.y = this.#value(); } } C.y === 9",
+        );
+    }
+
+    #[test]
+    fn test_class_static_blocks_share_private_static_state() {
+        assert_eval_true(
+            "class C { static #x = 1; static first = 0; static second = 0; static { this.first = this.#x; this.#x = 2; } static { this.second = this.#x; } } C.first === 1 && C.second === 2",
+        );
+    }
+
+    #[test]
+    fn test_class_static_block_super_calls_parent_static_method() {
+        assert_eval_true(
+            "class A { static value() { return 40; } } class B extends A { static result = 0; static { this.result = super.value() + 2; } } B.result === 42",
+        );
+    }
+
+    #[test]
+    fn test_class_static_block_super_uses_current_class_as_receiver() {
+        assert_eval_true(
+            "class A { static who() { return this.name; } } class B extends A { static result = ''; static { this.result = super.who(); } } B.result === 'B'",
+        );
+    }
+
+    #[test]
+    fn test_class_static_field_super_calls_parent_static_method() {
+        assert_eval_true(
+            "class A { static value() { return 5; } } class B extends A { static x = super.value() + 1; } B.x === 6",
+        );
+    }
+
+    #[test]
+    fn test_class_static_field_super_uses_current_class_as_receiver() {
+        assert_eval_true(
+            "class A { static who() { return this.name; } } class B extends A { static value = super.who(); } B.value === 'B'",
+        );
+    }
+
+    #[test]
+    fn test_class_static_block_throw_aborts_class_declaration() {
+        assert_eval_true("try { class C { static { throw 1; } } false; } catch (e) { e === 1; }");
+    }
+
+    #[test]
+    fn test_class_static_block_throw_aborts_class_expression() {
+        assert_eval_true(
+            "try { var C = class { static { throw 2; } }; false; } catch (e) { e === 2; }",
+        );
+    }
+
+    #[test]
+    fn test_class_static_block_runs_in_class_expression() {
+        assert_eval_true(
+            "var seen = 0; var C = class { static { seen = 1; } }; seen === 1 && typeof C === 'function'",
+        );
+    }
+
+    #[test]
+    fn test_class_static_blocks_in_class_expression_follow_order() {
+        assert_eval_true(
+            "var log = []; var C = class { static { log.push('x'); } static { log.push('y'); } }; log.join(',') === 'x,y' && typeof C === 'function'",
+        );
+    }
+
+    #[test]
+    fn test_class_static_block_sees_class_expression_name() {
+        assert_eval_true(
+            "var value = class C { static { this.ok = C === this; } }; value.ok === true",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_fields_run_per_new_invocation() {
+        assert_eval_true(
+            "var n = 0; class C { x = ++n; } var a = new C(); var b = new C(); a.x === 1 && b.x === 2",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_fields_follow_declaration_order() {
+        assert_eval_true(
+            "class C { a = 1; b = this.a + 1; c = this.b + 1; } var o = new C(); o.a === 1 && o.b === 2 && o.c === 3",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_fields_run_before_base_constructor_body() {
+        assert_eval_true(
+            "class C { x = 1; constructor() { this.y = this.x + 1; } } new C().y === 2",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_fields_run_after_super_in_derived_constructor() {
+        assert_eval_true(
+            "class A { constructor() { this.log = ['base']; } } class B extends A { x = this.log.push('field'); constructor() { super(); this.log.push('ctor'); } } new B().log.join(',') === 'base,field,ctor'",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_computed_field_name_evaluates_once() {
+        assert_eval_true(
+            "var count = 0; function key() { count++; return 'x'; } class C { [key()] = 1; } var a = new C(); var b = new C(); count === 1 && a.x === 1 && b.x === 1",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_computed_field_names_follow_source_order() {
+        assert_eval_true(
+            "var log = []; function key(v) { log.push(v); return v; } class C { [key('a')] = 1; [key('b')] = 2; } new C(); new C(); log.join(',') === 'a,b'",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_computed_field_names_interleave_with_static_blocks() {
+        assert_eval_true(
+            "var log = []; function key(v) { log.push(v); return v; } class C { [key('a')] = 1; static { log.push('b'); } [key('c')] = 2; } log.join(',') === 'a,b,c'",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_computed_field_names_interleave_with_static_fields() {
+        assert_eval_true(
+            "var log = []; function key(v) { log.push(v); return v; } class C { [key('a')] = 1; static x = log.push('b'); [key('c')] = 2; } log.join(',') === 'a,b,c'",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_computed_field_names_are_cached_for_multiple_fields() {
+        assert_eval_true(
+            "var idx = 0; function key() { idx++; return 'k' + idx; } class C { [key()] = 1; [key()] = 2; } var o = new C(); idx === 2 && o.k1 === 1 && o.k2 === 2",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_computed_field_names_are_cached_across_instances() {
+        assert_eval_true(
+            "var count = 0; function key() { count++; return 'x'; } var value = 0; class C { [key()] = ++value; } var a = new C(); var b = new C(); count === 1 && a.x === 1 && b.x === 2",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_computed_field_names_only_run_once_for_derived_class() {
+        assert_eval_true(
+            "var count = 0; function key() { count++; return 'x'; } class A {} class B extends A { [key()] = 1; } new B(); new B(); count === 1",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_computed_field_name_with_this_based_initializer() {
+        assert_eval_true(
+            "var count = 0; function key() { count++; return 'x'; } class C { y = 2; [key()] = this.y + 1; } var o = new C(); count === 1 && o.x === 3",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_computed_field_names_are_defined_on_each_instance() {
+        assert_eval_true(
+            "var count = 0; function key() { count++; return 'x'; } class C { [key()] = 1; } var a = new C(); var b = new C(); count === 1 && a.hasOwnProperty('x') && b.hasOwnProperty('x')",
+        );
+    }
+
+    #[test]
+    fn test_class_instance_field_throw_propagates_per_new() {
+        assert_eval_true(
+            "class C { x = (() => { throw 7; })(); } try { new C(); false; } catch (e) { e === 7; }",
+        );
     }
 
     #[test]
