@@ -39738,4 +39738,321 @@ mod tests {
         let result = global_eval("(-255).toString(16)").unwrap();
         assert_eq!(result, JsValue::String("-ff".to_string()));
     }
+
+    // ── Nullish assignment (??=) ────────────────────────────────────────
+
+    /// `??=` assigns when LHS is null.
+    #[test]
+    fn e2e_nullish_assign_null() {
+        assert_eval_true("var x = null; x ??= 5; x === 5");
+    }
+
+    /// `??=` assigns when LHS is undefined.
+    #[test]
+    fn e2e_nullish_assign_undefined() {
+        assert_eval_true("var x = undefined; x ??= 5; x === 5");
+    }
+
+    /// `??=` does NOT assign when LHS is 0 (falsy but not nullish).
+    #[test]
+    fn e2e_nullish_assign_zero_noop() {
+        assert_eval_true("var x = 0; x ??= 5; x === 0");
+    }
+
+    /// `??=` does NOT assign when LHS is false.
+    #[test]
+    fn e2e_nullish_assign_false_noop() {
+        assert_eval_true("var x = false; x ??= 5; x === false");
+    }
+
+    /// `??=` does NOT assign when LHS is empty string.
+    #[test]
+    fn e2e_nullish_assign_empty_string_noop() {
+        assert_eval_true("var x = ''; x ??= 'yes'; x === ''");
+    }
+
+    /// `??=` short-circuits: RHS is not evaluated when LHS is non-nullish.
+    #[test]
+    fn e2e_nullish_assign_short_circuit() {
+        assert_eval_true("var calls = 0; var x = 1; x ??= (calls++, 99); calls === 0 && x === 1");
+    }
+
+    // ── Logical OR assignment (||=) ─────────────────────────────────────
+
+    /// `||=` assigns when LHS is falsy (0).
+    #[test]
+    fn e2e_logical_or_assign_zero() {
+        assert_eval_true("var x = 0; x ||= 5; x === 5");
+    }
+
+    /// `||=` assigns when LHS is false.
+    #[test]
+    fn e2e_logical_or_assign_false() {
+        assert_eval_true("var x = false; x ||= 'yes'; x === 'yes'");
+    }
+
+    /// `||=` assigns when LHS is empty string.
+    #[test]
+    fn e2e_logical_or_assign_empty_string() {
+        assert_eval_true("var x = ''; x ||= 'filled'; x === 'filled'");
+    }
+
+    /// `||=` does NOT assign when LHS is truthy.
+    #[test]
+    fn e2e_logical_or_assign_truthy_noop() {
+        assert_eval_true("var x = 1; x ||= 5; x === 1");
+    }
+
+    /// `||=` short-circuits: RHS is not evaluated when LHS is truthy.
+    #[test]
+    fn e2e_logical_or_assign_short_circuit() {
+        assert_eval_true(
+            "var calls = 0; var x = 'ok'; x ||= (calls++, 'no'); calls === 0 && x === 'ok'",
+        );
+    }
+
+    // ── Logical AND assignment (&&=) ────────────────────────────────────
+
+    /// `&&=` assigns when LHS is truthy.
+    #[test]
+    fn e2e_logical_and_assign_truthy() {
+        assert_eval_true("var x = 1; x &&= 5; x === 5");
+    }
+
+    /// `&&=` does NOT assign when LHS is falsy (0).
+    #[test]
+    fn e2e_logical_and_assign_zero_noop() {
+        assert_eval_true("var x = 0; x &&= 5; x === 0");
+    }
+
+    /// `&&=` does NOT assign when LHS is false.
+    #[test]
+    fn e2e_logical_and_assign_false_noop() {
+        assert_eval_true("var x = false; x &&= 'yes'; x === false");
+    }
+
+    /// `&&=` short-circuits: RHS is not evaluated when LHS is falsy.
+    #[test]
+    fn e2e_logical_and_assign_short_circuit() {
+        assert_eval_true("var calls = 0; var x = 0; x &&= (calls++, 99); calls === 0 && x === 0");
+    }
+
+    // ── Property access side effects with logical assignment ────────────
+
+    /// `??=` on a property: no setter call when LHS is non-nullish.
+    #[test]
+    fn e2e_nullish_assign_property_no_setter() {
+        assert_eval_true("var o = { a: 1 }; o.a ??= 99; o.a === 1");
+    }
+
+    /// `||=` on a property: setter called only when LHS is falsy.
+    #[test]
+    fn e2e_logical_or_assign_property() {
+        assert_eval_true("var o = { a: 0 }; o.a ||= 42; o.a === 42");
+    }
+
+    /// `&&=` on a property: setter called only when LHS is truthy.
+    #[test]
+    fn e2e_logical_and_assign_property() {
+        assert_eval_true("var o = { a: 'yes' }; o.a &&= 'done'; o.a === 'done'");
+    }
+
+    // ── Exponentiation (**) ─────────────────────────────────────────────
+
+    /// Basic exponentiation.
+    #[test]
+    fn e2e_exp_basic() {
+        assert_eval_true("2 ** 3 === 8");
+    }
+
+    /// Right-associativity: `2 ** 3 ** 2` is `2 ** (3 ** 2)` = 512.
+    #[test]
+    fn e2e_exp_right_associative() {
+        assert_eval_true("2 ** 3 ** 2 === 512");
+    }
+
+    /// Negative base requires parens: `(-2) ** 3 === -8`.
+    #[test]
+    fn e2e_exp_negative_base() {
+        assert_eval_true("(-2) ** 3 === -8");
+    }
+
+    /// `0 ** 0 === 1` per IEEE 754.
+    #[test]
+    fn e2e_exp_zero_zero() {
+        assert_eval_true("0 ** 0 === 1");
+    }
+
+    /// Fractional exponent.
+    #[test]
+    fn e2e_exp_fractional() {
+        assert_eval_true("4 ** 0.5 === 2");
+    }
+
+    // ── Optional chaining (?.) ──────────────────────────────────────────
+
+    /// Member access with `?.` on non-null object.
+    #[test]
+    fn e2e_optional_chain_member() {
+        assert_eval_true("var o = {a:{b:1}}; o?.a?.b === 1");
+    }
+
+    /// Member access with `?.` on null short-circuits to undefined.
+    #[test]
+    fn e2e_optional_chain_null() {
+        assert_eval_true("var o = null; o?.a === undefined");
+    }
+
+    /// Nested optional chaining on undefined.
+    #[test]
+    fn e2e_optional_chain_nested_undef() {
+        assert_eval_true("var o = null; o?.a?.b?.c === undefined");
+    }
+
+    /// Computed optional chaining `?.[]`.
+    #[test]
+    fn e2e_optional_chain_computed() {
+        assert_eval_true("var o = {a: 42}; o?.['a'] === 42");
+    }
+
+    /// Computed optional chaining returns undefined on null.
+    #[test]
+    fn e2e_optional_chain_computed_null() {
+        assert_eval_true("var o = null; o?.['a'] === undefined");
+    }
+
+    /// Optional call `?.()` invokes the function when present.
+    #[test]
+    fn e2e_optional_chain_call() {
+        assert_eval_true("var f = function() { return 42; }; f?.() === 42");
+    }
+
+    /// Optional call `?.()` returns undefined when base is null.
+    #[test]
+    fn e2e_optional_chain_call_null() {
+        assert_eval_true("var f = null; f?.() === undefined");
+    }
+
+    /// `delete obj?.prop` returns true when obj is null.
+    #[test]
+    fn e2e_optional_chain_delete_null() {
+        assert_eval_true("var o = null; delete o?.a === true");
+    }
+
+    /// `delete obj?.prop` deletes when obj is not null.
+    #[test]
+    fn e2e_optional_chain_delete_nonnull() {
+        assert_eval_true("var o = {a: 1}; delete o?.a; o.a === undefined");
+    }
+
+    // ── Nullish coalescing (??) ─────────────────────────────────────────
+
+    /// `??` returns RHS when LHS is null.
+    #[test]
+    fn e2e_nullish_coalescing_null() {
+        assert_eval_true("null ?? 5 === 5");
+    }
+
+    /// `??` returns RHS when LHS is undefined.
+    #[test]
+    fn e2e_nullish_coalescing_undefined() {
+        assert_eval_true("undefined ?? 5 === 5");
+    }
+
+    /// `??` returns LHS when it is 0 (falsy but not nullish).
+    #[test]
+    fn e2e_nullish_coalescing_zero() {
+        assert_eval_true("(0 ?? 5) === 0");
+    }
+
+    /// `??` returns LHS when it is false.
+    #[test]
+    fn e2e_nullish_coalescing_false() {
+        assert_eval_true("(false ?? 5) === false");
+    }
+
+    /// `??` returns LHS when it is empty string.
+    #[test]
+    fn e2e_nullish_coalescing_empty_string() {
+        assert_eval_true("('' ?? 'x') === ''");
+    }
+
+    /// `??` short-circuits: RHS not evaluated if LHS is non-nullish.
+    #[test]
+    fn e2e_nullish_coalescing_short_circuit() {
+        assert_eval_true("var c = 0; 'ok' ?? (c = 1); c === 0");
+    }
+
+    // ── Comma operator ──────────────────────────────────────────────────
+
+    /// Comma evaluates all expressions and returns the last.
+    #[test]
+    fn e2e_comma_returns_last() {
+        assert_eval_true("(10, 20, 30) === 30");
+    }
+
+    /// Comma evaluates side effects of all operands.
+    #[test]
+    fn e2e_comma_side_effects() {
+        assert_eval_true("var a = 0; (a = 1, a = 2, a = 3); a === 3");
+    }
+
+    // ── Void operator ───────────────────────────────────────────────────
+
+    /// `void 0` returns undefined.
+    #[test]
+    fn e2e_void_zero() {
+        assert_eval_true("void 0 === undefined");
+    }
+
+    /// `void expr` evaluates the expression but returns undefined.
+    #[test]
+    fn e2e_void_expression() {
+        assert_eval_true("void (1 + 2) === undefined");
+    }
+
+    /// `void` with a side-effect — side effect still occurs.
+    #[test]
+    fn e2e_void_side_effect() {
+        assert_eval_true("var x = 0; void (x = 5); x === 5");
+    }
+
+    // ── In operator ─────────────────────────────────────────────────────
+
+    /// `in` returns true for own property.
+    #[test]
+    fn e2e_in_operator_own() {
+        assert_eval_true("var o = {a: 1, b: 2}; 'a' in o");
+    }
+
+    /// `in` returns false for missing property.
+    #[test]
+    fn e2e_in_operator_absent() {
+        assert_eval_true("var o = {a: 1}; !('z' in o)");
+    }
+
+    /// `in` checks prototype chain.
+    #[test]
+    fn e2e_in_operator_inherited() {
+        assert_eval_true("'toString' in {}");
+    }
+
+    /// `in` works with arrays (index check).
+    #[test]
+    fn e2e_in_operator_array_index() {
+        assert_eval_true("var a = [10, 20, 30]; 1 in a && !(5 in a)");
+    }
+
+    /// `in` with 'length' on arrays is always true.
+    #[test]
+    fn e2e_in_operator_array_length() {
+        assert_eval_true("'length' in [1, 2, 3]");
+    }
+
+    /// `in` throws TypeError for non-object RHS.
+    #[test]
+    fn e2e_in_operator_non_object_throws() {
+        let result = global_eval("'x' in 42");
+        assert!(result.is_err());
+    }
 }
