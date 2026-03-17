@@ -18,6 +18,7 @@
 use std::rc::Rc;
 
 use crate::error::StatorResult;
+use crate::interpreter::{dispatch_get_property_value, has_prototype_in_chain};
 use crate::objects::value::{JsValue, NativeFn};
 
 // ── Function.prototype.call ──────────────────────────────────────────────────
@@ -185,11 +186,10 @@ pub fn function_bound_name(target_name: &str) -> String {
 /// use stator_core::builtins::function::function_has_instance;
 /// use stator_core::objects::value::JsValue;
 ///
-/// assert!(!function_has_instance(&JsValue::Smi(42), &JsValue::Undefined));
+/// assert!(!function_has_instance(&JsValue::Undefined, &JsValue::Smi(42)));
 /// ```
-pub fn function_has_instance(value: &JsValue, _constructor_prototype: &JsValue) -> bool {
-    // Primitives are never instances.
-    !matches!(
+pub fn function_has_instance(constructor: &JsValue, value: &JsValue) -> bool {
+    if matches!(
         value,
         JsValue::Undefined
             | JsValue::Null
@@ -199,7 +199,20 @@ pub fn function_has_instance(value: &JsValue, _constructor_prototype: &JsValue) 
             | JsValue::String(_)
             | JsValue::Symbol(_)
             | JsValue::BigInt(_)
-    )
+    ) {
+        return false;
+    }
+
+    let Ok(constructor_prototype) =
+        dispatch_get_property_value(constructor, JsValue::String("prototype".into()))
+    else {
+        return false;
+    };
+
+    matches!(
+        constructor_prototype,
+        JsValue::PlainObject(_) | JsValue::Object(_)
+    ) && has_prototype_in_chain(value, &constructor_prototype)
 }
 
 // ── Function.prototype.toString ──────────────────────────────────────────────
@@ -537,48 +550,71 @@ mod tests {
     #[test]
     fn test_has_instance_primitives() {
         assert!(!function_has_instance(
-            &JsValue::Smi(42),
-            &JsValue::Undefined
+            &JsValue::Undefined,
+            &JsValue::Smi(42)
         ));
         assert!(!function_has_instance(
-            &JsValue::Boolean(true),
-            &JsValue::Undefined
+            &JsValue::Undefined,
+            &JsValue::Boolean(true)
         ));
         assert!(!function_has_instance(
-            &JsValue::String("hi".into()),
-            &JsValue::Undefined
+            &JsValue::Undefined,
+            &JsValue::String("hi".into())
         ));
-        assert!(!function_has_instance(&JsValue::Null, &JsValue::Undefined));
+        assert!(!function_has_instance(&JsValue::Undefined, &JsValue::Null));
         assert!(!function_has_instance(
             &JsValue::Undefined,
             &JsValue::Undefined
         ));
         assert!(!function_has_instance(
-            &JsValue::HeapNumber(3.14),
-            &JsValue::Undefined
+            &JsValue::Undefined,
+            &JsValue::HeapNumber(3.14)
         ));
         assert!(!function_has_instance(
-            &JsValue::Symbol(1),
-            &JsValue::Undefined
+            &JsValue::Undefined,
+            &JsValue::Symbol(1)
         ));
         assert!(!function_has_instance(
-            &JsValue::BigInt(99),
-            &JsValue::Undefined
+            &JsValue::Undefined,
+            &JsValue::BigInt(99)
         ));
     }
 
     #[test]
-    fn test_has_instance_object_like() {
+    fn test_has_instance_matches_constructor_prototype_chain() {
         use crate::objects::property_map::PropertyMap;
         use std::cell::RefCell;
-        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
-        assert!(function_has_instance(&obj, &JsValue::Undefined));
+        let proto = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+        let instance_map = Rc::new(RefCell::new(PropertyMap::new()));
+        instance_map
+            .borrow_mut()
+            .insert("__proto__".into(), proto.clone());
+        let mut ctor_map = PropertyMap::new();
+        ctor_map.insert("prototype".into(), proto);
+        let constructor = JsValue::PlainObject(Rc::new(RefCell::new(ctor_map)));
+        let instance = JsValue::PlainObject(instance_map);
+        assert!(function_has_instance(&constructor, &instance));
     }
 
     #[test]
-    fn test_has_instance_array() {
-        let arr = JsValue::new_array(vec![]);
-        assert!(function_has_instance(&arr, &JsValue::Undefined));
+    fn test_has_instance_rejects_non_matching_chain() {
+        use crate::objects::property_map::PropertyMap;
+        use std::cell::RefCell;
+        let proto = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+        let mut ctor_map = PropertyMap::new();
+        ctor_map.insert("prototype".into(), proto);
+        let constructor = JsValue::PlainObject(Rc::new(RefCell::new(ctor_map)));
+        let instance = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+        assert!(!function_has_instance(&constructor, &instance));
+    }
+
+    #[test]
+    fn test_has_instance_requires_object_prototype_property() {
+        use crate::objects::property_map::PropertyMap;
+        use std::cell::RefCell;
+        let constructor = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+        let instance = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+        assert!(!function_has_instance(&constructor, &instance));
     }
 
     // ── toString ────────────────────────────────────────────────────────

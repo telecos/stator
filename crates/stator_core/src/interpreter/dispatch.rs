@@ -18,8 +18,8 @@ use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
     PropertyIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, concat_rc_strs,
     constant_pool_jump_delta, constant_to_value, decode_string_constant, dispatch_call_property,
-    dispatch_call_value, dispatch_call_with_this, dispatch_setter, err_bad_operand,
-    error_message_from_value, extract_context, find_handler, fn_props_get, fn_props_set,
+    dispatch_call_with_this, dispatch_setter, err_bad_operand, error_message_from_value,
+    extract_context, find_handler, fn_props_get, fn_props_set, has_property_in_chain,
     has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
     maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
     number_to_jsvalue, plain_object_to_array_items, populate_self_name, proto_lookup, resolve_jump,
@@ -4457,19 +4457,6 @@ fn handle_test_instance_of(
     };
     let constructor = ctx.frame.read_reg(v)?.clone();
 
-    // §7.3.21 OrdinaryHasInstance — RHS must be callable, else TypeError.
-    let rhs_callable = match &constructor {
-        JsValue::Function(_) | JsValue::NativeFunction(_) => true,
-        JsValue::PlainObject(map) => map.borrow().contains_key("__call__"),
-        JsValue::Proxy(p) => p.borrow().is_callable(),
-        _ => false,
-    };
-    if !rhs_callable {
-        return Err(StatorError::TypeError(
-            "Right-hand side of 'instanceof' is not callable".to_string(),
-        ));
-    }
-
     // §7.3.21 OrdinaryHasInstance — first check @@hasInstance
     let has_instance_fn = match &constructor {
         JsValue::PlainObject(map) => map.borrow().get("@@hasInstance").cloned(),
@@ -4488,17 +4475,34 @@ fn handle_test_instance_of(
     if let Some(ref hi) = has_instance_fn {
         match hi {
             JsValue::NativeFunction(f) => {
-                let result = f(vec![ctx.frame.accumulator.clone()])?;
+                let result = f(vec![constructor.clone(), ctx.frame.accumulator.clone()])?;
                 ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
                 return Ok(DispatchAction::Continue);
             }
             JsValue::Function(_) | JsValue::PlainObject(_) => {
-                let result = dispatch_call_value(hi, vec![ctx.frame.accumulator.clone()])?;
+                let result = dispatch_call_with_this(
+                    hi,
+                    constructor.clone(),
+                    vec![ctx.frame.accumulator.clone()],
+                )?;
                 ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
                 return Ok(DispatchAction::Continue);
             }
             _ => {}
         }
+    }
+
+    // If @@hasInstance is absent, the RHS must be callable.
+    let rhs_callable = match &constructor {
+        JsValue::Function(_) | JsValue::NativeFunction(_) => true,
+        JsValue::PlainObject(map) => map.borrow().contains_key("__call__"),
+        JsValue::Proxy(p) => p.borrow().is_callable(),
+        _ => false,
+    };
+    if !rhs_callable {
+        return Err(StatorError::TypeError(
+            "Right-hand side of 'instanceof' is not callable".to_string(),
+        ));
     }
 
     // ── Built-in type checks via constructor identity ──────────────
@@ -4620,11 +4624,7 @@ fn handle_test_in(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
             let prop = to_property_key(key)?;
             proxy_has(&p.borrow(), &prop)?
         }
-        JsValue::PlainObject(_) => {
-            let prop = to_property_key(key)?;
-            // Walk the prototype chain for `in` operator.
-            !matches!(proto_lookup(&object, &prop), JsValue::Undefined)
-        }
+        JsValue::PlainObject(_) => has_property_in_chain(&object, &to_property_key(key)?),
         JsValue::Array(items) => {
             // "length" is always present on arrays.
             if let JsValue::String(s) = key

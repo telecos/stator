@@ -134,6 +134,7 @@ use crate::interpreter::{
     current_global_env, dispatch_call_value, dispatch_call_with_this, dispatch_get_property_value,
     dispatch_set_property_value, function_display_name, function_length_value,
     function_to_string_value, get_object_prototype, has_prototype_in_chain,
+    ordinary_set_prototype_of, plain_object_has_own_property,
 };
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
@@ -5180,24 +5181,7 @@ fn make_object() -> JsValue {
                         "Object prototype may only be an Object or null".to_string(),
                     ));
                 }
-                if let JsValue::PlainObject(map) = &obj {
-                    if !map.borrow().extensible {
-                        let current_proto = get_object_prototype(&obj).unwrap_or(JsValue::Null);
-                        if !current_proto.same_value(&proto) {
-                            return Err(StatorError::TypeError(
-                                "Cannot set prototype of a non-extensible object".to_string(),
-                            ));
-                        }
-                    }
-                    if !matches!(proto, JsValue::Null)
-                        && has_prototype_in_chain(&proto, &JsValue::PlainObject(Rc::clone(map)))
-                    {
-                        return Err(StatorError::TypeError("Cyclic __proto__ value".to_string()));
-                    }
-                    map.borrow_mut().insert("__proto__".to_string(), proto);
-                } else if let JsValue::Error(e) = &obj {
-                    e.props.borrow_mut().insert("__proto__".to_string(), proto);
-                }
+                ordinary_set_prototype_of(&obj, proto)?;
                 Ok(obj)
             }),
         );
@@ -5422,7 +5406,7 @@ fn make_object() -> JsValue {
                 let prop = key.to_property_key()?;
                 match this {
                     JsValue::PlainObject(map) => {
-                        let has = map.borrow().contains_key(&prop) && prop != "__proto__";
+                        let has = plain_object_has_own_property(&map.borrow(), &prop);
                         Ok(JsValue::Boolean(has))
                     }
                     _ => Ok(JsValue::Boolean(false)),
@@ -5436,22 +5420,10 @@ fn make_object() -> JsValue {
             native(|args| {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
                 let target = args.get(1).unwrap_or(&JsValue::Undefined);
-                if let (JsValue::PlainObject(this_map), JsValue::PlainObject(_)) = (this, target) {
-                    let mut current = target.clone();
-                    for _ in 0..256 {
-                        if let JsValue::PlainObject(cur_map) = &current {
-                            let next = cur_map.borrow().get("__proto__").cloned();
-                            match next {
-                                Some(JsValue::PlainObject(ref p)) if Rc::ptr_eq(p, this_map) => {
-                                    return Ok(JsValue::Boolean(true));
-                                }
-                                Some(v) => current = v,
-                                None => break,
-                            }
-                        } else {
-                            break;
-                        }
-                    }
+                if let JsValue::PlainObject(_) = this
+                    && target.is_object_like()
+                {
+                    return Ok(JsValue::Boolean(has_prototype_in_chain(target, this)));
                 }
                 Ok(JsValue::Boolean(false))
             }),
@@ -8922,11 +8894,11 @@ fn make_function() -> JsValue {
         proto.insert(
             "@@hasInstance".into(),
             native(|args| {
-                let constructor_proto = args.first().cloned().unwrap_or(JsValue::Undefined);
+                let constructor = args.first().cloned().unwrap_or(JsValue::Undefined);
                 let value = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                 Ok(JsValue::Boolean(function_has_instance(
+                    &constructor,
                     &value,
-                    &constructor_proto,
                 )))
             }),
         );
@@ -12302,33 +12274,8 @@ fn make_reflect() -> JsValue {
                     ));
                 }
                 let result = match &target {
-                    JsValue::PlainObject(map) => {
-                        if !map.borrow().extensible {
-                            let current_proto = map.borrow().get("__proto__").cloned();
-                            let same = match (&current_proto, &proto_arg) {
-                                (None, JsValue::Null) => true,
-                                (Some(cur), next) => cur == next,
-                                _ => false,
-                            };
-                            if !same {
-                                return Ok(JsValue::Boolean(false));
-                            }
-                        }
-                        if !matches!(proto_arg, JsValue::Null)
-                            && has_prototype_in_chain(&proto_arg, &target)
-                        {
-                            return Ok(JsValue::Boolean(false));
-                        }
-                        match &proto_arg {
-                            JsValue::Null => {
-                                map.borrow_mut().remove("__proto__");
-                            }
-                            _ => {
-                                map.borrow_mut()
-                                    .insert("__proto__".to_string(), proto_arg.clone());
-                            }
-                        }
-                        true
+                    JsValue::PlainObject(_) | JsValue::Error(_) => {
+                        ordinary_set_prototype_of(&target, proto_arg.clone()).is_ok()
                     }
                     JsValue::Proxy(proxy) => proxy_set_prototype_of(&mut proxy.borrow_mut(), None)?,
                     _ => false,
@@ -32262,6 +32209,327 @@ mod tests {
     fn e2e_object_group_by_name_prop() {
         let result = global_eval("Object.groupBy.name").unwrap();
         assert_eq!(result, JsValue::String("groupBy".into()));
+    }
+
+    // ── Conformance: prototype chain edge cases ──────────────────────────
+
+    #[test]
+    fn e2e_proto_assignment_updates_prototype_chain() {
+        let result = global_eval(
+            "var proto = { x: 1 }; var obj = {}; obj.__proto__ = proto; \
+             Object.getPrototypeOf(obj) === proto && obj.x === 1",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_proto_assignment_ignores_primitive_value() {
+        let result = global_eval(
+            "var proto = { x: 1 }; var obj = Object.create(proto); \
+             obj.__proto__ = 1; Object.getPrototypeOf(obj) === proto && obj.x === 1",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_proto_assignment_cycle_rejected() {
+        let result = global_eval(
+            "var a = {}; var b = {}; a.__proto__ = b; \
+             try { b.__proto__ = a; false; } catch (e) { e instanceof TypeError; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_proto_assignment_non_extensible_rejected() {
+        let result = global_eval(
+            "var o = {}; Object.preventExtensions(o); \
+             try { o.__proto__ = {}; false; } catch (e) { e instanceof TypeError; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_null_proto_object_has_no_tostring() {
+        let result = global_eval("typeof Object.create(null).toString").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_null_proto_object_has_no_has_own_property_method() {
+        let result = global_eval("typeof Object.create(null).hasOwnProperty").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_in_operator_sees_own_undefined_property() {
+        let result = global_eval("var o = { x: undefined }; 'x' in o").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_in_operator_sees_inherited_undefined_property() {
+        let result =
+            global_eval("var p = { x: undefined }; var o = Object.create(p); 'x' in o").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_in_operator_respects_null_prototype() {
+        let result = global_eval("var o = Object.create(null); 'toString' in o").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_has_own_property_accessor_counts_as_own() {
+        let result = global_eval(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { get: function() { return 1; }, configurable: true }); \
+             o.hasOwnProperty('x')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_has_own_property_accessor_inherited_is_false() {
+        let result = global_eval(
+            "var p = {}; \
+             Object.defineProperty(p, 'x', { get: function() { return 1; }, configurable: true }); \
+             var o = Object.create(p); \
+             o.hasOwnProperty('x') === false && ('x' in o)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_property_shadowing_own_value_overrides_inherited() {
+        let result = global_eval(
+            "var p = { x: 1 }; var o = Object.create(p); o.x = 2; o.x === 2 && p.x === 1",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_property_shadowing_undefined_masks_inherited_value() {
+        let result = global_eval(
+            "var p = { x: 1 }; var o = Object.create(p); \
+             o.x = undefined; o.x === undefined && ('x' in o) && o.hasOwnProperty('x')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_instanceof_uses_constructor_prototype_chain() {
+        let result = global_eval(
+            "function F() {} var o = new F(); \
+             o instanceof F && Object.getPrototypeOf(o) === F.prototype",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_instanceof_breaks_when_constructor_prototype_is_replaced() {
+        let result =
+            global_eval("function F() {} var o = new F(); F.prototype = {}; o instanceof F")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_instanceof_custom_symbol_hasinstance_receives_constructor_this() {
+        let result = global_eval(
+            "function F() {} \
+             F[Symbol.hasInstance] = function(v) { return this === F && v.flag === 1; }; \
+             ({ flag: 1 }) instanceof F",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_instanceof_custom_symbol_hasinstance_can_reject() {
+        let result = global_eval(
+            "function F() {} \
+             F[Symbol.hasInstance] = function(v) { return v.flag === 1; }; \
+             ({ flag: 0 }) instanceof F",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_instanceof_plain_object_rhs_uses_symbol_hasinstance() {
+        let result = global_eval(
+            "var C = { [Symbol.hasInstance]: function(v) { return this === C && v.ok === true; } }; \
+             ({ ok: true }) instanceof C",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_object_prototype_is_prototype_of_new_instance() {
+        let result = global_eval("function F() {} F.prototype.isPrototypeOf(new F())").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_object_prototype_is_not_prototype_of_null_proto_object() {
+        let result = global_eval("Object.prototype.isPrototypeOf(Object.create(null))").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_get_prototype_of_after_proto_assignment() {
+        let result =
+            global_eval("var p = {}; var o = {}; o.__proto__ = p; Object.getPrototypeOf(o) === p")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_prototype_of_detects_longer_cycle() {
+        let result = global_eval(
+            "var a = {}; var b = {}; var c = {}; \
+             Object.setPrototypeOf(a, b); Object.setPrototypeOf(b, c); \
+             try { Object.setPrototypeOf(c, a); false; } catch (e) { e instanceof TypeError; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_prototype_of_preserves_shadowed_property() {
+        let result = global_eval(
+            "var p = { x: 1 }; var o = { x: 2 }; \
+             Object.setPrototypeOf(o, p); o.x === 2 && Object.getPrototypeOf(o) === p",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_set_prototype_of_null_removes_inherited_in_operator_hit() {
+        let result = global_eval(
+            "var p = { x: 1 }; var o = Object.create(p); \
+             Object.setPrototypeOf(o, null); 'x' in o",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_set_prototype_of_null_removes_object_prototype_methods() {
+        let result =
+            global_eval("var o = {}; Object.setPrototypeOf(o, null); typeof o.toString").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_object_prototype_has_own_property_call_works_on_null_proto_object() {
+        let result = global_eval(
+            "var o = Object.create(null); o.x = 1; \
+             Object.prototype.hasOwnProperty.call(o, 'x')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_constructor_prototype_property_lookup_is_inherited() {
+        let result =
+            global_eval("function F() {} F.prototype.x = 1; var o = new F(); o.x").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_constructor_prototype_is_prototype_of_instance() {
+        let result =
+            global_eval("function F() {} var o = new F(); F.prototype.isPrototypeOf(o)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_replacing_constructor_prototype_affects_new_instances_only() {
+        let result = global_eval(
+            "function F() {} var old = new F(); var p = { y: 2 }; \
+             F.prototype = p; var fresh = new F(); \
+             Object.getPrototypeOf(fresh) === p && (old instanceof F) === false",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_has_own_property_vs_in_inherited_property() {
+        let result = global_eval(
+            "var p = { x: 1 }; var o = Object.create(p); ('x' in o) && !o.hasOwnProperty('x')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_has_own_property_vs_in_inherited_undefined_property() {
+        let result = global_eval(
+            "var p = { x: undefined }; var o = Object.create(p); ('x' in o) && !o.hasOwnProperty('x')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_proto_assignment_to_null_removes_inherited_lookup() {
+        let result = global_eval(
+            "var p = { x: 1 }; var o = Object.create(p); o.__proto__ = null; typeof o.x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_proto_assignment_same_prototype_is_noop() {
+        let result = global_eval(
+            "var p = { x: 1 }; var o = Object.create(p); o.__proto__ = p; Object.getPrototypeOf(o) === p",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_null_proto_object_not_in_object_prototype_chain() {
+        let result = global_eval(
+            "var o = Object.create(null); o.x = 1; Object.prototype.isPrototypeOf(o) === false",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_proto_assignment_to_null_removes_has_own_property_method() {
+        let result =
+            global_eval("var o = {}; o.__proto__ = null; typeof o.hasOwnProperty").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_custom_symbol_hasinstance_can_match_primitive() {
+        let result = global_eval(
+            "function F() {} \
+             F[Symbol.hasInstance] = function(v) { return typeof v === 'number'; }; \
+             1 instanceof F",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 
     // ── Map.groupBy e2e tests ───────────────────────────────────────────
