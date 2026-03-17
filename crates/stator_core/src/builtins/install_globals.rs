@@ -7221,6 +7221,22 @@ fn make_symbol() -> JsValue {
             }),
         );
 
+        // Symbol.prototype[@@toPrimitive](hint) — returns the symbol itself.
+        // Per §20.4.3.4 the hint argument is accepted but ignored.
+        proto.insert(
+            "@@toPrimitive".into(),
+            native(|args| {
+                let this = args.first().unwrap_or(&JsValue::Undefined);
+                if let JsValue::Symbol(id) = this {
+                    Ok(JsValue::Symbol(*id))
+                } else {
+                    Err(crate::error::StatorError::TypeError(
+                        "Symbol.prototype[@@toPrimitive] requires a symbol".into(),
+                    ))
+                }
+            }),
+        );
+
         // Symbol.prototype[@@toStringTag] = "Symbol"
         proto.insert("@@toStringTag".into(), JsValue::String("Symbol".into()));
 
@@ -16361,6 +16377,365 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(6));
+    }
+
+    // ── Symbol.prototype[@@toPrimitive] tests ──────────────────────────
+
+    /// `Symbol.prototype[Symbol.toPrimitive]` exists and is callable.
+    #[test]
+    fn e2e_symbol_to_primitive_method_exists() {
+        let result =
+            global_eval(r#"typeof Symbol.prototype[Symbol.toPrimitive] === "function""#).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Symbol("x")[Symbol.toPrimitive]("string")` returns the symbol.
+    #[test]
+    fn e2e_symbol_to_primitive_string_hint_returns_symbol() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("x");
+            s[Symbol.toPrimitive]("string") === s
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Symbol("x")[Symbol.toPrimitive]("number")` returns the symbol.
+    #[test]
+    fn e2e_symbol_to_primitive_number_hint_returns_symbol() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("x");
+            s[Symbol.toPrimitive]("number") === s
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Symbol("x")[Symbol.toPrimitive]("default")` returns the symbol.
+    #[test]
+    fn e2e_symbol_to_primitive_default_hint_returns_symbol() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("x");
+            s[Symbol.toPrimitive]("default") === s
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `typeof Symbol("x")[Symbol.toPrimitive]("string")` → "symbol".
+    #[test]
+    fn e2e_symbol_to_primitive_result_is_symbol() {
+        let result = global_eval(r#"typeof Symbol("x")[Symbol.toPrimitive]("string")"#).unwrap();
+        assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// Well-known symbol via @@toPrimitive preserves identity.
+    #[test]
+    fn e2e_well_known_symbol_to_primitive_identity() {
+        let result =
+            global_eval("Symbol.iterator[Symbol.toPrimitive]('default') === Symbol.iterator")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Symbol.prototype.toString on well-known symbols ────────────────
+
+    /// `Symbol.toPrimitive.toString()` → "Symbol(Symbol.toPrimitive)"
+    #[test]
+    fn e2e_symbol_to_primitive_to_string() {
+        let result = global_eval("Symbol.toPrimitive.toString()").unwrap();
+        assert_eq!(result, JsValue::String("Symbol(Symbol.toPrimitive)".into()));
+    }
+
+    /// `Symbol.hasInstance.toString()` → "Symbol(Symbol.hasInstance)"
+    #[test]
+    fn e2e_symbol_has_instance_to_string() {
+        let result = global_eval("Symbol.hasInstance.toString()").unwrap();
+        assert_eq!(result, JsValue::String("Symbol(Symbol.hasInstance)".into()));
+    }
+
+    /// `Symbol.toStringTag.toString()` → "Symbol(Symbol.toStringTag)"
+    #[test]
+    fn e2e_symbol_to_string_tag_to_string() {
+        let result = global_eval("Symbol.toStringTag.toString()").unwrap();
+        assert_eq!(result, JsValue::String("Symbol(Symbol.toStringTag)".into()));
+    }
+
+    /// `Symbol.species.toString()` → "Symbol(Symbol.species)"
+    #[test]
+    fn e2e_symbol_species_to_string() {
+        let result = global_eval("Symbol.species.toString()").unwrap();
+        assert_eq!(result, JsValue::String("Symbol(Symbol.species)".into()));
+    }
+
+    /// `Symbol.isConcatSpreadable.toString()`
+    #[test]
+    fn e2e_symbol_is_concat_spreadable_to_string() {
+        let result = global_eval("Symbol.isConcatSpreadable.toString()").unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("Symbol(Symbol.isConcatSpreadable)".into())
+        );
+    }
+
+    /// `Symbol.match.toString()` → "Symbol(Symbol.match)"
+    #[test]
+    fn e2e_symbol_match_to_string() {
+        let result = global_eval("Symbol.match.toString()").unwrap();
+        assert_eq!(result, JsValue::String("Symbol(Symbol.match)".into()));
+    }
+
+    /// `Symbol.replace.toString()` → "Symbol(Symbol.replace)"
+    #[test]
+    fn e2e_symbol_replace_to_string() {
+        let result = global_eval("Symbol.replace.toString()").unwrap();
+        assert_eq!(result, JsValue::String("Symbol(Symbol.replace)".into()));
+    }
+
+    /// `Symbol.search.toString()` → "Symbol(Symbol.search)"
+    #[test]
+    fn e2e_symbol_search_to_string() {
+        let result = global_eval("Symbol.search.toString()").unwrap();
+        assert_eq!(result, JsValue::String("Symbol(Symbol.search)".into()));
+    }
+
+    /// `Symbol.split.toString()` → "Symbol(Symbol.split)"
+    #[test]
+    fn e2e_symbol_split_to_string() {
+        let result = global_eval("Symbol.split.toString()").unwrap();
+        assert_eq!(result, JsValue::String("Symbol(Symbol.split)".into()));
+    }
+
+    /// `Symbol.unscopables.toString()` → "Symbol(Symbol.unscopables)"
+    #[test]
+    fn e2e_symbol_unscopables_to_string() {
+        let result = global_eval("Symbol.unscopables.toString()").unwrap();
+        assert_eq!(result, JsValue::String("Symbol(Symbol.unscopables)".into()));
+    }
+
+    /// `Symbol.asyncIterator.toString()` → "Symbol(Symbol.asyncIterator)"
+    #[test]
+    fn e2e_symbol_async_iterator_to_string() {
+        let result = global_eval("Symbol.asyncIterator.toString()").unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("Symbol(Symbol.asyncIterator)".into())
+        );
+    }
+
+    /// `Symbol.matchAll.toString()` → "Symbol(Symbol.matchAll)"
+    #[test]
+    fn e2e_symbol_match_all_to_string() {
+        let result = global_eval("Symbol.matchAll.toString()").unwrap();
+        assert_eq!(result, JsValue::String("Symbol(Symbol.matchAll)".into()));
+    }
+
+    // ── Symbol.prototype.valueOf identity tests ────────────────────────
+
+    /// User symbol valueOf preserves identity.
+    #[test]
+    fn e2e_symbol_user_value_of_identity() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("v");
+            s.valueOf() === s
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Symbol.for symbol valueOf preserves identity.
+    #[test]
+    fn e2e_symbol_for_value_of_identity() {
+        let result = global_eval(r#"Symbol.for("vof").valueOf() === Symbol.for("vof")"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Well-known Symbol.toPrimitive valueOf preserves identity.
+    #[test]
+    fn e2e_symbol_to_primitive_value_of_identity() {
+        let result = global_eval("Symbol.toPrimitive.valueOf() === Symbol.toPrimitive").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Symbol.for / Symbol.keyFor additional tests ────────────────────
+
+    /// `Symbol.for("x").toString()` → "Symbol(x)"
+    #[test]
+    fn e2e_symbol_for_to_string() {
+        let result = global_eval(r#"Symbol.for("x").toString()"#).unwrap();
+        assert_eq!(result, JsValue::String("Symbol(x)".into()));
+    }
+
+    /// `Symbol.for("").toString()` → "Symbol()"
+    #[test]
+    fn e2e_symbol_for_empty_to_string() {
+        let result = global_eval(r#"Symbol.for("").toString()"#).unwrap();
+        assert_eq!(result, JsValue::String("Symbol()".into()));
+    }
+
+    /// `Symbol.keyFor` returns undefined for well-known `Symbol.match`.
+    #[test]
+    fn e2e_symbol_key_for_well_known_match() {
+        let result = global_eval("Symbol.keyFor(Symbol.match) === undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Symbol.keyFor` returns undefined for well-known `Symbol.species`.
+    #[test]
+    fn e2e_symbol_key_for_well_known_species() {
+        let result = global_eval("Symbol.keyFor(Symbol.species) === undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Object.prototype.toString.call(Symbol) ─────────────────────────
+
+    /// `Object.prototype.toString.call(Symbol("x"))` → "[object Symbol]"
+    #[test]
+    fn e2e_obj_tostring_call_symbol() {
+        let result = global_eval(r#"Object.prototype.toString.call(Symbol("x"))"#).unwrap();
+        assert_eq!(result, JsValue::String("[object Symbol]".into()));
+    }
+
+    /// `Object.prototype.toString.call(Symbol.iterator)` → "[object Symbol]"
+    #[test]
+    fn e2e_obj_tostring_call_well_known_symbol() {
+        let result = global_eval("Object.prototype.toString.call(Symbol.iterator)").unwrap();
+        assert_eq!(result, JsValue::String("[object Symbol]".into()));
+    }
+
+    // ── Symbol truthiness / coercion edge cases ────────────────────────
+
+    /// Symbol in conditional expression evaluates truthy.
+    #[test]
+    fn e2e_symbol_ternary_truthy() {
+        let result = global_eval(r#"Symbol("t") ? "yes" : "no""#).unwrap();
+        assert_eq!(result, JsValue::String("yes".into()));
+    }
+
+    /// `Boolean(Symbol())` → true.
+    #[test]
+    fn e2e_boolean_of_symbol() {
+        let result = global_eval("Boolean(Symbol())").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Symbol strict-not-equals to its toString.
+    #[test]
+    fn e2e_symbol_not_equal_to_its_tostring() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("abc");
+            s !== s.toString()
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Two Symbol.for calls with same key in one expression.
+    #[test]
+    fn e2e_symbol_for_inline_identity() {
+        let result = global_eval(r#"Symbol.for("inline") === Symbol.for("inline")"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Symbol description with unicode characters.
+    #[test]
+    fn e2e_symbol_unicode_description() {
+        let result = global_eval("Symbol('\u{1F600}').description === '\u{1F600}'").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Symbol.for with unicode key round-trips.
+    #[test]
+    fn e2e_symbol_for_unicode_key() {
+        let result = global_eval("Symbol.keyFor(Symbol.for('\u{1F600}')) === '\u{1F600}'").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Symbol stored across closure retains identity.
+    #[test]
+    fn e2e_symbol_closure_identity() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("closed");
+            var get = function() { return s; };
+            get() === s
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Symbol as Map key.
+    #[test]
+    fn e2e_symbol_as_map_key() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("mapKey");
+            var m = new Map();
+            m.set(s, 42);
+            m.get(s)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Different symbols as different Map keys.
+    #[test]
+    fn e2e_symbol_map_different_keys() {
+        let result = global_eval(
+            r#"
+            var s1 = Symbol("a");
+            var s2 = Symbol("a");
+            var m = new Map();
+            m.set(s1, 1);
+            m.set(s2, 2);
+            m.get(s1) === 1 && m.get(s2) === 2 && m.size === 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Symbol in array survives and is retrievable.
+    #[test]
+    fn e2e_symbol_in_array() {
+        let result = global_eval(
+            r#"
+            var s = Symbol("arr");
+            var a = [1, s, 3];
+            a[1] === s
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Symbol.dispose.toString()` → "Symbol(Symbol.dispose)"
+    #[test]
+    fn e2e_symbol_dispose_to_string() {
+        let result = global_eval("Symbol.dispose.toString()").unwrap();
+        assert_eq!(result, JsValue::String("Symbol(Symbol.dispose)".into()));
+    }
+
+    /// `Symbol.asyncDispose.toString()` → "Symbol(Symbol.asyncDispose)"
+    #[test]
+    fn e2e_symbol_async_dispose_to_string() {
+        let result = global_eval("Symbol.asyncDispose.toString()").unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("Symbol(Symbol.asyncDispose)".into())
+        );
     }
 
     // ── Object.defineProperty / getOwnPropertyDescriptor tests ──────────
