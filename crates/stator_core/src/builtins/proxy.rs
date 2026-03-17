@@ -99,7 +99,7 @@ pub type ConstructTrap = Box<dyn Fn(Vec<JsValue>, JsValue) -> StatorResult<JsVal
 ///
 /// let mut handler = ProxyHandler::default();
 /// // Install a get-trap that intercepts every property read.
-/// handler.get = Some(Box::new(|_target, _key| Ok(JsValue::Smi(42))));
+/// handler.get = Some(Box::new(|_target, _key, _receiver| Ok(JsValue::Smi(42))));
 ///
 /// let target = JsObject::new();
 /// let mut proxy = proxy_new(target, handler);
@@ -294,7 +294,24 @@ impl JsProxy {
                 .get("__proto__")
                 .cloned()
                 .unwrap_or(JsValue::Null),
-            _ => JsValue::Null,
+            _ => {
+                // For JsObject targets, convert the prototype chain entry
+                // into a PlainObject JsValue so that invariant checks using
+                // `same_value` work correctly.
+                match self.target.prototype() {
+                    Some(proto) => {
+                        let borrowed = proto.borrow();
+                        let mut map = PropertyMap::new();
+                        for key in borrowed.own_property_keys() {
+                            if let Some(val) = borrowed.get_own_property(&key) {
+                                map.insert(key, val);
+                            }
+                        }
+                        JsValue::PlainObject(Rc::new(RefCell::new(map)))
+                    }
+                    None => JsValue::Null,
+                }
+            }
         }
     }
 
@@ -321,6 +338,23 @@ impl JsProxy {
             _ => self.target.own_property_keys(),
         }
     }
+}
+
+/// Converts a `JsValue` representing a prototype into a `JsObject`.
+///
+/// When the default `[[SetPrototypeOf]]` path receives a non-null, object-like
+/// `JsValue`, this helper copies visible properties into a fresh `JsObject` so
+/// that `object_set_prototype_of` receives a real `JsObject` instead of a
+/// discarded empty one.
+fn proto_value_to_js_object(value: &JsValue) -> JsObject {
+    let mut obj = JsObject::new();
+    if let JsValue::PlainObject(map) = value {
+        let borrowed = map.borrow();
+        for (key, val) in borrowed.iter() {
+            let _ = obj.set_property(key, val.clone());
+        }
+    }
+    obj
 }
 
 fn accessor_property_name(key: &str) -> Option<&str> {
@@ -816,11 +850,11 @@ pub fn proxy_set_prototype_of(proxy: &mut JsProxy, proto: JsValue) -> StatorResu
         if matches!(proto, JsValue::Null) {
             Ok(object_set_prototype_of(&mut proxy.target, None).is_ok())
         } else if proto.is_object_like() {
-            Ok(object_set_prototype_of(
-                &mut proxy.target,
-                Some(Rc::new(RefCell::new(JsObject::new()))),
+            let js_obj = proto_value_to_js_object(&proto);
+            Ok(
+                object_set_prototype_of(&mut proxy.target, Some(Rc::new(RefCell::new(js_obj))))
+                    .is_ok(),
             )
-            .is_ok())
         } else {
             Err(StatorError::TypeError(
                 "Object prototype may only be an Object or null".to_string(),

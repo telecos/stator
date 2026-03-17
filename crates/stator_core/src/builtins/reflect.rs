@@ -24,9 +24,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::error::StatorResult;
+use crate::error::{StatorError, StatorResult};
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
+use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsValue;
 
 // ── reflect_get ───────────────────────────────────────────────────────────────
@@ -404,6 +405,126 @@ pub fn reflect_construct_with_new_target(
         result.set_prototype(Some(proto));
     }
     Ok(result)
+}
+
+// ── JsValue-based bridge functions ────────────────────────────────────────────
+//
+// The Proxy layer represents prototypes as `JsValue` (either `Null` or an
+// object-like variant), while the Reflect/JsObject layer uses
+// `Option<Rc<RefCell<JsObject>>>`.  The bridge functions below convert between
+// the two representations so that round-trip conformance tests can compare
+// Proxy and Reflect results directly.
+
+/// Returns the prototype of `target` as a [`JsValue`].
+///
+/// Returns [`JsValue::Null`] when the target has no prototype, or a
+/// [`JsValue::PlainObject`] snapshot of the prototype's own properties.
+///
+/// This mirrors the proxy's `[[GetPrototypeOf]]` default path so that
+/// `proxy_get_prototype_of` (no trap) and `reflect_get_prototype_of_value`
+/// agree on the representation.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::reflect::reflect_get_prototype_of_value;
+/// use stator_core::objects::js_object::JsObject;
+/// use stator_core::objects::value::JsValue;
+///
+/// let target = JsObject::new();
+/// assert_eq!(reflect_get_prototype_of_value(&target), JsValue::Null);
+/// ```
+pub fn reflect_get_prototype_of_value(target: &JsObject) -> JsValue {
+    match target.prototype() {
+        Some(proto) => {
+            let borrowed = proto.borrow();
+            let mut map = PropertyMap::new();
+            for key in borrowed.own_property_keys() {
+                if let Some(val) = borrowed.get_own_property(&key) {
+                    map.insert(key, val);
+                }
+            }
+            JsValue::PlainObject(Rc::new(RefCell::new(map)))
+        }
+        None => JsValue::Null,
+    }
+}
+
+/// Sets the prototype of `target` from a [`JsValue`].
+///
+/// Accepts [`JsValue::Null`] to remove the prototype, or any object-like
+/// [`JsValue`] to set one.  Returns `Ok(true)` on success, `Ok(false)` if
+/// the target is non-extensible with a different prototype, or `Err` for
+/// non-object, non-null values.
+///
+/// This mirrors the proxy's `[[SetPrototypeOf]]` default path so that
+/// `proxy_set_prototype_of` (no trap) and `reflect_set_prototype_of_value`
+/// agree on the representation.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::reflect::reflect_set_prototype_of_value;
+/// use stator_core::objects::js_object::JsObject;
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut target = JsObject::new();
+/// assert!(reflect_set_prototype_of_value(&mut target, JsValue::Null).unwrap());
+/// ```
+pub fn reflect_set_prototype_of_value(target: &mut JsObject, proto: JsValue) -> StatorResult<bool> {
+    use crate::builtins::object::object_set_prototype_of;
+    if matches!(proto, JsValue::Null) {
+        Ok(object_set_prototype_of(target, None).is_ok())
+    } else if proto.is_object_like() {
+        let mut js_obj = JsObject::new();
+        if let JsValue::PlainObject(map) = &proto {
+            let borrowed = map.borrow();
+            for (key, val) in borrowed.iter() {
+                let _ = js_obj.set_property(key, val.clone());
+            }
+        }
+        Ok(object_set_prototype_of(target, Some(Rc::new(RefCell::new(js_obj)))).is_ok())
+    } else {
+        Err(StatorError::TypeError(
+            "Object prototype may only be an Object or null".to_string(),
+        ))
+    }
+}
+
+/// Returns all own property keys of `target` as [`JsValue`] entries.
+///
+/// Each string key becomes [`JsValue::String`].  Symbol keys are detected by
+/// checking for the internal `Symbol(…)` property-key encoding and returned
+/// as [`JsValue::Symbol`].
+///
+/// This mirrors the proxy's `[[OwnPropertyKeys]]` default path so that
+/// `proxy_own_keys` (no trap) and `reflect_own_keys_values` produce the
+/// same representation.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::reflect::reflect_own_keys_values;
+/// use stator_core::objects::js_object::JsObject;
+/// use stator_core::objects::value::JsValue;
+///
+/// let mut target = JsObject::new();
+/// target.set_property("a", JsValue::Smi(1)).unwrap();
+/// let keys = reflect_own_keys_values(&target);
+/// assert_eq!(keys, vec![JsValue::String("a".into())]);
+/// ```
+pub fn reflect_own_keys_values(target: &JsObject) -> Vec<JsValue> {
+    target
+        .own_property_keys()
+        .into_iter()
+        .map(|key| {
+            if let Some(id) = crate::builtins::symbol::property_key_to_symbol(&key) {
+                JsValue::Symbol(id)
+            } else {
+                JsValue::String(key.into())
+            }
+        })
+        .collect()
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

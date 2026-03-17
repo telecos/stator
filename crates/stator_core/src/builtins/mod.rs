@@ -45,6 +45,9 @@ pub mod object;
 pub mod promise;
 /// ECMAScript §28.2 `Proxy` built-in and §10.5 invariant enforcement.
 pub mod proxy;
+/// Proxy + Reflect round-trip conformance tests.
+#[cfg(test)]
+mod proxy_reflect;
 /// ECMAScript §28.1 `Reflect` built-in static methods.
 pub mod reflect;
 /// ECMAScript §22.2 `RegExp` built-in constructor and prototype methods.
