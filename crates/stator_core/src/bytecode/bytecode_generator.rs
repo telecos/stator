@@ -1834,6 +1834,25 @@ impl FunctionCompiler {
         let class_reg = self.allocator.allocate_temporary();
         self.emit_star(class_reg);
 
+        // 3b. Set the `.name` property on the class constructor (ES §14.6.13).
+        if let Some(ident) = id {
+            let name_val_idx = self.add_string(&ident.name);
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaConstant,
+                vec![Operand::ConstantPoolIdx(name_val_idx)],
+            ));
+            let name_key_idx = self.add_string("name");
+            let name_slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+            self.emit(Instruction::new_unchecked(
+                Opcode::DefineNamedOwnProperty,
+                vec![
+                    to_reg_op(class_reg),
+                    Operand::ConstantPoolIdx(name_key_idx),
+                    name_slot,
+                ],
+            ));
+        }
+
         // 4. Load the prototype object.
         let proto_reg = self.allocator.allocate_temporary();
         let proto_name = self.add_string("prototype");
