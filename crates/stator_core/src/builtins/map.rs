@@ -443,6 +443,47 @@ pub fn map_create_iterator(map: &JsMap, kind: MapIteratorKind) -> JsValue {
     JsValue::Iterator(NativeIterator::from_items(items))
 }
 
+// ── Map.groupBy ───────────────────────────────────────────────────────────────
+
+/// ECMAScript §24.1.2.1 `Map.groupBy(items, callbackFn)`.
+///
+/// Groups the elements of `items` into a [`JsMap`] whose keys are the values
+/// returned by `key_fn(element, index)`.  Unlike [`object_group_by`], the keys
+/// are arbitrary [`JsValue`]s — not just strings — so non-string keys like
+/// objects and numbers are preserved.
+///
+/// Each group is stored as a [`Vec<JsValue>`].
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::map::{map_group_by, map_size, map_get};
+/// use stator_core::objects::value::JsValue;
+///
+/// let items = vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)];
+/// let m = map_group_by(&items, |v, _idx| {
+///     if let JsValue::Smi(n) = v { if n % 2 == 0 { JsValue::Smi(0) } else { JsValue::Smi(1) } }
+///     else { JsValue::Undefined }
+/// });
+/// assert_eq!(map_size(&m), 2);
+/// ```
+pub fn map_group_by(
+    items: &[JsValue],
+    mut key_fn: impl FnMut(&JsValue, usize) -> JsValue,
+) -> JsMap {
+    let mut result = map_new();
+    for (i, item) in items.iter().enumerate() {
+        let key = key_fn(item, i);
+        let existing = map_get(&result, &key);
+        if let JsValue::Array(existing_arr) = existing {
+            existing_arr.borrow_mut().push(item.clone());
+        } else {
+            map_set(&mut result, key, JsValue::new_array(vec![item.clone()]));
+        }
+    }
+    result
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -728,5 +769,99 @@ mod tests {
         assert_eq!(iterator_next(&iter).unwrap().value, JsValue::Smi(1));
         assert_eq!(iterator_next(&iter).unwrap().value, JsValue::Smi(2));
         assert!(iterator_next(&iter).unwrap().done);
+    }
+
+    // ── map_group_by ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_map_group_by_even_odd() {
+        let items = vec![
+            JsValue::Smi(1),
+            JsValue::Smi(2),
+            JsValue::Smi(3),
+            JsValue::Smi(4),
+        ];
+        let m = map_group_by(&items, |v, _| {
+            if let JsValue::Smi(n) = v {
+                if n % 2 == 0 {
+                    JsValue::String("even".into())
+                } else {
+                    JsValue::String("odd".into())
+                }
+            } else {
+                JsValue::Undefined
+            }
+        });
+        assert_eq!(map_size(&m), 2);
+        let odd = map_get(&m, &JsValue::String("odd".into()));
+        if let JsValue::Array(arr) = odd {
+            assert_eq!(arr.borrow().len(), 2);
+        } else {
+            panic!("expected array for 'odd' group");
+        }
+    }
+
+    #[test]
+    fn test_map_group_by_empty() {
+        let items: Vec<JsValue> = vec![];
+        let m = map_group_by(&items, |_, _| JsValue::Smi(0));
+        assert_eq!(map_size(&m), 0);
+    }
+
+    #[test]
+    fn test_map_group_by_single_group() {
+        let items = vec![JsValue::Smi(1), JsValue::Smi(2)];
+        let m = map_group_by(&items, |_, _| JsValue::String("all".into()));
+        assert_eq!(map_size(&m), 1);
+    }
+
+    #[test]
+    fn test_map_group_by_non_string_keys() {
+        let items = vec![JsValue::Smi(10), JsValue::Smi(20), JsValue::Smi(30)];
+        let m = map_group_by(&items, |v, _| v.clone());
+        assert_eq!(map_size(&m), 3);
+        let group = map_get(&m, &JsValue::Smi(10));
+        if let JsValue::Array(arr) = group {
+            assert_eq!(arr.borrow().len(), 1);
+        } else {
+            panic!("expected array");
+        }
+    }
+
+    #[test]
+    fn test_map_group_by_callback_receives_index() {
+        let items = vec![JsValue::Smi(5), JsValue::Smi(6)];
+        let mut indices = Vec::new();
+        map_group_by(&items, |_, idx| {
+            indices.push(idx);
+            JsValue::Smi(0)
+        });
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_map_group_by_preserves_insertion_order() {
+        let items = vec![JsValue::Smi(3), JsValue::Smi(1), JsValue::Smi(2)];
+        let m = map_group_by(&items, |v, _| v.clone());
+        let keys = map_keys(&m);
+        assert_eq!(
+            keys,
+            vec![JsValue::Smi(3), JsValue::Smi(1), JsValue::Smi(2)]
+        );
+    }
+
+    #[test]
+    fn test_map_group_by_boolean_keys() {
+        let items = vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)];
+        let m = map_group_by(&items, |v, _| {
+            if let JsValue::Smi(n) = v {
+                JsValue::Boolean(n % 2 == 0)
+            } else {
+                JsValue::Undefined
+            }
+        });
+        assert_eq!(map_size(&m), 2);
+        assert!(map_has(&m, &JsValue::Boolean(true)));
+        assert!(map_has(&m, &JsValue::Boolean(false)));
     }
 }

@@ -618,6 +618,45 @@ pub fn object_get_own_property_descriptor_as_object(obj: &JsObject, key: &str) -
     })
 }
 
+// ── Object.groupBy ────────────────────────────────────────────────────────────
+
+/// ECMAScript §22.1.2.5 `Object.groupBy(items, callbackFn)`.
+///
+/// Groups the elements of `items` into a null-prototype object by the string
+/// keys returned by `key_fn(element, index)`.  Each group is a [`Vec<JsValue>`].
+///
+/// The result is an [`IndexMap`] preserving first-seen key order, which mirrors
+/// the insertion-order semantics of a null-prototype object.
+///
+/// # Examples
+///
+/// ```
+/// use stator_core::builtins::object::object_group_by;
+/// use stator_core::objects::value::JsValue;
+///
+/// let items = vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3), JsValue::Smi(4)];
+/// let groups = object_group_by(&items, |v, _idx| {
+///     if let JsValue::Smi(n) = v { if n % 2 == 0 { "even" } else { "odd" } }
+///     else { "other" }
+///     .to_string()
+/// });
+/// assert_eq!(groups.len(), 2);
+/// assert_eq!(groups["odd"].len(), 2);
+/// assert_eq!(groups["even"].len(), 2);
+/// ```
+pub fn object_group_by(
+    items: &[JsValue],
+    mut key_fn: impl FnMut(&JsValue, usize) -> String,
+) -> std::collections::HashMap<String, Vec<JsValue>> {
+    let mut groups: std::collections::HashMap<String, Vec<JsValue>> =
+        std::collections::HashMap::new();
+    for (i, item) in items.iter().enumerate() {
+        let key = key_fn(item, i);
+        groups.entry(key).or_default().push(item.clone());
+    }
+    groups
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2386,5 +2425,108 @@ mod tests {
         assert!(!attrs.contains(PropertyAttributes::WRITABLE));
         assert!(attrs.contains(PropertyAttributes::ENUMERABLE));
         assert!(attrs.contains(PropertyAttributes::CONFIGURABLE));
+    }
+
+    // ── object_group_by ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_object_group_by_even_odd() {
+        let items = vec![
+            JsValue::Smi(1),
+            JsValue::Smi(2),
+            JsValue::Smi(3),
+            JsValue::Smi(4),
+        ];
+        let groups = object_group_by(&items, |v, _| {
+            if let JsValue::Smi(n) = v {
+                if n % 2 == 0 { "even" } else { "odd" }
+            } else {
+                "other"
+            }
+            .to_string()
+        });
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups["odd"].len(), 2);
+        assert_eq!(groups["even"].len(), 2);
+    }
+
+    #[test]
+    fn test_object_group_by_empty() {
+        let items: Vec<JsValue> = vec![];
+        let groups = object_group_by(&items, |_, _| "x".to_string());
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_object_group_by_single_group() {
+        let items = vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)];
+        let groups = object_group_by(&items, |_, _| "all".to_string());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups["all"].len(), 3);
+    }
+
+    #[test]
+    fn test_object_group_by_preserves_values() {
+        let items = vec![
+            JsValue::String("apple".into()),
+            JsValue::String("avocado".into()),
+            JsValue::String("banana".into()),
+        ];
+        let groups = object_group_by(&items, |v, _| {
+            if let JsValue::String(s) = v {
+                s.chars().next().unwrap_or('?').to_string()
+            } else {
+                "?".to_string()
+            }
+        });
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups["a"].len(), 2);
+        assert_eq!(groups["b"].len(), 1);
+    }
+
+    #[test]
+    fn test_object_group_by_callback_receives_index() {
+        let items = vec![JsValue::Smi(10), JsValue::Smi(20), JsValue::Smi(30)];
+        let mut indices = Vec::new();
+        object_group_by(&items, |_, idx| {
+            indices.push(idx);
+            "g".to_string()
+        });
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_object_group_by_same_key_all_items() {
+        let items = vec![JsValue::Boolean(true), JsValue::Boolean(false)];
+        let groups = object_group_by(&items, |_, _| "k".to_string());
+        assert_eq!(groups["k"].len(), 2);
+        assert_eq!(groups["k"][0], JsValue::Boolean(true));
+        assert_eq!(groups["k"][1], JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_object_group_by_unique_keys() {
+        let items = vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)];
+        let groups = object_group_by(&items, |v, _| {
+            if let JsValue::Smi(n) = v {
+                n.to_string()
+            } else {
+                "?".to_string()
+            }
+        });
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups["1"].len(), 1);
+        assert_eq!(groups["2"].len(), 1);
+        assert_eq!(groups["3"].len(), 1);
+    }
+
+    #[test]
+    fn test_object_group_by_with_undefined_values() {
+        let items = vec![JsValue::Undefined, JsValue::Null, JsValue::Undefined];
+        let groups = object_group_by(&items, |v, _| {
+            if v.is_undefined() { "undef" } else { "other" }.to_string()
+        });
+        assert_eq!(groups["undef"].len(), 2);
+        assert_eq!(groups["other"].len(), 1);
     }
 }
