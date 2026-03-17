@@ -318,14 +318,24 @@ impl<'src> Parser<'src> {
                         body.push(ProgramItem::Stmt(stmt));
                     } else {
                         in_directive_prologue = false;
-                        is_module = true;
+                        // Module code is always strict (ES2024 §10.2.1).
+                        if !is_module {
+                            is_module = true;
+                            self.strict_mode = true;
+                            is_strict = true;
+                        }
                         let decl = self.parse_import_decl()?;
                         body.push(ProgramItem::ModuleDecl(ModuleDecl::Import(decl)));
                     }
                 }
                 TokenKind::Export => {
                     in_directive_prologue = false;
-                    is_module = true;
+                    // Module code is always strict (ES2024 §10.2.1).
+                    if !is_module {
+                        is_module = true;
+                        self.strict_mode = true;
+                        is_strict = true;
+                    }
                     let decl = self.parse_export_decl()?;
                     body.push(ProgramItem::ModuleDecl(decl));
                 }
@@ -3786,6 +3796,9 @@ impl<'src> Parser<'src> {
                 // Parse the constructor target. Using parse_primary() allows
                 // nested `new` (e.g. `new new Foo()`) while avoiding the
                 // call-expression `()` being consumed by parse_call_member().
+                if self.peek_kind() == TokenKind::Import {
+                    return Err(self.error("cannot use 'new' with 'import'"));
+                }
                 let mut callee = self.parse_primary()?;
                 // Allow member-access chains on the callee so that
                 // `new Foo.Bar()` and `new a[b]()` work correctly.
@@ -3900,6 +3913,14 @@ impl<'src> Parser<'src> {
                     self.bump()?; // consume `.`
                     let prop_tok = self.bump()?;
                     let prop_name = self.name_from_token(&prop_tok)?;
+                    if prop_name != "meta" {
+                        return Err(Self::error_at(
+                            prop_tok.span,
+                            &format!(
+                                "the only valid meta property for import is 'import.meta', got 'import.{prop_name}'"
+                            ),
+                        ));
+                    }
                     let end = prop_tok.span;
                     Ok(Expr::MetaProp(MetaPropExpr {
                         loc: Self::merge_spans(import_tok.span, end),
@@ -3912,9 +3933,16 @@ impl<'src> Parser<'src> {
                             name: prop_name,
                         },
                     }))
-                } else {
+                } else if self.peek_kind() == TokenKind::LeftParen {
                     // `import(source)` or `import(source, options)`
-                    self.expect(TokenKind::LeftParen)?;
+                    self.bump()?; // consume `(`
+                    // import() requires at least one argument.
+                    if self.peek_kind() == TokenKind::RightParen {
+                        return Err(Self::error_at(
+                            import_tok.span,
+                            "import() requires a specifier argument",
+                        ));
+                    }
                     let source = self.parse_assignment_expr()?;
                     let options = if self.eat(TokenKind::Comma)? {
                         // Allow trailing comma: `import(x,)`
@@ -3935,6 +3963,11 @@ impl<'src> Parser<'src> {
                         source: Box::new(source),
                         options,
                     })))
+                } else {
+                    Err(Self::error_at(
+                        import_tok.span,
+                        "expected '(' or '.' after 'import' in expression context",
+                    ))
                 }
             }
             TokenKind::Class => self.parse_class_expr(),
