@@ -577,40 +577,46 @@ impl JsRegExp {
         }
 
         let mut parts: Vec<Option<String>> = Vec::new();
-        let mut last_end = 0_usize;
-        let mut search_index = 0usize;
+        let mut p = 0usize;
+        let mut q = 0usize;
 
-        while search_index <= input.len() {
-            let Some(mat) = self.compiled.find_from(input, search_index).next() else {
-                break;
-            };
-            if mat.start() == mat.end() && mat.start() == search_index {
-                search_index = advance_string_index(input, search_index);
-                continue;
-            }
+        while q < input.len() {
+            let sticky_match = self
+                .compiled
+                .find_from(input, q)
+                .next()
+                .filter(|m| m.start() == q);
 
-            parts.push(Some(input[last_end..mat.start()].to_string()));
-            if parts.len() >= lim {
-                break;
-            }
-            for cap in &mat.captures {
-                parts.push(cap.as_ref().map(|r| input[r.clone()].to_string()));
-                if parts.len() >= lim {
-                    break;
+            match sticky_match {
+                None => {
+                    q = advance_string_index(input, q);
+                }
+                Some(mat) => {
+                    let e = mat.end();
+                    if e == p {
+                        q = advance_string_index(input, q);
+                        continue;
+                    }
+
+                    parts.push(Some(input[p..q].to_string()));
+                    if parts.len() >= lim {
+                        return parts;
+                    }
+
+                    for cap in &mat.captures {
+                        parts.push(cap.as_ref().map(|r| input[r.clone()].to_string()));
+                        if parts.len() >= lim {
+                            return parts;
+                        }
+                    }
+
+                    p = e;
+                    q = e;
                 }
             }
-            last_end = mat.end();
-            search_index = mat.end();
-
-            if parts.len() >= lim {
-                break;
-            }
         }
 
-        // Push the trailing portion (only if we haven't hit the limit).
-        if parts.len() < lim {
-            parts.push(Some(input[last_end..].to_string()));
-        }
+        parts.push(Some(input[p..].to_string()));
         parts
     }
 
@@ -1230,6 +1236,26 @@ mod tests {
             re.symbol_split("a-b", None),
             vec![Some("a".into()), None, Some("b".into())]
         );
+    }
+
+    #[test]
+    fn test_symbol_split_zero_width_produces_characters() {
+        let re = JsRegExp::new(r"(?:)", "").unwrap();
+        assert_eq!(
+            re.symbol_split("ab", None),
+            vec![Some("a".into()), Some("b".into())]
+        );
+    }
+
+    #[test]
+    fn test_symbol_split_ignores_existing_last_index() {
+        let re = JsRegExp::new(",", "g").unwrap();
+        re.set_last_index(2);
+        assert_eq!(
+            re.symbol_split("a,b,c", None),
+            vec![Some("a".into()), Some("b".into()), Some("c".into())]
+        );
+        assert_eq!(re.last_index(), 2);
     }
 
     // ── Unicode property escapes ──────────────────────────────────────────────
