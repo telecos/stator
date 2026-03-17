@@ -14924,6 +14924,13 @@ mod tests {
         ));
     }
 
+    fn assert_eval_syntax_error(script: &str) {
+        assert!(matches!(
+            global_eval(script),
+            Err(StatorError::SyntaxError(_))
+        ));
+    }
+
     /// Verify that `install_globals` populates the expected keys.
     #[test]
     fn test_install_globals_keys() {
@@ -15477,21 +15484,243 @@ mod tests {
     }
 
     #[test]
+    fn e2e_asi_return_newline_before_object_returns_undefined() {
+        let result = global_eval("(function () { return\n{ value: 1 }; })()").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_asi_return_newline_before_parenthesized_expr_returns_undefined() {
+        let result = global_eval("(function () { return\n(1 + 2); })()").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_asi_return_same_line_keeps_expression() {
+        let result = global_eval("(function () { return 1\n+ 2; })()").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
     fn e2e_asi_throw_newline_is_syntax_error() {
-        let result = global_eval("(function () { throw\n1; })()").unwrap_err();
-        assert!(matches!(result, StatorError::SyntaxError(_)));
+        assert_eval_syntax_error("(function () { throw\n1; })()");
+    }
+
+    #[test]
+    fn e2e_asi_throw_newline_at_top_level_is_syntax_error() {
+        assert_eval_syntax_error("throw\n1");
+    }
+
+    #[test]
+    fn e2e_throw_same_line_still_throws_value() {
+        let result = global_eval("try { throw 7; } catch (e) { e; }").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
     }
 
     #[test]
     fn e2e_asi_break_newline_label_is_syntax_error() {
-        let result = global_eval("label: { break\nlabel; }").unwrap_err();
-        assert!(matches!(result, StatorError::SyntaxError(_)));
+        assert_eval_syntax_error("label: { break\nlabel; }");
+    }
+
+    #[test]
+    fn e2e_asi_break_newline_in_loop_ignores_label() {
+        let result = global_eval(
+            "function f() { outer: while (true) { break\nouter; return 0; } return 1; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_asi_continue_newline_ignores_label() {
+        let result = global_eval(
+            "function f() { var hits = 0; outer: for (var i = 0; i < 3; i++) { hits = hits + 1; continue\nouter; hits = hits + 100; } return hits; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_asi_continue_newline_label_outside_loop_is_syntax_error() {
+        assert_eval_syntax_error("label: { continue\nlabel; }");
+    }
+
+    #[test]
+    fn e2e_continue_same_line_still_uses_label() {
+        let result = global_eval(
+            "function f() { var hits = 0; outer: for (var i = 0; i < 2; i++) { inner: for (var j = 0; j < 2; j++) { hits = hits + 1; continue outer; } hits = hits + 100; } return hits; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_asi_postfix_increment_newline_becomes_prefix_on_next_identifier() {
+        let result = global_eval("var a = 1; var b = 10; a\n++\nb; a * 100 + b").unwrap();
+        assert_eq!(result, JsValue::Smi(111));
+    }
+
+    #[test]
+    fn e2e_asi_postfix_decrement_newline_becomes_prefix_on_next_identifier() {
+        let result = global_eval("var a = 10; var b = 3; a\n--\nb; a * 100 + b").unwrap();
+        assert_eq!(result, JsValue::Smi(1002));
+    }
+
+    #[test]
+    fn e2e_postfix_increment_same_line_still_updates_left_operand() {
+        let result = global_eval("var a = 1; var b = a++; a * 10 + b").unwrap();
+        assert_eq!(result, JsValue::Smi(21));
+    }
+
+    #[test]
+    fn e2e_postfix_decrement_same_line_still_updates_left_operand() {
+        let result = global_eval("var a = 3; var b = a--; a * 10 + b").unwrap();
+        assert_eq!(result, JsValue::Smi(23));
+    }
+
+    #[test]
+    fn e2e_no_asi_before_left_paren_parses_call() {
+        let result = global_eval("function a(x) { return x + 1; }\na\n(2)").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_no_asi_before_left_paren_parses_multiline_call_args() {
+        let result = global_eval("function add(a, b) { return a + b; }\nadd\n(1,\n2)").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_no_asi_before_left_paren_on_function_expression() {
+        let result =
+            global_eval("var fnValue = function (x) { return x * 2; };\nfnValue\n(4)").unwrap();
+        assert_eq!(result, JsValue::Smi(8));
+    }
+
+    #[test]
+    fn e2e_no_asi_before_left_bracket_parses_property_access() {
+        let result = global_eval("var a = { x: 7 }; var b = 'x'; a\n[b]").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_no_asi_before_left_bracket_parses_array_index() {
+        let result = global_eval("var a = [9]; var b = 0; a\n[b]").unwrap();
+        assert_eq!(result, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn e2e_no_asi_before_left_bracket_allows_chained_access() {
+        let result = global_eval("var a = [[5]]; a\n[0]\n[0]").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_no_asi_before_template_parses_tagged_template() {
+        let result =
+            global_eval("function tag(strings) { return 'tag:' + strings[0]; }\ntag\n`b`").unwrap();
+        assert_eq!(result, JsValue::String("tag:b".into()));
+    }
+
+    #[test]
+    fn e2e_no_asi_before_template_preserves_substitutions() {
+        let result = global_eval(
+            "function tag(strings, value) { return 'tag:' + strings[0] + value + strings[1]; } var a = 5; tag\n`x${a}y`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("tag:x5y".into()));
+    }
+
+    #[test]
+    fn e2e_no_asi_before_template_on_member_tag() {
+        let result = global_eval(
+            "var obj = {}; obj.tag = function (strings) { return 'member:' + strings[0]; }; obj.tag\n`z`",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("member:z".into()));
+    }
+
+    #[test]
+    fn e2e_for_header_missing_first_semicolon_after_newline_is_syntax_error() {
+        assert_eval_syntax_error("for (var i = 0\n i < 1; i++) {}");
+    }
+
+    #[test]
+    fn e2e_for_header_missing_second_semicolon_after_newline_is_syntax_error() {
+        assert_eval_syntax_error("for (var i = 0; i < 1\n i++) {}");
+    }
+
+    #[test]
+    fn e2e_for_header_newlines_do_not_insert_semicolons() {
+        let result =
+            global_eval("var hits = 0; for (var i = 0\n; i < 3\n; i++) { hits = hits + 1; } hits")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_for_header_multiline_empty_clauses_still_parse() {
+        let result =
+            global_eval("var hits = 0; for (\n;\n hits < 2\n;\n hits = hits + 1\n) {} hits")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_do_while_allows_asi_after_while_clause() {
+        let result = global_eval(
+            "function f() { var hits = 0; do { hits = hits + 1; } while (false)\nreturn hits; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_do_while_explicit_semicolon_still_works() {
+        let result = global_eval(
+            "function f() { var hits = 0; do { hits = hits + 1; } while (false); return hits; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_do_while_condition_spans_newlines_without_asi_inside() {
+        let result = global_eval(
+            "function f() { var hits = 0; do { hits = hits + 1; } while (\nfalse\n)\nreturn hits; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
     }
 
     #[test]
     fn e2e_empty_statements_are_valid() {
         let result = global_eval(";;; 7").unwrap();
         assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_empty_statements_inside_function_are_valid() {
+        let result = global_eval("function f() { ;;; return 7; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_empty_statement_can_be_if_branch() {
+        let result = global_eval("if (true) ; 9").unwrap();
+        assert_eq!(result, JsValue::Smi(9));
+    }
+
+    #[test]
+    fn e2e_empty_statement_can_be_else_branch() {
+        let result = global_eval("if (false) ; else ; 11").unwrap();
+        assert_eq!(result, JsValue::Smi(11));
+    }
+
+    #[test]
+    fn e2e_empty_statement_can_be_loop_body() {
+        let result = global_eval("var hits = 0; for (var i = 0; i < 3; i++) ; hits").unwrap();
+        assert_eq!(result, JsValue::Smi(0));
     }
 
     #[test]
