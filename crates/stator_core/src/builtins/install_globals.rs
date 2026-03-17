@@ -4858,12 +4858,29 @@ fn make_object() -> JsValue {
                     if matches!(source, JsValue::Null | JsValue::Undefined) {
                         continue;
                     }
+                    // Copy enumerable own string-keyed properties.
                     for key in enumerable_own_string_keys(source) {
                         let value = dispatch_get_property_value(
                             source,
                             JsValue::String(key.clone().into()),
                         )?;
                         dispatch_set_property_value(&target, JsValue::String(key.into()), value)?;
+                    }
+                    // Copy enumerable own symbol-keyed properties.
+                    if let JsValue::PlainObject(map) = source {
+                        let borrow = map.borrow();
+                        for sym_id in borrow.own_symbol_keys() {
+                            let prop_key = crate::builtins::symbol::symbol_to_property_key(sym_id);
+                            if borrow.is_enumerable(&prop_key)
+                                && let Some(val) = borrow.get(&prop_key)
+                            {
+                                dispatch_set_property_value(
+                                    &target,
+                                    JsValue::Symbol(sym_id),
+                                    val.clone(),
+                                )?;
+                            }
+                        }
                     }
                 }
                 Ok(target)
@@ -5007,7 +5024,11 @@ fn make_object() -> JsValue {
 
                 match obj {
                     JsValue::PlainObject(map) => {
-                        Ok(JsValue::Boolean(map.borrow().contains_key(&key)))
+                        let borrow = map.borrow();
+                        let has_data = borrow.contains_key(&key) && key != "__proto__";
+                        let has_accessor = borrow.contains_key(&format!("__get_{key}__"))
+                            || borrow.contains_key(&format!("__set_{key}__"));
+                        Ok(JsValue::Boolean(has_data || has_accessor))
                     }
                     JsValue::Array(items) => {
                         if key == "length" {
@@ -5197,94 +5218,145 @@ fn make_object() -> JsValue {
                         "Cannot convert undefined or null to object".into(),
                     ));
                 }
-                if let JsValue::PlainObject(map) = obj {
-                    let mut result = PropertyMap::new();
-                    let borrow = map.borrow();
-                    // Collect visible property names first (skip dunder internals).
-                    let visible_keys: Vec<String> = borrow
-                        .keys()
-                        .filter(|k| !k.starts_with("__"))
-                        .cloned()
-                        .collect();
-                    // Also collect accessor property names from __get_*__ / __set_*__
-                    let mut accessor_names: Vec<String> = Vec::new();
-                    for k in borrow.keys() {
-                        if let Some(name) = k.strip_prefix("__get_")
-                            && let Some(name) = name.strip_suffix("__")
-                            && !accessor_names.contains(&name.to_string())
-                        {
-                            accessor_names.push(name.to_string());
-                        } else if let Some(name) = k.strip_prefix("__set_")
-                            && let Some(name) = name.strip_suffix("__")
-                            && !accessor_names.contains(&name.to_string())
-                        {
-                            accessor_names.push(name.to_string());
+
+                fn make_data_desc(
+                    value: JsValue,
+                    writable: bool,
+                    enumerable: bool,
+                    configurable: bool,
+                ) -> JsValue {
+                    let mut desc = PropertyMap::new();
+                    desc.insert("value".into(), value);
+                    desc.insert("writable".into(), JsValue::Boolean(writable));
+                    desc.insert("enumerable".into(), JsValue::Boolean(enumerable));
+                    desc.insert("configurable".into(), JsValue::Boolean(configurable));
+                    JsValue::PlainObject(Rc::new(RefCell::new(desc)))
+                }
+
+                match obj {
+                    JsValue::PlainObject(map) => {
+                        let mut result = PropertyMap::new();
+                        let borrow = map.borrow();
+                        let visible_keys: Vec<String> = borrow
+                            .keys()
+                            .filter(|k| !k.starts_with("__"))
+                            .cloned()
+                            .collect();
+                        let mut accessor_names: Vec<String> = Vec::new();
+                        for k in borrow.keys() {
+                            if let Some(name) = k.strip_prefix("__get_")
+                                && let Some(name) = name.strip_suffix("__")
+                                && !accessor_names.contains(&name.to_string())
+                            {
+                                accessor_names.push(name.to_string());
+                            } else if let Some(name) = k.strip_prefix("__set_")
+                                && let Some(name) = name.strip_suffix("__")
+                                && !accessor_names.contains(&name.to_string())
+                            {
+                                accessor_names.push(name.to_string());
+                            }
                         }
+                        for key in &visible_keys {
+                            if accessor_names.contains(key) {
+                                continue;
+                            }
+                            // Skip symbol keys from the data descriptor list.
+                            if crate::builtins::symbol::is_symbol_property_key(key) {
+                                continue;
+                            }
+                            let mut desc = PropertyMap::new();
+                            if let Some(val) = borrow.get(key) {
+                                desc.insert("value".into(), val.clone());
+                            }
+                            desc.insert(
+                                "writable".into(),
+                                JsValue::Boolean(borrow.is_writable(key)),
+                            );
+                            desc.insert(
+                                "enumerable".into(),
+                                JsValue::Boolean(borrow.is_enumerable(key)),
+                            );
+                            desc.insert(
+                                "configurable".into(),
+                                JsValue::Boolean(borrow.is_configurable(key)),
+                            );
+                            result.insert(
+                                key.clone(),
+                                JsValue::PlainObject(Rc::new(RefCell::new(desc))),
+                            );
+                        }
+                        for name in &accessor_names {
+                            let getter_key = format!("__get_{name}__");
+                            let setter_key = format!("__set_{name}__");
+                            let mut desc = PropertyMap::new();
+                            desc.insert(
+                                "get".into(),
+                                borrow
+                                    .get(&getter_key)
+                                    .cloned()
+                                    .unwrap_or(JsValue::Undefined),
+                            );
+                            desc.insert(
+                                "set".into(),
+                                borrow
+                                    .get(&setter_key)
+                                    .cloned()
+                                    .unwrap_or(JsValue::Undefined),
+                            );
+                            let attr_key = if borrow.contains_key(&getter_key) {
+                                &getter_key
+                            } else {
+                                &setter_key
+                            };
+                            desc.insert(
+                                "enumerable".into(),
+                                JsValue::Boolean(borrow.is_enumerable(attr_key)),
+                            );
+                            desc.insert(
+                                "configurable".into(),
+                                JsValue::Boolean(borrow.is_configurable(attr_key)),
+                            );
+                            result.insert(
+                                name.clone(),
+                                JsValue::PlainObject(Rc::new(RefCell::new(desc))),
+                            );
+                        }
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
                     }
-                    for key in &visible_keys {
-                        // Skip keys that are accessor properties (handled below).
-                        if accessor_names.contains(key) {
-                            continue;
+                    JsValue::Array(items) => {
+                        let mut result = PropertyMap::new();
+                        let borrow = items.borrow();
+                        for (i, val) in borrow.iter().enumerate() {
+                            result.insert(
+                                i.to_string(),
+                                make_data_desc(val.clone(), true, true, true),
+                            );
                         }
-                        let mut desc = PropertyMap::new();
-                        if let Some(val) = borrow.get(key) {
-                            desc.insert("value".into(), val.clone());
-                        }
-                        desc.insert("writable".into(), JsValue::Boolean(borrow.is_writable(key)));
-                        desc.insert(
-                            "enumerable".into(),
-                            JsValue::Boolean(borrow.is_enumerable(key)),
-                        );
-                        desc.insert(
-                            "configurable".into(),
-                            JsValue::Boolean(borrow.is_configurable(key)),
-                        );
                         result.insert(
-                            key.clone(),
-                            JsValue::PlainObject(Rc::new(RefCell::new(desc))),
+                            "length".into(),
+                            make_data_desc(JsValue::Smi(borrow.len() as i32), true, false, false),
                         );
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
                     }
-                    for name in &accessor_names {
-                        let getter_key = format!("__get_{name}__");
-                        let setter_key = format!("__set_{name}__");
-                        let mut desc = PropertyMap::new();
-                        desc.insert(
-                            "get".into(),
-                            borrow
-                                .get(&getter_key)
-                                .cloned()
-                                .unwrap_or(JsValue::Undefined),
-                        );
-                        desc.insert(
-                            "set".into(),
-                            borrow
-                                .get(&setter_key)
-                                .cloned()
-                                .unwrap_or(JsValue::Undefined),
-                        );
-                        let attr_key = if borrow.contains_key(&getter_key) {
-                            &getter_key
-                        } else {
-                            &setter_key
-                        };
-                        desc.insert(
-                            "enumerable".into(),
-                            JsValue::Boolean(borrow.is_enumerable(attr_key)),
-                        );
-                        desc.insert(
-                            "configurable".into(),
-                            JsValue::Boolean(borrow.is_configurable(attr_key)),
-                        );
+                    JsValue::String(s) => {
+                        let mut result = PropertyMap::new();
+                        let len = utf16_len(s);
+                        for i in 0..len {
+                            let ch = string_char_at(s, i as i64);
+                            result.insert(
+                                i.to_string(),
+                                make_data_desc(JsValue::String(ch.into()), false, true, false),
+                            );
+                        }
                         result.insert(
-                            name.clone(),
-                            JsValue::PlainObject(Rc::new(RefCell::new(desc))),
+                            "length".into(),
+                            make_data_desc(JsValue::Smi(len as i32), false, false, false),
                         );
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
                     }
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
-                } else {
-                    Ok(JsValue::PlainObject(Rc::new(RefCell::new(
+                    _ => Ok(JsValue::PlainObject(Rc::new(RefCell::new(
                         PropertyMap::new(),
-                    ))))
+                    )))),
                 }
             }),
         );
@@ -39737,5 +39809,475 @@ mod tests {
     fn e2e_to_string_negative_hex() {
         let result = global_eval("(-255).toString(16)").unwrap();
         assert_eq!(result, JsValue::String("-ff".to_string()));
+    }
+
+    // ── Object utility method conformance tests ─────────────────────────────
+
+    // ── Object.assign ───────────────────────────────────────────────────────
+
+    /// Object.assign copies enumerable own properties from multiple sources.
+    #[test]
+    fn e2e_object_assign_multiple_sources() {
+        assert_eval_true(
+            "var t = {}; Object.assign(t, {a:1}, {b:2}, {c:3}); \
+             t.a === 1 && t.b === 2 && t.c === 3",
+        );
+    }
+
+    /// Object.assign: later source overwrites earlier.
+    #[test]
+    fn e2e_object_assign_overwrite() {
+        assert_eval_true("var t = Object.assign({}, {x:1}, {x:2}); t.x === 2");
+    }
+
+    /// Object.assign skips non-enumerable properties.
+    #[test]
+    fn e2e_object_assign_skips_non_enumerable() {
+        assert_eval_true(
+            "var s = {}; \
+             Object.defineProperty(s, 'hidden', {value:42, enumerable:false}); \
+             s.visible = 1; \
+             var t = Object.assign({}, s); \
+             t.visible === 1 && t.hidden === undefined",
+        );
+    }
+
+    /// Object.assign returns the target object.
+    #[test]
+    fn e2e_object_assign_returns_target() {
+        assert_eval_true("var t = {}; Object.assign(t, {a:1}) === t");
+    }
+
+    /// Object.assign skips null/undefined sources.
+    #[test]
+    fn e2e_object_assign_null_source_ignored() {
+        assert_eval_true(
+            "var t = Object.assign({a:1}, null, undefined, {b:2}); \
+             t.a === 1 && t.b === 2",
+        );
+    }
+
+    /// Object.assign throws on null target.
+    #[test]
+    fn e2e_object_assign_null_target_throws() {
+        let result = global_eval(
+            "try { Object.assign(null, {}); false } catch(e) { e instanceof TypeError }",
+        );
+        assert_eq!(result.unwrap(), JsValue::Boolean(true));
+    }
+
+    /// Object.assign copies symbol-keyed properties.
+    #[test]
+    fn e2e_object_assign_copies_symbol_keys() {
+        assert_eval_true(
+            "var sym = Symbol('k'); \
+             var src = {}; src[sym] = 42; \
+             var t = Object.assign({}, src); \
+             t[sym] === 42",
+        );
+    }
+
+    // ── Object.fromEntries ──────────────────────────────────────────────────
+
+    /// Object.fromEntries creates object from array of pairs.
+    #[test]
+    fn e2e_object_from_entries_basic_pairs() {
+        assert_eval_true(
+            "var o = Object.fromEntries([['a',1],['b',2]]); \
+             o.a === 1 && o.b === 2",
+        );
+    }
+
+    /// Object.fromEntries: later duplicate key overwrites earlier.
+    #[test]
+    fn e2e_object_from_entries_duplicate_overwrites() {
+        assert_eval_true("var o = Object.fromEntries([['x',1],['x',2]]); o.x === 2");
+    }
+
+    /// Object.fromEntries round-trips with Object.entries.
+    #[test]
+    fn e2e_object_from_entries_round_trip_entries() {
+        assert_eval_true(
+            "var o = {a:1, b:2}; \
+             var o2 = Object.fromEntries(Object.entries(o)); \
+             o2.a === 1 && o2.b === 2",
+        );
+    }
+
+    /// Object.fromEntries with empty array returns empty object.
+    #[test]
+    fn e2e_object_from_entries_empty() {
+        assert_eval_true("Object.keys(Object.fromEntries([])).length === 0");
+    }
+
+    /// Object.fromEntries throws on null/undefined.
+    #[test]
+    fn e2e_object_from_entries_null_throws() {
+        let result = global_eval(
+            "try { Object.fromEntries(null); false } catch(e) { e instanceof TypeError }",
+        );
+        assert_eq!(result.unwrap(), JsValue::Boolean(true));
+    }
+
+    // ── Object.getOwnPropertyDescriptors ────────────────────────────────────
+
+    /// getOwnPropertyDescriptors returns descriptors for all own properties.
+    #[test]
+    fn e2e_get_own_property_descriptors_basic() {
+        assert_eval_true(
+            "var o = {a:1, b:2}; \
+             var d = Object.getOwnPropertyDescriptors(o); \
+             d.a.value === 1 && d.b.value === 2 && \
+             d.a.writable === true && d.a.enumerable === true && d.a.configurable === true",
+        );
+    }
+
+    /// getOwnPropertyDescriptors includes non-enumerable properties.
+    #[test]
+    fn e2e_get_own_property_descriptors_non_enumerable() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value:42, writable:false, enumerable:false, configurable:false}); \
+             var d = Object.getOwnPropertyDescriptors(o); \
+             d.x.value === 42 && d.x.writable === false && \
+             d.x.enumerable === false && d.x.configurable === false",
+        );
+    }
+
+    /// getOwnPropertyDescriptors on array returns index + length descriptors.
+    #[test]
+    fn e2e_get_own_property_descriptors_array() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptors([10, 20]); \
+             d['0'].value === 10 && d['1'].value === 20 && \
+             d.length.value === 2",
+        );
+    }
+
+    /// getOwnPropertyDescriptors on empty object returns empty object.
+    #[test]
+    fn e2e_get_own_property_descriptors_empty() {
+        assert_eval_true("Object.keys(Object.getOwnPropertyDescriptors({})).length === 0");
+    }
+
+    // ── Object.hasOwn ───────────────────────────────────────────────────────
+
+    /// Object.hasOwn returns true for own property.
+    #[test]
+    fn e2e_object_has_own_true() {
+        assert_eval_true("Object.hasOwn({a:1}, 'a')");
+    }
+
+    /// Object.hasOwn returns false for missing property.
+    #[test]
+    fn e2e_object_has_own_false() {
+        assert_eval_true("Object.hasOwn({a:1}, 'b') === false");
+    }
+
+    /// Object.hasOwn does not traverse prototype chain.
+    #[test]
+    fn e2e_object_has_own_no_prototype() {
+        assert_eval_true(
+            "var parent = {inherited: 1}; \
+             var child = Object.create(parent); \
+             Object.hasOwn(child, 'inherited') === false",
+        );
+    }
+
+    /// Object.hasOwn works on arrays (index check).
+    #[test]
+    fn e2e_object_has_own_array_index() {
+        assert_eval_true(
+            "Object.hasOwn([10,20,30], '1') === true && \
+             Object.hasOwn([10,20,30], '5') === false",
+        );
+    }
+
+    /// Object.hasOwn detects non-enumerable own properties.
+    #[test]
+    fn e2e_object_has_own_non_enumerable() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value:1, enumerable:false}); \
+             Object.hasOwn(o, 'x')",
+        );
+    }
+
+    /// Object.hasOwn detects accessor properties.
+    #[test]
+    fn e2e_object_has_own_accessor() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'g', {get: function(){return 1}, enumerable:true, configurable:true}); \
+             Object.hasOwn(o, 'g')",
+        );
+    }
+
+    // ── Object.entries / Object.values ───────────────────────────────────────
+
+    /// Object.values returns only enumerable own values.
+    #[test]
+    fn e2e_object_values_enumerable_only() {
+        assert_eval_true(
+            "var o = {a:1, b:2}; \
+             Object.defineProperty(o, 'c', {value:3, enumerable:false}); \
+             var v = Object.values(o); \
+             v.length === 2 && v.indexOf(1) !== -1 && v.indexOf(2) !== -1",
+        );
+    }
+
+    /// Object.entries returns [key, value] pairs.
+    #[test]
+    fn e2e_object_entries_pairs() {
+        assert_eval_true(
+            "var e = Object.entries({x:10}); \
+             e.length === 1 && e[0][0] === 'x' && e[0][1] === 10",
+        );
+    }
+
+    /// Object.entries skips non-enumerable properties.
+    #[test]
+    fn e2e_object_entries_skips_non_enumerable() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'hidden', {value:1, enumerable:false}); \
+             o.visible = 2; \
+             Object.entries(o).length === 1",
+        );
+    }
+
+    /// Object.values on string returns characters.
+    #[test]
+    fn e2e_object_values_string_chars() {
+        assert_eval_true(
+            "var v = Object.values('hi'); v[0] === 'h' && v[1] === 'i' && v.length === 2",
+        );
+    }
+
+    /// Object.entries orders integer keys before string keys.
+    #[test]
+    fn e2e_object_entries_integer_ordering() {
+        assert_eval_true(
+            "var o = {}; o.b = 2; o['1'] = 'one'; o.a = 1; o['0'] = 'zero'; \
+             var e = Object.entries(o); \
+             e[0][0] === '0' && e[1][0] === '1' && e[2][0] === 'b' && e[3][0] === 'a'",
+        );
+    }
+
+    // ── Object.getOwnPropertyNames ──────────────────────────────────────────
+
+    /// getOwnPropertyNames includes non-enumerable properties.
+    #[test]
+    fn e2e_get_own_property_names_includes_non_enumerable() {
+        assert_eval_true(
+            "var o = {a:1}; \
+             Object.defineProperty(o, 'b', {value:2, enumerable:false}); \
+             var n = Object.getOwnPropertyNames(o); \
+             n.indexOf('a') !== -1 && n.indexOf('b') !== -1",
+        );
+    }
+
+    /// getOwnPropertyNames on array returns indices and 'length'.
+    #[test]
+    fn e2e_get_own_property_names_array() {
+        assert_eval_true(
+            "var n = Object.getOwnPropertyNames([10,20]); \
+             n.indexOf('0') !== -1 && n.indexOf('1') !== -1 && n.indexOf('length') !== -1",
+        );
+    }
+
+    /// getOwnPropertyNames does not include symbol keys.
+    #[test]
+    fn e2e_get_own_property_names_excludes_symbols() {
+        assert_eval_true(
+            "var o = {}; o[Symbol('s')] = 1; o.a = 2; \
+             var n = Object.getOwnPropertyNames(o); \
+             n.length === 1 && n[0] === 'a'",
+        );
+    }
+
+    // ── Object.getOwnPropertySymbols ────────────────────────────────────────
+
+    /// getOwnPropertySymbols returns symbol keys.
+    #[test]
+    fn e2e_get_own_property_symbols_basic() {
+        assert_eval_true(
+            "var sym = Symbol('test'); \
+             var o = {}; o[sym] = 'val'; o.str = 'str'; \
+             var s = Object.getOwnPropertySymbols(o); \
+             s.length === 1",
+        );
+    }
+
+    /// getOwnPropertySymbols returns empty for no-symbol objects.
+    #[test]
+    fn e2e_get_own_property_symbols_empty() {
+        assert_eval_true("Object.getOwnPropertySymbols({a:1, b:2}).length === 0");
+    }
+
+    // ── Object.create ───────────────────────────────────────────────────────
+
+    /// Object.create(null) creates object with null prototype.
+    #[test]
+    fn e2e_object_create_null_no_methods() {
+        assert_eval_true(
+            "var o = Object.create(null); \
+             Object.getPrototypeOf(o) === null",
+        );
+    }
+
+    /// Object.create with property descriptors.
+    #[test]
+    fn e2e_object_create_with_descriptors() {
+        assert_eval_true(
+            "var o = Object.create(null, { \
+               x: {value: 42, writable: true, enumerable: true, configurable: true}, \
+               y: {value: 'hi', writable: false, enumerable: true, configurable: false} \
+             }); \
+             o.x === 42 && o.y === 'hi'",
+        );
+    }
+
+    /// Object.create inherits from proto.
+    #[test]
+    fn e2e_object_create_inherits_proto() {
+        assert_eval_true(
+            "var proto = {greet: function() { return 'hello' }}; \
+             var o = Object.create(proto); \
+             o.greet() === 'hello'",
+        );
+    }
+
+    /// Object.create rejects non-object, non-null proto.
+    #[test]
+    fn e2e_object_create_rejects_number_proto() {
+        let result =
+            global_eval("try { Object.create(42); false } catch(e) { e instanceof TypeError }");
+        assert_eq!(result.unwrap(), JsValue::Boolean(true));
+    }
+
+    // ── Object.is ───────────────────────────────────────────────────────────
+
+    /// Object.is: NaN equals NaN.
+    #[test]
+    fn e2e_object_is_nan_nan() {
+        assert_eval_true("Object.is(NaN, NaN)");
+    }
+
+    /// Object.is: +0 !== -0.
+    #[test]
+    fn e2e_object_is_pos_neg_zero() {
+        assert_eval_true("Object.is(0, -0) === false");
+    }
+
+    /// Object.is: -0 !== +0 (symmetric).
+    #[test]
+    fn e2e_object_is_neg_pos_zero() {
+        assert_eval_true("Object.is(-0, 0) === false");
+    }
+
+    /// Object.is: same primitives.
+    #[test]
+    fn e2e_object_is_same_primitives() {
+        assert_eval_true(
+            "Object.is(1, 1) && Object.is('a', 'a') && \
+             Object.is(true, true) && Object.is(null, null) && \
+             Object.is(undefined, undefined)",
+        );
+    }
+
+    /// Object.is: different primitives.
+    #[test]
+    fn e2e_object_is_different_primitives() {
+        assert_eval_true(
+            "Object.is(1, 2) === false && \
+             Object.is('a', 'b') === false && \
+             Object.is(true, false) === false && \
+             Object.is(null, undefined) === false",
+        );
+    }
+
+    /// Object.is: object identity (same ref vs different ref).
+    #[test]
+    fn e2e_object_is_identity() {
+        assert_eval_true("var o = {}; Object.is(o, o) === true && Object.is({}, {}) === false");
+    }
+
+    // ── Object.keys with integer ordering ───────────────────────────────────
+
+    /// Object.keys orders integer indices before string keys.
+    #[test]
+    fn e2e_object_keys_integer_ordering() {
+        assert_eval_true(
+            "var o = {}; o.b = 1; o['2'] = 2; o.a = 3; o['0'] = 4; \
+             var k = Object.keys(o); \
+             k[0] === '0' && k[1] === '2' && k[2] === 'b' && k[3] === 'a'",
+        );
+    }
+
+    /// Object.keys excludes symbol-keyed properties.
+    #[test]
+    fn e2e_object_keys_excludes_symbols() {
+        assert_eval_true(
+            "var o = {a:1}; o[Symbol('s')] = 2; \
+             Object.keys(o).length === 1 && Object.keys(o)[0] === 'a'",
+        );
+    }
+
+    // ── Cross-method consistency tests ──────────────────────────────────────
+
+    /// Object.keys length matches Object.values length.
+    #[test]
+    fn e2e_keys_values_same_length() {
+        assert_eval_true(
+            "var o = {a:1,b:2,c:3}; \
+             Object.keys(o).length === Object.values(o).length",
+        );
+    }
+
+    /// Object.entries length matches Object.keys length.
+    #[test]
+    fn e2e_entries_keys_same_length() {
+        assert_eval_true(
+            "var o = {x:10,y:20}; \
+             Object.entries(o).length === Object.keys(o).length",
+        );
+    }
+
+    /// Object.fromEntries + Object.entries round-trip preserves all keys.
+    #[test]
+    fn e2e_from_entries_entries_roundtrip_keys() {
+        assert_eval_true(
+            "var o = {a:1, b:2, c:3}; \
+             var o2 = Object.fromEntries(Object.entries(o)); \
+             Object.keys(o2).length === 3 && o2.a === 1 && o2.b === 2 && o2.c === 3",
+        );
+    }
+
+    /// getOwnPropertyNames is superset of keys for objects with
+    /// non-enumerable properties.
+    #[test]
+    fn e2e_get_own_property_names_superset_of_keys() {
+        assert_eval_true(
+            "var o = {a:1}; \
+             Object.defineProperty(o, 'b', {value:2, enumerable:false}); \
+             Object.getOwnPropertyNames(o).length > Object.keys(o).length",
+        );
+    }
+
+    /// Object.assign + Object.is: assigned NaN is same NaN.
+    #[test]
+    fn e2e_assign_preserves_nan() {
+        assert_eval_true("var t = Object.assign({}, {v: NaN}); Object.is(t.v, NaN)");
+    }
+
+    /// hasOwn + defineProperty: non-configurable non-writable is still "own".
+    #[test]
+    fn e2e_has_own_non_configurable() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value:1, writable:false, configurable:false}); \
+             Object.hasOwn(o, 'x')",
+        );
     }
 }

@@ -17,6 +17,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::builtins::symbol::{is_symbol_property_key, property_key_to_symbol};
 use crate::error::{StatorError, StatorResult};
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
@@ -69,7 +70,7 @@ pub fn object_assign(target: &mut JsObject, sources: &[&JsObject]) -> StatorResu
             if is_internal_accessor_key(&key) {
                 continue;
             }
-            // Only copy enumerable own properties.
+            // Only copy enumerable own properties (string and symbol keys).
             if let Some((value, attrs)) = src.get_own_property_descriptor(&key)
                 && attrs.contains(PropertyAttributes::ENUMERABLE)
             {
@@ -91,6 +92,7 @@ pub fn object_keys(obj: &JsObject) -> Vec<String> {
         .into_iter()
         .filter(|k| {
             !is_internal_accessor_key(k)
+                && !is_symbol_property_key(k)
                 && obj
                     .get_own_property_descriptor(k)
                     .map(|(_, a)| a.contains(PropertyAttributes::ENUMERABLE))
@@ -277,7 +279,7 @@ pub fn object_is_sealed(obj: &JsObject) -> bool {
 pub fn object_get_own_property_names(obj: &JsObject) -> Vec<String> {
     obj.own_property_keys()
         .into_iter()
-        .filter(|k| !is_internal_accessor_key(k))
+        .filter(|k| !is_internal_accessor_key(k) && !is_symbol_property_key(k))
         .collect()
 }
 // ── Object.is ────────────────────────────────────────────────────────────────
@@ -397,7 +399,7 @@ pub fn object_get_own_property_descriptors(
 ) -> Vec<(String, JsValue, PropertyAttributes)> {
     obj.own_property_keys()
         .into_iter()
-        .filter(|k| !is_internal_accessor_key(k))
+        .filter(|k| !is_internal_accessor_key(k) && !is_symbol_property_key(k))
         .filter_map(|k| obj.get_own_property_descriptor(&k).map(|(v, a)| (k, v, a)))
         .collect()
 }
@@ -407,10 +409,11 @@ pub fn object_get_own_property_descriptors(
 /// ECMAScript §20.1.2.11 `Object.getOwnPropertySymbols(obj)`.
 ///
 /// Returns an array of all own symbol-keyed properties of `obj`.
-/// Currently returns an empty `Vec` since `JsObject` does not track
-/// symbol-keyed properties.
-pub fn object_get_own_property_symbols(_obj: &JsObject) -> Vec<JsValue> {
-    Vec::new()
+pub fn object_get_own_property_symbols(obj: &JsObject) -> Vec<JsValue> {
+    obj.own_property_keys()
+        .into_iter()
+        .filter_map(|k| property_key_to_symbol(&k).map(JsValue::Symbol))
+        .collect()
 }
 
 // ── Object.defineProperty (descriptor object) ────────────────────────────────
@@ -1108,7 +1111,7 @@ mod tests {
     // ── object_get_own_property_symbols ──────────────────────────────────
 
     #[test]
-    fn test_get_own_property_symbols_returns_empty() {
+    fn test_get_own_property_symbols_returns_empty_without_symbols() {
         let mut obj = JsObject::new();
         obj.set_property("x", JsValue::Smi(1)).unwrap();
         assert!(object_get_own_property_symbols(&obj).is_empty());
