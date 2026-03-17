@@ -34104,4 +34104,878 @@ mod tests {
         .unwrap();
         assert_eq!(result, JsValue::String("tdz".into()));
     }
+
+    // ── Iterator protocol deep conformance tests ────────────────────────
+
+    /// Custom Symbol.iterator: for-of consumes all values.
+    #[test]
+    fn e2e_iter_custom_symbol_iterator_for_of() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        if (n <= 3) return { value: n * 100, done: false };
+                        return { value: undefined, done: true };
+                    }
+                };
+            };
+            var r = []; for (var v of obj) r.push(v); r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("100,200,300".into()));
+    }
+
+    /// Iterator .return() is called on break in for-of.
+    #[test]
+    fn e2e_iter_return_called_on_break() {
+        let r = global_eval(
+            r#"
+            var log = [];
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        log.push('next' + n);
+                        return { value: n, done: n > 5 };
+                    },
+                    return: function() {
+                        log.push('return');
+                        return { done: true };
+                    }
+                };
+            };
+            for (var v of obj) { if (v === 2) break; }
+            log.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("next1,next2,return".into()));
+    }
+
+    /// Iterator .return() NOT called on normal completion.
+    #[test]
+    fn e2e_iter_return_not_called_on_normal_completion() {
+        let r = global_eval(
+            r#"
+            var returnCalled = false;
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        if (n <= 2) return { value: n, done: false };
+                        return { done: true };
+                    },
+                    return: function() {
+                        returnCalled = true;
+                        return { done: true };
+                    }
+                };
+            };
+            for (var v of obj) { }
+            returnCalled
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Iterator .return() called when returning from function inside for-of.
+    #[test]
+    fn e2e_iter_return_called_on_function_return() {
+        let r = global_eval(
+            r#"
+            var returnCalled = false;
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        return { value: n, done: n > 10 };
+                    },
+                    return: function() {
+                        returnCalled = true;
+                        return { done: true };
+                    }
+                };
+            };
+            function f() {
+                for (var v of obj) {
+                    if (v === 3) return v;
+                }
+            }
+            f();
+            returnCalled
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Spread in array literal uses custom iterator protocol.
+    #[test]
+    fn e2e_iter_spread_array_uses_custom_iterator() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        if (n <= 3) return { value: n * 10, done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var a = [0, ...obj, 40];
+            a.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,10,20,30,40".into()));
+    }
+
+    /// Spread custom iterator in function call arguments.
+    #[test]
+    fn e2e_iter_spread_custom_in_call() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        if (n <= 3) return { value: n, done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            function sum(a, b, c) { return a + b + c; }
+            sum(...obj)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(6));
+    }
+
+    /// Array destructuring uses iterator protocol with custom Symbol.iterator.
+    #[test]
+    fn e2e_iter_destructuring_uses_custom_iterator() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        if (n <= 3) return { value: n * 11, done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var [a, b, c] = obj;
+            a + ',' + b + ',' + c
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("11,22,33".into()));
+    }
+
+    /// Array destructuring with rest uses custom iterator.
+    #[test]
+    fn e2e_iter_destructuring_rest_custom_iterator() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        if (n <= 4) return { value: n, done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var [first, ...rest] = obj;
+            first + '|' + rest.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1|2,3,4".into()));
+    }
+
+    /// for-of on number throws TypeError.
+    #[test]
+    fn e2e_iter_for_of_number_throws() {
+        let r = global_eval(
+            r#"
+            try { for (var x of 42) {} 'no error'; } catch(e) { e instanceof TypeError ? 'TypeError' : 'other'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("TypeError".into()));
+    }
+
+    /// for-of on boolean throws TypeError.
+    #[test]
+    fn e2e_iter_for_of_boolean_throws() {
+        let r = global_eval(
+            r#"
+            try { for (var x of true) {} 'no error'; } catch(e) { e instanceof TypeError ? 'TypeError' : 'other'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("TypeError".into()));
+    }
+
+    /// for-of on null throws TypeError.
+    #[test]
+    fn e2e_iter_for_of_null_throws() {
+        let r = global_eval(
+            r#"
+            try { for (var x of null) {} 'no error'; } catch(e) { e instanceof TypeError ? 'TypeError' : 'other'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("TypeError".into()));
+    }
+
+    /// for-of on undefined throws TypeError.
+    #[test]
+    fn e2e_iter_for_of_undefined_throws() {
+        let r = global_eval(
+            r#"
+            try { for (var x of undefined) {} 'no error'; } catch(e) { e instanceof TypeError ? 'TypeError' : 'other'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("TypeError".into()));
+    }
+
+    /// for-of on plain object without Symbol.iterator throws TypeError.
+    #[test]
+    fn e2e_iter_for_of_plain_object_throws() {
+        let r = global_eval(
+            r#"
+            try { for (var x of {a:1}) {} 'no error'; } catch(e) { e instanceof TypeError ? 'TypeError' : 'other'; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("TypeError".into()));
+    }
+
+    /// Iterator result with done: 0 (falsy) continues iteration.
+    #[test]
+    fn e2e_iter_done_zero_is_falsy() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        if (n === 1) return { value: 'a', done: 0 };
+                        if (n === 2) return { value: 'b', done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var r = []; for (var v of obj) r.push(v); r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a,b".into()));
+    }
+
+    /// Iterator result with done: 1 (truthy) stops iteration.
+    #[test]
+    fn e2e_iter_done_one_is_truthy() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                return {
+                    next: function() { return { value: 99, done: 1 }; }
+                };
+            };
+            var r = []; for (var v of obj) r.push(v); r.length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Iterator result with done: null (falsy) continues.
+    #[test]
+    fn e2e_iter_done_null_is_falsy() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        if (n === 1) return { value: 'x', done: null };
+                        return { done: true };
+                    }
+                };
+            };
+            var r = []; for (var v of obj) r.push(v); r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("x".into()));
+    }
+
+    /// Iterator value defaults to undefined when missing.
+    #[test]
+    fn e2e_iter_missing_value_is_undefined() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        if (n === 1) return { done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var r; for (var v of obj) r = v; r === undefined
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Nested for-of with custom iterators.
+    #[test]
+    fn e2e_iter_nested_custom_iterators() {
+        let r = global_eval(
+            r#"
+            function makeIter(items) {
+                var obj = {};
+                obj[Symbol.iterator] = function() {
+                    var i = 0;
+                    return {
+                        next: function() {
+                            if (i < items.length) return { value: items[i++], done: false };
+                            return { done: true };
+                        }
+                    };
+                };
+                return obj;
+            }
+            var r = [];
+            for (var a of makeIter([1, 2])) {
+                for (var b of makeIter([10, 20])) {
+                    r.push(a + b);
+                }
+            }
+            r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("11,21,12,22".into()));
+    }
+
+    /// for-of with let binding and custom iterator.
+    #[test]
+    fn e2e_iter_for_of_let_binding() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        if (n <= 3) return { value: n, done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var r = [];
+            for (let v of obj) r.push(v);
+            r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,2,3".into()));
+    }
+
+    /// for-of with const binding and custom iterator.
+    #[test]
+    fn e2e_iter_for_of_const_binding() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        if (n <= 2) return { value: n * 5, done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var r = [];
+            for (const v of obj) r.push(v);
+            r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("5,10".into()));
+    }
+
+    /// Custom iterator yielding objects.
+    #[test]
+    fn e2e_iter_yields_objects() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var items = [{ x: 1 }, { x: 2 }];
+                var i = 0;
+                return {
+                    next: function() {
+                        if (i < items.length) return { value: items[i++], done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var sum = 0;
+            for (var item of obj) sum += item.x;
+            sum
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// Stateful iterator: each for-of creates a fresh iterator.
+    #[test]
+    fn e2e_iter_fresh_iterator_each_loop() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        if (n <= 3) return { value: n, done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var r1 = []; for (var v of obj) r1.push(v);
+            var r2 = []; for (var v of obj) r2.push(v);
+            r1.join(',') + '|' + r2.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,2,3|1,2,3".into()));
+    }
+
+    /// for-of continue does NOT call .return().
+    #[test]
+    fn e2e_iter_continue_does_not_call_return() {
+        let r = global_eval(
+            r#"
+            var returnCalled = false;
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        if (n <= 3) return { value: n, done: false };
+                        return { done: true };
+                    },
+                    return: function() {
+                        returnCalled = true;
+                        return { done: true };
+                    }
+                };
+            };
+            var r = [];
+            for (var v of obj) { if (v === 2) continue; r.push(v); }
+            returnCalled + '|' + r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("false|1,3".into()));
+    }
+
+    /// Destructuring with default values and custom iterator.
+    #[test]
+    fn e2e_iter_destructuring_defaults_custom() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var items = [10, undefined];
+                var i = 0;
+                return {
+                    next: function() {
+                        if (i < items.length) return { value: items[i++], done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var [a = 1, b = 2, c = 3] = obj;
+            a + ',' + b + ',' + c
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("10,2,3".into()));
+    }
+
+    /// Spread of empty custom iterator.
+    #[test]
+    fn e2e_iter_spread_empty_custom() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                return {
+                    next: function() { return { done: true }; }
+                };
+            };
+            var a = [...obj];
+            a.length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// for-of with throw in body calls .return() on iterator.
+    #[test]
+    fn e2e_iter_return_called_on_throw() {
+        let r = global_eval(
+            r#"
+            var returnCalled = false;
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        return { value: n, done: n > 10 };
+                    },
+                    return: function() {
+                        returnCalled = true;
+                        return { done: true };
+                    }
+                };
+            };
+            try {
+                for (var v of obj) {
+                    if (v === 2) throw new Error('stop');
+                }
+            } catch(e) {}
+            returnCalled
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Nested for-of break only closes inner iterator.
+    #[test]
+    fn e2e_iter_nested_break_closes_inner_only() {
+        let r = global_eval(
+            r#"
+            var outerReturns = 0;
+            var innerReturns = 0;
+            function makeIter(name, count) {
+                var obj = {};
+                obj[Symbol.iterator] = function() {
+                    var n = 0;
+                    return {
+                        next: function() {
+                            n++;
+                            if (n <= count) return { value: n, done: false };
+                            return { done: true };
+                        },
+                        return: function() {
+                            if (name === 'outer') outerReturns++;
+                            else innerReturns++;
+                            return { done: true };
+                        }
+                    };
+                };
+                return obj;
+            }
+            var r = [];
+            for (var a of makeIter('outer', 2)) {
+                for (var b of makeIter('inner', 3)) {
+                    r.push(a + '-' + b);
+                    if (b === 2) break;
+                }
+            }
+            r.join(',') + '|' + outerReturns + '|' + innerReturns
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1-1,1-2,2-1,2-2|0|2".into()));
+    }
+
+    /// for-of with object destructuring and custom iterator.
+    #[test]
+    fn e2e_iter_for_of_object_destructuring_custom() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var items = [{ a: 1, b: 2 }, { a: 3, b: 4 }];
+                var i = 0;
+                return {
+                    next: function() {
+                        if (i < items.length) return { value: items[i++], done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var r = [];
+            for (var { a, b } of obj) r.push(a + b);
+            r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("3,7".into()));
+    }
+
+    /// new Set() with custom iterable.
+    #[test]
+    fn e2e_iter_set_from_custom_iterable() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var items = [1, 2, 2, 3, 3, 3];
+                var i = 0;
+                return {
+                    next: function() {
+                        if (i < items.length) return { value: items[i++], done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var s = new Set(obj);
+            s.size
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// new Map() with custom iterable of [key, value] pairs.
+    #[test]
+    fn e2e_iter_map_from_custom_iterable() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var items = [["a", 1], ["b", 2]];
+                var i = 0;
+                return {
+                    next: function() {
+                        if (i < items.length) return { value: items[i++], done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var m = new Map(obj);
+            m.get("a") + m.get("b")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// Array.from with custom iterable.
+    #[test]
+    fn e2e_iter_array_from_custom_iterable() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        if (n <= 3) return { value: n * 2, done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var a = Array.from(obj);
+            a.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("2,4,6".into()));
+    }
+
+    /// for-of generator: .return() terminates generator.
+    #[test]
+    fn e2e_iter_generator_return_on_break() {
+        let r = global_eval(
+            r#"
+            var finallyRan = false;
+            function* gen() {
+                try { yield 1; yield 2; yield 3; }
+                finally { finallyRan = true; }
+            }
+            for (var v of gen()) { if (v === 1) break; }
+            finallyRan
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// String iteration yields code points (including multi-byte).
+    #[test]
+    fn e2e_iter_string_code_points() {
+        let r = global_eval("var r = []; for (var c of 'AB') r.push(c); r.join(',')").unwrap();
+        assert_eq!(r, JsValue::String("A,B".into()));
+    }
+
+    /// Spread string produces individual characters.
+    #[test]
+    fn e2e_iter_spread_string_chars() {
+        let r = global_eval("[...'abc'].join('-')").unwrap();
+        assert_eq!(r, JsValue::String("a-b-c".into()));
+    }
+
+    /// Destructuring string yields characters.
+    #[test]
+    fn e2e_iter_destructuring_string_chars() {
+        let r = global_eval("var [a, b, c] = 'XYZ'; a + b + c").unwrap();
+        assert_eq!(r, JsValue::String("XYZ".into()));
+    }
+
+    /// Iterator without .return() method — break still works.
+    #[test]
+    fn e2e_iter_break_without_return_method() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        return { value: n, done: n > 100 };
+                    }
+                };
+            };
+            var last;
+            for (var v of obj) { last = v; if (v === 3) break; }
+            last
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// for-of with array destructuring in loop variable.
+    #[test]
+    fn e2e_iter_for_of_array_destructuring_in_head() {
+        let r = global_eval(
+            r#"
+            var pairs = [[1, 'a'], [2, 'b'], [3, 'c']];
+            var r = [];
+            for (var [num, letter] of pairs) r.push(letter + num);
+            r.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a1,b2,c3".into()));
+    }
+
+    /// Spread generator into array.
+    #[test]
+    fn e2e_iter_spread_generator_into_array() {
+        let r = global_eval(
+            r#"
+            function* g() { yield 10; yield 20; yield 30; }
+            var a = [...g()];
+            a.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("10,20,30".into()));
+    }
+
+    /// Destructuring assignment (not declaration) with custom iterator.
+    #[test]
+    fn e2e_iter_destructuring_assignment_custom() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var items = [100, 200];
+                var i = 0;
+                return {
+                    next: function() {
+                        if (i < items.length) return { value: items[i++], done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var a, b;
+            [a, b] = obj;
+            a + b
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(300));
+    }
+
+    /// Multiple spreads of same iterable create independent iterators.
+    #[test]
+    fn e2e_iter_multiple_spread_independent() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        if (n <= 2) return { value: n, done: false };
+                        return { done: true };
+                    }
+                };
+            };
+            var a = [...obj, ...obj];
+            a.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,2,1,2".into()));
+    }
 }
