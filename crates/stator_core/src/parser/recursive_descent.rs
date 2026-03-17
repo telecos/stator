@@ -43,6 +43,31 @@ use crate::parser::ast::{
 use crate::parser::scanner::{Scanner, Span, Token, TokenKind, TokenValue, cook_template_raw};
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Template raw-value helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Normalise line terminators in a Template Raw Value (TRV) per ES2025
+/// §12.9.4: `\r\n` → `\n` and standalone `\r` → `\n`.
+fn normalize_template_raw_line_terminators(raw: &str) -> String {
+    if !raw.contains('\r') {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            out.push('\n');
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Parser
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2320,6 +2345,11 @@ impl<'src> Parser<'src> {
     }
 
     /// Build a template element from raw scanner text.
+    ///
+    /// Per ES2025 §12.9.4, the Template Raw Value (TRV) must normalise
+    /// `\r\n` → `\n` and standalone `\r` → `\n`.  The scanner stores the
+    /// verbatim source bytes, so we apply that normalisation here before
+    /// recording the `raw` field.
     fn template_element_from_raw(
         &self,
         loc: Span,
@@ -2327,6 +2357,7 @@ impl<'src> Parser<'src> {
         tail: bool,
         allow_invalid_escapes: bool,
     ) -> StatorResult<TemplateElement> {
+        let raw = normalize_template_raw_line_terminators(&raw);
         let cooked = cook_template_raw(&raw);
         if !allow_invalid_escapes && cooked.is_none() {
             return Err(Self::error_at(

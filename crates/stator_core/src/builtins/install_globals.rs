@@ -32171,4 +32171,312 @@ mod tests {
         let result = global_eval("var s = new Set(null); s.size === 0").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
+
+    // ── Template literal conformance tests ──────────────────────────────────
+
+    #[test]
+    fn e2e_template_basic_no_substitution() {
+        let r = global_eval("`hello world`").unwrap();
+        assert_eq!(r, JsValue::String("hello world".into()));
+    }
+
+    #[test]
+    fn e2e_template_empty() {
+        let r = global_eval("``").unwrap();
+        assert_eq!(r, JsValue::String("".into()));
+    }
+
+    #[test]
+    fn e2e_template_single_expression() {
+        let r = global_eval("`value: ${1 + 2}`").unwrap();
+        assert_eq!(r, JsValue::String("value: 3".into()));
+    }
+
+    #[test]
+    fn e2e_template_multiple_expressions() {
+        let r = global_eval("`${1}+${2}=${1+2}`").unwrap();
+        assert_eq!(r, JsValue::String("1+2=3".into()));
+    }
+
+    #[test]
+    fn e2e_template_escape_newline() {
+        let r = global_eval(r"`a\nb`").unwrap();
+        assert_eq!(r, JsValue::String("a\nb".into()));
+    }
+
+    #[test]
+    fn e2e_template_escape_tab() {
+        let r = global_eval(r"`a\tb`").unwrap();
+        assert_eq!(r, JsValue::String("a\tb".into()));
+    }
+
+    #[test]
+    fn e2e_template_escape_backslash() {
+        let r = global_eval(r"`a\\b`").unwrap();
+        assert_eq!(r, JsValue::String("a\\b".into()));
+    }
+
+    #[test]
+    fn e2e_template_nested_simple() {
+        let r = global_eval("`outer ${`inner`} end`").unwrap();
+        assert_eq!(r, JsValue::String("outer inner end".into()));
+    }
+
+    #[test]
+    fn e2e_template_nested_with_expr() {
+        let r = global_eval("`a${`b${1}c`}d`").unwrap();
+        assert_eq!(r, JsValue::String("ab1cd".into()));
+    }
+
+    #[test]
+    fn e2e_template_deeply_nested() {
+        let r = global_eval("`${`${`deep`}`}`").unwrap();
+        assert_eq!(r, JsValue::String("deep".into()));
+    }
+
+    #[test]
+    fn e2e_template_coercion_number() {
+        let r = global_eval("`${42}`").unwrap();
+        assert_eq!(r, JsValue::String("42".into()));
+    }
+
+    #[test]
+    fn e2e_template_coercion_boolean() {
+        let r = global_eval("`${true}`").unwrap();
+        assert_eq!(r, JsValue::String("true".into()));
+    }
+
+    #[test]
+    fn e2e_template_coercion_null() {
+        let r = global_eval("`${null}`").unwrap();
+        assert_eq!(r, JsValue::String("null".into()));
+    }
+
+    #[test]
+    fn e2e_template_coercion_undefined() {
+        let r = global_eval("`${undefined}`").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_template_coercion_array() {
+        let r = global_eval("`${[1,2,3]}`").unwrap();
+        assert_eq!(r, JsValue::String("1,2,3".into()));
+    }
+
+    #[test]
+    fn e2e_template_coercion_tostring_method() {
+        let r = global_eval(
+            r#"
+            var obj = { toString: function() { return "custom"; } };
+            `${obj}`
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("custom".into()));
+    }
+
+    #[test]
+    fn e2e_template_coercion_valueof_fallback() {
+        let r = global_eval(
+            r#"
+            var obj = { valueOf: function() { return 99; } };
+            `${obj}`
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("99".into()));
+    }
+
+    #[test]
+    fn e2e_template_coercion_tostring_over_valueof() {
+        let r = global_eval(
+            r#"
+            var obj = {
+                toString: function() { return "ts"; },
+                valueOf: function() { return "vo"; }
+            };
+            `${obj}`
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("ts".into()));
+    }
+
+    #[test]
+    fn e2e_tagged_receives_strings_first_element() {
+        let r = global_eval("function tag(strs) { return strs[0]; } tag`hello`").unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    #[test]
+    fn e2e_tagged_receives_substitution_values() {
+        let r = global_eval("function tag(strs, a, b) { return a + b; } tag`${10}${20}`").unwrap();
+        assert_eq!(r, JsValue::Smi(30));
+    }
+
+    #[test]
+    fn e2e_tagged_strings_has_raw_property() {
+        let r = global_eval("function tag(strs) { return strs.raw !== undefined; } tag`hello`")
+            .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_tagged_raw_matches_content() {
+        let r = global_eval(r"function tag(strs) { return strs.raw[0]; } tag`hello`").unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    #[test]
+    fn e2e_tagged_strings_is_frozen() {
+        let r = global_eval("function tag(strs) { return Object.isFrozen(strs); } tag`x`").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_tagged_raw_is_frozen() {
+        let r =
+            global_eval("function tag(strs) { return Object.isFrozen(strs.raw); } tag`x`").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_tagged_strings_length() {
+        let r = global_eval("function tag(strs) { return strs.length; } tag`a${1}b${2}c`").unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_tagged_raw_length() {
+        let r = global_eval("function tag(strs) { return strs.raw.length; } tag`a${1}b`").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_tagged_cooked_interprets_escapes() {
+        let r = global_eval(r"function tag(strs) { return strs[0]; } tag`\n`").unwrap();
+        assert_eq!(r, JsValue::String("\n".into()));
+    }
+
+    #[test]
+    fn e2e_tagged_raw_preserves_escapes() {
+        let r = global_eval(r"function tag(strs) { return strs.raw[0]; } tag`\n`").unwrap();
+        assert_eq!(r, JsValue::String("\\n".into()));
+    }
+
+    #[test]
+    fn e2e_tagged_invalid_escape_cooked_undefined() {
+        let r = global_eval(r"function tag(strs) { return strs[0] === undefined; } tag`\unicode`")
+            .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_tagged_invalid_escape_raw_preserved() {
+        let r = global_eval(r"function tag(strs) { return strs.raw[0]; } tag`\unicode`").unwrap();
+        assert_eq!(r, JsValue::String("\\unicode".into()));
+    }
+
+    #[test]
+    fn e2e_tagged_no_substitutions() {
+        let r =
+            global_eval(r#"function tag(strs) { return strs.length + ":" + strs[0]; } tag`only`"#)
+                .unwrap();
+        assert_eq!(r, JsValue::String("1:only".into()));
+    }
+
+    #[test]
+    fn e2e_tagged_multiple_substitutions() {
+        let r = global_eval(
+            r#"
+            function tag(strs, a, b, c) {
+                return strs[0] + a + strs[1] + b + strs[2] + c + strs[3];
+            }
+            tag`A${1}B${2}C${3}D`
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("A1B2C3D".into()));
+    }
+
+    #[test]
+    fn e2e_tagged_subs_not_coerced_to_string() {
+        let r = global_eval("function tag(strs, v) { return typeof v; } tag`${42}`").unwrap();
+        assert_eq!(r, JsValue::String("number".into()));
+    }
+
+    #[test]
+    fn e2e_string_raw_tag_preserves_escapes() {
+        let r = global_eval(r"String.raw`\n\t\\`").unwrap();
+        assert_eq!(r, JsValue::String("\\n\\t\\\\".into()));
+    }
+
+    #[test]
+    fn e2e_string_raw_tag_with_substitutions() {
+        let r = global_eval(r"String.raw`a${1}b${2}c`").unwrap();
+        assert_eq!(r, JsValue::String("a1b2c".into()));
+    }
+
+    #[test]
+    fn e2e_string_raw_tag_unicode_escape() {
+        let r = global_eval(r"String.raw`\u0041`").unwrap();
+        assert_eq!(r, JsValue::String("\\u0041".into()));
+    }
+
+    #[test]
+    fn e2e_string_raw_tag_hex_escape() {
+        let r = global_eval(r"String.raw`\x41`").unwrap();
+        assert_eq!(r, JsValue::String("\\x41".into()));
+    }
+
+    #[test]
+    fn e2e_template_expression_is_variable() {
+        let r = global_eval("var x = 'hi'; `say ${x}`").unwrap();
+        assert_eq!(r, JsValue::String("say hi".into()));
+    }
+
+    #[test]
+    fn e2e_template_expression_is_function_call() {
+        let r = global_eval(
+            r#"
+            function greet() { return "world"; }
+            `hello ${greet()}`
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("hello world".into()));
+    }
+
+    #[test]
+    fn e2e_template_expression_is_ternary() {
+        let r = global_eval("`${true ? 'yes' : 'no'}`").unwrap();
+        assert_eq!(r, JsValue::String("yes".into()));
+    }
+
+    #[test]
+    fn e2e_tagged_cooked_and_raw_differ_on_escape() {
+        let r = global_eval(
+            r#"
+            function tag(strs) {
+                return strs[0] === "\t" && strs.raw[0] === "\\t";
+            }
+            tag`\t`
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_tagged_template_with_method_tag() {
+        let r = global_eval(
+            r#"
+            var obj = { tag: function(strs, v) { return strs[0] + v + strs[1]; } };
+            obj.tag`hello ${42} world`
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("hello 42 world".into()));
+    }
 }
