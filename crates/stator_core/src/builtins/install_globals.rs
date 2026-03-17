@@ -29395,6 +29395,264 @@ mod tests {
         assert_eq!(r, JsValue::String("a|1|b|2|c".into()));
     }
 
+    /// Global `match` collects all matches and resets `lastIndex`.
+    #[test]
+    fn e2e_regexp_match_global_resets_last_index() {
+        let r = global_eval(
+            "var re = /a/g; re.lastIndex = 2; var out = 'baab'.match(re); out.join(',') + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a,a:0".into()));
+    }
+
+    /// Global `match` with no matches returns `null` and resets `lastIndex`.
+    #[test]
+    fn e2e_regexp_match_global_no_match_resets_last_index() {
+        let r = global_eval(
+            "var re = /z/g; re.lastIndex = 3; var out = 'abc'.match(re); String(out === null) + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true:0".into()));
+    }
+
+    /// Sticky-only `match` behaves like `exec`, not global collection.
+    #[test]
+    fn e2e_regexp_match_sticky_returns_exec_shape() {
+        let r = global_eval(
+            "var re = /a/y; re.lastIndex = 1; var out = 'ba'.match(re); out[0] + ':' + out.index + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a:1:2".into()));
+    }
+
+    /// Sticky-only `match` failure resets `lastIndex`.
+    #[test]
+    fn e2e_regexp_match_sticky_failure_resets_last_index() {
+        let r = global_eval(
+            "var re = /a/y; re.lastIndex = 1; var out = 'bb'.match(re); String(out === null) + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true:0".into()));
+    }
+
+    /// Global zero-length `match` terminates and includes the end position.
+    #[test]
+    fn e2e_regexp_match_global_zero_length() {
+        let r = global_eval("'ab'.match(/(?:)/g).length").unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// Sticky `search` only matches at the operation's start position.
+    #[test]
+    fn e2e_regexp_search_sticky_requires_start_match() {
+        let r = global_eval("var re = /b/y; re.lastIndex = 2; 'ab'.search(re)").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    /// `search` restores a sticky regexp's original `lastIndex`.
+    #[test]
+    fn e2e_regexp_search_sticky_restores_last_index() {
+        let r =
+            global_eval("var re = /a/y; re.lastIndex = 1; 'ba'.search(re); re.lastIndex").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// `search` restores a global regexp's original `lastIndex`.
+    #[test]
+    fn e2e_regexp_search_global_restores_last_index() {
+        let r =
+            global_eval("var re = /a/g; re.lastIndex = 2; 'ba'.search(re); re.lastIndex").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// Function replacers receive named groups as the final parameter.
+    #[test]
+    fn e2e_regexp_replace_function_named_groups() {
+        let r = global_eval(
+            "'2024-07'.replace(/(?<year>\\d{4})-(?<month>\\d{2})/, function(m, y, mo, off, s, groups) { return groups.month + '/' + groups.year; })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("07/2024".into()));
+    }
+
+    /// Named-group replacers receive six arguments including `groups`.
+    #[test]
+    fn e2e_regexp_replace_function_named_groups_argument_count() {
+        let r = global_eval(
+            "'2024-07'.replace(/(?<year>\\d{4})-(?<month>\\d{2})/, function(m, y, mo, off, s, groups) { return String(arguments.length) + ':' + groups.year; })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("6:2024".into()));
+    }
+
+    /// Replacers without named groups do not receive a `groups` argument.
+    #[test]
+    fn e2e_regexp_replace_function_without_named_groups_argument_count() {
+        let r = global_eval(
+            "'2024-07'.replace(/(\\d+)-(\\d+)/, function(m, y, mo, off, s) { return String(arguments.length) + ':' + off; })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("5:0".into()));
+    }
+
+    /// Missing named captures are surfaced as `undefined` in the groups object.
+    #[test]
+    fn e2e_regexp_replace_function_named_groups_undefined_entry() {
+        let r = global_eval(
+            "'a'.replace(/(?<x>a)|(?<y>b)/, function(m, x, y, off, s, groups) { return groups.x === 'a' && groups.y === undefined ? 'ok' : 'bad'; })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("ok".into()));
+    }
+
+    /// Global function replacers receive named groups for each match.
+    #[test]
+    fn e2e_regexp_replace_function_named_groups_global() {
+        let r = global_eval(
+            "'2024-07 2025-01'.replace(/(?<year>\\d{4})-(?<month>\\d{2})/g, function(m, y, mo, off, s, groups) { return groups.month + '/' + groups.year + '@' + off; })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("07/2024@0 01/2025@8".into()));
+    }
+
+    /// Global replace resets `lastIndex` after completion.
+    #[test]
+    fn e2e_regexp_replace_global_resets_last_index() {
+        let r =
+            global_eval("var re = /a/g; re.lastIndex = 1; 'baab'.replace(re, 'x'); re.lastIndex")
+                .unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Sticky non-global replace starts from the current `lastIndex`.
+    #[test]
+    fn e2e_regexp_replace_sticky_uses_current_last_index() {
+        let r = global_eval("var re = /a/y; re.lastIndex = 1; 'baab'.replace(re, 'x')").unwrap();
+        assert_eq!(r, JsValue::String("bxab".into()));
+    }
+
+    /// Sticky replace failure resets `lastIndex` via exec semantics.
+    #[test]
+    fn e2e_regexp_replace_sticky_failure_resets_last_index() {
+        let r = global_eval(
+            "var re = /a/y; re.lastIndex = 3; 'baab'.replace(re, 'x') + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("baab:0".into()));
+    }
+
+    /// Zero-length regexp splits a non-empty string into characters.
+    #[test]
+    fn e2e_regexp_split_zero_length_non_empty() {
+        let r = global_eval("'ab'.split(/(?:)/).join('|')").unwrap();
+        assert_eq!(r, JsValue::String("a|b".into()));
+    }
+
+    /// Zero-length regexp splits an empty string into an empty array.
+    #[test]
+    fn e2e_regexp_split_zero_length_empty_input() {
+        let r = global_eval("''.split(/(?:)/).length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Zero-length regexp split respects the result limit.
+    #[test]
+    fn e2e_regexp_split_zero_length_limit() {
+        let r = global_eval("'ab'.split(/(?:)/, 1)[0]").unwrap();
+        assert_eq!(r, JsValue::String("a".into()));
+    }
+
+    /// RegExp split does not mutate the original global regexp's `lastIndex`.
+    #[test]
+    fn e2e_regexp_split_preserves_global_last_index() {
+        let r =
+            global_eval("var re = /a/g; re.lastIndex = 2; 'baab'.split(re); re.lastIndex").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// Sticky regexp split preserves the original `lastIndex`.
+    #[test]
+    fn e2e_regexp_split_sticky_preserves_last_index() {
+        let r = global_eval(
+            "var re = /a/y; re.lastIndex = 1; 'baab'.split(re).join('|') + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("b||b:1".into()));
+    }
+
+    /// Constructing from a regexp preserves the source and flags.
+    #[test]
+    fn e2e_regexp_constructor_from_regexp_preserves_source_and_flags() {
+        let r = global_eval(
+            "var re = /a/gi; var clone = new RegExp(re); clone.source + ':' + clone.flags",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a:gi".into()));
+    }
+
+    /// Constructing from a regexp with explicit flags overrides the original flags.
+    #[test]
+    fn e2e_regexp_constructor_from_regexp_overrides_flags() {
+        let r = global_eval(
+            "var re = /a/gi; var clone = new RegExp(re, 'm'); clone.source + ':' + clone.flags",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a:m".into()));
+    }
+
+    /// Constructing from a regexp starts the new object's `lastIndex` at zero.
+    #[test]
+    fn e2e_regexp_constructor_from_regexp_resets_last_index() {
+        let r = global_eval(
+            "var re = /a/g; re.lastIndex = 2; var clone = new RegExp(re); clone.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Instance `toString()` renders an empty pattern as `(?:)`.
+    #[test]
+    fn e2e_regexp_to_string_empty_pattern() {
+        let r = global_eval("new RegExp('').toString()").unwrap();
+        assert_eq!(r, JsValue::String("/(?:)/".into()));
+    }
+
+    /// `lastIndex` is coerced from strings for global exec.
+    #[test]
+    fn e2e_regexp_last_index_string_coercion() {
+        let r =
+            global_eval("var re = /a/g; re.lastIndex = '2'; var m = re.exec('baab'); m.index + ':' + re.lastIndex")
+                .unwrap();
+        assert_eq!(r, JsValue::String("2:3".into()));
+    }
+
+    /// Negative `lastIndex` values clamp to zero.
+    #[test]
+    fn e2e_regexp_last_index_negative_clamps_to_zero() {
+        let r = global_eval(
+            "var re = /a/y; re.lastIndex = -1; var m = re.exec('ab'); m.index + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0:1".into()));
+    }
+
+    /// `NaN` `lastIndex` values coerce to zero before matching.
+    #[test]
+    fn e2e_regexp_last_index_nan_coerces_to_zero() {
+        let r =
+            global_eval("var re = /a/g; re.lastIndex = NaN; re.exec('ba'); re.lastIndex").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// Combined global+sticky `match` resets `lastIndex` after collecting matches.
+    #[test]
+    fn e2e_regexp_match_global_sticky_resets_last_index() {
+        let r =
+            global_eval("var re = /a/gy; re.lastIndex = 2; var out = 'aaab'.match(re); out.join(',') + ':' + re.lastIndex")
+                .unwrap();
+        assert_eq!(r, JsValue::String("a,a,a:0".into()));
+    }
+
     /// Split without a separator returns the original string as one element.
     #[test]
     fn e2e_split_undefined_separator() {

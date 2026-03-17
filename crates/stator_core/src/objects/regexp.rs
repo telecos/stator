@@ -422,20 +422,22 @@ impl JsRegExp {
     ///
     /// * **Non-global**: returns `Some` with the first [`RegExpMatch`], or
     ///   `None`.
-    /// * **Global / sticky**: resets `lastIndex` to `0`, then collects every
+    /// * **Global**: resets `lastIndex` to `0`, then collects every
     ///   non-overlapping matched string into a `Vec<String>`.  Returns `None`
-    ///   if there are no matches.
+    ///   if there are no matches. `lastIndex` is reset to `0` before returning.
     pub fn symbol_match(&self, input: &str) -> Option<SymbolMatchResult> {
-        if !self.flags.contains(RegExpFlags::GLOBAL) && !self.flags.contains(RegExpFlags::STICKY) {
-            // Non-global: behave like exec.
+        if !self.flags.contains(RegExpFlags::GLOBAL) {
+            // Non-global: behave like exec, which also preserves sticky
+            // semantics when /y is present.
             self.exec(input).map(SymbolMatchResult::Single)
         } else {
-            // Global/sticky: collect all matches.
+            // Global: collect all matches and reset lastIndex when finished.
             self.last_index.set(0);
             let mut matches: Vec<String> = Vec::new();
             loop {
                 let start = self.last_index.get();
                 if start > input.len() {
+                    self.last_index.set(0);
                     break;
                 }
                 let m = if self.flags.contains(RegExpFlags::STICKY) {
@@ -447,18 +449,17 @@ impl JsRegExp {
                     self.compiled.find_from(input, start).next()
                 };
                 match m {
-                    None => break,
+                    None => {
+                        self.last_index.set(0);
+                        break;
+                    }
                     Some(mat) => {
                         let end = mat.end();
                         matches.push(input[mat.range()].to_string());
-                        // Advance by at least 1 to avoid infinite loops on
-                        // zero-length matches.
-                        self.last_index
-                            .set(if end > start { end } else { start + 1 });
+                        self.last_index.set(advance_after_match(input, start, end));
                     }
                 }
             }
-            self.last_index.set(0);
             if matches.is_empty() {
                 None
             } else {
@@ -484,52 +485,56 @@ impl JsRegExp {
     /// When the `g` flag is set all matches are replaced; otherwise only the
     /// first match is replaced.
     pub fn symbol_replace(&self, input: &str, replacement: &str) -> String {
-        let global =
-            self.flags.contains(RegExpFlags::GLOBAL) || self.flags.contains(RegExpFlags::STICKY);
+        let global = self.flags.contains(RegExpFlags::GLOBAL);
         if global {
             self.last_index.set(0);
-        }
-        let mut result = String::new();
-        let mut last_end = 0_usize;
+            let mut result = String::new();
+            let mut last_end = 0_usize;
 
-        loop {
-            let start = if global { self.last_index.get() } else { 0 };
-            if start > input.len() {
-                break;
-            }
-            let m = if self.flags.contains(RegExpFlags::STICKY) {
-                self.compiled
-                    .find_from(input, start)
-                    .next()
-                    .filter(|m| m.start() == start)
-            } else {
-                self.compiled.find_from(input, start).next()
-            };
-            match m {
-                None => break,
-                Some(mat) => {
-                    let rm = build_match(input, &mat, false);
-                    // Append the portion of input before this match.
-                    result.push_str(&input[last_end..rm.index]);
-                    // Apply replacement.
-                    result.push_str(&apply_replacement(replacement, &rm, input));
-                    let end = mat.end();
-                    last_end = end;
-                    if global {
-                        self.last_index
-                            .set(if end > start { end } else { start + 1 });
-                    } else {
+            loop {
+                let start = self.last_index.get();
+                if start > input.len() {
+                    self.last_index.set(0);
+                    break;
+                }
+                let m = if self.flags.contains(RegExpFlags::STICKY) {
+                    self.compiled
+                        .find_from(input, start)
+                        .next()
+                        .filter(|m| m.start() == start)
+                } else {
+                    self.compiled.find_from(input, start).next()
+                };
+                match m {
+                    None => {
+                        self.last_index.set(0);
                         break;
+                    }
+                    Some(mat) => {
+                        let rm = build_match(input, &mat, false);
+                        result.push_str(&input[last_end..rm.index]);
+                        result.push_str(&apply_replacement(replacement, &rm, input));
+                        let end = mat.end();
+                        last_end = end;
+                        self.last_index.set(advance_after_match(input, start, end));
                     }
                 }
             }
+
+            result.push_str(&input[last_end..]);
+            return result;
         }
-        // Append the remainder of the input.
-        result.push_str(&input[last_end..]);
-        if global {
-            self.last_index.set(0);
+
+        if let Some(matched) = self.exec(input) {
+            let end = matched.index + matched.matched.len();
+            let mut result = String::new();
+            result.push_str(&input[..matched.index]);
+            result.push_str(&apply_replacement(replacement, &matched, input));
+            result.push_str(&input[end..]);
+            result
+        } else {
+            input.to_string()
         }
-        result
     }
 
     /// ECMAScript `RegExp.prototype[Symbol.search](string)`.
@@ -539,10 +544,7 @@ impl JsRegExp {
     pub fn symbol_search(&self, input: &str) -> i64 {
         let saved = self.last_index.get();
         self.last_index.set(0);
-        let result = self
-            .compiled
-            .find(input)
-            .map_or(-1, |m| input[..m.start()].encode_utf16().count() as i64);
+        let result = self.exec(input).map_or(-1, |m| m.index as i64);
         self.last_index.set(saved);
         result
     }
@@ -559,26 +561,51 @@ impl JsRegExp {
         if lim == 0 {
             return Vec::new();
         }
+
+        if input.is_empty() {
+            let empty_match = self
+                .compiled
+                .find(input)
+                .is_some_and(|m| m.start() == 0 && m.end() == 0);
+            return if empty_match {
+                Vec::new()
+            } else {
+                vec![String::new()]
+            };
+        }
+
         let mut parts: Vec<String> = Vec::new();
         let mut last_end = 0_usize;
+        let mut search_index = 0usize;
 
-        for mat in self.compiled.find_iter(input) {
+        while search_index <= input.len() {
+            let Some(mat) = self.compiled.find_from(input, search_index).next() else {
+                break;
+            };
+            if mat.start() == mat.end() && mat.start() == search_index {
+                search_index = advance_string_index(input, search_index);
+                continue;
+            }
+
+            parts.push(input[last_end..mat.start()].to_string());
             if parts.len() >= lim {
                 break;
             }
-            // Push the part before this match.
-            parts.push(input[last_end..mat.start()].to_string());
-            // Push each capture group (None → empty string, per ES spec).
             for cap in &mat.captures {
-                if parts.len() >= lim {
-                    break;
-                }
                 parts.push(
                     cap.as_ref()
                         .map_or(String::new(), |r| input[r.clone()].to_string()),
                 );
+                if parts.len() >= lim {
+                    break;
+                }
             }
             last_end = mat.end();
+            search_index = mat.end();
+
+            if parts.len() >= lim {
+                break;
+            }
         }
 
         // Push the trailing portion (only if we haven't hit the limit).
@@ -596,7 +623,7 @@ impl JsRegExp {
     pub fn symbol_match_all(&self, input: &str) -> Vec<RegExpMatch> {
         let has_indices = self.flags.contains(RegExpFlags::HAS_INDICES);
         let mut results = Vec::new();
-        let mut start = self.last_index.get();
+        let mut start = 0_usize;
         loop {
             if start > input.len() {
                 break;
@@ -614,7 +641,7 @@ impl JsRegExp {
                 Some(mat) => {
                     let end = mat.end();
                     results.push(build_match(input, &mat, has_indices));
-                    start = if end > start { end } else { start + 1 };
+                    start = advance_after_match(input, start, end);
                 }
             }
         }
@@ -630,13 +657,13 @@ impl JsRegExp {
 ///
 /// * [`Single`][SymbolMatchResult::Single] — non-global match, returns the
 ///   full exec result.
-/// * [`All`][SymbolMatchResult::All] — global/sticky match, returns the list
+/// * [`All`][SymbolMatchResult::All] — global match, returns the list
 ///   of matched strings.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SymbolMatchResult {
     /// Result of a non-global `Symbol.match` call.
     Single(RegExpMatch),
-    /// Result of a global/sticky `Symbol.match` call: all matched strings.
+    /// Result of a global `Symbol.match` call: all matched strings.
     All(Vec<String>),
 }
 
@@ -788,6 +815,25 @@ fn apply_replacement(replacement: &str, m: &RegExpMatch, input: &str) -> String 
         }
     }
     out
+}
+
+fn advance_after_match(input: &str, start: usize, end: usize) -> usize {
+    if end > start {
+        end
+    } else {
+        advance_string_index(input, start)
+    }
+}
+
+fn advance_string_index(input: &str, index: usize) -> usize {
+    if index >= input.len() {
+        index.saturating_add(1)
+    } else {
+        input[index..]
+            .chars()
+            .next()
+            .map_or(index.saturating_add(1), |ch| index + ch.len_utf8())
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
