@@ -46844,7 +46844,7 @@ mod tests {
             "class C { \
                get x() { return 'instance'; } \
                static get x() { return 'static'; } \
-             } \
+              } \
              var c = new C(); c.x === 'instance' && C.x === 'static'",
         );
     }

@@ -7810,6 +7810,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_tagged_template_invalid_escape_keeps_raw_and_none_cooked() {
+        let prog = parse(r#"tag`\unicode${x}`"#).unwrap();
+        if let ProgramItem::Stmt(Stmt::Expr(es)) = &prog.body[0] {
+            if let Expr::TaggedTemplate(t) = es.expr.as_ref() {
+                assert_eq!(t.quasi.quasis.len(), 2);
+                assert_eq!(t.quasi.quasis[0].raw, r"\unicode");
+                assert_eq!(t.quasi.quasis[0].cooked, None);
+            } else {
+                panic!("expected TaggedTemplate");
+            }
+        } else {
+            panic!("expected expression statement");
+        }
+    }
+
+    #[test]
+    fn test_untagged_template_invalid_escape_is_syntax_error() {
+        let result = parse(r#"`\unicode`"#);
+        assert!(matches!(result, Err(StatorError::SyntaxError(_))));
+    }
+
     // ── Optional catch binding ────────────────────────────────────────────────
 
     #[test]

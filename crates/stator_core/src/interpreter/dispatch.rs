@@ -5652,8 +5652,8 @@ fn handle_get_template_object(
         return Err(err_bad_operand("GetTemplateObject", 0));
     };
     let cache_key = ctx.byte_offsets[ctx.frame.pc - 1] as u32;
-    if let Some(cached) = ctx.frame.template_cache.get(&cache_key) {
-        ctx.frame.accumulator = cached.clone();
+    if let Some(cached) = ctx.frame.bytecode_array.cached_template_object(cache_key) {
+        ctx.frame.accumulator = cached;
     } else {
         let entry = ctx
             .frame
@@ -5673,7 +5673,9 @@ fn handle_get_template_object(
             }
             map.borrow_mut().freeze();
         }
-        ctx.frame.template_cache.insert(cache_key, tpl_val.clone());
+        ctx.frame
+            .bytecode_array
+            .cache_template_object(cache_key, tpl_val.clone());
         ctx.frame.accumulator = tpl_val;
     }
     Ok(DispatchAction::Continue)

@@ -236,6 +236,12 @@ pub struct BytecodeArray {
     feedback_metadata: FeedbackMetadata,
     /// Per-function exception handler table.
     handler_table: Vec<HandlerTableEntry>,
+    /// Cached template objects keyed by bytecode offset.
+    ///
+    /// Tagged template sites must reuse the same frozen template object across
+    /// executions of the same compiled function. Clones of this bytecode array
+    /// share the cache so repeated calls observe the same identity.
+    template_cache: Rc<RefCell<HashMap<u32, crate::objects::value::JsValue>>>,
     /// `true` if this bytecode belongs to a generator function (`function*`).
     ///
     /// When a generator function is *called*, the interpreter creates a fresh
@@ -308,8 +314,8 @@ pub struct BytecodeArray {
 impl PartialEq for BytecodeArray {
     /// Two [`BytecodeArray`]s are equal when their static bytecode and metadata
     /// are identical.  The tiering state (`invocation_count`, `jit_code`,
-    /// `maglev_jit_code`, `turbofan_jit_code`) is intentionally excluded from
-    /// the comparison.
+    /// `maglev_jit_code`, `turbofan_jit_code`) and runtime caches
+    /// (`template_cache`) are intentionally excluded from the comparison.
     fn eq(&self, other: &Self) -> bool {
         self.bytecodes == other.bytecodes
             && self.constant_pool == other.constant_pool
@@ -366,6 +372,7 @@ impl BytecodeArray {
             source_positions,
             feedback_metadata,
             handler_table,
+            template_cache: Rc::new(RefCell::new(HashMap::new())),
             is_generator: false,
             is_async: false,
             is_module: false,
@@ -380,6 +387,31 @@ impl BytecodeArray {
             closure_context: None,
             self_name_register: None,
         }
+    }
+
+    /// Return a cached template object for the given bytecode offset, if any.
+    pub fn cached_template_object(
+        &self,
+        bytecode_offset: u32,
+    ) -> Option<crate::objects::value::JsValue> {
+        self.template_cache.borrow().get(&bytecode_offset).cloned()
+    }
+
+    /// Cache a template object for the given bytecode offset.
+    pub fn cache_template_object(
+        &self,
+        bytecode_offset: u32,
+        value: crate::objects::value::JsValue,
+    ) {
+        self.template_cache
+            .borrow_mut()
+            .insert(bytecode_offset, value);
+    }
+
+    /// Return the number of cached template objects.
+    #[cfg(test)]
+    pub(crate) fn template_cache_len(&self) -> usize {
+        self.template_cache.borrow().len()
     }
 
     /// Mark this [`BytecodeArray`] as belonging to a generator function.
