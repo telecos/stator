@@ -1196,7 +1196,7 @@ pub fn typed_array_find_last_index(
 /// `%TypedArray%.prototype.forEach(callbackfn)`.
 pub fn typed_array_for_each(
     ta: &JsTypedArray,
-    f: impl Fn(&JsValue, usize) -> StatorResult<()>,
+    mut f: impl FnMut(&JsValue, usize) -> StatorResult<()>,
 ) -> StatorResult<()> {
     for i in 0..ta.effective_length() {
         let v = typed_array_get(ta, i);

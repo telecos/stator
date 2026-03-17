@@ -47,7 +47,7 @@ fn all_attrs() -> PropertyAttributes {
 #[test]
 fn test_roundtrip_get_existing_key() {
     let target = target_with("x", JsValue::Smi(42));
-    let proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let proxy = proxy_new(target_with("x", JsValue::Smi(42)), ProxyHandler::default());
     let proxy_val = proxy_get(&proxy, "x").unwrap();
     let reflect_val = reflect_get(&target, "x");
     assert_eq!(proxy_val, reflect_val);
@@ -56,7 +56,7 @@ fn test_roundtrip_get_existing_key() {
 #[test]
 fn test_roundtrip_get_missing_key() {
     let target = JsObject::new();
-    let proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let proxy = proxy_new(JsObject::new(), ProxyHandler::default());
     assert_eq!(
         proxy_get(&proxy, "nope").unwrap(),
         reflect_get(&target, "nope")
@@ -68,7 +68,7 @@ fn test_roundtrip_get_missing_key() {
 #[test]
 fn test_roundtrip_get_with_receiver() {
     let target = target_with("k", JsValue::Smi(77));
-    let proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let proxy = proxy_new(target_with("k", JsValue::Smi(77)), ProxyHandler::default());
     let receiver = JsValue::Boolean(true);
     let proxy_val = proxy_get_with_receiver(&proxy, "k", &receiver).unwrap();
     let reflect_val = reflect_get_with_receiver(&target, "k", &receiver);
@@ -78,7 +78,7 @@ fn test_roundtrip_get_with_receiver() {
 #[test]
 fn test_roundtrip_get_with_receiver_missing() {
     let target = JsObject::new();
-    let proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let proxy = proxy_new(JsObject::new(), ProxyHandler::default());
     let receiver = JsValue::Smi(99);
     assert_eq!(
         proxy_get_with_receiver(&proxy, "z", &receiver).unwrap(),
@@ -90,9 +90,9 @@ fn test_roundtrip_get_with_receiver_missing() {
 
 #[test]
 fn test_roundtrip_set_new_property() {
-    let mut target1 = JsObject::new();
+    let target1 = JsObject::new();
     let mut target2 = JsObject::new();
-    let mut proxy = proxy_new(target1.clone(), ProxyHandler::default());
+    let mut proxy = proxy_new(target1, ProxyHandler::default());
     let proxy_ok = proxy_set(&mut proxy, "a", JsValue::Smi(1)).unwrap();
     let reflect_ok = reflect_set(&mut target2, "a", JsValue::Smi(1)).unwrap();
     assert_eq!(proxy_ok, reflect_ok);
@@ -101,7 +101,7 @@ fn test_roundtrip_set_new_property() {
 #[test]
 fn test_roundtrip_set_overwrite() {
     let mut target = target_with("k", JsValue::Smi(1));
-    let mut proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let mut proxy = proxy_new(target_with("k", JsValue::Smi(1)), ProxyHandler::default());
     let proxy_ok = proxy_set(&mut proxy, "k", JsValue::Smi(2)).unwrap();
     let reflect_ok = reflect_set(&mut target, "k", JsValue::Smi(2)).unwrap();
     assert_eq!(proxy_ok, reflect_ok);
@@ -111,10 +111,10 @@ fn test_roundtrip_set_overwrite() {
 
 #[test]
 fn test_roundtrip_set_with_receiver() {
-    let mut target1 = JsObject::new();
+    let target1 = JsObject::new();
     let mut target2 = JsObject::new();
     let receiver = JsValue::Smi(10);
-    let mut proxy = proxy_new(target1.clone(), ProxyHandler::default());
+    let mut proxy = proxy_new(target1, ProxyHandler::default());
     let proxy_ok = proxy_set_with_receiver(&mut proxy, "r", JsValue::Smi(5), &receiver).unwrap();
     let reflect_ok =
         reflect_set_with_receiver(&mut target2, "r", JsValue::Smi(5), &receiver).unwrap();
@@ -126,14 +126,14 @@ fn test_roundtrip_set_with_receiver() {
 #[test]
 fn test_roundtrip_has_existing() {
     let target = target_with("p", JsValue::Null);
-    let proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let proxy = proxy_new(target_with("p", JsValue::Null), ProxyHandler::default());
     assert_eq!(proxy_has(&proxy, "p").unwrap(), reflect_has(&target, "p"));
 }
 
 #[test]
 fn test_roundtrip_has_missing() {
     let target = JsObject::new();
-    let proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let proxy = proxy_new(JsObject::new(), ProxyHandler::default());
     assert_eq!(proxy_has(&proxy, "q").unwrap(), reflect_has(&target, "q"));
 }
 
@@ -145,8 +145,8 @@ fn test_roundtrip_has_is_in_operator() {
         .borrow_mut()
         .set_property("inherited", JsValue::Boolean(true))
         .unwrap();
-    let target = JsObject::with_prototype(proto);
-    let proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let target = JsObject::with_prototype(Rc::clone(&proto));
+    let proxy = proxy_new(JsObject::with_prototype(proto), ProxyHandler::default());
     assert!(proxy_has(&proxy, "inherited").unwrap());
     assert!(reflect_has(&target, "inherited"));
 }
@@ -155,7 +155,7 @@ fn test_roundtrip_has_is_in_operator() {
 
 #[test]
 fn test_roundtrip_delete_existing() {
-    let mut target1 = target_with("d", JsValue::Smi(1));
+    let target1 = target_with("d", JsValue::Smi(1));
     let mut target2 = target_with("d", JsValue::Smi(1));
     let mut proxy = proxy_new(target1, ProxyHandler::default());
     let proxy_ok = proxy_delete_property(&mut proxy, "d").unwrap();
@@ -166,7 +166,7 @@ fn test_roundtrip_delete_existing() {
 #[test]
 fn test_roundtrip_delete_missing() {
     let mut target = JsObject::new();
-    let mut proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let mut proxy = proxy_new(JsObject::new(), ProxyHandler::default());
     let proxy_ok = proxy_delete_property(&mut proxy, "ghost").unwrap();
     let reflect_ok = reflect_delete_property(&mut target, "ghost").unwrap();
     assert_eq!(proxy_ok, reflect_ok);
@@ -197,7 +197,10 @@ fn test_roundtrip_own_keys_string_keys() {
     let mut target = JsObject::new();
     target.set_property("a", JsValue::Smi(1)).unwrap();
     target.set_property("b", JsValue::Smi(2)).unwrap();
-    let proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let mut proxy_target = JsObject::new();
+    proxy_target.set_property("a", JsValue::Smi(1)).unwrap();
+    proxy_target.set_property("b", JsValue::Smi(2)).unwrap();
+    let proxy = proxy_new(proxy_target, ProxyHandler::default());
     let proxy_keys = proxy_own_keys(&proxy).unwrap();
     let reflect_keys = reflect_own_keys_values(&target);
     assert_eq!(proxy_keys.len(), reflect_keys.len());
@@ -209,7 +212,7 @@ fn test_roundtrip_own_keys_string_keys() {
 #[test]
 fn test_roundtrip_own_keys_empty() {
     let target = JsObject::new();
-    let proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let proxy = proxy_new(JsObject::new(), ProxyHandler::default());
     let proxy_keys = proxy_own_keys(&proxy).unwrap();
     let reflect_keys = reflect_own_keys_values(&target);
     assert!(proxy_keys.is_empty());
@@ -288,7 +291,7 @@ fn test_roundtrip_construct_through_trap() {
 #[test]
 fn test_roundtrip_get_prototype_of_null() {
     let target = JsObject::new();
-    let proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let proxy = proxy_new(JsObject::new(), ProxyHandler::default());
     let proxy_proto = proxy_get_prototype_of(&proxy).unwrap();
     let reflect_proto = reflect_get_prototype_of_value(&target);
     assert_eq!(proxy_proto, reflect_proto);
@@ -302,8 +305,8 @@ fn test_roundtrip_get_prototype_of_with_prototype() {
         .borrow_mut()
         .set_property("tag", JsValue::Boolean(true))
         .unwrap();
-    let target = JsObject::with_prototype(proto);
-    let proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let target = JsObject::with_prototype(Rc::clone(&proto));
+    let proxy = proxy_new(JsObject::with_prototype(proto), ProxyHandler::default());
     let proxy_proto = proxy_get_prototype_of(&proxy).unwrap();
     let reflect_proto = reflect_get_prototype_of_value(&target);
     // Both must return an object-like value (not Null).
@@ -314,7 +317,7 @@ fn test_roundtrip_get_prototype_of_with_prototype() {
 #[test]
 fn test_roundtrip_set_prototype_of_null() {
     let proto = Rc::new(RefCell::new(JsObject::new()));
-    let mut target1 = JsObject::with_prototype(Rc::clone(&proto));
+    let target1 = JsObject::with_prototype(Rc::clone(&proto));
     let mut target2 = JsObject::with_prototype(proto);
     let mut proxy = proxy_new(target1, ProxyHandler::default());
     let proxy_ok = proxy_set_prototype_of(&mut proxy, JsValue::Null).unwrap();
@@ -326,7 +329,7 @@ fn test_roundtrip_set_prototype_of_null() {
 fn test_roundtrip_set_prototype_of_object() {
     let mut target = JsObject::new();
     let new_proto = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
-    let mut proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let mut proxy = proxy_new(JsObject::new(), ProxyHandler::default());
     let proxy_ok = proxy_set_prototype_of(&mut proxy, new_proto.clone()).unwrap();
     let reflect_ok = reflect_set_prototype_of_value(&mut target, new_proto).unwrap();
     assert_eq!(proxy_ok, reflect_ok);
@@ -357,8 +360,8 @@ fn test_set_prototype_of_accepts_jsvalue() {
 #[test]
 fn test_roundtrip_define_then_get_descriptor() {
     let attrs = PropertyAttributes::WRITABLE | PropertyAttributes::ENUMERABLE;
-    let mut target = JsObject::new();
-    let mut proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let target = JsObject::new();
+    let mut proxy = proxy_new(target, ProxyHandler::default());
 
     proxy_define_property(&mut proxy, "dp", JsValue::Smi(99), attrs).unwrap();
     let desc = proxy_get_own_property_descriptor(&proxy, "dp").unwrap();
@@ -400,7 +403,7 @@ fn test_roundtrip_descriptor_read_only_property() {
 #[test]
 fn test_roundtrip_is_extensible() {
     let target = JsObject::new();
-    let proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let proxy = proxy_new(JsObject::new(), ProxyHandler::default());
     assert_eq!(
         proxy_is_extensible(&proxy).unwrap(),
         reflect_is_extensible(&target),
@@ -410,7 +413,7 @@ fn test_roundtrip_is_extensible() {
 #[test]
 fn test_roundtrip_prevent_extensions() {
     let mut target = JsObject::new();
-    let mut proxy = proxy_new(target.clone(), ProxyHandler::default());
+    let mut proxy = proxy_new(JsObject::new(), ProxyHandler::default());
     let proxy_ok = proxy_prevent_extensions(&mut proxy).unwrap();
     let reflect_ok = reflect_prevent_extensions(&mut target);
     assert_eq!(proxy_ok, reflect_ok);
