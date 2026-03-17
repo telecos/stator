@@ -693,6 +693,7 @@ pub(super) const GENERATOR_RETURN_SENTINEL: &str = "__stator_generator_return_co
 const GENERATOR_RETURN_COMPLETION_MARKER_KEY: &str = "__stator_generator_return_completion__";
 const GENERATOR_RETURN_COMPLETION_VALUE_KEY: &str = "value";
 
+#[allow(dead_code)]
 pub(crate) fn make_generator_return_completion(value: JsValue) -> JsValue {
     let mut map = PropertyMap::new();
     map.insert(
