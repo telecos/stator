@@ -1377,7 +1377,6 @@ fn handle_tail_call(
                     ctx.frame.generator_state = None;
                     ctx.frame.osr_loop_count = 0;
                     ctx.frame.pending_message = JsValue::Undefined;
-                    ctx.frame.template_cache.clear();
                     ctx.frame.new_target = if ba.is_arrow() {
                         inherited_new_target
                     } else {
