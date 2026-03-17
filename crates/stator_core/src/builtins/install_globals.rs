@@ -129,12 +129,16 @@ use crate::builtins::typed_array::{
     dataview_set_bigint64, dataview_set_biguint64, dataview_set_float32, dataview_set_float64,
     dataview_set_int8, dataview_set_int16, dataview_set_int32, dataview_set_uint8,
     dataview_set_uint16, dataview_set_uint32, shared_arraybuffer_grow, shared_arraybuffer_growable,
-    shared_arraybuffer_new, shared_arraybuffer_new_growable, typed_array_byte_length,
-    typed_array_copy_within, typed_array_entries, typed_array_fill, typed_array_from_values,
-    typed_array_get, typed_array_includes, typed_array_index_of, typed_array_join,
-    typed_array_keys, typed_array_last_index_of, typed_array_new_from_buffer,
-    typed_array_new_from_length, typed_array_reverse, typed_array_set, typed_array_set_from,
-    typed_array_slice, typed_array_sort, typed_array_subarray, typed_array_values,
+    shared_arraybuffer_new, shared_arraybuffer_new_growable, typed_array_at,
+    typed_array_byte_length, typed_array_copy_within, typed_array_entries, typed_array_every,
+    typed_array_fill, typed_array_filter, typed_array_find, typed_array_find_index,
+    typed_array_find_last, typed_array_find_last_index, typed_array_for_each,
+    typed_array_from_values, typed_array_get, typed_array_includes, typed_array_index_of,
+    typed_array_join, typed_array_keys, typed_array_last_index_of, typed_array_map,
+    typed_array_new_from_buffer, typed_array_new_from_length, typed_array_reduce,
+    typed_array_reduce_right, typed_array_reverse, typed_array_set, typed_array_set_from,
+    typed_array_set_from_typed_array, typed_array_slice, typed_array_some, typed_array_sort,
+    typed_array_subarray, typed_array_values,
 };
 use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new, weak_ref_new_plain};
 use crate::error::{StatorError, StatorResult};
@@ -2159,6 +2163,12 @@ fn current_derived_constructor_this() -> Option<Rc<RefCell<PropertyMap>>> {
 fn current_native_receiver_this() -> Option<JsValue> {
     let globals = current_global_env()?;
     globals.borrow().get("this").cloned()
+}
+
+fn native_receiver_arg(args: &[JsValue]) -> JsValue {
+    current_native_receiver_this()
+        .or_else(|| args.first().cloned())
+        .unwrap_or(JsValue::Undefined)
 }
 
 fn default_promise_constructor() -> Option<JsValue> {
@@ -13273,8 +13283,8 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
     proto.insert(
         "__get_byteLength__".into(),
         native(move |args| {
-            let receiver = args.first().unwrap_or(&JsValue::Undefined);
-            let Some(buf_rc) = extract_arraybuffer(receiver) else {
+            let receiver = native_receiver_arg(&args);
+            let Some(buf_rc) = extract_arraybuffer(&receiver) else {
                 return Err(incompatible_receiver(&format!(
                     "{display_name}.prototype.byteLength"
                 )));
@@ -13293,8 +13303,8 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
         proto.insert(
             "__get_maxByteLength__".into(),
             native(move |args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                let receiver = native_receiver_arg(&args);
+                let Some(buf_rc) = extract_arraybuffer(&receiver) else {
                     return Err(incompatible_receiver(
                         "SharedArrayBuffer.prototype.maxByteLength",
                     ));
@@ -13312,8 +13322,8 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
         proto.insert(
             "__get_growable__".into(),
             native(move |args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                let receiver = native_receiver_arg(&args);
+                let Some(buf_rc) = extract_arraybuffer(&receiver) else {
                     return Err(incompatible_receiver(
                         "SharedArrayBuffer.prototype.growable",
                     ));
@@ -13331,14 +13341,14 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
         proto.insert(
             "grow".into(),
             builtin_fn("grow", 1, move |args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                let receiver = native_receiver_arg(&args);
+                let Some(buf_rc) = extract_arraybuffer(&receiver) else {
                     return Err(incompatible_receiver("SharedArrayBuffer.prototype.grow"));
                 };
                 if !buf_rc.borrow().shared {
                     return Err(incompatible_receiver("SharedArrayBuffer.prototype.grow"));
                 }
-                let new_len = match args.get(1) {
+                let new_len = match args.first() {
                     Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
                     None => 0,
                 };
@@ -13350,8 +13360,8 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
         proto.insert(
             "__get_resizable__".into(),
             native(move |args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                let receiver = native_receiver_arg(&args);
+                let Some(buf_rc) = extract_arraybuffer(&receiver) else {
                     return Err(incompatible_receiver("ArrayBuffer.prototype.resizable"));
                 };
                 if buf_rc.borrow().shared {
@@ -13363,8 +13373,8 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
         proto.insert(
             "__get_maxByteLength__".into(),
             native(move |args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                let receiver = native_receiver_arg(&args);
+                let Some(buf_rc) = extract_arraybuffer(&receiver) else {
                     return Err(incompatible_receiver("ArrayBuffer.prototype.maxByteLength"));
                 };
                 if buf_rc.borrow().shared {
@@ -13378,8 +13388,8 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
         proto.insert(
             "__get_detached__".into(),
             native(move |args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                let receiver = native_receiver_arg(&args);
+                let Some(buf_rc) = extract_arraybuffer(&receiver) else {
                     return Err(incompatible_receiver("ArrayBuffer.prototype.detached"));
                 };
                 if buf_rc.borrow().shared {
@@ -13391,14 +13401,14 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
         proto.insert(
             "resize".into(),
             builtin_fn("resize", 1, move |args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                let receiver = native_receiver_arg(&args);
+                let Some(buf_rc) = extract_arraybuffer(&receiver) else {
                     return Err(incompatible_receiver("ArrayBuffer.prototype.resize"));
                 };
                 if buf_rc.borrow().shared {
                     return Err(incompatible_receiver("ArrayBuffer.prototype.resize"));
                 }
-                let new_len = match args.get(1) {
+                let new_len = match args.first() {
                     Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
                     None => 0,
                 };
@@ -13409,14 +13419,14 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
         proto.insert(
             "transfer".into(),
             builtin_fn("transfer", 0, move |args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                let receiver = native_receiver_arg(&args);
+                let Some(buf_rc) = extract_arraybuffer(&receiver) else {
                     return Err(incompatible_receiver("ArrayBuffer.prototype.transfer"));
                 };
                 if buf_rc.borrow().shared {
                     return Err(incompatible_receiver("ArrayBuffer.prototype.transfer"));
                 }
-                let new_len = match args.get(1) {
+                let new_len = match args.first() {
                     Some(v) if !v.is_undefined() => {
                         Some(crate::builtins::util::checked_f64_to_index(v.to_number()?)?)
                     }
@@ -13431,8 +13441,8 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
         proto.insert(
             "transferToFixedLength".into(),
             builtin_fn("transferToFixedLength", 0, move |args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                let receiver = native_receiver_arg(&args);
+                let Some(buf_rc) = extract_arraybuffer(&receiver) else {
                     return Err(incompatible_receiver(
                         "ArrayBuffer.prototype.transferToFixedLength",
                     ));
@@ -13442,7 +13452,7 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
                         "ArrayBuffer.prototype.transferToFixedLength",
                     ));
                 }
-                let new_len = match args.get(1) {
+                let new_len = match args.first() {
                     Some(v) if !v.is_undefined() => {
                         Some(crate::builtins::util::checked_f64_to_index(v.to_number()?)?)
                     }
@@ -13458,8 +13468,8 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
     proto.insert(
         "slice".into(),
         builtin_fn("slice", 2, move |args| {
-            let receiver = args.first().unwrap_or(&JsValue::Undefined);
-            let Some(buf_rc) = extract_arraybuffer(receiver) else {
+            let receiver = native_receiver_arg(&args);
+            let Some(buf_rc) = extract_arraybuffer(&receiver) else {
                 return Err(incompatible_receiver(&format!(
                     "{display_name}.prototype.slice"
                 )));
@@ -13472,11 +13482,11 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
             let buffer = buf_rc.borrow();
             let len = buffer.data.len();
             let begin =
-                clamp_relative_integer_index(len, to_integer_or_infinity_arg(args.get(1), 0.0)?)
+                clamp_relative_integer_index(len, to_integer_or_infinity_arg(args.first(), 0.0)?)
                     as i64;
             let end = clamp_relative_integer_index(
                 len,
-                to_integer_or_infinity_arg(args.get(2), len as f64)?,
+                to_integer_or_infinity_arg(args.get(1), len as f64)?,
             ) as i64;
             let sliced = arraybuffer_slice(&buffer, begin, end);
             Ok(make_buffer_instance(Rc::new(RefCell::new(sliced))))
@@ -13614,11 +13624,11 @@ fn make_dataview() -> JsValue {
     prototype.insert(
         "__get_buffer__".into(),
         native(|args| {
-            let receiver = args.first().unwrap_or(&JsValue::Undefined);
-            let Some(inner) = extract_dataview(receiver) else {
+            let receiver = native_receiver_arg(&args);
+            let Some(inner) = extract_dataview(&receiver) else {
                 return Err(incompatible_receiver("DataView.prototype.buffer"));
             };
-            if let JsValue::PlainObject(map) = receiver
+            if let JsValue::PlainObject(map) = &receiver
                 && let Some(buffer_object) = map.borrow().get("__buffer_object__").cloned()
             {
                 return Ok(buffer_object);
@@ -13629,8 +13639,8 @@ fn make_dataview() -> JsValue {
     prototype.insert(
         "__get_byteLength__".into(),
         native(|args| {
-            let receiver = args.first().unwrap_or(&JsValue::Undefined);
-            let Some(inner) = extract_dataview(receiver) else {
+            let receiver = native_receiver_arg(&args);
+            let Some(inner) = extract_dataview(&receiver) else {
                 return Err(incompatible_receiver("DataView.prototype.byteLength"));
             };
             Ok(JsValue::Smi(dataview_byte_length(&inner.borrow())? as i32))
@@ -13639,8 +13649,8 @@ fn make_dataview() -> JsValue {
     prototype.insert(
         "__get_byteOffset__".into(),
         native(|args| {
-            let receiver = args.first().unwrap_or(&JsValue::Undefined);
-            let Some(inner) = extract_dataview(receiver) else {
+            let receiver = native_receiver_arg(&args);
+            let Some(inner) = extract_dataview(&receiver) else {
                 return Err(incompatible_receiver("DataView.prototype.byteOffset"));
             };
             Ok(JsValue::Smi(dataview_byte_offset(&inner.borrow())? as i32))
@@ -13652,15 +13662,15 @@ fn make_dataview() -> JsValue {
             prototype.insert(
                 $name.into(),
                 builtin_fn($name, $length, move |args| {
-                    let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                    let Some(inner) = extract_dataview(receiver) else {
+                    let receiver = native_receiver_arg(&args);
+                    let Some(inner) = extract_dataview(&receiver) else {
                         return Err(incompatible_receiver(concat!("DataView.prototype.", $name)));
                     };
-                    let offset = match args.get(1) {
+                    let offset = match args.first() {
                         Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
                         None => 0,
                     };
-                    let little_endian = args.get(2).is_some_and(JsValue::to_boolean);
+                    let little_endian = args.get(1).is_some_and(JsValue::to_boolean);
                     let value = $fn_get(&inner.borrow(), offset, little_endian)?;
                     Ok(num_value(value))
                 }),
@@ -13673,16 +13683,16 @@ fn make_dataview() -> JsValue {
             prototype.insert(
                 $name.into(),
                 builtin_fn($name, $length, move |args| {
-                    let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                    let Some(inner) = extract_dataview(receiver) else {
+                    let receiver = native_receiver_arg(&args);
+                    let Some(inner) = extract_dataview(&receiver) else {
                         return Err(incompatible_receiver(concat!("DataView.prototype.", $name)));
                     };
-                    let offset = match args.get(1) {
+                    let offset = match args.first() {
                         Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
                         None => 0,
                     };
-                    let value = $conv(args.get(2).unwrap_or(&JsValue::Undefined))?;
-                    let little_endian = args.get(3).is_some_and(JsValue::to_boolean);
+                    let value = $conv(args.get(1).unwrap_or(&JsValue::Undefined))?;
+                    let little_endian = args.get(2).is_some_and(JsValue::to_boolean);
                     $fn_set(&inner.borrow(), offset, value, little_endian)?;
                     Ok(JsValue::Undefined)
                 }),
@@ -13701,15 +13711,15 @@ fn make_dataview() -> JsValue {
     prototype.insert(
         "getBigInt64".into(),
         builtin_fn("getBigInt64", 1, |args| {
-            let receiver = args.first().unwrap_or(&JsValue::Undefined);
-            let Some(inner) = extract_dataview(receiver) else {
+            let receiver = native_receiver_arg(&args);
+            let Some(inner) = extract_dataview(&receiver) else {
                 return Err(incompatible_receiver("DataView.prototype.getBigInt64"));
             };
-            let offset = match args.get(1) {
+            let offset = match args.first() {
                 Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
                 None => 0,
             };
-            let little_endian = args.get(2).is_some_and(JsValue::to_boolean);
+            let little_endian = args.get(1).is_some_and(JsValue::to_boolean);
             let value = dataview_get_bigint64(&inner.borrow(), offset, little_endian)?;
             Ok(JsValue::BigInt(i128::from(value)))
         }),
@@ -13717,15 +13727,15 @@ fn make_dataview() -> JsValue {
     prototype.insert(
         "getBigUint64".into(),
         builtin_fn("getBigUint64", 1, |args| {
-            let receiver = args.first().unwrap_or(&JsValue::Undefined);
-            let Some(inner) = extract_dataview(receiver) else {
+            let receiver = native_receiver_arg(&args);
+            let Some(inner) = extract_dataview(&receiver) else {
                 return Err(incompatible_receiver("DataView.prototype.getBigUint64"));
             };
-            let offset = match args.get(1) {
+            let offset = match args.first() {
                 Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
                 None => 0,
             };
-            let little_endian = args.get(2).is_some_and(JsValue::to_boolean);
+            let little_endian = args.get(1).is_some_and(JsValue::to_boolean);
             let value = dataview_get_biguint64(&inner.borrow(), offset, little_endian)?;
             Ok(JsValue::BigInt(i128::from(value)))
         }),
@@ -13834,9 +13844,614 @@ fn num_value<T: Into<f64>>(v: T) -> JsValue {
     }
 }
 
+fn typed_array_prototype_receiver(
+    args: &[JsValue],
+    display_name: &str,
+) -> StatorResult<(
+    JsValue,
+    Rc<RefCell<crate::builtins::typed_array::JsTypedArray>>,
+)> {
+    let receiver = native_receiver_arg(args);
+    let Some(inner) = extract_typed_array(&receiver) else {
+        return Err(incompatible_receiver(display_name));
+    };
+    Ok((receiver, inner))
+}
+
+fn make_typed_array_shared_prototype() -> JsValue {
+    let mut prototype = PropertyMap::new();
+    prototype.insert(
+        "__get_length__".into(),
+        native(|args| {
+            let (_, inner) = typed_array_prototype_receiver(&args, "TypedArray.prototype.length")?;
+            Ok(JsValue::Smi(inner.borrow().effective_length() as i32))
+        }),
+    );
+    prototype.insert(
+        "__get_byteLength__".into(),
+        native(|args| {
+            let (_, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.byteLength")?;
+            Ok(JsValue::Smi(typed_array_byte_length(&inner.borrow()) as i32))
+        }),
+    );
+    prototype.insert(
+        "__get_byteOffset__".into(),
+        native(|args| {
+            let (_, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.byteOffset")?;
+            Ok(JsValue::Smi(inner.borrow().byte_offset as i32))
+        }),
+    );
+    prototype.insert(
+        "__get_buffer__".into(),
+        native(|args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.buffer")?;
+            Ok(typed_array_buffer_object(&receiver)
+                .unwrap_or_else(|| make_buffer_instance(Rc::clone(&inner.borrow().buffer))))
+        }),
+    );
+    prototype.insert(
+        "at".into(),
+        builtin_fn("at", 1, |args| {
+            let (_, inner) = typed_array_prototype_receiver(&args, "TypedArray.prototype.at")?;
+            let ta = inner.borrow();
+            match normalize_at_index(ta.effective_length(), args.first())? {
+                Some(index) => Ok(typed_array_at(&ta, index as i64)),
+                None => Ok(JsValue::Undefined),
+            }
+        }),
+    );
+    prototype.insert(
+        "copyWithin".into(),
+        builtin_fn("copyWithin", 2, |args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.copyWithin")?;
+            let ta = inner.borrow();
+            let len = ta.effective_length();
+            let target =
+                clamp_relative_integer_index(len, to_integer_or_infinity_arg(args.first(), 0.0)?)
+                    as i64;
+            let start =
+                clamp_relative_integer_index(len, to_integer_or_infinity_arg(args.get(1), 0.0)?)
+                    as i64;
+            let end = clamp_relative_integer_index(
+                len,
+                to_integer_or_infinity_arg(args.get(2), len as f64)?,
+            ) as i64;
+            typed_array_copy_within(&ta, target, start, end);
+            Ok(receiver)
+        }),
+    );
+    prototype.insert(
+        "entries".into(),
+        builtin_fn("entries", 0, |args| {
+            let (_, inner) = typed_array_prototype_receiver(&args, "TypedArray.prototype.entries")?;
+            Ok(JsValue::Iterator(NativeIterator::from_items(
+                typed_array_entries(&inner.borrow()),
+            )))
+        }),
+    );
+    prototype.insert(
+        "every".into(),
+        builtin_fn("every", 1, |args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.every")?;
+            let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if !is_callable(&callback) {
+                return Err(StatorError::TypeError(
+                    "TypedArray.prototype.every callback must be callable".into(),
+                ));
+            }
+            let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let ta = inner.borrow();
+            Ok(JsValue::Boolean(typed_array_every(&ta, |value, index| {
+                Ok(call_callback_with_this(
+                    &callback,
+                    this_arg.clone(),
+                    vec![value.clone(), JsValue::Smi(index as i32), receiver.clone()],
+                )?
+                .to_boolean())
+            })?))
+        }),
+    );
+    prototype.insert(
+        "fill".into(),
+        builtin_fn("fill", 1, |args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.fill")?;
+            let value = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let ta = inner.borrow();
+            let len = ta.effective_length();
+            let start =
+                clamp_relative_integer_index(len, to_integer_or_infinity_arg(args.get(1), 0.0)?)
+                    as i64;
+            let end = clamp_relative_integer_index(
+                len,
+                to_integer_or_infinity_arg(args.get(2), len as f64)?,
+            ) as i64;
+            typed_array_fill(&ta, &value, start, end)?;
+            Ok(receiver)
+        }),
+    );
+    prototype.insert(
+        "filter".into(),
+        builtin_fn("filter", 1, |args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.filter")?;
+            let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if !is_callable(&callback) {
+                return Err(StatorError::TypeError(
+                    "TypedArray.prototype.filter callback must be callable".into(),
+                ));
+            }
+            let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let ta = inner.borrow();
+            let result = typed_array_filter(&ta, |value, index| {
+                Ok(call_callback_with_this(
+                    &callback,
+                    this_arg.clone(),
+                    vec![value.clone(), JsValue::Smi(index as i32), receiver.clone()],
+                )?
+                .to_boolean())
+            })?;
+            Ok(make_typed_array_instance(
+                ta.kind,
+                Rc::new(RefCell::new(result)),
+                None,
+            ))
+        }),
+    );
+    prototype.insert(
+        "find".into(),
+        builtin_fn("find", 1, |args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.find")?;
+            let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if !is_callable(&callback) {
+                return Err(StatorError::TypeError(
+                    "TypedArray.prototype.find callback must be callable".into(),
+                ));
+            }
+            let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let ta = inner.borrow();
+            typed_array_find(&ta, |value, index| {
+                Ok(call_callback_with_this(
+                    &callback,
+                    this_arg.clone(),
+                    vec![value.clone(), JsValue::Smi(index as i32), receiver.clone()],
+                )?
+                .to_boolean())
+            })
+        }),
+    );
+    prototype.insert(
+        "findIndex".into(),
+        builtin_fn("findIndex", 1, |args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.findIndex")?;
+            let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if !is_callable(&callback) {
+                return Err(StatorError::TypeError(
+                    "TypedArray.prototype.findIndex callback must be callable".into(),
+                ));
+            }
+            let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let ta = inner.borrow();
+            Ok(JsValue::Smi(typed_array_find_index(&ta, |value, index| {
+                Ok(call_callback_with_this(
+                    &callback,
+                    this_arg.clone(),
+                    vec![value.clone(), JsValue::Smi(index as i32), receiver.clone()],
+                )?
+                .to_boolean())
+            })? as i32))
+        }),
+    );
+    prototype.insert(
+        "findLast".into(),
+        builtin_fn("findLast", 1, |args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.findLast")?;
+            let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if !is_callable(&callback) {
+                return Err(StatorError::TypeError(
+                    "TypedArray.prototype.findLast callback must be callable".into(),
+                ));
+            }
+            let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let ta = inner.borrow();
+            typed_array_find_last(&ta, |value, index| {
+                Ok(call_callback_with_this(
+                    &callback,
+                    this_arg.clone(),
+                    vec![value.clone(), JsValue::Smi(index as i32), receiver.clone()],
+                )?
+                .to_boolean())
+            })
+        }),
+    );
+    prototype.insert(
+        "findLastIndex".into(),
+        builtin_fn("findLastIndex", 1, |args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.findLastIndex")?;
+            let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if !is_callable(&callback) {
+                return Err(StatorError::TypeError(
+                    "TypedArray.prototype.findLastIndex callback must be callable".into(),
+                ));
+            }
+            let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let ta = inner.borrow();
+            Ok(JsValue::Smi(
+                typed_array_find_last_index(&ta, |value, index| {
+                    Ok(call_callback_with_this(
+                        &callback,
+                        this_arg.clone(),
+                        vec![value.clone(), JsValue::Smi(index as i32), receiver.clone()],
+                    )?
+                    .to_boolean())
+                })? as i32,
+            ))
+        }),
+    );
+    prototype.insert(
+        "forEach".into(),
+        builtin_fn("forEach", 1, |args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.forEach")?;
+            let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if !is_callable(&callback) {
+                return Err(StatorError::TypeError(
+                    "TypedArray.prototype.forEach callback must be callable".into(),
+                ));
+            }
+            let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let ta = inner.borrow();
+            typed_array_for_each(&ta, |value, index| {
+                call_callback_with_this(
+                    &callback,
+                    this_arg.clone(),
+                    vec![value.clone(), JsValue::Smi(index as i32), receiver.clone()],
+                )?;
+                Ok(())
+            })?;
+            Ok(JsValue::Undefined)
+        }),
+    );
+    prototype.insert(
+        "includes".into(),
+        builtin_fn("includes", 1, |args| {
+            let (_, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.includes")?;
+            let search = args.first().unwrap_or(&JsValue::Undefined);
+            let from = normalize_from_index(inner.borrow().effective_length(), args.get(1))? as i64;
+            Ok(JsValue::Boolean(typed_array_includes(
+                &inner.borrow(),
+                search,
+                from,
+            )))
+        }),
+    );
+    prototype.insert(
+        "indexOf".into(),
+        builtin_fn("indexOf", 1, |args| {
+            let (_, inner) = typed_array_prototype_receiver(&args, "TypedArray.prototype.indexOf")?;
+            let search = args.first().unwrap_or(&JsValue::Undefined);
+            let from = normalize_from_index(inner.borrow().effective_length(), args.get(1))? as i64;
+            Ok(JsValue::Smi(
+                typed_array_index_of(&inner.borrow(), search, from) as i32,
+            ))
+        }),
+    );
+    prototype.insert(
+        "join".into(),
+        builtin_fn("join", 1, |args| {
+            let (_, inner) = typed_array_prototype_receiver(&args, "TypedArray.prototype.join")?;
+            let separator = match args.first() {
+                Some(value) if !value.is_undefined() => value.to_js_string()?,
+                _ => ",".to_string(),
+            };
+            Ok(JsValue::String(
+                typed_array_join(&inner.borrow(), &separator)?.into(),
+            ))
+        }),
+    );
+    prototype.insert(
+        "keys".into(),
+        builtin_fn("keys", 0, |args| {
+            let (_, inner) = typed_array_prototype_receiver(&args, "TypedArray.prototype.keys")?;
+            Ok(JsValue::Iterator(NativeIterator::from_items(
+                typed_array_keys(&inner.borrow()),
+            )))
+        }),
+    );
+    prototype.insert(
+        "lastIndexOf".into(),
+        builtin_fn("lastIndexOf", 1, |args| {
+            let (_, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.lastIndexOf")?;
+            let search = args.first().unwrap_or(&JsValue::Undefined);
+            let ta = inner.borrow();
+            let Some(from) = normalize_last_from_index(ta.effective_length(), args.get(1))? else {
+                return Ok(JsValue::Smi(-1));
+            };
+            Ok(JsValue::Smi(
+                typed_array_last_index_of(&ta, search, from as i64) as i32,
+            ))
+        }),
+    );
+    prototype.insert(
+        "map".into(),
+        builtin_fn("map", 1, |args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.map")?;
+            let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if !is_callable(&callback) {
+                return Err(StatorError::TypeError(
+                    "TypedArray.prototype.map callback must be callable".into(),
+                ));
+            }
+            let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let ta = inner.borrow();
+            let result = typed_array_map(&ta, |value, index| {
+                call_callback_with_this(
+                    &callback,
+                    this_arg.clone(),
+                    vec![value.clone(), JsValue::Smi(index as i32), receiver.clone()],
+                )
+            })?;
+            Ok(make_typed_array_instance(
+                ta.kind,
+                Rc::new(RefCell::new(result)),
+                None,
+            ))
+        }),
+    );
+    prototype.insert(
+        "reduce".into(),
+        builtin_fn("reduce", 1, |args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.reduce")?;
+            let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if !is_callable(&callback) {
+                return Err(StatorError::TypeError(
+                    "TypedArray.prototype.reduce callback must be callable".into(),
+                ));
+            }
+            let ta = inner.borrow();
+            typed_array_reduce(
+                &ta,
+                |acc, value, index| {
+                    call_callback(
+                        &callback,
+                        vec![
+                            acc.clone(),
+                            value.clone(),
+                            JsValue::Smi(index as i32),
+                            receiver.clone(),
+                        ],
+                    )
+                },
+                args.get(1).cloned(),
+            )
+        }),
+    );
+    prototype.insert(
+        "reduceRight".into(),
+        builtin_fn("reduceRight", 1, |args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.reduceRight")?;
+            let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if !is_callable(&callback) {
+                return Err(StatorError::TypeError(
+                    "TypedArray.prototype.reduceRight callback must be callable".into(),
+                ));
+            }
+            let ta = inner.borrow();
+            typed_array_reduce_right(
+                &ta,
+                |acc, value, index| {
+                    call_callback(
+                        &callback,
+                        vec![
+                            acc.clone(),
+                            value.clone(),
+                            JsValue::Smi(index as i32),
+                            receiver.clone(),
+                        ],
+                    )
+                },
+                args.get(1).cloned(),
+            )
+        }),
+    );
+    prototype.insert(
+        "reverse".into(),
+        builtin_fn("reverse", 0, |args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.reverse")?;
+            typed_array_reverse(&inner.borrow());
+            Ok(receiver)
+        }),
+    );
+    prototype.insert(
+        "set".into(),
+        builtin_fn("set", 1, |args| {
+            let (_, inner) = typed_array_prototype_receiver(&args, "TypedArray.prototype.set")?;
+            let offset = match args.get(1) {
+                Some(value) if !value.is_undefined() => {
+                    crate::builtins::util::checked_f64_to_index(value.to_number()?)?
+                }
+                _ => 0,
+            };
+            let target = inner.borrow();
+            if let Some(source_inner) = args.first().and_then(extract_typed_array) {
+                let source = source_inner.borrow();
+                typed_array_set_from_typed_array(&target, &source, offset)?;
+            } else {
+                let source = match args.first() {
+                    Some(source) => collect_typed_array_source_values(source)?,
+                    None => Vec::new(),
+                };
+                typed_array_set_from(&target, &source, offset)?;
+            }
+            Ok(JsValue::Undefined)
+        }),
+    );
+    prototype.insert(
+        "slice".into(),
+        builtin_fn("slice", 2, |args| {
+            let (_, inner) = typed_array_prototype_receiver(&args, "TypedArray.prototype.slice")?;
+            let ta = inner.borrow();
+            let len = ta.effective_length();
+            let start =
+                clamp_relative_integer_index(len, to_integer_or_infinity_arg(args.first(), 0.0)?)
+                    as i64;
+            let end = clamp_relative_integer_index(
+                len,
+                to_integer_or_infinity_arg(args.get(1), len as f64)?,
+            ) as i64;
+            let result = typed_array_slice(&ta, start, end)?;
+            Ok(make_typed_array_instance(
+                ta.kind,
+                Rc::new(RefCell::new(result)),
+                None,
+            ))
+        }),
+    );
+    prototype.insert(
+        "some".into(),
+        builtin_fn("some", 1, |args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.some")?;
+            let callback = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if !is_callable(&callback) {
+                return Err(StatorError::TypeError(
+                    "TypedArray.prototype.some callback must be callable".into(),
+                ));
+            }
+            let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let ta = inner.borrow();
+            Ok(JsValue::Boolean(typed_array_some(&ta, |value, index| {
+                Ok(call_callback_with_this(
+                    &callback,
+                    this_arg.clone(),
+                    vec![value.clone(), JsValue::Smi(index as i32), receiver.clone()],
+                )?
+                .to_boolean())
+            })?))
+        }),
+    );
+    prototype.insert(
+        "sort".into(),
+        builtin_fn("sort", 1, |args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.sort")?;
+            let compare = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let ta = inner.borrow();
+            if compare.is_undefined() {
+                typed_array_sort(&ta, None)?;
+            } else {
+                if !is_callable(&compare) {
+                    return Err(StatorError::TypeError(
+                        "TypedArray.prototype.sort comparefn must be callable".into(),
+                    ));
+                }
+                typed_array_sort(
+                    &ta,
+                    Some(&|a, b| call_callback(&compare, vec![a.clone(), b.clone()])?.to_number()),
+                )?;
+            }
+            Ok(receiver)
+        }),
+    );
+    prototype.insert(
+        "subarray".into(),
+        builtin_fn("subarray", 2, |args| {
+            let (receiver, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.subarray")?;
+            let ta = inner.borrow();
+            let len = ta.effective_length();
+            let begin =
+                clamp_relative_integer_index(len, to_integer_or_infinity_arg(args.first(), 0.0)?)
+                    as i64;
+            let end = clamp_relative_integer_index(
+                len,
+                to_integer_or_infinity_arg(args.get(1), len as f64)?,
+            ) as i64;
+            let sub = typed_array_subarray(&ta, begin, end);
+            Ok(make_typed_array_instance(
+                ta.kind,
+                Rc::new(RefCell::new(sub)),
+                typed_array_buffer_object(&receiver),
+            ))
+        }),
+    );
+    prototype.insert(
+        "toLocaleString".into(),
+        builtin_fn("toLocaleString", 0, |args| {
+            let (_, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.toLocaleString")?;
+            Ok(JsValue::String(
+                typed_array_join(&inner.borrow(), ",")?.into(),
+            ))
+        }),
+    );
+    prototype.insert(
+        "toString".into(),
+        builtin_fn("toString", 0, |args| {
+            let (_, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype.toString")?;
+            Ok(JsValue::String(
+                typed_array_join(&inner.borrow(), ",")?.into(),
+            ))
+        }),
+    );
+    prototype.insert(
+        "values".into(),
+        builtin_fn("values", 0, |args| {
+            let (_, inner) = typed_array_prototype_receiver(&args, "TypedArray.prototype.values")?;
+            Ok(JsValue::Iterator(NativeIterator::from_items(
+                typed_array_values(&inner.borrow()),
+            )))
+        }),
+    );
+    prototype.insert(
+        "@@iterator".into(),
+        builtin_fn("@@iterator", 0, |args| {
+            let (_, inner) =
+                typed_array_prototype_receiver(&args, "TypedArray.prototype[@@iterator]")?;
+            Ok(JsValue::Iterator(NativeIterator::from_items(
+                typed_array_values(&inner.borrow()),
+            )))
+        }),
+    );
+    prototype.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(prototype)))
+}
+
+fn make_typed_array_prototype(kind: TypedArrayKind, shared_prototype: JsValue) -> JsValue {
+    let mut prototype = PropertyMap::new();
+    prototype.insert("__proto__".into(), shared_prototype);
+    prototype.insert(
+        "BYTES_PER_ELEMENT".into(),
+        JsValue::Smi(kind.bytes_per_element() as i32),
+    );
+    prototype.insert_with_attrs(
+        "@@toStringTag".into(),
+        JsValue::String(kind.name().into()),
+        PropertyAttributes::CONFIGURABLE,
+    );
+    prototype.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(prototype)))
+}
+
 /// Build a typed-array constructor for the given `TypedArrayKind`.
 #[inline(never)]
-fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
+fn make_typed_array_constructor(kind: TypedArrayKind, shared_prototype: JsValue) -> JsValue {
     let mut props = PropertyMap::new();
 
     // BYTES_PER_ELEMENT
@@ -13845,17 +14460,9 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
         JsValue::Smi(kind.bytes_per_element() as i32),
     );
 
-    let mut prototype = PropertyMap::new();
-    // §23.2.3.32 %TypedArray%.prototype[@@toStringTag]
-    prototype.insert_with_attrs(
-        "@@toStringTag".into(),
-        JsValue::String(kind.name().into()),
-        PropertyAttributes::CONFIGURABLE,
-    );
-    prototype.make_all_non_enumerable();
     props.insert(
         "prototype".into(),
-        JsValue::PlainObject(Rc::new(RefCell::new(prototype))),
+        make_typed_array_prototype(kind, shared_prototype),
     );
 
     // Constructor: TypedArray(length) | TypedArray(array) | TypedArray(buffer, offset?, length?)
@@ -13917,11 +14524,33 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
     // TypedArray.from(source)
     props.insert(
         "from".into(),
-        native(move |args| {
+        builtin_fn("from", 1, move |args| {
             let source = args.first().ok_or_else(|| {
                 StatorError::TypeError("TypedArray.from requires a source value".into())
             })?;
             let source = collect_typed_array_source_values(source)?;
+            let map_fn = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+            let source = if map_fn.is_undefined() {
+                source
+            } else {
+                if !is_callable(&map_fn) {
+                    return Err(StatorError::TypeError(
+                        "TypedArray.from mapFn must be callable".into(),
+                    ));
+                }
+                source
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        call_callback_with_this(
+                            &map_fn,
+                            this_arg.clone(),
+                            vec![value.clone(), JsValue::Smi(index as i32)],
+                        )
+                    })
+                    .collect::<StatorResult<Vec<_>>>()?
+            };
             let ta = typed_array_from_values(kind, &source)?;
             let inner = Rc::new(RefCell::new(ta));
             Ok(make_typed_array_instance(kind, inner, None))
@@ -13931,7 +14560,7 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
     // TypedArray.of(...items)
     props.insert(
         "of".into(),
-        native(move |args| {
+        builtin_fn("of", 0, move |args| {
             let ta = typed_array_from_values(kind, &args)?;
             let inner = Rc::new(RefCell::new(ta));
             Ok(make_typed_array_instance(kind, inner, None))
@@ -14005,10 +14634,7 @@ fn make_typed_array_instance(
         }
         obj.insert(
             "__get_buffer__".into(),
-            native(move |args| {
-                let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                Ok(typed_array_buffer_object(receiver).unwrap_or(JsValue::Undefined))
-            }),
+            native(move |_| Ok(buffer_object.clone())),
         );
         obj.insert(
             "@@toStringTag".into(),
@@ -14503,19 +15129,23 @@ fn make_typed_array_instance(
             obj.insert(
                 "set".into(),
                 native(move |a| {
-                    let source = match a.first() {
-                        Some(source) => collect_typed_array_source_values(source)?,
-                        None => Vec::new(),
+                    let offset = match a.get(1) {
+                        Some(v) if !v.is_undefined() => {
+                            crate::builtins::util::checked_f64_to_index(v.to_number()?)?
+                        }
+                        _ => 0,
                     };
-                    let offset = a
-                        .get(1)
-                        .map(|v| {
-                            crate::builtins::util::clamped_f64_to_usize(
-                                v.to_number().unwrap_or(0.0),
-                            )
-                        })
-                        .unwrap_or(0);
-                    typed_array_set_from(&inner.borrow(), &source, offset)?;
+                    let target = inner.borrow();
+                    if let Some(source_inner) = a.first().and_then(extract_typed_array) {
+                        let source = source_inner.borrow();
+                        typed_array_set_from_typed_array(&target, &source, offset)?;
+                    } else {
+                        let source = match a.first() {
+                            Some(source) => collect_typed_array_source_values(source)?,
+                            None => Vec::new(),
+                        };
+                        typed_array_set_from(&target, &source, offset)?;
+                    }
                     Ok(JsValue::Undefined)
                 }),
             );
@@ -15441,6 +16071,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
 
     // Phase 4: TypedArray / ArrayBuffer / DataView constructors
     stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
+        let typed_array_shared_prototype = make_typed_array_shared_prototype();
         globals.insert(
             "ArrayBuffer".into(),
             finalize_ctor(make_arraybuffer(), "ArrayBuffer"),
@@ -15452,77 +16083,110 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         globals.insert(
             "Int8Array".into(),
             finalize_ctor(
-                make_typed_array_constructor(TypedArrayKind::Int8),
+                make_typed_array_constructor(
+                    TypedArrayKind::Int8,
+                    typed_array_shared_prototype.clone(),
+                ),
                 "Int8Array",
             ),
         );
         globals.insert(
             "Uint8Array".into(),
             finalize_ctor(
-                make_typed_array_constructor(TypedArrayKind::Uint8),
+                make_typed_array_constructor(
+                    TypedArrayKind::Uint8,
+                    typed_array_shared_prototype.clone(),
+                ),
                 "Uint8Array",
             ),
         );
         globals.insert(
             "Uint8ClampedArray".into(),
             finalize_ctor(
-                make_typed_array_constructor(TypedArrayKind::Uint8Clamped),
+                make_typed_array_constructor(
+                    TypedArrayKind::Uint8Clamped,
+                    typed_array_shared_prototype.clone(),
+                ),
                 "Uint8ClampedArray",
             ),
         );
         globals.insert(
             "Int16Array".into(),
             finalize_ctor(
-                make_typed_array_constructor(TypedArrayKind::Int16),
+                make_typed_array_constructor(
+                    TypedArrayKind::Int16,
+                    typed_array_shared_prototype.clone(),
+                ),
                 "Int16Array",
             ),
         );
         globals.insert(
             "Uint16Array".into(),
             finalize_ctor(
-                make_typed_array_constructor(TypedArrayKind::Uint16),
+                make_typed_array_constructor(
+                    TypedArrayKind::Uint16,
+                    typed_array_shared_prototype.clone(),
+                ),
                 "Uint16Array",
             ),
         );
         globals.insert(
             "Int32Array".into(),
             finalize_ctor(
-                make_typed_array_constructor(TypedArrayKind::Int32),
+                make_typed_array_constructor(
+                    TypedArrayKind::Int32,
+                    typed_array_shared_prototype.clone(),
+                ),
                 "Int32Array",
             ),
         );
         globals.insert(
             "Uint32Array".into(),
             finalize_ctor(
-                make_typed_array_constructor(TypedArrayKind::Uint32),
+                make_typed_array_constructor(
+                    TypedArrayKind::Uint32,
+                    typed_array_shared_prototype.clone(),
+                ),
                 "Uint32Array",
             ),
         );
         globals.insert(
             "Float32Array".into(),
             finalize_ctor(
-                make_typed_array_constructor(TypedArrayKind::Float32),
+                make_typed_array_constructor(
+                    TypedArrayKind::Float32,
+                    typed_array_shared_prototype.clone(),
+                ),
                 "Float32Array",
             ),
         );
         globals.insert(
             "Float64Array".into(),
             finalize_ctor(
-                make_typed_array_constructor(TypedArrayKind::Float64),
+                make_typed_array_constructor(
+                    TypedArrayKind::Float64,
+                    typed_array_shared_prototype.clone(),
+                ),
                 "Float64Array",
             ),
         );
         globals.insert(
             "BigInt64Array".into(),
             finalize_ctor(
-                make_typed_array_constructor(TypedArrayKind::BigInt64),
+                make_typed_array_constructor(
+                    TypedArrayKind::BigInt64,
+                    typed_array_shared_prototype.clone(),
+                ),
                 "BigInt64Array",
             ),
         );
         globals.insert(
             "BigUint64Array".into(),
             finalize_ctor(
-                make_typed_array_constructor(TypedArrayKind::BigUint64),
+                make_typed_array_constructor(
+                    TypedArrayKind::BigUint64,
+                    typed_array_shared_prototype.clone(),
+                ),
                 "BigUint64Array",
             ),
         );
@@ -38661,6 +39325,198 @@ mod tests {
     );
     typed_array_constructor_exists_test!(test_typed_array_ctor_bigint64_exists, "BigInt64Array");
     typed_array_constructor_exists_test!(test_typed_array_ctor_biguint64_exists, "BigUint64Array");
+
+    macro_rules! typed_array_shared_method_test {
+        ($name:ident, $method:literal) => {
+            #[test]
+            fn $name() {
+                assert_eval_true(concat!(
+                    "Int8Array.prototype.",
+                    $method,
+                    " === Float64Array.prototype.",
+                    $method
+                ));
+            }
+        };
+    }
+
+    macro_rules! typed_array_shared_getter_test {
+        ($name:ident, $property:literal) => {
+            #[test]
+            fn $name() {
+                assert_eval_true(concat!(
+                    "Object.getOwnPropertyDescriptor(Int8Array.prototype, '",
+                    $property,
+                    "').get === Object.getOwnPropertyDescriptor(Float64Array.prototype, '",
+                    $property,
+                    "').get"
+                ));
+            }
+        };
+    }
+
+    typed_array_shared_method_test!(e2e_typed_array_shared_at_method, "at");
+    typed_array_shared_method_test!(e2e_typed_array_shared_copy_within_method, "copyWithin");
+    typed_array_shared_method_test!(e2e_typed_array_shared_entries_method, "entries");
+    typed_array_shared_method_test!(e2e_typed_array_shared_every_method, "every");
+    typed_array_shared_method_test!(e2e_typed_array_shared_fill_method, "fill");
+    typed_array_shared_method_test!(e2e_typed_array_shared_filter_method, "filter");
+    typed_array_shared_method_test!(e2e_typed_array_shared_find_method, "find");
+    typed_array_shared_method_test!(e2e_typed_array_shared_find_index_method, "findIndex");
+    typed_array_shared_method_test!(e2e_typed_array_shared_find_last_method, "findLast");
+    typed_array_shared_method_test!(
+        e2e_typed_array_shared_find_last_index_method,
+        "findLastIndex"
+    );
+    typed_array_shared_method_test!(e2e_typed_array_shared_for_each_method, "forEach");
+    typed_array_shared_method_test!(e2e_typed_array_shared_includes_method, "includes");
+    typed_array_shared_method_test!(e2e_typed_array_shared_index_of_method, "indexOf");
+    typed_array_shared_method_test!(e2e_typed_array_shared_join_method, "join");
+    typed_array_shared_method_test!(e2e_typed_array_shared_keys_method, "keys");
+    typed_array_shared_method_test!(e2e_typed_array_shared_last_index_of_method, "lastIndexOf");
+    typed_array_shared_method_test!(e2e_typed_array_shared_map_method, "map");
+    typed_array_shared_method_test!(e2e_typed_array_shared_reduce_method, "reduce");
+    typed_array_shared_method_test!(e2e_typed_array_shared_reduce_right_method, "reduceRight");
+    typed_array_shared_method_test!(e2e_typed_array_shared_reverse_method, "reverse");
+    typed_array_shared_method_test!(e2e_typed_array_shared_set_method, "set");
+    typed_array_shared_method_test!(e2e_typed_array_shared_slice_method, "slice");
+    typed_array_shared_method_test!(e2e_typed_array_shared_some_method, "some");
+    typed_array_shared_method_test!(e2e_typed_array_shared_sort_method, "sort");
+    typed_array_shared_method_test!(e2e_typed_array_shared_subarray_method, "subarray");
+    typed_array_shared_method_test!(
+        e2e_typed_array_shared_to_locale_string_method,
+        "toLocaleString"
+    );
+    typed_array_shared_method_test!(e2e_typed_array_shared_to_string_method, "toString");
+    typed_array_shared_method_test!(e2e_typed_array_shared_values_method, "values");
+
+    typed_array_shared_getter_test!(e2e_typed_array_shared_buffer_getter, "buffer");
+    typed_array_shared_getter_test!(e2e_typed_array_shared_byte_length_getter, "byteLength");
+    typed_array_shared_getter_test!(e2e_typed_array_shared_byte_offset_getter, "byteOffset");
+
+    #[test]
+    fn e2e_typed_array_shared_iterator_method() {
+        assert_eval_true(
+            "Int8Array.prototype[Symbol.iterator] === Float64Array.prototype[Symbol.iterator]",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_prototypes_share_same_base_object() {
+        assert_eval_true(
+            "Object.getPrototypeOf(Int8Array.prototype) === Object.getPrototypeOf(Float64Array.prototype)",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_constructor_from_typed_array_converts_values() {
+        assert_eval_true(
+            "var source = new Float64Array([1.9, 257.1, -1.2]); var dest = new Uint8Array(source); dest.join(',') === '1,1,255'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_constructor_from_generator_iterable() {
+        assert_eval_true(
+            "function* values() { yield 3; yield 4; yield 5; } new Uint8Array(values()).join(',') === '3,4,5'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_constructor_from_set_iterable() {
+        assert_eval_true("new Uint8Array(new Set([9, 8, 7])).join(',') === '9,8,7'");
+    }
+
+    #[test]
+    fn e2e_typed_array_constructor_from_arraybuffer_offset_and_length() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(8); var bytes = new Uint8Array(buf); bytes.set([1,2,3,4,5,6,7,8]); var view = new Uint16Array(buf, 2, 2); view.length === 2 && view.byteOffset === 2 && view.byteLength === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_subarray_preserves_buffer_identity() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(8); var ta = new Uint8Array(buf); ta.subarray(2, 4).buffer === buf",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_subarray_method_on_shared_prototype_uses_receiver() {
+        assert_eval_true(
+            "var ta = new Uint8Array([10, 20, 30]); Int8Array.prototype.subarray.call(ta, 1).join(',') === '20,30'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_set_method_on_shared_prototype_uses_receiver() {
+        assert_eval_true(
+            "var ta = new Uint8Array(3); Float64Array.prototype.set.call(ta, [4, 5], 1); ta.join(',') === '0,4,5'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_set_negative_offset_throws_range_error() {
+        assert_eval_true(
+            "try { new Uint8Array(2).set([1], -1); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_from_map_fn_uses_this_arg() {
+        assert_eval_true(
+            "var result = Uint8Array.from([1,2,3], function(x, i) { return x + this.delta + i; }, { delta: 4 }); result.join(',') === '5,7,9'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_of_preserves_constructor_name() {
+        assert_eval_true("Float64Array.of(1, 2).constructor.name === 'Float64Array'");
+    }
+
+    #[test]
+    fn e2e_typed_array_static_bytes_per_element_uint8() {
+        assert_eval_true("Uint8Array.BYTES_PER_ELEMENT === 1");
+    }
+
+    #[test]
+    fn e2e_typed_array_static_bytes_per_element_uint16() {
+        assert_eval_true("Uint16Array.BYTES_PER_ELEMENT === 2");
+    }
+
+    #[test]
+    fn e2e_typed_array_static_bytes_per_element_uint32() {
+        assert_eval_true("Uint32Array.BYTES_PER_ELEMENT === 4");
+    }
+
+    #[test]
+    fn e2e_typed_array_static_bytes_per_element_float64() {
+        assert_eval_true("Float64Array.BYTES_PER_ELEMENT === 8");
+    }
+
+    #[test]
+    fn e2e_typed_array_constructor_name_float64() {
+        assert_eval_true("Float64Array.name === 'Float64Array'");
+    }
+
+    #[test]
+    fn e2e_typed_array_constructor_name_uint8() {
+        assert_eval_true("Uint8Array.name === 'Uint8Array'");
+    }
+
+    #[test]
+    fn e2e_dataview_shared_arraybuffer_little_endian_round_trip() {
+        assert_eval_true(
+            "var buf = new SharedArrayBuffer(8); var view = new DataView(buf); view.setUint32(0, 0x01020304, true); view.getUint32(0, true) === 0x01020304 && view.getUint8(0) === 4 && view.getUint8(3) === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_shared_arraybuffer_big_endian_round_trip() {
+        assert_eval_true(
+            "var buf = new SharedArrayBuffer(8); var view = new DataView(buf); view.setInt16(0, 0x1234); view.getInt16(0) === 0x1234 && view.buffer === buf",
+        );
+    }
 
     #[test]
     fn e2e_typed_array_constructor_from_length() {
