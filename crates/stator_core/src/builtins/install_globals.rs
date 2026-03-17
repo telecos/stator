@@ -9330,7 +9330,7 @@ fn make_string() -> JsValue {
                 };
                 let limit = match args.get(2) {
                     Some(JsValue::Undefined) | None => None,
-                    Some(v) => Some(v.to_number().unwrap_or(0.0) as u32),
+                    Some(v) => Some(v.to_uint32()?),
                 };
                 let parts = string_split(&s, sep.as_deref(), limit);
                 let arr: Vec<JsValue> = parts
@@ -9634,11 +9634,8 @@ fn make_string() -> JsValue {
             "at".into(),
             native(|args| {
                 let s = require_coercible_string(&args)?;
-                let idx = args
-                    .get(1)
-                    .unwrap_or(&JsValue::Undefined)
-                    .to_integer_or_infinity()? as i64;
-                match string_at(&s, idx) {
+                let idx = normalize_at_index(utf16_len(&s), args.get(1))?;
+                match idx.and_then(|idx| string_at(&s, idx as i64)) {
                     Some(ch) => Ok(JsValue::String(ch.into())),
                     None => Ok(JsValue::Undefined),
                 }
@@ -29403,6 +29400,259 @@ mod tests {
     fn e2e_split_undefined_separator() {
         let r = global_eval("'abc'.split(undefined).length").unwrap();
         assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// Global regexp `match` returns all whole-match strings.
+    #[test]
+    fn e2e_string_match_global_returns_all_matches() {
+        let r = global_eval("'a1b22c333'.match(/\\d+/g).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,22,333".into()));
+    }
+
+    /// Global regexp `match` resets `lastIndex` after iteration completes.
+    #[test]
+    fn e2e_string_match_global_resets_last_index() {
+        let r = global_eval("var re = /a/g; 'aba'.match(re); re.lastIndex").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Global regexp `match` returns null when there are no matches.
+    #[test]
+    fn e2e_string_match_global_no_match_returns_null() {
+        let r = global_eval("'abc'.match(/\\d/g) === null").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Global regexp `match` returns whole matches, not capture tuples.
+    #[test]
+    fn e2e_string_match_global_returns_whole_matches_only() {
+        let r = global_eval("'ab12cd34'.match(/(\\d+)/g).join('|')").unwrap();
+        assert_eq!(r, JsValue::String("12|34".into()));
+    }
+
+    /// `matchAll` reports indices in UTF-16 code units.
+    #[test]
+    fn e2e_string_match_all_utf16_indices() {
+        let r = global_eval(
+            "Array.from('😀a😀b'.matchAll(/[ab]/g)).map(function(m) { return m.index; }).join(',')",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("2,5".into()));
+    }
+
+    /// `matchAll` starts from the regexp's current `lastIndex`.
+    #[test]
+    fn e2e_string_match_all_uses_existing_last_index() {
+        let r = global_eval(
+            "var re = /a/g; re.lastIndex = 2; Array.from('baaa'.matchAll(re)).map(function(m) { return m.index; }).join(',')",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("2,3".into()));
+    }
+
+    /// `matchAll` does not mutate the original regexp's `lastIndex`.
+    #[test]
+    fn e2e_string_match_all_preserves_original_last_index() {
+        let r = global_eval(
+            "var re = /a/g; re.lastIndex = 2; Array.from('baaa'.matchAll(re)); re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// `matchAll` with named groups keeps the groups object on each match.
+    #[test]
+    fn e2e_string_match_all_named_groups_object() {
+        let r = global_eval(
+            "Array.from('2024-07 2025-08'.matchAll(/(?<y>\\d{4})-(?<m>\\d{2})/g)).map(function(m) { return m.groups.y + '/' + m.groups.m; }).join(',')",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("2024/07,2025/08".into()));
+    }
+
+    /// Regex function replacers receive UTF-16 offsets.
+    #[test]
+    fn e2e_replace_regex_function_replacer_utf16_offsets() {
+        let r = global_eval(
+            "'😀1😀2'.replace(/(\\d)/g, function(m, d, off) { return '[' + off + ']'; })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("😀[2]😀[5]".into()));
+    }
+
+    /// Regex function replacers receive named groups as the final argument.
+    #[test]
+    fn e2e_replace_regex_function_replacer_named_groups_argument() {
+        let r = global_eval(
+            "'2024-07'.replace(/(?<y>\\d+)-(?<m>\\d+)/, function(m, y, mo, off, s, groups) { return groups.y + '/' + groups.m + '/' + off; })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("2024/07/0".into()));
+    }
+
+    /// Regex function replacers surface undefined named-group values.
+    #[test]
+    fn e2e_replace_regex_function_replacer_named_group_undefined() {
+        let r = global_eval(
+            "'a'.replace(/(?<a>a)|(?<b>b)/, function(m, a, b, off, s, groups) { return String(groups.a === 'a') + ':' + String(groups.b === undefined); })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true:true".into()));
+    }
+
+    /// Regex function replacers leave the input unchanged when nothing matches.
+    #[test]
+    fn e2e_replace_regex_function_replacer_no_match() {
+        let r = global_eval("'hello'.replace(/\\d+/, function() { return 'x'; })").unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    /// `replaceAll` with a global regexp callback uses UTF-16 offsets.
+    #[test]
+    fn e2e_replace_all_regex_function_replacer_utf16_offsets() {
+        let r = global_eval(
+            "'😀1😀2'.replaceAll(/(\\d)/g, function(m, d, off) { return '[' + off + ']'; })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("😀[2]😀[5]".into()));
+    }
+
+    /// `replaceAll` forwards named groups to callback replacers.
+    #[test]
+    fn e2e_replace_all_regex_function_replacer_named_groups_argument() {
+        let r = global_eval(
+            "'2024-07 2025-08'.replaceAll(/(?<y>\\d+)-(?<m>\\d+)/g, function(m, y, mo, off, s, groups) { return groups.m + '/' + groups.y + '@' + off; })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("07/2024@0 08/2025@8".into()));
+    }
+
+    /// `replaceAll` with a regexp callback leaves the input unchanged when there are no matches.
+    #[test]
+    fn e2e_replace_all_regex_function_replacer_no_match() {
+        let r = global_eval("'hello'.replaceAll(/\\d+/g, function() { return 'x'; })").unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    /// `replaceAll` resets a global regexp's `lastIndex` after replacement.
+    #[test]
+    fn e2e_replace_all_regex_resets_last_index() {
+        let r = global_eval("var re = /a/g; 'aba'.replaceAll(re, 'x'); re.lastIndex").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// `search` with a regexp returns a UTF-16 code unit index.
+    #[test]
+    fn e2e_string_search_regexp_uses_utf16_index() {
+        let r = global_eval("'😀a'.search(/a/)").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// `search` preserves the original regexp `lastIndex`.
+    #[test]
+    fn e2e_string_search_regexp_preserves_last_index() {
+        let r =
+            global_eval("var re = /a/g; re.lastIndex = 2; 'ba'.search(re) + ':' + re.lastIndex")
+                .unwrap();
+        assert_eq!(r, JsValue::String("1:2".into()));
+    }
+
+    /// `search` returns `-1` when the regexp does not match.
+    #[test]
+    fn e2e_string_search_regexp_no_match() {
+        let r = global_eval("'abc'.search(/\\d+/)").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    /// RegExp `split` treats negative limits via `ToUint32`.
+    #[test]
+    fn e2e_split_regexp_negative_limit_wraps() {
+        let r = global_eval("'a1b2'.split(/(\\d)/, -1).join('|')").unwrap();
+        assert_eq!(r, JsValue::String("a|1|b|2|".into()));
+    }
+
+    /// RegExp `split` with `NaN` limit returns an empty array.
+    #[test]
+    fn e2e_split_regexp_nan_limit_is_zero() {
+        let r = global_eval("'a1b2'.split(/(\\d)/, NaN).length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// RegExp `split` with `Infinity` limit returns an empty array.
+    #[test]
+    fn e2e_split_regexp_infinity_limit_is_zero() {
+        let r = global_eval("'a1b2'.split(/(\\d)/, Infinity).length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// RegExp `split` with captures counts the limit in result elements even around astral chars.
+    #[test]
+    fn e2e_split_regexp_limit_counts_utf16_agnostic_parts() {
+        let r = global_eval("'😀1😀2x'.split(/(\\d)/, 4).join('|')").unwrap();
+        assert_eq!(r, JsValue::String("😀|1|😀|2".into()));
+    }
+
+    /// `String.prototype.at(-Infinity)` returns `undefined`.
+    #[test]
+    fn e2e_string_at_negative_infinity_is_undefined() {
+        let r = global_eval("'hello'.at(-Infinity) === undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `String.prototype.at` truncates fractional negative indices.
+    #[test]
+    fn e2e_string_at_fractional_negative_truncates() {
+        let r = global_eval("'hello'.at(-1.9)").unwrap();
+        assert_eq!(r, JsValue::String("o".into()));
+    }
+
+    /// `String.prototype.at` returns `undefined` when the negative index is too small.
+    #[test]
+    fn e2e_string_at_too_negative_is_undefined() {
+        let r = global_eval("'hello'.at(-99) === undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `trimStart` removes a leading BOM.
+    #[test]
+    fn e2e_trim_start_bom() {
+        let r = global_eval("'\\uFEFFhello'.trimStart()").unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    /// `trimEnd` removes a trailing BOM.
+    #[test]
+    fn e2e_trim_end_bom() {
+        let r = global_eval("'hello\\uFEFF'.trimEnd()").unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    /// `trimStart` removes a leading non-breaking space.
+    #[test]
+    fn e2e_trim_start_nbsp() {
+        let r = global_eval("'\\u00A0hello'.trimStart()").unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    /// `trimEnd` removes a trailing paragraph separator.
+    #[test]
+    fn e2e_trim_end_paragraph_separator() {
+        let r = global_eval("'hello\\u2029'.trimEnd()").unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    /// `trimStart` trims only the leading ECMAScript whitespace.
+    #[test]
+    fn e2e_trim_start_preserves_trailing_ecmascript_whitespace() {
+        let r = global_eval("'\\uFEFFhello\\u00A0'.trimStart()").unwrap();
+        assert_eq!(r, JsValue::String("hello\u{00A0}".into()));
+    }
+
+    /// `trimEnd` trims only the trailing ECMAScript whitespace.
+    #[test]
+    fn e2e_trim_end_preserves_leading_ecmascript_whitespace() {
+        let r = global_eval("'\\u00A0hello\\uFEFF'.trimEnd()").unwrap();
+        assert_eq!(r, JsValue::String("\u{00A0}hello".into()));
     }
 
     /// `slice(-2)` returns last 2 characters.

@@ -132,6 +132,47 @@ fn clamp_index(index: i64, len: usize) -> usize {
     }
 }
 
+/// Returns whether `ch` is trimmed by ECMAScript `TrimString`.
+fn is_ecmascript_trim_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0009}'
+            | '\u{000A}'
+            | '\u{000B}'
+            | '\u{000C}'
+            | '\u{000D}'
+            | '\u{0020}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'
+            ..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
+    )
+}
+
+fn trim_start_index(s: &str) -> usize {
+    for (idx, ch) in s.char_indices() {
+        if !is_ecmascript_trim_char(ch) {
+            return idx;
+        }
+    }
+    s.len()
+}
+
+fn trim_end_index(s: &str) -> usize {
+    for (idx, ch) in s.char_indices().rev() {
+        if !is_ecmascript_trim_char(ch) {
+            return idx + ch.len_utf8();
+        }
+    }
+    0
+}
+
 // UTF-16 surrogate range boundaries (Unicode §3.8).
 /// First code unit of a high (leading) surrogate pair.
 const UTF16_HIGH_SURROGATE_START: u16 = 0xD800;
@@ -588,7 +629,9 @@ pub fn string_to_lower_case(s: &str) -> String {
 /// assert_eq!(string_trim("\t\nhello\r\n"), "hello");
 /// ```
 pub fn string_trim(s: &str) -> String {
-    s.trim().to_string()
+    let start = trim_start_index(s);
+    let end = trim_end_index(&s[start..]) + start;
+    s[start..end].to_string()
 }
 
 /// ECMAScript §22.1.3.32 `String.prototype.trimStart()`.
@@ -603,7 +646,7 @@ pub fn string_trim(s: &str) -> String {
 /// assert_eq!(string_trim_start("  hello  "), "hello  ");
 /// ```
 pub fn string_trim_start(s: &str) -> String {
-    s.trim_start().to_string()
+    s[trim_start_index(s)..].to_string()
 }
 
 /// ECMAScript §22.1.3.33 `String.prototype.trimEnd()`.
@@ -618,7 +661,7 @@ pub fn string_trim_start(s: &str) -> String {
 /// assert_eq!(string_trim_end("  hello  "), "  hello");
 /// ```
 pub fn string_trim_end(s: &str) -> String {
-    s.trim_end().to_string()
+    s[..trim_end_index(s)].to_string()
 }
 
 // ── split ─────────────────────────────────────────────────────────────────────
@@ -962,8 +1005,12 @@ pub fn string_pad_end(
 /// ```
 pub fn string_at(s: &str, index: i64) -> Option<String> {
     let units = encode_utf16(s);
-    let len = units.len() as i64;
-    let actual = if index < 0 { len + index } else { index };
+    let len = units.len() as i128;
+    let actual = if index < 0 {
+        len + i128::from(index)
+    } else {
+        i128::from(index)
+    };
     if actual < 0 || actual >= len {
         return None;
     }
