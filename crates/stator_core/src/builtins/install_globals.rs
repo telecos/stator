@@ -1805,6 +1805,11 @@ fn make_error_constructor(kind: ErrorKind) -> JsValue {
             ));
         }
         let mut err = JsError::new(kind, message);
+        if let Some(ref cause_val) = cause {
+            err.props
+                .borrow_mut()
+                .insert("cause".to_string(), cause_val.clone());
+        }
         err.cause = cause;
         Ok(JsValue::Error(Rc::new(err)))
     })
@@ -1915,6 +1920,16 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
             ));
         }
         let mut err = JsError::new_aggregate(inner_errors, message);
+        // Store `errors` as an own property so that `hasOwnProperty` and
+        // the `in` operator see it via the props overlay.
+        err.props
+            .borrow_mut()
+            .insert("errors".to_string(), JsValue::new_array(err.errors.clone()));
+        if let Some(ref cause_val) = cause {
+            err.props
+                .borrow_mut()
+                .insert("cause".to_string(), cause_val.clone());
+        }
         err.cause = cause;
         Ok(JsValue::Error(Rc::new(err)))
     });
@@ -34103,5 +34118,431 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::String("tdz".into()));
+    }
+
+    // ── Error.cause and error-subtype conformance ───────────────────────
+
+    /// new Error("msg", { cause: 42 }).cause === 42
+    #[test]
+    fn e2e_error_cause_number() {
+        let r = global_eval(r#"new Error("msg", { cause: 42 }).cause"#).unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// new Error("msg", { cause: "reason" }).cause === "reason"
+    #[test]
+    fn e2e_error_cause_string() {
+        let r = global_eval(r#"new Error("msg", { cause: "reason" }).cause"#).unwrap();
+        assert_eq!(r, JsValue::String("reason".into()));
+    }
+
+    /// Error cause can be another Error object.
+    #[test]
+    fn e2e_error_cause_is_error() {
+        let r = global_eval(
+            r#"
+            var inner = new Error("inner");
+            var outer = new Error("outer", { cause: inner });
+            outer.cause.message;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("inner".into()));
+    }
+
+    /// Error without cause option → .cause is undefined.
+    #[test]
+    fn e2e_error_no_cause_is_undefined() {
+        let r = global_eval(r#"typeof new Error("msg").cause"#).unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// hasOwnProperty("cause") is true when cause is set.
+    #[test]
+    fn e2e_error_has_own_property_cause() {
+        let r = global_eval(r#"new Error("msg", { cause: 1 }).hasOwnProperty("cause")"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// hasOwnProperty("cause") is false when cause is not set.
+    #[test]
+    fn e2e_error_no_cause_has_own_property_false() {
+        let r = global_eval(r#"new Error("msg").hasOwnProperty("cause")"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// TypeError supports cause option.
+    #[test]
+    fn e2e_type_error_cause() {
+        let r = global_eval(r#"new TypeError("t", { cause: "tc" }).cause"#).unwrap();
+        assert_eq!(r, JsValue::String("tc".into()));
+    }
+
+    /// RangeError supports cause option.
+    #[test]
+    fn e2e_range_error_cause() {
+        let r = global_eval(r#"new RangeError("r", { cause: 99 }).cause"#).unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    /// ReferenceError supports cause option.
+    #[test]
+    fn e2e_reference_error_cause() {
+        let r = global_eval(r#"new ReferenceError("r", { cause: true }).cause"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// SyntaxError supports cause option.
+    #[test]
+    fn e2e_syntax_error_cause() {
+        let r = global_eval(r#"new SyntaxError("s", { cause: null }).cause"#).unwrap();
+        assert_eq!(r, JsValue::Null);
+    }
+
+    /// URIError supports cause option.
+    #[test]
+    fn e2e_uri_error_cause() {
+        let r = global_eval(r#"new URIError("u", { cause: false }).cause"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// EvalError supports cause option.
+    #[test]
+    fn e2e_eval_error_cause() {
+        let r = global_eval(r#"new EvalError("e", { cause: 7 }).cause"#).unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    /// AggregateError supports cause option (third arg).
+    #[test]
+    fn e2e_aggregate_error_cause() {
+        let r = global_eval(r#"new AggregateError([], "ae", { cause: "root" }).cause"#).unwrap();
+        assert_eq!(r, JsValue::String("root".into()));
+    }
+
+    /// AggregateError .errors returns the array of inner errors.
+    #[test]
+    fn e2e_aggregate_error_errors_length() {
+        let r = global_eval(r#"new AggregateError([1, 2, 3], "ae").errors.length"#).unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// AggregateError .errors contains the right values.
+    #[test]
+    fn e2e_aggregate_error_errors_values() {
+        let r = global_eval(
+            r#"
+            var ae = new AggregateError(["a", "b"], "ae");
+            ae.errors[0] + ae.errors[1];
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("ab".into()));
+    }
+
+    /// AggregateError .errors is own property.
+    #[test]
+    fn e2e_aggregate_error_has_own_errors() {
+        let r = global_eval(r#"new AggregateError([], "x").hasOwnProperty("errors")"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// AggregateError .name is "AggregateError".
+    #[test]
+    fn e2e_aggregate_error_name() {
+        let r = global_eval(r#"new AggregateError([], "x").name"#).unwrap();
+        assert_eq!(r, JsValue::String("AggregateError".into()));
+    }
+
+    /// AggregateError .message is set correctly.
+    #[test]
+    fn e2e_aggregate_error_message() {
+        let r = global_eval(r#"new AggregateError([], "hello").message"#).unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    /// AggregateError instanceof AggregateError and Error.
+    #[test]
+    fn e2e_aggregate_error_instanceof() {
+        let r = global_eval(
+            r#"
+            var ae = new AggregateError([], "ae");
+            ae instanceof AggregateError && ae instanceof Error;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// AggregateError .toString() produces correct string.
+    #[test]
+    fn e2e_aggregate_error_to_string() {
+        let r = global_eval(r#"new AggregateError([], "oops").toString()"#).unwrap();
+        assert_eq!(r, JsValue::String("AggregateError: oops".into()));
+    }
+
+    /// Error.prototype.name default is "Error".
+    #[test]
+    fn e2e_error_prototype_name_default() {
+        let r = global_eval("Error.prototype.name").unwrap();
+        assert_eq!(r, JsValue::String("Error".into()));
+    }
+
+    /// TypeError.prototype.name default is "TypeError".
+    #[test]
+    fn e2e_type_error_prototype_name_default() {
+        let r = global_eval("TypeError.prototype.name").unwrap();
+        assert_eq!(r, JsValue::String("TypeError".into()));
+    }
+
+    /// RangeError.prototype.name default is "RangeError".
+    #[test]
+    fn e2e_range_error_prototype_name_default() {
+        let r = global_eval("RangeError.prototype.name").unwrap();
+        assert_eq!(r, JsValue::String("RangeError".into()));
+    }
+
+    /// Error .toString() with no message returns just the name.
+    #[test]
+    fn e2e_error_to_string_no_message() {
+        let r = global_eval(r#"new Error().toString()"#).unwrap();
+        assert_eq!(r, JsValue::String("Error".into()));
+    }
+
+    /// TypeError .toString() returns "TypeError: msg".
+    #[test]
+    fn e2e_type_error_to_string_with_msg() {
+        let r = global_eval(r#"new TypeError("oops").toString()"#).unwrap();
+        assert_eq!(r, JsValue::String("TypeError: oops".into()));
+    }
+
+    /// RangeError .toString() returns "RangeError: msg".
+    #[test]
+    fn e2e_range_error_to_string_with_msg() {
+        let r = global_eval(r#"new RangeError("out").toString()"#).unwrap();
+        assert_eq!(r, JsValue::String("RangeError: out".into()));
+    }
+
+    /// instanceof Error is true for all native error subtypes.
+    #[test]
+    fn e2e_all_subtypes_instanceof_error() {
+        let r = global_eval(
+            r#"
+            new TypeError("a") instanceof Error
+            && new RangeError("b") instanceof Error
+            && new ReferenceError("c") instanceof Error
+            && new SyntaxError("d") instanceof Error
+            && new URIError("e") instanceof Error
+            && new EvalError("f") instanceof Error;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// instanceof specific subtype is true.
+    #[test]
+    fn e2e_subtype_instanceof_self() {
+        let r = global_eval(
+            r#"
+            new TypeError("a") instanceof TypeError
+            && new RangeError("b") instanceof RangeError
+            && new ReferenceError("c") instanceof ReferenceError
+            && new SyntaxError("d") instanceof SyntaxError
+            && new URIError("e") instanceof URIError
+            && new EvalError("f") instanceof EvalError;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// TypeError is not instanceof RangeError (cross-subtype).
+    #[test]
+    fn e2e_cross_subtype_instanceof_false() {
+        let r = global_eval("new TypeError('a') instanceof RangeError").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Custom subclass extends TypeError.
+    #[test]
+    fn e2e_custom_subclass_extends_type_error() {
+        let r = global_eval(
+            r#"
+            class MyTypeError extends TypeError {
+                constructor(msg) { super(msg); this.name = "MyTypeError"; }
+            }
+            var e = new MyTypeError("custom");
+            e instanceof MyTypeError && e instanceof TypeError && e instanceof Error;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Custom subclass preserves message.
+    #[test]
+    fn e2e_custom_subclass_message() {
+        let r = global_eval(
+            r#"
+            class AppError extends Error {
+                constructor(msg) { super(msg); this.name = "AppError"; }
+            }
+            new AppError("fail").message;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("fail".into()));
+    }
+
+    /// Custom subclass toString uses overridden name.
+    #[test]
+    fn e2e_custom_subclass_to_string() {
+        let r = global_eval(
+            r#"
+            class AppError extends Error {
+                constructor(msg) { super(msg); this.name = "AppError"; }
+            }
+            new AppError("fail").toString();
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("AppError: fail".into()));
+    }
+
+    /// Custom subclass supports cause option.
+    #[test]
+    fn e2e_custom_subclass_cause() {
+        let r = global_eval(
+            r#"
+            class AppError extends Error {
+                constructor(msg, opts) { super(msg, opts); }
+            }
+            new AppError("fail", { cause: "root" }).cause;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("root".into()));
+    }
+
+    /// Error .hasOwnProperty("message") is true.
+    #[test]
+    fn e2e_error_has_own_message() {
+        let r = global_eval(r#"new Error("hi").hasOwnProperty("message")"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Error .hasOwnProperty("stack") is true.
+    #[test]
+    fn e2e_error_has_own_stack() {
+        let r = global_eval(r#"new Error("hi").hasOwnProperty("stack")"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Error.isError recognises Error instances.
+    #[test]
+    fn e2e_error_is_error() {
+        let r = global_eval(r#"Error.isError(new Error("x"))"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Error.isError recognises TypeError instances.
+    #[test]
+    fn e2e_error_is_error_type_error() {
+        let r = global_eval(r#"Error.isError(new TypeError("x"))"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Error.isError returns false for plain objects.
+    #[test]
+    fn e2e_error_is_error_plain_object_false() {
+        let r = global_eval(r#"Error.isError({ message: "x" })"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// Error cause chain — nested causes.
+    #[test]
+    fn e2e_error_cause_chain() {
+        let r = global_eval(
+            r#"
+            var e1 = new Error("a");
+            var e2 = new Error("b", { cause: e1 });
+            var e3 = new Error("c", { cause: e2 });
+            e3.cause.cause.message;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a".into()));
+    }
+
+    /// try/catch preserves cause through throw.
+    #[test]
+    fn e2e_try_catch_cause_preserved() {
+        let r = global_eval(
+            r#"
+            try {
+                throw new TypeError("inner");
+            } catch (orig) {
+                try {
+                    throw new Error("outer", { cause: orig });
+                } catch (e) {
+                    e.cause.message;
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("inner".into()));
+    }
+
+    /// AggregateError with cause AND errors.
+    #[test]
+    fn e2e_aggregate_error_cause_and_errors() {
+        let r = global_eval(
+            r#"
+            var ae = new AggregateError(["e1", "e2"], "agg", { cause: "root" });
+            ae.cause + ":" + ae.errors.length;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("root:2".into()));
+    }
+
+    /// Subtype .name defaults — all subtypes report correct .name.
+    #[test]
+    fn e2e_all_subtype_names() {
+        let r = global_eval(
+            r#"
+            [
+                new TypeError().name,
+                new RangeError().name,
+                new ReferenceError().name,
+                new SyntaxError().name,
+                new URIError().name,
+                new EvalError().name
+            ].join(",");
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            JsValue::String(
+                "TypeError,RangeError,ReferenceError,SyntaxError,URIError,EvalError".into()
+            )
+        );
+    }
+
+    /// Error constructor without new (called as function) still creates error.
+    #[test]
+    fn e2e_error_called_as_function() {
+        let r = global_eval(r#"Error("called").message"#).unwrap();
+        assert_eq!(r, JsValue::String("called".into()));
+    }
+
+    /// TypeError called as function.
+    #[test]
+    fn e2e_type_error_called_as_function() {
+        let r = global_eval(r#"TypeError("called").message"#).unwrap();
+        assert_eq!(r, JsValue::String("called".into()));
     }
 }

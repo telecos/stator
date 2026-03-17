@@ -4926,10 +4926,12 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     if e.props.borrow().contains_key(&prop) {
                         return Ok(JsValue::Boolean(true));
                     }
-                    Ok(JsValue::Boolean(matches!(
-                        prop.as_str(),
-                        "name" | "message" | "stack"
-                    )))
+                    Ok(JsValue::Boolean(
+                        matches!(prop.as_str(), "message" | "stack")
+                            || (prop == "cause" && e.cause.is_some())
+                            || (prop == "errors"
+                                && e.kind == crate::builtins::error::ErrorKind::AggregateError),
+                    ))
                 }))
             }
             "propertyIsEnumerable" => {
