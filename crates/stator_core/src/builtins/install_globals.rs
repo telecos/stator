@@ -10211,9 +10211,9 @@ fn make_regexp() -> JsValue {
                         {
                             f(vec![this.clone()])?.to_js_string()?
                         } else {
-                            match map.borrow().get("source") {
-                                Some(JsValue::String(s)) => s.to_string(),
-                                _ => "(?:)".to_string(),
+                            match map.borrow().get("source").cloned() {
+                                Some(JsValue::Undefined) | None => "(?:)".to_string(),
+                                Some(value) => value.to_js_string()?,
                             }
                         };
                         let flags = if let Some(JsValue::NativeFunction(f)) =
@@ -10221,14 +10221,16 @@ fn make_regexp() -> JsValue {
                         {
                             f(vec![this.clone()])?.to_js_string()?
                         } else {
-                            match map.borrow().get("flags") {
-                                Some(JsValue::String(s)) => s.to_string(),
-                                _ => String::new(),
+                            match map.borrow().get("flags").cloned() {
+                                Some(JsValue::Undefined) | None => String::new(),
+                                Some(value) => value.to_js_string()?,
                             }
                         };
                         Ok(JsValue::String(format!("/{source}/{flags}").into()))
                     } else {
-                        Ok(JsValue::String("/(?:)/".to_string().into()))
+                        Err(crate::error::StatorError::TypeError(
+                            "RegExp.prototype.toString requires that 'this' be an Object".into(),
+                        ))
                     }
                 }),
             );
@@ -28723,6 +28725,247 @@ mod tests {
     fn e2e_split_regexp_captures() {
         let r = global_eval("'a1b2c'.split(/(\\d)/).join('|')").unwrap();
         assert_eq!(r, JsValue::String("a|1|b|2|c".into()));
+    }
+
+    /// Global `@@match` returns all matches and resets `lastIndex` to zero.
+    #[test]
+    fn e2e_regexp_symbol_match_global_resets_last_index() {
+        let r = global_eval(
+            "var re = /\\d+/g; var m = re[Symbol.match]('a1b22'); m.length + ':' + m[0] + ':' + m[1] + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("2:1:22:0".into()));
+    }
+
+    /// Sticky `@@match` behaves like `exec`, not the global array-returning path.
+    #[test]
+    fn e2e_regexp_symbol_match_sticky_returns_exec_shape() {
+        let r = global_eval(
+            "var re = /a/y; re.lastIndex = 1; var m = re[Symbol.match]('ba'); typeof m.index + ':' + m[0] + ':' + m.index + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("number:a:1:2".into()));
+    }
+
+    /// Sticky `@@match` failures reset `lastIndex` through `exec` semantics.
+    #[test]
+    fn e2e_regexp_symbol_match_sticky_failure_resets_last_index() {
+        let r = global_eval("var re = /a/y; re.lastIndex = 0; String(re[Symbol.match]('ba') === null) + ':' + re.lastIndex").unwrap();
+        assert_eq!(r, JsValue::String("true:0".into()));
+    }
+
+    /// Global `String.prototype.match` also resets `lastIndex` after iteration.
+    #[test]
+    fn e2e_string_match_global_resets_last_index() {
+        let r = global_eval(
+            "var re = /\\d+/g; var m = 'a1b22'.match(re); m.length + ':' + m[0] + ':' + m[1] + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("2:1:22:0".into()));
+    }
+
+    /// A failed global `match` leaves `lastIndex` at zero.
+    #[test]
+    fn e2e_string_match_global_failure_resets_last_index() {
+        let r = global_eval("var re = /z/g; re.lastIndex = 3; String('abc'.match(re) === null) + ':' + re.lastIndex").unwrap();
+        assert_eq!(r, JsValue::String("true:0".into()));
+    }
+
+    /// `@@search` ignores the current `lastIndex` and restores it afterwards.
+    #[test]
+    fn e2e_regexp_symbol_search_restores_last_index() {
+        let r = global_eval(
+            "var re = /a/g; re.lastIndex = 2; re[Symbol.search]('ba') + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1:2".into()));
+    }
+
+    /// Sticky `@@search` still searches from index zero.
+    #[test]
+    fn e2e_regexp_symbol_search_sticky_matches_from_zero() {
+        let r = global_eval(
+            "var re = /a/y; re.lastIndex = 1; re[Symbol.search]('abc') + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0:1".into()));
+    }
+
+    /// Sticky `@@search` returns `-1` when the anchored zero-index match fails.
+    #[test]
+    fn e2e_regexp_symbol_search_sticky_failure() {
+        let r = global_eval(
+            "var re = /b/y; re.lastIndex = 1; re[Symbol.search]('abc') + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("-1:1".into()));
+    }
+
+    /// String `search` delegates to the same sticky-aware `@@search` semantics.
+    #[test]
+    fn e2e_string_search_sticky_ignores_existing_last_index() {
+        let r =
+            global_eval("var re = /b/y; re.lastIndex = 2; 'abc'.search(re) + ':' + re.lastIndex")
+                .unwrap();
+        assert_eq!(r, JsValue::String("-1:2".into()));
+    }
+
+    /// Regex function replacers receive the named captures object as the last argument.
+    #[test]
+    fn e2e_replace_regex_function_replacer_named_groups_object() {
+        let r = global_eval(
+            "'2024-07'.replace(/(?<y>\\d{4})-(?<m>\\d{2})/, function(match, y, m, offset, string, groups) { return groups.y + '/' + groups.m + ':' + offset + ':' + string; })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("2024/07:0:2024-07".into()));
+    }
+
+    /// Regex function replacers receive `undefined` for the groups argument when there are no named captures.
+    #[test]
+    fn e2e_replace_regex_function_replacer_groups_undefined_without_named_captures() {
+        let r = global_eval(
+            "'a'.replace(/a/, function(match, offset, string, groups) { return String(groups === undefined) + ':' + offset + ':' + string; })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true:0:a".into()));
+    }
+
+    /// Global regex function replacers can use named groups for every match.
+    #[test]
+    fn e2e_replace_regex_function_replacer_global_named_groups() {
+        let r = global_eval(
+            "'2024-07 and 1999-12'.replace(/(?<y>\\d{4})-(?<m>\\d{2})/g, function(match, y, m, offset, string, groups) { return groups.m + '/' + groups.y; })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("07/2024 and 12/1999".into()));
+    }
+
+    /// Global `@@replace` resets `lastIndex` after exhausting matches.
+    #[test]
+    fn e2e_regexp_symbol_replace_global_resets_last_index() {
+        let r = global_eval("var re = /\\d/g; re[Symbol.replace]('a1b2', function() { return 'x'; }); String(re.lastIndex)").unwrap();
+        assert_eq!(r, JsValue::String("0".into()));
+    }
+
+    /// Sticky non-global `@@replace` honors `lastIndex` and updates it once.
+    #[test]
+    fn e2e_regexp_symbol_replace_sticky_uses_current_last_index() {
+        let r = global_eval("var re = /a/y; re.lastIndex = 1; re[Symbol.replace]('baaa', function() { return 'X'; }) + ':' + re.lastIndex").unwrap();
+        assert_eq!(r, JsValue::String("bXaa:2".into()));
+    }
+
+    /// Failed sticky replacements reset `lastIndex`.
+    #[test]
+    fn e2e_regexp_symbol_replace_sticky_failure_resets_last_index() {
+        let r = global_eval("var re = /a/y; re.lastIndex = 0; re[Symbol.replace]('baaa', function() { return 'X'; }) + ':' + re.lastIndex").unwrap();
+        assert_eq!(r, JsValue::String("baaa:0".into()));
+    }
+
+    /// Named capture replacement text uses the resolved groups object.
+    #[test]
+    fn e2e_replace_regex_named_capture_text_replacement() {
+        let r = global_eval("'2024-07'.replace(/(?<y>\\d{4})-(?<m>\\d{2})/, '$<m>/$<y>')").unwrap();
+        assert_eq!(r, JsValue::String("07/2024".into()));
+    }
+
+    /// Missing named captures substitute the empty string in replacement text.
+    #[test]
+    fn e2e_replace_regex_named_capture_missing_group_is_empty() {
+        let r = global_eval("'a'.replace(/(?<x>b)?a/, '[$<x>]')").unwrap();
+        assert_eq!(r, JsValue::String("[]".into()));
+    }
+
+    /// RegExp `split` preserves `undefined` for nonparticipating captures.
+    #[test]
+    fn e2e_split_regexp_nonparticipating_capture_is_undefined() {
+        let r = global_eval("var parts = 'a-b'.split(/-(x)?/); String(parts[1] === undefined) + ':' + parts.length + ':' + parts[0] + ':' + parts[2]").unwrap();
+        assert_eq!(r, JsValue::String("true:3:a:b".into()));
+    }
+
+    /// RegExp `split` does not mutate the original regexp's `lastIndex`.
+    #[test]
+    fn e2e_split_regexp_preserves_original_last_index() {
+        let r = global_eval(
+            "var re = /-/g; re.lastIndex = 2; 'a-b-c'.split(re).join('|') + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a|b|c:2".into()));
+    }
+
+    /// Sticky RegExp `split` also preserves the original `lastIndex`.
+    #[test]
+    fn e2e_split_regexp_sticky_preserves_original_last_index() {
+        let r = global_eval(
+            "var re = /-/y; re.lastIndex = 2; 'a-b-c'.split(re).join('|') + ':' + re.lastIndex",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a|b|c:2".into()));
+    }
+
+    /// Zero-width regexp splitting produces character boundaries.
+    #[test]
+    fn e2e_split_regexp_zero_width_boundaries() {
+        let r = global_eval("'ab'.split(/(?:)/).join('|')").unwrap();
+        assert_eq!(r, JsValue::String("a|b".into()));
+    }
+
+    /// Splitting the empty string with an empty-matching regexp returns an empty array.
+    #[test]
+    fn e2e_split_regexp_empty_string_empty_match() {
+        let r = global_eval("''.split(/(?:)/).length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Split limits count both substrings and inserted capture values.
+    #[test]
+    fn e2e_split_regexp_limit_counts_undefined_capture() {
+        let r = global_eval("var parts = 'a-b'.split(/-(x)?/, 2); String(parts[1] === undefined) + ':' + parts.length").unwrap();
+        assert_eq!(r, JsValue::String("true:2".into()));
+    }
+
+    /// `RegExp.prototype.toString` throws for primitive receivers.
+    #[test]
+    fn e2e_regexp_prototype_to_string_requires_object_receiver() {
+        let r =
+            global_eval("try { RegExp.prototype.toString.call(1); 'nope'; } catch (e) { e.name; }")
+                .unwrap();
+        assert_eq!(r, JsValue::String("TypeError".into()));
+    }
+
+    /// `RegExp.prototype.toString` works on duck-typed objects.
+    #[test]
+    fn e2e_regexp_prototype_to_string_duck_typed_object() {
+        let r =
+            global_eval("RegExp.prototype.toString.call({ source: 'ab', flags: 'gi' })").unwrap();
+        assert_eq!(r, JsValue::String("/ab/gi".into()));
+    }
+
+    /// `RegExp.prototype.toString` stringifies non-string `source` and `flags` values.
+    #[test]
+    fn e2e_regexp_prototype_to_string_coerces_source_and_flags() {
+        let r = global_eval("RegExp.prototype.toString.call({ source: 12, flags: 34 })").unwrap();
+        assert_eq!(r, JsValue::String("/12/34".into()));
+    }
+
+    /// Constructing from another regexp keeps the source text raw and applies overriding flags.
+    #[test]
+    fn e2e_regexp_construct_from_regexp_overrides_flags_preserving_source() {
+        let r = global_eval("new RegExp(new RegExp('a/b', 'g'), 'i').toString()").unwrap();
+        assert_eq!(r, JsValue::String("/a\\/b/i".into()));
+    }
+
+    /// Constructing from another regexp resets the new instance's `lastIndex`.
+    #[test]
+    fn e2e_regexp_construct_from_regexp_resets_last_index() {
+        let r = global_eval("var re = /a/g; re.lastIndex = 2; var copy = new RegExp(re); String(copy.lastIndex) + ':' + copy.flags + ':' + copy.source").unwrap();
+        assert_eq!(r, JsValue::String("0:g:a".into()));
+    }
+
+    /// Constructing from a regexp preserves the raw source rather than stringifying `/source/flags`.
+    #[test]
+    fn e2e_regexp_construct_from_regexp_uses_source_not_literal_text() {
+        let r = global_eval("new RegExp(/a\\/b/g).source").unwrap();
+        assert_eq!(r, JsValue::String("a\\/b".into()));
     }
 
     /// Split without a separator returns the original string as one element.

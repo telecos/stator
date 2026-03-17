@@ -38,6 +38,7 @@ use bitflags::bitflags;
 use regress::{Flags as RegressFlags, Regex};
 
 use crate::error::{StatorError, StatorResult};
+use crate::objects::value::JsValue;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // RegExpFlags
@@ -386,7 +387,8 @@ impl JsRegExp {
             }
             Some(mat) => {
                 if is_stateful {
-                    self.last_index.set(mat.end());
+                    self.last_index
+                        .set(advance_string_index(input, mat.start(), mat.end()));
                 }
                 Some(build_match(
                     input,
@@ -422,41 +424,17 @@ impl JsRegExp {
     ///
     /// * **Non-global**: returns `Some` with the first [`RegExpMatch`], or
     ///   `None`.
-    /// * **Global / sticky**: resets `lastIndex` to `0`, then collects every
+    /// * **Global**: resets `lastIndex` to `0`, then collects every
     ///   non-overlapping matched string into a `Vec<String>`.  Returns `None`
     ///   if there are no matches.
     pub fn symbol_match(&self, input: &str) -> Option<SymbolMatchResult> {
-        if !self.flags.contains(RegExpFlags::GLOBAL) && !self.flags.contains(RegExpFlags::STICKY) {
-            // Non-global: behave like exec.
+        if !self.flags.contains(RegExpFlags::GLOBAL) {
             self.exec(input).map(SymbolMatchResult::Single)
         } else {
-            // Global/sticky: collect all matches.
             self.last_index.set(0);
             let mut matches: Vec<String> = Vec::new();
-            loop {
-                let start = self.last_index.get();
-                if start > input.len() {
-                    break;
-                }
-                let m = if self.flags.contains(RegExpFlags::STICKY) {
-                    self.compiled
-                        .find_from(input, start)
-                        .next()
-                        .filter(|m| m.start() == start)
-                } else {
-                    self.compiled.find_from(input, start).next()
-                };
-                match m {
-                    None => break,
-                    Some(mat) => {
-                        let end = mat.end();
-                        matches.push(input[mat.range()].to_string());
-                        // Advance by at least 1 to avoid infinite loops on
-                        // zero-length matches.
-                        self.last_index
-                            .set(if end > start { end } else { start + 1 });
-                    }
-                }
+            while let Some(matched) = self.exec(input) {
+                matches.push(matched.matched);
             }
             if matches.is_empty() {
                 None
@@ -483,47 +461,30 @@ impl JsRegExp {
     /// When the `g` flag is set all matches are replaced; otherwise only the
     /// first match is replaced.
     pub fn symbol_replace(&self, input: &str, replacement: &str) -> String {
-        let global =
-            self.flags.contains(RegExpFlags::GLOBAL) || self.flags.contains(RegExpFlags::STICKY);
+        let global = self.flags.contains(RegExpFlags::GLOBAL);
         if global {
             self.last_index.set(0);
         }
+        let mut matches = Vec::new();
+        if global {
+            while let Some(matched) = self.exec(input) {
+                matches.push(matched);
+            }
+        } else if let Some(matched) = self.exec(input) {
+            matches.push(matched);
+        }
+
+        if matches.is_empty() {
+            return input.to_string();
+        }
+
         let mut result = String::new();
         let mut last_end = 0_usize;
-
-        loop {
-            let start = if global { self.last_index.get() } else { 0 };
-            if start > input.len() {
-                break;
-            }
-            let m = if self.flags.contains(RegExpFlags::STICKY) {
-                self.compiled
-                    .find_from(input, start)
-                    .next()
-                    .filter(|m| m.start() == start)
-            } else {
-                self.compiled.find_from(input, start).next()
-            };
-            match m {
-                None => break,
-                Some(mat) => {
-                    let rm = build_match(input, &mat, false);
-                    // Append the portion of input before this match.
-                    result.push_str(&input[last_end..rm.index]);
-                    // Apply replacement.
-                    result.push_str(&apply_replacement(replacement, &rm, input));
-                    let end = mat.end();
-                    last_end = end;
-                    if global {
-                        self.last_index
-                            .set(if end > start { end } else { start + 1 });
-                    } else {
-                        break;
-                    }
-                }
-            }
+        for matched in matches {
+            result.push_str(&input[last_end..matched.index]);
+            result.push_str(&apply_replacement(replacement, &matched, input));
+            last_end = matched.index + matched.matched.len();
         }
-        // Append the remainder of the input.
         result.push_str(&input[last_end..]);
         result
     }
@@ -535,48 +496,78 @@ impl JsRegExp {
     pub fn symbol_search(&self, input: &str) -> i64 {
         let saved = self.last_index.get();
         self.last_index.set(0);
-        let result = self.compiled.find(input).map_or(-1, |m| m.start() as i64);
+        let result = self.exec(input).map_or(-1, |m| m.index as i64);
         self.last_index.set(saved);
         result
     }
 
     /// ECMAScript `RegExp.prototype[Symbol.split](string[, limit])`.
     ///
-    /// Splits `input` around each match and returns the parts as a
-    /// `Vec<String>`.  Capture groups are included in the result between the
-    /// surrounding parts, matching ECMAScript semantics.
+    /// Splits `input` around each match and returns the parts as JavaScript
+    /// values. Capture groups are included in the result between the
+    /// surrounding parts, with nonparticipating groups surfaced as
+    /// `undefined`, matching ECMAScript semantics.
     ///
     /// If `limit` is `Some(0)` an empty `Vec` is returned immediately.
-    pub fn symbol_split(&self, input: &str, limit: Option<usize>) -> Vec<String> {
+    pub fn symbol_split(&self, input: &str, limit: Option<usize>) -> Vec<JsValue> {
         let lim = limit.unwrap_or(usize::MAX);
         if lim == 0 {
             return Vec::new();
         }
-        let mut parts: Vec<String> = Vec::new();
-        let mut last_end = 0_usize;
 
-        for mat in self.compiled.find_iter(input) {
-            if parts.len() >= lim {
-                break;
-            }
-            // Push the part before this match.
-            parts.push(input[last_end..mat.start()].to_string());
-            // Push each capture group (None → empty string, per ES spec).
-            for cap in &mat.captures {
-                if parts.len() >= lim {
-                    break;
-                }
-                parts.push(
-                    cap.as_ref()
-                        .map_or(String::new(), |r| input[r.clone()].to_string()),
-                );
-            }
-            last_end = mat.end();
+        let mut flags = self.flags;
+        flags.remove(RegExpFlags::GLOBAL);
+        flags.insert(RegExpFlags::STICKY);
+        let splitter = Self::new(&self.pattern, &flags.to_flags_string())
+            .expect("existing RegExp pattern and flags must remain valid");
+
+        if input.is_empty() {
+            splitter.set_last_index(0);
+            return if splitter.exec(input).is_some() {
+                Vec::new()
+            } else {
+                vec![JsValue::String(String::new().into())]
+            };
         }
 
-        // Push the trailing portion (only if we haven't hit the limit).
+        let mut parts = Vec::new();
+        let mut p = 0usize;
+        let mut q = 0usize;
+
+        while q < input.len() {
+            splitter.set_last_index(q);
+            let Some(matched) = splitter.exec(input) else {
+                q = advance_string_index_by_char(input, q);
+                continue;
+            };
+
+            let e = splitter.last_index();
+            if e == p {
+                q = advance_string_index_by_char(input, q);
+                continue;
+            }
+
+            parts.push(JsValue::String(input[p..matched.index].to_string().into()));
+            if parts.len() == lim {
+                return parts;
+            }
+
+            for capture in matched.captures {
+                parts.push(match capture {
+                    Some(value) => JsValue::String(value.into()),
+                    None => JsValue::Undefined,
+                });
+                if parts.len() == lim {
+                    return parts;
+                }
+            }
+
+            p = e;
+            q = e;
+        }
+
         if parts.len() < lim {
-            parts.push(input[last_end..].to_string());
+            parts.push(JsValue::String(input[p..].to_string().into()));
         }
         parts
     }
@@ -623,13 +614,13 @@ impl JsRegExp {
 ///
 /// * [`Single`][SymbolMatchResult::Single] — non-global match, returns the
 ///   full exec result.
-/// * [`All`][SymbolMatchResult::All] — global/sticky match, returns the list
-///   of matched strings.
+/// * [`All`][SymbolMatchResult::All] — global match, returns the list of
+///   matched strings.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SymbolMatchResult {
     /// Result of a non-global `Symbol.match` call.
     Single(RegExpMatch),
-    /// Result of a global/sticky `Symbol.match` call: all matched strings.
+    /// Result of a global `Symbol.match` call: all matched strings.
     All(Vec<String>),
 }
 
@@ -650,6 +641,22 @@ fn build_regress_flags(f: RegExpFlags) -> RegressFlags {
         unicode_sets: f.contains(RegExpFlags::UNICODE_SETS),
         no_opt: false,
     }
+}
+
+fn advance_string_index(input: &str, start: usize, end: usize) -> usize {
+    if end > start {
+        end
+    } else {
+        advance_string_index_by_char(input, start)
+    }
+}
+
+fn advance_string_index_by_char(input: &str, index: usize) -> usize {
+    if index >= input.len() {
+        return index.saturating_add(1);
+    }
+    let next = input[index..].chars().next().map_or(1, char::len_utf8);
+    index + next
 }
 
 /// Converts a [`regress::Match`] into a [`RegExpMatch`].
@@ -1022,6 +1029,7 @@ mod tests {
         let result = re.symbol_match("a1 b22 c333").unwrap();
         if let SymbolMatchResult::All(v) = result {
             assert_eq!(v, vec!["1", "22", "333"]);
+            assert_eq!(re.last_index(), 0);
         } else {
             panic!("expected All");
         }
@@ -1045,6 +1053,7 @@ mod tests {
     fn test_symbol_replace_global() {
         let re = JsRegExp::new(r"\d+", "g").unwrap();
         assert_eq!(re.symbol_replace("a1 b2 c3", "N"), "aN bN cN");
+        assert_eq!(re.last_index(), 0);
     }
 
     #[test]
@@ -1104,24 +1113,42 @@ mod tests {
         assert_eq!(re.last_index(), 5); // restored
     }
 
+    #[test]
+    fn test_symbol_search_respects_sticky_semantics() {
+        let re = JsRegExp::new("b", "y").unwrap();
+        re.set_last_index(3);
+        assert_eq!(re.symbol_search("abc"), -1);
+        assert_eq!(re.last_index(), 3);
+    }
+
     // ── Symbol.split ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_symbol_split_basic() {
         let re = JsRegExp::new(",", "").unwrap();
-        assert_eq!(re.symbol_split("a,b,c", None), vec!["a", "b", "c"]);
+        assert_eq!(
+            re.symbol_split("a,b,c", None),
+            vec![
+                JsValue::String("a".into()),
+                JsValue::String("b".into()),
+                JsValue::String("c".into())
+            ]
+        );
     }
 
     #[test]
     fn test_symbol_split_with_limit() {
         let re = JsRegExp::new(",", "").unwrap();
-        assert_eq!(re.symbol_split("a,b,c,d", Some(2)), vec!["a", "b"]);
+        assert_eq!(
+            re.symbol_split("a,b,c,d", Some(2)),
+            vec![JsValue::String("a".into()), JsValue::String("b".into())]
+        );
     }
 
     #[test]
     fn test_symbol_split_zero_limit() {
         let re = JsRegExp::new(",", "").unwrap();
-        assert_eq!(re.symbol_split("a,b,c", Some(0)), Vec::<String>::new());
+        assert_eq!(re.symbol_split("a,b,c", Some(0)), Vec::<JsValue>::new());
     }
 
     #[test]
@@ -1130,14 +1157,51 @@ mod tests {
         let re = JsRegExp::new(r"(\d+)", "").unwrap();
         assert_eq!(
             re.symbol_split("a1b2c", None),
-            vec!["a", "1", "b", "2", "c"]
+            vec![
+                JsValue::String("a".into()),
+                JsValue::String("1".into()),
+                JsValue::String("b".into()),
+                JsValue::String("2".into()),
+                JsValue::String("c".into())
+            ]
         );
     }
 
     #[test]
     fn test_symbol_split_no_match_returns_whole_string() {
         let re = JsRegExp::new(r"\d+", "").unwrap();
-        assert_eq!(re.symbol_split("abc", None), vec!["abc"]);
+        assert_eq!(
+            re.symbol_split("abc", None),
+            vec![JsValue::String("abc".into())]
+        );
+    }
+
+    #[test]
+    fn test_symbol_split_nonparticipating_capture_is_undefined() {
+        let re = JsRegExp::new(r"-(x)?", "").unwrap();
+        assert_eq!(
+            re.symbol_split("a-b", None),
+            vec![
+                JsValue::String("a".into()),
+                JsValue::Undefined,
+                JsValue::String("b".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_symbol_split_preserves_original_last_index() {
+        let re = JsRegExp::new("-", "g").unwrap();
+        re.set_last_index(2);
+        assert_eq!(
+            re.symbol_split("a-b-c", None),
+            vec![
+                JsValue::String("a".into()),
+                JsValue::String("b".into()),
+                JsValue::String("c".into())
+            ]
+        );
+        assert_eq!(re.last_index(), 2);
     }
 
     // ── Unicode property escapes ──────────────────────────────────────────────

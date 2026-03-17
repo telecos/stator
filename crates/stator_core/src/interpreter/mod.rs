@@ -3230,11 +3230,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 drop(borrow);
                                 let re = crate::objects::regexp::JsRegExp::new(&source, &flags)?;
                                 let parts = re.symbol_split(&s, limit);
-                                let items: Vec<JsValue> = parts
-                                    .into_iter()
-                                    .map(|p| JsValue::String(p.into()))
-                                    .collect();
-                                Ok(JsValue::new_array(items))
+                                Ok(JsValue::new_array(parts))
                             } else {
                                 Ok(JsValue::new_array(vec![JsValue::String(s.clone())]))
                             }
