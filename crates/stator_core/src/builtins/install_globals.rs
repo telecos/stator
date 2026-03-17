@@ -70,12 +70,12 @@ use crate::builtins::iterator::{
     async_iterator_flat_map, async_iterator_for_each, async_iterator_from, async_iterator_map,
     async_iterator_reduce, async_iterator_some, async_iterator_take, async_iterator_to_array,
     iterator_drop, iterator_every, iterator_filter, iterator_find, iterator_flat_map,
-    iterator_for_each, iterator_from, iterator_map, iterator_reduce, iterator_some, iterator_take,
-    iterator_to_array, iterator_to_vec,
+    iterator_for_each, iterator_from, iterator_map, iterator_next, iterator_reduce, iterator_some,
+    iterator_take, iterator_to_array, iterator_to_vec,
 };
 use crate::builtins::map::{
-    MapIteratorKind, map_clear, map_create_iterator, map_delete, map_entries, map_from_iterable,
-    map_get, map_has, map_new, map_set, map_size,
+    MapIteratorKind, map_clear, map_delete, map_from_iterable, map_get, map_has, map_new,
+    map_next_entry, map_next_iteration_item, map_set, map_size,
 };
 use crate::builtins::math::{
     MATH_E, MATH_LN2, MATH_LN10, MATH_LOG2E, MATH_LOG10E, MATH_PI, MATH_SQRT1_2, MATH_SQRT2,
@@ -96,8 +96,8 @@ use crate::builtins::proxy::{
 };
 use crate::builtins::regexp::{regexp_construct, regexp_static_get};
 use crate::builtins::set::{
-    SetIteratorKind, set_add, set_clear, set_create_iterator, set_delete, set_from_iterable,
-    set_has, set_new, set_size, set_values,
+    SetIteratorKind, set_add, set_clear, set_delete, set_from_iterable, set_has, set_new,
+    set_next_iteration_item, set_next_value, set_size, set_values,
 };
 use crate::builtins::string::{
     string_anchor, string_at, string_big, string_blink, string_bold, string_char_at,
@@ -626,6 +626,104 @@ fn is_callable(val: &JsValue) -> bool {
         JsValue::Proxy(proxy) => proxy.borrow().is_callable(),
         _ => false,
     }
+}
+
+fn attach_constructor_prototype(obj: &JsValue, ctor_name: &str) -> StatorResult<()> {
+    if let Some(proto) = constructor_prototype(ctor_name) {
+        ordinary_set_prototype_of(obj, proto)?;
+    }
+    Ok(())
+}
+
+fn iterator_method(value: &JsValue) -> StatorResult<JsValue> {
+    let method = dispatch_get_property_value(value, JsValue::Symbol(SYMBOL_ITERATOR))?;
+    if is_callable(&method) {
+        Ok(method)
+    } else {
+        Err(StatorError::TypeError("value is not iterable".into()))
+    }
+}
+
+fn iterable_to_items(value: &JsValue) -> StatorResult<Vec<JsValue>> {
+    let method = iterator_method(value)?;
+    let iterator = dispatch_call_with_this(&method, value.clone(), vec![])?;
+    let mut items = Vec::new();
+    loop {
+        let step = iterator_next(&iterator)?;
+        if step.done {
+            break;
+        }
+        items.push(step.value);
+    }
+    Ok(items)
+}
+
+fn iterable_to_map_pairs(value: &JsValue) -> StatorResult<Vec<(JsValue, JsValue)>> {
+    iterable_to_items(value)?
+        .into_iter()
+        .map(|item| {
+            if !item.is_object_like() {
+                return Err(StatorError::TypeError(
+                    "Map iterable value is not an object".into(),
+                ));
+            }
+            let key = dispatch_get_property_value(&item, JsValue::Smi(0))?;
+            let value = dispatch_get_property_value(&item, JsValue::Smi(1))?;
+            Ok((key, value))
+        })
+        .collect()
+}
+
+fn make_self_iterating_object(next_fn: JsValue) -> JsValue {
+    let obj_rc = Rc::new(RefCell::new(PropertyMap::new()));
+    let iterator = JsValue::PlainObject(Rc::clone(&obj_rc));
+    {
+        let mut obj = obj_rc.borrow_mut();
+        obj.insert("next".into(), next_fn);
+        let iterator_value = iterator.clone();
+        obj.insert(
+            "@@iterator".into(),
+            native(move |_| Ok(iterator_value.clone())),
+        );
+        obj.make_all_non_enumerable();
+    }
+    iterator
+}
+
+fn build_map_iterator_object(
+    inner: Rc<RefCell<crate::builtins::map::JsMap>>,
+    kind: MapIteratorKind,
+) -> JsValue {
+    let cursor = Rc::new(RefCell::new(0usize));
+    make_self_iterating_object(native(move |_| {
+        let mut cursor = cursor.borrow_mut();
+        let next = {
+            let map = inner.borrow();
+            map_next_iteration_item(&map, &mut cursor, kind)
+        };
+        Ok(match next {
+            Some(value) => crate::interpreter::make_iterator_result(value, false),
+            None => crate::interpreter::make_iterator_result(JsValue::Undefined, true),
+        })
+    }))
+}
+
+fn build_set_iterator_object(
+    inner: Rc<RefCell<crate::builtins::set::JsSet>>,
+    kind: SetIteratorKind,
+) -> JsValue {
+    let cursor = Rc::new(RefCell::new(0usize));
+    make_self_iterating_object(native(move |_| {
+        let mut cursor = cursor.borrow_mut();
+        let next = {
+            let set = inner.borrow();
+            set_next_iteration_item(&set, &mut cursor, kind)
+        };
+        Ok(match next {
+            Some(value) => crate::interpreter::make_iterator_result(value, false),
+            None => crate::interpreter::make_iterator_result(JsValue::Undefined, true),
+        })
+    }))
 }
 
 fn is_internal_accessor_key(key: &str) -> bool {
@@ -1424,7 +1522,7 @@ fn build_map_instance(m: crate::builtins::map::JsMap) -> StatorResult<JsValue> {
         {
             let inner = Rc::clone(&inner);
             obj.insert(
-                "get".into(),
+                "__map_get__".into(),
                 native(move |a| {
                     let key = a.first().unwrap_or(&JsValue::Undefined);
                     Ok(map_get(&inner.borrow(), key))
@@ -1435,7 +1533,7 @@ fn build_map_instance(m: crate::builtins::map::JsMap) -> StatorResult<JsValue> {
             let inner = Rc::clone(&inner);
             let self_ref = Rc::clone(&obj_rc);
             obj.insert(
-                "set".into(),
+                "__map_set__".into(),
                 native(move |a| {
                     let key = a.first().cloned().unwrap_or(JsValue::Undefined);
                     let val = a.get(1).cloned().unwrap_or(JsValue::Undefined);
@@ -1447,7 +1545,7 @@ fn build_map_instance(m: crate::builtins::map::JsMap) -> StatorResult<JsValue> {
         {
             let inner = Rc::clone(&inner);
             obj.insert(
-                "has".into(),
+                "__map_has__".into(),
                 native(move |a| {
                     let key = a.first().unwrap_or(&JsValue::Undefined);
                     Ok(JsValue::Boolean(map_has(&inner.borrow(), key)))
@@ -1457,7 +1555,7 @@ fn build_map_instance(m: crate::builtins::map::JsMap) -> StatorResult<JsValue> {
         {
             let inner = Rc::clone(&inner);
             obj.insert(
-                "delete".into(),
+                "__map_delete__".into(),
                 native(move |a| {
                     let key = a.first().unwrap_or(&JsValue::Undefined);
                     Ok(JsValue::Boolean(map_delete(&mut inner.borrow_mut(), key)))
@@ -1467,7 +1565,7 @@ fn build_map_instance(m: crate::builtins::map::JsMap) -> StatorResult<JsValue> {
         {
             let inner = Rc::clone(&inner);
             obj.insert(
-                "clear".into(),
+                "__map_clear__".into(),
                 native(move |_| {
                     map_clear(&mut inner.borrow_mut());
                     Ok(JsValue::Undefined)
@@ -1478,12 +1576,25 @@ fn build_map_instance(m: crate::builtins::map::JsMap) -> StatorResult<JsValue> {
             let inner = Rc::clone(&inner);
             let self_ref = Rc::clone(&obj_rc);
             obj.insert(
-                "forEach".into(),
+                "__map_for_each__".into(),
                 native(move |a| {
                     let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
-                    let snapshot = map_entries(&inner.borrow());
-                    for (k, v) in snapshot {
-                        call_callback(&cb, vec![v, k, JsValue::PlainObject(Rc::clone(&self_ref))])?;
+                    let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let receiver = JsValue::PlainObject(Rc::clone(&self_ref));
+                    let mut cursor = 0;
+                    loop {
+                        let next = {
+                            let map = inner.borrow();
+                            map_next_entry(&map, &mut cursor)
+                        };
+                        let Some((k, v)) = next else {
+                            break;
+                        };
+                        call_callback_with_this(
+                            &cb,
+                            this_arg.clone(),
+                            vec![v, k, receiver.clone()],
+                        )?;
                     }
                     Ok(JsValue::Undefined)
                 }),
@@ -1492,17 +1603,22 @@ fn build_map_instance(m: crate::builtins::map::JsMap) -> StatorResult<JsValue> {
         {
             let inner = Rc::clone(&inner);
             obj.insert(
-                "keys".into(),
-                native(move |_| Ok(map_create_iterator(&inner.borrow(), MapIteratorKind::Keys))),
+                "__map_keys__".into(),
+                native(move |_| {
+                    Ok(build_map_iterator_object(
+                        Rc::clone(&inner),
+                        MapIteratorKind::Keys,
+                    ))
+                }),
             );
         }
         {
             let inner = Rc::clone(&inner);
             obj.insert(
-                "values".into(),
+                "__map_values__".into(),
                 native(move |_| {
-                    Ok(map_create_iterator(
-                        &inner.borrow(),
+                    Ok(build_map_iterator_object(
+                        Rc::clone(&inner),
                         MapIteratorKind::Values,
                     ))
                 }),
@@ -1510,19 +1626,20 @@ fn build_map_instance(m: crate::builtins::map::JsMap) -> StatorResult<JsValue> {
         }
         {
             let inner = Rc::clone(&inner);
-            let entries_fn = native(move |_| {
-                Ok(map_create_iterator(
-                    &inner.borrow(),
-                    MapIteratorKind::Entries,
-                ))
-            });
-            obj.insert("entries".into(), entries_fn.clone());
-            obj.insert("@@iterator".into(), entries_fn);
+            obj.insert(
+                "__map_entries__".into(),
+                native(move |_| {
+                    Ok(build_map_iterator_object(
+                        Rc::clone(&inner),
+                        MapIteratorKind::Entries,
+                    ))
+                }),
+            );
         }
         {
             let inner = Rc::clone(&inner);
             obj.insert(
-                "getOrInsert".into(),
+                "__map_get_or_insert__".into(),
                 native(move |a| {
                     let key = a.first().cloned().unwrap_or(JsValue::Undefined);
                     let default_val = a.get(1).cloned().unwrap_or(JsValue::Undefined);
@@ -1539,7 +1656,7 @@ fn build_map_instance(m: crate::builtins::map::JsMap) -> StatorResult<JsValue> {
         {
             let inner = Rc::clone(&inner);
             obj.insert(
-                "getOrInsertComputed".into(),
+                "__map_get_or_insert_computed__".into(),
                 native(move |a| {
                     let key = a.first().cloned().unwrap_or(JsValue::Undefined);
                     let callback = a.get(1).cloned().unwrap_or(JsValue::Undefined);
@@ -1554,14 +1671,11 @@ fn build_map_instance(m: crate::builtins::map::JsMap) -> StatorResult<JsValue> {
                 }),
             );
         }
-        obj.insert_with_attrs(
-            "@@toStringTag".into(),
-            JsValue::String("Map".into()),
-            PropertyAttributes::CONFIGURABLE,
-        );
         obj.make_all_non_enumerable();
     }
-    Ok(JsValue::PlainObject(obj_rc))
+    let instance = JsValue::PlainObject(obj_rc);
+    attach_constructor_prototype(&instance, "Map")?;
+    Ok(instance)
 }
 
 /// Build a full `Set` instance (PlainObject with prototype methods) from a
@@ -1588,7 +1702,7 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
             let inner = Rc::clone(&inner);
             let self_ref = Rc::clone(&obj_rc);
             obj.insert(
-                "add".into(),
+                "__set_add__".into(),
                 native(move |a| {
                     let val = a.first().cloned().unwrap_or(JsValue::Undefined);
                     set_add(&mut inner.borrow_mut(), val);
@@ -1599,7 +1713,7 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
         {
             let inner = Rc::clone(&inner);
             obj.insert(
-                "has".into(),
+                "__set_has__".into(),
                 native(move |a| {
                     let val = a.first().unwrap_or(&JsValue::Undefined);
                     Ok(JsValue::Boolean(set_has(&inner.borrow(), val)))
@@ -1609,7 +1723,7 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
         {
             let inner = Rc::clone(&inner);
             obj.insert(
-                "delete".into(),
+                "__set_delete__".into(),
                 native(move |a| {
                     let val = a.first().unwrap_or(&JsValue::Undefined);
                     Ok(JsValue::Boolean(set_delete(&mut inner.borrow_mut(), val)))
@@ -1619,7 +1733,7 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
         {
             let inner = Rc::clone(&inner);
             obj.insert(
-                "clear".into(),
+                "__set_clear__".into(),
                 native(move |_| {
                     set_clear(&mut inner.borrow_mut());
                     Ok(JsValue::Undefined)
@@ -1630,14 +1744,24 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
             let inner = Rc::clone(&inner);
             let self_ref = Rc::clone(&obj_rc);
             obj.insert(
-                "forEach".into(),
+                "__set_for_each__".into(),
                 native(move |a| {
                     let cb = a.first().cloned().unwrap_or(JsValue::Undefined);
-                    let snapshot = set_values(&inner.borrow());
-                    for v in snapshot {
-                        call_callback(
+                    let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    let receiver = JsValue::PlainObject(Rc::clone(&self_ref));
+                    let mut cursor = 0;
+                    loop {
+                        let next = {
+                            let set = inner.borrow();
+                            set_next_value(&set, &mut cursor)
+                        };
+                        let Some(v) = next else {
+                            break;
+                        };
+                        call_callback_with_this(
                             &cb,
-                            vec![v.clone(), v, JsValue::PlainObject(Rc::clone(&self_ref))],
+                            this_arg.clone(),
+                            vec![v.clone(), v, receiver.clone()],
                         )?;
                     }
                     Ok(JsValue::Undefined)
@@ -1646,23 +1770,23 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
         }
         {
             let inner = Rc::clone(&inner);
-            let values_fn = native(move |_| {
-                Ok(set_create_iterator(
-                    &inner.borrow(),
-                    SetIteratorKind::Values,
-                ))
-            });
-            obj.insert("values".into(), values_fn.clone());
-            obj.insert("keys".into(), values_fn.clone());
-            obj.insert("@@iterator".into(), values_fn);
+            obj.insert(
+                "__set_values__".into(),
+                native(move |_| {
+                    Ok(build_set_iterator_object(
+                        Rc::clone(&inner),
+                        SetIteratorKind::Values,
+                    ))
+                }),
+            );
         }
         {
             let inner = Rc::clone(&inner);
             obj.insert(
-                "entries".into(),
+                "__set_entries__".into(),
                 native(move |_| {
-                    Ok(set_create_iterator(
-                        &inner.borrow(),
+                    Ok(build_set_iterator_object(
+                        Rc::clone(&inner),
                         SetIteratorKind::Entries,
                     ))
                 }),
@@ -1831,7 +1955,9 @@ fn build_set_instance(s: crate::builtins::set::JsSet) -> StatorResult<JsValue> {
         );
         obj.make_all_non_enumerable();
     }
-    Ok(JsValue::PlainObject(obj_rc))
+    let instance = JsValue::PlainObject(obj_rc);
+    attach_constructor_prototype(&instance, "Set")?;
+    Ok(instance)
 }
 
 /// §20.5.3.4 `Error.prototype.toString()` algorithm.
@@ -8002,105 +8128,15 @@ fn make_map_builtin() -> JsValue {
                 let arg = args.first().cloned().unwrap_or(JsValue::Undefined);
                 let m = match &arg {
                     JsValue::Undefined | JsValue::Null => map_new(),
-                    _ if is_js_array(&arg) => {
-                        let (elements, _) = to_array_like_elements(&arg);
-                        let mut pairs = Vec::new();
-                        for item in &elements {
-                            let (pair_elems, _) = to_array_like_elements(item);
-                            let k = pair_elems.first().cloned().unwrap_or(JsValue::Undefined);
-                            let v = pair_elems.get(1).cloned().unwrap_or(JsValue::Undefined);
-                            pairs.push((k, v));
-                        }
-                        map_from_iterable(pairs)
-                    }
-                    JsValue::PlainObject(rc) => {
-                        let borrow = rc.borrow();
-                        if borrow
-                            .get("__is_map__")
-                            .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
-                        {
-                            // Copy from another Map via @@iterator / entries
-                            if let Some(JsValue::NativeFunction(iter_fn)) =
-                                borrow.get("@@iterator").cloned()
-                            {
-                                drop(borrow);
-                                let iter_val = iter_fn(vec![])?;
-                                let mut pairs = Vec::new();
-                                if let JsValue::Iterator(iter_rc) = iter_val {
-                                    while let Some(item) = iter_rc.borrow_mut().next_item() {
-                                        let (pair_elems, _) = to_array_like_elements(&item);
-                                        let k = pair_elems
-                                            .first()
-                                            .cloned()
-                                            .unwrap_or(JsValue::Undefined);
-                                        let v = pair_elems
-                                            .get(1)
-                                            .cloned()
-                                            .unwrap_or(JsValue::Undefined);
-                                        pairs.push((k, v));
-                                    }
-                                }
-                                map_from_iterable(pairs)
-                            } else {
-                                drop(borrow);
-                                map_new()
-                            }
-                        } else if borrow
-                            .get("__is_set__")
-                            .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
-                        {
-                            // Set-like: iterate values as [value, value] pairs
-                            if let Some(JsValue::NativeFunction(iter_fn)) =
-                                borrow.get("@@iterator").cloned()
-                            {
-                                drop(borrow);
-                                let iter_val = iter_fn(vec![])?;
-                                let mut pairs = Vec::new();
-                                if let JsValue::Iterator(iter_rc) = iter_val {
-                                    while let Some(item) = iter_rc.borrow_mut().next_item() {
-                                        pairs.push((item.clone(), item));
-                                    }
-                                }
-                                map_from_iterable(pairs)
-                            } else {
-                                drop(borrow);
-                                map_new()
-                            }
-                        } else if borrow.get("@@iterator").is_some()
-                            || borrow.get("length").is_some()
-                        {
-                            // Array-like or iterable PlainObject
-                            drop(borrow);
-                            let (elements, _) = to_array_like_elements(&arg);
-                            let mut pairs = Vec::new();
-                            for item in &elements {
-                                let (pair_elems, _) = to_array_like_elements(item);
-                                let k = pair_elems.first().cloned().unwrap_or(JsValue::Undefined);
-                                let v = pair_elems.get(1).cloned().unwrap_or(JsValue::Undefined);
-                                pairs.push((k, v));
-                            }
-                            map_from_iterable(pairs)
-                        } else {
-                            drop(borrow);
-                            return Err(StatorError::TypeError(
-                                "Map: argument is not iterable".into(),
-                            ));
-                        }
-                    }
-                    JsValue::Iterator(iter_rc) => {
-                        let mut pairs = Vec::new();
-                        while let Some(item) = iter_rc.borrow_mut().next_item() {
-                            let (pair_elems, _) = to_array_like_elements(&item);
-                            let k = pair_elems.first().cloned().unwrap_or(JsValue::Undefined);
-                            let v = pair_elems.get(1).cloned().unwrap_or(JsValue::Undefined);
-                            pairs.push((k, v));
-                        }
-                        map_from_iterable(pairs)
-                    }
                     _ => {
-                        return Err(StatorError::TypeError(
-                            "Map: argument is not iterable".into(),
-                        ));
+                        map_from_iterable(iterable_to_map_pairs(&arg).map_err(|err| match err {
+                            StatorError::TypeError(message)
+                                if message == "value is not iterable" =>
+                            {
+                                StatorError::TypeError("Map: argument is not iterable".into())
+                            }
+                            other => other,
+                        })?)
                     }
                 };
                 build_map_instance(m)
@@ -8183,48 +8219,62 @@ fn make_map_builtin() -> JsValue {
         // ── Map.prototype ─────────────────────────────────────────────────
         let map_proto_rc = {
             let mut proto = PropertyMap::new();
-            for method_name in &[
-                "has",
-                "get",
-                "set",
-                "delete",
-                "clear",
-                "forEach",
-                "keys",
-                "values",
-                "getOrInsert",
-                "getOrInsertComputed",
+            for (method_name, hidden_name) in [
+                ("has", "__map_has__"),
+                ("get", "__map_get__"),
+                ("set", "__map_set__"),
+                ("delete", "__map_delete__"),
+                ("clear", "__map_clear__"),
+                ("forEach", "__map_for_each__"),
+                ("keys", "__map_keys__"),
+                ("values", "__map_values__"),
+                ("entries", "__map_entries__"),
+                ("getOrInsert", "__map_get_or_insert__"),
+                ("getOrInsertComputed", "__map_get_or_insert_computed__"),
             ] {
                 let name = method_name.to_string();
+                let hidden = hidden_name.to_string();
                 proto.insert(
                     name.clone(),
                     native(move |args| {
                         let receiver = args.first().unwrap_or(&JsValue::Undefined);
                         let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
-                        if let JsValue::PlainObject(map) = receiver
-                            && let Some(JsValue::NativeFunction(f)) =
-                                map.borrow().get(&name).cloned()
-                        {
-                            return f(rest);
-                        }
-                        Ok(JsValue::Undefined)
+                        let method = get_hidden_method(
+                            receiver,
+                            "__is_map__",
+                            &hidden,
+                            &format!("Map.prototype.{name}"),
+                        )?;
+                        dispatch_call_value(&method, rest)
                     }),
                 );
             }
-            {
-                let iterator_fn = native(move |args| {
+            let entries_fn = native(|args| {
+                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                let method = get_hidden_method(
+                    receiver,
+                    "__is_map__",
+                    "__map_entries__",
+                    "Map.prototype.entries",
+                )?;
+                dispatch_call_value(&method, vec![])
+            });
+            proto.insert("entries".into(), entries_fn.clone());
+            proto.insert("@@iterator".into(), entries_fn);
+            proto.insert_with_attrs(
+                "__get_size__".into(),
+                native(|args| {
                     let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                    if let JsValue::PlainObject(map) = receiver
-                        && let Some(JsValue::NativeFunction(f)) =
-                            map.borrow().get("@@iterator").cloned()
-                    {
-                        return f(vec![]);
-                    }
-                    Ok(JsValue::Undefined)
-                });
-                proto.insert("entries".into(), iterator_fn.clone());
-                proto.insert("@@iterator".into(), iterator_fn);
-            }
+                    let getter = get_hidden_method(
+                        receiver,
+                        "__is_map__",
+                        "__get_size__",
+                        "get Map.prototype.size",
+                    )?;
+                    dispatch_call_value(&getter, vec![])
+                }),
+                PropertyAttributes::CONFIGURABLE,
+            );
             proto.insert_with_attrs(
                 "@@toStringTag".into(),
                 JsValue::String("Map".into()),
@@ -8277,67 +8327,12 @@ fn make_set_builtin() -> JsValue {
                 let arg = args.first().cloned().unwrap_or(JsValue::Undefined);
                 let s = match &arg {
                     JsValue::Undefined | JsValue::Null => set_new(),
-                    _ if is_js_array(&arg) => {
-                        let (elements, _) = to_array_like_elements(&arg);
-                        set_from_iterable(elements)
-                    }
-                    JsValue::String(str_val) => {
-                        let chars: Vec<JsValue> = str_val
-                            .chars()
-                            .map(|c| JsValue::String(c.to_string().into()))
-                            .collect();
-                        set_from_iterable(chars)
-                    }
-                    JsValue::PlainObject(rc) => {
-                        let borrow = rc.borrow();
-                        if borrow
-                            .get("__is_set__")
-                            .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
-                            || borrow
-                                .get("__is_map__")
-                                .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
-                        {
-                            if let Some(JsValue::NativeFunction(iter_fn)) =
-                                borrow.get("@@iterator").cloned()
-                            {
-                                drop(borrow);
-                                let iter_val = iter_fn(vec![])?;
-                                let mut items = Vec::new();
-                                if let JsValue::Iterator(iter_rc) = iter_val {
-                                    while let Some(item) = iter_rc.borrow_mut().next_item() {
-                                        items.push(item);
-                                    }
-                                }
-                                set_from_iterable(items)
-                            } else {
-                                drop(borrow);
-                                set_new()
-                            }
-                        } else if borrow.get("@@iterator").is_some()
-                            || borrow.get("length").is_some()
-                        {
-                            drop(borrow);
-                            let (elements, _) = to_array_like_elements(&arg);
-                            set_from_iterable(elements)
-                        } else {
-                            drop(borrow);
-                            return Err(StatorError::TypeError(
-                                "Set: argument is not iterable".into(),
-                            ));
+                    _ => set_from_iterable(iterable_to_items(&arg).map_err(|err| match err {
+                        StatorError::TypeError(message) if message == "value is not iterable" => {
+                            StatorError::TypeError("Set: argument is not iterable".into())
                         }
-                    }
-                    JsValue::Iterator(iter_rc) => {
-                        let mut items = Vec::new();
-                        while let Some(item) = iter_rc.borrow_mut().next_item() {
-                            items.push(item);
-                        }
-                        set_from_iterable(items)
-                    }
-                    _ => {
-                        return Err(StatorError::TypeError(
-                            "Set: argument is not iterable".into(),
-                        ));
-                    }
+                        other => other,
+                    })?),
                 };
                 build_set_instance(s)
             }),
@@ -8346,52 +8341,65 @@ fn make_set_builtin() -> JsValue {
         // ── Set.prototype ──────────────────────────────────────────────────
         let set_proto_rc = {
             let mut proto = PropertyMap::new();
-            for method_name in &[
-                "has",
-                "add",
-                "delete",
-                "clear",
-                "forEach",
-                "entries",
-                "union",
-                "intersection",
-                "difference",
-                "symmetricDifference",
-                "isSubsetOf",
-                "isSupersetOf",
-                "isDisjointFrom",
+            for (method_name, hidden_name) in [
+                ("has", "__set_has__"),
+                ("add", "__set_add__"),
+                ("delete", "__set_delete__"),
+                ("clear", "__set_clear__"),
+                ("forEach", "__set_for_each__"),
+                ("entries", "__set_entries__"),
+                ("union", "union"),
+                ("intersection", "intersection"),
+                ("difference", "difference"),
+                ("symmetricDifference", "symmetricDifference"),
+                ("isSubsetOf", "isSubsetOf"),
+                ("isSupersetOf", "isSupersetOf"),
+                ("isDisjointFrom", "isDisjointFrom"),
             ] {
                 let name = method_name.to_string();
+                let hidden = hidden_name.to_string();
                 proto.insert(
                     name.clone(),
                     native(move |args| {
                         let receiver = args.first().unwrap_or(&JsValue::Undefined);
                         let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
-                        if let JsValue::PlainObject(map) = receiver
-                            && let Some(JsValue::NativeFunction(f)) =
-                                map.borrow().get(&name).cloned()
-                        {
-                            return f(rest);
-                        }
-                        Ok(JsValue::Undefined)
+                        let method = get_hidden_method(
+                            receiver,
+                            "__is_set__",
+                            &hidden,
+                            &format!("Set.prototype.{name}"),
+                        )?;
+                        dispatch_call_value(&method, rest)
                     }),
                 );
             }
-            {
-                let values_fn = native(move |args| {
+            let values_fn = native(|args| {
+                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                let method = get_hidden_method(
+                    receiver,
+                    "__is_set__",
+                    "__set_values__",
+                    "Set.prototype.values",
+                )?;
+                dispatch_call_value(&method, vec![])
+            });
+            proto.insert("values".into(), values_fn.clone());
+            proto.insert("keys".into(), values_fn.clone());
+            proto.insert("@@iterator".into(), values_fn);
+            proto.insert_with_attrs(
+                "__get_size__".into(),
+                native(|args| {
                     let receiver = args.first().unwrap_or(&JsValue::Undefined);
-                    if let JsValue::PlainObject(map) = receiver
-                        && let Some(JsValue::NativeFunction(f)) =
-                            map.borrow().get("values").cloned()
-                    {
-                        return f(vec![]);
-                    }
-                    Ok(JsValue::Undefined)
-                });
-                proto.insert("values".into(), values_fn.clone());
-                proto.insert("keys".into(), values_fn.clone());
-                proto.insert("@@iterator".into(), values_fn);
-            }
+                    let getter = get_hidden_method(
+                        receiver,
+                        "__is_set__",
+                        "__get_size__",
+                        "get Set.prototype.size",
+                    )?;
+                    dispatch_call_value(&getter, vec![])
+                }),
+                PropertyAttributes::CONFIGURABLE,
+            );
             proto.insert_with_attrs(
                 "@@toStringTag".into(),
                 JsValue::String("Set".into()),

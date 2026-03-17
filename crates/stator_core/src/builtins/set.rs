@@ -74,8 +74,45 @@ pub enum SetIteratorKind {
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct JsSet {
-    /// Values stored in insertion order.  Duplicates are never inserted.
-    values: Vec<JsValue>,
+    /// Values stored in insertion order.
+    ///
+    /// Deleted values are replaced with tombstones so active traversals can
+    /// continue and later additions remain observable in the same iteration.
+    values: Vec<Option<JsValue>>,
+    /// Number of live values.
+    size: usize,
+}
+
+fn set_find_value_index(set: &JsSet, value: &JsValue) -> Option<usize> {
+    set.values.iter().position(|entry| {
+        entry
+            .as_ref()
+            .is_some_and(|candidate| same_value_zero(candidate, value))
+    })
+}
+
+/// Return the next live value at or after `cursor`, advancing `cursor`.
+pub fn set_next_value(set: &JsSet, cursor: &mut usize) -> Option<JsValue> {
+    while let Some(value) = set.values.get(*cursor) {
+        *cursor += 1;
+        if let Some(value) = value {
+            return Some(value.clone());
+        }
+    }
+    None
+}
+
+/// Return the next iterator result at or after `cursor`, advancing `cursor`.
+pub fn set_next_iteration_item(
+    set: &JsSet,
+    cursor: &mut usize,
+    kind: SetIteratorKind,
+) -> Option<JsValue> {
+    let value = set_next_value(set, cursor)?;
+    Some(match kind {
+        SetIteratorKind::Values | SetIteratorKind::Keys => value.clone(),
+        SetIteratorKind::Entries => JsValue::new_array(vec![value.clone(), value]),
+    })
 }
 
 // ── Constructors ──────────────────────────────────────────────────────────────
@@ -141,8 +178,9 @@ pub fn set_from_iterable(items: Vec<JsValue>) -> JsSet {
 pub fn set_add(set: &mut JsSet, value: JsValue) {
     // §24.2.3.1 step 5: normalise -0 → +0.
     let value = normalize_negative_zero(value);
-    if !set.values.iter().any(|v| same_value_zero(v, &value)) {
-        set.values.push(value);
+    if set_find_value_index(set, &value).is_none() {
+        set.values.push(Some(value));
+        set.size += 1;
     }
 }
 
@@ -164,7 +202,10 @@ pub fn set_add(set: &mut JsSet, value: JsValue) {
 /// assert!(!set_has(&s, &JsValue::Boolean(false)));
 /// ```
 pub fn set_has(set: &JsSet, value: &JsValue) -> bool {
-    set.values.iter().any(|v| same_value_zero(v, value))
+    set.values
+        .iter()
+        .filter_map(Option::as_ref)
+        .any(|v| same_value_zero(v, value))
 }
 
 // ── set_delete ────────────────────────────────────────────────────────────────
@@ -187,8 +228,9 @@ pub fn set_has(set: &JsSet, value: &JsValue) -> bool {
 /// assert_eq!(set_size(&s), 0);
 /// ```
 pub fn set_delete(set: &mut JsSet, value: &JsValue) -> bool {
-    if let Some(pos) = set.values.iter().position(|v| same_value_zero(v, value)) {
-        set.values.remove(pos);
+    if let Some(pos) = set_find_value_index(set, value) {
+        set.values[pos] = None;
+        set.size -= 1;
         true
     } else {
         false
@@ -213,7 +255,10 @@ pub fn set_delete(set: &mut JsSet, value: &JsValue) -> bool {
 /// assert_eq!(set_size(&s), 0);
 /// ```
 pub fn set_clear(set: &mut JsSet) {
-    set.values.clear();
+    for value in &mut set.values {
+        *value = None;
+    }
+    set.size = 0;
 }
 
 // ── set_size ──────────────────────────────────────────────────────────────────
@@ -233,7 +278,7 @@ pub fn set_clear(set: &mut JsSet) {
 /// assert_eq!(set_size(&s), 1);
 /// ```
 pub fn set_size(set: &JsSet) -> usize {
-    set.values.len()
+    set.size
 }
 
 // ── set_for_each ──────────────────────────────────────────────────────────────
@@ -256,7 +301,7 @@ pub fn set_size(set: &JsSet) -> usize {
 /// assert_eq!(out, vec![JsValue::Smi(1), JsValue::Smi(2)]);
 /// ```
 pub fn set_for_each(set: &JsSet, mut callback: impl FnMut(&JsValue)) {
-    for v in &set.values {
+    for v in set.values.iter().flatten() {
         callback(v);
     }
 }
@@ -279,7 +324,7 @@ pub fn set_for_each(set: &JsSet, mut callback: impl FnMut(&JsValue)) {
 /// assert_eq!(set_values(&s), vec![JsValue::Smi(7), JsValue::Smi(3)]);
 /// ```
 pub fn set_values(set: &JsSet) -> Vec<JsValue> {
-    set.values.clone()
+    set.values.iter().flatten().cloned().collect()
 }
 
 /// ECMAScript §24.2.3.8 `Set.prototype.keys()`.
@@ -320,7 +365,11 @@ pub fn set_keys(set: &JsSet) -> Vec<JsValue> {
 /// assert_eq!(set_entries(&s), vec![(JsValue::Smi(1), JsValue::Smi(1))]);
 /// ```
 pub fn set_entries(set: &JsSet) -> Vec<(JsValue, JsValue)> {
-    set.values.iter().map(|v| (v.clone(), v.clone())).collect()
+    set.values
+        .iter()
+        .flatten()
+        .map(|v| (v.clone(), v.clone()))
+        .collect()
 }
 
 // ── set_iter ──────────────────────────────────────────────────────────────────
@@ -381,10 +430,13 @@ pub fn set_iter(set: &JsSet) -> Vec<JsValue> {
 /// ```
 pub fn set_create_iterator(set: &JsSet, kind: SetIteratorKind) -> JsValue {
     let items: Vec<JsValue> = match kind {
-        SetIteratorKind::Values | SetIteratorKind::Keys => set.values.clone(),
+        SetIteratorKind::Values | SetIteratorKind::Keys => {
+            set.values.iter().flatten().cloned().collect()
+        }
         SetIteratorKind::Entries => set
             .values
             .iter()
+            .flatten()
             .map(|v| JsValue::new_array(vec![v.clone(), v.clone()]))
             .collect(),
     };
@@ -418,9 +470,10 @@ pub fn set_create_iterator(set: &JsSet, kind: SetIteratorKind) -> JsValue {
 /// ```
 pub fn set_union(a: &JsSet, b: &JsSet) -> JsSet {
     let mut result = a.clone();
-    for v in &b.values {
+    for v in b.values.iter().flatten() {
         if !set_has(&result, v) {
-            result.values.push(v.clone());
+            result.values.push(Some(v.clone()));
+            result.size += 1;
         }
     }
     result
@@ -447,9 +500,10 @@ pub fn set_union(a: &JsSet, b: &JsSet) -> JsSet {
 /// ```
 pub fn set_intersection(a: &JsSet, b: &JsSet) -> JsSet {
     let mut result = set_new();
-    for v in &a.values {
+    for v in a.values.iter().flatten() {
         if set_has(b, v) {
-            result.values.push(v.clone());
+            result.values.push(Some(v.clone()));
+            result.size += 1;
         }
     }
     result
@@ -476,9 +530,10 @@ pub fn set_intersection(a: &JsSet, b: &JsSet) -> JsSet {
 /// ```
 pub fn set_difference(a: &JsSet, b: &JsSet) -> JsSet {
     let mut result = set_new();
-    for v in &a.values {
+    for v in a.values.iter().flatten() {
         if !set_has(b, v) {
-            result.values.push(v.clone());
+            result.values.push(Some(v.clone()));
+            result.size += 1;
         }
     }
     result
@@ -505,14 +560,16 @@ pub fn set_difference(a: &JsSet, b: &JsSet) -> JsSet {
 /// ```
 pub fn set_symmetric_difference(a: &JsSet, b: &JsSet) -> JsSet {
     let mut result = set_new();
-    for v in &a.values {
+    for v in a.values.iter().flatten() {
         if !set_has(b, v) {
-            result.values.push(v.clone());
+            result.values.push(Some(v.clone()));
+            result.size += 1;
         }
     }
-    for v in &b.values {
+    for v in b.values.iter().flatten() {
         if !set_has(a, v) {
-            result.values.push(v.clone());
+            result.values.push(Some(v.clone()));
+            result.size += 1;
         }
     }
     result
@@ -537,7 +594,7 @@ pub fn set_symmetric_difference(a: &JsSet, b: &JsSet) -> JsSet {
 /// assert!(!set_is_subset_of(&b, &a));
 /// ```
 pub fn set_is_subset_of(a: &JsSet, b: &JsSet) -> bool {
-    a.values.iter().all(|v| set_has(b, v))
+    a.values.iter().flatten().all(|v| set_has(b, v))
 }
 
 /// ECMAScript §24.2.3.10 `Set.prototype.isSupersetOf(other)`.
@@ -559,7 +616,7 @@ pub fn set_is_subset_of(a: &JsSet, b: &JsSet) -> bool {
 /// assert!(!set_is_superset_of(&b, &a));
 /// ```
 pub fn set_is_superset_of(a: &JsSet, b: &JsSet) -> bool {
-    b.values.iter().all(|v| set_has(a, v))
+    b.values.iter().flatten().all(|v| set_has(a, v))
 }
 
 /// ECMAScript §24.2.3.8 `Set.prototype.isDisjointFrom(other)`.
@@ -581,7 +638,7 @@ pub fn set_is_superset_of(a: &JsSet, b: &JsSet) -> bool {
 /// assert!(!set_is_disjoint_from(&a, &b));
 /// ```
 pub fn set_is_disjoint_from(a: &JsSet, b: &JsSet) -> bool {
-    !a.values.iter().any(|v| set_has(b, v))
+    !a.values.iter().flatten().any(|v| set_has(b, v))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
