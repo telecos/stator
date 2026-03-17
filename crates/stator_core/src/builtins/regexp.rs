@@ -189,7 +189,10 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
         );
         props.insert(
             "unicode".into(),
-            JsValue::Boolean(re.flags().contains(RegExpFlags::UNICODE)),
+            JsValue::Boolean(
+                re.flags().contains(RegExpFlags::UNICODE)
+                    || re.flags().contains(RegExpFlags::UNICODE_SETS),
+            ),
         );
         props.insert(
             "unicodeSets".into(),
@@ -234,7 +237,15 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
         insert_regexp_getter(
             &mut props,
             "unicode",
-            bool_getter(&re, RegExpFlags::UNICODE),
+            JsValue::NativeFunction(Rc::new({
+                let re = Rc::clone(&re);
+                move |_args: Vec<JsValue>| {
+                    Ok(JsValue::Boolean(
+                        re.flags().contains(RegExpFlags::UNICODE)
+                            || re.flags().contains(RegExpFlags::UNICODE_SETS),
+                    ))
+                }
+            })),
         );
         insert_regexp_getter(
             &mut props,
@@ -1224,7 +1235,7 @@ mod tests {
             regexp_construct(&[JsValue::String("a".into()), JsValue::String("v".into())]).unwrap();
         assert_eq!(get_str(&re, "flags").as_deref(), Some("v"));
         assert_eq!(get_bool(&re, "unicodeSets"), Some(true));
-        assert_eq!(get_bool(&re, "unicode"), Some(false));
+        assert_eq!(get_bool(&re, "unicode"), Some(true));
     }
 
     #[test]

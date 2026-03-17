@@ -46,3 +46,6 @@ opt-level = 1
 # Prevent LTO from recombining the per-crate builds.
 [profile.release]
 lto = false
+
+[patch.crates-io]
+regress = { path = "vendor/regress" }

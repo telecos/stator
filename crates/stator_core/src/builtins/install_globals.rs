@@ -11332,13 +11332,32 @@ fn make_regexp() -> JsValue {
                 native(|args| {
                     let this = args.first().unwrap_or(&JsValue::Undefined);
                     if let JsValue::PlainObject(map) = this {
+                        Ok(JsValue::Boolean(
+                            matches!(map.borrow().get("unicode"), Some(JsValue::Boolean(true)))
+                                || matches!(
+                                    map.borrow().get("unicodeSets"),
+                                    Some(JsValue::Boolean(true))
+                                ),
+                        ))
+                    } else {
+                        Err(crate::error::StatorError::TypeError(
+                            "RegExp.prototype.unicode requires that 'this' be an Object".into(),
+                        ))
+                    }
+                }),
+            );
+            proto.insert(
+                "__get_unicodeSets__".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    if let JsValue::PlainObject(map) = this {
                         Ok(JsValue::Boolean(matches!(
-                            map.borrow().get("unicode"),
+                            map.borrow().get("unicodeSets"),
                             Some(JsValue::Boolean(true))
                         )))
                     } else {
                         Err(crate::error::StatorError::TypeError(
-                            "RegExp.prototype.unicode requires that 'this' be an Object".into(),
+                            "RegExp.prototype.unicodeSets requires that 'this' be an Object".into(),
                         ))
                     }
                 }),

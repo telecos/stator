@@ -3292,7 +3292,7 @@ impl FunctionCompiler {
                 }
                 Expr::Regexp(r) => {
                     let pattern_idx = self.add_string(&r.pattern);
-                    // Encode flags as a bitfield: g=1, i=2, m=4, s=8, u=16, y=32
+                    // Encode flags as a bitfield: g=1, i=2, m=4, s=8, u=16, v=32, y=64, d=128
                     let flags_val: u8 = r.flags.bytes().fold(0u8, |acc, b| {
                         let bit = match b {
                             b'g' => 0x01,
@@ -3300,7 +3300,9 @@ impl FunctionCompiler {
                             b'm' => 0x04,
                             b's' => 0x08,
                             b'u' => 0x10,
-                            b'y' => 0x20,
+                            b'v' => 0x20,
+                            b'y' => 0x40,
+                            b'd' => 0x80,
                             _ => 0,
                         };
                         acc | bit
