@@ -129,10 +129,10 @@ use crate::builtins::typed_array::{
     dataview_set_bigint64, dataview_set_biguint64, dataview_set_float32, dataview_set_float64,
     dataview_set_int8, dataview_set_int16, dataview_set_int32, dataview_set_uint8,
     dataview_set_uint16, dataview_set_uint32, shared_arraybuffer_grow, shared_arraybuffer_growable,
-    shared_arraybuffer_new, shared_arraybuffer_new_growable, typed_array_at,
-    typed_array_byte_length, typed_array_copy_within, typed_array_entries, typed_array_fill,
-    typed_array_from_values, typed_array_get, typed_array_includes, typed_array_index_of,
-    typed_array_join, typed_array_keys, typed_array_last_index_of, typed_array_new_from_buffer,
+    shared_arraybuffer_new, shared_arraybuffer_new_growable, typed_array_byte_length,
+    typed_array_copy_within, typed_array_entries, typed_array_fill, typed_array_from_values,
+    typed_array_get, typed_array_includes, typed_array_index_of, typed_array_join,
+    typed_array_keys, typed_array_last_index_of, typed_array_new_from_buffer,
     typed_array_new_from_length, typed_array_reverse, typed_array_set, typed_array_set_from,
     typed_array_slice, typed_array_sort, typed_array_subarray, typed_array_values,
 };
@@ -1409,21 +1409,46 @@ fn array_species_create(original: &JsValue, length: usize) -> StatorResult<Optio
     }
 }
 
+fn to_integer_or_infinity_arg(value: Option<&JsValue>, default: f64) -> StatorResult<f64> {
+    match value {
+        Some(value) => value.to_integer_or_infinity(),
+        None => Ok(default),
+    }
+}
+
+fn clamp_relative_integer_index(len: usize, index: f64) -> usize {
+    if index == f64::NEG_INFINITY {
+        0
+    } else if index < 0.0 {
+        ((len as f64) + index).max(0.0) as usize
+    } else {
+        index.min(len as f64) as usize
+    }
+}
+
+fn clamp_nonnegative_integer_index(len: usize, index: f64) -> usize {
+    if index <= 0.0 {
+        0
+    } else {
+        index.min(len as f64) as usize
+    }
+}
+
+fn normalize_string_index(len: usize, index: Option<&JsValue>) -> StatorResult<Option<usize>> {
+    let index = to_integer_or_infinity_arg(index, 0.0)?;
+    if index < 0.0 || index == f64::INFINITY || index >= len as f64 {
+        Ok(None)
+    } else {
+        Ok(Some(index as usize))
+    }
+}
+
 /// ECMAScript `ToIntegerOrInfinity` index normalization for forward searches.
 fn normalize_from_index(len: usize, from: Option<&JsValue>) -> StatorResult<usize> {
-    let from = match from {
-        Some(value) => value.to_integer_or_infinity()?,
-        None => 0.0,
-    };
-    if from == f64::INFINITY {
-        Ok(len)
-    } else if from == f64::NEG_INFINITY {
-        Ok(0)
-    } else if from < 0.0 {
-        Ok(((len as f64) + from).max(0.0) as usize)
-    } else {
-        Ok(from.min(len as f64) as usize)
-    }
+    Ok(clamp_relative_integer_index(
+        len,
+        to_integer_or_infinity_arg(from, 0.0)?,
+    ))
 }
 
 /// ECMAScript `ToIntegerOrInfinity` index normalization for reverse searches.
@@ -1431,10 +1456,7 @@ fn normalize_last_from_index(len: usize, from: Option<&JsValue>) -> StatorResult
     if len == 0 {
         return Ok(None);
     }
-    let from = match from {
-        Some(value) => value.to_integer_or_infinity()?,
-        None => (len - 1) as f64,
-    };
+    let from = to_integer_or_infinity_arg(from, (len - 1) as f64)?;
     if from == f64::NEG_INFINITY {
         return Ok(None);
     }
@@ -1452,10 +1474,7 @@ fn normalize_last_from_index(len: usize, from: Option<&JsValue>) -> StatorResult
 
 /// ECMAScript `ToIntegerOrInfinity` index normalization for `.at(...)`.
 fn normalize_at_index(len: usize, index: Option<&JsValue>) -> StatorResult<Option<usize>> {
-    let index = match index {
-        Some(value) => value.to_integer_or_infinity()?,
-        None => 0.0,
-    };
+    let index = to_integer_or_infinity_arg(index, 0.0)?;
     if index == f64::INFINITY {
         return Ok(None);
     }
@@ -1593,7 +1612,7 @@ fn get_set_like_record(arg: &JsValue) -> StatorResult<SetLikeRecord> {
     if matches!(size_value, JsValue::Undefined) {
         return Err(invalid_set_like_arg());
     }
-    let size = crate::builtins::util::checked_f64_to_length(size_value.to_number()?)?;
+    let size = size_value.to_length()?.min(usize::MAX as u64) as usize;
 
     let keys = ["keys", "values", "@@iterator"]
         .into_iter()
@@ -6738,26 +6757,14 @@ fn make_array() -> JsValue {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let (elements, len) = to_array_like_elements(arr);
-                let len = len as i64;
-                let start = args
-                    .get(1)
-                    .unwrap_or(&JsValue::Smi(0))
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
-                let end = args
-                    .get(2)
-                    .map(|v| v.to_number().unwrap_or(len as f64) as i64)
-                    .unwrap_or(len);
-                let s = if start < 0 {
-                    (len + start).max(0)
-                } else {
-                    start.min(len)
-                } as usize;
-                let e = if end < 0 {
-                    (len + end).max(0)
-                } else {
-                    end.min(len)
-                } as usize;
+                let s = clamp_relative_integer_index(
+                    len,
+                    to_integer_or_infinity_arg(args.get(1), 0.0)?,
+                );
+                let e = clamp_relative_integer_index(
+                    len,
+                    to_integer_or_infinity_arg(args.get(2), len as f64)?,
+                );
                 let sliced: Vec<JsValue> = elements[s..e].to_vec();
                 // §23.1.3.25 ArraySpeciesCreate
                 if let Some(result) = array_species_create(arr, sliced.len())? {
@@ -6874,26 +6881,15 @@ fn make_array() -> JsValue {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let value = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let len = array_like_length(arr)? as i64;
-                let start = args
-                    .get(2)
-                    .unwrap_or(&JsValue::Smi(0))
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
-                let end = args
-                    .get(3)
-                    .map(|v| v.to_number().unwrap_or(len as f64) as i64)
-                    .unwrap_or(len);
-                let s = if start < 0 {
-                    (len + start).max(0)
-                } else {
-                    start.min(len)
-                } as usize;
-                let e = if end < 0 {
-                    (len + end).max(0)
-                } else {
-                    end.min(len)
-                } as usize;
+                let len = array_like_length(arr)?;
+                let s = clamp_relative_integer_index(
+                    len,
+                    to_integer_or_infinity_arg(args.get(2), 0.0)?,
+                );
+                let e = clamp_relative_integer_index(
+                    len,
+                    to_integer_or_infinity_arg(args.get(3), len as f64)?,
+                );
                 for i in s..e {
                     array_like_set_index(arr, i, value.clone());
                 }
@@ -6988,37 +6984,20 @@ fn make_array() -> JsValue {
             builtin_fn("copyWithin", 2, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                let len = array_like_length(arr)? as i64;
-                let target = args
-                    .get(1)
-                    .unwrap_or(&JsValue::Smi(0))
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
-                let start = args
-                    .get(2)
-                    .unwrap_or(&JsValue::Smi(0))
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
-                let end = args
-                    .get(3)
-                    .map(|v| v.to_number().unwrap_or(len as f64) as i64)
-                    .unwrap_or(len);
-                let to = if target < 0 {
-                    (len + target).max(0)
-                } else {
-                    target.min(len)
-                } as usize;
-                let from = if start < 0 {
-                    (len + start).max(0)
-                } else {
-                    start.min(len)
-                } as usize;
-                let fin = if end < 0 {
-                    (len + end).max(0)
-                } else {
-                    end.min(len)
-                } as usize;
-                let count = (fin.saturating_sub(from)).min((len as usize).saturating_sub(to));
+                let len = array_like_length(arr)?;
+                let to = clamp_relative_integer_index(
+                    len,
+                    to_integer_or_infinity_arg(args.get(1), 0.0)?,
+                );
+                let from = clamp_relative_integer_index(
+                    len,
+                    to_integer_or_infinity_arg(args.get(2), 0.0)?,
+                );
+                let fin = clamp_relative_integer_index(
+                    len,
+                    to_integer_or_infinity_arg(args.get(3), len as f64)?,
+                );
+                let count = fin.saturating_sub(from).min(len.saturating_sub(to));
                 // Buffer source elements first to handle overlapping regions.
                 let buf: Vec<(bool, JsValue)> = (0..count)
                     .map(|i| {
@@ -7643,26 +7622,25 @@ fn make_array() -> JsValue {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let (elements, _) = try_to_array_like_elements(arr)?;
-                let len = elements.len() as i64;
-                let start = args
-                    .get(1)
-                    .unwrap_or(&JsValue::Smi(0))
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
-                let s = if start < 0 {
-                    (len + start).max(0)
-                } else {
-                    start.min(len)
-                } as usize;
-                let max_del = (len - s as i64).max(0) as usize;
+                let len = elements.len();
+                let s = clamp_relative_integer_index(
+                    len,
+                    to_integer_or_infinity_arg(args.get(1), 0.0)?,
+                );
+                let max_del = len.saturating_sub(s);
                 let del = args
                     .get(2)
                     .map(|v| {
-                        crate::builtins::util::clamped_f64_to_usize(
-                            v.to_number().unwrap_or(max_del as f64),
-                        )
-                        .min(max_del)
+                        let delete_count = v.to_integer_or_infinity()?;
+                        Ok(if delete_count <= 0.0 {
+                            0
+                        } else if delete_count == f64::INFINITY {
+                            max_del
+                        } else {
+                            (delete_count as usize).min(max_del)
+                        })
                     })
+                    .transpose()?
                     .unwrap_or(max_del);
                 let new_items = if args.len() > 3 { &args[3..] } else { &[] };
                 let mut v: Vec<JsValue> = elements[..s].to_vec();
@@ -9857,12 +9835,10 @@ fn make_string() -> JsValue {
             "charAt".into(),
             native(|args| {
                 let s = require_coercible_string(&args)?;
-                let pos = args
-                    .get(1)
-                    .unwrap_or(&JsValue::Undefined)
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
-                Ok(JsValue::String(string_char_at(&s, pos).into()))
+                Ok(match normalize_string_index(utf16_len(&s), args.get(1))? {
+                    Some(pos) => JsValue::String(string_char_at(&s, pos as i64).into()),
+                    None => JsValue::String(String::new().into()),
+                })
             }),
         );
 
@@ -9871,12 +9847,10 @@ fn make_string() -> JsValue {
             "charCodeAt".into(),
             native(|args| {
                 let s = require_coercible_string(&args)?;
-                let pos = args
-                    .get(1)
-                    .unwrap_or(&JsValue::Undefined)
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
-                Ok(num(string_char_code_at(&s, pos)))
+                Ok(match normalize_string_index(utf16_len(&s), args.get(1))? {
+                    Some(pos) => num(string_char_code_at(&s, pos as i64)),
+                    None => num(f64::NAN),
+                })
             }),
         );
 
@@ -9885,12 +9859,10 @@ fn make_string() -> JsValue {
             "codePointAt".into(),
             native(|args| {
                 let s = require_coercible_string(&args)?;
-                let pos = args
-                    .get(1)
-                    .unwrap_or(&JsValue::Undefined)
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
-                match string_code_point_at(&s, pos) {
+                let Some(pos) = normalize_string_index(utf16_len(&s), args.get(1))? else {
+                    return Ok(JsValue::Undefined);
+                };
+                match string_code_point_at(&s, pos as i64) {
                     Some(cp) => Ok(num(cp as f64)),
                     None => Ok(JsValue::Undefined),
                 }
@@ -9915,14 +9887,16 @@ fn make_string() -> JsValue {
             "slice".into(),
             native(|args| {
                 let s = require_coercible_string(&args)?;
-                let start = args
-                    .get(1)
-                    .unwrap_or(&JsValue::Undefined)
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
+                let len = utf16_len(&s);
+                let start = clamp_relative_integer_index(
+                    len,
+                    to_integer_or_infinity_arg(args.get(1), 0.0)?,
+                ) as i64;
                 let end = match args.get(2) {
                     Some(JsValue::Undefined) | None => None,
-                    Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+                    Some(v) => {
+                        Some(clamp_relative_integer_index(len, v.to_integer_or_infinity()?) as i64)
+                    }
                 };
                 Ok(JsValue::String(string_slice(&s, start, end).into()))
             }),
@@ -9933,14 +9907,17 @@ fn make_string() -> JsValue {
             "substring".into(),
             native(|args| {
                 let s = require_coercible_string(&args)?;
-                let start = args
-                    .get(1)
-                    .unwrap_or(&JsValue::Undefined)
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
+                let len = utf16_len(&s);
+                let start = clamp_nonnegative_integer_index(
+                    len,
+                    to_integer_or_infinity_arg(args.get(1), 0.0)?,
+                ) as i64;
                 let end = match args.get(2) {
                     Some(JsValue::Undefined) | None => None,
-                    Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+                    Some(v) => Some(clamp_nonnegative_integer_index(
+                        len,
+                        v.to_integer_or_infinity()?,
+                    ) as i64),
                 };
                 Ok(JsValue::String(string_substring(&s, start, end).into()))
             }),
@@ -9952,9 +9929,13 @@ fn make_string() -> JsValue {
             native(|args| {
                 let s = require_coercible_string(&args)?;
                 let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+                let len = utf16_len(&s);
                 let pos = match args.get(2) {
                     Some(JsValue::Undefined) | None => None,
-                    Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+                    Some(v) => Some(clamp_nonnegative_integer_index(
+                        len,
+                        v.to_integer_or_infinity()?,
+                    ) as i64),
                 };
                 Ok(num(string_index_of(&s, &search, pos) as f64))
             }),
@@ -9966,9 +9947,13 @@ fn make_string() -> JsValue {
             native(|args| {
                 let s = require_coercible_string(&args)?;
                 let search = args.get(1).unwrap_or(&JsValue::Undefined).to_js_string()?;
+                let len = utf16_len(&s);
                 let pos = match args.get(2) {
                     Some(JsValue::Undefined) | None => None,
-                    Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+                    Some(v) => Some(clamp_nonnegative_integer_index(
+                        len,
+                        v.to_integer_or_infinity()?,
+                    ) as i64),
                 };
                 Ok(num(string_last_index_of(&s, &search, pos) as f64))
             }),
@@ -9992,9 +9977,10 @@ fn make_string() -> JsValue {
                     ));
                 }
                 let search = search_arg.to_js_string()?;
+                let len = utf16_len(&s);
                 let pos = match args.get(2) {
                     Some(JsValue::Undefined) | None => None,
-                    Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+                    Some(v) => Some(clamp_nonnegative_integer_index(len, v.to_integer_or_infinity()?) as i64),
                 };
                 Ok(JsValue::Boolean(string_includes(&s, &search, pos)))
             }),
@@ -10018,9 +10004,10 @@ fn make_string() -> JsValue {
                     ));
             }
             let search = search_arg.to_js_string()?;
+            let len = utf16_len(&s);
             let pos = match args.get(2) {
                 Some(JsValue::Undefined) | None => None,
-                Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+                Some(v) => Some(clamp_nonnegative_integer_index(len, v.to_integer_or_infinity()?) as i64),
             };
             Ok(JsValue::Boolean(string_starts_with(&s, &search, pos)))
         }),
@@ -10045,9 +10032,13 @@ fn make_string() -> JsValue {
                 ));
                 }
                 let search = search_arg.to_js_string()?;
+                let len = utf16_len(&s);
                 let end = match args.get(2) {
                     Some(JsValue::Undefined) | None => None,
-                    Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+                    Some(v) => Some(clamp_nonnegative_integer_index(
+                        len,
+                        v.to_integer_or_infinity()?,
+                    ) as i64),
                 };
                 Ok(JsValue::Boolean(string_ends_with(&s, &search, end)))
             }),
@@ -10555,14 +10546,17 @@ fn make_string() -> JsValue {
             "substr".into(),
             builtin_fn("substr", 2, |args| {
                 let s = require_coercible_string(&args)?;
-                let start = args
-                    .get(1)
-                    .unwrap_or(&JsValue::Undefined)
-                    .to_number()
-                    .unwrap_or(0.0) as i64;
+                let len = utf16_len(&s);
+                let start = clamp_relative_integer_index(
+                    len,
+                    to_integer_or_infinity_arg(args.get(1), 0.0)?,
+                ) as i64;
                 let length = match args.get(2) {
                     Some(JsValue::Undefined) | None => None,
-                    Some(v) => Some(v.to_number().unwrap_or(0.0) as i64),
+                    Some(v) => Some(clamp_nonnegative_integer_index(
+                        len,
+                        v.to_integer_or_infinity()?,
+                    ) as i64),
                 };
                 Ok(JsValue::String(string_substr(&s, start, length).into()))
             }),
@@ -13476,15 +13470,14 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
                 )));
             }
             let buffer = buf_rc.borrow();
-            let len = buffer.data.len() as i64;
-            let begin = args
-                .get(1)
-                .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                .unwrap_or(0);
-            let end = args
-                .get(2)
-                .map(|v| v.to_number().unwrap_or(len as f64) as i64)
-                .unwrap_or(len);
+            let len = buffer.data.len();
+            let begin =
+                clamp_relative_integer_index(len, to_integer_or_infinity_arg(args.get(1), 0.0)?)
+                    as i64;
+            let end = clamp_relative_integer_index(
+                len,
+                to_integer_or_infinity_arg(args.get(2), len as f64)?,
+            ) as i64;
             let sliced = arraybuffer_slice(&buffer, begin, end);
             Ok(make_buffer_instance(Rc::new(RefCell::new(sliced))))
         }),
@@ -13884,14 +13877,14 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
                     });
                     let offset = match args.get(1) {
                         Some(v) if !v.is_undefined() => {
-                            crate::builtins::util::checked_f64_to_length(v.to_number()?)?
+                            crate::builtins::util::checked_f64_to_index(v.to_number()?)?
                         }
                         _ => 0,
                     };
                     let length = match args.get(2) {
-                        Some(v) if !v.is_undefined() => Some(
-                            crate::builtins::util::checked_f64_to_length(v.to_number()?)?,
-                        ),
+                        Some(v) if !v.is_undefined() => {
+                            Some(crate::builtins::util::checked_f64_to_index(v.to_number()?)?)
+                        }
                         _ => None,
                     };
                     typed_array_new_from_buffer(kind, buf, offset, length)?
@@ -13911,7 +13904,7 @@ fn make_typed_array_constructor(kind: TypedArrayKind) -> JsValue {
                 }
                 // From length (number)
                 Some(v) => {
-                    let len = crate::builtins::util::checked_f64_to_length(v.to_number()?)?;
+                    let len = crate::builtins::util::checked_f64_to_index(v.to_number()?)?;
                     typed_array_new_from_length(kind, len)
                 }
                 None => typed_array_new_from_length(kind, 0),
@@ -14026,11 +14019,11 @@ fn make_typed_array_instance(
             obj.insert(
                 "at".into(),
                 native(move |a| {
-                    let idx = a
-                        .first()
-                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                        .unwrap_or(0);
-                    Ok(typed_array_at(&inner.borrow(), idx))
+                    let ta = inner.borrow();
+                    match normalize_at_index(ta.effective_length(), a.first())? {
+                        Some(idx) => Ok(typed_array_get(&ta, idx)),
+                        None => Ok(JsValue::Undefined),
+                    }
                 }),
             );
         }
@@ -14040,22 +14033,19 @@ fn make_typed_array_instance(
             obj.insert(
                 "copyWithin".into(),
                 native(move |a| {
-                    let target = a
-                        .first()
-                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                        .unwrap_or(0);
-                    let start = a
-                        .get(1)
-                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                        .unwrap_or(0);
-                    let end = a
-                        .get(2)
-                        .map(|v| {
-                            v.to_number()
-                                .unwrap_or(inner.borrow().effective_length() as f64)
-                                as i64
-                        })
-                        .unwrap_or(inner.borrow().effective_length() as i64);
+                    let len = inner.borrow().effective_length();
+                    let target = clamp_relative_integer_index(
+                        len,
+                        to_integer_or_infinity_arg(a.first(), 0.0)?,
+                    ) as i64;
+                    let start = clamp_relative_integer_index(
+                        len,
+                        to_integer_or_infinity_arg(a.get(1), 0.0)?,
+                    ) as i64;
+                    let end = clamp_relative_integer_index(
+                        len,
+                        to_integer_or_infinity_arg(a.get(2), len as f64)?,
+                    ) as i64;
                     typed_array_copy_within(&inner.borrow(), target, start, end);
                     Ok(instance.clone())
                 }),
@@ -14111,14 +14101,15 @@ fn make_typed_array_instance(
                 native(move |a| {
                     let val = a.first().unwrap_or(&JsValue::Undefined).clone();
                     let ta = inner.borrow();
-                    let start = a
-                        .get(1)
-                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                        .unwrap_or(0);
-                    let end = a
-                        .get(2)
-                        .map(|v| v.to_number().unwrap_or(ta.effective_length() as f64) as i64)
-                        .unwrap_or(ta.effective_length() as i64);
+                    let len = ta.effective_length();
+                    let start = clamp_relative_integer_index(
+                        len,
+                        to_integer_or_infinity_arg(a.get(1), 0.0)?,
+                    ) as i64;
+                    let end = clamp_relative_integer_index(
+                        len,
+                        to_integer_or_infinity_arg(a.get(2), len as f64)?,
+                    ) as i64;
                     typed_array_fill(&ta, &val, start, end)?;
                     Ok(instance.clone())
                 }),
@@ -14313,10 +14304,8 @@ fn make_typed_array_instance(
                 "includes".into(),
                 native(move |a| {
                     let search = a.first().unwrap_or(&JsValue::Undefined);
-                    let from = a
-                        .get(1)
-                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                        .unwrap_or(0);
+                    let from =
+                        normalize_from_index(inner.borrow().effective_length(), a.get(1))? as i64;
                     Ok(JsValue::Boolean(typed_array_includes(
                         &inner.borrow(),
                         search,
@@ -14331,10 +14320,8 @@ fn make_typed_array_instance(
                 "indexOf".into(),
                 native(move |a| {
                     let search = a.first().unwrap_or(&JsValue::Undefined);
-                    let from = a
-                        .get(1)
-                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                        .unwrap_or(0);
+                    let from =
+                        normalize_from_index(inner.borrow().effective_length(), a.get(1))? as i64;
                     Ok(JsValue::Smi(
                         typed_array_index_of(&inner.borrow(), search, from) as i32,
                     ))
@@ -14373,12 +14360,12 @@ fn make_typed_array_instance(
                 native(move |a| {
                     let search = a.first().unwrap_or(&JsValue::Undefined);
                     let ta = inner.borrow();
-                    let from = a
-                        .get(1)
-                        .map(|v| v.to_number().unwrap_or(ta.effective_length() as f64 - 1.0) as i64)
-                        .unwrap_or(ta.effective_length() as i64 - 1);
+                    let Some(from) = normalize_last_from_index(ta.effective_length(), a.get(1))?
+                    else {
+                        return Ok(JsValue::Smi(-1));
+                    };
                     Ok(JsValue::Smi(
-                        typed_array_last_index_of(&ta, search, from) as i32
+                        typed_array_last_index_of(&ta, search, from as i64) as i32,
                     ))
                 }),
             );
@@ -14539,14 +14526,15 @@ fn make_typed_array_instance(
                 "slice".into(),
                 native(move |a| {
                     let ta = inner.borrow();
-                    let start = a
-                        .first()
-                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                        .unwrap_or(0);
-                    let end = a
-                        .get(1)
-                        .map(|v| v.to_number().unwrap_or(ta.effective_length() as f64) as i64)
-                        .unwrap_or(ta.effective_length() as i64);
+                    let len = ta.effective_length();
+                    let start = clamp_relative_integer_index(
+                        len,
+                        to_integer_or_infinity_arg(a.first(), 0.0)?,
+                    ) as i64;
+                    let end = clamp_relative_integer_index(
+                        len,
+                        to_integer_or_infinity_arg(a.get(1), len as f64)?,
+                    ) as i64;
                     let result = typed_array_slice(&ta, start, end)?;
                     let inner = Rc::new(RefCell::new(result));
                     Ok(make_typed_array_instance(ta.kind, inner, None))
@@ -14603,14 +14591,15 @@ fn make_typed_array_instance(
                 "subarray".into(),
                 native(move |a| {
                     let ta = inner.borrow();
-                    let begin = a
-                        .first()
-                        .map(|v| v.to_number().unwrap_or(0.0) as i64)
-                        .unwrap_or(0);
-                    let end = a
-                        .get(1)
-                        .map(|v| v.to_number().unwrap_or(ta.effective_length() as f64) as i64)
-                        .unwrap_or(ta.effective_length() as i64);
+                    let len = ta.effective_length();
+                    let begin = clamp_relative_integer_index(
+                        len,
+                        to_integer_or_infinity_arg(a.first(), 0.0)?,
+                    ) as i64;
+                    let end = clamp_relative_integer_index(
+                        len,
+                        to_integer_or_infinity_arg(a.get(1), len as f64)?,
+                    ) as i64;
                     let sub = typed_array_subarray(&ta, begin, end);
                     let sub_inner = Rc::new(RefCell::new(sub));
                     Ok(make_typed_array_instance(
