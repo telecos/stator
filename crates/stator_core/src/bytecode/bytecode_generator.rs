@@ -2562,8 +2562,9 @@ impl FunctionCompiler {
     fn compile_return(&mut self, s: &crate::parser::ast::ReturnStmt) -> StatorResult<()> {
         if let Some(arg) = &s.argument {
             // Disable tail calls when inside a finally scope — the finally
-            // block must run before the frame is replaced.
-            self.in_tail_position = self.finally_stack.is_empty();
+            // block must run before the frame is replaced.  Proper tail calls
+            // are only enabled for strict-mode callers.
+            self.in_tail_position = self.is_strict && self.finally_stack.is_empty();
             self.compile_expr(arg)?;
             self.in_tail_position = false;
         } else {
