@@ -44649,4 +44649,429 @@ mod tests {
             parts.length === 2 && parts[0] === "a" && parts[1] === "b""#,
         );
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  ES2022+ conformance – comprehensive e2e tests
+    // ══════════════════════════════════════════════════════════════════
+
+    // ── 1. String.raw ────────────────────────────────────────────────
+
+    /// `String.raw` with manual template object produces interleaved output.
+    #[test]
+    fn e2e_string_raw_manual_template() {
+        assert_eval_true("String.raw({raw: ['a', 'b', 'c']}, 'X', 'Y') === 'aXbYc'");
+    }
+
+    /// `String.raw` with single segment and no substitutions.
+    #[test]
+    fn e2e_string_raw_single_segment() {
+        assert_eval_true("String.raw({raw: ['hello']}) === 'hello'");
+    }
+
+    /// `String.raw` ignores extra substitutions beyond template gaps.
+    #[test]
+    fn e2e_string_raw_extra_subs_ignored() {
+        assert_eval_true("String.raw({raw: ['a', 'b']}, 'X', 'EXTRA') === 'aXb'");
+    }
+
+    /// `String.raw` with fewer substitutions than gaps fills remaining
+    /// segments without substitution.
+    #[test]
+    fn e2e_string_raw_fewer_subs() {
+        assert_eval_true("String.raw({raw: ['a', 'b', 'c']}, 'X') === 'aXbc'");
+    }
+
+    /// `String.raw` preserves backslashes literally.
+    #[test]
+    fn e2e_string_raw_preserves_backslash() {
+        assert_eval_true(r#"String.raw({raw: ['C:\\Users']}) === 'C:\\Users'"#);
+    }
+
+    /// `String.raw` with empty raw array returns empty string.
+    #[test]
+    fn e2e_string_raw_empty_raw() {
+        assert_eval_true("String.raw({raw: []}) === ''");
+    }
+
+    // ── 2. Object.hasOwn ─────────────────────────────────────────────
+
+    /// `Object.hasOwn` returns true for own data property.
+    #[test]
+    fn e2e_object_has_own_data_property() {
+        assert_eval_true("Object.hasOwn({x: 1}, 'x') === true");
+    }
+
+    /// `Object.hasOwn` returns false for missing property.
+    #[test]
+    fn e2e_object_has_own_missing() {
+        assert_eval_true("Object.hasOwn({x: 1}, 'y') === false");
+    }
+
+    /// `Object.hasOwn` returns false for inherited toString.
+    #[test]
+    fn e2e_has_own_inherited_to_string() {
+        assert_eval_true("Object.hasOwn({}, 'toString') === false");
+    }
+
+    /// `Object.hasOwn` works on null-prototype objects.
+    #[test]
+    fn e2e_has_own_null_prototype_obj() {
+        assert_eval_true("var o = Object.create(null); o.x = 42; Object.hasOwn(o, 'x') === true");
+    }
+
+    /// `Object.hasOwn` returns true for numeric array indices.
+    #[test]
+    fn e2e_has_own_array_numeric_index() {
+        assert_eval_true("Object.hasOwn([10, 20, 30], '1') === true");
+    }
+
+    /// `Object.hasOwn` returns false for out-of-bounds array index.
+    #[test]
+    fn e2e_has_own_array_index_oob() {
+        assert_eval_true("Object.hasOwn([10, 20], '5') === false");
+    }
+
+    // ── 3. Array.prototype.at ────────────────────────────────────────
+
+    /// `Array.prototype.at` with positive index returns correct element.
+    #[test]
+    fn e2e_array_at_positive_index() {
+        assert_eval_true("[10, 20, 30].at(1) === 20");
+    }
+
+    /// `Array.prototype.at` with negative index wraps from end.
+    #[test]
+    fn e2e_array_at_negative_wrap() {
+        assert_eval_true("[10, 20, 30].at(-1) === 30");
+    }
+
+    /// `Array.prototype.at` with -length returns first element.
+    #[test]
+    fn e2e_array_at_negative_equals_length() {
+        assert_eval_true("[10, 20, 30].at(-3) === 10");
+    }
+
+    /// `Array.prototype.at` out of bounds returns undefined.
+    #[test]
+    fn e2e_array_at_out_of_bounds() {
+        assert_eval_true("[10, 20].at(5) === undefined");
+    }
+
+    /// `Array.prototype.at` with negative out of bounds returns undefined.
+    #[test]
+    fn e2e_array_at_neg_out_of_bounds() {
+        assert_eval_true("[10, 20].at(-5) === undefined");
+    }
+
+    /// `Array.prototype.at` on empty array always returns undefined.
+    #[test]
+    fn e2e_array_at_empty() {
+        assert_eval_true("[].at(0) === undefined");
+    }
+
+    // ── 4. String.prototype.at ───────────────────────────────────────
+
+    /// `String.prototype.at` positive index returns correct char.
+    #[test]
+    fn e2e_string_at_pos_index() {
+        assert_eval_true("'hello'.at(1) === 'e'");
+    }
+
+    /// `String.prototype.at` with negative index wraps from end.
+    #[test]
+    fn e2e_string_at_negative_wrap() {
+        assert_eval_true("'hello'.at(-1) === 'o'");
+    }
+
+    /// `String.prototype.at` out of bounds returns undefined.
+    #[test]
+    fn e2e_string_at_oob() {
+        assert_eval_true("'hi'.at(10) === undefined");
+    }
+
+    /// `String.prototype.at` on empty string returns undefined.
+    #[test]
+    fn e2e_string_at_empty() {
+        assert_eval_true("''.at(0) === undefined");
+    }
+
+    /// `String.prototype.at` with -length returns first character.
+    #[test]
+    fn e2e_string_at_neg_equals_length() {
+        assert_eval_true("'abc'.at(-3) === 'a'");
+    }
+
+    // ── 5. String.prototype.replaceAll ───────────────────────────────
+
+    /// `replaceAll` replaces all occurrences of a plain string.
+    #[test]
+    fn e2e_replace_all_basic() {
+        assert_eval_true("'abcabc'.replaceAll('b', 'X') === 'aXcaXc'");
+    }
+
+    /// `replaceAll` with no matches returns original string.
+    #[test]
+    fn e2e_replace_all_no_match() {
+        assert_eval_true("'hello'.replaceAll('z', 'X') === 'hello'");
+    }
+
+    /// `replaceAll` with empty search inserts between every character.
+    #[test]
+    fn e2e_replace_all_empty_search() {
+        assert_eval_true("'ab'.replaceAll('', '-') === '-a-b-'");
+    }
+
+    /// `replaceAll` replaces with empty string to delete.
+    #[test]
+    fn e2e_replace_all_delete() {
+        assert_eval_true("'aXbXc'.replaceAll('X', '') === 'abc'");
+    }
+
+    /// `replaceAll` is case-sensitive.
+    #[test]
+    fn e2e_replace_all_case_sensitive() {
+        assert_eval_true("'AaBbAa'.replaceAll('A', 'x') === 'xaBbxa'");
+    }
+
+    // ── 6. Promise.any / AggregateError ──────────────────────────────
+
+    /// `AggregateError` constructor creates error with errors array.
+    #[test]
+    fn e2e_aggregate_error_constructor() {
+        assert_eval_true(
+            "var e = new AggregateError([1, 2, 3], 'all failed'); \
+             e.errors.length === 3 && e.message === 'all failed'",
+        );
+    }
+
+    /// `AggregateError` is an instance of its constructor.
+    #[test]
+    fn e2e_aggregate_error_is_instance() {
+        assert_eval_true("var e = new AggregateError([], 'msg'); e instanceof AggregateError");
+    }
+
+    /// `AggregateError` name property equals "AggregateError".
+    #[test]
+    fn e2e_aggregate_error_name_prop() {
+        assert_eval_true("new AggregateError([], 'msg').name === 'AggregateError'");
+    }
+
+    /// `AggregateError` supports cause option (ES2022).
+    #[test]
+    fn e2e_aggregate_error_cause_opt() {
+        assert_eval_true(
+            "var e = new AggregateError([], 'msg', {cause: 'root'}); \
+             e.cause === 'root'",
+        );
+    }
+
+    // ── 7. Numeric separators ────────────────────────────────────────
+
+    /// Decimal numeric separator: `1_000_000` equals 1000000.
+    #[test]
+    fn e2e_numeric_sep_decimal() {
+        assert_eval_true("1_000_000 === 1000000");
+    }
+
+    /// Hex numeric separator: `0xFF_FF` equals 65535.
+    #[test]
+    fn e2e_numeric_sep_hex() {
+        assert_eval_true("0xFF_FF === 65535");
+    }
+
+    /// Binary numeric separator: `0b1010_0001` equals 161.
+    #[test]
+    fn e2e_numeric_sep_binary() {
+        assert_eval_true("0b1010_0001 === 161");
+    }
+
+    /// Octal numeric separator: `0o77_77` equals 4095.
+    #[test]
+    fn e2e_numeric_sep_octal() {
+        assert_eval_true("0o77_77 === 4095");
+    }
+
+    /// Floating-point numeric separator: `1_000.5` equals 1000.5.
+    #[test]
+    fn e2e_numeric_sep_float() {
+        assert_eval_true("1_000.5 === 1000.5");
+    }
+
+    // ── 8. Logical assignment operators ──────────────────────────────
+
+    /// `||=` assigns when LHS is falsy.
+    #[test]
+    fn e2e_logical_or_assign_falsy() {
+        assert_eval_true("var x = 0; x ||= 42; x === 42");
+    }
+
+    /// `||=` does not assign when LHS is truthy.
+    #[test]
+    fn e2e_logical_or_assign_truthy() {
+        assert_eval_true("var x = 1; x ||= 42; x === 1");
+    }
+
+    /// `&&=` assigns when LHS is truthy.
+    #[test]
+    fn e2e_logical_and_assign_truthy() {
+        assert_eval_true("var x = 1; x &&= 42; x === 42");
+    }
+
+    /// `&&=` does not assign when LHS is falsy.
+    #[test]
+    fn e2e_logical_and_assign_falsy() {
+        assert_eval_true("var x = 0; x &&= 42; x === 0");
+    }
+
+    /// `??=` assigns when LHS is null.
+    #[test]
+    fn e2e_nullish_assign_null() {
+        assert_eval_true("var x = null; x ??= 42; x === 42");
+    }
+
+    /// `??=` assigns when LHS is undefined.
+    #[test]
+    fn e2e_nullish_assign_undefined() {
+        assert_eval_true("var x = undefined; x ??= 42; x === 42");
+    }
+
+    /// `??=` does not assign when LHS is zero (falsy but defined).
+    #[test]
+    fn e2e_nullish_assign_zero() {
+        assert_eval_true("var x = 0; x ??= 42; x === 0");
+    }
+
+    /// `??=` does not assign when LHS is empty string.
+    #[test]
+    fn e2e_nullish_assign_empty_string() {
+        assert_eval_true("var x = ''; x ??= 'default'; x === ''");
+    }
+
+    /// `||=` on object properties.
+    #[test]
+    fn e2e_logical_or_assign_property() {
+        assert_eval_true("var o = {a: null}; o.a ||= 99; o.a === 99");
+    }
+
+    /// `&&=` on object properties.
+    #[test]
+    fn e2e_logical_and_assign_property() {
+        assert_eval_true("var o = {a: 5}; o.a &&= 10; o.a === 10");
+    }
+
+    // ── 9. Private class fields (#field in obj) ─────────────────────
+
+    /// Private field access inside class method.
+    #[test]
+    fn e2e_private_field_access() {
+        assert_eval_true(
+            "class C { #x = 42; get() { return this.#x; } } \
+             new C().get() === 42",
+        );
+    }
+
+    /// Private field is not accessible outside class.
+    #[test]
+    fn e2e_private_field_not_external() {
+        let result = global_eval("class C { #x = 1; } new C().#x");
+        assert!(
+            result.is_err(),
+            "Private field access outside class should fail"
+        );
+    }
+
+    /// `#field in obj` brand check returns true for class instances.
+    #[test]
+    fn e2e_private_brand_check_true() {
+        assert_eval_true(
+            "class C { #x = 1; static has(o) { return #x in o; } } \
+             C.has(new C()) === true",
+        );
+    }
+
+    /// `#field in obj` brand check returns false for plain objects.
+    #[test]
+    fn e2e_private_brand_check_false() {
+        assert_eval_true(
+            "class C { #x = 1; static has(o) { return #x in o; } } \
+             C.has({}) === false",
+        );
+    }
+
+    // ── 10. Error.cause ──────────────────────────────────────────────
+
+    /// `Error` with cause option sets `.cause` property.
+    #[test]
+    fn e2e_error_cause_basic() {
+        assert_eval_true("var e = new Error('fail', {cause: 'root'}); e.cause === 'root'");
+    }
+
+    /// `Error` without cause option has undefined `.cause`.
+    #[test]
+    fn e2e_error_no_cause() {
+        assert_eval_true("new Error('msg').cause === undefined");
+    }
+
+    /// Error cause chaining: outer error wraps inner error.
+    #[test]
+    fn e2e_error_cause_chaining() {
+        assert_eval_true(
+            "var inner = new Error('inner'); \
+             var outer = new Error('outer', {cause: inner}); \
+             outer.cause.message === 'inner'",
+        );
+    }
+
+    /// `TypeError` also supports cause option (ES2022).
+    #[test]
+    fn e2e_type_error_with_cause_option() {
+        assert_eval_true(
+            "var e = new TypeError('bad', {cause: 42}); \
+             e.cause === 42 && e.message === 'bad'",
+        );
+    }
+
+    // ── 11. Cross-feature interactions ───────────────────────────────
+
+    /// `Object.hasOwn` + `Object.create(null)`: null-prototype object.
+    #[test]
+    fn e2e_has_own_create_null_missing() {
+        assert_eval_true("var o = Object.create(null); Object.hasOwn(o, 'toString') === false");
+    }
+
+    /// `Array.prototype.at` with `replaceAll` pipeline.
+    #[test]
+    fn e2e_array_at_replace_all_combo() {
+        assert_eval_true("'a-b-c'.split('-').at(-1) === 'c'");
+    }
+
+    /// Logical assignment with numeric separator literals.
+    #[test]
+    fn e2e_logical_assign_numeric_sep() {
+        assert_eval_true("var x = null; x ??= 1_000; x === 1000");
+    }
+
+    /// `String.raw` with numeric expressions as substitutions.
+    #[test]
+    fn e2e_string_raw_numeric_subs() {
+        assert_eval_true("String.raw({raw: ['val=', '!']}, 42) === 'val=42!'");
+    }
+
+    /// `AggregateError` with cause and errors together.
+    #[test]
+    fn e2e_aggregate_error_cause_and_errors() {
+        assert_eval_true(
+            "var e = new AggregateError(['a', 'b'], 'msg', {cause: 'root'}); \
+             e.errors.length === 2 && e.cause === 'root'",
+        );
+    }
+
+    /// Private field with default value of zero is not nullish.
+    #[test]
+    fn e2e_private_field_default_zero() {
+        assert_eval_true(
+            "class C { #x = 0; get() { return this.#x; } } \
+             new C().get() === 0",
+        );
+    }
 }
