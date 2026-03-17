@@ -16,6 +16,8 @@
 //!
 //! * **`get`** – if the corresponding target property is non-configurable and
 //!   non-writable the trap result must equal the target's value.
+//! * **`set`** – a trap may not successfully change a non-configurable,
+//!   non-writable data property to a different value.
 //! * **`has`** – a trap may not report `false` for a property that is
 //!   non-configurable on the target, or for any property when the target is
 //!   non-extensible.
@@ -25,12 +27,18 @@
 //!   non-existent if the corresponding target property is non-configurable.
 //! * **`defineProperty`** – a trap may not define a property that would
 //!   violate the non-configurable property constraints of the target.
+//! * **`getPrototypeOf`** – for a non-extensible target, the trap result must
+//!   equal the target's actual prototype.
+//! * **`setPrototypeOf`** – for a non-extensible target, a successful trap
+//!   result requires the requested prototype to equal the target's actual
+//!   prototype.
 //! * **`isExtensible`** – the trap result must match the target's
 //!   extensibility.
 //! * **`preventExtensions`** – a trap may only return `true` if the target is
 //!   non-extensible.
-//! * **`ownKeys`** – when the target is non-extensible the trap result must
-//!   contain every existing own key of the target and no extra keys.
+//! * **`ownKeys`** – the trap result must include every non-configurable own
+//!   key, and for non-extensible targets it must contain every existing own key
+//!   and no extra keys.
 //!
 //! # Naming convention
 //!

@@ -12317,11 +12317,12 @@ fn make_proxy() -> JsValue {
                 };
                 // Build a ProxyHandler from the handler PlainObject's trap functions
                 let handler = build_proxy_handler(&handler_val, &target_val);
-                let proxy = if callable {
+                let mut proxy = if callable {
                     proxy_new_callable(target, handler)
                 } else {
                     proxy_new(target, handler)
                 };
+                proxy.target_value = Some(target_val.clone());
                 Ok(JsValue::Proxy(Rc::new(RefCell::new(proxy))))
             }),
         );
@@ -12349,6 +12350,7 @@ fn make_proxy() -> JsValue {
                 };
                 let handler = build_proxy_handler(&handler_val, &target_val);
                 let mut proxy = proxy_revocable(target, handler);
+                proxy.target_value = Some(target_val.clone());
                 if callable {
                     proxy.callable = true;
                 }
@@ -44907,6 +44909,623 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::String("revoked_keys".into()));
+    }
+
+    // ── Proxy invariant e2e tests ─────────────────────────────────────────────
+
+    #[test]
+    fn e2e_proxy_invariant_get_allows_virtual_value_for_configurable_property() {
+        assert_eval_true(
+            r#"
+            var target = { x: 1 };
+            var proxy = new Proxy(target, { get: function () { return 2; } });
+            proxy.x === 2;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_get_allows_matching_value_for_frozen_data_property() {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, writable: false, configurable: false });
+            var proxy = new Proxy(target, { get: function () { return 1; } });
+            proxy.x === 1;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_get_throws_for_mismatched_frozen_data_property() {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, writable: false, configurable: false });
+            var proxy = new Proxy(target, { get: function () { return 2; } });
+            try { proxy.x; false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_get_allows_virtual_value_for_missing_property() {
+        assert_eval_true(
+            r#"
+            var proxy = new Proxy({}, { get: function () { return 7; } });
+            proxy.x === 7;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_set_allows_writable_property_change() {
+        assert_eval_true(
+            r#"
+            var target = { x: 1 };
+            var proxy = new Proxy(target, {
+                set: function (t, key, value) { t[key] = value; return true; }
+            });
+            Reflect.set(proxy, "x", 2) && target.x === 2;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_set_allows_same_value_for_frozen_data_property() {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, writable: false, configurable: false });
+            var proxy = new Proxy(target, { set: function () { return true; } });
+            Reflect.set(proxy, "x", 1) === true;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_set_throws_for_mismatched_frozen_data_property() {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, writable: false, configurable: false });
+            var proxy = new Proxy(target, { set: function () { return true; } });
+            try { Reflect.set(proxy, "x", 2); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_set_allows_new_property_on_extensible_target() {
+        assert_eval_true(
+            r#"
+            var proxy = new Proxy({}, { set: function () { return true; } });
+            Reflect.set(proxy, "x", 1) === true;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_has_allows_false_for_missing_property() {
+        assert_eval_true(
+            r#"
+            var proxy = new Proxy({}, { has: function () { return false; } });
+            !Reflect.has(proxy, "x");
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_has_throws_for_non_configurable_property() {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, configurable: false });
+            var proxy = new Proxy(target, { has: function () { return false; } });
+            try { Reflect.has(proxy, "x"); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_has_throws_for_non_extensible_existing_property() {
+        assert_eval_true(
+            r#"
+            var target = Object.preventExtensions({ x: 1 });
+            var proxy = new Proxy(target, { has: function () { return false; } });
+            try { Reflect.has(proxy, "x"); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_has_allows_true_for_non_configurable_property() {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, configurable: false });
+            var proxy = new Proxy(target, { has: function () { return true; } });
+            Reflect.has(proxy, "x");
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_has_allows_true_for_non_extensible_existing_property() {
+        assert_eval_true(
+            r#"
+            var target = Object.preventExtensions({ x: 1 });
+            var proxy = new Proxy(target, { has: function () { return true; } });
+            Reflect.has(proxy, "x");
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_delete_property_allows_configurable_property() {
+        assert_eval_true(
+            r#"
+            var target = { x: 1 };
+            var proxy = new Proxy(target, { deleteProperty: function () { return true; } });
+            Reflect.deleteProperty(proxy, "x") === true;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_delete_property_throws_for_non_configurable_property() {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, configurable: false });
+            var proxy = new Proxy(target, { deleteProperty: function () { return true; } });
+            try { Reflect.deleteProperty(proxy, "x"); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_delete_property_false_is_allowed() {
+        assert_eval_true(
+            r#"
+            var proxy = new Proxy({ x: 1 }, { deleteProperty: function () { return false; } });
+            Reflect.deleteProperty(proxy, "x") === false;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_delete_property_allows_missing_property_success() {
+        assert_eval_true(
+            r#"
+            var proxy = new Proxy({}, { deleteProperty: function () { return true; } });
+            Reflect.deleteProperty(proxy, "x") === true;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_own_keys_allows_extra_keys_on_extensible_target() {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "fixed", { value: 1, configurable: false });
+            var proxy = new Proxy(target, {
+                ownKeys: function () { return ["fixed", "extra"]; }
+            });
+            Reflect.ownKeys(proxy).join(",") === "fixed,extra";
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_own_keys_throws_when_omitting_non_configurable_key() {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "fixed", { value: 1, configurable: false });
+            var proxy = new Proxy(target, { ownKeys: function () { return []; } });
+            try { Reflect.ownKeys(proxy); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_own_keys_allows_omitting_configurable_key_on_extensible_target() {
+        assert_eval_true(
+            r#"
+            var target = { x: 1, y: 2 };
+            var proxy = new Proxy(target, { ownKeys: function () { return ["x"]; } });
+            Reflect.ownKeys(proxy).join(",") === "x";
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_own_keys_throws_when_non_extensible_target_omits_key() {
+        assert_eval_true(
+            r#"
+            var target = Object.preventExtensions({ x: 1, y: 2 });
+            var proxy = new Proxy(target, { ownKeys: function () { return ["x"]; } });
+            try { Reflect.ownKeys(proxy); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_own_keys_throws_when_non_extensible_target_adds_key() {
+        assert_eval_true(
+            r#"
+            var target = Object.preventExtensions({ x: 1 });
+            var proxy = new Proxy(target, { ownKeys: function () { return ["x", "y"]; } });
+            try { Reflect.ownKeys(proxy); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_own_keys_throws_for_duplicate_key() {
+        assert_eval_true(
+            r#"
+            var proxy = new Proxy({}, { ownKeys: function () { return ["x", "x"]; } });
+            try { Reflect.ownKeys(proxy); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_get_own_property_descriptor_allows_virtual_property_on_extensible_target()
+     {
+        assert_eval_true(
+            r#"
+            var proxy = new Proxy({}, {
+                getOwnPropertyDescriptor: function () {
+                    return { value: 1, writable: true, enumerable: true, configurable: true };
+                }
+            });
+            Reflect.getOwnPropertyDescriptor(proxy, "x").value === 1;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_get_own_property_descriptor_throws_when_hiding_non_configurable_property()
+     {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, configurable: false });
+            var proxy = new Proxy(target, { getOwnPropertyDescriptor: function () { return undefined; } });
+            try { Reflect.getOwnPropertyDescriptor(proxy, "x"); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_get_own_property_descriptor_throws_when_hiding_property_on_non_extensible_target()
+     {
+        assert_eval_true(
+            r#"
+            var target = Object.preventExtensions({ x: 1 });
+            var proxy = new Proxy(target, { getOwnPropertyDescriptor: function () { return undefined; } });
+            try { Reflect.getOwnPropertyDescriptor(proxy, "x"); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_get_own_property_descriptor_throws_for_configurable_non_configurable_mismatch()
+     {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, configurable: false });
+            var proxy = new Proxy(target, {
+                getOwnPropertyDescriptor: function () {
+                    return { value: 1, configurable: true };
+                }
+            });
+            try { Reflect.getOwnPropertyDescriptor(proxy, "x"); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_get_own_property_descriptor_throws_for_enumerable_non_configurable_mismatch()
+     {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, enumerable: false, configurable: false });
+            var proxy = new Proxy(target, {
+                getOwnPropertyDescriptor: function () {
+                    return { value: 1, enumerable: true, configurable: false };
+                }
+            });
+            try { Reflect.getOwnPropertyDescriptor(proxy, "x"); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_get_own_property_descriptor_throws_for_value_non_configurable_non_writable_mismatch()
+     {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, writable: false, configurable: false });
+            var proxy = new Proxy(target, {
+                getOwnPropertyDescriptor: function () {
+                    return { value: 2, writable: false, configurable: false };
+                }
+            });
+            try { Reflect.getOwnPropertyDescriptor(proxy, "x"); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_get_own_property_descriptor_throws_for_new_property_on_non_extensible_target()
+     {
+        assert_eval_true(
+            r#"
+            var target = Object.preventExtensions({});
+            var proxy = new Proxy(target, {
+                getOwnPropertyDescriptor: function () {
+                    return { value: 1, configurable: true };
+                }
+            });
+            try { Reflect.getOwnPropertyDescriptor(proxy, "x"); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_get_own_property_descriptor_allows_matching_frozen_descriptor() {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, writable: false, enumerable: false, configurable: false });
+            var proxy = new Proxy(target, {
+                getOwnPropertyDescriptor: function () {
+                    return { value: 1, writable: false, enumerable: false, configurable: false };
+                }
+            });
+            var desc = Reflect.getOwnPropertyDescriptor(proxy, "x");
+            desc.value === 1 && desc.writable === false && desc.enumerable === false && desc.configurable === false;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_define_property_allows_new_property_on_extensible_target() {
+        assert_eval_true(
+            r#"
+            var proxy = new Proxy({}, { defineProperty: function () { return true; } });
+            Reflect.defineProperty(proxy, "x", { value: 1 }) === true;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_define_property_throws_for_new_property_on_non_extensible_target() {
+        assert_eval_true(
+            r#"
+            var target = Object.preventExtensions({});
+            var proxy = new Proxy(target, { defineProperty: function () { return true; } });
+            try { Reflect.defineProperty(proxy, "x", { value: 1 }); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_define_property_throws_for_configurable_non_configurable_mismatch() {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, configurable: false });
+            var proxy = new Proxy(target, { defineProperty: function () { return true; } });
+            try { Reflect.defineProperty(proxy, "x", { value: 1, configurable: true }); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_define_property_throws_for_enumerable_non_configurable_mismatch() {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, enumerable: false, configurable: false });
+            var proxy = new Proxy(target, { defineProperty: function () { return true; } });
+            try { Reflect.defineProperty(proxy, "x", { value: 1, enumerable: true }); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_define_property_throws_for_value_non_configurable_non_writable_mismatch()
+    {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, writable: false, configurable: false });
+            var proxy = new Proxy(target, { defineProperty: function () { return true; } });
+            try { Reflect.defineProperty(proxy, "x", { value: 2 }); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_define_property_allows_matching_frozen_descriptor() {
+        assert_eval_true(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, writable: false, configurable: false });
+            var proxy = new Proxy(target, { defineProperty: function () { return true; } });
+            Reflect.defineProperty(proxy, "x", { value: 1 }) === true;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_prevent_extensions_allows_true_when_target_becomes_non_extensible() {
+        assert_eval_true(
+            r#"
+            var target = {};
+            var proxy = new Proxy(target, {
+                preventExtensions: function (t) {
+                    Object.preventExtensions(t);
+                    return true;
+                }
+            });
+            Reflect.preventExtensions(proxy) && Reflect.isExtensible(target) === false;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_prevent_extensions_throws_when_target_stays_extensible() {
+        assert_eval_true(
+            r#"
+            var proxy = new Proxy({}, { preventExtensions: function () { return true; } });
+            try { Reflect.preventExtensions(proxy); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_prevent_extensions_allows_false_without_freezing_target() {
+        assert_eval_true(
+            r#"
+            var target = {};
+            var proxy = new Proxy(target, { preventExtensions: function () { return false; } });
+            Reflect.preventExtensions(proxy) === false && Reflect.isExtensible(target) === true;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_is_extensible_allows_true_when_target_is_extensible() {
+        assert_eval_true(
+            r#"
+            var proxy = new Proxy({}, { isExtensible: function () { return true; } });
+            Reflect.isExtensible(proxy) === true;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_is_extensible_throws_when_trap_disagrees_with_extensible_target() {
+        assert_eval_true(
+            r#"
+            var proxy = new Proxy({}, { isExtensible: function () { return false; } });
+            try { Reflect.isExtensible(proxy); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_is_extensible_allows_false_when_target_is_not_extensible() {
+        assert_eval_true(
+            r#"
+            var target = Object.preventExtensions({});
+            var proxy = new Proxy(target, { isExtensible: function () { return false; } });
+            Reflect.isExtensible(proxy) === false;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_get_prototype_of_allows_alternate_prototype_for_extensible_target() {
+        assert_eval_true(
+            r#"
+            var proto = { tag: 1 };
+            var proxy = new Proxy({}, { getPrototypeOf: function () { return proto; } });
+            Reflect.getPrototypeOf(proxy) === proto;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_get_prototype_of_throws_for_non_object_non_null_result() {
+        assert_eval_true(
+            r#"
+            var proxy = new Proxy({}, { getPrototypeOf: function () { return 1; } });
+            try { Reflect.getPrototypeOf(proxy); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_get_prototype_of_throws_for_non_extensible_target_mismatch() {
+        assert_eval_true(
+            r#"
+            var proto = { tag: 1 };
+            var other = { tag: 2 };
+            var target = Object.preventExtensions(Object.create(proto));
+            var proxy = new Proxy(target, { getPrototypeOf: function () { return other; } });
+            try { Reflect.getPrototypeOf(proxy); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_get_prototype_of_allows_matching_result_for_non_extensible_target() {
+        assert_eval_true(
+            r#"
+            var proto = { tag: 1 };
+            var target = Object.preventExtensions(Object.create(proto));
+            var proxy = new Proxy(target, { getPrototypeOf: function () { return proto; } });
+            Reflect.getPrototypeOf(proxy) === proto;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_set_prototype_of_allows_true_for_extensible_target() {
+        assert_eval_true(
+            r#"
+            var target = {};
+            var next = {};
+            var proxy = new Proxy(target, { setPrototypeOf: function () { return true; } });
+            Reflect.setPrototypeOf(proxy, next) === true;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_set_prototype_of_throws_for_non_extensible_target_mismatch() {
+        assert_eval_true(
+            r#"
+            var proto = {};
+            var next = {};
+            var target = Object.preventExtensions(Object.create(proto));
+            var proxy = new Proxy(target, { setPrototypeOf: function () { return true; } });
+            try { Reflect.setPrototypeOf(proxy, next); false; } catch (e) { true; }
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_set_prototype_of_allows_matching_result_for_non_extensible_target() {
+        assert_eval_true(
+            r#"
+            var proto = {};
+            var target = Object.preventExtensions(Object.create(proto));
+            var proxy = new Proxy(target, { setPrototypeOf: function () { return true; } });
+            Reflect.setPrototypeOf(proxy, proto) === true;
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_proxy_invariant_set_prototype_of_allows_false_result() {
+        assert_eval_true(
+            r#"
+            var proxy = new Proxy({}, { setPrototypeOf: function () { return false; } });
+            Reflect.setPrototypeOf(proxy, {}) === false;
+            "#,
+        );
     }
 
     // ── Proxy/Reflect receiver & ownKeys conformance ──────────────────────────
