@@ -101,6 +101,10 @@ impl TypedArrayKind {
 pub struct JsArrayBuffer {
     /// Whether this buffer represents a `SharedArrayBuffer`.
     pub shared: bool,
+    /// Whether this buffer may be resized or grown.
+    pub max_byte_length: Option<usize>,
+    /// Whether this buffer has been detached.
+    pub detached: bool,
     /// Raw byte storage.
     pub data: Vec<u8>,
 }
@@ -120,6 +124,18 @@ pub struct JsArrayBuffer {
 pub fn arraybuffer_new(byte_length: usize) -> JsArrayBuffer {
     JsArrayBuffer {
         shared: false,
+        max_byte_length: None,
+        detached: false,
+        data: vec![0u8; byte_length],
+    }
+}
+
+/// Create a resizable `ArrayBuffer`.
+pub fn arraybuffer_new_resizable(byte_length: usize, max_byte_length: usize) -> JsArrayBuffer {
+    JsArrayBuffer {
+        shared: false,
+        max_byte_length: Some(max_byte_length),
+        detached: false,
         data: vec![0u8; byte_length],
     }
 }
@@ -130,6 +146,21 @@ pub fn arraybuffer_new(byte_length: usize) -> JsArrayBuffer {
 pub fn shared_arraybuffer_new(byte_length: usize) -> JsArrayBuffer {
     JsArrayBuffer {
         shared: true,
+        max_byte_length: None,
+        detached: false,
+        data: vec![0u8; byte_length],
+    }
+}
+
+/// Create a growable `SharedArrayBuffer`.
+pub fn shared_arraybuffer_new_growable(
+    byte_length: usize,
+    max_byte_length: usize,
+) -> JsArrayBuffer {
+    JsArrayBuffer {
+        shared: true,
+        max_byte_length: Some(max_byte_length),
+        detached: false,
         data: vec![0u8; byte_length],
     }
 }
@@ -145,7 +176,128 @@ pub fn shared_arraybuffer_new(byte_length: usize) -> JsArrayBuffer {
 /// assert_eq!(arraybuffer_byte_length(&buf), 32);
 /// ```
 pub fn arraybuffer_byte_length(buf: &JsArrayBuffer) -> usize {
-    buf.data.len()
+    if buf.detached { 0 } else { buf.data.len() }
+}
+
+/// `ArrayBuffer.prototype.resizable` getter.
+pub fn arraybuffer_resizable(buf: &JsArrayBuffer) -> bool {
+    !buf.shared && buf.max_byte_length.is_some()
+}
+
+/// `SharedArrayBuffer.prototype.growable` getter.
+pub fn shared_arraybuffer_growable(buf: &JsArrayBuffer) -> bool {
+    buf.shared && buf.max_byte_length.is_some()
+}
+
+/// `ArrayBuffer.prototype.maxByteLength` getter.
+pub fn arraybuffer_max_byte_length(buf: &JsArrayBuffer) -> usize {
+    buf.max_byte_length
+        .unwrap_or_else(|| arraybuffer_byte_length(buf))
+}
+
+/// `ArrayBuffer.prototype.detached` getter.
+pub fn arraybuffer_detached(buf: &JsArrayBuffer) -> bool {
+    buf.detached
+}
+
+/// Resize an `ArrayBuffer` in place.
+pub fn arraybuffer_resize(buf: &mut JsArrayBuffer, new_byte_length: usize) -> StatorResult<()> {
+    if buf.shared {
+        return Err(StatorError::TypeError(
+            "SharedArrayBuffer cannot be resized with ArrayBuffer.prototype.resize".into(),
+        ));
+    }
+    if buf.detached {
+        return Err(StatorError::TypeError("ArrayBuffer is detached".into()));
+    }
+    let Some(max_byte_length) = buf.max_byte_length else {
+        return Err(StatorError::TypeError(
+            "ArrayBuffer is not resizable".into(),
+        ));
+    };
+    if new_byte_length > max_byte_length {
+        return Err(StatorError::RangeError(
+            "newByteLength exceeds maxByteLength".into(),
+        ));
+    }
+    buf.data.resize(new_byte_length, 0);
+    Ok(())
+}
+
+/// Grow a `SharedArrayBuffer` in place.
+pub fn shared_arraybuffer_grow(
+    buf: &mut JsArrayBuffer,
+    new_byte_length: usize,
+) -> StatorResult<()> {
+    if !buf.shared {
+        return Err(StatorError::TypeError(
+            "SharedArrayBuffer.prototype.grow called on incompatible receiver".into(),
+        ));
+    }
+    let Some(max_byte_length) = buf.max_byte_length else {
+        return Err(StatorError::TypeError(
+            "SharedArrayBuffer is not growable".into(),
+        ));
+    };
+    if new_byte_length < buf.data.len() {
+        return Err(StatorError::RangeError(
+            "SharedArrayBuffer can only grow".into(),
+        ));
+    }
+    if new_byte_length > max_byte_length {
+        return Err(StatorError::RangeError(
+            "newByteLength exceeds maxByteLength".into(),
+        ));
+    }
+    buf.data.resize(new_byte_length, 0);
+    Ok(())
+}
+
+/// Transfer an `ArrayBuffer` to a new buffer, detaching the source.
+pub fn arraybuffer_transfer(
+    buf: &mut JsArrayBuffer,
+    new_byte_length: Option<usize>,
+    to_fixed_length: bool,
+) -> StatorResult<JsArrayBuffer> {
+    if buf.shared {
+        return Err(StatorError::TypeError(
+            "SharedArrayBuffer cannot be transferred".into(),
+        ));
+    }
+    if buf.detached {
+        return Err(StatorError::TypeError("ArrayBuffer is detached".into()));
+    }
+
+    let old_len = buf.data.len();
+    let target_len = new_byte_length.unwrap_or(old_len);
+    if let Some(max_byte_length) = buf.max_byte_length
+        && target_len > max_byte_length
+    {
+        return Err(StatorError::RangeError(
+            "newByteLength exceeds maxByteLength".into(),
+        ));
+    }
+
+    let mut data = vec![0; target_len];
+    let copy_len = cmp::min(old_len, target_len);
+    data[..copy_len].copy_from_slice(&buf.data[..copy_len]);
+
+    let transferred = JsArrayBuffer {
+        shared: false,
+        max_byte_length: if to_fixed_length {
+            None
+        } else {
+            buf.max_byte_length
+        },
+        detached: false,
+        data,
+    };
+
+    buf.data.clear();
+    buf.max_byte_length = None;
+    buf.detached = true;
+
+    Ok(transferred)
 }
 
 /// ECMAScript §25.1.5.3 `ArrayBuffer.prototype.slice(begin, end)`.
@@ -173,6 +325,8 @@ pub fn arraybuffer_slice(buf: &JsArrayBuffer, begin: i64, end: i64) -> JsArrayBu
     let fin = cmp::max(start, fin);
     JsArrayBuffer {
         shared: buf.shared,
+        max_byte_length: None,
+        detached: false,
         data: buf.data[start..fin].to_vec(),
     }
 }
@@ -367,8 +521,32 @@ pub struct JsTypedArray {
     pub kind: TypedArrayKind,
     /// Byte offset into the buffer.
     pub byte_offset: usize,
-    /// Number of elements (not bytes).
+    /// Declared number of elements (not bytes).
     pub length: usize,
+    /// Whether this view tracks the current backing-buffer byte length.
+    pub auto_length: bool,
+}
+
+impl JsTypedArray {
+    /// The view length after accounting for detached or resized backing stores.
+    pub fn effective_length(&self) -> usize {
+        let buf = self.buffer.borrow();
+        if buf.detached || self.byte_offset > buf.data.len() {
+            return 0;
+        }
+        let available = buf.data.len() - self.byte_offset;
+        let available_len = available / self.kind.bytes_per_element();
+        if self.auto_length {
+            available_len
+        } else {
+            cmp::min(self.length, available_len)
+        }
+    }
+
+    /// The current byte length of the view.
+    pub fn effective_byte_length(&self) -> usize {
+        self.effective_length() * self.kind.bytes_per_element()
+    }
 }
 
 /// Construct a TypedArray of `length` elements, allocating a new buffer.
@@ -389,6 +567,7 @@ pub fn typed_array_new_from_length(kind: TypedArrayKind, length: usize) -> JsTyp
         kind,
         byte_offset: 0,
         length,
+        auto_length: false,
     }
 }
 
@@ -438,6 +617,7 @@ pub fn typed_array_new_from_buffer(
         kind,
         byte_offset,
         length: len,
+        auto_length: length.is_none(),
     })
 }
 
@@ -457,12 +637,12 @@ pub fn typed_array_from_values(
 
 /// `%TypedArray%.prototype.length` getter.
 pub fn typed_array_length(ta: &JsTypedArray) -> usize {
-    ta.length
+    ta.effective_length()
 }
 
 /// `%TypedArray%.prototype.byteLength` getter.
 pub fn typed_array_byte_length(ta: &JsTypedArray) -> usize {
-    ta.length * ta.kind.bytes_per_element()
+    ta.effective_byte_length()
 }
 
 /// `%TypedArray%.prototype.byteOffset` getter.
@@ -481,7 +661,7 @@ pub fn typed_array_buffer(ta: &JsTypedArray) -> Rc<RefCell<JsArrayBuffer>> {
 ///
 /// Returns `JsValue::Undefined` for out-of-bounds access.
 pub fn typed_array_get(ta: &JsTypedArray, index: usize) -> JsValue {
-    if index >= ta.length {
+    if index >= ta.effective_length() {
         return JsValue::Undefined;
     }
     let bpe = ta.kind.bytes_per_element();
@@ -533,7 +713,7 @@ pub fn typed_array_get(ta: &JsTypedArray, index: usize) -> JsValue {
 /// Returns `RangeError` for out-of-bounds indices. Returns `TypeError`
 /// if the value cannot be converted to the typed-array element type.
 pub fn typed_array_set(ta: &JsTypedArray, index: usize, value: &JsValue) -> StatorResult<()> {
-    if index >= ta.length {
+    if index >= ta.effective_length() {
         return Err(StatorError::RangeError("Index out of bounds".into()));
     }
     let bpe = ta.kind.bytes_per_element();
@@ -601,7 +781,7 @@ pub fn typed_array_set(ta: &JsTypedArray, index: usize, value: &JsValue) -> Stat
 
 /// `%TypedArray%.prototype.at(index)`.
 pub fn typed_array_at(ta: &JsTypedArray, index: i64) -> JsValue {
-    let len = ta.length as i64;
+    let len = ta.effective_length() as i64;
     let i = if index < 0 { len + index } else { index };
     if i < 0 || i >= len {
         return JsValue::Undefined;
@@ -616,7 +796,7 @@ pub fn typed_array_fill(
     start: i64,
     end: i64,
 ) -> StatorResult<()> {
-    let len = ta.length as i64;
+    let len = ta.effective_length() as i64;
     let s = clamp_index(start, len) as usize;
     let e = clamp_index(end, len) as usize;
     for i in s..e {
@@ -627,11 +807,14 @@ pub fn typed_array_fill(
 
 /// `%TypedArray%.prototype.copyWithin(target, start, end?)`.
 pub fn typed_array_copy_within(ta: &JsTypedArray, target: i64, start: i64, end: i64) {
-    let len = ta.length as i64;
+    let len = ta.effective_length() as i64;
     let to = clamp_index(target, len) as usize;
     let from = clamp_index(start, len) as usize;
     let fin = clamp_index(end, len) as usize;
-    let count = cmp::min(fin.saturating_sub(from), ta.length.saturating_sub(to));
+    let count = cmp::min(
+        fin.saturating_sub(from),
+        ta.effective_length().saturating_sub(to),
+    );
     if count == 0 {
         return;
     }
@@ -646,7 +829,7 @@ pub fn typed_array_copy_within(ta: &JsTypedArray, target: i64, start: i64, end: 
 
 /// `%TypedArray%.prototype.reverse()`.
 pub fn typed_array_reverse(ta: &JsTypedArray) {
-    let len = ta.length;
+    let len = ta.effective_length();
     if len < 2 {
         return;
     }
@@ -663,13 +846,13 @@ pub fn typed_array_reverse(ta: &JsTypedArray) {
 
 /// `%TypedArray%.prototype.indexOf(searchElement, fromIndex?)`.
 pub fn typed_array_index_of(ta: &JsTypedArray, search: &JsValue, from: i64) -> i64 {
-    let len = ta.length as i64;
+    let len = ta.effective_length() as i64;
     let start = if from < 0 {
         cmp::max(len + from, 0) as usize
     } else {
         from as usize
     };
-    for i in start..ta.length {
+    for i in start..ta.effective_length() {
         if typed_array_get(ta, i).is_strictly_equal(search) {
             return i as i64;
         }
@@ -679,7 +862,7 @@ pub fn typed_array_index_of(ta: &JsTypedArray, search: &JsValue, from: i64) -> i
 
 /// `%TypedArray%.prototype.lastIndexOf(searchElement, fromIndex?)`.
 pub fn typed_array_last_index_of(ta: &JsTypedArray, search: &JsValue, from: i64) -> i64 {
-    let len = ta.length as i64;
+    let len = ta.effective_length() as i64;
     let start = if from < 0 {
         (len + from) as isize
     } else {
@@ -698,13 +881,13 @@ pub fn typed_array_last_index_of(ta: &JsTypedArray, search: &JsValue, from: i64)
 
 /// `%TypedArray%.prototype.includes(searchElement, fromIndex?)`.
 pub fn typed_array_includes(ta: &JsTypedArray, search: &JsValue, from: i64) -> bool {
-    let len = ta.length as i64;
+    let len = ta.effective_length() as i64;
     let start = if from < 0 {
         cmp::max(len + from, 0) as usize
     } else {
         from as usize
     };
-    for i in start..ta.length {
+    for i in start..ta.effective_length() {
         let elem = typed_array_get(ta, i);
         if elem.same_value_zero(search) {
             return true;
@@ -715,8 +898,8 @@ pub fn typed_array_includes(ta: &JsTypedArray, search: &JsValue, from: i64) -> b
 
 /// `%TypedArray%.prototype.join(separator?)`.
 pub fn typed_array_join(ta: &JsTypedArray, separator: &str) -> StatorResult<String> {
-    let mut parts = Vec::with_capacity(ta.length);
-    for i in 0..ta.length {
+    let mut parts = Vec::with_capacity(ta.effective_length());
+    for i in 0..ta.effective_length() {
         let v = typed_array_get(ta, i);
         parts.push(v.to_js_string()?);
     }
@@ -727,7 +910,7 @@ pub fn typed_array_join(ta: &JsTypedArray, separator: &str) -> StatorResult<Stri
 ///
 /// Returns a new TypedArray of the same kind containing the sliced elements.
 pub fn typed_array_slice(ta: &JsTypedArray, start: i64, end: i64) -> StatorResult<JsTypedArray> {
-    let len = ta.length as i64;
+    let len = ta.effective_length() as i64;
     let s = clamp_index(start, len) as usize;
     let e = clamp_index(end, len) as usize;
     let count = e.saturating_sub(s);
@@ -749,7 +932,7 @@ pub fn typed_array_slice(ta: &JsTypedArray, start: i64, end: i64) -> StatorResul
 ///
 /// Returns a new TypedArray that shares the same buffer.
 pub fn typed_array_subarray(ta: &JsTypedArray, begin: i64, end: i64) -> JsTypedArray {
-    let len = ta.length as i64;
+    let len = ta.effective_length() as i64;
     let s = clamp_index(begin, len) as usize;
     let e = clamp_index(end, len) as usize;
     let count = e.saturating_sub(s);
@@ -759,6 +942,7 @@ pub fn typed_array_subarray(ta: &JsTypedArray, begin: i64, end: i64) -> JsTypedA
         kind: ta.kind,
         byte_offset: ta.byte_offset + s * bpe,
         length: count,
+        auto_length: ta.auto_length && e == len as usize,
     }
 }
 
@@ -770,7 +954,7 @@ pub fn typed_array_set_from(
     source: &[JsValue],
     offset: usize,
 ) -> StatorResult<()> {
-    if offset + source.len() > ta.length {
+    if offset + source.len() > ta.effective_length() {
         return Err(StatorError::RangeError("Source is too large".into()));
     }
     for (i, v) in source.iter().enumerate() {
@@ -784,7 +968,7 @@ pub fn typed_array_set_from(
 /// Sorts elements in-place using a default numeric sort (no custom comparator
 /// support in the pure-data API).
 pub fn typed_array_sort(ta: &JsTypedArray) {
-    let len = ta.length;
+    let len = ta.effective_length();
     if len < 2 {
         return;
     }
@@ -806,7 +990,7 @@ pub fn typed_array_every(
     ta: &JsTypedArray,
     pred: impl Fn(&JsValue, usize) -> StatorResult<bool>,
 ) -> StatorResult<bool> {
-    for i in 0..ta.length {
+    for i in 0..ta.effective_length() {
         let v = typed_array_get(ta, i);
         if !pred(&v, i)? {
             return Ok(false);
@@ -820,7 +1004,7 @@ pub fn typed_array_some(
     ta: &JsTypedArray,
     pred: impl Fn(&JsValue, usize) -> StatorResult<bool>,
 ) -> StatorResult<bool> {
-    for i in 0..ta.length {
+    for i in 0..ta.effective_length() {
         let v = typed_array_get(ta, i);
         if pred(&v, i)? {
             return Ok(true);
@@ -834,7 +1018,7 @@ pub fn typed_array_find(
     ta: &JsTypedArray,
     pred: impl Fn(&JsValue, usize) -> StatorResult<bool>,
 ) -> StatorResult<JsValue> {
-    for i in 0..ta.length {
+    for i in 0..ta.effective_length() {
         let v = typed_array_get(ta, i);
         if pred(&v, i)? {
             return Ok(v);
@@ -848,7 +1032,7 @@ pub fn typed_array_find_index(
     ta: &JsTypedArray,
     pred: impl Fn(&JsValue, usize) -> StatorResult<bool>,
 ) -> StatorResult<i64> {
-    for i in 0..ta.length {
+    for i in 0..ta.effective_length() {
         let v = typed_array_get(ta, i);
         if pred(&v, i)? {
             return Ok(i as i64);
@@ -862,7 +1046,7 @@ pub fn typed_array_find_last(
     ta: &JsTypedArray,
     pred: impl Fn(&JsValue, usize) -> StatorResult<bool>,
 ) -> StatorResult<JsValue> {
-    for i in (0..ta.length).rev() {
+    for i in (0..ta.effective_length()).rev() {
         let v = typed_array_get(ta, i);
         if pred(&v, i)? {
             return Ok(v);
@@ -876,7 +1060,7 @@ pub fn typed_array_find_last_index(
     ta: &JsTypedArray,
     pred: impl Fn(&JsValue, usize) -> StatorResult<bool>,
 ) -> StatorResult<i64> {
-    for i in (0..ta.length).rev() {
+    for i in (0..ta.effective_length()).rev() {
         let v = typed_array_get(ta, i);
         if pred(&v, i)? {
             return Ok(i as i64);
@@ -890,7 +1074,7 @@ pub fn typed_array_for_each(
     ta: &JsTypedArray,
     f: impl Fn(&JsValue, usize) -> StatorResult<()>,
 ) -> StatorResult<()> {
-    for i in 0..ta.length {
+    for i in 0..ta.effective_length() {
         let v = typed_array_get(ta, i);
         f(&v, i)?;
     }
@@ -903,7 +1087,7 @@ pub fn typed_array_filter(
     pred: impl Fn(&JsValue, usize) -> StatorResult<bool>,
 ) -> StatorResult<JsTypedArray> {
     let mut kept = Vec::new();
-    for i in 0..ta.length {
+    for i in 0..ta.effective_length() {
         let v = typed_array_get(ta, i);
         if pred(&v, i)? {
             kept.push(v);
@@ -917,8 +1101,8 @@ pub fn typed_array_map(
     ta: &JsTypedArray,
     f: impl Fn(&JsValue, usize) -> StatorResult<JsValue>,
 ) -> StatorResult<JsTypedArray> {
-    let mut mapped = Vec::with_capacity(ta.length);
-    for i in 0..ta.length {
+    let mut mapped = Vec::with_capacity(ta.effective_length());
+    for i in 0..ta.effective_length() {
         let v = typed_array_get(ta, i);
         mapped.push(f(&v, i)?);
     }
@@ -935,7 +1119,7 @@ pub fn typed_array_reduce(
     let mut acc = match initial {
         Some(v) => v,
         None => {
-            if ta.length == 0 {
+            if ta.effective_length() == 0 {
                 return Err(StatorError::TypeError(
                     "Reduce of empty array with no initial value".into(),
                 ));
@@ -944,7 +1128,7 @@ pub fn typed_array_reduce(
             typed_array_get(ta, 0)
         }
     };
-    for i in start..ta.length {
+    for i in start..ta.effective_length() {
         let v = typed_array_get(ta, i);
         acc = f(&acc, &v, i)?;
     }
@@ -957,7 +1141,7 @@ pub fn typed_array_reduce_right(
     f: impl Fn(&JsValue, &JsValue, usize) -> StatorResult<JsValue>,
     initial: Option<JsValue>,
 ) -> StatorResult<JsValue> {
-    let len = ta.length;
+    let len = ta.effective_length();
     let has_initial = initial.is_some();
     let mut acc = match initial {
         Some(v) => v,
@@ -984,17 +1168,21 @@ pub fn typed_array_reduce_right(
 
 /// `%TypedArray%.prototype.values()` — returns element values as a `Vec`.
 pub fn typed_array_values(ta: &JsTypedArray) -> Vec<JsValue> {
-    (0..ta.length).map(|i| typed_array_get(ta, i)).collect()
+    (0..ta.effective_length())
+        .map(|i| typed_array_get(ta, i))
+        .collect()
 }
 
 /// `%TypedArray%.prototype.keys()` — returns indices as a `Vec`.
 pub fn typed_array_keys(ta: &JsTypedArray) -> Vec<JsValue> {
-    (0..ta.length).map(|i| JsValue::Smi(i as i32)).collect()
+    (0..ta.effective_length())
+        .map(|i| JsValue::Smi(i as i32))
+        .collect()
 }
 
 /// `%TypedArray%.prototype.entries()` — returns `[index, value]` pairs.
 pub fn typed_array_entries(ta: &JsTypedArray) -> Vec<JsValue> {
-    (0..ta.length)
+    (0..ta.effective_length())
         .map(|i| JsValue::new_array(vec![JsValue::Smi(i as i32), typed_array_get(ta, i)]))
         .collect()
 }

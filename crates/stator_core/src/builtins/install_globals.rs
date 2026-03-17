@@ -120,18 +120,20 @@ use crate::builtins::symbol::{
     symbol_key_for,
 };
 use crate::builtins::typed_array::{
-    JsArrayBuffer, TypedArrayKind, arraybuffer_new, arraybuffer_slice, dataview_get_bigint64,
-    dataview_get_biguint64, dataview_get_float32, dataview_get_float64, dataview_get_int8,
-    dataview_get_int16, dataview_get_int32, dataview_get_uint8, dataview_get_uint16,
-    dataview_get_uint32, dataview_new, dataview_set_bigint64, dataview_set_biguint64,
-    dataview_set_float32, dataview_set_float64, dataview_set_int8, dataview_set_int16,
-    dataview_set_int32, dataview_set_uint8, dataview_set_uint16, dataview_set_uint32,
-    shared_arraybuffer_new, typed_array_at, typed_array_copy_within, typed_array_entries,
-    typed_array_fill, typed_array_from_values, typed_array_get, typed_array_includes,
-    typed_array_index_of, typed_array_join, typed_array_keys, typed_array_last_index_of,
-    typed_array_new_from_buffer, typed_array_new_from_length, typed_array_reverse, typed_array_set,
-    typed_array_set_from, typed_array_slice, typed_array_sort, typed_array_subarray,
-    typed_array_values,
+    JsArrayBuffer, TypedArrayKind, arraybuffer_detached, arraybuffer_max_byte_length,
+    arraybuffer_new, arraybuffer_new_resizable, arraybuffer_resizable, arraybuffer_resize,
+    arraybuffer_slice, arraybuffer_transfer, dataview_get_bigint64, dataview_get_biguint64,
+    dataview_get_float32, dataview_get_float64, dataview_get_int8, dataview_get_int16,
+    dataview_get_int32, dataview_get_uint8, dataview_get_uint16, dataview_get_uint32, dataview_new,
+    dataview_set_bigint64, dataview_set_biguint64, dataview_set_float32, dataview_set_float64,
+    dataview_set_int8, dataview_set_int16, dataview_set_int32, dataview_set_uint8,
+    dataview_set_uint16, dataview_set_uint32, shared_arraybuffer_grow, shared_arraybuffer_growable,
+    shared_arraybuffer_new, shared_arraybuffer_new_growable, typed_array_at,
+    typed_array_byte_length, typed_array_copy_within, typed_array_entries, typed_array_fill,
+    typed_array_from_values, typed_array_get, typed_array_includes, typed_array_index_of,
+    typed_array_join, typed_array_keys, typed_array_last_index_of, typed_array_new_from_buffer,
+    typed_array_new_from_length, typed_array_reverse, typed_array_set, typed_array_set_from,
+    typed_array_slice, typed_array_sort, typed_array_subarray, typed_array_values,
 };
 use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new, weak_ref_new_plain};
 use crate::error::{StatorError, StatorResult};
@@ -12719,6 +12721,19 @@ fn incompatible_receiver(display_name: &str) -> StatorError {
     StatorError::TypeError(format!("{display_name} called on incompatible receiver"))
 }
 
+fn buffer_option_max_byte_length(options: Option<&JsValue>) -> StatorResult<Option<usize>> {
+    let Some(options) = options.filter(|value| !value.is_undefined()) else {
+        return Ok(None);
+    };
+    let max = dispatch_get_property_value(options, JsValue::String("maxByteLength".into()))?;
+    if max.is_undefined() {
+        return Ok(None);
+    }
+    Ok(Some(crate::builtins::util::checked_f64_to_index(
+        max.to_number()?,
+    )?))
+}
+
 fn arraybuffer_display_name(buf: &JsArrayBuffer) -> &'static str {
     if buf.shared {
         "SharedArrayBuffer"
@@ -12757,6 +12772,172 @@ fn make_arraybuffer_prototype_impl(shared: bool) -> JsValue {
             ))
         }),
     );
+    if shared {
+        proto.insert(
+            "__get_maxByteLength__".into(),
+            native(move |args| {
+                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                    return Err(incompatible_receiver(
+                        "SharedArrayBuffer.prototype.maxByteLength",
+                    ));
+                };
+                if !buf_rc.borrow().shared {
+                    return Err(incompatible_receiver(
+                        "SharedArrayBuffer.prototype.maxByteLength",
+                    ));
+                }
+                Ok(JsValue::Smi(
+                    arraybuffer_max_byte_length(&buf_rc.borrow()) as i32
+                ))
+            }),
+        );
+        proto.insert(
+            "__get_growable__".into(),
+            native(move |args| {
+                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                    return Err(incompatible_receiver(
+                        "SharedArrayBuffer.prototype.growable",
+                    ));
+                };
+                if !buf_rc.borrow().shared {
+                    return Err(incompatible_receiver(
+                        "SharedArrayBuffer.prototype.growable",
+                    ));
+                }
+                Ok(JsValue::Boolean(shared_arraybuffer_growable(
+                    &buf_rc.borrow(),
+                )))
+            }),
+        );
+        proto.insert(
+            "grow".into(),
+            builtin_fn("grow", 1, move |args| {
+                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                    return Err(incompatible_receiver("SharedArrayBuffer.prototype.grow"));
+                };
+                if !buf_rc.borrow().shared {
+                    return Err(incompatible_receiver("SharedArrayBuffer.prototype.grow"));
+                }
+                let new_len = match args.get(1) {
+                    Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
+                    None => 0,
+                };
+                shared_arraybuffer_grow(&mut buf_rc.borrow_mut(), new_len)?;
+                Ok(JsValue::Undefined)
+            }),
+        );
+    } else {
+        proto.insert(
+            "__get_resizable__".into(),
+            native(move |args| {
+                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                    return Err(incompatible_receiver("ArrayBuffer.prototype.resizable"));
+                };
+                if buf_rc.borrow().shared {
+                    return Err(incompatible_receiver("ArrayBuffer.prototype.resizable"));
+                }
+                Ok(JsValue::Boolean(arraybuffer_resizable(&buf_rc.borrow())))
+            }),
+        );
+        proto.insert(
+            "__get_maxByteLength__".into(),
+            native(move |args| {
+                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                    return Err(incompatible_receiver("ArrayBuffer.prototype.maxByteLength"));
+                };
+                if buf_rc.borrow().shared {
+                    return Err(incompatible_receiver("ArrayBuffer.prototype.maxByteLength"));
+                }
+                Ok(JsValue::Smi(
+                    arraybuffer_max_byte_length(&buf_rc.borrow()) as i32
+                ))
+            }),
+        );
+        proto.insert(
+            "__get_detached__".into(),
+            native(move |args| {
+                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                    return Err(incompatible_receiver("ArrayBuffer.prototype.detached"));
+                };
+                if buf_rc.borrow().shared {
+                    return Err(incompatible_receiver("ArrayBuffer.prototype.detached"));
+                }
+                Ok(JsValue::Boolean(arraybuffer_detached(&buf_rc.borrow())))
+            }),
+        );
+        proto.insert(
+            "resize".into(),
+            builtin_fn("resize", 1, move |args| {
+                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                    return Err(incompatible_receiver("ArrayBuffer.prototype.resize"));
+                };
+                if buf_rc.borrow().shared {
+                    return Err(incompatible_receiver("ArrayBuffer.prototype.resize"));
+                }
+                let new_len = match args.get(1) {
+                    Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
+                    None => 0,
+                };
+                arraybuffer_resize(&mut buf_rc.borrow_mut(), new_len)?;
+                Ok(JsValue::Undefined)
+            }),
+        );
+        proto.insert(
+            "transfer".into(),
+            builtin_fn("transfer", 0, move |args| {
+                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                    return Err(incompatible_receiver("ArrayBuffer.prototype.transfer"));
+                };
+                if buf_rc.borrow().shared {
+                    return Err(incompatible_receiver("ArrayBuffer.prototype.transfer"));
+                }
+                let new_len = match args.get(1) {
+                    Some(v) if !v.is_undefined() => {
+                        Some(crate::builtins::util::checked_f64_to_index(v.to_number()?)?)
+                    }
+                    _ => None,
+                };
+                let transferred = arraybuffer_transfer(&mut buf_rc.borrow_mut(), new_len, false)?;
+                Ok(make_arraybuffer_instance(Rc::new(RefCell::new(
+                    transferred,
+                ))))
+            }),
+        );
+        proto.insert(
+            "transferToFixedLength".into(),
+            builtin_fn("transferToFixedLength", 0, move |args| {
+                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                let Some(buf_rc) = extract_arraybuffer(receiver) else {
+                    return Err(incompatible_receiver(
+                        "ArrayBuffer.prototype.transferToFixedLength",
+                    ));
+                };
+                if buf_rc.borrow().shared {
+                    return Err(incompatible_receiver(
+                        "ArrayBuffer.prototype.transferToFixedLength",
+                    ));
+                }
+                let new_len = match args.get(1) {
+                    Some(v) if !v.is_undefined() => {
+                        Some(crate::builtins::util::checked_f64_to_index(v.to_number()?)?)
+                    }
+                    _ => None,
+                };
+                let transferred = arraybuffer_transfer(&mut buf_rc.borrow_mut(), new_len, true)?;
+                Ok(make_arraybuffer_instance(Rc::new(RefCell::new(
+                    transferred,
+                ))))
+            }),
+        );
+    }
     proto.insert(
         "slice".into(),
         builtin_fn("slice", 2, move |args| {
@@ -12870,7 +13051,18 @@ fn make_arraybuffer() -> JsValue {
                 Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
                 None => 0,
             };
-            let buf = arraybuffer_new(len);
+            let max_byte_length = buffer_option_max_byte_length(args.get(1))?;
+            let buf = match max_byte_length {
+                Some(max_byte_length) => {
+                    if max_byte_length < len {
+                        return Err(StatorError::RangeError(
+                            "maxByteLength must be at least byteLength".into(),
+                        ));
+                    }
+                    arraybuffer_new_resizable(len, max_byte_length)
+                }
+                None => arraybuffer_new(len),
+            };
             Ok(make_arraybuffer_instance(Rc::new(RefCell::new(buf))))
         }),
     );
@@ -13262,22 +13454,37 @@ fn make_typed_array_instance(
             "BYTES_PER_ELEMENT".into(),
             JsValue::Smi(inner.borrow().kind.bytes_per_element() as i32),
         );
-        obj.insert("length".into(), JsValue::Smi(inner.borrow().length as i32));
-        {
-            let ta = inner.borrow();
-            obj.insert(
-                "byteLength".into(),
-                JsValue::Smi((ta.length * ta.kind.bytes_per_element()) as i32),
-            );
-        }
-        obj.insert(
-            "byteOffset".into(),
-            JsValue::Smi(inner.borrow().byte_offset as i32),
-        );
         let buffer_object = buffer_object
             .unwrap_or_else(|| make_buffer_instance(Rc::clone(&inner.borrow().buffer)));
         obj.insert("__buffer_object__".into(), buffer_object.clone());
-        obj.insert("buffer".into(), buffer_object);
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "__get_length__".into(),
+                native(move |_| Ok(JsValue::Smi(inner.borrow().effective_length() as i32))),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "__get_byteLength__".into(),
+                native(move |_| Ok(JsValue::Smi(typed_array_byte_length(&inner.borrow()) as i32))),
+            );
+        }
+        {
+            let inner = Rc::clone(&inner);
+            obj.insert(
+                "__get_byteOffset__".into(),
+                native(move |_| Ok(JsValue::Smi(inner.borrow().byte_offset as i32))),
+            );
+        }
+        obj.insert(
+            "__get_buffer__".into(),
+            native(move |args| {
+                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                Ok(typed_array_buffer_object(receiver).unwrap_or(JsValue::Undefined))
+            }),
+        );
         obj.insert(
             "@@toStringTag".into(),
             JsValue::String(inner.borrow().kind.name().into()),
@@ -13311,8 +13518,12 @@ fn make_typed_array_instance(
                         .unwrap_or(0);
                     let end = a
                         .get(2)
-                        .map(|v| v.to_number().unwrap_or(inner.borrow().length as f64) as i64)
-                        .unwrap_or(inner.borrow().length as i64);
+                        .map(|v| {
+                            v.to_number()
+                                .unwrap_or(inner.borrow().effective_length() as f64)
+                                as i64
+                        })
+                        .unwrap_or(inner.borrow().effective_length() as i64);
                     typed_array_copy_within(&inner.borrow(), target, start, end);
                     Ok(instance.clone())
                 }),
@@ -13342,7 +13553,7 @@ fn make_typed_array_instance(
                     }
                     let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
                     let ta = inner.borrow();
-                    for i in 0..ta.length {
+                    for i in 0..ta.effective_length() {
                         let result = call_callback_with_this(
                             &cb,
                             this_arg.clone(),
@@ -13374,8 +13585,8 @@ fn make_typed_array_instance(
                         .unwrap_or(0);
                     let end = a
                         .get(2)
-                        .map(|v| v.to_number().unwrap_or(ta.length as f64) as i64)
-                        .unwrap_or(ta.length as i64);
+                        .map(|v| v.to_number().unwrap_or(ta.effective_length() as f64) as i64)
+                        .unwrap_or(ta.effective_length() as i64);
                     typed_array_fill(&ta, &val, start, end)?;
                     Ok(instance.clone())
                 }),
@@ -13396,7 +13607,7 @@ fn make_typed_array_instance(
                     let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
                     let ta = inner.borrow();
                     let mut kept = Vec::new();
-                    for i in 0..ta.length {
+                    for i in 0..ta.effective_length() {
                         let value = typed_array_get(&ta, i);
                         let result = call_callback_with_this(
                             &cb,
@@ -13427,7 +13638,7 @@ fn make_typed_array_instance(
                     }
                     let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
                     let ta = inner.borrow();
-                    for i in 0..ta.length {
+                    for i in 0..ta.effective_length() {
                         let value = typed_array_get(&ta, i);
                         let result = call_callback_with_this(
                             &cb,
@@ -13456,7 +13667,7 @@ fn make_typed_array_instance(
                     }
                     let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
                     let ta = inner.borrow();
-                    for i in 0..ta.length {
+                    for i in 0..ta.effective_length() {
                         let result = call_callback_with_this(
                             &cb,
                             this_arg.clone(),
@@ -13488,7 +13699,7 @@ fn make_typed_array_instance(
                     }
                     let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
                     let ta = inner.borrow();
-                    for i in (0..ta.length).rev() {
+                    for i in (0..ta.effective_length()).rev() {
                         let value = typed_array_get(&ta, i);
                         let result = call_callback_with_this(
                             &cb,
@@ -13517,7 +13728,7 @@ fn make_typed_array_instance(
                     }
                     let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
                     let ta = inner.borrow();
-                    for i in (0..ta.length).rev() {
+                    for i in (0..ta.effective_length()).rev() {
                         let result = call_callback_with_this(
                             &cb,
                             this_arg.clone(),
@@ -13549,7 +13760,7 @@ fn make_typed_array_instance(
                     }
                     let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
                     let ta = inner.borrow();
-                    for i in 0..ta.length {
+                    for i in 0..ta.effective_length() {
                         call_callback_with_this(
                             &cb,
                             this_arg.clone(),
@@ -13632,8 +13843,8 @@ fn make_typed_array_instance(
                     let ta = inner.borrow();
                     let from = a
                         .get(1)
-                        .map(|v| v.to_number().unwrap_or(ta.length as f64 - 1.0) as i64)
-                        .unwrap_or(ta.length as i64 - 1);
+                        .map(|v| v.to_number().unwrap_or(ta.effective_length() as f64 - 1.0) as i64)
+                        .unwrap_or(ta.effective_length() as i64 - 1);
                     Ok(JsValue::Smi(
                         typed_array_last_index_of(&ta, search, from) as i32
                     ))
@@ -13654,8 +13865,8 @@ fn make_typed_array_instance(
                     }
                     let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
                     let ta = inner.borrow();
-                    let mut mapped = Vec::with_capacity(ta.length);
-                    for i in 0..ta.length {
+                    let mut mapped = Vec::with_capacity(ta.effective_length());
+                    for i in 0..ta.effective_length() {
                         let mapped_value = call_callback_with_this(
                             &cb,
                             this_arg.clone(),
@@ -13690,7 +13901,7 @@ fn make_typed_array_instance(
                     let mut acc = if a.len() > 1 {
                         a[1].clone()
                     } else {
-                        if ta.length == 0 {
+                        if ta.effective_length() == 0 {
                             return Err(StatorError::TypeError(
                                 "Reduce of empty array with no initial value".into(),
                             ));
@@ -13698,7 +13909,7 @@ fn make_typed_array_instance(
                         start = 1;
                         typed_array_get(&ta, 0)
                     };
-                    for i in start..ta.length {
+                    for i in start..ta.effective_length() {
                         acc = call_callback(
                             &cb,
                             vec![
@@ -13726,7 +13937,7 @@ fn make_typed_array_instance(
                         ));
                     }
                     let ta = inner.borrow();
-                    let len = ta.length;
+                    let len = ta.effective_length();
                     let mut acc = if a.len() > 1 {
                         a[1].clone()
                     } else {
@@ -13802,8 +14013,8 @@ fn make_typed_array_instance(
                         .unwrap_or(0);
                     let end = a
                         .get(1)
-                        .map(|v| v.to_number().unwrap_or(ta.length as f64) as i64)
-                        .unwrap_or(ta.length as i64);
+                        .map(|v| v.to_number().unwrap_or(ta.effective_length() as f64) as i64)
+                        .unwrap_or(ta.effective_length() as i64);
                     let result = typed_array_slice(&ta, start, end)?;
                     let inner = Rc::new(RefCell::new(result));
                     Ok(make_typed_array_instance(ta.kind, inner, None))
@@ -13824,7 +14035,7 @@ fn make_typed_array_instance(
                     }
                     let this_arg = a.get(1).cloned().unwrap_or(JsValue::Undefined);
                     let ta = inner.borrow();
-                    for i in 0..ta.length {
+                    for i in 0..ta.effective_length() {
                         let result = call_callback_with_this(
                             &cb,
                             this_arg.clone(),
@@ -13866,8 +14077,8 @@ fn make_typed_array_instance(
                         .unwrap_or(0);
                     let end = a
                         .get(1)
-                        .map(|v| v.to_number().unwrap_or(ta.length as f64) as i64)
-                        .unwrap_or(ta.length as i64);
+                        .map(|v| v.to_number().unwrap_or(ta.effective_length() as f64) as i64)
+                        .unwrap_or(ta.effective_length() as i64);
                     let sub = typed_array_subarray(&ta, begin, end);
                     let sub_inner = Rc::new(RefCell::new(sub));
                     Ok(make_typed_array_instance(
@@ -14001,7 +14212,18 @@ fn make_shared_arraybuffer() -> JsValue {
                 Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
                 None => 0,
             };
-            let buf = shared_arraybuffer_new(len);
+            let max_byte_length = buffer_option_max_byte_length(args.get(1))?;
+            let buf = match max_byte_length {
+                Some(max_byte_length) => {
+                    if max_byte_length < len {
+                        return Err(StatorError::RangeError(
+                            "maxByteLength must be at least byteLength".into(),
+                        ));
+                    }
+                    shared_arraybuffer_new_growable(len, max_byte_length)
+                }
+                None => shared_arraybuffer_new(len),
+            };
             Ok(make_shared_arraybuffer_instance(Rc::new(RefCell::new(buf))))
         }),
     );
@@ -14100,7 +14322,7 @@ fn atomics_extract_ta(
         Some(v) => crate::builtins::util::checked_f64_to_index(v.to_number()?)?,
         None => 0,
     };
-    if index >= inner.borrow().length {
+    if index >= inner.borrow().effective_length() {
         return Err(StatorError::RangeError(
             "Atomics: index out of range".into(),
         ));
@@ -33216,6 +33438,175 @@ mod tests {
     }
 
     #[test]
+    fn e2e_arraybuffer_constructor_with_max_byte_length_is_resizable() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); buf.resizable && buf.maxByteLength === 8 && buf.byteLength === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_constructor_rejects_too_small_max_byte_length() {
+        assert_eval_true(
+            "try { new ArrayBuffer(4, { maxByteLength: 3 }); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_resizable_defaults_false() {
+        assert_eval_true("new ArrayBuffer(4).resizable === false");
+    }
+
+    #[test]
+    fn e2e_arraybuffer_max_byte_length_defaults_to_current_length() {
+        assert_eval_true("new ArrayBuffer(4).maxByteLength === 4");
+    }
+
+    #[test]
+    fn e2e_arraybuffer_detached_defaults_false() {
+        assert_eval_true("new ArrayBuffer(4).detached === false");
+    }
+
+    #[test]
+    fn e2e_arraybuffer_resizable_descriptor_is_getter() {
+        assert_eval_true(
+            "typeof Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resizable').get === 'function'",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_max_byte_length_descriptor_is_getter() {
+        assert_eval_true(
+            "typeof Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'maxByteLength').get === 'function'",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_detached_descriptor_is_getter() {
+        assert_eval_true(
+            "typeof Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'detached').get === 'function'",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_resize_grows_in_place() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var bytes = new Uint8Array(buf); bytes[0] = 1; buf.resize(6); buf.byteLength === 6 && bytes.length === 6 && bytes[0] === 1 && bytes[5] === 0",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_resize_shrinks_in_place() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(6, { maxByteLength: 8 }); var bytes = new Uint8Array(buf); bytes[0] = 1; bytes[1] = 2; buf.resize(2); buf.byteLength === 2 && bytes.length === 2 && bytes.join(',') === '1,2'",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_resize_rejects_non_resizable_buffer() {
+        assert_eval_true(
+            "try { new ArrayBuffer(4).resize(5); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_resize_rejects_growing_past_max() {
+        assert_eval_true(
+            "try { new ArrayBuffer(4, { maxByteLength: 6 }).resize(7); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_transfer_detaches_source() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var moved = buf.transfer(); buf.detached === true && buf.byteLength === 0 && moved.byteLength === 4 && moved.detached === false",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_transfer_copies_bytes() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var bytes = new Uint8Array(buf); bytes[0] = 10; bytes[1] = 20; bytes[2] = 30; bytes[3] = 40; var moved = buf.transfer(); new Uint8Array(moved).join(',') === '10,20,30,40'",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_transfer_can_change_length() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var bytes = new Uint8Array(buf); bytes[0] = 1; bytes[1] = 2; var moved = buf.transfer(6); moved.byteLength === 6 && moved.resizable === true && new Uint8Array(moved).join(',') === '1,2,0,0,0,0'",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_transfer_preserves_max_byte_length() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var moved = buf.transfer(6); moved.maxByteLength === 8 && moved.resizable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_transfer_to_fixed_length_returns_fixed_buffer() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var moved = buf.transferToFixedLength(); moved.resizable === false && moved.maxByteLength === 4 && moved.byteLength === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_transfer_to_fixed_length_with_new_length() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var moved = buf.transferToFixedLength(6); moved.resizable === false && moved.maxByteLength === 6 && moved.byteLength === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_transfer_rejects_length_past_max() {
+        assert_eval_true(
+            "try { new ArrayBuffer(4, { maxByteLength: 6 }).transfer(7); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_arraybuffer_transfer_rejects_detached_source() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); buf.transfer(); try { buf.transfer(); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_auto_length_tracks_resizable_growth() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint8Array(buf); buf.resize(6); ta.length === 6 && ta.byteLength === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_auto_length_tracks_resizable_shrink() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(6, { maxByteLength: 8 }); var ta = new Uint8Array(buf); buf.resize(2); ta.length === 2 && ta.byteLength === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_auto_length_join_tracks_resize() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint8Array(buf); ta[0] = 1; ta[1] = 2; buf.resize(2); ta.join(',') === '1,2'",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_buffer_identity_survives_resize() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint8Array(buf); buf.resize(6); ta.buffer === buf",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_fixed_length_view_stays_fixed_on_growth() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint16Array(buf, 0, 2); buf.resize(8); ta.length === 2 && ta.byteLength === 4",
+        );
+    }
+
+    #[test]
     fn e2e_shared_arraybuffer_constructor_allocates_length() {
         assert_eval_true("new SharedArrayBuffer(6).byteLength === 6");
     }
@@ -33316,6 +33707,88 @@ mod tests {
     fn e2e_shared_typed_array_subarray_preserves_shared_buffer_identity() {
         assert_eval_true(
             "var sab = new SharedArrayBuffer(8); var ta = new Int32Array(sab); ta.subarray(1).buffer === sab",
+        );
+    }
+
+    #[test]
+    fn e2e_shared_arraybuffer_constructor_with_max_byte_length_is_growable() {
+        assert_eval_true(
+            "var sab = new SharedArrayBuffer(4, { maxByteLength: 8 }); sab.growable && sab.maxByteLength === 8 && sab.byteLength === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_shared_arraybuffer_constructor_rejects_too_small_max_byte_length() {
+        assert_eval_true(
+            "try { new SharedArrayBuffer(4, { maxByteLength: 3 }); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_shared_arraybuffer_growable_defaults_false() {
+        assert_eval_true("new SharedArrayBuffer(4).growable === false");
+    }
+
+    #[test]
+    fn e2e_shared_arraybuffer_growable_descriptor_is_getter() {
+        assert_eval_true(
+            "typeof Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'growable').get === 'function'",
+        );
+    }
+
+    #[test]
+    fn e2e_shared_arraybuffer_max_byte_length_descriptor_is_getter() {
+        assert_eval_true(
+            "typeof Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'maxByteLength').get === 'function'",
+        );
+    }
+
+    #[test]
+    fn e2e_shared_arraybuffer_grow_increases_byte_length() {
+        assert_eval_true(
+            "var sab = new SharedArrayBuffer(4, { maxByteLength: 8 }); sab.grow(6); sab.byteLength === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_shared_arraybuffer_grow_preserves_existing_bytes() {
+        assert_eval_true(
+            "var sab = new SharedArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint8Array(sab); ta[0] = 7; sab.grow(6); ta.length === 6 && ta[0] === 7 && ta[5] === 0",
+        );
+    }
+
+    #[test]
+    fn e2e_shared_arraybuffer_grow_rejects_non_growable_buffer() {
+        assert_eval_true(
+            "try { new SharedArrayBuffer(4).grow(5); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_shared_arraybuffer_grow_rejects_shrinking() {
+        assert_eval_true(
+            "try { new SharedArrayBuffer(4, { maxByteLength: 8 }).grow(3); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_shared_arraybuffer_grow_rejects_length_past_max() {
+        assert_eval_true(
+            "try { new SharedArrayBuffer(4, { maxByteLength: 6 }).grow(7); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_shared_typed_array_auto_length_tracks_growth() {
+        assert_eval_true(
+            "var sab = new SharedArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint8Array(sab); sab.grow(6); ta.length === 6 && ta.byteLength === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_shared_typed_array_fixed_length_view_stays_fixed_on_growth() {
+        assert_eval_true(
+            "var sab = new SharedArrayBuffer(4, { maxByteLength: 8 }); var ta = new Uint16Array(sab, 0, 2); sab.grow(8); ta.length === 2 && ta.byteLength === 4",
         );
     }
 
