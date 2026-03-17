@@ -1148,6 +1148,12 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::DefineSetterProperty
             | Opcode::DefineKeyedGetterProperty
             | Opcode::DefineKeyedSetterProperty
+            | Opcode::DefineClassNamedOwnProperty
+            | Opcode::DefineClassGetterProperty
+            | Opcode::DefineClassSetterProperty
+            | Opcode::DefineClassKeyedOwnProperty
+            | Opcode::DefineClassKeyedGetterProperty
+            | Opcode::DefineClassKeyedSetterProperty
             | Opcode::CopyDataProperties => {
                 self.emit_deopt(bytecode_offset);
             }

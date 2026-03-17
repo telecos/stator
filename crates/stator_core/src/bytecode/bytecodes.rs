@@ -651,6 +651,18 @@ pub enum Opcode {
     TestPrivateBrand,
     /// Define a private brand on `obj`. `[obj]`
     DefinePrivateBrand,
+    /// Define a named class method (non-enumerable). `[obj, name_idx, slot]`
+    DefineClassNamedOwnProperty,
+    /// Define a class getter (non-enumerable). `[obj, name_idx, slot]`
+    DefineClassGetterProperty,
+    /// Define a class setter (non-enumerable). `[obj, name_idx, slot]`
+    DefineClassSetterProperty,
+    /// Define a keyed class method (non-enumerable). `[obj, key_reg, flags, slot]`
+    DefineClassKeyedOwnProperty,
+    /// Define a class getter with computed key (non-enumerable). `[obj, key_reg, slot]`
+    DefineClassKeyedGetterProperty,
+    /// Define a class setter with computed key (non-enumerable). `[obj, key_reg, slot]`
+    DefineClassKeyedSetterProperty,
 
     // ── Module ────────────────────────────────────────────────────────────
     /// Load a module variable (import binding) into the accumulator.
@@ -934,6 +946,12 @@ impl Opcode {
             Opcode::CreateClass => &[ConstantPoolIdx, Register, FeedbackSlot],
             Opcode::TestPrivateBrand => &[Register, Register],
             Opcode::DefinePrivateBrand => &[Register],
+            Opcode::DefineClassNamedOwnProperty => &[Register, ConstantPoolIdx, FeedbackSlot],
+            Opcode::DefineClassGetterProperty => &[Register, ConstantPoolIdx, FeedbackSlot],
+            Opcode::DefineClassSetterProperty => &[Register, ConstantPoolIdx, FeedbackSlot],
+            Opcode::DefineClassKeyedOwnProperty => &[Register, Register, Flag, FeedbackSlot],
+            Opcode::DefineClassKeyedGetterProperty => &[Register, Register, FeedbackSlot],
+            Opcode::DefineClassKeyedSetterProperty => &[Register, Register, FeedbackSlot],
 
             // Module
             Opcode::LdaModuleVariable => &[ConstantPoolIdx, Immediate],
