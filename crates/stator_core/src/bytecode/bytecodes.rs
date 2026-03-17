@@ -263,6 +263,8 @@ pub enum Opcode {
     LdaLookupGlobalSlotInsideTypeof,
     /// Dynamic store of a variable name. `[name_idx, flags]`
     StaLookupSlot,
+    /// Dynamic delete of a variable via the with-scope chain. `[name_idx]`
+    DeleteLookupSlot,
     /// Load a register into the accumulator. `[reg]`
     Ldar,
     /// Store the accumulator into a register. `[reg]`
@@ -732,6 +734,7 @@ impl Opcode {
             }
             Opcode::LdaLookupGlobalSlotInsideTypeof => &[ConstantPoolIdx, FeedbackSlot, Immediate],
             Opcode::StaLookupSlot => &[ConstantPoolIdx, Flag],
+            Opcode::DeleteLookupSlot => &[ConstantPoolIdx],
             Opcode::Ldar => &[Register],
             Opcode::Star => &[Register],
             Opcode::Mov => &[Register, Register],

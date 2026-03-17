@@ -16887,4 +16887,278 @@ mod tests {
             JsValue::Smi(2)
         );
     }
+
+    // ── with-statement e2e tests ─────────────────────────────────────────
+
+    /// Helper: parse + compile + run JS source and return the result.
+    fn eval(src: &str) -> StatorResult<JsValue> {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::parse;
+        let program = parse(src).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        Interpreter::run(&mut frame)
+    }
+
+    #[test]
+    fn test_with_basic_read() {
+        let r = eval("var obj = {x: 42}; var result; with (obj) { result = x; } return result;")
+            .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_with_read_falls_through_to_outer() {
+        let r = eval(
+            "var outer = 99; var obj = {}; var result; with (obj) { result = outer; } return result;",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_with_write_existing_property() {
+        let r = eval("var obj = {x: 1}; with (obj) { x = 5; } return obj.x;").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_with_write_new_property_goes_to_global() {
+        let r = eval("var obj = {}; with (obj) { y = 10; } return y;").unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_with_strict_mode_rejected() {
+        let result = crate::parser::parse("'use strict'; with (obj) { x; }");
+        assert!(
+            result.is_err(),
+            "with in strict mode should be a parse error"
+        );
+    }
+
+    #[test]
+    fn test_with_strict_mode_rejected_double_quotes() {
+        let result = crate::parser::parse("\"use strict\"; with (obj) { x; }");
+        assert!(
+            result.is_err(),
+            "with in strict mode should be a parse error"
+        );
+    }
+
+    #[test]
+    fn test_with_closure_captures_with_scope() {
+        let r = eval(
+            "var obj = {x: 7}; var fn; with (obj) { fn = function() { return x; }; } return fn();",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn test_with_var_declaration_hoists() {
+        let r = eval("var obj = {x: 1}; with (obj) { var hoisted = 42; } return hoisted;").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_with_unscopables_excludes_property() {
+        let r = eval(
+            r#"
+            var obj = {x: 10};
+            obj["@@unscopables"] = {x: true};
+            var x = 99;
+            var result;
+            with (obj) { result = x; }
+            return result;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_with_unscopables_does_not_exclude_false() {
+        let r = eval(
+            r#"
+            var obj = {x: 10};
+            obj["@@unscopables"] = {x: false};
+            var result;
+            with (obj) { result = x; }
+            return result;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_with_nested_inner_takes_precedence() {
+        let r = eval(
+            "var a = {x: 1}; var b = {x: 2}; var result; with (a) { with (b) { result = x; } } return result;",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_with_nested_falls_through_to_outer() {
+        let r = eval(
+            "var a = {x: 1}; var b = {}; var result; with (a) { with (b) { result = x; } } return result;",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_with_delete_property_from_obj() {
+        let r = eval("var obj = {x: 1}; with (obj) { delete x; } return obj.x;").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_with_delete_returns_true() {
+        let r =
+            eval("var obj = {x: 1}; var result; with (obj) { result = delete x; } return result;")
+                .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_with_delete_nonexistent_returns_true() {
+        let r = eval(
+            "var obj = {}; var result; with (obj) { result = delete nonexistent; } return result;",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_with_multiple_properties() {
+        let r = eval(
+            "var obj = {a: 1, b: 2}; var result; with (obj) { result = a + b; } return result;",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_with_shadows_outer_variable() {
+        let r = eval(
+            "var x = 100; var obj = {x: 5}; var result; with (obj) { result = x; } return result;",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_with_does_not_leak_to_outer_after_pop() {
+        let r = eval("var x = 100; var obj = {x: 5}; with (obj) { x; } return x;").unwrap();
+        assert_eq!(r, JsValue::Smi(100));
+    }
+
+    #[test]
+    fn test_with_expression_is_evaluated() {
+        let r = eval(
+            "function makeObj() { return {val: 77}; } var result; with (makeObj()) { result = val; } return result;",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(77));
+    }
+
+    #[test]
+    fn test_with_write_updates_obj_not_global() {
+        let r = eval("var g = 0; var obj = {g: 1}; with (obj) { g = 42; } return obj.g;").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_with_empty_body() {
+        let r = eval("var obj = {x: 1}; with (obj) { } return obj.x;").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_with_if_inside() {
+        let r = eval(
+            "var obj = {flag: true, val: 10}; var result = 0; with (obj) { if (flag) { result = val; } } return result;",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_with_loop_inside() {
+        let r = eval(
+            "var obj = {n: 5}; var sum = 0; with (obj) { var i = 0; while (i < n) { sum = sum + 1; i = i + 1; } } return sum;",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_with_nested_write_inner_obj() {
+        let r =
+            eval("var a = {x: 1}; var b = {x: 2}; with (a) { with (b) { x = 99; } } return b.x;")
+                .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_with_nested_write_outer_obj() {
+        let r = eval("var a = {x: 1}; var b = {}; with (a) { with (b) { x = 99; } } return a.x;")
+            .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_with_read_method_call() {
+        let r = eval(
+            r#"
+            var obj = {
+                val: 3,
+                double: function() { return this.val * 2; }
+            };
+            var result;
+            with (obj) { result = val; }
+            return result;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_with_string_property() {
+        let r = eval(
+            r#"var obj = {msg: "hello"}; var result; with (obj) { result = msg; } return result;"#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    #[test]
+    fn test_with_boolean_property() {
+        let r = eval(
+            "var obj = {flag: true}; var result; with (obj) { result = flag; } return result;",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_with_null_property() {
+        let r = eval("var obj = {n: null}; var result; with (obj) { result = n; } return result;")
+            .unwrap();
+        assert_eq!(r, JsValue::Null);
+    }
+
+    #[test]
+    fn test_with_class_body_strict_rejected() {
+        let result = crate::parser::parse("class C { m() { with (obj) {} } }");
+        assert!(
+            result.is_err(),
+            "with inside class method should fail (implicit strict)"
+        );
+    }
 }
