@@ -34104,4 +34104,220 @@ mod tests {
         .unwrap();
         assert_eq!(result, JsValue::String("tdz".into()));
     }
+
+    // ── Dynamic import() and module-related conformance ──────────────────
+
+    #[test]
+    fn e2e_dynamic_import_returns_promise() {
+        // `import()` must return a Promise object.
+        let r = global_eval("typeof import('x')").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_dynamic_import_has_then() {
+        // The Promise returned by import() should have a `.then` method.
+        let r = global_eval("typeof import('x').then").unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn e2e_dynamic_import_has_catch() {
+        // The Promise returned by import() should have a `.catch` method.
+        let r = global_eval("typeof import('x').catch").unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn e2e_dynamic_import_instanceof_promise() {
+        let r = global_eval("import('x') instanceof Promise").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_dynamic_import_variable_specifier() {
+        // import() accepts an expression, not just a string literal.
+        let r = global_eval("var spec = 'mod'; typeof import(spec)").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_dynamic_import_with_options() {
+        // import() with a second options argument still returns a Promise.
+        let r = global_eval("typeof import('x', { with: { type: 'json' } })").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_dynamic_import_trailing_comma() {
+        // Trailing comma after the specifier is allowed.
+        let r = global_eval("typeof import('x',)").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_dynamic_import_no_args_syntax_error() {
+        // `import()` with zero arguments is a SyntaxError.
+        let err = global_eval("import()").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SyntaxError"),
+            "expected SyntaxError, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn e2e_dynamic_import_in_expression() {
+        // import() can be used as a sub-expression.
+        let r = global_eval("[import('a')].length").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_dynamic_import_in_ternary() {
+        let r = global_eval("typeof (true ? import('x') : null)").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_dynamic_import_in_arrow() {
+        // import() inside an arrow function body.
+        let r = global_eval("var f = () => import('m'); typeof f()").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_dynamic_import_concat_specifier() {
+        // Expression as specifier: string concatenation.
+        let r = global_eval("typeof import('a' + 'b')").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_dynamic_import_options_trailing_comma() {
+        // Trailing comma after both arguments.
+        let r = global_eval("typeof import('x', {},)").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_import_meta_is_object() {
+        // import.meta evaluates to an object.
+        let r = global_eval("typeof import.meta").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_import_meta_not_null() {
+        let r = global_eval("import.meta !== null").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_import_meta_url_undefined() {
+        // The stub implementation returns an empty object, so .url is undefined.
+        let r = global_eval("import.meta.url === undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_import_meta_in_expression() {
+        // import.meta can be used inside an expression.
+        let r = global_eval("var m = import.meta; typeof m").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_import_dot_invalid_property_syntax_error() {
+        // `import.foo` is a SyntaxError — only `import.meta` is valid.
+        let err = global_eval("import.foo").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("expected 'meta' after 'import.'"),
+            "expected import.meta syntax error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn e2e_import_dot_resolve_syntax_error() {
+        // `import.resolve` is not a valid meta property.
+        let err = global_eval("import.resolve('x')").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("expected 'meta' after 'import.'"),
+            "expected syntax error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn e2e_strict_mode_with_stmt_forbidden() {
+        // `with` statement is forbidden in strict mode.
+        let err = global_eval("\"use strict\"; with ({}) {}").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SyntaxError"),
+            "expected SyntaxError for with in strict mode, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn e2e_strict_mode_octal_literal_forbidden() {
+        // Legacy octal literals (0123) are forbidden in strict mode.
+        let err = global_eval("\"use strict\"; 0123").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SyntaxError") || msg.contains("octal"),
+            "expected SyntaxError for octal in strict mode, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn e2e_strict_mode_delete_unqualified() {
+        // Deleting an unqualified identifier is forbidden in strict mode.
+        let err = global_eval("\"use strict\"; var x = 1; delete x").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SyntaxError") || msg.contains("delete"),
+            "expected SyntaxError for delete in strict mode, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn e2e_use_strict_respected() {
+        // "use strict" is recognized and enforced.
+        let err = global_eval("\"use strict\"; with ({a:1}) { a }").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SyntaxError"),
+            "strict mode not enforced: {msg}"
+        );
+    }
+
+    #[test]
+    fn e2e_dynamic_import_not_callable() {
+        // `import` is not a function — `import.call()` or `var x = import` are errors.
+        let err = global_eval("var x = import").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SyntaxError") || msg.contains("unexpected"),
+            "expected error for bare import, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn e2e_dynamic_import_nested_in_function() {
+        // import() works inside a regular function.
+        let r = global_eval("function f() { return typeof import('x'); } f()").unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_dynamic_import_then_returns_function() {
+        // .then on the import() promise is callable.
+        let r = global_eval(
+            "var p = import('x'); typeof p.then === 'function' && typeof p.catch === 'function'",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
 }

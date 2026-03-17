@@ -3900,6 +3900,12 @@ impl<'src> Parser<'src> {
                     self.bump()?; // consume `.`
                     let prop_tok = self.bump()?;
                     let prop_name = self.name_from_token(&prop_tok)?;
+                    if prop_name != "meta" {
+                        return Err(Self::error_at(
+                            prop_tok.span,
+                            &format!("expected 'meta' after 'import.', got '{prop_name}'"),
+                        ));
+                    }
                     let end = prop_tok.span;
                     Ok(Expr::MetaProp(MetaPropExpr {
                         loc: Self::merge_spans(import_tok.span, end),
@@ -3909,7 +3915,7 @@ impl<'src> Parser<'src> {
                         },
                         property: Ident {
                             loc: prop_tok.span,
-                            name: prop_name,
+                            name: "meta".into(),
                         },
                     }))
                 } else {
@@ -7950,6 +7956,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_import_dot_non_meta_is_error() {
+        // `import.foo` is a SyntaxError — only `import.meta` is valid.
+        let err = parse("import.foo").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("expected 'meta' after 'import.'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_import_meta_not_module() {
+        // `import.meta` does NOT trigger module-mode detection.
+        let prog = parse("import.meta").unwrap();
+        assert_eq!(prog.source_type, SourceType::Script);
+    }
+
+    #[test]
     fn test_parse_import_decl_still_works() {
         // Ensure normal import declarations still parse correctly.
         let prog = parse("import foo from 'bar'").unwrap();
@@ -7958,6 +7982,14 @@ mod tests {
             ProgramItem::ModuleDecl(ModuleDecl::Import(_))
         ));
         assert_eq!(prog.source_type, SourceType::Module);
+    }
+
+    #[test]
+    fn test_parse_import_decl_is_module_strict() {
+        // Module code (has import declaration) is always strict.
+        let prog = parse("import x from 'y'").unwrap();
+        assert_eq!(prog.source_type, SourceType::Module);
+        assert!(prog.is_strict);
     }
 
     // ── Strict mode tests ────────────────────────────────────────────────
