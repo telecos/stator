@@ -88,10 +88,10 @@ use crate::builtins::number::{
     number_reformat_exponential, number_to_exponential, number_to_fixed, number_to_precision,
 };
 use crate::builtins::proxy::{
-    ProxyHandler, proxy_define_property, proxy_delete_property, proxy_get_own_property_descriptor,
-    proxy_get_prototype_of, proxy_get_with_receiver, proxy_has, proxy_is_extensible, proxy_new,
-    proxy_new_callable, proxy_own_keys, proxy_prevent_extensions, proxy_revocable, proxy_revoke,
-    proxy_set_prototype_of, proxy_set_with_receiver,
+    ProxyHandler, proxy_construct, proxy_define_property, proxy_delete_property,
+    proxy_get_own_property_descriptor, proxy_get_prototype_of, proxy_get_with_receiver, proxy_has,
+    proxy_is_extensible, proxy_new, proxy_new_callable, proxy_own_keys, proxy_prevent_extensions,
+    proxy_revocable, proxy_revoke, proxy_set_prototype_of, proxy_set_with_receiver,
 };
 use crate::builtins::regexp::regexp_construct;
 use crate::builtins::set::{
@@ -11685,29 +11685,25 @@ fn make_proxy() -> JsValue {
             native(|args| {
                 let target_val = args.first().cloned().unwrap_or(JsValue::Undefined);
                 let handler_val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                // target must be an object-like value; detect callability
-                let (target, callable) = match &target_val {
-                    JsValue::PlainObject(map) => {
-                        let mut obj = JsObject::new();
-                        for (k, v) in map.borrow().iter() {
-                            obj.set_property(k, v.clone()).ok();
-                        }
-                        (obj, false)
-                    }
-                    JsValue::Function(_) | JsValue::NativeFunction(_) => (JsObject::new(), true),
-                    _ => {
-                        return Err(StatorError::TypeError(
-                            "Proxy: target must be an object".to_string(),
-                        ));
-                    }
+                if !target_val.is_object_like() {
+                    return Err(StatorError::TypeError(
+                        "Proxy: target must be an object".to_string(),
+                    ));
+                }
+                let target = match &target_val {
+                    JsValue::PlainObject(map) => plain_object_to_js_object(map),
+                    JsValue::Error(_) => JsObject::new(),
+                    _ => JsObject::new(),
                 };
+                let callable = is_callable(&target_val);
                 // Build a ProxyHandler from the handler PlainObject's trap functions
                 let handler = build_proxy_handler(&handler_val, &target_val);
-                let proxy = if callable {
+                let mut proxy = if callable {
                     proxy_new_callable(target, handler)
                 } else {
                     proxy_new(target, handler)
                 };
+                proxy.target_value = Some(target_val.clone());
                 Ok(JsValue::Proxy(Rc::new(RefCell::new(proxy))))
             }),
         );
@@ -11718,26 +11714,21 @@ fn make_proxy() -> JsValue {
             native(|args| {
                 let target_val = args.first().cloned().unwrap_or(JsValue::Undefined);
                 let handler_val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (target, callable) = match &target_val {
-                    JsValue::PlainObject(map) => {
-                        let mut obj = JsObject::new();
-                        for (k, v) in map.borrow().iter() {
-                            obj.set_property(k, v.clone()).ok();
-                        }
-                        (obj, false)
-                    }
-                    JsValue::Function(_) | JsValue::NativeFunction(_) => (JsObject::new(), true),
-                    _ => {
-                        return Err(StatorError::TypeError(
-                            "Proxy.revocable: target must be an object".to_string(),
-                        ));
-                    }
+                if !target_val.is_object_like() {
+                    return Err(StatorError::TypeError(
+                        "Proxy.revocable: target must be an object".to_string(),
+                    ));
+                }
+                let target = match &target_val {
+                    JsValue::PlainObject(map) => plain_object_to_js_object(map),
+                    JsValue::Error(_) => JsObject::new(),
+                    _ => JsObject::new(),
                 };
+                let callable = is_callable(&target_val);
                 let handler = build_proxy_handler(&handler_val, &target_val);
                 let mut proxy = proxy_revocable(target, handler);
-                if callable {
-                    proxy.callable = true;
-                }
+                proxy.callable = callable;
+                proxy.target_value = Some(target_val.clone());
                 let proxy_rc = Rc::new(RefCell::new(proxy));
                 let proxy_val = JsValue::Proxy(Rc::clone(&proxy_rc));
                 let revoke_fn = JsValue::NativeFunction(Rc::new(move |_args| {
@@ -11798,6 +11789,24 @@ fn descriptor_value_to_parts(result: &JsValue) -> Option<(JsValue, PropertyAttri
         attrs |= PropertyAttributes::CONFIGURABLE;
     }
     Some((value, attrs))
+}
+
+fn descriptor_parts_to_object(value: JsValue, attrs: PropertyAttributes) -> JsValue {
+    let mut desc = PropertyMap::new();
+    desc.insert("value".to_string(), value);
+    desc.insert(
+        "writable".to_string(),
+        JsValue::Boolean(attrs.contains(PropertyAttributes::WRITABLE)),
+    );
+    desc.insert(
+        "enumerable".to_string(),
+        JsValue::Boolean(attrs.contains(PropertyAttributes::ENUMERABLE)),
+    );
+    desc.insert(
+        "configurable".to_string(),
+        JsValue::Boolean(attrs.contains(PropertyAttributes::CONFIGURABLE)),
+    );
+    JsValue::PlainObject(Rc::new(RefCell::new(desc)))
 }
 
 fn plain_object_to_js_object(map: &Rc<RefCell<PropertyMap>>) -> JsObject {
@@ -11967,20 +11976,33 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
         }));
     }
 
-    if let Some(trap) = define_property_trap {
+    {
         let target = target_val.clone();
         let handler_this = handler_this.clone();
-        handler.define_property = Some(Box::new(move |_target, key, value, _attrs| {
-            let result = call_proxy_handler_trap(
-                &trap,
-                &handler_this,
-                vec![
-                    target.clone(),
-                    JsValue::String(key.to_string().into()),
-                    value,
-                ],
-            )?;
-            Ok(result.to_boolean())
+        handler.define_property = Some(Box::new(move |_target, key, value, attrs| {
+            if let Some(trap) = &define_property_trap {
+                let result = call_proxy_handler_trap(
+                    trap,
+                    &handler_this,
+                    vec![
+                        target.clone(),
+                        JsValue::String(key.to_string().into()),
+                        descriptor_parts_to_object(value, attrs),
+                    ],
+                )?;
+                return Ok(result.to_boolean());
+            }
+
+            match &target {
+                JsValue::PlainObject(map) => {
+                    let desc = descriptor_parts_to_object(value, attrs);
+                    let JsValue::PlainObject(desc_map) = desc else {
+                        return Ok(false);
+                    };
+                    Ok(define_plain_own_property(map, key, &desc_map.borrow()).is_ok())
+                }
+                _ => Ok(false),
+            }
         }));
     }
 
@@ -11993,62 +12015,86 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
                     trap,
                     &handler_this,
                     vec![target.clone(), JsValue::String(key.to_string().into())],
-                )
-                .ok()?;
-                return descriptor_value_to_parts(&result);
+                )?;
+                return Ok(descriptor_value_to_parts(&result));
             }
-            match &target {
+            Ok(match &target {
                 JsValue::PlainObject(map) => {
                     descriptor_value_to_parts(&plain_descriptor_as_object(map, key))
                 }
                 _ => None,
-            }
+            })
         }));
     }
 
-    if let Some(trap) = get_prototype_of_trap {
+    {
         let target = target_val.clone();
         let handler_this = handler_this.clone();
         handler.get_prototype_of = Some(Box::new(move |_target| {
-            let result =
-                call_proxy_handler_trap(&trap, &handler_this, vec![target.clone()]).ok()?;
-            if result.is_null() || result.is_undefined() {
-                None
+            if let Some(trap) = &get_prototype_of_trap {
+                let result = call_proxy_handler_trap(trap, &handler_this, vec![target.clone()])?;
+                if result.is_null() || result.is_undefined() {
+                    Ok(JsValue::Null)
+                } else {
+                    Ok(result)
+                }
             } else {
-                Some(Rc::new(RefCell::new(JsObject::new())))
+                Ok(get_prototype_of_value(&target).unwrap_or(JsValue::Null))
             }
         }));
     }
 
-    if let Some(trap) = set_prototype_of_trap {
+    {
         let target = target_val.clone();
         let handler_this = handler_this.clone();
         handler.set_prototype_of = Some(Box::new(move |_target, proto| {
-            let proto_val = match proto {
-                Some(_) => JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))),
-                None => JsValue::Null,
-            };
-            let result =
-                call_proxy_handler_trap(&trap, &handler_this, vec![target.clone(), proto_val])?;
-            Ok(result.to_boolean())
+            if let Some(trap) = &set_prototype_of_trap {
+                let result =
+                    call_proxy_handler_trap(trap, &handler_this, vec![target.clone(), proto])?;
+                Ok(result.to_boolean())
+            } else {
+                Ok(ordinary_set_prototype_of(&target, proto).is_ok())
+            }
         }));
     }
 
-    if let Some(trap) = is_extensible_trap {
+    {
         let target = target_val.clone();
         let handler_this = handler_this.clone();
         handler.is_extensible = Some(Box::new(move |_target| {
-            let result = call_proxy_handler_trap(&trap, &handler_this, vec![target.clone()])?;
-            Ok(result.to_boolean())
+            if let Some(trap) = &is_extensible_trap {
+                let result = call_proxy_handler_trap(trap, &handler_this, vec![target.clone()])?;
+                Ok(result.to_boolean())
+            } else {
+                Ok(match &target {
+                    JsValue::PlainObject(map) => map.borrow().extensible,
+                    JsValue::Error(error) => error.props.borrow().extensible,
+                    _ => true,
+                })
+            }
         }));
     }
 
-    if let Some(trap) = prevent_extensions_trap {
+    {
         let target = target_val.clone();
         let handler_this = handler_this.clone();
         handler.prevent_extensions = Some(Box::new(move |_target| {
-            let result = call_proxy_handler_trap(&trap, &handler_this, vec![target.clone()])?;
-            Ok(result.to_boolean())
+            if let Some(trap) = &prevent_extensions_trap {
+                let result = call_proxy_handler_trap(trap, &handler_this, vec![target.clone()])?;
+                Ok(result.to_boolean())
+            } else {
+                match &target {
+                    JsValue::PlainObject(map) => {
+                        map.borrow_mut().extensible = false;
+                        Ok(true)
+                    }
+                    JsValue::Error(error) => {
+                        error.props.borrow_mut().extensible = false;
+                        Ok(true)
+                    }
+                    _ => Ok(true),
+                }
+            }
         }));
     }
 
@@ -12101,17 +12147,11 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
         let handler_this = handler_this.clone();
         handler.construct = Some(Box::new(move |args, new_target| {
             if let Some(trap) = &construct_trap {
-                let result = call_proxy_handler_trap(
+                return call_proxy_handler_trap(
                     trap,
                     &handler_this,
                     vec![target.clone(), JsValue::new_array(args), new_target],
-                )?;
-                return match &result {
-                    JsValue::PlainObject(map) => Ok(plain_object_to_js_object(map)),
-                    _ => Err(StatorError::TypeError(
-                        "construct trap must return an object".to_string(),
-                    )),
-                };
+                );
             }
 
             let ctor_proto =
@@ -12124,11 +12164,21 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
             }
             let result = dispatch_call_with_this(&target, this_obj.clone(), args)?;
             match result {
-                JsValue::PlainObject(map) => Ok(plain_object_to_js_object(&map)),
-                _ => match this_obj {
-                    JsValue::PlainObject(map) => Ok(plain_object_to_js_object(&map)),
-                    _ => Ok(JsObject::new()),
-                },
+                JsValue::PlainObject(_)
+                | JsValue::Array(_)
+                | JsValue::Function(_)
+                | JsValue::NativeFunction(_)
+                | JsValue::Error(_)
+                | JsValue::Proxy(_)
+                | JsValue::ArrayBuffer(_)
+                | JsValue::TypedArray(_)
+                | JsValue::DataView(_)
+                | JsValue::Promise(_)
+                | JsValue::Generator(_)
+                | JsValue::Iterator(_)
+                | JsValue::Context(_)
+                | JsValue::Object(_) => Ok(result),
+                _ => Ok(this_obj),
             }
         }));
     }
@@ -12369,8 +12419,7 @@ fn make_reflect() -> JsValue {
                     ));
                 }
                 let proto = match &target {
-                    JsValue::Proxy(proxy) => proxy_get_prototype_of(&proxy.borrow())?
-                        .map(|_| JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())))),
+                    JsValue::Proxy(proxy) => Some(proxy_get_prototype_of(&proxy.borrow())?),
                     _ => get_object_prototype(&target),
                 };
                 Ok(proto.unwrap_or(JsValue::Null))
@@ -12399,7 +12448,9 @@ fn make_reflect() -> JsValue {
                     JsValue::PlainObject(_) | JsValue::Error(_) => {
                         ordinary_set_prototype_of(&target, proto_arg.clone()).is_ok()
                     }
-                    JsValue::Proxy(proxy) => proxy_set_prototype_of(&mut proxy.borrow_mut(), None)?,
+                    JsValue::Proxy(proxy) => {
+                        proxy_set_prototype_of(&mut proxy.borrow_mut(), proto_arg.clone())?
+                    }
                     _ => false,
                 };
                 Ok(JsValue::Boolean(result))
@@ -12502,6 +12553,9 @@ fn make_reflect() -> JsValue {
                     return Err(StatorError::TypeError(
                         "Reflect.construct: newTarget is not a constructor".to_string(),
                     ));
+                }
+                if let JsValue::Proxy(proxy) = &target {
+                    return proxy_construct(&mut proxy.borrow_mut(), arg_list, new_target);
                 }
                 let ctor_proto =
                     dispatch_get_property_value(&new_target, JsValue::String("prototype".into()))?;
@@ -14705,6 +14759,10 @@ mod tests {
             global_eval(script),
             Err(StatorError::TypeError(_))
         ));
+    }
+
+    fn exec_script(script: &str) -> JsValue {
+        global_eval(script).unwrap()
     }
 
     /// Verify that `install_globals` populates the expected keys.
@@ -36833,6 +36891,486 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::String("b,c".into()));
+    }
+
+    #[test]
+    fn test_proxy_get_trap_same_value_invariant_allowed() {
+        let result = exec_script(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, writable: false, configurable: false });
+            var proxy = new Proxy(target, { get: function () { return 1; } });
+            proxy.x === 1;
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_get_trap_falls_through_to_target_value() {
+        let result = exec_script(
+            r#"
+            var proxy = new Proxy({ x: 2 }, null);
+            Reflect.get(proxy, "x") === 2;
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_set_trap_frozen_target_throws() {
+        let result = exec_script(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, writable: false, configurable: false });
+            var proxy = new Proxy(target, { set: function () { return true; } });
+            try { Reflect.set(proxy, "x", 2); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_set_trap_same_value_on_frozen_target_allowed() {
+        let result = exec_script(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, writable: false, configurable: false });
+            var proxy = new Proxy(target, { set: function () { return true; } });
+            Reflect.set(proxy, "x", 1) === true;
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_has_trap_non_configurable_key_required() {
+        let result = exec_script(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, configurable: false });
+            var proxy = new Proxy(target, { has: function () { return false; } });
+            try { "x" in proxy; false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_delete_property_non_configurable_key_required() {
+        let result = exec_script(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, configurable: false });
+            var proxy = new Proxy(target, { deleteProperty: function () { return true; } });
+            try { Reflect.deleteProperty(proxy, "x"); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_own_keys_includes_non_configurable_key_on_extensible_target() {
+        let result = exec_script(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, configurable: false });
+            var proxy = new Proxy(target, { ownKeys: function () { return []; } });
+            try { Reflect.ownKeys(proxy); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_own_keys_duplicate_key_throws() {
+        let result = exec_script(
+            r#"
+            var proxy = new Proxy({}, { ownKeys: function () { return ["x", "x"]; } });
+            try { Reflect.ownKeys(proxy); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_own_keys_non_extensible_extra_key_throws() {
+        let result = exec_script(
+            r#"
+            var target = Object.preventExtensions({ x: 1 });
+            var proxy = new Proxy(target, { ownKeys: function () { return ["x", "y"]; } });
+            try { Reflect.ownKeys(proxy); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_get_own_property_descriptor_cannot_hide_non_configurable_key() {
+        let result = exec_script(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, configurable: false });
+            var proxy = new Proxy(target, { getOwnPropertyDescriptor: function () { return undefined; } });
+            try { Reflect.getOwnPropertyDescriptor(proxy, "x"); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_get_own_property_descriptor_reports_non_configurable_value() {
+        let result = exec_script(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", {
+                value: 1,
+                writable: false,
+                enumerable: true,
+                configurable: false
+            });
+            var proxy = new Proxy(target, {
+                getOwnPropertyDescriptor: function () {
+                    return {
+                        value: 1,
+                        writable: false,
+                        enumerable: true,
+                        configurable: false
+                    };
+                }
+            });
+            Reflect.getOwnPropertyDescriptor(proxy, "x").value === 1;
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_define_property_trap_receives_descriptor_object() {
+        let result = exec_script(
+            r#"
+            var seen = "";
+            var proxy = new Proxy({}, {
+                defineProperty: function (target, key, desc) {
+                    seen = key + ":" + desc.value + ":" + desc.configurable + ":" + desc.writable;
+                    return true;
+                }
+            });
+            Reflect.defineProperty(proxy, "x", { value: 5, configurable: true, writable: false });
+            seen === "x:5:true:false";
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_define_property_non_configurable_incompatible_throws() {
+        let result = exec_script(
+            r#"
+            var target = {};
+            Object.defineProperty(target, "x", { value: 1, writable: false, enumerable: true, configurable: false });
+            var proxy = new Proxy(target, { defineProperty: function () { return true; } });
+            try {
+                Reflect.defineProperty(proxy, "x", { value: 2, writable: false, enumerable: true, configurable: false });
+                false;
+            } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_get_prototype_of_trap_returns_exact_object() {
+        let result = exec_script(
+            r#"
+            var proto = { marker: 1 };
+            var proxy = new Proxy({}, { getPrototypeOf: function () { return proto; } });
+            Reflect.getPrototypeOf(proxy) === proto;
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_get_prototype_of_non_extensible_mismatch_throws() {
+        let result = exec_script(
+            r#"
+            var target = Object.preventExtensions({});
+            var proxy = new Proxy(target, { getPrototypeOf: function () { return {}; } });
+            try { Reflect.getPrototypeOf(proxy); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_set_prototype_of_trap_receives_proto() {
+        let result = exec_script(
+            r#"
+            var proto = { marker: 1 };
+            var seen = false;
+            var proxy = new Proxy({}, {
+                setPrototypeOf: function (target, nextProto) {
+                    seen = nextProto === proto;
+                    return true;
+                }
+            });
+            Reflect.setPrototypeOf(proxy, proto) && seen;
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_set_prototype_of_null_forwards() {
+        let result = exec_script(
+            r#"
+            var proxy = new Proxy({}, null);
+            Reflect.setPrototypeOf(proxy, null) && Reflect.getPrototypeOf(proxy) === null;
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_set_prototype_of_non_extensible_mismatch_throws() {
+        let result = exec_script(
+            r#"
+            var target = Object.preventExtensions({});
+            var proxy = new Proxy(target, { setPrototypeOf: function () { return true; } });
+            try { Reflect.setPrototypeOf(proxy, {}); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_is_extensible_trap_must_match_target() {
+        let result = exec_script(
+            r#"
+            var proxy = new Proxy({}, { isExtensible: function () { return false; } });
+            try { Reflect.isExtensible(proxy); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_prevent_extensions_true_requires_target_non_extensible() {
+        let result = exec_script(
+            r#"
+            var proxy = new Proxy({}, { preventExtensions: function () { return true; } });
+            try { Reflect.preventExtensions(proxy); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_prevent_extensions_forwarding_makes_target_non_extensible() {
+        let result = exec_script(
+            r#"
+            var target = {};
+            var proxy = new Proxy(target, null);
+            Reflect.preventExtensions(proxy) && Reflect.isExtensible(target) === false;
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_apply_without_trap_forwards_to_target() {
+        let result = exec_script(
+            r#"
+            var proxy = new Proxy(function (x) { return x + 1; }, null);
+            Reflect.apply(proxy, undefined, [4]) === 5;
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_construct_without_trap_forwards_to_target() {
+        let result = exec_script(
+            r#"
+            function Point(x) { this.x = x; }
+            var ProxyPoint = new Proxy(Point, null);
+            Reflect.construct(ProxyPoint, [4]).x === 4;
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_construct_trap_used_by_reflect_construct() {
+        let result = exec_script(
+            r#"
+            var proxy = new Proxy(function () {}, {
+                construct: function (target, args, newTarget) {
+                    return { value: args[0], ok: newTarget === proxy };
+                }
+            });
+            var obj = Reflect.construct(proxy, [7]);
+            obj.value === 7 && obj.ok === true;
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_revocable_returns_proxy_and_revoke_members() {
+        let result = exec_script(
+            r#"
+            var rev = Proxy.revocable({}, {});
+            typeof rev.proxy === "object" && typeof rev.revoke === "function";
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_revoked_get_prototype_of_throws() {
+        let result = exec_script(
+            r#"
+            var rev = Proxy.revocable({}, {});
+            rev.revoke();
+            try { Reflect.getPrototypeOf(rev.proxy); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_revoked_set_prototype_of_throws() {
+        let result = exec_script(
+            r#"
+            var rev = Proxy.revocable({}, {});
+            rev.revoke();
+            try { Reflect.setPrototypeOf(rev.proxy, {}); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_revoked_define_property_throws() {
+        let result = exec_script(
+            r#"
+            var rev = Proxy.revocable({}, {});
+            rev.revoke();
+            try { Reflect.defineProperty(rev.proxy, "x", { value: 1 }); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_revoked_is_extensible_throws() {
+        let result = exec_script(
+            r#"
+            var rev = Proxy.revocable({}, {});
+            rev.revoke();
+            try { Reflect.isExtensible(rev.proxy); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_revoked_prevent_extensions_throws() {
+        let result = exec_script(
+            r#"
+            var rev = Proxy.revocable({}, {});
+            rev.revoke();
+            try { Reflect.preventExtensions(rev.proxy); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_revoked_apply_via_reflect_throws() {
+        let result = exec_script(
+            r#"
+            var rev = Proxy.revocable(function (x) { return x; }, {});
+            rev.revoke();
+            try { Reflect.apply(rev.proxy, undefined, [1]); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_revoked_construct_via_reflect_throws() {
+        let result = exec_script(
+            r#"
+            function Point(x) { this.x = x; }
+            var rev = Proxy.revocable(Point, {});
+            rev.revoke();
+            try { Reflect.construct(rev.proxy, [1]); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_revoked_get_throws() {
+        let result = exec_script(
+            r#"
+            var rev = Proxy.revocable({ x: 1 }, {});
+            rev.revoke();
+            try { rev.proxy.x; false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_revoked_has_via_reflect_throws() {
+        let result = exec_script(
+            r#"
+            var rev = Proxy.revocable({ x: 1 }, {});
+            rev.revoke();
+            try { Reflect.has(rev.proxy, "x"); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_revoked_delete_property_via_reflect_throws() {
+        let result = exec_script(
+            r#"
+            var rev = Proxy.revocable({ x: 1 }, {});
+            rev.revoke();
+            try { Reflect.deleteProperty(rev.proxy, "x"); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_revoked_get_own_property_descriptor_via_reflect_throws() {
+        let result = exec_script(
+            r#"
+            var rev = Proxy.revocable({ x: 1 }, {});
+            rev.revoke();
+            try { Reflect.getOwnPropertyDescriptor(rev.proxy, "x"); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_proxy_revoked_own_keys_via_reflect_throws() {
+        let result = exec_script(
+            r#"
+            var rev = Proxy.revocable({ x: 1 }, {});
+            rev.revoke();
+            try { Reflect.ownKeys(rev.proxy); false; } catch (e) { true; }
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
     }
 
     #[test]

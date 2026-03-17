@@ -37,7 +37,6 @@ use crate::bytecode::bytecode_array::{
 };
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
 use crate::error::{StatorError, StatorResult};
-use crate::objects::js_object::JsObject;
 use crate::objects::value::{
     GeneratorResumeMode, GeneratorState, GeneratorStatus, GeneratorStep, JsContext, JsValue,
     NativeIterator,
@@ -51,16 +50,6 @@ pub(super) enum DispatchAction {
     Return(JsValue),
     /// Restart the tail-call trampoline loop.
     TailCall,
-}
-
-fn js_object_to_plain_value(obj: JsObject) -> JsValue {
-    let mut props = PropertyMap::new();
-    for key in obj.own_property_keys() {
-        if let Some((value, _attrs)) = obj.get_own_property_descriptor(&key) {
-            props.insert(key, value);
-        }
-    }
-    JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
 /// Mutable execution context passed to every opcode handler.
@@ -2289,7 +2278,7 @@ fn handle_construct(
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
             let ctor_val = ctx.frame.accumulator.clone();
             let obj = proxy_construct(&mut p.borrow_mut(), args, ctor_val)?;
-            ctx.frame.accumulator = js_object_to_plain_value(obj);
+            ctx.frame.accumulator = obj;
         }
         other => {
             return Err(StatorError::TypeError(format!(
@@ -2381,7 +2370,7 @@ fn handle_construct_with_spread(
         JsValue::Proxy(ref p) => {
             let ctor_val = ctx.frame.accumulator.clone();
             let obj = proxy_construct(&mut p.borrow_mut(), args, ctor_val)?;
-            ctx.frame.accumulator = js_object_to_plain_value(obj);
+            ctx.frame.accumulator = obj;
         }
         other => {
             return Err(StatorError::TypeError(format!(
