@@ -10,8 +10,13 @@
 //! - [`iterator_next`] — advance any [`JsValue`] iterator one step.
 //! - [`iterator_to_vec`] — exhaust an iterator into a `Vec<JsValue>`.
 
+use std::rc::Rc;
+
 use crate::builtins::promise::{MicrotaskQueue, promise_reject, promise_resolve};
 use crate::error::{StatorError, StatorResult};
+use crate::interpreter::{
+    dispatch_call_value, dispatch_call_with_this, dispatch_get_property_value,
+};
 use crate::objects::value::{GeneratorStep, JsValue, NativeIterator};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -193,6 +198,25 @@ pub fn iterator_next(iter: &JsValue) -> StatorResult<IteratorRecord> {
                 GeneratorStep::Return(v) => Ok(IteratorRecord::done(v)),
             }
         }
+        JsValue::PlainObject(_) => {
+            let next = dispatch_get_property_value(iter, JsValue::String("next".into()))?;
+            if !is_callable(&next) {
+                return Err(StatorError::TypeError(
+                    "iterator_next: object does not have a callable next method".into(),
+                ));
+            }
+            let result = dispatch_call_with_this(&next, iter.clone(), vec![])?;
+            if !result.is_object_like() {
+                return Err(StatorError::TypeError(
+                    "iterator_next: next() did not return an object".into(),
+                ));
+            }
+            let done =
+                dispatch_get_property_value(&result, JsValue::String("done".into()))?.to_boolean();
+            let value = dispatch_get_property_value(&result, JsValue::String("value".into()))
+                .unwrap_or(JsValue::Undefined);
+            Ok(IteratorRecord { value, done })
+        }
         other => Err(StatorError::TypeError(format!(
             "iterator_next: value is not an iterator (got {other:?})"
         ))),
@@ -229,11 +253,95 @@ pub fn iterator_to_vec(iter: &JsValue) -> StatorResult<Vec<JsValue>> {
 /// Returns [`StatorError::TypeError`] if `func` is not a callable
 /// [`JsValue::NativeFunction`].
 fn call_fn(func: &JsValue, args: Vec<JsValue>) -> StatorResult<JsValue> {
-    match func {
-        JsValue::NativeFunction(f) => f(args),
-        _ => Err(StatorError::TypeError(
+    if is_callable(func) {
+        dispatch_call_value(func, args)
+    } else {
+        Err(StatorError::TypeError(
             "iterator helper: callback is not a function".into(),
-        )),
+        ))
+    }
+}
+
+fn is_callable(value: &JsValue) -> bool {
+    matches!(value, JsValue::NativeFunction(_) | JsValue::Function(_))
+        || matches!(value, JsValue::PlainObject(map) if map.borrow().contains_key("__call__"))
+}
+
+fn is_iterator_like(value: &JsValue) -> bool {
+    matches!(value, JsValue::Iterator(_) | JsValue::Generator(_))
+        || matches!(
+            dispatch_get_property_value(value, JsValue::String("next".into())),
+            Ok(next) if is_callable(&next)
+        )
+}
+
+fn numeric_index(index: usize) -> JsValue {
+    if index <= i32::MAX as usize {
+        JsValue::Smi(index as i32)
+    } else {
+        JsValue::HeapNumber(index as f64)
+    }
+}
+
+/// Return a method closure bound to a specific iterator receiver.
+pub fn get_bound_iterator_method(receiver: &JsValue, key: &str) -> Option<JsValue> {
+    let receiver = receiver.clone();
+    match key {
+        "map" => Some(JsValue::NativeFunction(Rc::new(move |args| {
+            iterator_map(&receiver, args.first().unwrap_or(&JsValue::Undefined))
+        }))),
+        "filter" => Some(JsValue::NativeFunction(Rc::new(move |args| {
+            iterator_filter(&receiver, args.first().unwrap_or(&JsValue::Undefined))
+        }))),
+        "take" => Some(JsValue::NativeFunction(Rc::new(move |args| {
+            let limit = args
+                .first()
+                .unwrap_or(&JsValue::Undefined)
+                .to_number()
+                .unwrap_or(0.0);
+            if limit.is_sign_negative() {
+                return Err(StatorError::RangeError(
+                    "Iterator.prototype.take limit must be non-negative".into(),
+                ));
+            }
+            iterator_take(&receiver, limit as usize)
+        }))),
+        "drop" => Some(JsValue::NativeFunction(Rc::new(move |args| {
+            let count = args
+                .first()
+                .unwrap_or(&JsValue::Undefined)
+                .to_number()
+                .unwrap_or(0.0);
+            if count.is_sign_negative() {
+                return Err(StatorError::RangeError(
+                    "Iterator.prototype.drop count must be non-negative".into(),
+                ));
+            }
+            iterator_drop(&receiver, count as usize)
+        }))),
+        "reduce" => Some(JsValue::NativeFunction(Rc::new(move |args| {
+            iterator_reduce(
+                &receiver,
+                args.first().unwrap_or(&JsValue::Undefined),
+                args.get(1).cloned(),
+            )
+        }))),
+        "toArray" => Some(JsValue::NativeFunction(Rc::new(move |_args| {
+            iterator_to_array(&receiver)
+        }))),
+        "forEach" => Some(JsValue::NativeFunction(Rc::new(move |args| {
+            iterator_for_each(&receiver, args.first().unwrap_or(&JsValue::Undefined))
+        }))),
+        "some" => Some(JsValue::NativeFunction(Rc::new(move |args| {
+            iterator_some(&receiver, args.first().unwrap_or(&JsValue::Undefined))
+        }))),
+        "every" => Some(JsValue::NativeFunction(Rc::new(move |args| {
+            iterator_every(&receiver, args.first().unwrap_or(&JsValue::Undefined))
+        }))),
+        "find" => Some(JsValue::NativeFunction(Rc::new(move |args| {
+            iterator_find(&receiver, args.first().unwrap_or(&JsValue::Undefined))
+        }))),
+        _ => None,
     }
 }
 
@@ -251,13 +359,13 @@ fn call_fn(func: &JsValue, args: Vec<JsValue>) -> StatorResult<JsValue> {
 /// Propagates any error from the source iterator or the mapper callback.
 pub fn iterator_map(iter: &JsValue, mapper: &JsValue) -> StatorResult<JsValue> {
     let mut out = Vec::new();
-    let mut index = 0i64;
+    let mut index = 0usize;
     loop {
         let rec = iterator_next(iter)?;
         if rec.done {
             break;
         }
-        let mapped = call_fn(mapper, vec![rec.value, JsValue::HeapNumber(index as f64)])?;
+        let mapped = call_fn(mapper, vec![rec.value, numeric_index(index)])?;
         out.push(mapped);
         index += 1;
     }
@@ -274,16 +382,13 @@ pub fn iterator_map(iter: &JsValue, mapper: &JsValue) -> StatorResult<JsValue> {
 /// Propagates any error from the source iterator or the predicate callback.
 pub fn iterator_filter(iter: &JsValue, predicate: &JsValue) -> StatorResult<JsValue> {
     let mut out = Vec::new();
-    let mut index = 0i64;
+    let mut index = 0usize;
     loop {
         let rec = iterator_next(iter)?;
         if rec.done {
             break;
         }
-        let result = call_fn(
-            predicate,
-            vec![rec.value.clone(), JsValue::HeapNumber(index as f64)],
-        )?;
+        let result = call_fn(predicate, vec![rec.value.clone(), numeric_index(index)])?;
         if result.to_boolean() {
             out.push(rec.value);
         }
@@ -351,13 +456,13 @@ pub fn iterator_drop(iter: &JsValue, count: usize) -> StatorResult<JsValue> {
 /// Propagates any error from the source iterator or the mapper callback.
 pub fn iterator_flat_map(iter: &JsValue, mapper: &JsValue) -> StatorResult<JsValue> {
     let mut out = Vec::new();
-    let mut index = 0i64;
+    let mut index = 0usize;
     loop {
         let rec = iterator_next(iter)?;
         if rec.done {
             break;
         }
-        let mapped = call_fn(mapper, vec![rec.value, JsValue::HeapNumber(index as f64)])?;
+        let mapped = call_fn(mapper, vec![rec.value, numeric_index(index)])?;
         match &mapped {
             JsValue::Iterator(_) | JsValue::Generator(_) => {
                 let inner = iterator_to_vec(&mapped)?;
@@ -391,6 +496,7 @@ pub fn iterator_reduce(
     reducer: &JsValue,
     initial: Option<JsValue>,
 ) -> StatorResult<JsValue> {
+    let mut index = 0usize;
     let mut acc = match initial {
         Some(v) => v,
         None => {
@@ -400,6 +506,7 @@ pub fn iterator_reduce(
                     "Reduce of empty iterator with no initial value".into(),
                 ));
             }
+            index = 1;
             rec.value
         }
     };
@@ -408,7 +515,8 @@ pub fn iterator_reduce(
         if rec.done {
             break;
         }
-        acc = call_fn(reducer, vec![acc, rec.value])?;
+        acc = call_fn(reducer, vec![acc, rec.value, numeric_index(index)])?;
+        index += 1;
     }
     Ok(acc)
 }
@@ -434,13 +542,13 @@ pub fn iterator_to_array(iter: &JsValue) -> StatorResult<JsValue> {
 ///
 /// Propagates any error from the source iterator or the callback.
 pub fn iterator_for_each(iter: &JsValue, callback: &JsValue) -> StatorResult<JsValue> {
-    let mut index = 0i64;
+    let mut index = 0usize;
     loop {
         let rec = iterator_next(iter)?;
         if rec.done {
             break;
         }
-        call_fn(callback, vec![rec.value, JsValue::HeapNumber(index as f64)])?;
+        call_fn(callback, vec![rec.value, numeric_index(index)])?;
         index += 1;
     }
     Ok(JsValue::Undefined)
@@ -455,16 +563,13 @@ pub fn iterator_for_each(iter: &JsValue, callback: &JsValue) -> StatorResult<JsV
 ///
 /// Propagates any error from the source iterator or the predicate callback.
 pub fn iterator_some(iter: &JsValue, predicate: &JsValue) -> StatorResult<JsValue> {
-    let mut index = 0i64;
+    let mut index = 0usize;
     loop {
         let rec = iterator_next(iter)?;
         if rec.done {
             return Ok(JsValue::Boolean(false));
         }
-        let result = call_fn(
-            predicate,
-            vec![rec.value, JsValue::HeapNumber(index as f64)],
-        )?;
+        let result = call_fn(predicate, vec![rec.value, numeric_index(index)])?;
         if result.to_boolean() {
             return Ok(JsValue::Boolean(true));
         }
@@ -481,16 +586,13 @@ pub fn iterator_some(iter: &JsValue, predicate: &JsValue) -> StatorResult<JsValu
 ///
 /// Propagates any error from the source iterator or the predicate callback.
 pub fn iterator_every(iter: &JsValue, predicate: &JsValue) -> StatorResult<JsValue> {
-    let mut index = 0i64;
+    let mut index = 0usize;
     loop {
         let rec = iterator_next(iter)?;
         if rec.done {
             return Ok(JsValue::Boolean(true));
         }
-        let result = call_fn(
-            predicate,
-            vec![rec.value, JsValue::HeapNumber(index as f64)],
-        )?;
+        let result = call_fn(predicate, vec![rec.value, numeric_index(index)])?;
         if !result.to_boolean() {
             return Ok(JsValue::Boolean(false));
         }
@@ -507,16 +609,13 @@ pub fn iterator_every(iter: &JsValue, predicate: &JsValue) -> StatorResult<JsVal
 ///
 /// Propagates any error from the source iterator or the predicate callback.
 pub fn iterator_find(iter: &JsValue, predicate: &JsValue) -> StatorResult<JsValue> {
-    let mut index = 0i64;
+    let mut index = 0usize;
     loop {
         let rec = iterator_next(iter)?;
         if rec.done {
             return Ok(JsValue::Undefined);
         }
-        let result = call_fn(
-            predicate,
-            vec![rec.value.clone(), JsValue::HeapNumber(index as f64)],
-        )?;
+        let result = call_fn(predicate, vec![rec.value.clone(), numeric_index(index)])?;
         if result.to_boolean() {
             return Ok(rec.value);
         }
@@ -538,9 +637,31 @@ pub fn iterator_from(iterable: &JsValue) -> StatorResult<JsValue> {
         JsValue::Iterator(_) | JsValue::Generator(_) => Ok(iterable.clone()),
         JsValue::Array(arr) => Ok(make_array_iterator(arr.borrow().clone())),
         JsValue::String(s) => Ok(make_string_iterator(s)),
-        _ => Err(StatorError::TypeError(format!(
-            "Iterator.from: value is not iterable (got {iterable:?})"
-        ))),
+        value if is_iterator_like(value) => Ok(value.clone()),
+        value => {
+            for key in ["@@iterator", "Symbol(1)"] {
+                let method = dispatch_get_property_value(value, JsValue::String(key.into()));
+                if let Ok(method) = method
+                    && !matches!(method, JsValue::Undefined)
+                {
+                    if !is_callable(&method) {
+                        return Err(StatorError::TypeError(
+                            "Iterator.from: @@iterator is not a function".into(),
+                        ));
+                    }
+                    let iterator = dispatch_call_with_this(&method, value.clone(), vec![])?;
+                    if !is_iterator_like(&iterator) {
+                        return Err(StatorError::TypeError(
+                            "Iterator.from: iterator method did not return an iterator".into(),
+                        ));
+                    }
+                    return Ok(iterator);
+                }
+            }
+            Err(StatorError::TypeError(format!(
+                "Iterator.from: value is not iterable (got {iterable:?})"
+            )))
+        }
     }
 }
 
