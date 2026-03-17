@@ -94,7 +94,7 @@ use crate::builtins::proxy::{
     proxy_new_callable, proxy_own_keys, proxy_prevent_extensions, proxy_revocable, proxy_revoke,
     proxy_set_prototype_of, proxy_set_with_receiver,
 };
-use crate::builtins::regexp::regexp_construct;
+use crate::builtins::regexp::{regexp_construct, regexp_static_get};
 use crate::builtins::set::{
     SetIteratorKind, set_add, set_clear, set_create_iterator, set_delete, set_difference,
     set_from_iterable, set_has, set_intersection, set_is_disjoint_from, set_is_subset_of,
@@ -10526,15 +10526,33 @@ fn make_regexp() -> JsValue {
         // Callable: new RegExp(pattern, flags)
         props.insert("__call__".into(), native(|args| regexp_construct(&args)));
 
-        // Annex B legacy static properties (stubs)
+        // Annex B legacy static properties — live getters backed by
+        // thread-local state updated after every successful exec/test.
         for i in 1..=9 {
-            props.insert(format!("${i}"), JsValue::String(String::new().into()));
+            let key = format!("${i}");
+            let getter_key = format!("__get_{key}__");
+            props.insert(
+                getter_key,
+                native(move |_args| Ok(regexp_static_get(&format!("${i}")))),
+            );
+            // Placeholder so `"$1" in RegExp` is true.
+            props.insert(key, JsValue::String(String::new().into()));
         }
-        props.insert("input".into(), JsValue::String(String::new().into()));
-        props.insert("lastMatch".into(), JsValue::String(String::new().into()));
-        props.insert("lastParen".into(), JsValue::String(String::new().into()));
-        props.insert("leftContext".into(), JsValue::String(String::new().into()));
-        props.insert("rightContext".into(), JsValue::String(String::new().into()));
+        for &name in &[
+            "input",
+            "lastMatch",
+            "lastParen",
+            "leftContext",
+            "rightContext",
+        ] {
+            let getter_key = format!("__get_{name}__");
+            let name_owned = name.to_string();
+            props.insert(
+                getter_key,
+                native(move |_args| Ok(regexp_static_get(&name_owned))),
+            );
+            props.insert(name.into(), JsValue::String(String::new().into()));
+        }
 
         // §22.2.4.2 RegExp.escape(string)  — ES2025
         props.insert(

@@ -21,6 +21,83 @@ use crate::interpreter::dispatch_call_value;
 use crate::objects::regexp::{JsRegExp, RegExpFlags, RegExpMatch, SymbolMatchResult};
 use crate::objects::value::{JsValue, NativeIterator};
 
+// ── Annex B legacy static properties ─────────────────────────────────────────
+
+// Per-thread storage for the legacy `RegExp.$1`–`$9`, `RegExp.input`,
+// `RegExp.lastMatch`, `RegExp.lastParen`, `RegExp.leftContext`, and
+// `RegExp.rightContext` static properties (Annex B §B.2.4).
+//
+// Updated after every successful `exec` / `test`.
+thread_local! {
+    static REGEXP_STATICS: RefCell<RegExpStatics> = RefCell::new(RegExpStatics::default());
+}
+
+/// Snapshot of the most recent successful match.
+#[derive(Default, Clone)]
+struct RegExpStatics {
+    input: String,
+    last_match: String,
+    last_paren: String,
+    left_context: String,
+    right_context: String,
+    captures: [String; 9],
+}
+
+/// Record a successful match into the thread-local statics.
+fn update_regexp_statics(m: &RegExpMatch) {
+    REGEXP_STATICS.with(|cell| {
+        let mut s = cell.borrow_mut();
+        s.input.clone_from(&m.input);
+        s.last_match.clone_from(&m.matched);
+        s.left_context = m.input[..m.index].to_string();
+        let end = m.index + m.matched.len();
+        s.right_context = if end <= m.input.len() {
+            m.input[end..].to_string()
+        } else {
+            String::new()
+        };
+        // last paren = last non-empty capture
+        s.last_paren = m
+            .captures
+            .iter()
+            .rev()
+            .find_map(|c| c.clone())
+            .unwrap_or_default();
+        for (i, slot) in s.captures.iter_mut().enumerate() {
+            *slot = m
+                .captures
+                .get(i)
+                .and_then(|c| c.clone())
+                .unwrap_or_default();
+        }
+    });
+}
+
+/// Read a legacy static property by key (e.g. `"$1"`, `"input"`, `"lastMatch"`).
+pub(crate) fn regexp_static_get(key: &str) -> JsValue {
+    REGEXP_STATICS.with(|cell| {
+        let s = cell.borrow();
+        let val = match key {
+            "$1" => &s.captures[0],
+            "$2" => &s.captures[1],
+            "$3" => &s.captures[2],
+            "$4" => &s.captures[3],
+            "$5" => &s.captures[4],
+            "$6" => &s.captures[5],
+            "$7" => &s.captures[6],
+            "$8" => &s.captures[7],
+            "$9" => &s.captures[8],
+            "input" | "$_" => &s.input,
+            "lastMatch" | "$&" => &s.last_match,
+            "lastParen" | "$+" => &s.last_paren,
+            "leftContext" | "$`" => &s.left_context,
+            "rightContext" | "$'" => &s.right_context,
+            _ => return JsValue::Undefined,
+        };
+        JsValue::String(val.clone().into())
+    })
+}
+
 /// Create a new [`JsRegExp`] from positional `JsValue` arguments.
 ///
 /// Handles three cases per §22.2.3.1:
@@ -183,15 +260,20 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
     // test(string)
     {
         let re_test = Rc::clone(&re);
+        let re_test_exec = Rc::clone(&re);
         let w = weak.clone();
         props_rc.borrow_mut().insert(
             "test".into(),
             JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
                 sync_last_index_from_props(&w, &re_test);
                 let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let result = re_test.test(&input);
+                // Use exec internally so we can capture match data for statics.
+                let matched = re_test_exec.exec(&input);
+                if let Some(ref m) = matched {
+                    update_regexp_statics(m);
+                }
                 sync_last_index_to_props(&w, &re_test);
-                Ok(JsValue::Boolean(result))
+                Ok(JsValue::Boolean(matched.is_some()))
             })),
         );
     }
@@ -206,7 +288,10 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
                 sync_last_index_from_props(&w, &re_exec);
                 let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
                 let result = match re_exec.exec(&input) {
-                    Some(m) => match_to_js(&m),
+                    Some(m) => {
+                        update_regexp_statics(&m);
+                        match_to_js(&m)
+                    }
                     None => JsValue::Null,
                 };
                 sync_last_index_to_props(&w, &re_exec);
