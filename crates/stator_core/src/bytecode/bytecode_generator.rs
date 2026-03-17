@@ -2803,7 +2803,7 @@ impl FunctionCompiler {
                         self.in_tail_position = saved_tail && i == len - 1;
                         self.compile_expr(expr)?;
                     }
-                    self.in_tail_position = false;
+                    self.in_tail_position = saved_tail;
                     Ok(())
                 }
 

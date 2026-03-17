@@ -17,7 +17,7 @@ use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
     PropertyIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, concat_rc_strs,
     constant_pool_jump_delta, constant_to_value, decode_string_constant, dispatch_call_property,
-    dispatch_call_value, dispatch_call_with_this, dispatch_setter, err_bad_operand,
+    dispatch_call_with_this, dispatch_setter, err_bad_operand,
     error_message_from_value, extract_context, find_handler, fn_props_set, has_prototype_in_chain,
     is_js_receiver, js_add, js_less_than, keyed_load, keyed_store, maybe_compile_baseline,
     maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue,
@@ -28,7 +28,7 @@ use super::{
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
-    proxy_construct, proxy_delete_property, proxy_has, proxy_set_with_receiver,
+    proxy_construct, proxy_delete_property, proxy_get, proxy_has, proxy_set_with_receiver,
 };
 use crate::bytecode::bytecode_array::{
     ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD, TIERING_THRESHOLD,
@@ -81,6 +81,62 @@ pub(super) type OpcodeHandler =
 
 /// Number of opcode variants (= `Opcode::Illegal as usize + 1`).
 const OPCODE_COUNT: usize = 193;
+
+fn property_map_has_entry(map: &PropertyMap, key: &str) -> bool {
+    map.contains_key(key)
+        || map.contains_key(&format!("__get_{key}__"))
+        || map.contains_key(&format!("__set_{key}__"))
+}
+
+fn plain_object_has_property_in_chain(value: &JsValue, key: &str) -> bool {
+    let mut current = value.clone();
+    for _ in 0..256 {
+        if let JsValue::PlainObject(map) = current {
+            let next_proto = {
+                let borrow = map.borrow();
+                if property_map_has_entry(&borrow, key) {
+                    return true;
+                }
+                borrow.get("__proto__").cloned()
+            };
+            if let Some(proto) = next_proto {
+                current = proto;
+                continue;
+            }
+        }
+        break;
+    }
+    false
+}
+
+fn plain_delete_property(map: &Rc<RefCell<PropertyMap>>, key: &str) -> bool {
+    let getter_key = format!("__get_{key}__");
+    let setter_key = format!("__set_{key}__");
+    let mut borrow = map.borrow_mut();
+    let has_accessor = borrow.contains_key(&getter_key) || borrow.contains_key(&setter_key);
+    if has_accessor {
+        let configurable = if borrow.contains_key(&getter_key) {
+            borrow.is_configurable(&getter_key)
+        } else {
+            borrow.is_configurable(&setter_key)
+        };
+        if !configurable {
+            return false;
+        }
+        borrow.remove(&getter_key);
+        borrow.remove(&setter_key);
+        borrow.remove(key);
+        true
+    } else if borrow.contains_key(key) {
+        if !borrow.is_configurable(key) {
+            return false;
+        }
+        borrow.remove(key);
+        true
+    } else {
+        true
+    }
+}
 
 #[inline]
 fn handle_lda_zero(
@@ -4391,6 +4447,49 @@ fn handle_test_instance_of(
     };
     let constructor = ctx.frame.read_reg(v)?.clone();
 
+    // §7.3.19 InstanceofOperator — consult @@hasInstance before checking callability.
+    let has_instance_fn = match &constructor {
+        JsValue::Proxy(proxy) => {
+            let value = proxy_get(&proxy.borrow(), "@@hasInstance")?;
+            if matches!(value, JsValue::Undefined) {
+                None
+            } else {
+                Some(value)
+            }
+        }
+        _ => {
+            let value = proto_lookup(&constructor, "@@hasInstance");
+            if matches!(value, JsValue::Undefined) {
+                None
+            } else {
+                Some(value)
+            }
+        }
+    };
+    if let Some(ref hi) = has_instance_fn {
+        match hi {
+            JsValue::NativeFunction(f) => {
+                let result = f(vec![ctx.frame.accumulator.clone()])?;
+                ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
+                return Ok(DispatchAction::Continue);
+            }
+            JsValue::Function(_) | JsValue::PlainObject(_) | JsValue::Proxy(_) => {
+                let result = dispatch_call_with_this(
+                    hi,
+                    constructor.clone(),
+                    vec![ctx.frame.accumulator.clone()],
+                )?;
+                ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
+                return Ok(DispatchAction::Continue);
+            }
+            _ => {
+                return Err(StatorError::TypeError(
+                    "Symbol.hasInstance is not callable".to_string(),
+                ));
+            }
+        }
+    }
+
     // §7.3.21 OrdinaryHasInstance — RHS must be callable, else TypeError.
     let rhs_callable = match &constructor {
         JsValue::Function(_) | JsValue::NativeFunction(_) => true,
@@ -4402,37 +4501,6 @@ fn handle_test_instance_of(
         return Err(StatorError::TypeError(
             "Right-hand side of 'instanceof' is not callable".to_string(),
         ));
-    }
-
-    // §7.3.21 OrdinaryHasInstance — first check @@hasInstance
-    let has_instance_fn = match &constructor {
-        JsValue::PlainObject(map) => map.borrow().get("@@hasInstance").cloned(),
-        JsValue::NativeFunction(_) | JsValue::Function(_) => {
-            // Look up @@hasInstance via the prototype chain (e.g.
-            // Function.prototype[@@hasInstance]).
-            let v = proto_lookup(&constructor, "@@hasInstance");
-            if matches!(v, JsValue::Undefined) {
-                None
-            } else {
-                Some(v)
-            }
-        }
-        _ => None,
-    };
-    if let Some(ref hi) = has_instance_fn {
-        match hi {
-            JsValue::NativeFunction(f) => {
-                let result = f(vec![ctx.frame.accumulator.clone()])?;
-                ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
-                return Ok(DispatchAction::Continue);
-            }
-            JsValue::Function(_) | JsValue::PlainObject(_) => {
-                let result = dispatch_call_value(hi, vec![ctx.frame.accumulator.clone()])?;
-                ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
-                return Ok(DispatchAction::Continue);
-            }
-            _ => {}
-        }
     }
 
     // ── Built-in type checks via constructor identity ──────────────
@@ -4556,8 +4624,7 @@ fn handle_test_in(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
         }
         JsValue::PlainObject(_) => {
             let prop = to_property_key(key)?;
-            // Walk the prototype chain for `in` operator.
-            !matches!(proto_lookup(&object, &prop), JsValue::Undefined)
+            plain_object_has_property_in_chain(&object, &prop)
         }
         JsValue::Array(items) => {
             // "length" is always present on arrays.
@@ -4802,20 +4869,7 @@ fn handle_delete_property_sloppy(
     let removed = if let JsValue::Proxy(ref p) = obj {
         proxy_delete_property(&mut p.borrow_mut(), &key)?
     } else if let JsValue::PlainObject(ref map) = obj {
-        let pm = map.borrow();
-        if pm.contains_key(&key) {
-            if !pm.is_configurable(&key) {
-                // Non-configurable: silently fail in sloppy mode.
-                false
-            } else {
-                drop(pm);
-                map.borrow_mut().remove(&key);
-                true
-            }
-        } else {
-            // Non-existent property: return true per spec.
-            true
-        }
+        plain_delete_property(map, &key)
     } else if let JsValue::Array(ref items) = obj {
         if key == "length" {
             // "length" is non-configurable on arrays.
@@ -4854,14 +4908,11 @@ fn handle_delete_property_strict(
             )));
         }
     } else if let JsValue::PlainObject(ref map) = obj {
-        let pm = map.borrow();
-        if pm.contains_key(&key) && !pm.is_configurable(&key) {
+        if !plain_delete_property(map, &key) {
             return Err(StatorError::TypeError(format!(
                 "Cannot delete property '{key}' of object"
             )));
         }
-        drop(pm);
-        map.borrow_mut().remove(&key);
     } else if let JsValue::Array(ref items) = obj {
         if key == "length" {
             return Err(StatorError::TypeError(

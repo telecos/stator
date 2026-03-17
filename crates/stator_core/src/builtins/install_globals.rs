@@ -32171,4 +32171,372 @@ mod tests {
         let result = global_eval("var s = new Set(null); s.size === 0").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
+
+    fn operator_eval(src: &str) -> JsValue {
+        global_eval(src).unwrap()
+    }
+
+    fn operator_assert_true(src: &str) {
+        assert_eq!(operator_eval(src), JsValue::Boolean(true));
+    }
+
+    // ── Operator conformance regressions ───────────────────────────────────
+
+    #[test]
+    fn e2e_operator_typeof_undeclared_identifier_is_undefined() {
+        assert_eq!(
+            operator_eval("typeof missingName"),
+            JsValue::String("undefined".into())
+        );
+    }
+
+    #[test]
+    fn e2e_operator_typeof_undeclared_inside_with_is_undefined() {
+        assert_eq!(
+            operator_eval("with ({ present: 1 }) { typeof absentName }"),
+            JsValue::String("undefined".into())
+        );
+    }
+
+    #[test]
+    fn e2e_operator_typeof_null_reports_object() {
+        assert_eq!(
+            operator_eval("typeof null"),
+            JsValue::String("object".into())
+        );
+    }
+
+    #[test]
+    fn e2e_operator_typeof_function_expression_reports_function() {
+        assert_eq!(
+            operator_eval("typeof (function named() {})"),
+            JsValue::String("function".into())
+        );
+    }
+
+    #[test]
+    fn e2e_operator_typeof_arrow_function_reports_function() {
+        assert_eq!(
+            operator_eval("typeof (() => 1)"),
+            JsValue::String("function".into())
+        );
+    }
+
+    #[test]
+    fn e2e_operator_typeof_symbol_reports_symbol() {
+        assert_eq!(
+            operator_eval("typeof Symbol('token')"),
+            JsValue::String("symbol".into())
+        );
+    }
+
+    #[test]
+    fn e2e_operator_typeof_symbol_well_known_reports_symbol() {
+        assert_eq!(
+            operator_eval("typeof Symbol.hasInstance"),
+            JsValue::String("symbol".into())
+        );
+    }
+
+    #[test]
+    fn e2e_operator_typeof_function_declaration_binding_reports_function() {
+        assert_eq!(
+            operator_eval("function Foo() {} typeof Foo"),
+            JsValue::String("function".into())
+        );
+    }
+
+    #[test]
+    fn e2e_operator_void_literal_is_undefined() {
+        assert_eq!(operator_eval("void 0"), JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_operator_void_expression_is_undefined() {
+        assert_eq!(operator_eval("void (1 + 2)"), JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_operator_void_preserves_side_effects() {
+        operator_assert_true(
+            "var count = 0; var result = void (count = count + 1); count === 1 && result === undefined",
+        );
+    }
+
+    #[test]
+    fn e2e_operator_void_function_call_is_undefined() {
+        assert_eq!(
+            operator_eval("(function () { return void 123; })()"),
+            JsValue::Undefined
+        );
+    }
+
+    #[test]
+    fn e2e_operator_void_assignment_expression_is_undefined() {
+        operator_assert_true("var value = 0; void (value = 9) === undefined && value === 9");
+    }
+
+    #[test]
+    fn e2e_operator_void_typeof_result_is_undefined() {
+        assert_eq!(
+            operator_eval("typeof (void (function () {})())"),
+            JsValue::String("undefined".into())
+        );
+    }
+
+    #[test]
+    fn e2e_operator_delete_missing_property_returns_true() {
+        assert_eq!(
+            operator_eval("var obj = {}; delete obj.missing"),
+            JsValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_delete_missing_computed_property_returns_true() {
+        assert_eq!(
+            operator_eval("var obj = {}; delete obj['missing']"),
+            JsValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_delete_existing_property_returns_true_and_removes_value() {
+        operator_assert_true(
+            "var obj = { keep: 1, drop: 2 }; delete obj.drop && obj.drop === undefined && obj.keep === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_operator_delete_non_configurable_property_returns_false() {
+        assert_eq!(
+            operator_eval(
+                "var obj = {}; Object.defineProperty(obj, 'fixed', { value: 1, configurable: false }); delete obj.fixed",
+            ),
+            JsValue::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_delete_non_configurable_accessor_returns_false() {
+        assert_eq!(
+            operator_eval(
+                "var obj = {}; Object.defineProperty(obj, 'fixed', { get: function() { return 1; }, configurable: false }); delete obj.fixed",
+            ),
+            JsValue::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_delete_configurable_accessor_returns_true() {
+        assert_eq!(
+            operator_eval(
+                "var obj = {}; Object.defineProperty(obj, 'gone', { get: function() { return 1; }, configurable: true }); delete obj.gone",
+            ),
+            JsValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_delete_strict_non_configurable_throws() {
+        operator_assert_true(
+            r#""use strict"; var obj = {}; Object.defineProperty(obj, "x", { value: 1, configurable: false }); try { delete obj.x; false; } catch (e) { e instanceof TypeError; }"#,
+        );
+    }
+
+    #[test]
+    fn e2e_operator_comma_returns_last_value() {
+        assert_eq!(operator_eval("(1, 2, 3, 4)"), JsValue::Smi(4));
+    }
+
+    #[test]
+    fn e2e_operator_comma_evaluates_all_side_effects() {
+        operator_assert_true(
+            "var order = []; (order.push(1), order.push(2), order.push(3), order.join(',') === '1,2,3')",
+        );
+    }
+
+    #[test]
+    fn e2e_operator_comma_nested_sequence_returns_last() {
+        assert_eq!(operator_eval("(1, (2, 3), 4)"), JsValue::Smi(4));
+    }
+
+    #[test]
+    fn e2e_operator_comma_assignment_uses_last_subexpression() {
+        operator_assert_true("var a = 0; var b = (a = 1, a + 4); a === 1 && b === 5");
+    }
+
+    #[test]
+    fn e2e_operator_comma_function_call_arguments_still_evaluate() {
+        operator_assert_true(
+            "var seen = 0; function mark(v) { seen = seen + v; return seen; } var out = (mark(1), mark(2), mark(3)); seen === 6 && out === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_operator_comma_in_return_returns_last_value() {
+        assert_eq!(
+            operator_eval("(function () { return (1, 2, 7); })()"),
+            JsValue::Smi(7)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_in_own_property_is_true() {
+        assert_eq!(operator_eval("'x' in { x: 1 }"), JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_operator_in_missing_property_is_false() {
+        assert_eq!(operator_eval("'y' in { x: 1 }"), JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_operator_in_inherited_property_is_true() {
+        assert_eq!(
+            operator_eval("var proto = { x: 1 }; var obj = Object.create(proto); 'x' in obj"),
+            JsValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_in_own_undefined_value_is_true() {
+        assert_eq!(
+            operator_eval("'x' in { x: undefined }"),
+            JsValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_in_inherited_undefined_value_is_true() {
+        assert_eq!(
+            operator_eval(
+                "var proto = { x: undefined }; var obj = Object.create(proto); 'x' in obj"
+            ),
+            JsValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_in_symbol_property_is_true() {
+        operator_assert_true("var key = Symbol('s'); var obj = {}; obj[key] = 1; key in obj");
+    }
+
+    #[test]
+    fn e2e_operator_in_symbol_property_missing_is_false() {
+        assert_eq!(
+            operator_eval("var key = Symbol('missing'); key in {}"),
+            JsValue::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_in_array_index_is_true() {
+        assert_eq!(operator_eval("'0' in ['a']"), JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_operator_in_array_length_is_true() {
+        assert_eq!(operator_eval("'length' in []"), JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_operator_in_primitive_rhs_throws_type_error() {
+        operator_assert_true(r#"try { "x" in 1; false; } catch (e) { e instanceof TypeError; }"#);
+    }
+
+    #[test]
+    fn e2e_operator_instanceof_non_callable_with_symbol_has_instance_works() {
+        assert_eq!(
+            operator_eval(
+                "var Matcher = { [Symbol.hasInstance](value) { return value && value.flag === true; } }; ({ flag: true }) instanceof Matcher",
+            ),
+            JsValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_instanceof_symbol_has_instance_false_case() {
+        assert_eq!(
+            operator_eval(
+                "var Matcher = { [Symbol.hasInstance](value) { return value && value.flag === true; } }; ({ flag: false }) instanceof Matcher",
+            ),
+            JsValue::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_instanceof_symbol_has_instance_receives_this() {
+        assert_eq!(
+            operator_eval(
+                "var Matcher = { allow: true, [Symbol.hasInstance](value) { return this.allow && value === 7; } }; 7 instanceof Matcher",
+            ),
+            JsValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_instanceof_inherited_symbol_has_instance_is_used() {
+        assert_eq!(
+            operator_eval(
+                "var proto = { [Symbol.hasInstance](value) { return value === 'ok'; } }; var Matcher = Object.create(proto); 'ok' instanceof Matcher",
+            ),
+            JsValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_instanceof_non_callable_symbol_has_instance_must_be_callable() {
+        operator_assert_true(
+            "var Matcher = { [Symbol.hasInstance]: 123 }; try { 1 instanceof Matcher; false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_operator_instanceof_function_symbol_has_instance_true() {
+        assert_eq!(
+            operator_eval(
+                "function Foo() {} Foo[Symbol.hasInstance] = function(value) { return value === 9; }; 9 instanceof Foo",
+            ),
+            JsValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_instanceof_function_symbol_has_instance_false() {
+        assert_eq!(
+            operator_eval(
+                "function Foo() {} Foo[Symbol.hasInstance] = function(value) { return value === 9; }; 4 instanceof Foo",
+            ),
+            JsValue::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_instanceof_class_symbol_has_instance_truthy_result() {
+        assert_eq!(
+            operator_eval(
+                "class Foo { static [Symbol.hasInstance](value) { return value ? 1 : 0; } } ({}) instanceof Foo",
+            ),
+            JsValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_instanceof_class_symbol_has_instance_falsy_result() {
+        assert_eq!(
+            operator_eval(
+                "class Foo { static [Symbol.hasInstance](value) { return value && value.ok ? 1 : 0; } } ({ ok: false }) instanceof Foo",
+            ),
+            JsValue::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn e2e_operator_instanceof_ordinary_path_still_works() {
+        assert_eq!(
+            operator_eval("function Foo() {} var value = new Foo(); value instanceof Foo"),
+            JsValue::Boolean(true)
+        );
+    }
 }
