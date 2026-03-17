@@ -24,11 +24,46 @@ use std::rc::Rc;
 
 use smallvec::SmallVec;
 
+use crate::builtins::symbol::is_symbol_property_key;
 use crate::error::{StatorError, StatorResult};
 use crate::gc::trace::{Trace, Tracer};
 use crate::objects::map::{InstanceType, Map, PropertyAttributes, PropertyDescriptor};
 use crate::objects::shapes::{ShapeId, ShapeTable};
 use crate::objects::value::JsValue;
+
+/// Returns `Some(n)` if `key` is a valid ECMAScript array index — a canonical
+/// decimal string representing an integer in `0 ..= 2^32 − 2`.
+#[inline]
+fn parse_integer_index(key: &str) -> Option<u32> {
+    if key.is_empty() || (key.len() > 1 && key.as_bytes()[0] == b'0') {
+        return None;
+    }
+    let n: u32 = key.parse().ok()?;
+    if n < u32::MAX { Some(n) } else { None }
+}
+
+/// Sort `keys` in ECMAScript §10.1.11 enumeration order: integer indices
+/// ascending, then non-symbol string keys in their original relative order,
+/// then symbol keys in their original relative order.
+fn sort_keys_spec_order(keys: &mut Vec<String>) {
+    // Partition into three buckets preserving relative insertion order.
+    let mut indices: Vec<(u32, String)> = Vec::new();
+    let mut strings: Vec<String> = Vec::new();
+    let mut symbols: Vec<String> = Vec::new();
+    for k in keys.drain(..) {
+        if let Some(n) = parse_integer_index(&k) {
+            indices.push((n, k));
+        } else if is_symbol_property_key(&k) {
+            symbols.push(k);
+        } else {
+            strings.push(k);
+        }
+    }
+    indices.sort_by_key(|(n, _)| *n);
+    keys.extend(indices.into_iter().map(|(_, k)| k));
+    keys.extend(strings);
+    keys.extend(symbols);
+}
 
 /// Number of named-property slots stored directly in the object before the
 /// property store overflows to a [`HashMap`] (slow / dictionary mode).
@@ -224,10 +259,11 @@ impl JsObject {
     }
 
     /// Returns the names of all own named (string-keyed) properties in
-    /// insertion order for fast-mode objects, or an unspecified order for
-    /// slow-mode objects.
+    /// ECMAScript §10.1.11 enumeration order: integer indices ascending,
+    /// then non-symbol string keys in insertion order, then symbol keys in
+    /// insertion order.
     pub fn own_property_keys(&self) -> Vec<String> {
-        match &self.named_properties {
+        let mut keys = match &self.named_properties {
             NamedProperties::Fast(_) => self
                 .map
                 .descriptors()
@@ -235,7 +271,9 @@ impl JsObject {
                 .map(|d| d.key().to_string())
                 .collect(),
             NamedProperties::Slow { key_order, .. } => key_order.clone(),
-        }
+        };
+        sort_keys_spec_order(&mut keys);
+        keys
     }
 
     /// Returns the value **and** attribute flags of an own named property, or
@@ -1166,5 +1204,80 @@ mod tests {
         assert!(obj.prototype().is_some());
         obj.set_prototype(None);
         assert!(obj.prototype().is_none());
+    }
+
+    // ── Property enumeration order conformance ────────────────────────────
+
+    #[test]
+    fn test_own_keys_fast_mode_integer_sorted() {
+        let mut obj = JsObject::new();
+        obj.set_property("2", JsValue::Smi(2)).unwrap();
+        obj.set_property("0", JsValue::Smi(0)).unwrap();
+        obj.set_property("1", JsValue::Smi(1)).unwrap();
+        assert!(obj.is_fast_mode());
+        let keys = obj.own_property_keys();
+        assert_eq!(keys, &["0", "1", "2"]);
+    }
+
+    #[test]
+    fn test_own_keys_fast_mode_strings_after_integers() {
+        let mut obj = JsObject::new();
+        obj.set_property("b", JsValue::Smi(1)).unwrap();
+        obj.set_property("1", JsValue::Smi(2)).unwrap();
+        obj.set_property("a", JsValue::Smi(3)).unwrap();
+        obj.set_property("0", JsValue::Smi(4)).unwrap();
+        let keys = obj.own_property_keys();
+        assert_eq!(keys, &["0", "1", "b", "a"]);
+    }
+
+    #[test]
+    fn test_own_keys_slow_mode_integer_sorted() {
+        let mut obj = JsObject::new();
+        // Force slow mode by exceeding MAX_FAST_PROPERTIES
+        for i in 0..=MAX_FAST_PROPERTIES {
+            obj.set_property(&format!("p{i}"), JsValue::Smi(i as i32))
+                .unwrap();
+        }
+        assert!(!obj.is_fast_mode());
+        // Now add integer-indexed properties
+        obj.set_property("5", JsValue::Smi(50)).unwrap();
+        obj.set_property("2", JsValue::Smi(20)).unwrap();
+        obj.set_property("10", JsValue::Smi(100)).unwrap();
+        let keys = obj.own_property_keys();
+        // Integers first in ascending order
+        assert_eq!(keys[0], "2");
+        assert_eq!(keys[1], "5");
+        assert_eq!(keys[2], "10");
+    }
+
+    #[test]
+    fn test_own_keys_slow_mode_strings_insertion_order() {
+        let mut obj = JsObject::new();
+        for i in 0..=MAX_FAST_PROPERTIES {
+            obj.set_property(&format!("fill{i}"), JsValue::Smi(i as i32))
+                .unwrap();
+        }
+        assert!(!obj.is_fast_mode());
+        obj.set_property("z", JsValue::Smi(1)).unwrap();
+        obj.set_property("a", JsValue::Smi(2)).unwrap();
+        obj.set_property("m", JsValue::Smi(3)).unwrap();
+        let keys = obj.own_property_keys();
+        // String keys should be in insertion order relative to each other
+        let z_pos = keys.iter().position(|k| k == "z").unwrap();
+        let a_pos = keys.iter().position(|k| k == "a").unwrap();
+        let m_pos = keys.iter().position(|k| k == "m").unwrap();
+        assert!(z_pos < a_pos);
+        assert!(a_pos < m_pos);
+    }
+
+    #[test]
+    fn test_own_keys_element_indices_not_in_named() {
+        let mut obj = JsObject::new();
+        obj.set_element(0, JsValue::Smi(10));
+        obj.set_element(1, JsValue::Smi(20));
+        obj.set_property("a", JsValue::Smi(1)).unwrap();
+        // own_property_keys only returns named properties
+        let keys = obj.own_property_keys();
+        assert_eq!(keys, &["a"]);
     }
 }

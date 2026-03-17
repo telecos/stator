@@ -279,7 +279,8 @@ impl PropertyMap {
 
     /// Returns the position at which `key` should be inserted to maintain
     /// ECMAScript §10.1.11 enumeration order: integer indices (ascending)
-    /// first, then string keys in insertion order.
+    /// first, then non-symbol string keys in insertion order, then symbol
+    /// keys in insertion order.
     fn spec_insert_pos(&self, key: &str) -> usize {
         if let Some(n) = parse_integer_index(key) {
             // Integer index: find the correct sorted position among the
@@ -296,9 +297,17 @@ impl PropertyMap {
                 }
             }
             pos
-        } else {
-            // String property: append after all existing entries.
+        } else if is_symbol_property_key(key) {
+            // Symbol keys go at the very end, after all string keys.
             self.keys.len()
+        } else {
+            // Non-symbol string key: insert before the first symbol key
+            // (which, if any, occupies the tail of the keys vec).
+            let mut pos = self.keys.len();
+            while pos > 0 && is_symbol_property_key(&self.keys[pos - 1]) {
+                pos -= 1;
+            }
+            pos
         }
     }
 
@@ -1346,5 +1355,228 @@ mod tests {
         assert!(pm.is_configurable("x"));
         pm.set_configurable("x", false);
         assert!(!pm.is_configurable("x"));
+    }
+
+    // ── Property enumeration order conformance ────────────────────────────
+
+    #[test]
+    fn test_enum_order_integer_indices_sorted_ascending() {
+        let mut pm = PropertyMap::new();
+        pm.insert("2".to_string(), JsValue::Smi(2));
+        pm.insert("0".to_string(), JsValue::Smi(0));
+        pm.insert("1".to_string(), JsValue::Smi(1));
+        let keys: Vec<&String> = pm.keys().collect();
+        assert_eq!(keys, &["0", "1", "2"]);
+    }
+
+    #[test]
+    fn test_enum_order_strings_after_integers() {
+        let mut pm = PropertyMap::new();
+        pm.insert("b".to_string(), JsValue::Smi(1));
+        pm.insert("1".to_string(), JsValue::Smi(2));
+        pm.insert("a".to_string(), JsValue::Smi(3));
+        pm.insert("0".to_string(), JsValue::Smi(4));
+        let keys: Vec<&String> = pm.keys().collect();
+        assert_eq!(keys, &["0", "1", "b", "a"]);
+    }
+
+    #[test]
+    fn test_enum_order_symbols_after_strings() {
+        use crate::builtins::symbol::{symbol_create, symbol_to_property_key};
+        let mut pm = PropertyMap::new();
+        pm.insert("a".to_string(), JsValue::Smi(1));
+        let sym = symbol_create(Some("s".into()));
+        let sym_key = symbol_to_property_key(sym);
+        pm.insert(sym_key.clone(), JsValue::Smi(2));
+        pm.insert("b".to_string(), JsValue::Smi(3));
+        let keys: Vec<&String> = pm.keys().collect();
+        // "a", "b" (strings in insertion order), then symbol
+        assert_eq!(keys, &["a", "b", &sym_key]);
+    }
+
+    #[test]
+    fn test_enum_order_integers_strings_symbols_combined() {
+        use crate::builtins::symbol::{symbol_create, symbol_to_property_key};
+        let mut pm = PropertyMap::new();
+        let sym = symbol_create(Some("sym".into()));
+        let sym_key = symbol_to_property_key(sym);
+        pm.insert("z".to_string(), JsValue::Smi(1));
+        pm.insert(sym_key.clone(), JsValue::Smi(2));
+        pm.insert("5".to_string(), JsValue::Smi(3));
+        pm.insert("a".to_string(), JsValue::Smi(4));
+        pm.insert("0".to_string(), JsValue::Smi(5));
+        let keys: Vec<&String> = pm.keys().collect();
+        assert_eq!(keys, &["0", "5", "z", "a", &sym_key]);
+    }
+
+    #[test]
+    fn test_enum_order_sparse_array_indices() {
+        let mut pm = PropertyMap::new();
+        pm.insert("2".to_string(), JsValue::String("c".into()));
+        pm.insert("0".to_string(), JsValue::String("a".into()));
+        pm.insert("1".to_string(), JsValue::String("b".into()));
+        let keys: Vec<&String> = pm.keys().collect();
+        assert_eq!(keys, &["0", "1", "2"]);
+    }
+
+    #[test]
+    fn test_enum_order_large_integer_indices() {
+        let mut pm = PropertyMap::new();
+        pm.insert("100".to_string(), JsValue::Smi(1));
+        pm.insert("5".to_string(), JsValue::Smi(2));
+        pm.insert("42".to_string(), JsValue::Smi(3));
+        pm.insert("3".to_string(), JsValue::Smi(4));
+        let keys: Vec<&String> = pm.keys().collect();
+        assert_eq!(keys, &["3", "5", "42", "100"]);
+    }
+
+    #[test]
+    fn test_enum_order_u32_max_not_array_index() {
+        let mut pm = PropertyMap::new();
+        let max_str = u32::MAX.to_string();
+        pm.insert("0".to_string(), JsValue::Smi(1));
+        pm.insert(max_str.clone(), JsValue::Smi(2));
+        pm.insert("a".to_string(), JsValue::Smi(3));
+        let keys: Vec<&String> = pm.keys().collect();
+        // u32::MAX is NOT an array index, so treated as string
+        assert_eq!(keys, &["0", &max_str, "a"]);
+    }
+
+    #[test]
+    fn test_enum_order_leading_zero_not_array_index() {
+        let mut pm = PropertyMap::new();
+        pm.insert("01".to_string(), JsValue::Smi(1));
+        pm.insert("0".to_string(), JsValue::Smi(2));
+        pm.insert("1".to_string(), JsValue::Smi(3));
+        let keys: Vec<&String> = pm.keys().collect();
+        // "01" is not a valid array index, so it's a string key
+        assert_eq!(keys, &["0", "1", "01"]);
+    }
+
+    #[test]
+    fn test_enum_order_string_insertion_order_preserved() {
+        let mut pm = PropertyMap::new();
+        pm.insert("c".to_string(), JsValue::Smi(1));
+        pm.insert("a".to_string(), JsValue::Smi(2));
+        pm.insert("b".to_string(), JsValue::Smi(3));
+        let keys: Vec<&String> = pm.keys().collect();
+        assert_eq!(keys, &["c", "a", "b"]);
+    }
+
+    #[test]
+    fn test_enum_order_multiple_symbols_insertion_order() {
+        use crate::builtins::symbol::{symbol_create, symbol_to_property_key};
+        let mut pm = PropertyMap::new();
+        let s1 = symbol_create(Some("s1".into()));
+        let s2 = symbol_create(Some("s2".into()));
+        let k1 = symbol_to_property_key(s1);
+        let k2 = symbol_to_property_key(s2);
+        pm.insert(k1.clone(), JsValue::Smi(1));
+        pm.insert("a".to_string(), JsValue::Smi(2));
+        pm.insert(k2.clone(), JsValue::Smi(3));
+        let keys: Vec<&String> = pm.keys().collect();
+        // Strings first, then symbols in insertion order
+        assert_eq!(keys, &["a", &k1, &k2]);
+    }
+
+    #[test]
+    fn test_enumerable_keys_skips_symbols() {
+        use crate::builtins::symbol::{symbol_create, symbol_to_property_key};
+        let mut pm = PropertyMap::new();
+        pm.insert("a".to_string(), JsValue::Smi(1));
+        let sym = symbol_create(Some("hidden".into()));
+        let sym_key = symbol_to_property_key(sym);
+        pm.insert(sym_key, JsValue::Smi(2));
+        pm.insert("b".to_string(), JsValue::Smi(3));
+        let enumerable: Vec<&String> = pm.enumerable_keys().collect();
+        assert_eq!(enumerable, &["a", "b"]);
+    }
+
+    #[test]
+    fn test_enumerable_keys_skips_non_enumerable() {
+        let mut pm = PropertyMap::new();
+        pm.insert("visible".to_string(), JsValue::Smi(1));
+        pm.insert_with_attrs(
+            "hidden".to_string(),
+            JsValue::Smi(2),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        );
+        let enumerable: Vec<&String> = pm.enumerable_keys().collect();
+        assert_eq!(enumerable, &["visible"]);
+    }
+
+    #[test]
+    fn test_enumerable_iter_follows_spec_order() {
+        let mut pm = PropertyMap::new();
+        pm.insert("z".to_string(), JsValue::Smi(1));
+        pm.insert("3".to_string(), JsValue::Smi(2));
+        pm.insert("1".to_string(), JsValue::Smi(3));
+        pm.insert("a".to_string(), JsValue::Smi(4));
+        let pairs: Vec<(&String, &JsValue)> = pm.enumerable_iter().collect();
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, &["1", "3", "z", "a"]);
+    }
+
+    #[test]
+    fn test_own_symbol_keys_returns_symbols_only() {
+        use crate::builtins::symbol::{symbol_create, symbol_to_property_key};
+        let mut pm = PropertyMap::new();
+        pm.insert("a".to_string(), JsValue::Smi(1));
+        let s1 = symbol_create(None);
+        let s2 = symbol_create(None);
+        let k1 = symbol_to_property_key(s1);
+        let k2 = symbol_to_property_key(s2);
+        pm.insert(k1, JsValue::Smi(2));
+        pm.insert(k2, JsValue::Smi(3));
+        pm.insert("b".to_string(), JsValue::Smi(4));
+        let syms = pm.own_symbol_keys();
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0], s1);
+        assert_eq!(syms[1], s2);
+    }
+
+    #[test]
+    fn test_remove_preserves_spec_order() {
+        let mut pm = PropertyMap::new();
+        pm.insert("1".to_string(), JsValue::Smi(1));
+        pm.insert("0".to_string(), JsValue::Smi(2));
+        pm.insert("a".to_string(), JsValue::Smi(3));
+        pm.insert("b".to_string(), JsValue::Smi(4));
+        pm.remove("a");
+        let keys: Vec<&String> = pm.keys().collect();
+        assert_eq!(keys, &["0", "1", "b"]);
+    }
+
+    #[test]
+    fn test_iter_with_attrs_follows_spec_order() {
+        let mut pm = PropertyMap::new();
+        pm.insert("b".to_string(), JsValue::Smi(1));
+        pm.insert("10".to_string(), JsValue::Smi(2));
+        pm.insert("2".to_string(), JsValue::Smi(3));
+        pm.insert("a".to_string(), JsValue::Smi(4));
+        let keys: Vec<&str> = pm.iter_with_attrs().map(|(k, _, _)| k.as_str()).collect();
+        assert_eq!(keys, &["2", "10", "b", "a"]);
+    }
+
+    #[test]
+    fn test_insert_with_attrs_follows_spec_order() {
+        let mut pm = PropertyMap::new();
+        pm.insert_with_attrs(
+            "b".to_string(),
+            JsValue::Smi(1),
+            PropertyAttributes::ENUMERABLE,
+        );
+        pm.insert_with_attrs(
+            "3".to_string(),
+            JsValue::Smi(2),
+            PropertyAttributes::ENUMERABLE,
+        );
+        pm.insert_with_attrs(
+            "1".to_string(),
+            JsValue::Smi(3),
+            PropertyAttributes::ENUMERABLE,
+        );
+        let keys: Vec<&String> = pm.keys().collect();
+        assert_eq!(keys, &["1", "3", "b"]);
     }
 }

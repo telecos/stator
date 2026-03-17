@@ -2387,4 +2387,142 @@ mod tests {
         assert!(attrs.contains(PropertyAttributes::ENUMERABLE));
         assert!(attrs.contains(PropertyAttributes::CONFIGURABLE));
     }
+
+    // ── Property enumeration order conformance (Object.keys/values/entries) ──
+
+    #[test]
+    fn test_object_keys_integer_indices_sorted() {
+        let mut obj = JsObject::new();
+        obj.set_property("2", JsValue::Smi(20)).unwrap();
+        obj.set_property("0", JsValue::Smi(0)).unwrap();
+        obj.set_property("1", JsValue::Smi(10)).unwrap();
+        let keys = object_keys(&obj);
+        assert_eq!(keys, &["0", "1", "2"]);
+    }
+
+    #[test]
+    fn test_object_keys_integers_then_strings() {
+        let mut obj = JsObject::new();
+        obj.set_property("b", JsValue::Smi(1)).unwrap();
+        obj.set_property("3", JsValue::Smi(2)).unwrap();
+        obj.set_property("a", JsValue::Smi(3)).unwrap();
+        obj.set_property("1", JsValue::Smi(4)).unwrap();
+        let keys = object_keys(&obj);
+        assert_eq!(keys, &["1", "3", "b", "a"]);
+    }
+
+    #[test]
+    fn test_object_values_follows_key_order() {
+        let mut obj = JsObject::new();
+        obj.set_property("b", JsValue::Smi(10)).unwrap();
+        obj.set_property("1", JsValue::Smi(20)).unwrap();
+        obj.set_property("a", JsValue::Smi(30)).unwrap();
+        obj.set_property("0", JsValue::Smi(40)).unwrap();
+        let vals = object_values(&obj);
+        assert_eq!(
+            vals,
+            &[
+                JsValue::Smi(40),
+                JsValue::Smi(20),
+                JsValue::Smi(10),
+                JsValue::Smi(30),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_object_entries_follows_key_order() {
+        let mut obj = JsObject::new();
+        obj.set_property("z", JsValue::Smi(1)).unwrap();
+        obj.set_property("5", JsValue::Smi(2)).unwrap();
+        obj.set_property("a", JsValue::Smi(3)).unwrap();
+        let entries = object_entries(&obj);
+        assert_eq!(entries[0].0, "5");
+        assert_eq!(entries[1].0, "z");
+        assert_eq!(entries[2].0, "a");
+    }
+
+    #[test]
+    fn test_object_keys_excludes_non_enumerable() {
+        let mut obj = JsObject::new();
+        obj.set_property("visible", JsValue::Smi(1)).unwrap();
+        obj.define_own_property(
+            "hidden",
+            JsValue::Smi(2),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        )
+        .unwrap();
+        let keys = object_keys(&obj);
+        assert_eq!(keys, &["visible"]);
+    }
+
+    #[test]
+    fn test_get_own_property_names_includes_non_enumerable() {
+        let mut obj = JsObject::new();
+        obj.set_property("visible", JsValue::Smi(1)).unwrap();
+        obj.define_own_property(
+            "hidden",
+            JsValue::Smi(2),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        )
+        .unwrap();
+        let names = object_get_own_property_names(&obj);
+        assert!(names.contains(&"visible".to_string()));
+        assert!(names.contains(&"hidden".to_string()));
+    }
+
+    #[test]
+    fn test_get_own_property_names_follows_spec_order() {
+        let mut obj = JsObject::new();
+        obj.set_property("b", JsValue::Smi(1)).unwrap();
+        obj.set_property("7", JsValue::Smi(2)).unwrap();
+        obj.set_property("a", JsValue::Smi(3)).unwrap();
+        obj.set_property("2", JsValue::Smi(4)).unwrap();
+        let names = object_get_own_property_names(&obj);
+        assert_eq!(names, &["2", "7", "b", "a"]);
+    }
+
+    #[test]
+    fn test_object_keys_sparse_indices() {
+        let mut obj = JsObject::new();
+        obj.set_property("2", JsValue::String("c".into())).unwrap();
+        obj.set_property("0", JsValue::String("a".into())).unwrap();
+        obj.set_property("1", JsValue::String("b".into())).unwrap();
+        let keys = object_keys(&obj);
+        assert_eq!(keys, &["0", "1", "2"]);
+    }
+
+    #[test]
+    fn test_object_keys_mixed_with_sparse() {
+        let mut obj = JsObject::new();
+        obj.set_property("foo", JsValue::Smi(1)).unwrap();
+        obj.set_property("10", JsValue::Smi(2)).unwrap();
+        obj.set_property("bar", JsValue::Smi(3)).unwrap();
+        obj.set_property("0", JsValue::Smi(4)).unwrap();
+        let keys = object_keys(&obj);
+        assert_eq!(keys, &["0", "10", "foo", "bar"]);
+    }
+
+    #[test]
+    fn test_object_entries_values_match_keys() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(10)).unwrap();
+        obj.set_property("0", JsValue::Smi(20)).unwrap();
+        let entries = object_entries(&obj);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], ("0".to_string(), JsValue::Smi(20)));
+        assert_eq!(entries[1], ("x".to_string(), JsValue::Smi(10)));
+    }
+
+    #[test]
+    fn test_object_values_empty() {
+        let obj = JsObject::new();
+        assert!(object_values(&obj).is_empty());
+    }
+
+    #[test]
+    fn test_object_keys_empty() {
+        let obj = JsObject::new();
+        assert!(object_keys(&obj).is_empty());
+    }
 }
