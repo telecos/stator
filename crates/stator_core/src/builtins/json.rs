@@ -711,7 +711,14 @@ impl<'a> Parser<'a> {
             self.expect(':')?;
             self.skip_ws();
             let val = self.parse_value()?;
-            obj.borrow_mut().push((key, val));
+            // §25.5.1: duplicate keys — last value wins.
+            let mut entries = obj.borrow_mut();
+            if let Some(existing) = entries.iter_mut().find(|(k, _)| k == &key) {
+                existing.1 = val;
+            } else {
+                entries.push((key, val));
+            }
+            drop(entries);
             self.skip_ws();
             match self.peek() {
                 Some(',') => {
@@ -1834,7 +1841,6 @@ mod tests {
         let s = json_stringify_js_value(&obj, Some(&replacer), None)
             .unwrap()
             .unwrap();
-        // Only "a" and "c" should appear.
         assert!(s.contains("\"a\""), "should contain a: {s}");
         assert!(s.contains("\"c\""), "should contain c: {s}");
         assert!(!s.contains("\"b\""), "should not contain b: {s}");
@@ -1850,5 +1856,621 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(s, "[\n  1,\n  2\n]");
+    }
+
+    // ── E2E: JSON.parse reviver — bottom-up traversal ─────────────────────────
+
+    #[test]
+    fn test_e2e_reviver_receives_keys_bottom_up() {
+        let keys_ref = Rc::new(RefCell::new(Vec::<String>::new()));
+        let keys_clone = keys_ref.clone();
+        let v = json_parse(
+            r#"{"a":{"b":1},"c":2}"#,
+            Some(&move |key: &str, val: JsonValue| {
+                keys_clone.borrow_mut().push(key.to_string());
+                Ok(Some(val))
+            }),
+        )
+        .unwrap();
+        let keys = keys_ref.borrow().clone();
+        // Bottom-up: "b" visited before "a"; "c" before root ""
+        assert_eq!(keys, vec!["b", "a", "c", ""]);
+        assert!(v.is_object());
+    }
+
+    #[test]
+    fn test_e2e_reviver_transforms_nested_values() {
+        let v = json_parse(
+            r#"{"x":{"y":10}}"#,
+            Some(&|_key, val| {
+                Ok(Some(match val {
+                    JsonValue::Number(n) => JsonValue::Number(n + 1.0),
+                    other => other,
+                }))
+            }),
+        )
+        .unwrap();
+        if let JsonValue::Object(obj) = &v {
+            if let JsonValue::Object(inner) = &obj.borrow()[0].1 {
+                assert_eq!(inner.borrow()[0].1, JsonValue::Number(11.0));
+            } else {
+                panic!("expected inner object");
+            }
+        } else {
+            panic!("expected object");
+        }
+    }
+
+    #[test]
+    fn test_e2e_reviver_root_returns_none_gives_null() {
+        let v = json_parse(
+            "42",
+            Some(&|key, _val| {
+                if key.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(JsonValue::Null))
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(v, JsonValue::Null);
+    }
+
+    #[test]
+    fn test_e2e_reviver_with_nested_array_in_object() {
+        let call_log = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
+        let log = call_log.clone();
+        let v = json_parse(
+            r#"{"arr":[10,20]}"#,
+            Some(&move |key: &str, val: JsonValue| {
+                let repr = match &val {
+                    JsonValue::Number(n) => format!("{n}"),
+                    JsonValue::Array(_) => "array".to_string(),
+                    JsonValue::Object(_) => "object".to_string(),
+                    _ => "other".to_string(),
+                };
+                log.borrow_mut().push((key.to_string(), repr));
+                Ok(Some(val))
+            }),
+        )
+        .unwrap();
+        let log = call_log.borrow();
+        // Array elements "0","1" first, then "arr" key, then root ""
+        assert_eq!(log[0].0, "0");
+        assert_eq!(log[1].0, "1");
+        assert_eq!(log[2].0, "arr");
+        assert_eq!(log[3].0, "");
+        assert!(v.is_object());
+    }
+
+    // ── E2E: JSON.stringify replacer array ────────────────────────────────────
+
+    #[test]
+    fn test_e2e_replacer_array_nested_objects() {
+        let inner = JsonValue::Object(Rc::new(RefCell::new(vec![
+            ("x".to_string(), JsonValue::Number(1.0)),
+            ("y".to_string(), JsonValue::Number(2.0)),
+        ])));
+        let outer = JsonValue::Object(Rc::new(RefCell::new(vec![
+            ("a".to_string(), inner),
+            ("b".to_string(), JsonValue::Number(3.0)),
+        ])));
+        let replacer = JsonReplacer::Array(vec!["a".to_string(), "x".to_string()]);
+        let s = json_stringify(&outer, Some(&replacer), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s, r#"{"a":{"x":1}}"#);
+    }
+
+    #[test]
+    fn test_e2e_replacer_array_does_not_affect_arrays() {
+        let arr = JsonValue::Array(Rc::new(RefCell::new(vec![
+            JsonValue::Number(1.0),
+            JsonValue::Number(2.0),
+        ])));
+        let obj = JsonValue::Object(Rc::new(RefCell::new(vec![
+            ("a".to_string(), arr),
+            ("b".to_string(), JsonValue::Number(3.0)),
+        ])));
+        let replacer = JsonReplacer::Array(vec!["a".to_string()]);
+        let s = json_stringify(&obj, Some(&replacer), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s, r#"{"a":[1,2]}"#);
+    }
+
+    #[test]
+    fn test_e2e_replacer_array_empty_list_gives_empty_object() {
+        let obj = JsonValue::Object(Rc::new(RefCell::new(vec![(
+            "a".to_string(),
+            JsonValue::Number(1.0),
+        )])));
+        let replacer = JsonReplacer::Array(vec![]);
+        let s = json_stringify(&obj, Some(&replacer), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s, "{}");
+    }
+
+    // ── E2E: JSON.stringify replacer function ─────────────────────────────────
+
+    #[test]
+    fn test_e2e_replacer_fn_receives_root_with_empty_key() {
+        let root_key = Rc::new(RefCell::new(String::new()));
+        let rk = root_key.clone();
+        let replacer = JsonReplacer::Function(&move |key, val| {
+            if key.is_empty() {
+                *rk.borrow_mut() = "root_seen".to_string();
+            }
+            Ok(Some(val.clone()))
+        });
+        let _ = json_stringify(&JsonValue::Number(42.0), Some(&replacer), None, None).unwrap();
+        assert_eq!(*root_key.borrow(), "root_seen");
+    }
+
+    #[test]
+    fn test_e2e_replacer_fn_can_change_type() {
+        let obj = JsonValue::Object(Rc::new(RefCell::new(vec![(
+            "n".to_string(),
+            JsonValue::Number(42.0),
+        )])));
+        let replacer = JsonReplacer::Function(&|_key, val| {
+            Ok(Some(match val {
+                JsonValue::Number(n) => JsonValue::Str(format!("num:{n}")),
+                other => other.clone(),
+            }))
+        });
+        let s = json_stringify(&obj, Some(&replacer), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s, r#"{"n":"num:42"}"#);
+    }
+
+    #[test]
+    fn test_e2e_replacer_fn_returning_none_omits_root() {
+        let replacer = JsonReplacer::Function(&|_key, _val| Ok(None));
+        let result = json_stringify(&JsonValue::Number(1.0), Some(&replacer), None, None).unwrap();
+        assert_eq!(result, None);
+    }
+
+    // ── E2E: JSON.stringify space ─────────────────────────────────────────────
+
+    #[test]
+    fn test_e2e_space_zero_means_no_indent() {
+        let obj = JsonValue::Object(Rc::new(RefCell::new(vec![(
+            "a".to_string(),
+            JsonValue::Number(1.0),
+        )])));
+        let s = json_stringify(&obj, None, Some(&JsonSpace::Count(0)), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn test_e2e_space_nested_array_in_object() {
+        let arr = JsonValue::Array(Rc::new(RefCell::new(vec![
+            JsonValue::Number(1.0),
+            JsonValue::Number(2.0),
+        ])));
+        let obj = JsonValue::Object(Rc::new(RefCell::new(vec![("items".to_string(), arr)])));
+        let s = json_stringify(&obj, None, Some(&JsonSpace::Count(2)), None)
+            .unwrap()
+            .unwrap();
+        let expected = "{\n  \"items\": [\n    1,\n    2\n  ]\n}";
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn test_e2e_space_string_longer_than_10_truncated() {
+        let obj = JsonValue::Object(Rc::new(RefCell::new(vec![(
+            "x".to_string(),
+            JsonValue::Number(1.0),
+        )])));
+        let long_indent = "abcdefghijklmno".to_string(); // 15 chars
+        let s = json_stringify(&obj, None, Some(&JsonSpace::Str(long_indent)), None)
+            .unwrap()
+            .unwrap();
+        // Should be truncated to 10 chars: "abcdefghij"
+        assert!(s.contains("abcdefghij\"x\""));
+    }
+
+    #[test]
+    fn test_e2e_space_tab_string() {
+        let arr = JsonValue::Array(Rc::new(RefCell::new(vec![
+            JsonValue::Bool(true),
+            JsonValue::Bool(false),
+        ])));
+        let s = json_stringify(&arr, None, Some(&JsonSpace::Str("\t".to_string())), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s, "[\n\ttrue,\n\tfalse\n]");
+    }
+
+    // ── E2E: JSON.stringify toJSON ────────────────────────────────────────────
+
+    #[test]
+    fn test_e2e_to_json_hook_on_nested_object() {
+        let inner = JsonValue::Object(Rc::new(RefCell::new(vec![(
+            "val".to_string(),
+            JsonValue::Number(99.0),
+        )])));
+        let outer = JsonValue::Object(Rc::new(RefCell::new(vec![("child".to_string(), inner)])));
+        let hook: &dyn Fn(&str, &JsonValue) -> Option<JsonValue> = &|key, _v| {
+            if key == "child" {
+                Some(JsonValue::Str("hooked".to_string()))
+            } else {
+                None
+            }
+        };
+        let s = json_stringify(&outer, None, None, Some(hook))
+            .unwrap()
+            .unwrap();
+        assert_eq!(s, r#"{"child":"hooked"}"#);
+    }
+
+    #[test]
+    fn test_e2e_to_json_hook_with_key_argument() {
+        let obj = JsonValue::Object(Rc::new(RefCell::new(vec![
+            ("a".to_string(), JsonValue::Number(1.0)),
+            ("b".to_string(), JsonValue::Number(2.0)),
+        ])));
+        let hook: &dyn Fn(&str, &JsonValue) -> Option<JsonValue> = &|key, _v| {
+            if !key.is_empty() {
+                Some(JsonValue::Str(format!("key={key}")))
+            } else {
+                None
+            }
+        };
+        let s = json_stringify(&obj, None, None, Some(hook))
+            .unwrap()
+            .unwrap();
+        assert_eq!(s, r#"{"a":"key=a","b":"key=b"}"#);
+    }
+
+    // ── E2E: JSON.stringify edge cases ────────────────────────────────────────
+
+    #[test]
+    fn test_e2e_bigint_throws_type_error() {
+        let result = json_stringify_js_value(&JsValue::BigInt(123), None, None);
+        assert!(matches!(result, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn test_e2e_undefined_function_symbol_omitted() {
+        assert_eq!(
+            json_stringify_js_value(&JsValue::Undefined, None, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            json_stringify_js_value(
+                &JsValue::NativeFunction(Rc::new(|_| Ok(JsValue::Undefined))),
+                None,
+                None,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            json_stringify_js_value(&JsValue::Symbol(0), None, None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_e2e_infinity_becomes_null() {
+        let pos = json_stringify_js_value(&JsValue::HeapNumber(f64::INFINITY), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pos, "null");
+        let neg = json_stringify_js_value(&JsValue::HeapNumber(f64::NEG_INFINITY), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(neg, "null");
+    }
+
+    #[test]
+    fn test_e2e_nan_becomes_null() {
+        let s = json_stringify_js_value(&JsValue::HeapNumber(f64::NAN), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s, "null");
+    }
+
+    #[test]
+    fn test_e2e_negative_zero() {
+        let s = json_stringify(&JsonValue::Number(-0.0), None, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s, "0");
+    }
+
+    // ── E2E: JSON.parse edge cases ────────────────────────────────────────────
+
+    #[test]
+    fn test_e2e_parse_duplicate_keys_last_wins() {
+        let v = json_parse(r#"{"a":1,"a":2}"#, None).unwrap();
+        if let JsonValue::Object(obj) = &v {
+            let b = obj.borrow();
+            assert_eq!(b.len(), 1, "duplicate keys should be deduplicated");
+            assert_eq!(b[0], ("a".to_string(), JsonValue::Number(2.0)));
+        } else {
+            panic!("expected object");
+        }
+    }
+
+    #[test]
+    fn test_e2e_parse_proto_key_is_normal_property() {
+        let v = json_parse(r#"{"__proto__":"val"}"#, None).unwrap();
+        if let JsonValue::Object(obj) = &v {
+            let b = obj.borrow();
+            assert_eq!(b.len(), 1);
+            assert_eq!(
+                b[0],
+                ("__proto__".to_string(), JsonValue::Str("val".to_string()))
+            );
+        } else {
+            panic!("expected object");
+        }
+    }
+
+    #[test]
+    fn test_e2e_parse_trailing_comma_in_array_rejected() {
+        let result = json_parse("[1, 2, ]", None);
+        assert!(
+            result.is_err(),
+            "trailing comma in array should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_e2e_parse_trailing_comma_in_object_rejected() {
+        let result = json_parse(r#"{"a":1,}"#, None);
+        assert!(
+            result.is_err(),
+            "trailing comma in object should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_e2e_parse_leading_zeros_rejected() {
+        let result = json_parse("01", None);
+        assert!(result.is_err(), "leading zeros should be rejected");
+    }
+
+    #[test]
+    fn test_e2e_parse_single_quoted_string_rejected() {
+        let result = json_parse("'hello'", None);
+        assert!(result.is_err(), "single-quoted strings should be rejected");
+    }
+
+    #[test]
+    fn test_e2e_parse_unquoted_key_rejected() {
+        let result = json_parse("{a: 1}", None);
+        assert!(result.is_err(), "unquoted keys should be rejected");
+    }
+
+    #[test]
+    fn test_e2e_parse_deeply_nested() {
+        let depth = 100;
+        let open: String = "[".repeat(depth);
+        let close: String = "]".repeat(depth);
+        let text = format!("{open}1{close}");
+        let v = json_parse(&text, None).unwrap();
+        let mut current = v;
+        for _ in 0..depth {
+            if let JsonValue::Array(arr) = current {
+                current = arr.borrow()[0].clone();
+            } else {
+                panic!("expected array");
+            }
+        }
+        assert_eq!(current, JsonValue::Number(1.0));
+    }
+
+    #[test]
+    fn test_e2e_parse_max_depth_exceeded() {
+        let depth = 600;
+        let text: String = "[".repeat(depth) + "1" + &"]".repeat(depth);
+        let result = json_parse(&text, None);
+        assert!(result.is_err(), "should reject nesting > 512");
+    }
+
+    #[test]
+    fn test_e2e_parse_whitespace_variants() {
+        let v = json_parse(" \t\r\n{ \t\r\n\"a\" \t\r\n: \t\r\n1 \t\r\n} \t\r\n", None).unwrap();
+        if let JsonValue::Object(obj) = &v {
+            assert_eq!(obj.borrow()[0].1, JsonValue::Number(1.0));
+        } else {
+            panic!("expected object");
+        }
+    }
+
+    #[test]
+    fn test_e2e_parse_empty_string_value() {
+        let v = json_parse(r#""""#, None).unwrap();
+        assert_eq!(v, JsonValue::Str(String::new()));
+    }
+
+    #[test]
+    fn test_e2e_parse_all_escape_sequences() {
+        let v = json_parse(r#""\"\\/\b\f\n\r\t""#, None).unwrap();
+        assert_eq!(v, JsonValue::Str("\"\\/\x08\x0C\n\r\t".to_string()));
+    }
+
+    #[test]
+    fn test_e2e_parse_negative_zero() {
+        let v = json_parse("-0", None).unwrap();
+        if let JsonValue::Number(n) = v {
+            assert!(n.is_sign_negative() && n == 0.0);
+        } else {
+            panic!("expected number");
+        }
+    }
+
+    #[test]
+    fn test_e2e_parse_large_exponent() {
+        let v = json_parse("1e308", None).unwrap();
+        assert_eq!(v, JsonValue::Number(1e308));
+    }
+
+    #[test]
+    fn test_e2e_parse_scientific_notation_variants() {
+        assert_eq!(json_parse("1E2", None).unwrap(), JsonValue::Number(100.0));
+        assert_eq!(json_parse("1e+2", None).unwrap(), JsonValue::Number(100.0));
+        assert_eq!(json_parse("1e-2", None).unwrap(), JsonValue::Number(0.01));
+        assert_eq!(
+            json_parse("-1.5e3", None).unwrap(),
+            JsonValue::Number(-1500.0)
+        );
+    }
+
+    // ── E2E: round-trip with all features ─────────────────────────────────────
+
+    #[test]
+    fn test_e2e_roundtrip_complex_document() {
+        let input = r#"{"name":"test","values":[1,2.5,true,false,null],"nested":{"inner":"ok"}}"#;
+        let parsed = json_parse(input, None).unwrap();
+        let output = json_stringify(&parsed, None, None, None).unwrap().unwrap();
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_e2e_roundtrip_with_indent_preserves_data() {
+        let input = r#"{"a":1,"b":[2,3]}"#;
+        let parsed = json_parse(input, None).unwrap();
+        let pretty = json_stringify(&parsed, None, Some(&JsonSpace::Count(2)), None)
+            .unwrap()
+            .unwrap();
+        let reparsed = json_parse(&pretty, None).unwrap();
+        let compact = json_stringify(&reparsed, None, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(compact, input);
+    }
+
+    // ── E2E: combined features ────────────────────────────────────────────────
+
+    #[test]
+    fn test_e2e_replacer_array_with_space() {
+        let obj = JsonValue::Object(Rc::new(RefCell::new(vec![
+            ("a".to_string(), JsonValue::Number(1.0)),
+            ("b".to_string(), JsonValue::Number(2.0)),
+            ("c".to_string(), JsonValue::Number(3.0)),
+        ])));
+        let replacer = JsonReplacer::Array(vec!["a".to_string(), "c".to_string()]);
+        let s = json_stringify(&obj, Some(&replacer), Some(&JsonSpace::Count(2)), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s, "{\n  \"a\": 1,\n  \"c\": 3\n}");
+    }
+
+    #[test]
+    fn test_e2e_replacer_fn_with_to_json_hook() {
+        let obj = JsonValue::Object(Rc::new(RefCell::new(vec![(
+            "x".to_string(),
+            JsonValue::Number(5.0),
+        )])));
+        let hook: &dyn Fn(&str, &JsonValue) -> Option<JsonValue> = &|key, _v| {
+            if key == "x" {
+                Some(JsonValue::Number(100.0))
+            } else {
+                None
+            }
+        };
+        let replacer = JsonReplacer::Function(&|_key, val| {
+            Ok(Some(match val {
+                JsonValue::Number(n) => JsonValue::Number(n * 2.0),
+                other => other.clone(),
+            }))
+        });
+        let s = json_stringify(&obj, Some(&replacer), None, Some(hook))
+            .unwrap()
+            .unwrap();
+        // toJSON replaces x→100, then replacer doubles it to 200
+        assert_eq!(s, r#"{"x":200}"#);
+    }
+
+    #[test]
+    fn test_e2e_stringify_array_with_undefined_holes() {
+        let arr = JsValue::new_array(vec![JsValue::Smi(1), JsValue::Undefined, JsValue::Smi(3)]);
+        let s = json_stringify_js_value(&arr, None, None).unwrap().unwrap();
+        assert_eq!(s, "[1,null,3]");
+    }
+
+    #[test]
+    fn test_e2e_stringify_mixed_types_in_array() {
+        let arr = JsValue::new_array(vec![
+            JsValue::String("hello".into()),
+            JsValue::Smi(42),
+            JsValue::Boolean(true),
+            JsValue::Null,
+            JsValue::HeapNumber(3.14),
+        ]);
+        let s = json_stringify_js_value(&arr, None, None).unwrap().unwrap();
+        assert_eq!(s, r#"["hello",42,true,null,3.14]"#);
+    }
+
+    #[test]
+    fn test_e2e_stringify_object_preserves_insertion_order() {
+        let obj = JsonValue::Object(Rc::new(RefCell::new(vec![
+            ("z".to_string(), JsonValue::Number(1.0)),
+            ("a".to_string(), JsonValue::Number(2.0)),
+            ("m".to_string(), JsonValue::Number(3.0)),
+        ])));
+        let s = json_stringify(&obj, None, None, None).unwrap().unwrap();
+        assert_eq!(s, r#"{"z":1,"a":2,"m":3}"#);
+    }
+
+    #[test]
+    fn test_e2e_js_value_to_json_circular_array() {
+        let items: Rc<RefCell<Vec<JsValue>>> = Rc::new(RefCell::new(vec![]));
+        let arr = JsValue::Array(items.clone());
+        items.borrow_mut().push(arr.clone());
+        let result = js_value_to_json(&arr);
+        assert!(matches!(result, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn test_e2e_parse_duplicate_keys_three_values() {
+        let v = json_parse(r#"{"k":1,"k":2,"k":3}"#, None).unwrap();
+        if let JsonValue::Object(obj) = &v {
+            let b = obj.borrow();
+            assert_eq!(b.len(), 1);
+            assert_eq!(b[0].1, JsonValue::Number(3.0));
+        } else {
+            panic!("expected object");
+        }
+    }
+
+    #[test]
+    fn test_e2e_parse_constructor_key() {
+        let v = json_parse(r#"{"constructor":"test"}"#, None).unwrap();
+        if let JsonValue::Object(obj) = &v {
+            assert_eq!(obj.borrow()[0].0, "constructor");
+        } else {
+            panic!("expected object");
+        }
+    }
+
+    #[test]
+    fn test_e2e_stringify_empty_string_key() {
+        let obj = JsonValue::Object(Rc::new(RefCell::new(vec![(
+            String::new(),
+            JsonValue::Number(1.0),
+        )])));
+        let s = json_stringify(&obj, None, None, None).unwrap().unwrap();
+        assert_eq!(s, r#"{"":1}"#);
+    }
+
+    #[test]
+    fn test_e2e_stringify_special_chars_in_key() {
+        let obj = JsonValue::Object(Rc::new(RefCell::new(vec![(
+            "key\nwith\tnewlines".to_string(),
+            JsonValue::Bool(true),
+        )])));
+        let s = json_stringify(&obj, None, None, None).unwrap().unwrap();
+        assert_eq!(s, r#"{"key\nwith\tnewlines":true}"#);
     }
 }
