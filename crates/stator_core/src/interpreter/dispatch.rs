@@ -2238,7 +2238,8 @@ fn handle_construct(
         }
         JsValue::Proxy(ref p) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-            let obj = proxy_construct(&mut p.borrow_mut(), args)?;
+            let ctor_val = ctx.frame.accumulator.clone();
+            let obj = proxy_construct(&mut p.borrow_mut(), args, ctor_val)?;
             ctx.frame.accumulator = js_object_to_plain_value(obj);
         }
         other => {
@@ -2329,7 +2330,8 @@ fn handle_construct_with_spread(
             }
         }
         JsValue::Proxy(ref p) => {
-            let obj = proxy_construct(&mut p.borrow_mut(), args)?;
+            let ctor_val = ctx.frame.accumulator.clone();
+            let obj = proxy_construct(&mut p.borrow_mut(), args, ctor_val)?;
             ctx.frame.accumulator = js_object_to_plain_value(obj);
         }
         other => {
