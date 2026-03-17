@@ -11714,6 +11714,11 @@ fn make_intl() -> JsValue {
                     Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                 }),
             );
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("Intl.NumberFormat".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
             ctor.insert(
                 "prototype".into(),
                 JsValue::PlainObject(Rc::new(RefCell::new(proto))),
@@ -11767,6 +11772,11 @@ fn make_intl() -> JsValue {
                     Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                 }),
             );
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("Intl.DateTimeFormat".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
             ctor.insert(
                 "prototype".into(),
                 JsValue::PlainObject(Rc::new(RefCell::new(proto))),
@@ -11810,6 +11820,11 @@ fn make_intl() -> JsValue {
                     Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                 }),
             );
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("Intl.Collator".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
             ctor.insert(
                 "prototype".into(),
                 JsValue::PlainObject(Rc::new(RefCell::new(proto))),
@@ -11852,6 +11867,11 @@ fn make_intl() -> JsValue {
                     opts.insert("type".into(), JsValue::String("cardinal".into()));
                     Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                 }),
+            );
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("Intl.PluralRules".into()),
+                PropertyAttributes::CONFIGURABLE,
             );
             ctor.insert(
                 "prototype".into(),
@@ -11927,6 +11947,11 @@ fn make_intl() -> JsValue {
                     Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                 }),
             );
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("Intl.ListFormat".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
             ctor.insert(
                 "prototype".into(),
                 JsValue::PlainObject(Rc::new(RefCell::new(proto))),
@@ -11979,6 +12004,11 @@ fn make_intl() -> JsValue {
                     opts.insert("numeric".into(), JsValue::String("always".into()));
                     Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                 }),
+            );
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("Intl.RelativeTimeFormat".into()),
+                PropertyAttributes::CONFIGURABLE,
             );
             ctor.insert(
                 "prototype".into(),
@@ -12043,6 +12073,11 @@ fn make_intl() -> JsValue {
                     Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                 }),
             );
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("Intl.Segmenter".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
             ctor.insert(
                 "prototype".into(),
                 JsValue::PlainObject(Rc::new(RefCell::new(proto))),
@@ -12100,6 +12135,11 @@ fn make_intl() -> JsValue {
                     Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                 }),
             );
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("Intl.DisplayNames".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
             ctor.insert(
                 "prototype".into(),
                 JsValue::PlainObject(Rc::new(RefCell::new(proto))),
@@ -12135,10 +12175,18 @@ fn make_intl() -> JsValue {
                 }),
             );
             ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
-            ctor.insert(
-                "prototype".into(),
-                JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))),
-            );
+            {
+                let mut locale_proto = PropertyMap::new();
+                locale_proto.insert_with_attrs(
+                    "@@toStringTag".into(),
+                    JsValue::String("Intl.Locale".into()),
+                    PropertyAttributes::CONFIGURABLE,
+                );
+                ctor.insert(
+                    "prototype".into(),
+                    JsValue::PlainObject(Rc::new(RefCell::new(locale_proto))),
+                );
+            }
             finalize_ctor(JsValue::PlainObject(Rc::new(RefCell::new(ctor))), "Locale")
         });
 
@@ -15993,6 +16041,209 @@ mod tests {
     #[test]
     fn e2e_intl_locale_name() {
         assert_eval_true("Intl.Locale.name === 'Locale'");
+    }
+
+    // ── PluralRules e2e ─────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_intl_plural_rules_exists() {
+        assert_eval_true("typeof Intl.PluralRules === 'object'");
+    }
+
+    #[test]
+    fn e2e_intl_plural_rules_name() {
+        assert_eval_true("Intl.PluralRules.name === 'PluralRules'");
+    }
+
+    #[test]
+    fn e2e_intl_plural_rules_prototype_constructor() {
+        assert_eval_true("Intl.PluralRules.prototype.constructor === Intl.PluralRules");
+    }
+
+    #[test]
+    fn e2e_intl_plural_rules_select_one() {
+        assert_eval_true("new Intl.PluralRules().select(1) === 'one'");
+    }
+
+    #[test]
+    fn e2e_intl_plural_rules_select_other() {
+        assert_eval_true("new Intl.PluralRules().select(5) === 'other'");
+    }
+
+    #[test]
+    fn e2e_intl_plural_rules_resolved_options_type() {
+        assert_eval_true("Intl.PluralRules().resolvedOptions().type === 'cardinal'");
+    }
+
+    // ── ListFormat e2e ──────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_intl_list_format_exists() {
+        assert_eval_true("typeof Intl.ListFormat === 'object'");
+    }
+
+    #[test]
+    fn e2e_intl_list_format_name() {
+        assert_eval_true("Intl.ListFormat.name === 'ListFormat'");
+    }
+
+    #[test]
+    fn e2e_intl_list_format_prototype_constructor() {
+        assert_eval_true("Intl.ListFormat.prototype.constructor === Intl.ListFormat");
+    }
+
+    #[test]
+    fn e2e_intl_list_format_format_returns_string() {
+        assert_eval_true("typeof new Intl.ListFormat().format(['a','b']) === 'string'");
+    }
+
+    #[test]
+    fn e2e_intl_list_format_format_two_items() {
+        assert_eval_true("new Intl.ListFormat().format(['A','B']) === 'A and B'");
+    }
+
+    #[test]
+    fn e2e_intl_list_format_resolved_options_locale() {
+        assert_eval_true("Intl.ListFormat().resolvedOptions().locale === 'en-US'");
+    }
+
+    // ── RelativeTimeFormat e2e ──────────────────────────────────────────────
+
+    #[test]
+    fn e2e_intl_relative_time_format_exists() {
+        assert_eval_true("typeof Intl.RelativeTimeFormat === 'object'");
+    }
+
+    #[test]
+    fn e2e_intl_relative_time_format_name() {
+        assert_eval_true("Intl.RelativeTimeFormat.name === 'RelativeTimeFormat'");
+    }
+
+    #[test]
+    fn e2e_intl_relative_time_format_prototype_constructor() {
+        assert_eval_true(
+            "Intl.RelativeTimeFormat.prototype.constructor === Intl.RelativeTimeFormat",
+        );
+    }
+
+    #[test]
+    fn e2e_intl_relative_time_format_format_returns_string() {
+        assert_eval_true("typeof new Intl.RelativeTimeFormat().format(-1, 'day') === 'string'");
+    }
+
+    #[test]
+    fn e2e_intl_relative_time_format_resolved_options_locale() {
+        assert_eval_true("Intl.RelativeTimeFormat().resolvedOptions().locale === 'en-US'");
+    }
+
+    // ── Segmenter e2e ───────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_intl_segmenter_exists() {
+        assert_eval_true("typeof Intl.Segmenter === 'object'");
+    }
+
+    #[test]
+    fn e2e_intl_segmenter_name() {
+        assert_eval_true("Intl.Segmenter.name === 'Segmenter'");
+    }
+
+    #[test]
+    fn e2e_intl_segmenter_prototype_constructor() {
+        assert_eval_true("Intl.Segmenter.prototype.constructor === Intl.Segmenter");
+    }
+
+    #[test]
+    fn e2e_intl_segmenter_segment_returns_array() {
+        assert_eval_true("Array.isArray(new Intl.Segmenter().segment('hi'))");
+    }
+
+    #[test]
+    fn e2e_intl_segmenter_segment_length() {
+        assert_eval_true("new Intl.Segmenter().segment('abc').length === 3");
+    }
+
+    #[test]
+    fn e2e_intl_segmenter_resolved_options_granularity() {
+        assert_eval_true("Intl.Segmenter().resolvedOptions().granularity === 'grapheme'");
+    }
+
+    // ── Symbol.toStringTag on all constructor prototypes ────────────────────
+
+    #[test]
+    fn e2e_intl_number_format_to_string_tag() {
+        assert_eval_true("Intl.NumberFormat.prototype[Symbol.toStringTag] === 'Intl.NumberFormat'");
+    }
+
+    #[test]
+    fn e2e_intl_date_time_format_to_string_tag() {
+        assert_eval_true(
+            "Intl.DateTimeFormat.prototype[Symbol.toStringTag] === 'Intl.DateTimeFormat'",
+        );
+    }
+
+    #[test]
+    fn e2e_intl_collator_to_string_tag() {
+        assert_eval_true("Intl.Collator.prototype[Symbol.toStringTag] === 'Intl.Collator'");
+    }
+
+    #[test]
+    fn e2e_intl_plural_rules_to_string_tag() {
+        assert_eval_true("Intl.PluralRules.prototype[Symbol.toStringTag] === 'Intl.PluralRules'");
+    }
+
+    #[test]
+    fn e2e_intl_list_format_to_string_tag() {
+        assert_eval_true("Intl.ListFormat.prototype[Symbol.toStringTag] === 'Intl.ListFormat'");
+    }
+
+    #[test]
+    fn e2e_intl_relative_time_format_to_string_tag() {
+        assert_eval_true(
+            "Intl.RelativeTimeFormat.prototype[Symbol.toStringTag] === 'Intl.RelativeTimeFormat'",
+        );
+    }
+
+    #[test]
+    fn e2e_intl_segmenter_to_string_tag() {
+        assert_eval_true("Intl.Segmenter.prototype[Symbol.toStringTag] === 'Intl.Segmenter'");
+    }
+
+    #[test]
+    fn e2e_intl_locale_to_string_tag() {
+        assert_eval_true("Intl.Locale.prototype[Symbol.toStringTag] === 'Intl.Locale'");
+    }
+
+    // ── Additional coverage ─────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_intl_get_canonical_locales_array() {
+        assert_eval_true("Intl.getCanonicalLocales(['en-US','fr']).length === 2");
+    }
+
+    #[test]
+    fn e2e_intl_supported_values_of_calendar() {
+        assert_eval_true("Array.isArray(Intl.supportedValuesOf('calendar'))");
+    }
+
+    #[test]
+    fn e2e_intl_collator_compare_greater() {
+        assert_eval_true("new Intl.Collator().compare('z', 'a') === 1");
+    }
+
+    #[test]
+    fn e2e_intl_number_format_decimal_format() {
+        assert_eval_true("new Intl.NumberFormat().format(3.14) === '3.14'");
+    }
+
+    #[test]
+    fn e2e_intl_plural_rules_select_zero() {
+        assert_eval_true("new Intl.PluralRules().select(0) === 'other'");
+    }
+
+    #[test]
+    fn e2e_intl_list_format_format_three_items() {
+        assert_eval_true("new Intl.ListFormat().format(['A','B','C']) === 'A, B, and C'");
     }
 
     /// Verify that the `Math` object has the expected properties.
