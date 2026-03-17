@@ -1306,6 +1306,9 @@ fn handle_tail_call(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
+    if !ctx.frame.bytecode_array.is_strict() {
+        return handle_call_any_receiver(ctx, instr);
+    }
     let Operand::Register(callee_v) = instr.operands[0] else {
         return Err(err_bad_operand("TailCall", 0));
     };
@@ -1349,21 +1352,45 @@ fn handle_tail_call(
                 }
                 if !tried_jit {
                     // ── Proper tail call: reuse the frame ─
-                    let new_ba = (*ba).clone();
-                    let param_count = new_ba.parameter_count() as usize;
-                    let frame_size = new_ba.frame_size() as usize;
+                    let param_count = ba.parameter_count() as usize;
+                    let frame_size = ba.frame_size() as usize;
                     let total_regs = param_count + frame_size;
-                    ctx.frame.bytecode_array = new_ba;
-                    ctx.frame.call_args = args.clone();
+                    let inherited_new_target = ctx.frame.new_target.clone();
+                    ctx.frame.bytecode_array = (*ba).clone();
+                    ctx.frame.call_args = args;
                     ctx.frame.registers.clear();
                     ctx.frame.registers.resize(total_regs, JsValue::Undefined);
-                    for (i, arg) in args.into_iter().enumerate().take(param_count) {
+                    for (i, arg) in ctx
+                        .frame
+                        .call_args
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .take(param_count)
+                    {
                         ctx.frame.registers[i] = arg;
                     }
                     ctx.frame.accumulator = JsValue::Undefined;
                     ctx.frame.pc = 0;
-                    ctx.frame.context =
-                        ba.closure_context().map(|c| JsValue::Context(Rc::clone(c)));
+                    ctx.frame.context = None;
+                    ctx.frame.suspend_result = None;
+                    ctx.frame.generator_state = None;
+                    ctx.frame.osr_loop_count = 0;
+                    ctx.frame.pending_message = JsValue::Undefined;
+                    ctx.frame.template_cache.clear();
+                    ctx.frame.new_target = if ba.is_arrow() {
+                        inherited_new_target
+                    } else {
+                        JsValue::Undefined
+                    };
+                    if !ba.is_arrow() && ba.is_strict() {
+                        ctx.frame
+                            .global_env
+                            .borrow_mut()
+                            .insert("this".to_string(), JsValue::Undefined);
+                    }
+                    restore_closure_context(ctx.frame, &ba);
+                    populate_self_name(ctx.frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                     ctx.frame.string_cache.clear();
                     ctx.frame.mono_load_cache.clear();
                     ctx.frame.poly_load_cache.clear();

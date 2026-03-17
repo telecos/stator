@@ -15020,26 +15020,314 @@ mod tests {
 
     // ── Tail call optimisation ────────────────────────────────────────────────
 
+    fn test_tail_call_eval_source(source: &str) -> JsValue {
+        crate::builtins::global::global_eval(source).unwrap()
+    }
+
+    fn test_tail_call_assert_smi(source: &str, expected: i32) {
+        assert_eq!(test_tail_call_eval_source(source), JsValue::Smi(expected));
+    }
+
+    fn test_tail_call_assert_bool(source: &str, expected: bool) {
+        assert_eq!(
+            test_tail_call_eval_source(source),
+            JsValue::Boolean(expected)
+        );
+    }
+
+    fn test_tail_call_assert_string(source: &str, expected: &str) {
+        assert_eq!(
+            test_tail_call_eval_source(source),
+            JsValue::String(expected.to_string().into())
+        );
+    }
+
     #[test]
-    fn test_tail_call_direct_recursion() {
-        // `return f(n-1, acc+n)` is a direct tail call — it should reuse
-        // the frame and not overflow the call stack even for large N.
-        let result = crate::builtins::global::global_eval(
+    fn test_tail_call_direct_recursion_strict() {
+        test_tail_call_assert_smi(
             "function sum(n, acc) { \
+               'use strict'; \
                if (n <= 0) return acc; \
                return sum(n - 1, acc + n); \
              } \
              sum(50000, 0)",
-        )
-        .unwrap();
-        // 50000 * 50001 / 2 = 1_250_025_000 (fits in i32)
-        assert_eq!(result, JsValue::Smi(1_250_025_000));
+            1_250_025_000,
+        );
     }
 
     #[test]
-    fn test_tail_call_conditional() {
-        // Both branches of the ternary are in tail position.
-        let result = crate::builtins::global::global_eval(
+    fn test_tail_call_mutual_recursion_strict() {
+        test_tail_call_assert_bool(
+            "function even(n) { \
+               'use strict'; \
+               if (n === 0) return true; \
+               return odd(n - 1); \
+             } \
+             function odd(n) { \
+               'use strict'; \
+               if (n === 0) return false; \
+               return even(n - 1); \
+             } \
+             even(100000)",
+            true,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_ternary_recursion_strict() {
+        test_tail_call_assert_string(
+            "function countdown(n) { \
+               'use strict'; \
+               return n <= 0 ? 'done' : countdown(n - 1); \
+             } \
+             countdown(50000)",
+            "done",
+        );
+    }
+
+    #[test]
+    fn test_tail_call_ternary_both_branches_strict() {
+        test_tail_call_assert_bool(
+            "function choose(n, flag) { \
+               'use strict'; \
+               return n === 0 ? flag : (flag ? choose(n - 1, false) : choose(n - 1, true)); \
+             } \
+             choose(50000, true)",
+            true,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_logical_and_right_operand_strict() {
+        test_tail_call_assert_bool(
+            "function all(n) { \
+               'use strict'; \
+               return n === 0 ? true : n > 0 && all(n - 1); \
+             } \
+             all(50000)",
+            true,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_logical_and_short_circuit_strict() {
+        test_tail_call_assert_bool(
+            "function guard() { \
+               'use strict'; \
+               return false && missing(); \
+             } \
+             guard()",
+            false,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_logical_or_right_operand_strict() {
+        test_tail_call_assert_bool(
+            "function any(n) { \
+               'use strict'; \
+               return n === 0 || any(n - 1); \
+             } \
+             any(50000)",
+            true,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_logical_or_short_circuit_strict() {
+        test_tail_call_assert_bool(
+            "function guard() { \
+               'use strict'; \
+               return true || missing(); \
+             } \
+             guard()",
+            true,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_comma_operator_strict() {
+        test_tail_call_assert_smi(
+            "function walk(n) { \
+               'use strict'; \
+               return n === 0 ? 7 : (n, walk(n - 1)); \
+             } \
+             walk(50000)",
+            7,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_nested_comma_operator_strict() {
+        test_tail_call_assert_smi(
+            "function walk(n) { \
+               'use strict'; \
+               return n === 0 ? 9 : (1, 2, 3, walk(n - 1)); \
+             } \
+             walk(50000)",
+            9,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_nullish_coalescing_right_operand_strict() {
+        test_tail_call_assert_smi(
+            "function choose(n, value) { \
+               'use strict'; \
+               if (n === 0) return value ?? 11; \
+               return value ?? choose(n - 1, undefined); \
+             } \
+             choose(50000, undefined)",
+            11,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_varying_argument_counts_strict() {
+        test_tail_call_assert_smi(
+            "function bounce(n, a, b, c) { \
+               'use strict'; \
+               if (n === 0) return arguments.length * 100 + a; \
+               return n % 2 === 0 ? bounce(n - 1, a + 1) : bounce(n - 1, a + 1, 2, 3, 4); \
+             } \
+             bounce(50000, 0, 1, 2)",
+            50_500,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_mutual_varying_argument_counts_strict() {
+        test_tail_call_assert_smi(
+            "function a(n, acc) { \
+               'use strict'; \
+               if (n === 0) return arguments.length * 100 + acc; \
+               return b(n - 1, acc + 1, 9, 8); \
+             } \
+             function b(n, acc, x, y) { \
+               'use strict'; \
+               if (n === 0) return arguments.length * 100 + acc; \
+               return a(n - 1, acc + 1); \
+             } \
+             a(50000, 0)",
+            50_200,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_named_function_expression_strict() {
+        test_tail_call_assert_smi(
+            "var sum = function inner(n, acc) { \
+               'use strict'; \
+               return n === 0 ? acc : inner(n - 1, acc + n); \
+             }; \
+             sum(50000, 0)",
+            1_250_025_000,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_arrow_function_strict() {
+        test_tail_call_assert_smi(
+            "function run(n) { \
+               'use strict'; \
+               var loop = (k, acc) => k === 0 ? acc : loop(k - 1, acc + k); \
+               return loop(n, 0); \
+             } \
+             run(50000)",
+            1_250_025_000,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_logical_or_comma_combo_strict() {
+        test_tail_call_assert_bool(
+            "function walk(n) { \
+               'use strict'; \
+               return n === 0 || (0, walk(n - 1)); \
+             } \
+             walk(50000)",
+            true,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_conditional_comma_combo_strict() {
+        test_tail_call_assert_smi(
+            "function walk(n) { \
+               'use strict'; \
+               return n === 0 ? 13 : (0, n % 2 === 0 ? walk(n - 1) : walk(n - 1)); \
+             } \
+             walk(50000)",
+            13,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_logical_and_comma_combo_strict() {
+        test_tail_call_assert_smi(
+            "function walk(n) { \
+               'use strict'; \
+               return n === 0 ? 21 : (n > 0 && (0, walk(n - 1))); \
+             } \
+             walk(50000)",
+            21,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_non_tail_arithmetic_strict() {
+        test_tail_call_assert_smi(
+            "function sum(n) { \
+               'use strict'; \
+               if (n <= 0) return 0; \
+               return n + sum(n - 1); \
+             } \
+             sum(10)",
+            55,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_non_tail_left_logical_operand_strict() {
+        test_tail_call_assert_bool(
+            "function walk(n) { \
+               'use strict'; \
+               if (n === 0) return true; \
+               return walk(n - 1) && true; \
+             } \
+             walk(10)",
+            true,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_non_tail_conditional_test_strict() {
+        test_tail_call_assert_smi(
+            "function walk(n) { \
+               'use strict'; \
+               if (n === 0) return 0; \
+               return walk(n - 1) ? 1 : 2; \
+             } \
+             walk(3)",
+            1,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_direct_recursion_sloppy_small() {
+        test_tail_call_assert_smi(
+            "function sum(n, acc) { \
+               if (n <= 0) return acc; \
+               return sum(n - 1, acc + n); \
+             } \
+             sum(10, 0)",
+            55,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_mutual_recursion_sloppy_small() {
+        test_tail_call_assert_bool(
             "function even(n) { \
                if (n === 0) return true; \
                return odd(n - 1); \
@@ -15048,38 +15336,76 @@ mod tests {
                if (n === 0) return false; \
                return even(n - 1); \
              } \
-             even(100000)",
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+             even(20)",
+            true,
+        );
     }
 
     #[test]
-    fn test_tail_call_non_tail_not_optimised() {
-        // `n + f(n-1)` is NOT a tail call — the call result feeds into `+`.
-        // This should work correctly (not be incorrectly optimised).
-        let result = crate::builtins::global::global_eval(
-            "function sum(n) { \
-               if (n <= 0) return 0; \
-               return n + sum(n - 1); \
-             } \
-             sum(10)",
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Smi(55));
-    }
-
-    #[test]
-    fn test_tail_call_conditional_ternary() {
-        // `return cond ? f() : g()` — both branches are tail calls.
-        let result = crate::builtins::global::global_eval(
+    fn test_tail_call_ternary_recursion_sloppy_small() {
+        test_tail_call_assert_string(
             "function countdown(n) { \
                return n <= 0 ? 'done' : countdown(n - 1); \
              } \
-             countdown(50000)",
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::String("done".to_string().into()));
+             countdown(10)",
+            "done",
+        );
+    }
+
+    #[test]
+    fn test_tail_call_logical_and_sloppy_small() {
+        test_tail_call_assert_bool(
+            "function all(n) { \
+               return n === 0 ? true : n > 0 && all(n - 1); \
+             } \
+             all(10)",
+            true,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_logical_or_sloppy_small() {
+        test_tail_call_assert_bool(
+            "function any(n) { \
+               return n === 0 || any(n - 1); \
+             } \
+             any(10)",
+            true,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_comma_operator_sloppy_small() {
+        test_tail_call_assert_smi(
+            "function walk(n) { \
+               return n === 0 ? 5 : (n, walk(n - 1)); \
+             } \
+             walk(10)",
+            5,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_varying_argument_counts_sloppy_small() {
+        test_tail_call_assert_smi(
+            "function bounce(n, a, b, c) { \
+               if (n === 0) return arguments.length * 100 + a; \
+               return n % 2 === 0 ? bounce(n - 1, a + 1) : bounce(n - 1, a + 1, 2, 3, 4); \
+             } \
+             bounce(10, 0, 1, 2)",
+            510,
+        );
+    }
+
+    #[test]
+    fn test_tail_call_named_function_expression_sloppy_small() {
+        test_tail_call_assert_smi(
+            "var sum = function inner(n, acc) { \
+               return n === 0 ? acc : inner(n - 1, acc + n); \
+             }; \
+             sum(10, 0)",
+            55,
+        );
     }
 
     // ── Class-inheritance conformance ────────────────────────────────────
