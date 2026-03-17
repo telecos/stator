@@ -262,7 +262,7 @@ pub(super) type OpcodeHandler =
     fn(&mut DispatchContext, &Instruction) -> StatorResult<DispatchAction>;
 
 /// Number of opcode variants (= `Opcode::Illegal as usize + 1`).
-const OPCODE_COUNT: usize = 196;
+const OPCODE_COUNT: usize = 202;
 
 #[inline]
 fn handle_lda_zero(
@@ -6795,6 +6795,184 @@ fn handle_define_keyed_setter_property(
     Ok(DispatchAction::Continue)
 }
 
+/// `DefineClassNamedOwnProperty <obj_reg> <name_idx> <slot>`
+fn handle_define_class_named_own_property(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(obj_v) = instr.operands[0] else {
+        return Err(err_bad_operand("DefineClassNamedOwnProperty", 0));
+    };
+    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+        return Err(err_bad_operand("DefineClassNamedOwnProperty", 1));
+    };
+    let prop_name = match ctx.frame.bytecode_array.get_constant(name_idx) {
+        Some(ConstantPoolEntry::String(s)) => s.clone(),
+        _ => {
+            return Err(StatorError::Internal(
+                "DefineClassNamedOwnProperty: property name is not a string".into(),
+            ));
+        }
+    };
+    let val = ctx.frame.accumulator.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    if let JsValue::PlainObject(ref map) = obj {
+        set_named_property_function_metadata(&val, &obj, &prop_name);
+        if let Some(attrs) = private_named_property_attrs(&prop_name) {
+            map.borrow_mut().insert_with_attrs(prop_name, val, attrs);
+        } else {
+            map.borrow_mut().insert_builtin(prop_name, val);
+        }
+    }
+    Ok(DispatchAction::Continue)
+}
+
+/// `DefineClassGetterProperty <obj_reg> <name_idx> <slot>`
+fn handle_define_class_getter_property(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(obj_v) = instr.operands[0] else {
+        return Err(err_bad_operand("DefineClassGetterProperty", 0));
+    };
+    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+        return Err(err_bad_operand("DefineClassGetterProperty", 1));
+    };
+    let prop_name = match ctx.frame.bytecode_array.get_constant(name_idx) {
+        Some(ConstantPoolEntry::String(s)) => s.clone(),
+        _ => {
+            return Err(StatorError::Internal(
+                "DefineClassGetterProperty: property name is not a string".into(),
+            ));
+        }
+    };
+    let getter = ctx.frame.accumulator.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    if let JsValue::PlainObject(ref map) = obj {
+        if let JsValue::Function(ba) = &getter {
+            fn_props_set(ba, ".home_object".to_string(), obj.clone());
+        }
+        let accessor_attrs = if is_private_storage_key(&prop_name) {
+            PropertyAttributes::CONFIGURABLE
+        } else {
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE
+        };
+        map.borrow_mut()
+            .insert_with_attrs(format!("__get_{prop_name}__"), getter, accessor_attrs);
+    }
+    Ok(DispatchAction::Continue)
+}
+
+/// `DefineClassSetterProperty <obj_reg> <name_idx> <slot>`
+fn handle_define_class_setter_property(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(obj_v) = instr.operands[0] else {
+        return Err(err_bad_operand("DefineClassSetterProperty", 0));
+    };
+    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+        return Err(err_bad_operand("DefineClassSetterProperty", 1));
+    };
+    let prop_name = match ctx.frame.bytecode_array.get_constant(name_idx) {
+        Some(ConstantPoolEntry::String(s)) => s.clone(),
+        _ => {
+            return Err(StatorError::Internal(
+                "DefineClassSetterProperty: property name is not a string".into(),
+            ));
+        }
+    };
+    let setter = ctx.frame.accumulator.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    if let JsValue::PlainObject(ref map) = obj {
+        if let JsValue::Function(ba) = &setter {
+            fn_props_set(ba, ".home_object".to_string(), obj.clone());
+        }
+        let accessor_attrs = if is_private_storage_key(&prop_name) {
+            PropertyAttributes::CONFIGURABLE
+        } else {
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE
+        };
+        map.borrow_mut()
+            .insert_with_attrs(format!("__set_{prop_name}__"), setter, accessor_attrs);
+    }
+    Ok(DispatchAction::Continue)
+}
+
+/// `DefineClassKeyedOwnProperty <obj_reg> <key_reg> <flags> <slot>`
+fn handle_define_class_keyed_own_property(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(obj_v) = instr.operands[0] else {
+        return Err(err_bad_operand("DefineClassKeyedOwnProperty", 0));
+    };
+    let Operand::Register(key_v) = instr.operands[1] else {
+        return Err(err_bad_operand("DefineClassKeyedOwnProperty", 1));
+    };
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let key = ctx.frame.read_reg(key_v)?.clone();
+    let val = ctx.frame.accumulator.clone();
+    if let JsValue::PlainObject(ref map) = obj {
+        let prop_name = to_property_key(&key)?;
+        set_named_property_function_metadata(&val, &obj, &prop_name);
+        map.borrow_mut().insert_builtin(prop_name, val);
+    }
+    Ok(DispatchAction::Continue)
+}
+
+/// `DefineClassKeyedGetterProperty <obj_reg> <key_reg> <slot>`
+fn handle_define_class_keyed_getter_property(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(obj_v) = instr.operands[0] else {
+        return Err(err_bad_operand("DefineClassKeyedGetterProperty", 0));
+    };
+    let Operand::Register(key_v) = instr.operands[1] else {
+        return Err(err_bad_operand("DefineClassKeyedGetterProperty", 1));
+    };
+    let getter = ctx.frame.accumulator.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let key = ctx.frame.read_reg(key_v)?.clone();
+    let key_str = to_property_key(&key)?;
+    if let JsValue::PlainObject(ref map) = obj {
+        if let JsValue::Function(ba) = &getter {
+            fn_props_set(ba, ".home_object".to_string(), obj.clone());
+        }
+        let accessor_attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
+        map.borrow_mut()
+            .insert_with_attrs(format!("__get_{key_str}__"), getter, accessor_attrs);
+    }
+    Ok(DispatchAction::Continue)
+}
+
+/// `DefineClassKeyedSetterProperty <obj_reg> <key_reg> <slot>`
+fn handle_define_class_keyed_setter_property(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(obj_v) = instr.operands[0] else {
+        return Err(err_bad_operand("DefineClassKeyedSetterProperty", 0));
+    };
+    let Operand::Register(key_v) = instr.operands[1] else {
+        return Err(err_bad_operand("DefineClassKeyedSetterProperty", 1));
+    };
+    let setter = ctx.frame.accumulator.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let key = ctx.frame.read_reg(key_v)?.clone();
+    let key_str = to_property_key(&key)?;
+    if let JsValue::PlainObject(ref map) = obj {
+        if let JsValue::Function(ba) = &setter {
+            fn_props_set(ba, ".home_object".to_string(), obj.clone());
+        }
+        let accessor_attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
+        map.borrow_mut()
+            .insert_with_attrs(format!("__set_{key_str}__"), setter, accessor_attrs);
+    }
+    Ok(DispatchAction::Continue)
+}
+
 /// `LdaEnumeratedKeyedProperty <obj_reg> <key_reg> <slot>`
 ///
 /// Like `LdaKeyedProperty` but for enumerated (for-in) keys.
@@ -7070,6 +7248,14 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::DefineSetterProperty as usize] = handle_define_setter_property;
     table[Opcode::DefineKeyedGetterProperty as usize] = handle_define_keyed_getter_property;
     table[Opcode::DefineKeyedSetterProperty as usize] = handle_define_keyed_setter_property;
+    table[Opcode::DefineClassNamedOwnProperty as usize] = handle_define_class_named_own_property;
+    table[Opcode::DefineClassGetterProperty as usize] = handle_define_class_getter_property;
+    table[Opcode::DefineClassSetterProperty as usize] = handle_define_class_setter_property;
+    table[Opcode::DefineClassKeyedOwnProperty as usize] = handle_define_class_keyed_own_property;
+    table[Opcode::DefineClassKeyedGetterProperty as usize] =
+        handle_define_class_keyed_getter_property;
+    table[Opcode::DefineClassKeyedSetterProperty as usize] =
+        handle_define_class_keyed_setter_property;
     table[Opcode::CollectTypeProfile as usize] = handle_collect_type_profile;
     table[Opcode::Add as usize] = handle_add;
     table[Opcode::Sub as usize] = handle_sub;
