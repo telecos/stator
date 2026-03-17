@@ -166,6 +166,7 @@
 //! dispatches on the [`Opcode`] via an exhaustive `match`.
 
 mod dispatch;
+mod dynamic_import_conformance_tests;
 mod map_set_conformance_tests;
 mod numeric_conformance_tests;
 
