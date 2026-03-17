@@ -5547,13 +5547,21 @@ fn make_array() -> JsValue {
                     }
                     _ => Vec::new(),
                 };
+                // §23.1.2.1 step 5: thisArg for mapFn.
+                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 // Apply mapFn if provided.
                 let mapped = if let Some(ref mf) = map_fn {
                     if !matches!(mf, JsValue::Undefined) {
                         items
                             .into_iter()
                             .enumerate()
-                            .map(|(i, v)| dispatch_call_value(mf, vec![v, JsValue::Smi(i as i32)]))
+                            .map(|(i, v)| {
+                                dispatch_call_with_this(
+                                    mf,
+                                    this_arg.clone(),
+                                    vec![v, JsValue::Smi(i as i32)],
+                                )
+                            })
                             .collect::<Result<Vec<_>, _>>()?
                     } else {
                         items
@@ -5565,7 +5573,10 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // Array.of(...items)
+        // Array.of(...items) — §23.1.2.3
+        // Creates a new Array from a variable number of arguments,
+        // regardless of number or type.  Unlike `Array(n)` which creates
+        // an array of length n, `Array.of(n)` creates `[n]`.
         props.insert(
             "of".into(),
             builtin_fn("of", 0, |args| Ok(JsValue::new_array(args))),
@@ -5993,44 +6004,39 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // fill(value, start?, end?)
+        // fill(value, start?, end?) — §23.1.3.7
+        // Works on both native JsValue::Array and PlainObject array-like
+        // values.  Negative start/end are resolved relative to length.
         proto.insert(
             "fill".into(),
             builtin_fn("fill", 1, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                if let JsValue::Array(items) = arr {
-                    let value = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                    let len = items.borrow().len() as i64;
-                    let start = args
-                        .get(2)
-                        .unwrap_or(&JsValue::Smi(0))
-                        .to_number()
-                        .unwrap_or(0.0) as i64;
-                    let end = args
-                        .get(3)
-                        .map(|v| v.to_number().unwrap_or(len as f64) as i64)
-                        .unwrap_or(len);
-                    let s = if start < 0 {
-                        (len + start).max(0)
-                    } else {
-                        start.min(len)
-                    } as usize;
-                    let e = if end < 0 {
-                        (len + end).max(0)
-                    } else {
-                        end.min(len)
-                    } as usize;
-                    {
-                        let mut vec = items.borrow_mut();
-                        for item in vec.iter_mut().take(e).skip(s) {
-                            *item = value.clone();
-                        }
-                    }
-                    Ok(arr.clone())
+                let value = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let len = array_like_length(arr)? as i64;
+                let start = args
+                    .get(2)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let end = args
+                    .get(3)
+                    .map(|v| v.to_number().unwrap_or(len as f64) as i64)
+                    .unwrap_or(len);
+                let s = if start < 0 {
+                    (len + start).max(0)
                 } else {
-                    Ok(JsValue::Undefined)
+                    start.min(len)
+                } as usize;
+                let e = if end < 0 {
+                    (len + end).max(0)
+                } else {
+                    end.min(len)
+                } as usize;
+                for i in s..e {
+                    array_like_set_index(arr, i, value.clone());
                 }
+                Ok(arr.clone())
             }),
         );
 
@@ -6048,19 +6054,27 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // flat(depth?)
+        // flat(depth?) — §23.1.3.11
+        // Handles `Infinity` depth and negative/NaN values.
         proto.insert(
             "flat".into(),
             builtin_fn("flat", 0, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let (elements, _) = to_array_like_elements(arr);
-                let depth = args
+                let depth_f = args
                     .get(1)
                     .unwrap_or(&JsValue::Smi(1))
                     .to_number()
-                    .unwrap_or(1.0) as u32;
-                fn flatten(items: &[JsValue], depth: u32) -> Vec<JsValue> {
+                    .unwrap_or(1.0);
+                let depth: usize = if depth_f.is_infinite() && depth_f > 0.0 {
+                    usize::MAX
+                } else if depth_f < 0.0 || depth_f.is_nan() {
+                    0
+                } else {
+                    depth_f as usize
+                };
+                fn flatten(items: &[JsValue], depth: usize) -> Vec<JsValue> {
                     let mut result = Vec::new();
                     for item in items {
                         if depth > 0 && is_js_array(item) {
@@ -6076,20 +6090,35 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // flatMap(callback)
+        // flatMap(callback, thisArg?) — §23.1.3.12
+        // Validates callback, supports thisArg, and skips holes.
         proto.insert(
             "flatMap".into(),
             builtin_fn("flatMap", 1, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                let (elements, _) = to_array_like_elements(arr);
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.flatMap callback must be callable".into(),
+                    ));
+                }
+                let len = array_like_length(arr)?;
+                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let arr_val = arr.clone();
                 let mut result = Vec::new();
-                for (i, item) in elements.iter().enumerate() {
-                    let mapped = call_callback(
+                for i in 0..len {
+                    if !array_like_has_index(arr, i) {
+                        continue;
+                    }
+                    let mapped = call_callback_with_this(
                         &cb,
-                        vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                        this_arg.clone(),
+                        vec![
+                            array_like_get_index(arr, i),
+                            JsValue::Smi(i as i32),
+                            arr_val.clone(),
+                        ],
                     )?;
                     if is_js_array(&mapped) {
                         let (inner, _) = to_array_like_elements(&mapped);
@@ -6102,56 +6131,64 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // copyWithin(target, start, end?)
+        // copyWithin(target, start, end?) — §23.1.3.4
+        // Works on both native JsValue::Array and PlainObject array-like
+        // values.  Copies a region within the array, preserving holes.
         proto.insert(
             "copyWithin".into(),
             builtin_fn("copyWithin", 2, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                if let JsValue::Array(items) = arr {
-                    let len = items.borrow().len() as i64;
-                    let target = args
-                        .get(1)
-                        .unwrap_or(&JsValue::Smi(0))
-                        .to_number()
-                        .unwrap_or(0.0) as i64;
-                    let start = args
-                        .get(2)
-                        .unwrap_or(&JsValue::Smi(0))
-                        .to_number()
-                        .unwrap_or(0.0) as i64;
-                    let end = args
-                        .get(3)
-                        .map(|v| v.to_number().unwrap_or(len as f64) as i64)
-                        .unwrap_or(len);
-                    let to = if target < 0 {
-                        (len + target).max(0)
-                    } else {
-                        target.min(len)
-                    } as usize;
-                    let from = if start < 0 {
-                        (len + start).max(0)
-                    } else {
-                        start.min(len)
-                    } as usize;
-                    let fin = if end < 0 {
-                        (len + end).max(0)
-                    } else {
-                        end.min(len)
-                    } as usize;
-                    let count =
-                        (fin.saturating_sub(from)).min(items.borrow().len().saturating_sub(to));
-                    let buf: Vec<JsValue> = items.borrow()[from..from + count].to_vec();
-                    {
-                        let mut vec = items.borrow_mut();
-                        for (i, val) in buf.into_iter().enumerate() {
-                            vec[to + i] = val;
-                        }
-                    }
-                    Ok(arr.clone())
+                let len = array_like_length(arr)? as i64;
+                let target = args
+                    .get(1)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let start = args
+                    .get(2)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let end = args
+                    .get(3)
+                    .map(|v| v.to_number().unwrap_or(len as f64) as i64)
+                    .unwrap_or(len);
+                let to = if target < 0 {
+                    (len + target).max(0)
                 } else {
-                    Ok(JsValue::Undefined)
+                    target.min(len)
+                } as usize;
+                let from = if start < 0 {
+                    (len + start).max(0)
+                } else {
+                    start.min(len)
+                } as usize;
+                let fin = if end < 0 {
+                    (len + end).max(0)
+                } else {
+                    end.min(len)
+                } as usize;
+                let count = (fin.saturating_sub(from)).min((len as usize).saturating_sub(to));
+                // Buffer source elements first to handle overlapping regions.
+                let buf: Vec<(bool, JsValue)> = (0..count)
+                    .map(|i| {
+                        let idx = from + i;
+                        if array_like_has_index(arr, idx) {
+                            (true, array_like_get_index(arr, idx))
+                        } else {
+                            (false, JsValue::Undefined)
+                        }
+                    })
+                    .collect();
+                for (i, (present, val)) in buf.into_iter().enumerate() {
+                    if present {
+                        array_like_set_index(arr, to + i, val);
+                    } else {
+                        array_like_delete_index(arr, to + i);
+                    }
                 }
+                Ok(arr.clone())
             }),
         );
 
@@ -6216,20 +6253,36 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // map(callback)
+        // map(callback, thisArg?) — §23.1.3.18
+        // Validates callback, supports thisArg, skips holes in array-like.
         proto.insert(
             "map".into(),
             builtin_fn("map", 1, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (elements, _) = to_array_like_elements(arr);
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.map callback must be callable".into(),
+                    ));
+                }
+                let len = array_like_length(arr)?;
+                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let arr_val = arr.clone();
-                let mut result = Vec::with_capacity(elements.len());
-                for (i, item) in elements.iter().enumerate() {
-                    let mapped = call_callback(
+                let mut result = Vec::with_capacity(len);
+                for i in 0..len {
+                    if !array_like_has_index(arr, i) {
+                        result.push(JsValue::Undefined);
+                        continue;
+                    }
+                    let mapped = call_callback_with_this(
                         &cb,
-                        vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                        this_arg.clone(),
+                        vec![
+                            array_like_get_index(arr, i),
+                            JsValue::Smi(i as i32),
+                            arr_val.clone(),
+                        ],
                     )?;
                     result.push(mapped);
                 }
@@ -6371,19 +6424,34 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // forEach(callback)
+        // forEach(callback, thisArg?) — §23.1.3.13
+        // Validates callback, supports thisArg, skips holes.
         proto.insert(
             "forEach".into(),
             builtin_fn("forEach", 1, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (elements, _) = to_array_like_elements(arr);
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.forEach callback must be callable".into(),
+                    ));
+                }
+                let len = array_like_length(arr)?;
+                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let arr_val = arr.clone();
-                for (i, item) in elements.iter().enumerate() {
-                    call_callback(
+                for i in 0..len {
+                    if !array_like_has_index(arr, i) {
+                        continue;
+                    }
+                    call_callback_with_this(
                         &cb,
-                        vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                        this_arg.clone(),
+                        vec![
+                            array_like_get_index(arr, i),
+                            JsValue::Smi(i as i32),
+                            arr_val.clone(),
+                        ],
                     )?;
                 }
                 Ok(JsValue::Undefined)
@@ -32170,5 +32238,369 @@ mod tests {
     fn e2e_set_constructor_null_creates_empty() {
         let result = global_eval("var s = new Set(null); s.size === 0").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Array method edge-case e2e tests ─────────────────────────────────────
+
+    // --- Array.from ---
+
+    #[test]
+    fn e2e_array_from_with_map_fn() {
+        let r = global_eval("Array.from([1,2,3], function(x) { return x * 2; }).join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("2,4,6".into()));
+    }
+
+    #[test]
+    fn e2e_array_from_map_fn_receives_index() {
+        let r = global_eval("Array.from([10,20,30], function(v, i) { return i; }).join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("0,1,2".into()));
+    }
+
+    #[test]
+    fn e2e_array_from_with_this_arg() {
+        let r = global_eval(
+            "Array.from([1,2,3], function(x) { return x + this.v; }, { v: 10 }).join(',')",
+        );
+        assert_eq!(r.unwrap(), JsValue::String("11,12,13".into()));
+    }
+
+    #[test]
+    fn e2e_array_from_string() {
+        let r = global_eval("Array.from('abc').join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("a,b,c".into()));
+    }
+
+    #[test]
+    fn e2e_array_from_array_like_object() {
+        let r = global_eval("Array.from({0: 'a', 1: 'b', length: 2}).join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("a,b".into()));
+    }
+
+    #[test]
+    fn e2e_array_from_non_callable_mapfn_throws() {
+        let r =
+            global_eval("try { Array.from([1], 42); false; } catch(e) { e instanceof TypeError; }");
+        assert_eq!(r.unwrap(), JsValue::Boolean(true));
+    }
+
+    // --- Array.of ---
+
+    #[test]
+    fn e2e_array_of_basic() {
+        let r = global_eval("Array.of(1, 2, 3).join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("1,2,3".into()));
+    }
+
+    #[test]
+    fn e2e_array_of_single_number_vs_constructor() {
+        // Array.of(5) creates [5], Array(5) creates length-5 array
+        let r = global_eval("Array.of(5).length");
+        assert_eq!(r.unwrap(), JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_array_of_empty() {
+        let r = global_eval("Array.of().length");
+        assert_eq!(r.unwrap(), JsValue::Smi(0));
+    }
+
+    // --- Array.prototype.flat ---
+
+    #[test]
+    fn e2e_array_flat_default_depth() {
+        let r = global_eval("[1, [2, 3]].flat().join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("1,2,3".into()));
+    }
+
+    #[test]
+    fn e2e_array_flat_infinity_depth() {
+        let r = global_eval("[1, [2, [3, [4]]]].flat(Infinity).join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("1,2,3,4".into()));
+    }
+
+    #[test]
+    fn e2e_array_flat_depth_zero() {
+        // depth 0 means no flattening
+        let r = global_eval("[1, [2, 3]].flat(0).length");
+        assert_eq!(r.unwrap(), JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_array_flat_empty_nested() {
+        let r = global_eval("[[], [[]]].flat(Infinity).length");
+        assert_eq!(r.unwrap(), JsValue::Smi(0));
+    }
+
+    // --- Array.prototype.flatMap ---
+
+    #[test]
+    fn e2e_array_flatmap_basic() {
+        let r = global_eval("[1, 2, 3].flatMap(function(x) { return [x, x * 2]; }).join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("1,2,2,4,3,6".into()));
+    }
+
+    #[test]
+    fn e2e_array_flatmap_with_this_arg() {
+        let r = global_eval(
+            "[1, 2].flatMap(function(x) { return [x + this.v]; }, { v: 10 }).join(',')",
+        );
+        assert_eq!(r.unwrap(), JsValue::String("11,12".into()));
+    }
+
+    #[test]
+    fn e2e_array_flatmap_non_callable_throws() {
+        let r = global_eval("try { [1].flatMap(42); false; } catch(e) { e instanceof TypeError; }");
+        assert_eq!(r.unwrap(), JsValue::Boolean(true));
+    }
+
+    // --- Array.prototype.fill ---
+
+    #[test]
+    fn e2e_array_fill_basic() {
+        let r = global_eval("[1,2,3,4].fill(0, 1, 3).join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("1,0,0,4".into()));
+    }
+
+    #[test]
+    fn e2e_array_fill_negative_start() {
+        let r = global_eval("[1,2,3,4].fill(5, -2).join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("1,2,5,5".into()));
+    }
+
+    #[test]
+    fn e2e_array_fill_negative_end() {
+        let r = global_eval("[1,2,3,4].fill(0, 1, -1).join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("1,0,0,4".into()));
+    }
+
+    #[test]
+    fn e2e_array_fill_entire_array() {
+        let r = global_eval("[1,2,3].fill(0).join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("0,0,0".into()));
+    }
+
+    #[test]
+    fn e2e_array_fill_both_negative() {
+        let r = global_eval("[1,2,3,4,5].fill(9, -3, -1).join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("1,2,9,9,5".into()));
+    }
+
+    // --- Array.prototype.copyWithin ---
+
+    #[test]
+    fn e2e_array_copywith_basic() {
+        let r = global_eval("[1,2,3,4,5].copyWithin(0, 3).join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("4,5,3,4,5".into()));
+    }
+
+    #[test]
+    fn e2e_array_copywith_negative_target() {
+        let r = global_eval("[1,2,3,4,5].copyWithin(-2, 0, 2).join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("1,2,3,1,2".into()));
+    }
+
+    #[test]
+    fn e2e_array_copywith_with_end() {
+        let r = global_eval("[1,2,3,4,5].copyWithin(1, 3, 4).join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("1,4,3,4,5".into()));
+    }
+
+    // --- Array.prototype.includes ---
+
+    #[test]
+    fn e2e_array_includes_nan() {
+        let r = global_eval("[1, NaN, 3].includes(NaN)");
+        assert_eq!(r.unwrap(), JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_array_includes_basic_true() {
+        let r = global_eval("[1, 2, 3].includes(2)");
+        assert_eq!(r.unwrap(), JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_array_includes_basic_false() {
+        let r = global_eval("[1, 2, 3].includes(4)");
+        assert_eq!(r.unwrap(), JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_array_includes_from_index_skips() {
+        // 1 is at index 0 but search starts at index 1
+        let r = global_eval("[1, 2, 3].includes(1, 1)");
+        assert_eq!(r.unwrap(), JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_array_includes_negative_zero() {
+        // SameValueZero: +0 equals -0
+        let r = global_eval("[0].includes(-0)");
+        assert_eq!(r.unwrap(), JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_array_includes_undefined() {
+        let r = global_eval("[1, undefined, 3].includes(undefined)");
+        assert_eq!(r.unwrap(), JsValue::Boolean(true));
+    }
+
+    // --- Array.prototype.every/some early termination ---
+
+    #[test]
+    fn e2e_array_every_all_true() {
+        let r = global_eval("[1, 2, 3].every(function(x) { return x > 0; })");
+        assert_eq!(r.unwrap(), JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_array_every_early_termination() {
+        // Should stop after element 2 (which fails x < 2)
+        let r = global_eval("var c = 0; [1,2,3].every(function(x) { c++; return x < 2; }); c");
+        assert_eq!(r.unwrap(), JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_array_every_empty_is_true() {
+        let r = global_eval("[].every(function(x) { return false; })");
+        assert_eq!(r.unwrap(), JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_array_some_found() {
+        let r = global_eval("[1, 2, 3].some(function(x) { return x === 2; })");
+        assert_eq!(r.unwrap(), JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_array_some_early_termination() {
+        // Should stop after first element (x === 1 is true)
+        let r = global_eval("var c = 0; [1,2,3].some(function(x) { c++; return x === 1; }); c");
+        assert_eq!(r.unwrap(), JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_array_some_not_found() {
+        let r = global_eval("[1, 2, 3].some(function(x) { return x > 5; })");
+        assert_eq!(r.unwrap(), JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_array_some_empty_is_false() {
+        let r = global_eval("[].some(function(x) { return true; })");
+        assert_eq!(r.unwrap(), JsValue::Boolean(false));
+    }
+
+    // --- Array.prototype.reduce/reduceRight ---
+
+    #[test]
+    fn e2e_array_reduce_no_initial_value() {
+        let r = global_eval("[1, 2, 3].reduce(function(a, b) { return a + b; })");
+        assert_eq!(r.unwrap(), JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_array_reduce_with_initial_value() {
+        let r = global_eval("[1, 2, 3].reduce(function(a, b) { return a + b; }, 10)");
+        assert_eq!(r.unwrap(), JsValue::Smi(16));
+    }
+
+    #[test]
+    fn e2e_array_reduce_single_element_no_initial() {
+        // Returns the single element without calling callback
+        let r = global_eval("[42].reduce(function(a, b) { return a + b; })");
+        assert_eq!(r.unwrap(), JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_array_reduce_empty_no_initial_throws() {
+        let r = global_eval(
+            "try { [].reduce(function(a,b) { return a+b; }); } catch(e) { e instanceof TypeError; }",
+        );
+        assert_eq!(r.unwrap(), JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_array_reduce_right_no_initial() {
+        let r = global_eval("[1, 2, 3].reduceRight(function(a, b) { return a + b; })");
+        assert_eq!(r.unwrap(), JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_array_reduce_right_accumulator_order() {
+        // reduceRight processes right-to-left: acc starts as 'c', then 'c'+'b', then 'cb'+'a'
+        let r = global_eval("['a','b','c'].reduceRight(function(a, b) { return a + b; })");
+        assert_eq!(r.unwrap(), JsValue::String("cba".into()));
+    }
+
+    #[test]
+    fn e2e_array_reduce_right_empty_no_initial_throws() {
+        let r = global_eval(
+            "try { [].reduceRight(function(a,b) { return a+b; }); } catch(e) { e instanceof TypeError; }",
+        );
+        assert_eq!(r.unwrap(), JsValue::Boolean(true));
+    }
+
+    // --- Array.prototype.sort stability ---
+
+    #[test]
+    fn e2e_array_sort_default_string_order() {
+        let r = global_eval("[3, 1, 2].sort().join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("1,2,3".into()));
+    }
+
+    #[test]
+    fn e2e_array_sort_custom_comparator() {
+        let r = global_eval("[3, 1, 2].sort(function(a, b) { return a - b; }).join(',')");
+        assert_eq!(r.unwrap(), JsValue::String("1,2,3".into()));
+    }
+
+    #[test]
+    fn e2e_array_sort_stability() {
+        // Equal-key elements preserve their original relative order (stable sort)
+        let r = global_eval(
+            r#"
+            var items = [{k:1, v:'a'}, {k:2, v:'b'}, {k:1, v:'c'}];
+            items.sort(function(a, b) { return a.k - b.k; });
+            items[0].v + items[1].v + items[2].v
+            "#,
+        );
+        assert_eq!(r.unwrap(), JsValue::String("acb".into()));
+    }
+
+    // --- forEach / map with thisArg ---
+
+    #[test]
+    fn e2e_array_foreach_with_this_arg() {
+        let r = global_eval(
+            r#"
+            var result = [];
+            [1, 2, 3].forEach(function(x) { result.push(x + this.v); }, { v: 10 });
+            result.join(',')
+            "#,
+        );
+        assert_eq!(r.unwrap(), JsValue::String("11,12,13".into()));
+    }
+
+    #[test]
+    fn e2e_array_foreach_non_callable_throws() {
+        let r = global_eval("try { [1].forEach(42); false; } catch(e) { e instanceof TypeError; }");
+        assert_eq!(r.unwrap(), JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_array_map_with_this_arg() {
+        let r = global_eval(
+            r#"
+            [1, 2, 3].map(function(x) { return x + this.v; }, { v: 100 }).join(',')
+            "#,
+        );
+        assert_eq!(r.unwrap(), JsValue::String("101,102,103".into()));
+    }
+
+    #[test]
+    fn e2e_array_map_non_callable_throws() {
+        let r = global_eval("try { [1].map(42); false; } catch(e) { e instanceof TypeError; }");
+        assert_eq!(r.unwrap(), JsValue::Boolean(true));
     }
 }
