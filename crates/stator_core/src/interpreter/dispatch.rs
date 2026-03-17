@@ -5350,6 +5350,13 @@ fn handle_sta_lookup_slot(
         }
     };
     let val = ctx.frame.accumulator.clone();
+    if let Some(current) = lookup_with_binding(&ctx.frame.context, &name)
+        && current == JsValue::TheHole
+    {
+        return Err(StatorError::ReferenceError(format!(
+            "Cannot access '{name}' before initialization"
+        )));
+    }
     if store_with_binding(&ctx.frame.context, &name, &val) {
         return Ok(DispatchAction::Continue);
     }
@@ -5380,9 +5387,19 @@ fn handle_lda_lookup_slot(
         }
     };
     ctx.frame.accumulator = if let Some(value) = lookup_with_binding(&ctx.frame.context, &name) {
+        if value == JsValue::TheHole {
+            return Err(StatorError::ReferenceError(format!(
+                "Cannot access '{name}' before initialization"
+            )));
+        }
         value
     } else {
         match ctx.frame.global_env.borrow().get(&name) {
+            Some(v) if *v == JsValue::TheHole => {
+                return Err(StatorError::ReferenceError(format!(
+                    "Cannot access '{name}' before initialization"
+                )));
+            }
             Some(v) => v.clone(),
             None => {
                 return Err(StatorError::ReferenceError(format!(
@@ -5411,6 +5428,13 @@ fn handle_lda_lookup_slot_inside_typeof(
     };
     ctx.frame.accumulator = lookup_with_binding(&ctx.frame.context, &name)
         .or_else(|| ctx.frame.global_env.borrow().get(&name).cloned())
+        .map(|value| {
+            if value == JsValue::TheHole {
+                JsValue::Undefined
+            } else {
+                value
+            }
+        })
         .unwrap_or(JsValue::Undefined);
     Ok(DispatchAction::Continue)
 }
@@ -6114,8 +6138,11 @@ fn handle_call_direct_eval(
                 return Ok(DispatchAction::Continue);
             }
         };
-        ctx.frame.accumulator =
-            crate::builtins::global::global_eval_direct(&source, Rc::clone(&ctx.frame.global_env))?;
+        ctx.frame.accumulator = crate::builtins::global::global_eval_direct_with_scope(
+            &source,
+            Rc::clone(&ctx.frame.global_env),
+            ctx.frame.context.clone(),
+        )?;
     } else {
         // Callee was reassigned — fall through to normal call.
         match callee {

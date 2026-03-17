@@ -158,6 +158,19 @@ struct LocalBinding {
     /// `true` while the binding is still in the Temporal Dead Zone
     /// (`let`/`const` before their declaration is reached at runtime).
     needs_tdz_check: bool,
+    /// Formal parameter index for sloppy-mode `arguments` aliasing.
+    param_index: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct EnvScope {
+    object_reg: Register,
+    saved_ctx_reg: Register,
+}
+
+struct LoopEnvScope {
+    names: std::collections::HashSet<String>,
+    env: EnvScope,
 }
 
 #[derive(Clone)]
@@ -190,6 +203,10 @@ struct FunctionCompiler {
     /// Variable scope stack.  Each entry is a map from variable name to
     /// its [`LocalBinding`].  The outermost scope is `scopes[0]`.
     scopes: Vec<HashMap<String, LocalBinding>>,
+    /// Active function environment object used for closure capture and eval.
+    function_env: Option<EnvScope>,
+    /// Per-iteration lexical environments for `for (let/const …)` loops.
+    active_loop_envs: Vec<LoopEnvScope>,
     /// Source-position table (populated at expression boundaries).
     source_positions: Vec<SourcePosition>,
     /// Pending `(instruction_index, line, column)` entries collected during
@@ -302,6 +319,8 @@ impl FunctionCompiler {
             constant_pool: Vec::new(),
             allocator: RegisterAllocator::new(param_count),
             scopes: vec![HashMap::new()],
+            function_env: None,
+            active_loop_envs: Vec::new(),
             source_positions: Vec::new(),
             pending_positions: Vec::new(),
             labels: Vec::new(),
@@ -342,6 +361,7 @@ impl FunctionCompiler {
                         reg,
                         is_const: false,
                         needs_tdz_check: false,
+                        param_index: Some(i as u32),
                     },
                 );
             }
@@ -1065,6 +1085,7 @@ impl FunctionCompiler {
                 reg,
                 is_const,
                 needs_tdz_check: false,
+                param_index: None,
             },
         );
         reg
@@ -1081,6 +1102,7 @@ impl FunctionCompiler {
                 reg,
                 is_const: false,
                 needs_tdz_check: false,
+                param_index: None,
             },
         );
         reg
@@ -1106,6 +1128,100 @@ impl FunctionCompiler {
                 binding.needs_tdz_check = false;
                 return;
             }
+        }
+    }
+
+    fn emit_define_named_property(&mut self, object_reg: Register, name: &str) {
+        let name_idx = self.add_string(name);
+        let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+        self.emit(Instruction::new_unchecked(
+            Opcode::DefineNamedOwnProperty,
+            vec![
+                to_reg_op(object_reg),
+                Operand::ConstantPoolIdx(name_idx),
+                slot,
+            ],
+        ));
+    }
+
+    fn emit_store_named_property(&mut self, object_reg: Register, name: &str) {
+        let name_idx = self.add_string(name);
+        let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
+        self.emit(Instruction::new_unchecked(
+            Opcode::StaNamedProperty,
+            vec![
+                to_reg_op(object_reg),
+                Operand::ConstantPoolIdx(name_idx),
+                slot,
+            ],
+        ));
+    }
+
+    fn create_function_env(&mut self) {
+        if self.function_env.is_some() || self.scopes[0].is_empty() {
+            return;
+        }
+
+        let bindings: Vec<(String, LocalBinding)> = self.scopes[0]
+            .iter()
+            .map(|(name, binding)| (name.clone(), *binding))
+            .collect();
+        let env = self.create_dynamic_env("function", &bindings);
+        self.function_env = Some(env);
+    }
+
+    fn create_dynamic_env(&mut self, kind: &str, bindings: &[(String, LocalBinding)]) -> EnvScope {
+        self.emit(Instruction::new_unchecked(
+            Opcode::CreateEmptyObjectLiteral,
+            vec![],
+        ));
+        let object_reg = self.allocator.new_local();
+        self.emit_star(object_reg);
+
+        self.emit(Instruction::new_unchecked(Opcode::LdaNull, vec![]));
+        self.emit_define_named_property(object_reg, "__proto__");
+
+        for (name, binding) in bindings {
+            self.emit_ldar(binding.reg);
+            self.emit_define_named_property(object_reg, name);
+        }
+
+        let scope_idx = self.add_string(kind);
+        self.emit(Instruction::new_unchecked(
+            Opcode::CreateWithContext,
+            vec![to_reg_op(object_reg), Operand::ConstantPoolIdx(scope_idx)],
+        ));
+        let saved_ctx_reg = self.allocator.new_local();
+        self.emit(Instruction::new_unchecked(
+            Opcode::PushContext,
+            vec![to_reg_op(saved_ctx_reg)],
+        ));
+        EnvScope {
+            object_reg,
+            saved_ctx_reg,
+        }
+    }
+
+    fn mirror_function_binding(&mut self, name: &str, reg: Register) {
+        if let Some(env) = self.function_env
+            && self
+                .scopes
+                .first()
+                .and_then(|scope| scope.get(name))
+                .is_some_and(|binding| binding.reg == reg)
+        {
+            self.emit_store_named_property(env.object_reg, name);
+        }
+    }
+
+    fn mirror_active_loop_binding(&mut self, name: &str) {
+        if let Some(loop_env) = self
+            .active_loop_envs
+            .iter()
+            .rev()
+            .find(|loop_env| loop_env.names.contains(name))
+        {
+            self.emit_store_named_property(loop_env.env.object_reg, name);
         }
     }
 
@@ -1375,6 +1491,7 @@ impl FunctionCompiler {
                     reg,
                     is_const: false,
                     needs_tdz_check: false,
+                    param_index: None,
                 },
             );
         }
@@ -1414,6 +1531,7 @@ impl FunctionCompiler {
                     reg,
                     is_const,
                     needs_tdz_check: true,
+                    param_index: None,
                 },
             );
         }
@@ -1436,6 +1554,7 @@ impl FunctionCompiler {
                     reg,
                     is_const: false,
                     needs_tdz_check: false,
+                    param_index: None,
                 },
             );
         }
@@ -1639,6 +1758,7 @@ impl FunctionCompiler {
                             self.compile_expr(init)?;
                         }
                         self.emit_star(reg);
+                        self.mirror_function_binding(&ident.name, reg);
                     }
                     // No init → the register already holds `undefined`
                     // from hoisting, so nothing to emit.
@@ -1662,6 +1782,7 @@ impl FunctionCompiler {
                         self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
                     }
                     self.emit_star(reg);
+                    self.mirror_function_binding(&ident.name, reg);
                     // Clear TDZ — the binding is now initialised.
                     self.mark_initialized(&ident.name);
                     Ok(Some(reg))
@@ -1711,6 +1832,7 @@ impl FunctionCompiler {
                 self.define_local(&id.name)
             };
             self.emit_star(reg);
+            self.mirror_function_binding(&id.name, reg);
             // Top-level function declarations are also stored as globals so
             // that recursive calls via `LdaGlobal` can find them.
             if self.is_program {
@@ -1751,6 +1873,7 @@ impl FunctionCompiler {
                 .map(|binding| binding.reg)
                 .unwrap_or_else(|| self.define_local(&id.name));
             self.emit_star(reg);
+            self.mirror_function_binding(&id.name, reg);
             self.mark_initialized(&id.name);
             // Top-level class declarations are also stored as globals.
             if self.is_program {
@@ -2265,10 +2388,13 @@ impl FunctionCompiler {
                         reg: Register::parameter(0),
                         is_const: false,
                         needs_tdz_check: false,
+                        param_index: None,
                     },
                 );
                 s
             }],
+            function_env: None,
+            active_loop_envs: Vec::new(),
             source_positions: Vec::new(),
             pending_positions: Vec::new(),
             labels: Vec::new(),
@@ -2497,14 +2623,23 @@ impl FunctionCompiler {
     fn compile_for(&mut self, s: &ForStmt) -> StatorResult<()> {
         let loop_start = self.new_label();
         let loop_end = self.new_label();
+        let loop_exit = self.new_label();
         let continue_label = self.new_label();
+        let mut per_iteration_names = Vec::new();
 
         self.push_scope();
 
         // Initializer.
         if let Some(init) = &s.init {
             match init {
-                ForInit::VarDecl(decl) => self.compile_var_decl(decl)?,
+                ForInit::VarDecl(decl) => {
+                    if matches!(decl.kind, VarKind::Let | VarKind::Const) {
+                        for declarator in &decl.declarators {
+                            Self::collect_pat_names(&declarator.id, &mut per_iteration_names);
+                        }
+                    }
+                    self.compile_var_decl(decl)?
+                }
                 ForInit::Expr(expr) => {
                     self.compile_expr(expr)?;
                 }
@@ -2519,8 +2654,23 @@ impl FunctionCompiler {
         // Test.
         if let Some(test) = &s.test {
             self.compile_expr(test)?;
-            self.emit_jump(Opcode::JumpIfToBooleanFalse, loop_end);
+            self.emit_jump(Opcode::JumpIfToBooleanFalse, loop_exit);
         }
+
+        let loop_env = if !per_iteration_names.is_empty() {
+            let bindings: Vec<(String, LocalBinding)> = per_iteration_names
+                .iter()
+                .filter_map(|name| self.lookup_var(name).map(|binding| (name.clone(), binding)))
+                .collect();
+            let env = self.create_dynamic_env("loop", &bindings);
+            self.active_loop_envs.push(LoopEnvScope {
+                names: per_iteration_names.iter().cloned().collect(),
+                env,
+            });
+            Some(env)
+        } else {
+            None
+        };
 
         self.compile_stmt(&s.body)?;
 
@@ -2530,8 +2680,24 @@ impl FunctionCompiler {
             self.compile_expr(update)?;
         }
 
+        if let Some(loop_env) = loop_env {
+            let _ = self.active_loop_envs.pop();
+            self.emit(Instruction::new_unchecked(
+                Opcode::PopContext,
+                vec![to_reg_op(loop_env.saved_ctx_reg)],
+            ));
+        }
+
         self.emit_jump_loop_to(loop_start);
         self.bind_label(loop_end);
+        if let Some(loop_env) = loop_env {
+            self.emit(Instruction::new_unchecked(
+                Opcode::PopContext,
+                vec![to_reg_op(loop_env.saved_ctx_reg)],
+            ));
+        }
+        self.emit_jump(Opcode::Jump, loop_exit);
+        self.bind_label(loop_exit);
 
         self.loop_stack.pop();
         self.pop_scope();
@@ -2769,6 +2935,12 @@ impl FunctionCompiler {
         // Open a block scope for the switch body so that `let`/`const`
         // declarations in case clauses are properly scoped.
         self.push_scope();
+        let switch_stmts: Vec<Stmt> = s
+            .cases
+            .iter()
+            .flat_map(|case| case.consequent.iter().cloned())
+            .collect();
+        self.hoist_lexical_decls(&switch_stmts);
 
         // Emit case bodies.
         for (i, case) in s.cases.iter().enumerate() {
@@ -3186,7 +3358,23 @@ impl FunctionCompiler {
     /// treated as globals.
     fn compile_ident_load(&mut self, name: &str) {
         if let Some(binding) = self.lookup_var(name) {
-            self.emit_ldar(binding.reg);
+            if !self.is_strict
+                && let Some(param_index) = binding.param_index
+                && let Some(args_binding) = self.lookup_var("arguments")
+            {
+                let name_idx = self.add_string(&param_index.to_string());
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaNamedProperty,
+                    vec![
+                        to_reg_op(args_binding.reg),
+                        Operand::ConstantPoolIdx(name_idx),
+                        slot,
+                    ],
+                ));
+            } else {
+                self.emit_ldar(binding.reg);
+            }
             if binding.needs_tdz_check {
                 let name_idx = self.add_string(name);
                 self.emit(Instruction::new_unchecked(
@@ -3196,18 +3384,10 @@ impl FunctionCompiler {
             }
         } else {
             let name_idx = self.add_string(name);
-            if self.with_depth > 0 {
-                self.emit(Instruction::new_unchecked(
-                    Opcode::LdaLookupSlot,
-                    vec![Operand::ConstantPoolIdx(name_idx)],
-                ));
-            } else {
-                let slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
-                self.emit(Instruction::new_unchecked(
-                    Opcode::LdaGlobal,
-                    vec![Operand::ConstantPoolIdx(name_idx), slot],
-                ));
-            }
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaLookupSlot,
+                vec![Operand::ConstantPoolIdx(name_idx)],
+            ));
         }
     }
 
@@ -3221,7 +3401,23 @@ impl FunctionCompiler {
     /// **still** throw a `ReferenceError` (unlike undeclared globals).
     fn compile_ident_load_typeof(&mut self, name: &str) {
         if let Some(binding) = self.lookup_var(name) {
-            self.emit_ldar(binding.reg);
+            if !self.is_strict
+                && let Some(param_index) = binding.param_index
+                && let Some(args_binding) = self.lookup_var("arguments")
+            {
+                let name_idx = self.add_string(&param_index.to_string());
+                let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::LdaNamedProperty,
+                    vec![
+                        to_reg_op(args_binding.reg),
+                        Operand::ConstantPoolIdx(name_idx),
+                        slot,
+                    ],
+                ));
+            } else {
+                self.emit_ldar(binding.reg);
+            }
             if binding.needs_tdz_check {
                 let name_idx = self.add_string(name);
                 self.emit(Instruction::new_unchecked(
@@ -3231,18 +3427,10 @@ impl FunctionCompiler {
             }
         } else {
             let name_idx = self.add_string(name);
-            if self.with_depth > 0 {
-                self.emit(Instruction::new_unchecked(
-                    Opcode::LdaLookupSlotInsideTypeof,
-                    vec![Operand::ConstantPoolIdx(name_idx)],
-                ));
-            } else {
-                let slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
-                self.emit(Instruction::new_unchecked(
-                    Opcode::LdaGlobalInsideTypeof,
-                    vec![Operand::ConstantPoolIdx(name_idx), slot],
-                ));
-            }
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaLookupSlotInsideTypeof,
+                vec![Operand::ConstantPoolIdx(name_idx)],
+            ));
         }
     }
 
@@ -3276,20 +3464,27 @@ impl FunctionCompiler {
             } else {
                 self.emit_star(binding.reg);
             }
+            if !self.is_strict
+                && let Some(param_index) = binding.param_index
+                && let Some(args_binding) = self.lookup_var("arguments")
+            {
+                let tmp = self.allocator.allocate_temporary();
+                self.emit_star(tmp);
+                self.emit_ldar(tmp);
+                self.emit_store_named_property(args_binding.reg, &param_index.to_string());
+                self.emit_ldar(tmp);
+                self.allocator
+                    .release_temporary(tmp)
+                    .map_err(|e| StatorError::Internal(e.to_string()))?;
+            }
+            self.mirror_active_loop_binding(name);
+            self.mirror_function_binding(name, binding.reg);
         } else {
             let name_idx = self.add_string(name);
-            if self.with_depth > 0 {
-                self.emit(Instruction::new_unchecked(
-                    Opcode::StaLookupSlot,
-                    vec![Operand::ConstantPoolIdx(name_idx), Operand::Flag(0)],
-                ));
-            } else {
-                let slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
-                self.emit(Instruction::new_unchecked(
-                    Opcode::StaGlobal,
-                    vec![Operand::ConstantPoolIdx(name_idx), slot],
-                ));
-            }
+            self.emit(Instruction::new_unchecked(
+                Opcode::StaLookupSlot,
+                vec![Operand::ConstantPoolIdx(name_idx), Operand::Flag(0)],
+            ));
         }
         Ok(())
     }
@@ -6677,9 +6872,15 @@ fn compile_function_inner(
     // instead of throwing.
     compiler.hoist_var_declarations(&body.body);
 
+    // Hoist top-level lexical bindings in the function body so that reads
+    // before initialisation observe the TDZ within the function scope.
+    compiler.hoist_lexical_decls(&body.body);
+
     // Annex B: in non-strict mode, function declarations inside
     // blocks also create var-like bindings in the function scope.
     compiler.hoist_annex_b_fn_declarations(&body.body);
+
+    compiler.create_function_env();
 
     // Hoist function declarations to the top of the scope.
     for stmt in &body.body {

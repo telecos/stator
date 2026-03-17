@@ -485,6 +485,14 @@ fn eval_core(
     rewrite_last_expr_to_return(&mut program);
 
     let mut frame = match mode {
+        EvalMode::Direct if program.is_strict => {
+            let bytecode = BytecodeGenerator::compile_program(&program)?;
+            let env = caller_env.expect("direct eval requires a caller environment");
+            let child_env = Rc::new(RefCell::new(env.borrow().clone()));
+            let mut frame = InterpreterFrame::new_with_globals(bytecode, vec![], child_env);
+            frame.context = caller_context;
+            frame
+        }
         EvalMode::Direct => {
             // Direct eval: var declarations emit StaGlobal so they are
             // hoisted into the caller's variable environment.
