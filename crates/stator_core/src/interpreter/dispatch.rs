@@ -1820,14 +1820,14 @@ fn expand_spread_args(raw_args: Vec<JsValue>) -> Vec<JsValue> {
                     drop(map_ref);
                     if let Some(ref f) = iter_fn {
                         if let Ok(iter_obj) = dispatch_call_with_this(f, arg.clone(), vec![]) {
-                            match iter_obj {
+                            match &iter_obj {
                                 JsValue::Iterator(ni) => {
                                     while let Some(v) = ni.borrow_mut().next_item() {
                                         out.push(v);
                                     }
                                 }
                                 JsValue::Generator(gs) => loop {
-                                    match Interpreter::run_generator_step(&gs, JsValue::Undefined) {
+                                    match Interpreter::run_generator_step(gs, JsValue::Undefined) {
                                         Ok(GeneratorStep::Yield(v)) => out.push(v),
                                         Ok(GeneratorStep::Return(v)) => {
                                             if !matches!(v, JsValue::Undefined) {
@@ -1838,6 +1838,16 @@ fn expand_spread_args(raw_args: Vec<JsValue>) -> Vec<JsValue> {
                                         Err(_) => break,
                                     }
                                 },
+                                // PlainObject iterator (has "next" method).
+                                JsValue::PlainObject(iter_map)
+                                    if iter_map.borrow().contains_key("next") =>
+                                {
+                                    if let Ok(items) =
+                                        collect_from_plain_object_iterator(&iter_obj, iter_map)
+                                    {
+                                        out.extend(items);
+                                    }
+                                }
                                 _ => out.push(arg.clone()),
                             }
                         } else {
@@ -4077,11 +4087,20 @@ fn handle_create_array_from_iterable(
                 return Err(StatorError::TypeError("object is not iterable".into()));
             }
         }
-        // Null and Undefined are not iterable.
-        JsValue::Null | JsValue::Undefined => {
-            return Err(StatorError::TypeError("object is not iterable".into()));
+        // Non-iterable primitives and null/undefined throw TypeError.
+        other => {
+            return Err(StatorError::TypeError(format!(
+                "{} is not iterable",
+                match other {
+                    JsValue::Null => "null".to_string(),
+                    JsValue::Undefined => "undefined".to_string(),
+                    JsValue::Smi(n) => n.to_string(),
+                    JsValue::HeapNumber(n) => n.to_string(),
+                    JsValue::Boolean(b) => b.to_string(),
+                    _ => format!("{other:?}"),
+                }
+            )));
         }
-        _ => vec![],
     };
     let mut map = PropertyMap::new();
     for (i, v) in items.iter().enumerate() {
