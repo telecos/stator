@@ -266,14 +266,28 @@ impl<'src> Parser<'src> {
 
     /// Return the directive string value for an expression statement when it is
     /// part of a directive prologue.
-    fn directive_prologue_value(stmt: &Stmt) -> Option<&str> {
+    ///
+    /// The scanner stores the *raw* source text including the opening and
+    /// closing quote characters.  This helper strips them so that the caller
+    /// can compare against a plain string like `"use strict"`.
+    fn directive_prologue_value(stmt: &Stmt) -> Option<String> {
         let Stmt::Expr(expr_stmt) = stmt else {
             return None;
         };
         let Expr::Str(str_lit) = expr_stmt.expr.as_ref() else {
             return None;
         };
-        Some(str_lit.value.as_str())
+        let raw = &str_lit.value;
+        let bytes = raw.as_bytes();
+        // Strip surrounding quotes (' or ").
+        if bytes.len() >= 2
+            && (bytes[0] == b'\'' || bytes[0] == b'"')
+            && bytes[bytes.len() - 1] == bytes[0]
+        {
+            Some(raw[1..raw.len() - 1].to_owned())
+        } else {
+            Some(raw.clone())
+        }
     }
 
     // ── Top-level ────────────────────────────────────────────────────────────
@@ -3382,6 +3396,16 @@ impl<'src> Parser<'src> {
                     TokenValue::Str(s) => s,
                     _ => return Err(Self::error_at(tok.span, "invalid identifier token")),
                 };
+                // Strict mode: future reserved words cannot be used as
+                // identifier references (ES2015 §12.1).
+                if self.strict_mode && Self::is_strict_reserved_word(&name) {
+                    return Err(Self::error_at(
+                        tok.span,
+                        &format!(
+                            "'{name}' is a reserved word and cannot be used as an identifier in strict mode"
+                        ),
+                    ));
+                }
                 Ok(Expr::Ident(Ident {
                     loc: tok.span,
                     name,
@@ -9217,5 +9241,420 @@ mod tests {
     #[test]
     fn test_for_of_let_simple() {
         parse("for (let x of [1, 2]) {}").unwrap();
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Strict mode comprehensive conformance tests
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // ── 1. "use strict" directive prologue ────────────────────────────────
+
+    #[test]
+    fn test_strict_directive_double_quote() {
+        let prog = parse("\"use strict\"; var x = 1;").unwrap();
+        assert!(prog.is_strict);
+    }
+
+    #[test]
+    fn test_strict_directive_single_quote() {
+        let prog = parse("'use strict'; var x = 1;").unwrap();
+        assert!(prog.is_strict);
+    }
+
+    #[test]
+    fn test_strict_directive_after_other_directive() {
+        // Another directive before "use strict" — still a valid prologue.
+        let prog = parse("'use nothing'; 'use strict'; var x = 1;").unwrap();
+        assert!(prog.is_strict);
+    }
+
+    #[test]
+    fn test_strict_directive_not_after_statement() {
+        // "use strict" after a real statement is not a directive.
+        let prog = parse("var x = 1; 'use strict';").unwrap();
+        assert!(!prog.is_strict);
+    }
+
+    #[test]
+    fn test_strict_directive_in_function_body() {
+        let prog = parse("function f() { 'use strict'; return 1; }").unwrap();
+        if let ProgramItem::Stmt(Stmt::FnDecl(decl)) = &prog.body[0] {
+            assert!(decl.is_strict);
+        } else {
+            panic!("expected FnDecl");
+        }
+    }
+
+    #[test]
+    fn test_strict_directive_fn_body_not_after_stmt() {
+        // "use strict" after a statement inside a function is not a directive.
+        let prog = parse("function f() { var x; 'use strict'; }").unwrap();
+        if let ProgramItem::Stmt(Stmt::FnDecl(decl)) = &prog.body[0] {
+            assert!(!decl.is_strict);
+        } else {
+            panic!("expected FnDecl");
+        }
+    }
+
+    #[test]
+    fn test_strict_directive_with_non_simple_params_error() {
+        let result = parse("function f(a = 1) { 'use strict'; }");
+        assert!(result.is_err());
+    }
+
+    // ── 2. Octal literals forbidden ──────────────────────────────────────
+
+    #[test]
+    fn test_strict_octal_literal_0123_error() {
+        let result = parse("'use strict'; 0123;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_octal_literal_00_error() {
+        let result = parse("'use strict'; 00;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sloppy_octal_literal_0123_ok() {
+        parse("0123;").unwrap();
+    }
+
+    #[test]
+    fn test_strict_0x_hex_ok() {
+        // Hex prefix is not legacy octal.
+        parse("'use strict'; 0xFF;").unwrap();
+    }
+
+    #[test]
+    fn test_strict_0o_octal_ok() {
+        // ES6 `0o` prefix is allowed in strict mode.
+        parse("'use strict'; 0o77;").unwrap();
+    }
+
+    #[test]
+    fn test_strict_0b_binary_ok() {
+        // Binary prefix is allowed in strict mode.
+        parse("'use strict'; 0b101;").unwrap();
+    }
+
+    // ── 3. with statement forbidden ──────────────────────────────────────
+
+    #[test]
+    fn test_strict_with_error() {
+        let result = parse("'use strict'; with (obj) { x; }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sloppy_with_ok_e2e() {
+        parse("with (obj) { x; }").unwrap();
+    }
+
+    #[test]
+    fn test_strict_fn_with_error() {
+        let result = parse("function f() { 'use strict'; with (obj) { x; } }");
+        assert!(result.is_err());
+    }
+
+    // ── 4. delete on plain name ──────────────────────────────────────────
+
+    #[test]
+    fn test_strict_delete_plain_name_error() {
+        let result = parse("'use strict'; var x = 1; delete x;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_delete_member_ok_e2e() {
+        parse("'use strict'; delete obj.prop;").unwrap();
+    }
+
+    #[test]
+    fn test_strict_delete_computed_member_ok() {
+        parse("'use strict'; delete obj['prop'];").unwrap();
+    }
+
+    #[test]
+    fn test_sloppy_delete_plain_name_ok() {
+        parse("var x = 1; delete x;").unwrap();
+    }
+
+    // ── 5. Duplicate parameters ──────────────────────────────────────────
+
+    #[test]
+    fn test_strict_dup_params_program_level_error() {
+        let result = parse("'use strict'; function f(a, a) {}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_dup_params_fn_body_error() {
+        let result = parse("function f(a, a) { 'use strict'; }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sloppy_dup_params_ok_e2e() {
+        parse("function f(a, a) { return a; }").unwrap();
+    }
+
+    #[test]
+    fn test_strict_dup_params_fn_expr_error() {
+        let result = parse("'use strict'; var f = function(a, a) {};");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_class_method_dup_params_error_e2e() {
+        // Class bodies are always strict.
+        let result = parse("class C { m(a, a) {} }");
+        assert!(result.is_err());
+    }
+
+    // ── 6. eval/arguments restrictions ───────────────────────────────────
+
+    #[test]
+    fn test_strict_assign_to_eval_error() {
+        let result = parse("'use strict'; eval = 42;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_assign_to_arguments_error() {
+        let result = parse("'use strict'; arguments = 42;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_prefix_inc_eval_error() {
+        let result = parse("'use strict'; ++eval;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_postfix_inc_eval_error() {
+        let result = parse("'use strict'; eval++;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_prefix_dec_arguments_error() {
+        let result = parse("'use strict'; --arguments;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_postfix_dec_arguments_error() {
+        let result = parse("'use strict'; arguments--;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_var_eval_binding_error() {
+        let result = parse("'use strict'; var eval = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_let_arguments_binding_error() {
+        let result = parse("'use strict'; let arguments = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_fn_name_eval_error_e2e() {
+        let result = parse("'use strict'; function eval() {}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_fn_param_eval_error_e2e() {
+        let result = parse("'use strict'; function f(eval) {}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sloppy_assign_eval_ok_e2e() {
+        parse("eval = 42;").unwrap();
+    }
+
+    #[test]
+    fn test_sloppy_assign_arguments_ok_e2e() {
+        parse("arguments = 42;").unwrap();
+    }
+
+    // ── 7. Octal escape sequences in strings ────────────────────────────
+
+    #[test]
+    fn test_strict_octal_escape_seq_error() {
+        let result = parse("'use strict'; '\\1';");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_octal_escape_012_error() {
+        let result = parse("'use strict'; '\\012';");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_nul_escape_ok() {
+        // `\0` alone (not followed by another digit) is fine.
+        parse("'use strict'; '\\0';").unwrap();
+    }
+
+    #[test]
+    fn test_strict_octal_89_error() {
+        // `\8` and `\9` are non-octal decimal escapes — also forbidden.
+        let result = parse("'use strict'; '\\8';");
+        assert!(result.is_err());
+    }
+
+    // ── 10. Reserved words in strict mode ────────────────────────────────
+
+    #[test]
+    fn test_strict_reserved_implements_as_binding() {
+        let result = parse("'use strict'; var implements = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_reserved_interface_as_binding() {
+        let result = parse("'use strict'; var interface = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_reserved_package_as_binding() {
+        let result = parse("'use strict'; var package = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_reserved_private_as_binding() {
+        let result = parse("'use strict'; var private = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_reserved_protected_as_binding() {
+        let result = parse("'use strict'; var protected = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_reserved_public_as_binding() {
+        let result = parse("'use strict'; var public = 1;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_reserved_implements_as_identifier() {
+        let result = parse("'use strict'; implements;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_reserved_interface_as_identifier() {
+        let result = parse("'use strict'; interface;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_reserved_package_as_identifier() {
+        let result = parse("'use strict'; package;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_reserved_private_as_identifier() {
+        let result = parse("'use strict'; private;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_reserved_protected_as_identifier() {
+        let result = parse("'use strict'; protected;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_reserved_public_as_identifier() {
+        let result = parse("'use strict'; public;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sloppy_reserved_implements_ok() {
+        // Not reserved outside strict mode.
+        parse("var implements = 1;").unwrap();
+    }
+
+    #[test]
+    fn test_sloppy_reserved_interface_ok() {
+        parse("var interface = 1;").unwrap();
+    }
+
+    #[test]
+    fn test_sloppy_reserved_private_ok() {
+        parse("var private = 1;").unwrap();
+    }
+
+    // ── Labelled function declarations in strict mode ────────────────────
+
+    #[test]
+    fn test_strict_labelled_fn_decl_error() {
+        let result = parse("'use strict'; L: function f() {}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sloppy_labelled_fn_decl_ok() {
+        parse("L: function f() {}").unwrap();
+    }
+
+    // ── Class body is always strict mode ─────────────────────────────────
+
+    #[test]
+    fn test_class_body_rejects_octal_e2e() {
+        let result = parse("class C { m() { 010; } }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_class_body_rejects_with_e2e() {
+        let result = parse("class C { m() { with(o){} } }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_class_body_rejects_delete_ident_e2e() {
+        let result = parse("class C { m() { var x; delete x; } }");
+        assert!(result.is_err());
+    }
+
+    // ── Module code is always strict ─────────────────────────────────────
+
+    #[test]
+    fn test_module_code_always_strict() {
+        let prog = parse("export var x = 1;").unwrap();
+        assert!(prog.is_strict);
+    }
+
+    // ── Strict mode in nested function ───────────────────────────────────
+
+    #[test]
+    fn test_strict_inherited_by_inner_fn() {
+        // Inner functions inherit strict mode from the enclosing context.
+        let result = parse("'use strict'; function f() { with (obj) {} }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_fn_body_inner_fn_inherits() {
+        let result = parse("function f() { 'use strict'; function g() { with (obj) {} } }");
+        assert!(result.is_err());
     }
 }
