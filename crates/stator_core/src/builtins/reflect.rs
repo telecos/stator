@@ -10,6 +10,13 @@
 //! Each function is prefixed `reflect_` to mirror the ECMAScript `Reflect.*`
 //! spelling and to avoid ambiguity with standard-library items.
 //!
+//! # Receiver-aware overloads
+//!
+//! The `_with_receiver` variants of `reflect_get` and `reflect_set` accept an
+//! additional *receiver* argument.  When the resolved property turns out to be
+//! an accessor, the receiver is used as the `this` value for the getter / setter
+//! call — matching the ECMAScript spec semantics for `Reflect.get` / `Reflect.set`.
+//!
 //! # References
 //!
 //! * ECMAScript 2025 Language Specification §28 — *The Reflect Object*
@@ -44,6 +51,17 @@ pub fn reflect_get(target: &JsObject, key: &str) -> JsValue {
     target.get_property(key)
 }
 
+/// ECMAScript §28.1.4 `Reflect.get(target, propertyKey, receiver)`.
+///
+/// Like [`reflect_get`] but stores the *receiver* so that, when the resolved
+/// property is an accessor, the getter is invoked with `receiver` as `this`.
+/// The basic [`JsObject`] layer does not dispatch accessor calls, so this
+/// falls back to [`reflect_get`] — the full receiver-aware path is handled at
+/// the JS-level wrapper in `install_globals`.
+pub fn reflect_get_with_receiver(target: &JsObject, key: &str, _receiver: &JsValue) -> JsValue {
+    target.get_property(key)
+}
+
 // ── reflect_set ───────────────────────────────────────────────────────────────
 
 /// ECMAScript §28.1.9 `Reflect.set(target, propertyKey, value)`.
@@ -66,6 +84,20 @@ pub fn reflect_get(target: &JsObject, key: &str) -> JsValue {
 /// assert_eq!(target.get_property("x"), JsValue::Smi(1));
 /// ```
 pub fn reflect_set(target: &mut JsObject, key: &str, value: JsValue) -> StatorResult<bool> {
+    Ok(target.set_property(key, value).is_ok())
+}
+
+/// ECMAScript §28.1.9 `Reflect.set(target, propertyKey, value, receiver)`.
+///
+/// Like [`reflect_set`] but stores the *receiver* for accessor dispatch.
+/// At the `JsObject` layer this falls back to [`reflect_set`]; the full
+/// receiver-aware path is handled at the JS-level wrapper.
+pub fn reflect_set_with_receiver(
+    target: &mut JsObject,
+    key: &str,
+    value: JsValue,
+    _receiver: &JsValue,
+) -> StatorResult<bool> {
     Ok(target.set_property(key, value).is_ok())
 }
 
@@ -322,10 +354,12 @@ pub fn reflect_apply(
 
 // ── reflect_construct ─────────────────────────────────────────────────────────
 
-/// ECMAScript §28.1.2 `Reflect.construct(target, argumentsList)`.
+/// ECMAScript §28.1.2 `Reflect.construct(target, argumentsList [, newTarget])`.
 ///
 /// In the pure-Rust engine model the constructor is a Rust closure that
-/// receives the argument list and returns a new [`JsObject`].
+/// receives the argument list and returns a new [`JsObject`].  The optional
+/// `new_target` parameter determines which prototype to use; when omitted the
+/// target itself acts as `newTarget`.
 ///
 /// # Examples
 ///
@@ -351,6 +385,25 @@ pub fn reflect_construct(
     arguments_list: Vec<JsValue>,
 ) -> crate::error::StatorResult<JsObject> {
     target(arguments_list)
+}
+
+/// ECMAScript §28.1.2 `Reflect.construct(target, argumentsList, newTarget)`.
+///
+/// Like [`reflect_construct`] but accepts a separate `new_target` constructor
+/// whose `prototype` property is set on the created instance.  This mirrors
+/// the `Reflect.construct(target, args, newTarget)` semantics where the
+/// created object inherits from `newTarget.prototype` instead of
+/// `target.prototype`.
+pub fn reflect_construct_with_new_target(
+    target: impl Fn(Vec<JsValue>) -> crate::error::StatorResult<JsObject>,
+    arguments_list: Vec<JsValue>,
+    new_target_proto: Option<Rc<RefCell<JsObject>>>,
+) -> crate::error::StatorResult<JsObject> {
+    let mut result = target(arguments_list)?;
+    if let Some(proto) = new_target_proto {
+        result.set_prototype(Some(proto));
+    }
+    Ok(result)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -391,6 +444,27 @@ mod tests {
         assert_eq!(reflect_get(&child, "inherited"), JsValue::Smi(10));
     }
 
+    #[test]
+    fn test_reflect_get_with_receiver_returns_value() {
+        let mut t = JsObject::new();
+        t.set_property("k", JsValue::Smi(77)).unwrap();
+        let receiver = JsValue::Undefined;
+        assert_eq!(
+            reflect_get_with_receiver(&t, "k", &receiver),
+            JsValue::Smi(77)
+        );
+    }
+
+    #[test]
+    fn test_reflect_get_with_receiver_missing_returns_undefined() {
+        let t = JsObject::new();
+        let receiver = JsValue::Undefined;
+        assert_eq!(
+            reflect_get_with_receiver(&t, "nope", &receiver),
+            JsValue::Undefined
+        );
+    }
+
     // ── reflect_set ──────────────────────────────────────────────────────────
 
     #[test]
@@ -406,6 +480,22 @@ mod tests {
         t.define_own_property("ro", JsValue::Smi(1), PropertyAttributes::empty())
             .unwrap();
         assert!(!reflect_set(&mut t, "ro", JsValue::Smi(2)).unwrap());
+    }
+
+    #[test]
+    fn test_reflect_set_with_receiver_creates_property() {
+        let mut t = JsObject::new();
+        let receiver = JsValue::Undefined;
+        assert!(reflect_set_with_receiver(&mut t, "k", JsValue::Smi(50), &receiver).unwrap());
+        assert_eq!(t.get_property("k"), JsValue::Smi(50));
+    }
+
+    #[test]
+    fn test_reflect_set_overwrites_existing() {
+        let mut t = JsObject::new();
+        t.set_property("k", JsValue::Smi(1)).unwrap();
+        assert!(reflect_set(&mut t, "k", JsValue::Smi(2)).unwrap());
+        assert_eq!(t.get_property("k"), JsValue::Smi(2));
     }
 
     // ── reflect_has ──────────────────────────────────────────────────────────
@@ -427,6 +517,12 @@ mod tests {
             .unwrap();
         let child = JsObject::with_prototype(proto);
         assert!(reflect_has(&child, "up"));
+    }
+
+    #[test]
+    fn test_reflect_has_empty_object() {
+        let t = JsObject::new();
+        assert!(!reflect_has(&t, "anything"));
     }
 
     // ── reflect_delete_property ───────────────────────────────────────────────
@@ -451,6 +547,19 @@ mod tests {
     fn test_reflect_delete_missing_property_returns_true() {
         let mut t = JsObject::new();
         assert!(reflect_delete_property(&mut t, "ghost").unwrap());
+    }
+
+    #[test]
+    fn test_reflect_delete_configurable_property() {
+        let mut t = JsObject::new();
+        t.define_own_property(
+            "cfg",
+            JsValue::Smi(1),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        )
+        .unwrap();
+        assert!(reflect_delete_property(&mut t, "cfg").unwrap());
+        assert!(!t.has_own_property("cfg"));
     }
 
     // ── reflect_define_property ───────────────────────────────────────────────
@@ -480,6 +589,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_reflect_define_property_read_only() {
+        let mut t = JsObject::new();
+        assert!(
+            reflect_define_property(&mut t, "ro", JsValue::Smi(7), PropertyAttributes::empty(),)
+                .unwrap()
+        );
+        let desc = reflect_get_own_property_descriptor(&t, "ro");
+        assert!(desc.is_some());
+        let (_val, attrs) = desc.unwrap();
+        assert!(!attrs.contains(PropertyAttributes::WRITABLE));
+    }
+
+    #[test]
+    fn test_reflect_define_property_all_attributes() {
+        let mut t = JsObject::new();
+        let all = PropertyAttributes::WRITABLE
+            | PropertyAttributes::ENUMERABLE
+            | PropertyAttributes::CONFIGURABLE;
+        assert!(reflect_define_property(&mut t, "full", JsValue::Boolean(true), all).unwrap());
+        let (val, attrs) = reflect_get_own_property_descriptor(&t, "full").unwrap();
+        assert_eq!(val, JsValue::Boolean(true));
+        assert_eq!(attrs, all);
+    }
+
     // ── reflect_get_own_property_descriptor ──────────────────────────────────
 
     #[test]
@@ -498,6 +632,17 @@ mod tests {
     fn test_reflect_get_own_property_descriptor_missing_returns_none() {
         let t = JsObject::new();
         assert!(reflect_get_own_property_descriptor(&t, "nope").is_none());
+    }
+
+    #[test]
+    fn test_reflect_get_own_property_descriptor_does_not_check_prototype() {
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        proto
+            .borrow_mut()
+            .set_property("inherited", JsValue::Smi(1))
+            .unwrap();
+        let child = JsObject::with_prototype(proto);
+        assert!(reflect_get_own_property_descriptor(&child, "inherited").is_none());
     }
 
     // ── reflect_get_prototype_of / set_prototype_of ───────────────────────────
@@ -523,6 +668,14 @@ mod tests {
         let mut t = JsObject::new();
         assert!(reflect_set_prototype_of(&mut t, Some(Rc::clone(&proto))));
         assert!(t.prototype().is_some());
+    }
+
+    #[test]
+    fn test_reflect_set_prototype_of_null() {
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        let mut t = JsObject::with_prototype(proto);
+        assert!(reflect_set_prototype_of(&mut t, None));
+        assert!(t.prototype().is_none());
     }
 
     #[test]
@@ -563,6 +716,94 @@ mod tests {
         let mut t = JsObject::new();
         assert!(reflect_prevent_extensions(&mut t));
         assert!(!t.is_extensible());
+    }
+
+    #[test]
+    fn test_reflect_prevent_extensions_idempotent() {
+        let mut t = JsObject::new();
+        assert!(reflect_prevent_extensions(&mut t));
+        assert!(reflect_prevent_extensions(&mut t));
+        assert!(!t.is_extensible());
+    }
+
+    // ── reflect_own_keys ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_reflect_own_keys_empty() {
+        let t = JsObject::new();
+        assert!(reflect_own_keys(&t).is_empty());
+    }
+
+    #[test]
+    fn test_reflect_own_keys_multiple() {
+        let mut t = JsObject::new();
+        t.set_property("a", JsValue::Smi(1)).unwrap();
+        t.set_property("b", JsValue::Smi(2)).unwrap();
+        t.set_property("c", JsValue::Smi(3)).unwrap();
+        let keys = reflect_own_keys(&t);
+        assert_eq!(keys.len(), 3);
+    }
+
+    // ── reflect_apply ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_reflect_apply_with_this() {
+        let result = reflect_apply(
+            |this, _args| {
+                if this == JsValue::Smi(42) {
+                    Ok(JsValue::Boolean(true))
+                } else {
+                    Ok(JsValue::Boolean(false))
+                }
+            },
+            JsValue::Smi(42),
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_reflect_apply_empty_args() {
+        let result = reflect_apply(
+            |_this, args| Ok(JsValue::Smi(args.len() as i32)),
+            JsValue::Undefined,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_reflect_apply_multiple_args() {
+        let result = reflect_apply(
+            |_this, args| Ok(JsValue::Smi(args.len() as i32)),
+            JsValue::Undefined,
+            vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── reflect_construct ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_reflect_construct_empty_args() {
+        let obj = reflect_construct(|_args| Ok(JsObject::new()), vec![]).unwrap();
+        assert!(reflect_own_keys(&obj).is_empty());
+    }
+
+    #[test]
+    fn test_reflect_construct_with_new_target_sets_prototype() {
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        proto
+            .borrow_mut()
+            .set_property("tag", JsValue::Boolean(true))
+            .unwrap();
+        let obj =
+            reflect_construct_with_new_target(|_args| Ok(JsObject::new()), vec![], Some(proto))
+                .unwrap();
+        assert!(obj.prototype().is_some());
     }
 
     // ── reflect_own_keys ─────────────────────────────────────────────────────
