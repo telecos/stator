@@ -3155,14 +3155,17 @@ fn handle_get_async_iterator(
         JsValue::Generator(_) | JsValue::Iterator(_) => normalize_async_iterator(iterable),
         // PlainObject with @@asyncIterator → call it first (§27.1.4.2).
         JsValue::PlainObject(ref map)
-            if map.borrow().contains_key("@@asyncIterator")
-                || map.borrow().contains_key("Symbol(2)") =>
+            if {
+                let sym_key = format!("Symbol({})", crate::builtins::symbol::SYMBOL_ASYNC_ITERATOR);
+                map.borrow().contains_key("@@asyncIterator") || map.borrow().contains_key(&sym_key)
+            } =>
         {
+            let sym_key = format!("Symbol({})", crate::builtins::symbol::SYMBOL_ASYNC_ITERATOR);
             let iter_fn = map
                 .borrow()
                 .get("@@asyncIterator")
                 .cloned()
-                .or_else(|| map.borrow().get("Symbol(2)").cloned());
+                .or_else(|| map.borrow().get(&sym_key).cloned());
             match iter_fn {
                 Some(ref f @ (JsValue::NativeFunction(_) | JsValue::Function(_))) => {
                     normalize_async_iterator(dispatch_call_with_this(f, iterable.clone(), vec![])?)
@@ -3395,7 +3398,7 @@ fn handle_iterator_close(
                 _ => {}
             }
         }
-        // Close a generator by marking it as completed (§27.5.3.4).
+        // Close a generator by calling .return() (§27.5.3.4).
         JsValue::Generator(gs) => {
             if gs.borrow().bytecode_array.is_async() {
                 let queue = crate::builtins::promise::MicrotaskQueue::new();
@@ -3403,10 +3406,8 @@ fn handle_iterator_close(
                 settle_async_iterator_result(result, &queue)
                     .map_err(super::async_iterator_reason_to_error)?;
             } else {
-                let mut state = gs.borrow_mut();
-                if state.status != GeneratorStatus::Completed {
-                    state.status = GeneratorStatus::Completed;
-                }
+                // Use generator_return so that finally blocks execute.
+                Interpreter::generator_return(gs, JsValue::Undefined)?;
             }
         }
         // NativeIterator has no .return() — nothing to do.

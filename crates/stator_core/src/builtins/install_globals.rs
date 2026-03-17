@@ -34104,4 +34104,520 @@ mod tests {
         .unwrap();
         assert_eq!(result, JsValue::String("tdz".into()));
     }
+
+    // ── Async iteration / for-await-of conformance tests ──────────────
+
+    /// Helper: evaluate async JS and unwrap the fulfilled promise value.
+    fn assert_async_eval(src: &str, expected: JsValue) {
+        let result = global_eval(src).unwrap();
+        match result {
+            JsValue::Promise(p) => {
+                assert!(
+                    !p.is_rejected(),
+                    "expected fulfilled promise, got rejected: {p:?}"
+                );
+                assert_eq!(
+                    p.value(),
+                    Some(expected),
+                    "promise fulfilled with wrong value"
+                );
+            }
+            other => panic!("expected Promise, got {other:?}"),
+        }
+    }
+
+    /// Helper: evaluate async JS and assert the promise rejects with a value.
+    fn assert_async_eval_rejects(src: &str, expected: JsValue) {
+        let result = global_eval(src).unwrap();
+        match result {
+            JsValue::Promise(p) => {
+                assert!(p.is_rejected(), "expected rejected promise, got {p:?}");
+                assert_eq!(
+                    p.reason(),
+                    Some(expected),
+                    "promise rejected with wrong reason"
+                );
+            }
+            other => panic!("expected Promise, got {other:?}"),
+        }
+    }
+
+    // 1. Basic async generator yields values.
+    #[test]
+    fn e2e_async_gen_basic_yield() {
+        assert_async_eval(
+            r#"async function* g() { yield 10; yield 20; }
+            async function f() {
+                var it = g();
+                var a = await it.next();
+                var b = await it.next();
+                var c = await it.next();
+                return String(a.value) + ',' + String(b.value) + ',' + String(c.done);
+            } f()"#,
+            JsValue::String("10,20,true".into()),
+        );
+    }
+
+    // 2. Async generator .next() returns a Promise.
+    #[test]
+    fn e2e_async_gen_next_returns_promise() {
+        let result =
+            global_eval("async function* g() { yield 1; } var it = g(); typeof it.next()").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    // 3. Async generator .return() completes the generator.
+    #[test]
+    fn e2e_async_gen_return_method() {
+        assert_async_eval(
+            r#"async function* g() { yield 1; yield 2; yield 3; }
+            async function f() {
+                var it = g();
+                await it.next();
+                var r = await it.return(99);
+                var n = await it.next();
+                return String(r.value) + ',' + r.done + ',' + String(n.value) + ',' + n.done;
+            } f()"#,
+            JsValue::String("99,true,undefined,true".into()),
+        );
+    }
+
+    // 4. Async generator .throw() caught by try/catch inside generator.
+    #[test]
+    fn e2e_async_gen_throw_caught() {
+        assert_async_eval(
+            r#"async function* g() {
+                try { yield 1; } catch(e) { yield 'caught:' + e; }
+            }
+            async function f() {
+                var it = g();
+                await it.next();
+                var r = await it.throw('oops');
+                return r.value;
+            } f()"#,
+            JsValue::String("caught:oops".into()),
+        );
+    }
+
+    // 5. Async generator .throw() rejects when uncaught.
+    #[test]
+    fn e2e_async_gen_throw_uncaught_rejects() {
+        assert_async_eval_rejects(
+            r#"async function* g() { yield 1; }
+            async function f() {
+                var it = g();
+                await it.next();
+                return await it.throw('boom');
+            } f()"#,
+            JsValue::String("boom".into()),
+        );
+    }
+
+    // 6. Async generator yield with await expression.
+    #[test]
+    fn e2e_async_gen_yield_await() {
+        assert_async_eval(
+            r#"async function* g() {
+                yield await Promise.resolve(42);
+            }
+            async function f() {
+                var r = await g().next();
+                return r.value;
+            } f()"#,
+            JsValue::Smi(42),
+        );
+    }
+
+    // 7. for-await-of over an array.
+    #[test]
+    fn e2e_for_await_of_array() {
+        assert_async_eval(
+            r#"async function f() {
+                var sum = 0;
+                for await (var x of [1, 2, 3]) { sum = sum + x; }
+                return sum;
+            } f()"#,
+            JsValue::Smi(6),
+        );
+    }
+
+    // 8. for-await-of over an array containing promises.
+    #[test]
+    fn e2e_for_await_of_array_promises() {
+        assert_async_eval(
+            r#"async function f() {
+                var sum = 0;
+                for await (var x of [Promise.resolve(10), Promise.resolve(20)]) {
+                    sum = sum + x;
+                }
+                return sum;
+            } f()"#,
+            JsValue::Smi(30),
+        );
+    }
+
+    // 9. for-await-of over an async generator.
+    #[test]
+    fn e2e_for_await_of_async_gen() {
+        assert_async_eval(
+            r#"async function* nums() { yield 5; yield 10; yield 15; }
+            async function f() {
+                var sum = 0;
+                for await (var x of nums()) { sum = sum + x; }
+                return sum;
+            } f()"#,
+            JsValue::Smi(30),
+        );
+    }
+
+    // 10. for-await-of over a sync generator wraps values.
+    #[test]
+    fn e2e_for_await_of_sync_gen() {
+        assert_async_eval(
+            r#"function* g() { yield 3; yield 7; }
+            async function f() {
+                var sum = 0;
+                for await (var x of g()) { sum = sum + x; }
+                return sum;
+            } f()"#,
+            JsValue::Smi(10),
+        );
+    }
+
+    // 11. for-await-of with custom Symbol.asyncIterator.
+    #[test]
+    fn e2e_for_await_of_custom_async_iterable() {
+        assert_async_eval(
+            r#"async function f() {
+                var obj = {};
+                obj[Symbol.asyncIterator] = function() {
+                    var i = 0;
+                    return {
+                        next: function() {
+                            i = i + 1;
+                            if (i <= 3) return Promise.resolve({ value: i, done: false });
+                            return Promise.resolve({ value: undefined, done: true });
+                        }
+                    };
+                };
+                var sum = 0;
+                for await (var x of obj) { sum = sum + x; }
+                return sum;
+            } f()"#,
+            JsValue::Smi(6),
+        );
+    }
+
+    // 12. for-await-of falls back to Symbol.iterator when no asyncIterator.
+    #[test]
+    fn e2e_for_await_of_fallback_symbol_iterator() {
+        assert_async_eval(
+            r#"async function f() {
+                var obj = {};
+                obj[Symbol.iterator] = function() {
+                    var i = 0;
+                    return {
+                        next: function() {
+                            i = i + 1;
+                            if (i <= 2) return { value: i * 10, done: false };
+                            return { value: undefined, done: true };
+                        }
+                    };
+                };
+                var sum = 0;
+                for await (var x of obj) { sum = sum + x; }
+                return sum;
+            } f()"#,
+            JsValue::Smi(30),
+        );
+    }
+
+    // 13. for-await-of break stops iteration early.
+    #[test]
+    fn e2e_for_await_of_break() {
+        assert_async_eval(
+            r#"async function* g() { yield 1; yield 2; yield 3; yield 4; }
+            async function f() {
+                var sum = 0;
+                for await (var x of g()) {
+                    sum = sum + x;
+                    if (x === 2) break;
+                }
+                return sum;
+            } f()"#,
+            JsValue::Smi(3),
+        );
+    }
+
+    // 14. for-await-of break calls .return() on async generator.
+    #[test]
+    fn e2e_for_await_of_break_calls_return_async_gen() {
+        assert_async_eval(
+            r#"async function* g() {
+                try { yield 1; yield 2; } finally { globalThis.__closed = true; }
+            }
+            async function f() {
+                globalThis.__closed = false;
+                for await (var x of g()) { break; }
+                return globalThis.__closed;
+            } f()"#,
+            JsValue::Boolean(true),
+        );
+    }
+
+    // 15. for-await-of break calls .return() on custom async iterator.
+    #[test]
+    fn e2e_for_await_of_break_calls_return_custom() {
+        assert_async_eval(
+            r#"async function f() {
+                var returned = false;
+                var obj = {};
+                obj[Symbol.asyncIterator] = function() {
+                    return {
+                        next: function() {
+                            return Promise.resolve({ value: 1, done: false });
+                        },
+                        return: function() {
+                            returned = true;
+                            return Promise.resolve({ value: undefined, done: true });
+                        }
+                    };
+                };
+                for await (var x of obj) { break; }
+                return returned;
+            } f()"#,
+            JsValue::Boolean(true),
+        );
+    }
+
+    // 16. for-await-of over empty async generator.
+    #[test]
+    fn e2e_for_await_of_empty_async_gen() {
+        assert_async_eval(
+            r#"async function* g() {}
+            async function f() {
+                var count = 0;
+                for await (var x of g()) { count = count + 1; }
+                return count;
+            } f()"#,
+            JsValue::Smi(0),
+        );
+    }
+
+    // 17. for-await-of over a string.
+    #[test]
+    fn e2e_for_await_of_string() {
+        assert_async_eval(
+            r#"async function f() {
+                var out = '';
+                for await (var ch of 'abc') { out = out + ch + ','; }
+                return out;
+            } f()"#,
+            JsValue::String("a,b,c,".into()),
+        );
+    }
+
+    // 18. Async generator with multiple awaits between yields.
+    #[test]
+    fn e2e_async_gen_multiple_awaits() {
+        assert_async_eval(
+            r#"async function* g() {
+                var a = await Promise.resolve(1);
+                yield a;
+                var b = await Promise.resolve(2);
+                yield a + b;
+            }
+            async function f() {
+                var out = [];
+                for await (var x of g()) { out.push(x); }
+                return out.join(',');
+            } f()"#,
+            JsValue::String("1,3".into()),
+        );
+    }
+
+    // 19. for-await-of with const destructuring.
+    #[test]
+    fn e2e_for_await_of_destructuring() {
+        assert_async_eval(
+            r#"async function f() {
+                var arr = [[1,2],[3,4]];
+                var sum = 0;
+                for await (var pair of arr) { sum = sum + pair[0] + pair[1]; }
+                return sum;
+            } f()"#,
+            JsValue::Smi(10),
+        );
+    }
+
+    // 20. Nested for-await-of loops.
+    #[test]
+    fn e2e_for_await_of_nested() {
+        assert_async_eval(
+            r#"async function f() {
+                var sum = 0;
+                for await (var a of [1, 2]) {
+                    for await (var b of [10, 20]) {
+                        sum = sum + a * b;
+                    }
+                }
+                return sum;
+            } f()"#,
+            JsValue::Smi(90),
+        );
+    }
+
+    // 21. Async generator return value is not iterated.
+    #[test]
+    fn e2e_async_gen_return_not_iterated() {
+        assert_async_eval(
+            r#"async function* g() { yield 1; return 999; }
+            async function f() {
+                var vals = [];
+                for await (var x of g()) { vals.push(x); }
+                return vals.join(',');
+            } f()"#,
+            JsValue::String("1".into()),
+        );
+    }
+
+    // 22. Symbol.asyncIterator is a symbol.
+    #[test]
+    fn e2e_symbol_async_iterator_is_symbol() {
+        let r = global_eval("typeof Symbol.asyncIterator").unwrap();
+        assert_eq!(r, JsValue::String("symbol".into()));
+    }
+
+    // 23. Symbol.asyncIterator description.
+    #[test]
+    fn e2e_symbol_async_iterator_desc() {
+        let r = global_eval("Symbol.asyncIterator.description").unwrap();
+        assert_eq!(r, JsValue::String("Symbol.asyncIterator".into()));
+    }
+
+    // 24. for-await-of rejected promise in array throws.
+    #[test]
+    fn e2e_for_await_of_rejected_promise_throws() {
+        assert_async_eval_rejects(
+            r#"async function f() {
+                for await (var x of [Promise.reject('fail')]) {}
+                return 'should not reach';
+            } f()"#,
+            JsValue::String("fail".into()),
+        );
+    }
+
+    // 25. Async generator .return() after completion.
+    #[test]
+    fn e2e_async_gen_return_after_done() {
+        assert_async_eval(
+            r#"async function* g() { yield 1; }
+            async function f() {
+                var it = g();
+                await it.next();
+                await it.next();
+                var r = await it.return(42);
+                return String(r.value) + ',' + r.done;
+            } f()"#,
+            JsValue::String("42,true".into()),
+        );
+    }
+
+    // 26. Sync generator for-of break runs finally (IteratorClose fix).
+    #[test]
+    fn e2e_sync_gen_for_of_break_runs_finally() {
+        let r = global_eval(
+            r#"var closed = false;
+            function* g() { try { yield 1; yield 2; } finally { closed = true; } }
+            for (var x of g()) { break; }
+            closed"#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // 27. Async generator exhaustion then .return().
+    #[test]
+    fn e2e_async_gen_exhausted_then_return() {
+        assert_async_eval(
+            r#"async function* g() { yield 'a'; }
+            async function f() {
+                var it = g();
+                await it.next();
+                await it.next();
+                var r = await it.return('z');
+                return r.value + ',' + r.done;
+            } f()"#,
+            JsValue::String("z,true".into()),
+        );
+    }
+
+    // 28. for-await-of with async gen that yields promises.
+    #[test]
+    fn e2e_for_await_of_async_gen_yields_promise() {
+        assert_async_eval(
+            r#"async function* g() {
+                yield Promise.resolve(100);
+                yield Promise.resolve(200);
+            }
+            async function f() {
+                var sum = 0;
+                for await (var x of g()) { sum = sum + x; }
+                return sum;
+            } f()"#,
+            JsValue::Smi(300),
+        );
+    }
+
+    // 29. for-await-of with break in second iteration.
+    #[test]
+    fn e2e_for_await_of_break_second_iteration() {
+        assert_async_eval(
+            r#"async function* g() { yield 'a'; yield 'b'; yield 'c'; }
+            async function f() {
+                var out = '';
+                for await (var x of g()) {
+                    out = out + x;
+                    if (x === 'b') break;
+                }
+                return out;
+            } f()"#,
+            JsValue::String("ab".into()),
+        );
+    }
+
+    // 30. Async generator passes values through .next() argument.
+    #[test]
+    fn e2e_async_gen_next_input_value() {
+        assert_async_eval(
+            r#"async function* g() {
+                var x = yield 'first';
+                yield 'got:' + x;
+            }
+            async function f() {
+                var it = g();
+                await it.next();
+                var r = await it.next('hello');
+                return r.value;
+            } f()"#,
+            JsValue::String("got:hello".into()),
+        );
+    }
+
+    // 31. for-await-of on async generator with try/finally.
+    #[test]
+    fn e2e_for_await_of_async_gen_try_finally() {
+        assert_async_eval(
+            r#"async function* g() {
+                try { yield 1; yield 2; yield 3; }
+                finally { globalThis.__fin = 'done'; }
+            }
+            async function f() {
+                globalThis.__fin = '';
+                for await (var x of g()) { if (x === 2) break; }
+                return globalThis.__fin;
+            } f()"#,
+            JsValue::String("done".into()),
+        );
+    }
 }
