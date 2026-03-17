@@ -6060,6 +6060,10 @@ pub fn dispatch_construct_call(
             pop_call_frame();
             result
         }
+        JsValue::NativeFunction(f) => {
+            let ctor_proto = proto_lookup(&new_target, "prototype");
+            construct_builtin_result(f(args)?, &ctor_proto)
+        }
         JsValue::PlainObject(map) => {
             let call_fn = map.borrow().get("__call__").cloned();
             if let Some(f) = call_fn {
@@ -6069,6 +6073,25 @@ pub fn dispatch_construct_call(
             }
         }
         _ => Err(StatorError::TypeError("value is not a function".into())),
+    }
+}
+
+pub(super) fn construct_builtin_result(
+    result: JsValue,
+    ctor_proto: &JsValue,
+) -> StatorResult<JsValue> {
+    match result {
+        JsValue::PlainObject(_) | JsValue::Object(_) | JsValue::Error(_) | JsValue::Promise(_) => {
+            Ok(wire_construct_prototype(result, ctor_proto))
+        }
+        JsValue::Null | JsValue::Undefined => {
+            let mut props = PropertyMap::new();
+            if !matches!(ctor_proto, JsValue::Undefined | JsValue::Null) {
+                props.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), ctor_proto.clone());
+            }
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
+        }
+        primitive => Ok(wire_construct_prototype(primitive.to_object()?, ctor_proto)),
     }
 }
 
