@@ -14813,17 +14813,33 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         // ── globalThis (ECMAScript §19.1) ───────────────────────────────────
         // `globalThis` is a self-referential property of the global object.
         // The inner map is shared via `Rc` so that `globalThis.globalThis`
-        // resolves back to the same object (configurable, writable, not enumerable).
+        // resolves back to the same object.
+        //
+        // Per the ES spec, global properties have specific descriptor
+        // attributes:
+        //  - Value properties (undefined, NaN, Infinity): {W:0, E:0, C:0}
+        //  - Everything else (constructors, functions, namespaces,
+        //    globalThis): {W:1, E:0, C:1}
+        let non_writable_non_configurable = PropertyAttributes::empty();
+        let builtin_attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
         let mut inner_props = PropertyMap::new();
         for (k, v) in globals.iter() {
-            inner_props.insert(k.clone(), v.clone());
+            let attrs = match k.as_str() {
+                "undefined" | "NaN" | "Infinity" => non_writable_non_configurable,
+                _ => builtin_attrs,
+            };
+            inner_props.insert_with_attrs(k.clone(), v.clone(), attrs);
         }
         let inner = Rc::new(RefCell::new(inner_props));
         let global_object = JsValue::PlainObject(Rc::clone(&inner));
         {
             let mut inner_borrow = inner.borrow_mut();
-            inner_borrow.insert("globalThis".into(), global_object.clone());
-            inner_borrow.insert("this".into(), global_object.clone());
+            inner_borrow.insert_with_attrs(
+                "globalThis".into(),
+                global_object.clone(),
+                builtin_attrs,
+            );
+            inner_borrow.insert_with_attrs("this".into(), global_object.clone(), builtin_attrs);
         }
         globals.insert("globalThis".into(), global_object.clone());
         globals.insert("this".into(), global_object);
@@ -47512,5 +47528,485 @@ mod tests {
     #[test]
     fn e2e_wk_has_instance_not_in_symbol_for_registry() {
         assert_eval_true("Symbol.keyFor(Symbol.hasInstance) === undefined");
+    }
+
+    // ── Global object conformance: property descriptors ──────────────────
+
+    // 1. Value properties — non-writable, non-enumerable, non-configurable
+
+    #[test]
+    fn e2e_global_undefined_not_writable() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'undefined'); \
+             d.writable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_global_undefined_not_enumerable() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'undefined'); \
+             d.enumerable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_global_undefined_not_configurable() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'undefined'); \
+             d.configurable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_global_nan_not_writable() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'NaN'); \
+             d.writable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_global_nan_not_enumerable() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'NaN'); \
+             d.enumerable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_global_nan_not_configurable() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'NaN'); \
+             d.configurable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_global_infinity_not_writable() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Infinity'); \
+             d.writable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_global_infinity_not_enumerable() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Infinity'); \
+             d.enumerable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_global_infinity_not_configurable() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Infinity'); \
+             d.configurable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_global_undefined_value() {
+        assert_eval_true(
+            "Object.getOwnPropertyDescriptor(globalThis, 'undefined').value === undefined",
+        );
+    }
+
+    #[test]
+    fn e2e_global_nan_value_is_nan() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'NaN'); \
+             typeof d.value === 'number' && d.value !== d.value",
+        );
+    }
+
+    #[test]
+    fn e2e_global_infinity_value() {
+        assert_eval_true(
+            "Object.getOwnPropertyDescriptor(globalThis, 'Infinity').value === Infinity",
+        );
+    }
+
+    // 2. Function properties — writable, non-enumerable, configurable
+
+    #[test]
+    fn e2e_global_eval_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'eval'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_isfinite_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'isFinite'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_isnan_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'isNaN'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_parsefloat_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'parseFloat'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_parseint_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'parseInt'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_decodeuri_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'decodeURI'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_encodeuri_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'encodeURI'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_decodeuricomponent_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'decodeURIComponent'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_encodeuricomponent_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'encodeURIComponent'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    // 3. Constructor properties — writable, non-enumerable, configurable
+
+    #[test]
+    fn e2e_global_object_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Object'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_function_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Function'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_array_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Array'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_number_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Number'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_string_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'String'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_boolean_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Boolean'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_symbol_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Symbol'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_error_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Error'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_typeerror_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'TypeError'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_regexp_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'RegExp'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_map_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Map'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_set_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Set'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_promise_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Promise'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_date_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Date'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_weakmap_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'WeakMap'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_weakset_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'WeakSet'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_arraybuffer_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'ArrayBuffer'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_dataview_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'DataView'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_json_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'JSON'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_math_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Math'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_reflect_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Reflect'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_global_proxy_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Proxy'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    // 4. globalThis identity
+
+    #[test]
+    fn e2e_globalthis_is_self_referential() {
+        assert_eval_true("globalThis.globalThis === globalThis");
+    }
+
+    #[test]
+    fn e2e_globalthis_equals_this() {
+        assert_eval_true("globalThis === this");
+    }
+
+    #[test]
+    fn e2e_globalthis_descriptor() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'globalThis'); \
+             d.writable === true && d.enumerable === false && d.configurable === true",
+        );
+    }
+
+    // 5. typeof on undeclared variable yields "undefined"
+
+    #[test]
+    fn e2e_typeof_undeclared_is_undefined() {
+        assert_eval_true("typeof undeclaredVariable === 'undefined'");
+    }
+
+    #[test]
+    fn e2e_typeof_undeclared_no_reference_error() {
+        // Must not throw — typeof on undeclared is always "undefined".
+        assert_eval_true(
+            "(function() { try { return typeof noSuchVar === 'undefined'; } \
+             catch(e) { return false; } })()",
+        );
+    }
+
+    // 6. Global var declarations become properties of globalThis
+
+    #[test]
+    fn e2e_var_declaration_visible_in_scope() {
+        assert_eval_true("var gTestVar1 = 42; gTestVar1 === 42");
+    }
+
+    // 7. Global let/const are NOT accessible as globalThis properties
+
+    #[test]
+    fn e2e_let_not_on_globalthis() {
+        assert_eval_true(
+            "let gTestLet1 = 99; \
+             typeof globalThis.gTestLet1 === 'undefined'",
+        );
+    }
+
+    #[test]
+    fn e2e_const_not_on_globalthis() {
+        assert_eval_true(
+            "const gTestConst1 = 77; \
+             typeof globalThis.gTestConst1 === 'undefined'",
+        );
+    }
+
+    // 8. Additional descriptor and identity checks
+
+    #[test]
+    fn e2e_global_nan_is_nan() {
+        assert_eval_true("NaN !== NaN");
+    }
+
+    #[test]
+    fn e2e_global_infinity_is_positive_infinity() {
+        assert_eval_true("Infinity > 0 && Infinity === 1/0");
+    }
+
+    #[test]
+    fn e2e_global_undefined_is_undefined() {
+        assert_eval_true("undefined === void 0");
+    }
+
+    #[test]
+    fn e2e_value_properties_not_in_keys() {
+        // Value properties must be non-enumerable → not in Object.keys
+        assert_eval_true(
+            "var keys = Object.keys(globalThis); \
+             keys.indexOf('undefined') === -1 && \
+             keys.indexOf('NaN') === -1 && \
+             keys.indexOf('Infinity') === -1",
+        );
+    }
+
+    #[test]
+    fn e2e_constructors_not_in_keys() {
+        // Constructor properties must be non-enumerable → not in Object.keys
+        assert_eval_true(
+            "var keys = Object.keys(globalThis); \
+             keys.indexOf('Object') === -1 && \
+             keys.indexOf('Array') === -1 && \
+             keys.indexOf('Function') === -1",
+        );
+    }
+
+    #[test]
+    fn e2e_functions_not_in_keys() {
+        // Function properties must be non-enumerable → not in Object.keys
+        assert_eval_true(
+            "var keys = Object.keys(globalThis); \
+             keys.indexOf('parseInt') === -1 && \
+             keys.indexOf('eval') === -1",
+        );
+    }
+
+    #[test]
+    fn e2e_globalthis_has_own_property_object() {
+        assert_eval_true("globalThis.hasOwnProperty('Object')");
+    }
+
+    #[test]
+    fn e2e_globalthis_has_own_property_undefined() {
+        assert_eval_true("globalThis.hasOwnProperty('undefined')");
+    }
+
+    #[test]
+    fn e2e_typeof_global_eval_is_function() {
+        assert_eval_true("typeof eval === 'function'");
+    }
+
+    #[test]
+    fn e2e_typeof_global_parseint_is_function() {
+        assert_eval_true("typeof parseInt === 'function'");
     }
 }
