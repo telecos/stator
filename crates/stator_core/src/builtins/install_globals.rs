@@ -79,7 +79,7 @@ use crate::builtins::math::{
     math_tan, math_tanh, math_trunc,
 };
 use crate::builtins::number::{
-    number_reformat_exponential, number_to_exponential, number_to_precision,
+    number_reformat_exponential, number_to_exponential, number_to_fixed, number_to_precision,
 };
 use crate::builtins::proxy::{
     ProxyHandler, proxy_define_property, proxy_delete_property, proxy_get,
@@ -4090,22 +4090,7 @@ fn make_number() -> JsValue {
                             "toFixed() digits argument must be between 0 and 100".to_string(),
                         ));
                     }
-                    let digits = f as usize;
-                    if n.is_nan() {
-                        return Ok(JsValue::String("NaN".into()));
-                    }
-                    if n.is_infinite() {
-                        return Ok(JsValue::String(
-                            if n > 0.0 { "Infinity" } else { "-Infinity" }.into(),
-                        ));
-                    }
-                    // For very large numbers (>= 1e21) the spec says ToString(x).
-                    if n.abs() >= 1e21 {
-                        return Ok(JsValue::String(
-                            JsValue::HeapNumber(n).to_js_string()?.into(),
-                        ));
-                    }
-                    Ok(JsValue::String(format!("{n:.digits$}").into()))
+                    Ok(JsValue::String(number_to_fixed(n, f as u32)?.into()))
                 }),
             );
 
@@ -36516,5 +36501,324 @@ mod tests {
     fn e2e_error_stack_trace_limit_type() {
         let result = global_eval("typeof Error.stackTraceLimit").unwrap();
         assert_eq!(result, JsValue::String("number".to_string()));
+    }
+
+    // ── Number deep conformance e2e tests ───────────────────────────────
+
+    /// Number() with no args returns 0.
+    #[test]
+    fn e2e_number_call_no_args() {
+        assert_eval_true("Number() === 0");
+    }
+
+    /// Number("123") coerces string to number.
+    #[test]
+    fn e2e_number_coerce_string() {
+        assert_eval_true("Number('123') === 123");
+    }
+
+    /// Number(true) returns 1.
+    #[test]
+    fn e2e_number_coerce_true() {
+        assert_eval_true("Number(true) === 1");
+    }
+
+    /// Number(false) returns 0.
+    #[test]
+    fn e2e_number_coerce_false() {
+        assert_eval_true("Number(false) === 0");
+    }
+
+    /// Number(null) returns 0.
+    #[test]
+    fn e2e_number_coerce_null() {
+        assert_eval_true("Number(null) === 0");
+    }
+
+    /// Number(undefined) returns NaN.
+    #[test]
+    fn e2e_number_coerce_undefined() {
+        assert_eval_true("Number.isNaN(Number(undefined))");
+    }
+
+    /// Number("") returns 0.
+    #[test]
+    fn e2e_number_coerce_empty_string() {
+        assert_eval_true("Number('') === 0");
+    }
+
+    /// Number("  ") returns 0 (whitespace only).
+    #[test]
+    fn e2e_number_coerce_whitespace() {
+        assert_eval_true("Number('  ') === 0");
+    }
+
+    /// Number("0x1A") parses hex.
+    #[test]
+    fn e2e_number_coerce_hex() {
+        assert_eval_true("Number('0x1A') === 26");
+    }
+
+    /// Number.EPSILON is a positive value close to machine epsilon.
+    #[test]
+    fn e2e_number_epsilon_value() {
+        assert_eval_true("Number.EPSILON === 2.220446049250313e-16");
+    }
+
+    /// Number.MAX_SAFE_INTEGER equals 2^53 - 1.
+    #[test]
+    fn e2e_number_max_safe_integer_value() {
+        assert_eval_true("Number.MAX_SAFE_INTEGER === 9007199254740991");
+    }
+
+    /// Number.MIN_SAFE_INTEGER equals -(2^53 - 1).
+    #[test]
+    fn e2e_number_min_safe_integer_value() {
+        assert_eval_true("Number.MIN_SAFE_INTEGER === -9007199254740991");
+    }
+
+    /// Number.isSafeInteger(42) returns true.
+    #[test]
+    fn e2e_number_is_safe_integer_42() {
+        assert_eval_true("Number.isSafeInteger(42) === true");
+    }
+
+    /// Number.isSafeInteger(3.14) returns false.
+    #[test]
+    fn e2e_number_is_safe_integer_float() {
+        assert_eval_true("Number.isSafeInteger(3.14) === false");
+    }
+
+    /// Number.isSafeInteger(NaN) returns false.
+    #[test]
+    fn e2e_number_is_safe_integer_nan() {
+        assert_eval_true("Number.isSafeInteger(NaN) === false");
+    }
+
+    /// Number.isSafeInteger(Infinity) returns false.
+    #[test]
+    fn e2e_number_is_safe_integer_infinity() {
+        assert_eval_true("Number.isSafeInteger(Infinity) === false");
+    }
+
+    /// Number.isSafeInteger("42") returns false (no coercion).
+    #[test]
+    fn e2e_number_is_safe_integer_no_coerce() {
+        assert_eval_true("Number.isSafeInteger('42') === false");
+    }
+
+    /// toFixed(2) basic rounding.
+    #[test]
+    fn e2e_to_fixed_basic() {
+        let result = global_eval("(3.14159).toFixed(2)").unwrap();
+        assert_eq!(result, JsValue::String("3.14".to_string()));
+    }
+
+    /// toFixed(0) rounds to integer.
+    #[test]
+    fn e2e_to_fixed_zero_digits() {
+        let result = global_eval("(1.5).toFixed(0)").unwrap();
+        assert_eq!(result, JsValue::String("2".to_string()));
+    }
+
+    /// toFixed on NaN returns "NaN".
+    #[test]
+    fn e2e_to_fixed_nan() {
+        let result = global_eval("NaN.toFixed(2)").unwrap();
+        assert_eq!(result, JsValue::String("NaN".to_string()));
+    }
+
+    /// toFixed with no args defaults to 0 digits.
+    #[test]
+    fn e2e_to_fixed_no_args() {
+        let result = global_eval("(1.7).toFixed()").unwrap();
+        assert_eq!(result, JsValue::String("2".to_string()));
+    }
+
+    /// toFixed range error for digits > 100.
+    #[test]
+    fn e2e_to_fixed_range_error() {
+        let result = global_eval(
+            "try { (1).toFixed(101); 'no error' } catch(e) { e instanceof RangeError }",
+        );
+        assert_eq!(result.unwrap(), JsValue::Boolean(true));
+    }
+
+    /// toExponential(2) formats in scientific notation.
+    #[test]
+    fn e2e_to_exponential_basic() {
+        let result = global_eval("(123456).toExponential(2)").unwrap();
+        assert_eq!(result, JsValue::String("1.23e+5".to_string()));
+    }
+
+    /// toExponential on zero.
+    #[test]
+    fn e2e_to_exponential_zero() {
+        let result = global_eval("(0).toExponential(2)").unwrap();
+        assert_eq!(result, JsValue::String("0.00e+0".to_string()));
+    }
+
+    /// toExponential with no args uses minimal digits.
+    #[test]
+    fn e2e_to_exponential_no_args() {
+        let result = global_eval("(100).toExponential()").unwrap();
+        assert_eq!(result, JsValue::String("1e+2".to_string()));
+    }
+
+    /// toExponential on NaN returns "NaN".
+    #[test]
+    fn e2e_to_exponential_nan() {
+        let result = global_eval("NaN.toExponential(2)").unwrap();
+        assert_eq!(result, JsValue::String("NaN".to_string()));
+    }
+
+    /// toPrecision(5) formats with significant digits.
+    #[test]
+    fn e2e_to_precision_basic() {
+        let result = global_eval("(123.456).toPrecision(5)").unwrap();
+        assert_eq!(result, JsValue::String("123.46".to_string()));
+    }
+
+    /// toPrecision with no args returns ToString(number).
+    #[test]
+    fn e2e_to_precision_no_args() {
+        let result = global_eval("(123.456).toPrecision()").unwrap();
+        assert_eq!(result, JsValue::String("123.456".to_string()));
+    }
+
+    /// toPrecision range error for precision 0.
+    #[test]
+    fn e2e_to_precision_range_error() {
+        let result = global_eval(
+            "try { (1).toPrecision(0); 'no error' } catch(e) { e instanceof RangeError }",
+        );
+        assert_eq!(result.unwrap(), JsValue::Boolean(true));
+    }
+
+    /// toString(16) for hex conversion.
+    #[test]
+    fn e2e_to_string_hex() {
+        let result = global_eval("(255).toString(16)").unwrap();
+        assert_eq!(result, JsValue::String("ff".to_string()));
+    }
+
+    /// toString(2) for binary conversion.
+    #[test]
+    fn e2e_to_string_binary() {
+        let result = global_eval("(10).toString(2)").unwrap();
+        assert_eq!(result, JsValue::String("1010".to_string()));
+    }
+
+    /// toString(8) for octal conversion.
+    #[test]
+    fn e2e_to_string_octal() {
+        let result = global_eval("(8).toString(8)").unwrap();
+        assert_eq!(result, JsValue::String("10".to_string()));
+    }
+
+    /// toString(36) for base-36 conversion.
+    #[test]
+    fn e2e_to_string_base36() {
+        let result = global_eval("(35).toString(36)").unwrap();
+        assert_eq!(result, JsValue::String("z".to_string()));
+    }
+
+    /// toString() defaults to radix 10.
+    #[test]
+    fn e2e_to_string_default_radix() {
+        let result = global_eval("(42).toString()").unwrap();
+        assert_eq!(result, JsValue::String("42".to_string()));
+    }
+
+    /// toString with invalid radix throws RangeError.
+    #[test]
+    fn e2e_to_string_invalid_radix() {
+        let result =
+            global_eval("try { (1).toString(1); 'no error' } catch(e) { e instanceof RangeError }");
+        assert_eq!(result.unwrap(), JsValue::Boolean(true));
+    }
+
+    /// toString with radix 37 throws RangeError.
+    #[test]
+    fn e2e_to_string_radix_37() {
+        let result = global_eval(
+            "try { (1).toString(37); 'no error' } catch(e) { e instanceof RangeError }",
+        );
+        assert_eq!(result.unwrap(), JsValue::Boolean(true));
+    }
+
+    /// Number.prototype.valueOf returns the number.
+    #[test]
+    fn e2e_number_valueof() {
+        let result = global_eval("(42).valueOf()").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Number.isNaN does not coerce — returns false for "NaN" string.
+    #[test]
+    fn e2e_number_is_nan_no_coerce_str() {
+        assert_eval_true("Number.isNaN('NaN') === false");
+    }
+
+    /// Number.isFinite does not coerce — returns false for "42" string.
+    #[test]
+    fn e2e_number_is_finite_no_coerce_str() {
+        assert_eval_true("Number.isFinite('42') === false");
+    }
+
+    /// Number.isInteger(5.0) returns true.
+    #[test]
+    fn e2e_number_is_integer_whole() {
+        assert_eval_true("Number.isInteger(5.0) === true");
+    }
+
+    /// Number.isInteger(5.5) returns false.
+    #[test]
+    fn e2e_number_is_integer_fraction() {
+        assert_eval_true("Number.isInteger(5.5) === false");
+    }
+
+    /// Number.parseInt works through Number constructor.
+    #[test]
+    fn e2e_number_parseint() {
+        assert_eval_true("Number.parseInt('0xff', 16) === 255");
+    }
+
+    /// Number.parseFloat works through Number constructor.
+    #[test]
+    fn e2e_number_parsefloat() {
+        assert_eval_true("Number.parseFloat('3.14') === 3.14");
+    }
+
+    /// Number.NaN is NaN.
+    #[test]
+    fn e2e_number_nan_constant() {
+        assert_eval_true("Number.isNaN(Number.NaN)");
+    }
+
+    /// Number.POSITIVE_INFINITY is Infinity.
+    #[test]
+    fn e2e_number_positive_infinity() {
+        assert_eval_true("Number.POSITIVE_INFINITY === Infinity");
+    }
+
+    /// Number.NEGATIVE_INFINITY is -Infinity.
+    #[test]
+    fn e2e_number_negative_infinity() {
+        assert_eval_true("Number.NEGATIVE_INFINITY === -Infinity");
+    }
+
+    /// toFixed(-0) returns "0".
+    #[test]
+    fn e2e_to_fixed_negative_zero() {
+        let result = global_eval("(-0).toFixed(1)").unwrap();
+        assert_eq!(result, JsValue::String("0.0".to_string()));
+    }
+
+    /// Negative number toString(16).
+    #[test]
+    fn e2e_to_string_negative_hex() {
+        let result = global_eval("(-255).toString(16)").unwrap();
+        assert_eq!(result, JsValue::String("-ff".to_string()));
     }
 }
