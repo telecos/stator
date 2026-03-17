@@ -5897,6 +5897,11 @@ impl FunctionCompiler {
             ],
         ));
 
+        // A property can disappear or become non-enumerable after the initial
+        // key snapshot was created. Skip the body when the runtime no longer
+        // considers the current key visible.
+        self.emit_jump(Opcode::JumpIfUndefined, continue_lbl);
+
         // Bind the loop variable.
         match &stmt.left {
             ForInOfLeft::VarDecl(decl) => {
