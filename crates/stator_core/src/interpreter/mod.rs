@@ -653,6 +653,18 @@ pub(crate) fn set_function_name_if_missing(value: &JsValue, name: &str) {
     {
         fn_props_set(ba, "name".to_string(), JsValue::String(name.into()));
     }
+    // Anonymous class expressions: `const Foo = class {}` → Foo.name === "Foo"
+    if let JsValue::PlainObject(map) = value {
+        let borrow = map.borrow();
+        if borrow.get(".class_constructor").is_some()
+            && let Some(JsValue::String(current_name)) = borrow.get("name")
+            && current_name.is_empty()
+        {
+            drop(borrow);
+            map.borrow_mut()
+                .insert_builtin("name".to_string(), JsValue::String(name.into()));
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -56442,4 +56442,477 @@ mod tests {
              Reflect.defineProperty(o, 'x', { value: 2 }) === false",
         );
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Class features precision conformance (40+ tests)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ── 1. Method .name property ─────────────────────────────────────────
+
+    /// Regular class method has correct `.name`.
+    #[test]
+    fn e2e_class_method_name_property() {
+        assert_eval_true("class C { foo() {} } C.prototype.foo.name === 'foo'");
+    }
+
+    /// Getter has `get ` prefix in `.name`.
+    #[test]
+    fn e2e_class_getter_name_property() {
+        assert_eval_true(
+            "class C { get val() { return 1; } } \
+             var d = Object.getOwnPropertyDescriptor(C.prototype, 'val'); \
+             d.get.name === 'get val'",
+        );
+    }
+
+    /// Setter has `set ` prefix in `.name`.
+    #[test]
+    fn e2e_class_setter_name_property() {
+        assert_eval_true(
+            "class C { set val(v) {} } \
+             var d = Object.getOwnPropertyDescriptor(C.prototype, 'val'); \
+             d.set.name === 'set val'",
+        );
+    }
+
+    /// Static method has correct `.name`.
+    #[test]
+    fn e2e_class_static_method_name_property() {
+        assert_eval_true("class C { static foo() {} } C.foo.name === 'foo'");
+    }
+
+    // ── 2. Class .length property ────────────────────────────────────────
+
+    /// Class `.length` reflects the number of required constructor params.
+    #[test]
+    fn e2e_class_length_no_params() {
+        assert_eval_true("class C {} C.length === 0");
+    }
+
+    #[test]
+    fn e2e_class_length_with_params() {
+        assert_eval_true("class C { constructor(a, b) {} } C.length === 2");
+    }
+
+    #[test]
+    fn e2e_class_length_default_param_not_counted() {
+        assert_eval_true("class C { constructor(a, b = 1) {} } C.length === 1");
+    }
+
+    #[test]
+    fn e2e_class_length_rest_param_not_counted() {
+        assert_eval_true("class C { constructor(a, ...rest) {} } C.length === 1");
+    }
+
+    // ── 3. toString() on class ───────────────────────────────────────────
+
+    /// Class declaration toString returns source-like string.
+    #[test]
+    fn e2e_class_tostring_declaration() {
+        assert_eval_true("class Foo {} Foo.toString() === 'class Foo {}'");
+    }
+
+    /// Class expression toString returns source-like string.
+    #[test]
+    fn e2e_class_tostring_expression() {
+        assert_eval_true("(class Bar {}).toString() === 'class Bar {}'");
+    }
+
+    /// Class with extends toString includes body.
+    #[test]
+    fn e2e_class_tostring_with_method() {
+        assert_eval_true(
+            "class C { foo() {} } \
+             C.toString().indexOf('class C') === 0",
+        );
+    }
+
+    // ── 4. Field initializer scope: `this` ──────────────────────────────
+
+    /// `this` in a field initializer refers to the instance.
+    #[test]
+    fn e2e_class_field_this_refers_to_instance() {
+        assert_eval_true(
+            "class C { x = 10; y = this.x + 5; } \
+             new C().y === 15",
+        );
+    }
+
+    /// Field initializer can access other fields defined earlier.
+    #[test]
+    fn e2e_class_field_access_prior_field() {
+        assert_eval_true(
+            "class C { a = 1; b = 2; c = this.a + this.b; } \
+             new C().c === 3",
+        );
+    }
+
+    // ── 5. Field initializer evaluation order ────────────────────────────
+
+    /// Instance fields are evaluated top-to-bottom.
+    #[test]
+    fn e2e_class_field_evaluation_order() {
+        assert_eval_true(
+            "var log = []; \
+             class C { \
+               a = (log.push('a'), 1); \
+               b = (log.push('b'), 2); \
+               c = (log.push('c'), 3); \
+             } \
+             new C(); \
+             log[0] === 'a' && log[1] === 'b' && log[2] === 'c'",
+        );
+    }
+
+    /// Base class fields run before derived class fields.
+    #[test]
+    fn e2e_class_field_base_before_derived() {
+        assert_eval_true(
+            "var log = []; \
+             class Base { x = (log.push('base'), 1); } \
+             class Derived extends Base { y = (log.push('derived'), 2); } \
+             new Derived(); \
+             log[0] === 'base' && log[1] === 'derived'",
+        );
+    }
+
+    // ── 6. Static field initializer `this` === class ─────────────────────
+
+    /// `this` in a static field initializer is the class itself.
+    #[test]
+    fn e2e_class_static_field_this_is_class() {
+        assert_eval_true(
+            "class C { static self = this; } \
+             C.self === C",
+        );
+    }
+
+    /// Static field can reference other static fields via `this`.
+    #[test]
+    fn e2e_class_static_field_references_prior_static() {
+        assert_eval_true(
+            "class C { static x = 10; static y = this.x * 2; } \
+             C.y === 20",
+        );
+    }
+
+    // ── 7. Class expression names (named) ────────────────────────────────
+
+    /// Named class expression: `.name` is the class name, not the binding.
+    #[test]
+    fn e2e_class_expression_named_has_class_name() {
+        assert_eval_true("var Foo = class Bar {}; Foo.name === 'Bar'");
+    }
+
+    /// Named class expression: the name is not visible outside.
+    #[test]
+    fn e2e_class_expression_name_not_visible_outside_scope() {
+        assert_eval_true(
+            "var Foo = class Bar {}; \
+             typeof Bar === 'undefined'",
+        );
+    }
+
+    // ── 8. Anonymous class expressions ───────────────────────────────────
+
+    /// Anonymous class expression assigned to variable infers name.
+    #[test]
+    fn e2e_class_expression_anonymous_infers_name() {
+        assert_eval_true("var Foo = class {}; Foo.name === 'Foo'");
+    }
+
+    /// Anonymous class expression assigned to `const` infers name.
+    #[test]
+    fn e2e_class_expression_anonymous_const_infers_name() {
+        assert_eval_true("const Baz = class {}; Baz.name === 'Baz'");
+    }
+
+    /// Anonymous class expression assigned to `let` infers name.
+    #[test]
+    fn e2e_class_expression_anonymous_let_infers_name() {
+        assert_eval_true("let Qux = class {}; Qux.name === 'Qux'");
+    }
+
+    // ── 9. Method definitions: non-enumerable, configurable, writable ────
+
+    /// Class method on prototype is non-enumerable.
+    #[test]
+    fn e2e_class_method_non_enumerable() {
+        assert_eval_true(
+            "class C { foo() {} } \
+             var d = Object.getOwnPropertyDescriptor(C.prototype, 'foo'); \
+             d.enumerable === false",
+        );
+    }
+
+    /// Class method on prototype is configurable.
+    #[test]
+    fn e2e_class_method_configurable() {
+        assert_eval_true(
+            "class C { foo() {} } \
+             var d = Object.getOwnPropertyDescriptor(C.prototype, 'foo'); \
+             d.configurable === true",
+        );
+    }
+
+    /// Class method on prototype is writable.
+    #[test]
+    fn e2e_class_method_writable() {
+        assert_eval_true(
+            "class C { foo() {} } \
+             var d = Object.getOwnPropertyDescriptor(C.prototype, 'foo'); \
+             d.writable === true",
+        );
+    }
+
+    /// Class getter/setter is non-enumerable.
+    #[test]
+    fn e2e_class_accessor_non_enumerable() {
+        assert_eval_true(
+            "class C { get x() { return 1; } } \
+             var d = Object.getOwnPropertyDescriptor(C.prototype, 'x'); \
+             d.enumerable === false",
+        );
+    }
+
+    /// Class getter/setter is configurable.
+    #[test]
+    fn e2e_class_accessor_configurable() {
+        assert_eval_true(
+            "class C { get x() { return 1; } } \
+             var d = Object.getOwnPropertyDescriptor(C.prototype, 'x'); \
+             d.configurable === true",
+        );
+    }
+
+    /// Static method is non-enumerable.
+    #[test]
+    fn e2e_class_static_method_non_enumerable() {
+        assert_eval_true(
+            "class C { static foo() {} } \
+             var d = Object.getOwnPropertyDescriptor(C, 'foo'); \
+             d.enumerable === false",
+        );
+    }
+
+    /// Static method is writable.
+    #[test]
+    fn e2e_class_static_method_writable() {
+        assert_eval_true(
+            "class C { static foo() {} } \
+             var d = Object.getOwnPropertyDescriptor(C, 'foo'); \
+             d.writable === true",
+        );
+    }
+
+    /// Static method is configurable.
+    #[test]
+    fn e2e_class_static_method_configurable() {
+        assert_eval_true(
+            "class C { static foo() {} } \
+             var d = Object.getOwnPropertyDescriptor(C, 'foo'); \
+             d.configurable === true",
+        );
+    }
+
+    /// Methods do not appear in Object.keys().
+    #[test]
+    fn e2e_class_method_not_in_object_keys() {
+        assert_eval_true(
+            "class C { foo() {} bar() {} } \
+             Object.keys(C.prototype).length === 0",
+        );
+    }
+
+    // ── 10. Constructor is non-enumerable on .prototype ──────────────────
+
+    /// The `constructor` property on the prototype is non-enumerable.
+    #[test]
+    fn e2e_class_prototype_constructor_non_enumerable() {
+        assert_eval_true(
+            "class C {} \
+             var d = Object.getOwnPropertyDescriptor(C.prototype, 'constructor'); \
+             d.enumerable === false",
+        );
+    }
+
+    /// The `constructor` property is writable.
+    #[test]
+    fn e2e_class_prototype_constructor_writable() {
+        assert_eval_true(
+            "class C {} \
+             var d = Object.getOwnPropertyDescriptor(C.prototype, 'constructor'); \
+             d.writable === true",
+        );
+    }
+
+    /// The `constructor` property is configurable.
+    #[test]
+    fn e2e_class_prototype_constructor_configurable() {
+        assert_eval_true(
+            "class C {} \
+             var d = Object.getOwnPropertyDescriptor(C.prototype, 'constructor'); \
+             d.configurable === true",
+        );
+    }
+
+    /// `constructor` does not appear in for-in or Object.keys.
+    #[test]
+    fn e2e_class_prototype_constructor_not_in_keys() {
+        assert_eval_true(
+            "class C {} \
+             Object.keys(C.prototype).indexOf('constructor') === -1",
+        );
+    }
+
+    // ── 11. Derived class default constructor ────────────────────────────
+
+    /// Default derived constructor forwards all arguments to super.
+    #[test]
+    fn e2e_class_derived_default_ctor_forwards_args() {
+        assert_eval_true(
+            "class Base { constructor(a, b) { this.sum = a + b; } } \
+             class Derived extends Base {} \
+             new Derived(3, 4).sum === 7",
+        );
+    }
+
+    /// Default derived constructor preserves new.target.
+    #[test]
+    fn e2e_class_derived_default_ctor_preserves_new_target() {
+        assert_eval_true(
+            "class Base { constructor() { this.nt = new.target; } } \
+             class Derived extends Base {} \
+             new Derived().nt === Derived",
+        );
+    }
+
+    /// Derived class instanceof checks work properly.
+    #[test]
+    fn e2e_class_derived_instanceof() {
+        assert_eval_true(
+            "class Base {} \
+             class Derived extends Base {} \
+             var d = new Derived(); \
+             d instanceof Derived && d instanceof Base",
+        );
+    }
+
+    // ── 12. Class body is always strict mode ─────────────────────────────
+
+    /// Assigning to an undeclared variable in a class method throws ReferenceError.
+    #[test]
+    fn e2e_class_body_strict_mode_undeclared_var() {
+        let result = global_eval(
+            "class C { foo() { undeclaredVar = 1; } } \
+             new C().foo()",
+        );
+        assert!(matches!(result, Err(StatorError::ReferenceError(_))));
+    }
+
+    /// Deleting a plain name in a class method throws SyntaxError.
+    #[test]
+    fn e2e_class_body_strict_mode_delete_var() {
+        let result = global_eval("class C { foo() { var x; delete x; } }");
+        assert!(result.is_err());
+    }
+
+    // ── Additional .name and .length on class itself ─────────────────────
+
+    /// Class `.name` property is non-enumerable.
+    #[test]
+    fn e2e_class_name_non_enumerable() {
+        assert_eval_true(
+            "class Foo {} \
+             var d = Object.getOwnPropertyDescriptor(Foo, 'name'); \
+             d.enumerable === false",
+        );
+    }
+
+    /// Class `.name` is configurable.
+    #[test]
+    fn e2e_class_name_configurable() {
+        assert_eval_true(
+            "class Foo {} \
+             var d = Object.getOwnPropertyDescriptor(Foo, 'name'); \
+             d.configurable === true",
+        );
+    }
+
+    /// Class `.length` property is non-enumerable.
+    #[test]
+    fn e2e_class_length_non_enumerable() {
+        assert_eval_true(
+            "class Foo { constructor(a) {} } \
+             var d = Object.getOwnPropertyDescriptor(Foo, 'length'); \
+             d.enumerable === false",
+        );
+    }
+
+    /// Class `.length` is configurable.
+    #[test]
+    fn e2e_class_length_configurable() {
+        assert_eval_true(
+            "class Foo { constructor(a) {} } \
+             var d = Object.getOwnPropertyDescriptor(Foo, 'length'); \
+             d.configurable === true",
+        );
+    }
+
+    /// Class `.prototype` is non-enumerable.
+    #[test]
+    fn e2e_class_prototype_non_enumerable() {
+        assert_eval_true(
+            "class Foo {} \
+             var d = Object.getOwnPropertyDescriptor(Foo, 'prototype'); \
+             d.enumerable === false",
+        );
+    }
+
+    /// `name` and `length` do not appear in Object.keys.
+    #[test]
+    fn e2e_class_name_length_not_in_keys() {
+        assert_eval_true(
+            "class Foo {} \
+             var keys = Object.keys(Foo); \
+             keys.indexOf('name') === -1 && keys.indexOf('length') === -1",
+        );
+    }
+
+    // ── Additional field and method interaction tests ─────────────────────
+
+    /// Instance field with method interaction.
+    #[test]
+    fn e2e_class_field_and_method() {
+        assert_eval_true(
+            "class C { x = 42; getX() { return this.x; } } \
+             new C().getX() === 42",
+        );
+    }
+
+    /// Multiple instance fields defined correctly.
+    #[test]
+    fn e2e_class_multiple_instance_fields() {
+        assert_eval_true(
+            "class C { a = 1; b = 'two'; c = true; } \
+             var o = new C(); \
+             o.a === 1 && o.b === 'two' && o.c === true",
+        );
+    }
+
+    /// Static getter is non-enumerable.
+    #[test]
+    fn e2e_class_static_getter_non_enumerable() {
+        assert_eval_true(
+            "class C { static get x() { return 1; } } \
+             var d = Object.getOwnPropertyDescriptor(C, 'x'); \
+             d.enumerable === false",
+        );
+    }
+
+    /// Class declaration `.name` matches class name.
+    #[test]
+    fn e2e_class_declaration_name_value() {
+        assert_eval_true("class MyClass {} MyClass.name === 'MyClass'");
+    }
 }

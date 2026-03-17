@@ -1903,7 +1903,7 @@ impl FunctionCompiler {
             let name_key_idx = self.add_string("name");
             let name_slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
             self.emit(Instruction::new_unchecked(
-                Opcode::DefineNamedOwnProperty,
+                Opcode::DefineClassNamedOwnProperty,
                 vec![
                     to_reg_op(class_reg),
                     Operand::ConstantPoolIdx(name_key_idx),
@@ -2100,7 +2100,7 @@ impl FunctionCompiler {
                     let name_idx = self.add_string(&name);
                     let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
                     self.emit(Instruction::new_unchecked(
-                        Opcode::DefineNamedOwnProperty,
+                        Opcode::DefineClassNamedOwnProperty,
                         vec![
                             to_reg_op(target_reg),
                             Operand::ConstantPoolIdx(name_idx),
@@ -2111,7 +2111,7 @@ impl FunctionCompiler {
                     let key_reg = self.compile_computed_property_key(key_expr)?;
                     let slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
                     self.emit(Instruction::new_unchecked(
-                        Opcode::DefineKeyedOwnProperty,
+                        Opcode::DefineClassKeyedOwnProperty,
                         vec![
                             to_reg_op(target_reg),
                             to_reg_op(key_reg),
@@ -2129,7 +2129,7 @@ impl FunctionCompiler {
                     let name_idx = self.add_string(&name);
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
-                        Opcode::DefineGetterProperty,
+                        Opcode::DefineClassGetterProperty,
                         vec![
                             to_reg_op(target_reg),
                             Operand::ConstantPoolIdx(name_idx),
@@ -2140,7 +2140,7 @@ impl FunctionCompiler {
                     let key_reg = self.compile_computed_property_key(key_expr)?;
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
-                        Opcode::DefineKeyedGetterProperty,
+                        Opcode::DefineClassKeyedGetterProperty,
                         vec![to_reg_op(target_reg), to_reg_op(key_reg), slot],
                     ));
                     self.allocator
@@ -2153,7 +2153,7 @@ impl FunctionCompiler {
                     let name_idx = self.add_string(&name);
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
-                        Opcode::DefineSetterProperty,
+                        Opcode::DefineClassSetterProperty,
                         vec![
                             to_reg_op(target_reg),
                             Operand::ConstantPoolIdx(name_idx),
@@ -2164,7 +2164,7 @@ impl FunctionCompiler {
                     let key_reg = self.compile_computed_property_key(key_expr)?;
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
-                        Opcode::DefineKeyedSetterProperty,
+                        Opcode::DefineClassKeyedSetterProperty,
                         vec![to_reg_op(target_reg), to_reg_op(key_reg), slot],
                     ));
                     self.allocator
@@ -2189,7 +2189,7 @@ impl FunctionCompiler {
             let kind_key_idx = self.add_string(&self.resolve_private_kind_key(&id.name));
             let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
             self.emit(Instruction::new_unchecked(
-                Opcode::DefineNamedOwnProperty,
+                Opcode::DefineClassNamedOwnProperty,
                 vec![
                     to_reg_op(target_reg),
                     Operand::ConstantPoolIdx(kind_key_idx),
@@ -5116,6 +5116,21 @@ impl FunctionCompiler {
             }
             Expr::Arrow(a) => {
                 self.compile_arrow_expr_named(a, name)?;
+                Ok(true)
+            }
+            Expr::Class(c) if c.id.is_none() => {
+                // Anonymous class expression: infer the name from the
+                // binding target (e.g. `const Foo = class {} → Foo.name === "Foo"`).
+                let synthetic_id = Some(crate::parser::ast::Ident {
+                    loc: c.loc,
+                    name: name.to_string(),
+                });
+                self.compile_class(
+                    synthetic_id.as_ref(),
+                    c.super_class.as_deref(),
+                    &c.body,
+                    c.loc,
+                )?;
                 Ok(true)
             }
             _ => Ok(false),
