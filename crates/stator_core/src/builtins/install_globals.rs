@@ -32222,6 +32222,254 @@ mod tests {
         assert_eq!(result, JsValue::Smi(0));
     }
 
+    /// for-in skips own symbol properties.
+    #[test]
+    fn e2e_for_in_skips_own_symbol_keys() {
+        assert_eval_true(
+            r#"
+            var s = Symbol("hidden");
+            var o = { visible: 1 };
+            o[s] = 2;
+            var keys = [];
+            for (var k in o) keys.push(k);
+            keys.join(",") === "visible"
+            "#,
+        );
+    }
+
+    /// for-in skips inherited symbol properties.
+    #[test]
+    fn e2e_for_in_skips_inherited_symbol_keys() {
+        assert_eval_true(
+            r#"
+            var s = Symbol("proto");
+            var p = {};
+            p[s] = 1;
+            p.protoVisible = 2;
+            var o = Object.create(p);
+            o.ownVisible = 3;
+            var keys = [];
+            for (var k in o) keys.push(k);
+            keys.join(",") === "ownVisible,protoVisible"
+            "#,
+        );
+    }
+
+    /// for-in skips inherited non-enumerable properties.
+    #[test]
+    fn e2e_for_in_skips_inherited_non_enumerable() {
+        assert_eval_true(
+            r#"
+            var p = {};
+            Object.defineProperty(p, "hidden", { value: 1, enumerable: false, configurable: true });
+            p.visible = 2;
+            var o = Object.create(p);
+            o.own = 3;
+            var keys = [];
+            for (var k in o) keys.push(k);
+            keys.join(",") === "own,visible"
+            "#,
+        );
+    }
+
+    /// for-in includes inherited enumerable accessors as string keys.
+    #[test]
+    fn e2e_for_in_includes_inherited_accessor_key() {
+        assert_eval_true(
+            r#"
+            var p = { get x() { return 1; } };
+            var o = Object.create(p);
+            var keys = [];
+            for (var k in o) keys.push(k);
+            keys.join(",") === "x"
+            "#,
+        );
+    }
+
+    /// for-in with null-prototype objects enumerates own keys only.
+    #[test]
+    fn e2e_for_in_null_proto_own_only() {
+        assert_eval_true(
+            r#"
+            var o = Object.create(null);
+            o.a = 1;
+            o.b = 2;
+            var keys = [];
+            for (var k in o) keys.push(k);
+            keys.join(",") === "a,b"
+            "#,
+        );
+    }
+
+    /// for-in on a string enumerates UTF-16 indices.
+    #[test]
+    fn e2e_for_in_string_utf16_indices() {
+        assert_eval_true(
+            r#"
+            var keys = [];
+            for (var k in "😀x") keys.push(k);
+            keys.join(",") === "0,1,2"
+            "#,
+        );
+    }
+
+    /// for-in over null produces no iterations.
+    #[test]
+    fn e2e_for_in_null_no_iterations() {
+        assert_eval_true(
+            r#"
+            var count = 0;
+            for (var k in null) count++;
+            count === 0
+            "#,
+        );
+    }
+
+    /// for-in over undefined produces no iterations.
+    #[test]
+    fn e2e_for_in_undefined_no_iterations() {
+        assert_eval_true(
+            r#"
+            var count = 0;
+            for (var k in undefined) count++;
+            count === 0
+            "#,
+        );
+    }
+
+    /// Deleting an unvisited own key during for-in skips it.
+    #[test]
+    fn e2e_for_in_delete_unvisited_own_key() {
+        assert_eval_true(
+            r#"
+            var o = { a: 1, b: 2, c: 3 };
+            var keys = [];
+            for (var k in o) {
+                keys.push(k);
+                if (k === "a") delete o.b;
+            }
+            keys.join(",") === "a,c"
+            "#,
+        );
+    }
+
+    /// Deleting an unvisited inherited key during for-in skips it.
+    #[test]
+    fn e2e_for_in_delete_unvisited_inherited_key() {
+        assert_eval_true(
+            r#"
+            var p = { b: 2, c: 3 };
+            var o = Object.create(p);
+            o.a = 1;
+            var keys = [];
+            for (var k in o) {
+                keys.push(k);
+                if (k === "a") delete p.b;
+            }
+            keys.join(",") === "a,c"
+            "#,
+        );
+    }
+
+    /// Making an unvisited own key non-enumerable during for-in skips it.
+    #[test]
+    fn e2e_for_in_make_unvisited_own_key_non_enumerable() {
+        assert_eval_true(
+            r#"
+            var o = { a: 1, b: 2, c: 3 };
+            var keys = [];
+            for (var k in o) {
+                keys.push(k);
+                if (k === "a") {
+                    Object.defineProperty(o, "b", { value: 2, enumerable: false, writable: true, configurable: true });
+                }
+            }
+            keys.join(",") === "a,c"
+            "#,
+        );
+    }
+
+    /// Making an unvisited inherited key non-enumerable during for-in skips it.
+    #[test]
+    fn e2e_for_in_make_unvisited_inherited_key_non_enumerable() {
+        assert_eval_true(
+            r#"
+            var p = { b: 2, c: 3 };
+            var o = Object.create(p);
+            o.a = 1;
+            var keys = [];
+            for (var k in o) {
+                keys.push(k);
+                if (k === "a") {
+                    Object.defineProperty(p, "b", { value: 2, enumerable: false, writable: true, configurable: true });
+                }
+            }
+            keys.join(",") === "a,c"
+            "#,
+        );
+    }
+
+    /// Deleting the current key does not duplicate or re-order iteration.
+    #[test]
+    fn e2e_for_in_delete_current_key_no_duplicate() {
+        assert_eval_true(
+            r#"
+            var o = { a: 1, b: 2 };
+            var keys = [];
+            for (var k in o) {
+                keys.push(k);
+                delete o[k];
+            }
+            keys.join(",") === "a,b"
+            "#,
+        );
+    }
+
+    /// Deleting an inherited accessor before it is reached skips it.
+    #[test]
+    fn e2e_for_in_delete_inherited_accessor_key() {
+        assert_eval_true(
+            r#"
+            var p = {};
+            Object.defineProperty(p, "x", {
+                get: function() { return 1; },
+                enumerable: true,
+                configurable: true
+            });
+            p.y = 2;
+            var o = Object.create(p);
+            o.a = 0;
+            var keys = [];
+            for (var k in o) {
+                keys.push(k);
+                if (k === "a") delete p.x;
+            }
+            keys.join(",") === "a,y"
+            "#,
+        );
+    }
+
+    /// for-in does not surface symbol-named inherited accessors.
+    #[test]
+    fn e2e_for_in_skips_symbol_accessor_keys() {
+        assert_eval_true(
+            r#"
+            var s = Symbol("iter");
+            var p = {};
+            Object.defineProperty(p, s, {
+                get: function() { return 1; },
+                enumerable: true,
+                configurable: true
+            });
+            p.visible = 2;
+            var o = Object.create(p);
+            var keys = [];
+            for (var k in o) keys.push(k);
+            keys.join(",") === "visible"
+            "#,
+        );
+    }
+
     /// `Object.groupBy` single group gathers all items.
     #[test]
     fn e2e_object_group_by_single_group() {
@@ -36649,6 +36897,473 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// for-of invokes Symbol.iterator exactly once.
+    #[test]
+    fn e2e_for_of_calls_iterator_factory_once() {
+        assert_eval_true(
+            r#"
+            var calls = 0;
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                calls++;
+                var done = false;
+                return {
+                    next: function() {
+                        if (done) return { done: true };
+                        done = true;
+                        return { value: 1, done: false };
+                    }
+                };
+            };
+            for (var v of obj) {}
+            calls === 1
+            "#,
+        );
+    }
+
+    /// for-of advances the iterator until done.
+    #[test]
+    fn e2e_for_of_advances_until_done() {
+        assert_eval_true(
+            r#"
+            var nextCalls = 0;
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                return {
+                    next: function() {
+                        nextCalls++;
+                        if (nextCalls <= 3) return { value: nextCalls, done: false };
+                        return { value: 99, done: true };
+                    }
+                };
+            };
+            var values = [];
+            for (var v of obj) values.push(v);
+            values.join(",") === "1,2,3" && nextCalls === 4
+            "#,
+        );
+    }
+
+    /// for-of break closes the iterator exactly once.
+    #[test]
+    fn e2e_for_of_break_calls_return_once() {
+        assert_eval_true(
+            r#"
+            var returns = 0;
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        return { value: n, done: false };
+                    },
+                    return: function() {
+                        returns++;
+                        return { done: true };
+                    }
+                };
+            };
+            for (var v of obj) {
+                if (v === 2) break;
+            }
+            returns === 1
+            "#,
+        );
+    }
+
+    /// for-of break passes undefined into iterator.return().
+    #[test]
+    fn e2e_for_of_break_passes_undefined_to_return() {
+        assert_eval_true(
+            r#"
+            var sawUndefined = false;
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        return { value: n, done: false };
+                    },
+                    return: function(x) {
+                        sawUndefined = arguments.length === 1 && x === undefined;
+                        return { done: true };
+                    }
+                };
+            };
+            for (var v of obj) {
+                break;
+            }
+            sawUndefined
+            "#,
+        );
+    }
+
+    /// IteratorClose runs before a thrown error is observed by user code.
+    #[test]
+    fn e2e_for_of_throw_closes_before_catch() {
+        assert_eval_true(
+            r#"
+            var log = [];
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        return { value: n, done: false };
+                    },
+                    return: function() {
+                        log.push("return");
+                        return { done: true };
+                    }
+                };
+            };
+            try {
+                for (var v of obj) {
+                    log.push("body" + v);
+                    throw "boom";
+                }
+            } catch (e) {
+                log.push(e);
+            }
+            log.join(",") === "body1,return,boom"
+            "#,
+        );
+    }
+
+    /// Non-object iterator.return() result on break throws TypeError.
+    #[test]
+    fn e2e_for_of_break_return_must_return_object() {
+        assert_eval_true(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                return {
+                    next: function() { return { value: 1, done: false }; },
+                    return: function() { return 1; }
+                };
+            };
+            try {
+                for (var v of obj) break;
+                false;
+            } catch (e) {
+                e instanceof TypeError;
+            }
+            "#,
+        );
+    }
+
+    /// Non-object iterator.return() result on throw throws TypeError.
+    #[test]
+    fn e2e_for_of_throw_return_must_return_object() {
+        assert_eval_true(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                return {
+                    next: function() { return { value: 1, done: false }; },
+                    return: function() { return 1; }
+                };
+            };
+            try {
+                for (var v of obj) throw "boom";
+                false;
+            } catch (e) {
+                e instanceof TypeError;
+            }
+            "#,
+        );
+    }
+
+    /// for-of over strings iterates Unicode code points.
+    #[test]
+    fn e2e_for_of_string_iterates_code_points() {
+        assert_eval_true(
+            r#"
+            var out = [];
+            for (var ch of "A😀B") out.push(ch);
+            out.join("|") === "A|😀|B"
+            "#,
+        );
+    }
+
+    /// Spread over a string also uses code-point iteration.
+    #[test]
+    fn e2e_for_of_spread_string_code_points() {
+        assert_eval_true(
+            r#"
+            [..."A😀B"].join("|") === "A|😀|B"
+            "#,
+        );
+    }
+
+    /// Destructuring from a string uses code-point iteration.
+    #[test]
+    fn e2e_for_of_destructure_string_code_points() {
+        assert_eval_true(
+            r#"
+            var a, b, c;
+            [a, b, c] = "A😀B";
+            a === "A" && b === "😀" && c === "B"
+            "#,
+        );
+    }
+
+    /// for-of over Map yields entry pairs.
+    #[test]
+    fn e2e_for_of_map_destructuring_entries() {
+        assert_eval_true(
+            r#"
+            var m = new Map();
+            m.set("a", 1);
+            m.set("b", 2);
+            var out = [];
+            for (var [k, v] of m) out.push(k + v);
+            out.join(",") === "a1,b2"
+            "#,
+        );
+    }
+
+    /// for-of over Set yields insertion-ordered distinct values.
+    #[test]
+    fn e2e_for_of_set_values_in_insertion_order() {
+        assert_eval_true(
+            r#"
+            var s = new Set([2, 1, 2, 3]);
+            var out = [];
+            for (var v of s) out.push(v);
+            out.join(",") === "2,1,3"
+            "#,
+        );
+    }
+
+    /// for-of consumes generator values on the normal path.
+    #[test]
+    fn e2e_for_of_generator_normal_completion() {
+        assert_eval_true(
+            r#"
+            function* gen() {
+                yield 1;
+                yield 2;
+                yield 3;
+            }
+            var out = [];
+            for (var v of gen()) out.push(v);
+            out.join(",") === "1,2,3"
+            "#,
+        );
+    }
+
+    /// Throwing out of a for-of over a generator runs the generator finally block.
+    #[test]
+    fn e2e_for_of_generator_throw_runs_finally() {
+        assert_eval_true(
+            r#"
+            var finallyRan = false;
+            function* gen() {
+                try {
+                    yield 1;
+                    yield 2;
+                } finally {
+                    finallyRan = true;
+                }
+            }
+            try {
+                for (var v of gen()) {
+                    throw "stop";
+                }
+            } catch (e) {}
+            finallyRan
+            "#,
+        );
+    }
+
+    /// Iterator.next() must return an object.
+    #[test]
+    fn e2e_for_of_next_result_must_be_object() {
+        assert_eval_true(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                return {
+                    next: function() { return 1; }
+                };
+            };
+            try {
+                for (var v of obj) {}
+                false;
+            } catch (e) {
+                e instanceof TypeError;
+            }
+            "#,
+        );
+    }
+
+    /// Symbol.iterator must return an object-like iterator.
+    #[test]
+    fn e2e_for_of_iterator_factory_must_return_object() {
+        assert_eval_true(
+            r#"
+            var obj = {};
+            obj[Symbol.iterator] = function() { return 1; };
+            try {
+                for (var v of obj) {}
+                false;
+            } catch (e) {
+                e instanceof TypeError;
+            }
+            "#,
+        );
+    }
+
+    /// `for (const x of ...)` rebinds the const binding each iteration.
+    #[test]
+    fn e2e_for_of_const_rebinds_each_iteration() {
+        assert_eval_true(
+            r#"
+            var total = 0;
+            for (const x of [1, 2, 3]) {
+                total += x;
+            }
+            total === 6
+            "#,
+        );
+    }
+
+    /// `for (const [k, v] of map)` supports destructuring in the loop head.
+    #[test]
+    fn e2e_for_of_const_destructuring_map_entries() {
+        assert_eval_true(
+            r#"
+            var m = new Map();
+            m.set("x", 4);
+            m.set("y", 5);
+            var out = [];
+            for (const [k, v] of m) out.push(k + ":" + v);
+            out.join(",") === "x:4,y:5"
+            "#,
+        );
+    }
+
+    /// `for (let x of ...)` works with continue and keeps iterating.
+    #[test]
+    fn e2e_for_of_let_continue() {
+        assert_eval_true(
+            r#"
+            var out = [];
+            for (let x of [1, 2, 3, 4]) {
+                if (x % 2 === 0) continue;
+                out.push(x);
+            }
+            out.join(",") === "1,3"
+            "#,
+        );
+    }
+
+    /// Exhausting an iterator normally does not call .return().
+    #[test]
+    fn e2e_for_of_normal_completion_does_not_call_return() {
+        assert_eval_true(
+            r#"
+            var returns = 0;
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() {
+                        n++;
+                        if (n <= 2) return { value: n, done: false };
+                        return { done: true };
+                    },
+                    return: function() {
+                        returns++;
+                        return { done: true };
+                    }
+                };
+            };
+            var out = [];
+            for (var v of obj) out.push(v);
+            out.join(",") === "1,2" && returns === 0
+            "#,
+        );
+    }
+
+    /// Labeled break from nested for-of closes both iterators.
+    #[test]
+    fn e2e_for_of_labeled_break_closes_all_exited_iterators() {
+        assert_eval_true(
+            r#"
+            var outerReturns = 0;
+            var innerReturns = 0;
+            function makeIter(which, count) {
+                var obj = {};
+                obj[Symbol.iterator] = function() {
+                    var n = 0;
+                    return {
+                        next: function() {
+                            n++;
+                            if (n <= count) return { value: n, done: false };
+                            return { done: true };
+                        },
+                        return: function() {
+                            if (which === "outer") outerReturns++;
+                            else innerReturns++;
+                            return { done: true };
+                        }
+                    };
+                };
+                return obj;
+            }
+            outer:
+            for (var a of makeIter("outer", 3)) {
+                for (var b of makeIter("inner", 3)) {
+                    break outer;
+                }
+            }
+            outerReturns === 1 && innerReturns === 1
+            "#,
+        );
+    }
+
+    /// Labeled continue from nested for-of closes only the inner iterator.
+    #[test]
+    fn e2e_for_of_labeled_continue_closes_inner_only() {
+        assert_eval_true(
+            r#"
+            var outerReturns = 0;
+            var innerReturns = 0;
+            function makeIter(which, count) {
+                var obj = {};
+                obj[Symbol.iterator] = function() {
+                    var n = 0;
+                    return {
+                        next: function() {
+                            n++;
+                            if (n <= count) return { value: n, done: false };
+                            return { done: true };
+                        },
+                        return: function() {
+                            if (which === "outer") outerReturns++;
+                            else innerReturns++;
+                            return { done: true };
+                        }
+                    };
+                };
+                return obj;
+            }
+            outer:
+            for (var a of makeIter("outer", 2)) {
+                for (var b of makeIter("inner", 2)) {
+                    continue outer;
+                }
+            }
+            outerReturns === 0 && innerReturns === 2
+            "#,
+        );
     }
 
     /// `Object.seal` on empty non-extensible object reports sealed.

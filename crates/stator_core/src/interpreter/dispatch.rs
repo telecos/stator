@@ -4761,6 +4761,49 @@ fn handle_for_in_enumerate(
     Ok(DispatchAction::Continue)
 }
 
+fn is_for_in_excluded_key(key: &str) -> bool {
+    (key.starts_with("__") && key.ends_with("__"))
+        || crate::builtins::symbol::is_symbol_property_key(key)
+        || key.starts_with('.')
+        || key.starts_with('#')
+}
+
+fn for_in_key_still_enumerable(obj: &JsValue, key: &str) -> bool {
+    if is_for_in_excluded_key(key) {
+        return false;
+    }
+
+    match obj {
+        JsValue::PlainObject(map) => {
+            let mut current_map = Some(Rc::clone(map));
+            for _ in 0..256 {
+                let Some(m) = current_map.take() else { break };
+                let borrow = m.borrow();
+                if let Some((_value, attrs)) = borrow.get_with_attrs(key) {
+                    return attrs.contains(PropertyAttributes::ENUMERABLE);
+                }
+                current_map = borrow.get("__proto__").and_then(|v| {
+                    if let JsValue::PlainObject(proto) = v {
+                        Some(Rc::clone(proto))
+                    } else {
+                        None
+                    }
+                });
+            }
+            false
+        }
+        JsValue::Array(items) => key
+            .parse::<usize>()
+            .ok()
+            .is_some_and(|idx| idx < items.borrow().len()),
+        JsValue::String(s) => key
+            .parse::<usize>()
+            .ok()
+            .is_some_and(|idx| idx < utf16_len(s)),
+        _ => false,
+    }
+}
+
 fn handle_for_in_prepare(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -4796,6 +4839,7 @@ fn handle_for_in_next(
         JsValue::Smi(n) => (*n).max(0) as usize,
         _ => 0,
     };
+    let obj = ctx.frame.read_reg(_receiver_v)?.clone();
     let keys = ctx.frame.read_reg(keys_v)?.clone();
     let key = match &keys {
         JsValue::Array(items) => items
@@ -4805,7 +4849,13 @@ fn handle_for_in_next(
             .unwrap_or(JsValue::Undefined),
         _ => JsValue::Undefined,
     };
-    ctx.frame.accumulator = key;
+    ctx.frame.accumulator = match key {
+        JsValue::String(key_string) if for_in_key_still_enumerable(&obj, &key_string) => {
+            JsValue::String(key_string)
+        }
+        other if !matches!(other, JsValue::String(_)) => other,
+        _ => JsValue::Undefined,
+    };
     Ok(DispatchAction::Continue)
 }
 
