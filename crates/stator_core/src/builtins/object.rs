@@ -657,6 +657,104 @@ pub fn object_group_by(
     groups
 }
 
+// ── Object.prototype.hasOwnProperty ──────────────────────────────────────────
+
+/// ECMAScript §20.1.3.2 `Object.prototype.hasOwnProperty(V)`.
+///
+/// Works on any [`JsValue`] by applying **ToObject** for primitives (auto-boxing)
+/// and **ToPropertyKey** for the argument.  Returns `true` if the resulting
+/// object has an own property with the given key.
+///
+/// For primitives (numbers, booleans, strings, symbols, bigint), the value is
+/// first wrapped into a temporary object wrapper via [`JsValue::to_object`].
+/// Because the wrapper is temporary, only intrinsic properties (e.g. string
+/// indices for strings) may appear as own properties.
+///
+/// Returns [`StatorError::TypeError`] if `this_value` is `null` or `undefined`.
+pub fn object_prototype_has_own_property(
+    this_value: &JsValue,
+    key: &JsValue,
+) -> StatorResult<bool> {
+    let prop_key = key.to_property_key()?;
+    match this_value {
+        JsValue::PlainObject(map) => Ok(map.borrow().contains_key(&prop_key)),
+        _ => {
+            let obj = this_value.to_object()?;
+            if let JsValue::PlainObject(map) = &obj {
+                Ok(map.borrow().contains_key(&prop_key))
+            } else {
+                Ok(false)
+            }
+        }
+    }
+}
+
+// ── Object.prototype.isPrototypeOf ──────────────────────────────────────────
+
+/// ECMAScript §20.1.3.4 `Object.prototype.isPrototypeOf(V)`.
+///
+/// Returns `true` if `this_obj` appears anywhere in the prototype chain of
+/// the [`JsObject`] `target`.  If `target` is not an object, returns `false`.
+///
+/// This performs a simple walk up the `[[Prototype]]` chain of `target`,
+/// comparing each link to `this_obj` by pointer identity.
+pub fn object_prototype_is_prototype_of(
+    this_obj: &Rc<RefCell<JsObject>>,
+    target: &JsObject,
+) -> bool {
+    let mut current = target.prototype().cloned();
+    while let Some(proto) = current {
+        if Rc::ptr_eq(&proto, this_obj) {
+            return true;
+        }
+        current = proto.borrow().prototype().cloned();
+    }
+    false
+}
+
+// ── Object.prototype.propertyIsEnumerable ────────────────────────────────────
+
+/// ECMAScript §20.1.3.5 `Object.prototype.propertyIsEnumerable(V)`.
+///
+/// Returns `true` if the object has an **own** property named `key` that is
+/// also **enumerable**.  Inherited properties always return `false`.
+pub fn object_prototype_property_is_enumerable(obj: &JsObject, key: &str) -> bool {
+    obj.get_own_property_descriptor(key)
+        .map(|(_, attrs)| attrs.contains(PropertyAttributes::ENUMERABLE))
+        .unwrap_or(false)
+}
+
+/// [`object_prototype_property_is_enumerable`] variant for [`PropertyMap`]-backed
+/// plain objects.
+pub fn object_prototype_property_is_enumerable_plain(
+    map: &crate::objects::property_map::PropertyMap,
+    key: &str,
+) -> bool {
+    map.get_with_attrs(key)
+        .map(|(_, attrs)| attrs.contains(PropertyAttributes::ENUMERABLE))
+        .unwrap_or(false)
+}
+
+// ── Object.prototype.valueOf ────────────────────────────────────────────────
+
+/// ECMAScript §20.1.3.7 `Object.prototype.valueOf()`.
+///
+/// Returns the object itself.  For primitive values, applies **ToObject**
+/// first to return the boxed wrapper.
+pub fn object_prototype_value_of(this_value: &JsValue) -> StatorResult<JsValue> {
+    this_value.to_object()
+}
+
+// ── Object.prototype.toLocaleString ─────────────────────────────────────────
+
+/// ECMAScript §20.1.3.6 `Object.prototype.toLocaleString()`.
+///
+/// Calls `this.toString()`.  For a plain [`JsObject`], this delegates to
+/// [`JsValue::to_js_string`].
+pub fn object_prototype_to_locale_string(this_value: &JsValue) -> StatorResult<String> {
+    this_value.to_js_string()
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2528,5 +2626,640 @@ mod tests {
         });
         assert_eq!(groups["undef"].len(), 2);
         assert_eq!(groups["other"].len(), 1);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  E2E Object.prototype and Object static methods conformance tests
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── Object.prototype.hasOwnProperty ─────────────────────────────────────
+
+    #[test]
+    fn test_e2e_has_own_property_own_key_returns_true() {
+        use crate::objects::property_map::PropertyMap;
+        let mut map = PropertyMap::new();
+        map.insert("x".to_string(), JsValue::Smi(1));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert!(object_prototype_has_own_property(&obj, &JsValue::String("x".into())).unwrap());
+    }
+
+    #[test]
+    fn test_e2e_has_own_property_missing_key_returns_false() {
+        use crate::objects::property_map::PropertyMap;
+        let map = PropertyMap::new();
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert!(
+            !object_prototype_has_own_property(&obj, &JsValue::String("missing".into())).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_e2e_has_own_property_inherited_returns_false() {
+        use crate::objects::property_map::PropertyMap;
+        // Simulate: child PlainObject that doesn't have the key itself.
+        let map = PropertyMap::new();
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        // hasOwnProperty only checks own, even though prototype may have it.
+        assert!(
+            !object_prototype_has_own_property(&obj, &JsValue::String("toString".into())).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_e2e_has_own_property_symbol_key() {
+        use crate::builtins::symbol::{symbol_create, symbol_to_property_key};
+        use crate::objects::property_map::PropertyMap;
+        let sym_id = symbol_create(Some("mySymbol".to_string()));
+        let sym_key = symbol_to_property_key(sym_id);
+        let mut map = PropertyMap::new();
+        map.insert(sym_key, JsValue::Smi(42));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert!(object_prototype_has_own_property(&obj, &JsValue::Symbol(sym_id)).unwrap());
+    }
+
+    #[test]
+    fn test_e2e_has_own_property_autoboxes_string_primitive() {
+        // Calling hasOwnProperty on a string primitive auto-boxes it.
+        // String wrapper has "0", "1", ... for character indices.
+        let str_val = JsValue::String("hi".into());
+        let obj = str_val.to_object().unwrap();
+        // The wrapper should have [[PrimitiveValue]].
+        assert!(
+            object_prototype_has_own_property(&obj, &JsValue::String("[[PrimitiveValue]]".into()))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_e2e_has_own_property_null_throws() {
+        let result =
+            object_prototype_has_own_property(&JsValue::Null, &JsValue::String("x".into()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_e2e_has_own_property_undefined_throws() {
+        let result =
+            object_prototype_has_own_property(&JsValue::Undefined, &JsValue::String("x".into()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_e2e_has_own_property_number_key_coercion() {
+        use crate::objects::property_map::PropertyMap;
+        let mut map = PropertyMap::new();
+        map.insert("42".to_string(), JsValue::Boolean(true));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        // Number 42 should coerce to "42".
+        assert!(object_prototype_has_own_property(&obj, &JsValue::Smi(42)).unwrap());
+    }
+
+    // ── Object.prototype.isPrototypeOf ──────────────────────────────────────
+
+    #[test]
+    fn test_e2e_is_prototype_of_direct_proto() {
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        let child = JsObject::with_prototype(Rc::clone(&proto));
+        assert!(object_prototype_is_prototype_of(&proto, &child));
+    }
+
+    #[test]
+    fn test_e2e_is_prototype_of_indirect_proto() {
+        let grandparent = Rc::new(RefCell::new(JsObject::new()));
+        let parent = Rc::new(RefCell::new(JsObject::with_prototype(Rc::clone(
+            &grandparent,
+        ))));
+        let child = JsObject::with_prototype(Rc::clone(&parent));
+        assert!(object_prototype_is_prototype_of(&grandparent, &child));
+    }
+
+    #[test]
+    fn test_e2e_is_prototype_of_returns_false_when_not_in_chain() {
+        let unrelated = Rc::new(RefCell::new(JsObject::new()));
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        let child = JsObject::with_prototype(proto);
+        assert!(!object_prototype_is_prototype_of(&unrelated, &child));
+    }
+
+    #[test]
+    fn test_e2e_is_prototype_of_returns_false_for_null_prototype() {
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        let child = JsObject::new(); // null prototype
+        assert!(!object_prototype_is_prototype_of(&proto, &child));
+    }
+
+    #[test]
+    fn test_e2e_is_prototype_of_self_reference_returns_false() {
+        // An object is not its own prototype.
+        let obj = Rc::new(RefCell::new(JsObject::new()));
+        assert!(!object_prototype_is_prototype_of(&obj, &obj.borrow()));
+    }
+
+    // ── Object.prototype.propertyIsEnumerable ───────────────────────────────
+
+    #[test]
+    fn test_e2e_property_is_enumerable_own_enumerable() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        assert!(object_prototype_property_is_enumerable(&obj, "x"));
+    }
+
+    #[test]
+    fn test_e2e_property_is_enumerable_own_non_enumerable() {
+        let mut obj = JsObject::new();
+        obj.define_own_property("hidden", JsValue::Smi(1), PropertyAttributes::WRITABLE)
+            .unwrap();
+        assert!(!object_prototype_property_is_enumerable(&obj, "hidden"));
+    }
+
+    #[test]
+    fn test_e2e_property_is_enumerable_inherited_returns_false() {
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        proto
+            .borrow_mut()
+            .set_property("inherited", JsValue::Smi(1))
+            .unwrap();
+        let child = object_create(Some(proto));
+        // Even though "inherited" is enumerable on the prototype,
+        // propertyIsEnumerable only checks own properties.
+        assert!(!object_prototype_property_is_enumerable(
+            &child,
+            "inherited"
+        ));
+    }
+
+    #[test]
+    fn test_e2e_property_is_enumerable_missing_returns_false() {
+        let obj = JsObject::new();
+        assert!(!object_prototype_property_is_enumerable(&obj, "nope"));
+    }
+
+    #[test]
+    fn test_e2e_property_is_enumerable_plain_object() {
+        use crate::objects::property_map::PropertyMap;
+        let mut map = PropertyMap::new();
+        map.insert("a".to_string(), JsValue::Smi(1));
+        map.insert_with_attrs(
+            "b".to_string(),
+            JsValue::Smi(2),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        );
+        assert!(object_prototype_property_is_enumerable_plain(&map, "a"));
+        assert!(!object_prototype_property_is_enumerable_plain(&map, "b"));
+    }
+
+    // ── Object.prototype.valueOf ────────────────────────────────────────────
+
+    #[test]
+    fn test_e2e_value_of_object_returns_itself() {
+        use crate::objects::property_map::PropertyMap;
+        let map = PropertyMap::new();
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        let result = object_prototype_value_of(&obj).unwrap();
+        // PlainObject should return itself (same Rc).
+        assert_eq!(result, obj);
+    }
+
+    #[test]
+    fn test_e2e_value_of_number_wraps() {
+        let val = JsValue::Smi(42);
+        let result = object_prototype_value_of(&val).unwrap();
+        // Should return a PlainObject wrapper.
+        assert!(matches!(result, JsValue::PlainObject(_)));
+        if let JsValue::PlainObject(map) = &result {
+            assert_eq!(
+                map.borrow().get("[[PrimitiveValue]]"),
+                Some(&JsValue::Smi(42))
+            );
+        }
+    }
+
+    #[test]
+    fn test_e2e_value_of_boolean_wraps() {
+        let val = JsValue::Boolean(true);
+        let result = object_prototype_value_of(&val).unwrap();
+        assert!(matches!(result, JsValue::PlainObject(_)));
+        if let JsValue::PlainObject(map) = &result {
+            assert_eq!(
+                map.borrow().get("[[PrimitiveValue]]"),
+                Some(&JsValue::Boolean(true))
+            );
+        }
+    }
+
+    #[test]
+    fn test_e2e_value_of_string_wraps() {
+        let val = JsValue::String("hello".into());
+        let result = object_prototype_value_of(&val).unwrap();
+        assert!(matches!(result, JsValue::PlainObject(_)));
+    }
+
+    #[test]
+    fn test_e2e_value_of_null_throws() {
+        assert!(object_prototype_value_of(&JsValue::Null).is_err());
+    }
+
+    #[test]
+    fn test_e2e_value_of_undefined_throws() {
+        assert!(object_prototype_value_of(&JsValue::Undefined).is_err());
+    }
+
+    // ── Object.prototype.toLocaleString ─────────────────────────────────────
+
+    #[test]
+    fn test_e2e_to_locale_string_number() {
+        let val = JsValue::Smi(42);
+        assert_eq!(object_prototype_to_locale_string(&val).unwrap(), "42");
+    }
+
+    #[test]
+    fn test_e2e_to_locale_string_string() {
+        let val = JsValue::String("hello".into());
+        assert_eq!(object_prototype_to_locale_string(&val).unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_e2e_to_locale_string_boolean() {
+        assert_eq!(
+            object_prototype_to_locale_string(&JsValue::Boolean(true)).unwrap(),
+            "true"
+        );
+    }
+
+    #[test]
+    fn test_e2e_to_locale_string_null() {
+        assert_eq!(
+            object_prototype_to_locale_string(&JsValue::Null).unwrap(),
+            "null"
+        );
+    }
+
+    // ── Object.create(null) — no prototype ──────────────────────────────────
+
+    #[test]
+    fn test_e2e_create_null_has_no_prototype() {
+        let obj = object_create(None);
+        assert!(obj.prototype().is_none());
+    }
+
+    #[test]
+    fn test_e2e_create_null_has_no_inherited_methods() {
+        let obj = object_create(None);
+        // A null-prototype object has no "toString" or "hasOwnProperty".
+        assert!(!obj.has_own_property("toString"));
+        assert!(!obj.has_own_property("hasOwnProperty"));
+        assert!(obj.get_property("toString") == JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_e2e_create_null_can_add_properties() {
+        let mut obj = object_create(None);
+        obj.set_property("x", JsValue::Smi(42)).unwrap();
+        assert_eq!(obj.get_own_property("x"), Some(JsValue::Smi(42)));
+    }
+
+    // ── Object.create(proto, properties) ────────────────────────────────────
+
+    #[test]
+    fn test_e2e_create_with_props_accessor_descriptor() {
+        use crate::objects::property_map::PropertyMap;
+        let mut desc = PropertyMap::new();
+        desc.insert("get".to_string(), JsValue::Boolean(true));
+        desc.insert("enumerable".to_string(), JsValue::Boolean(true));
+        desc.insert("configurable".to_string(), JsValue::Boolean(true));
+        let mut props_map = PropertyMap::new();
+        props_map.insert(
+            "acc".to_string(),
+            JsValue::PlainObject(Rc::new(RefCell::new(desc))),
+        );
+        let props = JsValue::PlainObject(Rc::new(RefCell::new(props_map)));
+
+        let obj = object_create_with_properties(None, Some(&props)).unwrap();
+        // The accessor internals should be set up.
+        assert!(obj.has_own_property("__get_acc__"));
+    }
+
+    // ── Object.assign — enumerable own + Symbol keys ────────────────────────
+
+    #[test]
+    fn test_e2e_assign_copies_symbol_keyed_properties() {
+        use crate::builtins::symbol::{symbol_create, symbol_to_property_key};
+        let sym_id = symbol_create(Some("testSym".to_string()));
+        let sym_key = symbol_to_property_key(sym_id);
+
+        let mut src = JsObject::new();
+        src.set_property(&sym_key, JsValue::Smi(99)).unwrap();
+
+        let mut target = JsObject::new();
+        object_assign(&mut target, &[&src]).unwrap();
+        assert_eq!(target.get_own_property(&sym_key), Some(JsValue::Smi(99)));
+    }
+
+    #[test]
+    fn test_e2e_assign_does_not_copy_non_enumerable_symbol() {
+        use crate::builtins::symbol::{symbol_create, symbol_to_property_key};
+        let sym_id = symbol_create(Some("hidden".to_string()));
+        let sym_key = symbol_to_property_key(sym_id);
+
+        let mut src = JsObject::new();
+        src.define_own_property(
+            &sym_key,
+            JsValue::Smi(1),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        )
+        .unwrap();
+
+        let mut target = JsObject::new();
+        object_assign(&mut target, &[&src]).unwrap();
+        assert!(!target.has_own_property(&sym_key));
+    }
+
+    #[test]
+    fn test_e2e_assign_overwrites_in_order() {
+        let mut target = JsObject::new();
+        let mut s1 = JsObject::new();
+        s1.set_property("a", JsValue::Smi(1)).unwrap();
+        s1.set_property("b", JsValue::Smi(2)).unwrap();
+        let mut s2 = JsObject::new();
+        s2.set_property("b", JsValue::Smi(3)).unwrap();
+        s2.set_property("c", JsValue::Smi(4)).unwrap();
+
+        object_assign(&mut target, &[&s1, &s2]).unwrap();
+        assert_eq!(target.get_own_property("a"), Some(JsValue::Smi(1)));
+        assert_eq!(target.get_own_property("b"), Some(JsValue::Smi(3)));
+        assert_eq!(target.get_own_property("c"), Some(JsValue::Smi(4)));
+    }
+
+    // ── Object.is — SameValue ───────────────────────────────────────────────
+
+    #[test]
+    fn test_e2e_object_is_nan_nan_true() {
+        assert!(object_is(
+            &JsValue::HeapNumber(f64::NAN),
+            &JsValue::HeapNumber(f64::NAN)
+        ));
+    }
+
+    #[test]
+    fn test_e2e_object_is_pos_zero_neg_zero_false() {
+        assert!(!object_is(
+            &JsValue::HeapNumber(0.0),
+            &JsValue::HeapNumber(-0.0)
+        ));
+    }
+
+    #[test]
+    fn test_e2e_object_is_neg_zero_pos_zero_false() {
+        assert!(!object_is(
+            &JsValue::HeapNumber(-0.0),
+            &JsValue::HeapNumber(0.0)
+        ));
+    }
+
+    #[test]
+    fn test_e2e_object_is_pos_zero_pos_zero_true() {
+        assert!(object_is(
+            &JsValue::HeapNumber(0.0),
+            &JsValue::HeapNumber(0.0)
+        ));
+    }
+
+    #[test]
+    fn test_e2e_object_is_smi_heap_number_cross_type() {
+        // Smi(5) and HeapNumber(5.0) are the same value.
+        assert!(object_is(&JsValue::Smi(5), &JsValue::HeapNumber(5.0)));
+        assert!(object_is(&JsValue::HeapNumber(5.0), &JsValue::Smi(5)));
+    }
+
+    #[test]
+    fn test_e2e_object_is_different_types_false() {
+        assert!(!object_is(&JsValue::Smi(0), &JsValue::Boolean(false)));
+        assert!(!object_is(&JsValue::String("0".into()), &JsValue::Smi(0)));
+        assert!(!object_is(&JsValue::Null, &JsValue::Undefined));
+    }
+
+    // ── Object.fromEntries — duplicate keys last-wins ───────────────────────
+
+    #[test]
+    fn test_e2e_from_entries_duplicate_keys_last_wins() {
+        let entries = vec![
+            ("x".to_string(), JsValue::Smi(1)),
+            ("x".to_string(), JsValue::Smi(2)),
+            ("x".to_string(), JsValue::Smi(3)),
+        ];
+        let obj = object_from_entries(entries).unwrap();
+        assert_eq!(obj.get_own_property("x"), Some(JsValue::Smi(3)));
+    }
+
+    #[test]
+    fn test_e2e_from_entries_preserves_insertion_order() {
+        let entries = vec![
+            ("b".to_string(), JsValue::Smi(2)),
+            ("a".to_string(), JsValue::Smi(1)),
+            ("c".to_string(), JsValue::Smi(3)),
+        ];
+        let obj = object_from_entries(entries).unwrap();
+        let keys = object_keys(&obj);
+        assert_eq!(keys, vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn test_e2e_from_entries_properties_are_enumerable() {
+        let entries = vec![("k".to_string(), JsValue::Smi(42))];
+        let obj = object_from_entries(entries).unwrap();
+        assert!(object_prototype_property_is_enumerable(&obj, "k"));
+    }
+
+    // ── Object.entries / Object.values — own enumerable string-keyed only ───
+
+    #[test]
+    fn test_e2e_entries_excludes_symbol_keys() {
+        use crate::builtins::symbol::{symbol_create, symbol_to_property_key};
+        let sym_id = symbol_create(Some("sym".to_string()));
+        let sym_key = symbol_to_property_key(sym_id);
+
+        let mut obj = JsObject::new();
+        obj.set_property("str", JsValue::Smi(1)).unwrap();
+        obj.set_property(&sym_key, JsValue::Smi(2)).unwrap();
+
+        let entries = object_entries(&obj);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "str");
+    }
+
+    #[test]
+    fn test_e2e_values_excludes_symbol_keys() {
+        use crate::builtins::symbol::{symbol_create, symbol_to_property_key};
+        let sym_id = symbol_create(Some("sym".to_string()));
+        let sym_key = symbol_to_property_key(sym_id);
+
+        let mut obj = JsObject::new();
+        obj.set_property("str", JsValue::Smi(1)).unwrap();
+        obj.set_property(&sym_key, JsValue::Smi(2)).unwrap();
+
+        let vals = object_values(&obj);
+        assert_eq!(vals.len(), 1);
+        assert_eq!(vals[0], JsValue::Smi(1));
+    }
+
+    #[test]
+    fn test_e2e_entries_excludes_non_enumerable() {
+        let mut obj = JsObject::new();
+        obj.set_property("a", JsValue::Smi(1)).unwrap();
+        obj.define_own_property(
+            "b",
+            JsValue::Smi(2),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        )
+        .unwrap();
+
+        let entries = object_entries(&obj);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "a");
+    }
+
+    #[test]
+    fn test_e2e_values_excludes_non_enumerable() {
+        let mut obj = JsObject::new();
+        obj.set_property("a", JsValue::Smi(1)).unwrap();
+        obj.define_own_property(
+            "b",
+            JsValue::Smi(2),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        )
+        .unwrap();
+
+        let vals = object_values(&obj);
+        assert_eq!(vals, vec![JsValue::Smi(1)]);
+    }
+
+    // ── Object.getOwnPropertyNames vs Object.getOwnPropertySymbols ──────────
+
+    #[test]
+    fn test_e2e_get_own_property_names_excludes_symbols() {
+        use crate::builtins::symbol::{symbol_create, symbol_to_property_key};
+        let sym_id = symbol_create(Some("s".to_string()));
+        let sym_key = symbol_to_property_key(sym_id);
+
+        let mut obj = JsObject::new();
+        obj.set_property("str", JsValue::Smi(1)).unwrap();
+        obj.set_property(&sym_key, JsValue::Smi(2)).unwrap();
+
+        let names = object_get_own_property_names(&obj);
+        assert!(names.contains(&"str".to_string()));
+        assert!(!names.iter().any(|k| is_symbol_property_key(k)));
+    }
+
+    #[test]
+    fn test_e2e_get_own_property_symbols_excludes_strings() {
+        use crate::builtins::symbol::{symbol_create, symbol_to_property_key};
+        let sym_id = symbol_create(Some("s".to_string()));
+        let sym_key = symbol_to_property_key(sym_id);
+
+        let mut obj = JsObject::new();
+        obj.set_property("str", JsValue::Smi(1)).unwrap();
+        obj.set_property(&sym_key, JsValue::Smi(2)).unwrap();
+
+        let symbols = object_get_own_property_symbols(&obj);
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0], JsValue::Symbol(sym_id));
+    }
+
+    #[test]
+    fn test_e2e_get_own_property_names_includes_non_enumerable() {
+        let mut obj = JsObject::new();
+        obj.set_property("vis", JsValue::Smi(1)).unwrap();
+        obj.define_own_property("hid", JsValue::Smi(2), PropertyAttributes::WRITABLE)
+            .unwrap();
+
+        let names = object_get_own_property_names(&obj);
+        assert!(names.contains(&"vis".to_string()));
+        assert!(names.contains(&"hid".to_string()));
+    }
+
+    #[test]
+    fn test_e2e_get_own_property_symbols_empty_when_no_symbols() {
+        let mut obj = JsObject::new();
+        obj.set_property("a", JsValue::Smi(1)).unwrap();
+        assert!(object_get_own_property_symbols(&obj).is_empty());
+    }
+
+    // ── Combined workflow tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_e2e_create_null_then_has_own_property() {
+        let mut obj = object_create(None);
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        assert!(object_has_own(&obj, "x"));
+        assert!(!object_has_own(&obj, "toString"));
+    }
+
+    #[test]
+    fn test_e2e_assign_then_entries() {
+        let mut target = JsObject::new();
+        let mut src = JsObject::new();
+        src.set_property("a", JsValue::Smi(1)).unwrap();
+        src.set_property("b", JsValue::Smi(2)).unwrap();
+        object_assign(&mut target, &[&src]).unwrap();
+
+        let entries = object_entries(&target);
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn test_e2e_from_entries_then_values() {
+        let entries = vec![
+            ("x".to_string(), JsValue::Smi(10)),
+            ("y".to_string(), JsValue::Smi(20)),
+        ];
+        let obj = object_from_entries(entries).unwrap();
+        let vals = object_values(&obj);
+        assert!(vals.contains(&JsValue::Smi(10)));
+        assert!(vals.contains(&JsValue::Smi(20)));
+    }
+
+    #[test]
+    fn test_e2e_freeze_then_property_is_enumerable() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        object_freeze(&mut obj).unwrap();
+        // The property remains enumerable after freezing.
+        assert!(object_prototype_property_is_enumerable(&obj, "x"));
+    }
+
+    #[test]
+    fn test_e2e_value_of_array_returns_self() {
+        let arr = JsValue::new_array(vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        let result = object_prototype_value_of(&arr).unwrap();
+        assert!(matches!(result, JsValue::Array(_)));
+    }
+
+    #[test]
+    fn test_e2e_to_locale_string_undefined() {
+        assert_eq!(
+            object_prototype_to_locale_string(&JsValue::Undefined).unwrap(),
+            "undefined"
+        );
+    }
+
+    #[test]
+    fn test_e2e_to_locale_string_heap_number() {
+        let val = JsValue::HeapNumber(3.14);
+        assert_eq!(object_prototype_to_locale_string(&val).unwrap(), "3.14");
+    }
+
+    #[test]
+    fn test_e2e_object_is_bigint_equality() {
+        assert!(object_is(&JsValue::BigInt(42), &JsValue::BigInt(42)));
+        assert!(!object_is(&JsValue::BigInt(1), &JsValue::BigInt(2)));
+    }
+
+    #[test]
+    fn test_e2e_object_is_symbol_equality() {
+        use crate::builtins::symbol::symbol_create;
+        let s1 = symbol_create(Some("a".to_string()));
+        let s2 = symbol_create(Some("a".to_string()));
+        assert!(object_is(&JsValue::Symbol(s1), &JsValue::Symbol(s1)));
+        assert!(!object_is(&JsValue::Symbol(s1), &JsValue::Symbol(s2)));
     }
 }
