@@ -17429,25 +17429,25 @@ mod tests {
     // ── typeof operator ─────────────────────────────────────────────────
 
     #[test]
-    fn test_typeof_number() {
+    fn test_typeof_number_v2() {
         let r = eval(r#"return typeof 42;"#).unwrap();
         assert_eq!(r, JsValue::String("number".into()));
     }
 
     #[test]
-    fn test_typeof_string() {
+    fn test_typeof_string_v2() {
         let r = eval(r#"return typeof "hello";"#).unwrap();
         assert_eq!(r, JsValue::String("string".into()));
     }
 
     #[test]
-    fn test_typeof_boolean() {
+    fn test_typeof_boolean_v2() {
         let r = eval(r#"return typeof true;"#).unwrap();
         assert_eq!(r, JsValue::String("boolean".into()));
     }
 
     #[test]
-    fn test_typeof_undefined() {
+    fn test_typeof_undefined_v2() {
         let r = eval(r#"return typeof undefined;"#).unwrap();
         assert_eq!(r, JsValue::String("undefined".into()));
     }
@@ -17756,7 +17756,7 @@ mod tests {
         let r = eval("return 99 ** 0;").unwrap();
         let n = match r {
             JsValue::Smi(v) => v as f64,
-            JsValue::HeapNumber(v) => *v,
+            JsValue::HeapNumber(v) => v,
             _ => panic!("expected number, got {r:?}"),
         };
         assert!((n - 1.0).abs() < f64::EPSILON);
@@ -17774,7 +17774,7 @@ mod tests {
         let r = eval("return 4 ** 0.5;").unwrap();
         let n = match r {
             JsValue::Smi(v) => v as f64,
-            JsValue::HeapNumber(v) => *v,
+            JsValue::HeapNumber(v) => v,
             _ => panic!("expected number, got {r:?}"),
         };
         assert!((n - 2.0).abs() < f64::EPSILON);

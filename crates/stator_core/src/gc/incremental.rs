@@ -923,7 +923,7 @@ mod tests {
         }
 
         let mut roots_raw: Vec<*mut HeapObject> = ptrs.iter().step_by(2).copied().collect();
-        let mut root_slots: Vec<*mut *mut HeapObject> = roots_raw
+        let root_slots: Vec<*mut *mut HeapObject> = roots_raw
             .iter_mut()
             .map(|p| p as *mut *mut HeapObject)
             .collect();

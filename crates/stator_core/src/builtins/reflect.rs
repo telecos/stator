@@ -930,7 +930,7 @@ mod tests {
     // ── reflect_own_keys ─────────────────────────────────────────────────────
 
     #[test]
-    fn test_reflect_own_keys_empty() {
+    fn test_reflect_own_keys_empty_v2() {
         let t = JsObject::new();
         assert!(reflect_own_keys(&t).is_empty());
     }
@@ -1036,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reflect_own_keys_empty() {
+    fn test_reflect_own_keys_empty_v3() {
         let obj = JsObject::new();
         assert!(reflect_own_keys(&obj).is_empty());
     }
