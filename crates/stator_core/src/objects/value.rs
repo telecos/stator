@@ -36,7 +36,7 @@ use std::rc::Rc;
 
 use crate::builtins::error::JsError;
 use crate::builtins::proxy::JsProxy;
-use crate::builtins::symbol::symbol_description;
+use crate::builtins::symbol::{SYMBOL_TO_PRIMITIVE, symbol_description};
 use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::error::{StatorError, StatorResult};
 use crate::gc::trace::{Trace, Tracer};
@@ -662,15 +662,15 @@ impl JsValue {
     /// ECMAScript §7.1.1 **ToPrimitive(input, preferredType)**.
     ///
     /// If the value is already a primitive, returns it unchanged.
-    /// For object-like types, performs **OrdinaryToPrimitive**:
+    /// For object-like types, first looks up `@@toPrimitive` and calls it when
+    /// present.  Otherwise it performs **OrdinaryToPrimitive**:
     /// - With [`ToPrimitiveHint::String`]: tries `toString` then `valueOf`.
     /// - With [`ToPrimitiveHint::Number`] or [`ToPrimitiveHint::Default`]:
     ///   tries `valueOf` then `toString`.
     ///
-    /// For [`PlainObject`][Self::PlainObject] values, callable
-    /// [`NativeFunction`][Self::NativeFunction] properties named `"valueOf"` or
-    /// `"toString"` are invoked.  All other object-like types use their default
-    /// string representation.
+    /// `Date` instances inherit `Date.prototype[@@toPrimitive]`, so the
+    /// `"default"` hint behaves like `"string"` for them as required by the
+    /// ECMAScript spec.
     pub fn to_primitive(&self, hint: ToPrimitiveHint) -> StatorResult<JsValue> {
         match self {
             // Primitives return themselves (§7.1.1 step 1).
@@ -686,72 +686,33 @@ impl JsValue {
             // TheHole is an internal sentinel — treat as undefined.
             Self::TheHole => Ok(JsValue::Undefined),
 
-            // PlainObject — check @@toPrimitive, then OrdinaryToPrimitive.
-            Self::PlainObject(map) => {
-                // §7.1.1 step 2: check for @@toPrimitive method
-                let exotic = map.borrow().get("@@toPrimitive").cloned();
-                let hint_str = match hint {
-                    ToPrimitiveHint::String => "string",
-                    ToPrimitiveHint::Number => "number",
-                    ToPrimitiveHint::Default => "default",
-                };
-                match exotic {
-                    Some(JsValue::NativeFunction(f)) => {
-                        let result = f(vec![self.clone(), JsValue::String(hint_str.into())])?;
-                        if result.is_primitive() {
-                            return Ok(result);
-                        }
-                        return Err(StatorError::TypeError(
-                            "Symbol.toPrimitive returned a non-primitive".into(),
-                        ));
-                    }
-                    Some(JsValue::Function(ref ba)) => {
-                        let mut frame = crate::interpreter::InterpreterFrame::new(
-                            (**ba).clone(),
-                            vec![JsValue::String(hint_str.into())],
-                        );
-                        frame.context = Some(self.clone());
-                        let result = crate::interpreter::Interpreter::run(&mut frame)?;
-                        if result.is_primitive() {
-                            return Ok(result);
-                        }
-                        return Err(StatorError::TypeError(
-                            "Symbol.toPrimitive returned a non-primitive".into(),
-                        ));
-                    }
-                    Some(_) => {
+            // Object-like values: @@toPrimitive, then OrdinaryToPrimitive.
+            _ => {
+                let exotic = crate::interpreter::dispatch_get_property_value(
+                    self,
+                    JsValue::Symbol(SYMBOL_TO_PRIMITIVE),
+                )?;
+                if !matches!(exotic, JsValue::Undefined | JsValue::Null) {
+                    if !is_callable_for_to_primitive(&exotic) {
                         return Err(StatorError::TypeError(
                             "Symbol.toPrimitive is not a function".into(),
                         ));
                     }
-                    _ => {}
+                    let result = call_to_primitive_method(
+                        &exotic,
+                        self,
+                        vec![JsValue::String(to_primitive_hint_str(hint).into())],
+                    )?;
+                    if result.is_primitive() {
+                        return Ok(result);
+                    }
+                    return Err(StatorError::TypeError(
+                        "Symbol.toPrimitive returned a non-primitive".into(),
+                    ));
                 }
-                ordinary_to_primitive_plain_object(map, hint)
+
+                ordinary_to_primitive(self, hint)
             }
-
-            // Array — OrdinaryToPrimitive: toString produces join(","),
-            // valueOf returns the array itself (not primitive), so
-            // toString always wins regardless of hint.
-            Self::Array(items) => {
-                // Clone elements before iterating so the RefCell borrow is
-                // released before any recursive `to_js_string()` call that
-                // might re-borrow the same array.
-                let snapshot: Vec<JsValue> = items.borrow().clone();
-                let parts: Vec<String> = snapshot
-                    .iter()
-                    .map(|v| match v {
-                        Self::Null | Self::Undefined => String::new(),
-                        other => other.to_js_string().unwrap_or_default(),
-                    })
-                    .collect();
-                Ok(JsValue::String(parts.join(",").into()))
-            }
-
-            // Error — convert to its string representation (e.g. "TypeError: msg").
-            Self::Error(e) => Ok(JsValue::String(e.to_error_string().into())),
-
-            // All other object-like types: default string representation.
-            _ => Ok(JsValue::String(self.default_obj_to_string().into())),
         }
     }
 
@@ -998,56 +959,6 @@ impl JsValue {
         match key {
             Self::Symbol(id) => Ok(crate::builtins::symbol::symbol_to_property_key(id)),
             other => other.to_js_string(),
-        }
-    }
-
-    /// Default `toString()` result for object-like [`JsValue`] variants.
-    ///
-    /// Used by [`to_primitive`](Self::to_primitive) as the fallback when no
-    /// custom `toString` method is available.
-    fn default_obj_to_string(&self) -> String {
-        match self {
-            Self::Function(_) => "function () { [native code] }".to_string(),
-            Self::Array(items) => {
-                // Array.prototype.toString → join with ","
-                let parts: Vec<String> = items
-                    .borrow()
-                    .iter()
-                    .map(|v| match v {
-                        Self::Null | Self::Undefined => String::new(),
-                        other => other.to_js_string().unwrap_or_default(),
-                    })
-                    .collect();
-                parts.join(",")
-            }
-            Self::Generator(_) => "[object Generator]".to_string(),
-            Self::Iterator(_) => "[object Iterator]".to_string(),
-            Self::Error(e) => e.to_error_string(),
-            Self::NativeFunction(_) => "function () { [native code] }".to_string(),
-            Self::PlainObject(map) => {
-                // §19.1.3.6: check @@toStringTag
-                if let Some(JsValue::String(tag)) = map.borrow().get("@@toStringTag").cloned() {
-                    return format!("[object {tag}]");
-                }
-                "[object Object]".to_string()
-            }
-            Self::Promise(_) => "[object Promise]".to_string(),
-            Self::Context(_) => "[object Context]".to_string(),
-            Self::Proxy(_) => "[object Object]".to_string(),
-            Self::Object(_) => "[object Object]".to_string(),
-            Self::ArrayBuffer(buf) => {
-                if buf.borrow().shared {
-                    "[object SharedArrayBuffer]".to_string()
-                } else {
-                    "[object ArrayBuffer]".to_string()
-                }
-            }
-            Self::TypedArray(ta) => {
-                format!("[object {}]", ta.borrow().kind.name())
-            }
-            Self::DataView(_) => "[object DataView]".to_string(),
-            // Primitives should not reach here.
-            _ => "undefined".to_string(),
         }
     }
 
@@ -1542,76 +1453,80 @@ fn parse_radix_digits(s: &str, radix: u32) -> f64 {
         .unwrap_or(f64::NAN)
 }
 
-/// OrdinaryToPrimitive for [`JsValue::PlainObject`] (ECMAScript §7.1.1.1).
-///
-/// Looks for callable `NativeFunction` properties named `"valueOf"` /
-/// `"toString"` in the order dictated by `hint`.  Returns the first primitive
-/// result, or falls back to `"[object Object]"`.
-fn ordinary_to_primitive_plain_object(
-    map: &Rc<RefCell<PropertyMap>>,
-    hint: ToPrimitiveHint,
+fn to_primitive_hint_str(hint: ToPrimitiveHint) -> &'static str {
+    match hint {
+        ToPrimitiveHint::Default => "default",
+        ToPrimitiveHint::Number => "number",
+        ToPrimitiveHint::String => "string",
+    }
+}
+
+fn is_callable_for_to_primitive(value: &JsValue) -> bool {
+    match value {
+        JsValue::Function(_) | JsValue::NativeFunction(_) => true,
+        JsValue::PlainObject(map) => map.borrow().contains_key("__call__"),
+        JsValue::Proxy(proxy) => proxy.borrow().is_callable(),
+        _ => false,
+    }
+}
+
+fn call_to_primitive_method(
+    callee: &JsValue,
+    receiver: &JsValue,
+    args: Vec<JsValue>,
 ) -> StatorResult<JsValue> {
+    match callee {
+        JsValue::Function(_) | JsValue::Proxy(_) => {
+            crate::interpreter::dispatch_call_with_this(callee, receiver.clone(), args)
+        }
+        JsValue::NativeFunction(f) => {
+            let mut call_args = Vec::with_capacity(args.len() + 1);
+            call_args.push(receiver.clone());
+            call_args.extend(args);
+            f(call_args)
+        }
+        JsValue::PlainObject(map) => {
+            let call_fn = map
+                .borrow()
+                .get("__call__")
+                .cloned()
+                .ok_or_else(|| StatorError::TypeError("value is not a function".to_string()))?;
+            call_to_primitive_method(&call_fn, receiver, args)
+        }
+        _ => Err(StatorError::TypeError(
+            "value is not a function".to_string(),
+        )),
+    }
+}
+
+/// OrdinaryToPrimitive for object-like values (ECMAScript §7.1.1.1).
+///
+/// Looks for callable properties named `"valueOf"` / `"toString"` in the order
+/// dictated by `hint`. Returns the first primitive result or throws a
+/// `TypeError` if neither method produces one.
+fn ordinary_to_primitive(value: &JsValue, hint: ToPrimitiveHint) -> StatorResult<JsValue> {
     let method_names: [&str; 2] = match hint {
         ToPrimitiveHint::String => ["toString", "valueOf"],
         ToPrimitiveHint::Number | ToPrimitiveHint::Default => ["valueOf", "toString"],
     };
-    let has_own_value_of = map.borrow().contains_key("valueOf");
-    let has_own_to_string = map.borrow().contains_key("toString");
 
     for name in &method_names {
-        let maybe_fn = map.borrow().get(name).cloned();
-        match maybe_fn {
-            Some(JsValue::NativeFunction(f)) => {
-                let result = f(vec![])?;
-                if result.is_primitive() {
-                    return Ok(result);
-                }
-            }
-            Some(JsValue::Function(ref ba)) => {
-                let mut frame = crate::interpreter::InterpreterFrame::new((**ba).clone(), vec![]);
-                frame.context = Some(JsValue::PlainObject(Rc::clone(map)));
-                let result = crate::interpreter::Interpreter::run(&mut frame)?;
-                if result.is_primitive() {
-                    return Ok(result);
-                }
-            }
-            _ => {}
+        let maybe_method = crate::interpreter::dispatch_get_property_value(
+            value,
+            JsValue::String((*name).into()),
+        )?;
+        if !is_callable_for_to_primitive(&maybe_method) {
+            continue;
+        }
+        let result = call_to_primitive_method(&maybe_method, value, Vec::new())?;
+        if result.is_primitive() {
+            return Ok(result);
         }
     }
 
-    // Array-like PlainObject: join elements with comma.
-    {
-        let borrow = map.borrow();
-        if matches!(borrow.get("__is_array__"), Some(JsValue::Boolean(true))) {
-            let len = match borrow.get("length") {
-                Some(JsValue::Smi(n)) => *n as usize,
-                _ => 0,
-            };
-            let mut parts = Vec::with_capacity(len);
-            for i in 0..len {
-                match borrow.get(&i.to_string()) {
-                    Some(JsValue::Null | JsValue::Undefined) | None => parts.push(String::new()),
-                    Some(JsValue::Smi(n)) => parts.push(n.to_string()),
-                    Some(JsValue::HeapNumber(n)) => parts.push(number_to_string(*n)),
-                    Some(JsValue::Boolean(b)) => {
-                        parts.push(if *b { "true" } else { "false" }.into());
-                    }
-                    Some(JsValue::String(s)) => parts.push(s.to_string()),
-                    Some(_) => parts.push(String::new()),
-                }
-            }
-            return Ok(JsValue::String(parts.join(",").into()));
-        }
-    }
-
-    if has_own_value_of && has_own_to_string {
-        return Err(StatorError::TypeError(
-            "Cannot convert object to primitive value".into(),
-        ));
-    }
-
-    // No callable method returned a primitive — use default.
-    Ok(JsValue::String("[object Object]".to_string().into()))
+    Err(StatorError::TypeError(
+        "Cannot convert object to primitive value".into(),
+    ))
 }
 
 /// ECMAScript §7.1.6 helper: truncate an `f64` to a signed 32-bit integer.
@@ -2064,10 +1979,7 @@ mod tests {
             JsValue::String("CustomType".to_string().into()),
         );
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
-        assert_eq!(
-            obj.default_obj_to_string(),
-            "[object CustomType]".to_string()
-        );
+        assert_eq!(obj.obj_to_string_tag(), "[object CustomType]".to_string());
     }
 
     #[test]
