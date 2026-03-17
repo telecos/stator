@@ -568,7 +568,7 @@ fn array_like_delete_index(val: &JsValue, index: usize) {
         JsValue::Array(items) => {
             let mut borrow = items.borrow_mut();
             if index < borrow.len() {
-                borrow[index] = JsValue::Undefined;
+                borrow[index] = JsValue::TheHole;
             }
         }
         JsValue::PlainObject(map) => {
@@ -3595,7 +3595,11 @@ fn apply_js_reviver(holder: &JsValue, key: &str, reviver: &JsValue) -> StatorRes
             let len = items.borrow().len();
             for index in 0..len {
                 let revived = apply_js_reviver(&array, &index.to_string(), reviver)?;
-                items.borrow_mut()[index] = revived;
+                if revived.is_undefined() {
+                    array_like_delete_index(&array, index);
+                } else {
+                    array_like_set_index(&array, index, revived);
+                }
             }
             array
         }
@@ -35007,6 +35011,550 @@ mod tests {
     fn e2e_json_stringify_numeric_precision_large_exponent_uses_json_number_text() {
         let result = global_eval("JSON.stringify(1e21)").unwrap();
         assert_eq!(result, JsValue::String("1e+21".into()));
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_deletes_array_index_as_hole() {
+        assert_eval_true(
+            r#"
+            var parsed = JSON.parse('[1,2,3]', function(key, value) {
+                return key === "1" ? undefined : value;
+            });
+            !(1 in parsed) && parsed.length === 3 && JSON.stringify(parsed) === '[1,null,3]'
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_deletes_nested_array_index_as_hole() {
+        assert_eval_true(
+            r#"
+            var parsed = JSON.parse('{"items":[1,2,3]}', function(key, value) {
+                return key === "1" ? undefined : value;
+            });
+            !(1 in parsed.items) && parsed.items.length === 3 && JSON.stringify(parsed) === '{"items":[1,null,3]}'
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_bottom_up_for_objects() {
+        assert_eval_true(
+            r#"
+            var calls = [];
+            JSON.parse('{"outer":{"inner":1}}', function(key, value) {
+                calls.push(key);
+                return value;
+            });
+            calls.join(",") === "inner,outer,"
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_bottom_up_for_arrays() {
+        assert_eval_true(
+            r#"
+            var calls = [];
+            JSON.parse('[1,[2]]', function(key, value) {
+                calls.push(key);
+                return value;
+            });
+            calls.join(",") === "0,0,1,"
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_sees_transformed_child_before_parent() {
+        assert_eval_true(
+            r#"
+            var parsed = JSON.parse('{"outer":{"inner":2}}', function(key, value) {
+                if (key === "inner") return value + 1;
+                if (key === "outer") return value.inner === 3;
+                return value;
+            });
+            parsed.outer === true
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_can_replace_array_element_with_object() {
+        assert_eval_true(
+            r#"
+            var parsed = JSON.parse('[1,2]', function(key, value) {
+                return key === "1" ? { wrapped: value } : value;
+            });
+            parsed[1].wrapped === 2
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_can_replace_property_with_array() {
+        assert_eval_true(
+            r#"
+            var parsed = JSON.parse('{"a":1}', function(key, value) {
+                return key === "a" ? [value, value + 1] : value;
+            });
+            parsed.a[0] === 1 && parsed.a[1] === 2
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_can_replace_nested_object() {
+        assert_eval_true(
+            r#"
+            var parsed = JSON.parse('{"a":{"b":1}}', function(key, value) {
+                return key === "a" ? { c: value.b + 1 } : value;
+            });
+            parsed.a.c === 2 && parsed.a.b === undefined
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_can_delete_nested_object_property() {
+        assert_eval_true(
+            r#"
+            var parsed = JSON.parse('{"a":{"b":1,"c":2}}', function(key, value) {
+                return key === "b" ? undefined : value;
+            });
+            parsed.a.b === undefined && Object.keys(parsed.a).length === 1 && parsed.a.c === 2
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_can_delete_nested_object_after_child_transform() {
+        assert_eval_true(
+            r#"
+            var parsed = JSON.parse('{"a":{"b":1}}', function(key, value) {
+                if (key === "b") return value + 1;
+                if (key === "a") return value.b === 2 ? undefined : value;
+                return value;
+            });
+            parsed.a === undefined
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_can_replace_root_array() {
+        assert_eval_true(
+            r#"
+            var parsed = JSON.parse('[1,2]', function(key, value) {
+                return key === "" ? { sum: value[0] + value[1] } : value;
+            });
+            parsed.sum === 3
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_root_undefined_on_array_returns_undefined() {
+        let result = global_eval(
+            r#"
+            JSON.parse('[1,2]', function(key, value) {
+                return key === "" ? undefined : value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_root_this_contains_root_array() {
+        assert_eval_true(
+            r#"
+            var ok = false;
+            JSON.parse('[1,2]', function(key, value) {
+                if (key === "") ok = this[""][0] === 1 && this[""][1] === 2;
+                return value;
+            });
+            ok
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_keeps_sparse_array_length() {
+        assert_eval_true(
+            r#"
+            var parsed = JSON.parse('[1,2,3,4]', function(key, value) {
+                return key === "1" || key === "2" ? undefined : value;
+            });
+            parsed.length === 4 && !(1 in parsed) && !(2 in parsed)
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_can_omit_nested_property() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({ a: { b: 1, c: 2 } }, function(key, value) {
+                return key === "b" ? undefined : value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":{"c":2}}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_can_null_array_element() {
+        let result = global_eval(
+            r#"
+            JSON.stringify([1, 2, 3], function(key, value) {
+                return key === "1" ? undefined : value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("[1,null,3]".into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_can_replace_object_with_array() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({ a: { b: 1 } }, function(key, value) {
+                return key === "a" ? [value.b, value.b + 1] : value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":[1,2]}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_can_replace_array_with_object() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({ a: [1, 2] }, function(key, value) {
+                return key === "a" ? { first: value[0] } : value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":{"first":1}}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_symbol_omits_property() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({ a: 1, b: 2 }, function(key, value) {
+                return key === "b" ? Symbol("drop") : value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":1}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_symbol_nulls_array_element() {
+        let result = global_eval(
+            r#"
+            JSON.stringify([1, 2], function(key, value) {
+                return key === "1" ? Symbol("drop") : value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("[1,null]".into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_function_omits_property() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({ a: 1, b: 2 }, function(key, value) {
+                return key === "b" ? function() {} : value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":1}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_function_nulls_array_element() {
+        let result = global_eval(
+            r#"
+            JSON.stringify([1, 2], function(key, value) {
+                return key === "1" ? function() {} : value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("[1,null]".into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_runs_after_to_json() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({
+                nested: {
+                    value: 2,
+                    toJSON: function() { return { count: this.value }; }
+                }
+            }, function(key, value) {
+                if (key === "nested") return { count: value.count + 1 };
+                return value;
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"nested":{"count":3}}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_sees_to_json_result_shape() {
+        assert_eval_true(
+            r#"
+            var seen = false;
+            JSON.stringify({
+                nested: {
+                    toJSON: function() { return { count: 2 }; }
+                }
+            }, function(key, value) {
+                if (key === "nested") seen = value.count === 2 && value.toJSON === undefined;
+                return value;
+            });
+            seen
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_to_json_on_array_element_receives_index_key() {
+        let result = global_eval(
+            r#"
+            JSON.stringify([{
+                toJSON: function(key) { return key; }
+            }])
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"["0"]"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_to_json_on_root_receives_empty_string_key() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({
+                toJSON: function(key) { return key; }
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#""""#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_to_json_returning_undefined_omits_property() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({
+                keep: 1,
+                drop: {
+                    toJSON: function() { return undefined; }
+                }
+            })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String(r#"{"keep":1}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_to_json_returning_undefined_nulls_array_element() {
+        let result = global_eval(
+            r#"
+            JSON.stringify([{
+                toJSON: function() { return undefined; }
+            }])
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("[null]".into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_array_filters_nested_objects_too() {
+        let result = global_eval(r#"JSON.stringify({ a: { a: 1, b: 2 }, b: 3 }, ["a"])"#).unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":{"a":1}}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_array_skips_unlisted_root_properties() {
+        let result = global_eval(r#"JSON.stringify({ a: 1, b: 2, c: 3 }, ["b"])"#).unwrap();
+        assert_eq!(result, JsValue::String(r#"{"b":2}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_array_empty_list_yields_empty_object() {
+        let result = global_eval(r#"JSON.stringify({ a: 1, b: 2 }, [])"#).unwrap();
+        assert_eq!(result, JsValue::String("{}".into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_space_heap_number_truncates_fractional_part() {
+        let result = global_eval("JSON.stringify({ a: { b: 1 } }, null, 2.9)").unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("{\n  \"a\": {\n    \"b\": 1\n  }\n}".into())
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_space_boolean_is_ignored() {
+        let result = global_eval("JSON.stringify({ a: { b: 1 } }, null, true)").unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":{"b":1}}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_space_empty_string_is_compact() {
+        let result = global_eval(r#"JSON.stringify({ a: { b: 1 } }, null, "")"#).unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":{"b":1}}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_space_tab_string_repeats_per_level() {
+        let result = global_eval(r#"JSON.stringify({ a: { b: 1 } }, null, "\t")"#).unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("{\n\t\"a\": {\n\t\t\"b\": 1\n\t}\n}".into())
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_space_applies_to_arrays() {
+        let result = global_eval("JSON.stringify([1, { a: 2 }], null, 2)").unwrap();
+        assert_eq!(
+            result,
+            JsValue::String("[\n  1,\n  {\n    \"a\": 2\n  }\n]".into())
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_root_function_returns_undefined() {
+        let result = global_eval("JSON.stringify(function() {})").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_json_stringify_nested_function_is_omitted() {
+        let result = global_eval("JSON.stringify({ a: { b: function() {}, c: 1 } })").unwrap();
+        assert_eq!(result, JsValue::String(r#"{"a":{"c":1}}"#.into()));
+    }
+
+    #[test]
+    fn e2e_json_stringify_bigint_in_nested_array_throws_type_error() {
+        let result = global_eval("JSON.stringify([1, [2n]])");
+        assert!(matches!(result, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn e2e_json_stringify_bigint_in_nested_object_throws_type_error() {
+        let result = global_eval("JSON.stringify({ a: { b: 2n } })");
+        assert!(matches!(result, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn e2e_json_stringify_replacer_function_returning_bigint_for_property_throws() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({ a: 1 }, function(key, value) {
+                return key === "a" ? 2n : value;
+            })
+            "#,
+        );
+        assert!(matches!(result, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn e2e_json_stringify_shared_child_reference_is_not_circular() {
+        let result = global_eval(
+            r#"
+            var child = { x: 1 };
+            JSON.stringify({ a: child, b: child })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            JsValue::String(r#"{"a":{"x":1},"b":{"x":1}}"#.into())
+        );
+    }
+
+    #[test]
+    fn e2e_json_stringify_cycle_from_replacer_return_value_throws() {
+        let result = global_eval(
+            r#"
+            var root = { a: 1 };
+            JSON.stringify(root, function(key, value) {
+                return key === "a" ? root : value;
+            })
+            "#,
+        );
+        assert!(matches!(result, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn e2e_json_stringify_nested_cycle_throws_type_error() {
+        let result = global_eval(
+            r#"
+            var child = {};
+            var root = { child: child };
+            child.parent = root;
+            JSON.stringify(root)
+            "#,
+        );
+        assert!(matches!(result, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn e2e_json_stringify_to_json_can_return_bigint_and_throw() {
+        let result = global_eval(
+            r#"
+            JSON.stringify({
+                nested: {
+                    toJSON: function() { return 2n; }
+                }
+            })
+            "#,
+        );
+        assert!(matches!(result, Err(StatorError::TypeError(_))));
+    }
+
+    #[test]
+    fn e2e_json_parse_reviver_and_stringify_replacer_round_trip() {
+        assert_eval_true(
+            r#"
+            var parsed = JSON.parse('{"a":1,"b":2}', function(key, value) {
+                return typeof value === "number" ? value * 2 : value;
+            });
+            JSON.stringify(parsed, function(key, value) {
+                return key === "b" ? undefined : value;
+            }) === '{"a":2}'
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_json_parse_with_whitespace_and_reviver() {
+        assert_eval_true(
+            r#"JSON.parse(' \n {"a": 1} \t ', function(key, value) { return value; }).a === 1"#,
+        );
     }
 
     // ── typeof conformance ───────────────────────────────────────────────────
