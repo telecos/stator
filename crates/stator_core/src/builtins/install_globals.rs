@@ -9562,43 +9562,21 @@ fn make_string() -> JsValue {
             }),
         );
 
-        // trimStart()
-        proto.insert(
-            "trimStart".into(),
-            native(|args| {
-                let s = require_coercible_string(&args)?;
-                Ok(JsValue::String(string_trim_start(&s).into()))
-            }),
-        );
+        // trimStart()/trimLeft() — §B.2.3.1 legacy aliases of the same function object.
+        let trim_start_fn = builtin_fn("trimStart", 0, |args| {
+            let s = require_coercible_string(&args)?;
+            Ok(JsValue::String(string_trim_start(&s).into()))
+        });
+        proto.insert("trimStart".into(), trim_start_fn.clone());
+        proto.insert("trimLeft".into(), trim_start_fn);
 
-        // trimEnd()
-        proto.insert(
-            "trimEnd".into(),
-            native(|args| {
-                let s = require_coercible_string(&args)?;
-                Ok(JsValue::String(string_trim_end(&s).into()))
-            }),
-        );
-
-        // trimLeft() — §B.2.3.1 legacy alias for trimStart
-        // Per spec, .name is "trimStart" (not "trimLeft").
-        proto.insert(
-            "trimLeft".into(),
-            builtin_fn("trimStart", 0, |args| {
-                let s = require_coercible_string(&args)?;
-                Ok(JsValue::String(string_trim_start(&s).into()))
-            }),
-        );
-
-        // trimRight() — §B.2.3.2 legacy alias for trimEnd
-        // Per spec, .name is "trimEnd" (not "trimRight").
-        proto.insert(
-            "trimRight".into(),
-            builtin_fn("trimEnd", 0, |args| {
-                let s = require_coercible_string(&args)?;
-                Ok(JsValue::String(string_trim_end(&s).into()))
-            }),
-        );
+        // trimEnd()/trimRight() — §B.2.3.2 legacy aliases of the same function object.
+        let trim_end_fn = builtin_fn("trimEnd", 0, |args| {
+            let s = require_coercible_string(&args)?;
+            Ok(JsValue::String(string_trim_end(&s).into()))
+        });
+        proto.insert("trimEnd".into(), trim_end_fn.clone());
+        proto.insert("trimRight".into(), trim_end_fn);
 
         // split(separator?, limit?)
         proto.insert(
@@ -36192,6 +36170,244 @@ mod tests {
     fn e2e_split_regexp_limit_counts_utf16_agnostic_parts() {
         let r = global_eval("'😀1😀2x'.split(/(\\d)/, 4).join('|')").unwrap();
         assert_eq!(r, JsValue::String("😀|1|😀|2".into()));
+    }
+
+    /// `trimStart` and `trimLeft` are the same function object.
+    #[test]
+    fn e2e_string_trim_start_is_trim_left_alias() {
+        let r = global_eval("String.prototype.trimStart === String.prototype.trimLeft").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `trimEnd` and `trimRight` are the same function object.
+    #[test]
+    fn e2e_string_trim_end_is_trim_right_alias() {
+        let r = global_eval("String.prototype.trimEnd === String.prototype.trimRight").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `trimLeft.name` matches the canonical `trimStart` name.
+    #[test]
+    fn e2e_string_trim_left_alias_uses_trim_start_name() {
+        let r =
+            global_eval("String.prototype.trimStart.name + ':' + String.prototype.trimLeft.name")
+                .unwrap();
+        assert_eq!(r, JsValue::String("trimStart:trimStart".into()));
+    }
+
+    /// `trimRight.name` matches the canonical `trimEnd` name.
+    #[test]
+    fn e2e_string_trim_right_alias_uses_trim_end_name() {
+        let r =
+            global_eval("String.prototype.trimEnd.name + ':' + String.prototype.trimRight.name")
+                .unwrap();
+        assert_eq!(r, JsValue::String("trimEnd:trimEnd".into()));
+    }
+
+    /// `isWellFormed` is exposed as a string prototype method.
+    #[test]
+    fn e2e_string_is_well_formed_exists() {
+        let r = global_eval("typeof ''.isWellFormed").unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// Plain BMP strings are well formed.
+    #[test]
+    fn e2e_string_is_well_formed_ascii() {
+        let r = global_eval("'hello'.isWellFormed()").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Astral characters are treated as well formed.
+    #[test]
+    fn e2e_string_is_well_formed_astral() {
+        let r = global_eval("'😀'.isWellFormed()").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `toWellFormed` leaves ordinary strings unchanged.
+    #[test]
+    fn e2e_string_to_well_formed_ascii_identity() {
+        let r = global_eval("'hello'.toWellFormed()").unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    /// `toWellFormed` leaves astral strings unchanged.
+    #[test]
+    fn e2e_string_to_well_formed_astral_identity() {
+        let r = global_eval("'A😀B'.toWellFormed()").unwrap();
+        assert_eq!(r, JsValue::String("A😀B".into()));
+    }
+
+    /// `String.fromCodePoint(0)` produces a single code unit string.
+    #[test]
+    fn e2e_string_from_code_point_zero() {
+        let r = global_eval("String.fromCodePoint(0).length").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// Negative code points are rejected.
+    #[test]
+    fn e2e_string_from_code_point_rejects_negative() {
+        assert!(global_eval("String.fromCodePoint(-1)").is_err());
+    }
+
+    /// Values above the Unicode range are rejected.
+    #[test]
+    fn e2e_string_from_code_point_rejects_above_unicode_max() {
+        assert!(global_eval("String.fromCodePoint(0x110000)").is_err());
+    }
+
+    /// `undefined` code points are rejected.
+    #[test]
+    fn e2e_string_from_code_point_rejects_undefined() {
+        assert!(global_eval("String.fromCodePoint(undefined)").is_err());
+    }
+
+    /// `codePointAt` returns BMP code points directly.
+    #[test]
+    fn e2e_string_code_point_at_ascii() {
+        let r = global_eval("'ABC'.codePointAt(1)").unwrap();
+        assert_eq!(r, JsValue::Smi(66));
+    }
+
+    /// Negative `codePointAt` indices return `undefined`.
+    #[test]
+    fn e2e_string_code_point_at_negative_is_undefined() {
+        let r = global_eval("'ABC'.codePointAt(-1) === undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Out-of-range `codePointAt` indices return `undefined`.
+    #[test]
+    fn e2e_string_code_point_at_out_of_range_is_undefined() {
+        let r = global_eval("'ABC'.codePointAt(99) === undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `split(undefined)` returns the whole string.
+    #[test]
+    fn e2e_string_split_undefined_separator_returns_whole_string() {
+        let r = global_eval(
+            "'abc'.split(undefined).length === 1 && 'abc'.split(undefined)[0] === 'abc'",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `split(undefined, 0)` returns an empty array.
+    #[test]
+    fn e2e_string_split_undefined_separator_zero_limit() {
+        let r = global_eval("'abc'.split(undefined, 0).length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// String separators respect the limit parameter.
+    #[test]
+    fn e2e_string_split_string_separator_limit() {
+        let r = global_eval("'a,b,c'.split(',', 2).join('|')").unwrap();
+        assert_eq!(r, JsValue::String("a|b".into()));
+    }
+
+    /// RegExp separators include capture groups in the result.
+    #[test]
+    fn e2e_string_split_regexp_separator_includes_captures() {
+        let r = global_eval("'a1b2c'.split(/(\\d)/).join('|')").unwrap();
+        assert_eq!(r, JsValue::String("a|1|b|2|c".into()));
+    }
+
+    /// Optional RegExp captures surface as `undefined`.
+    #[test]
+    fn e2e_string_split_regexp_separator_optional_capture_is_undefined() {
+        let r = global_eval(
+            "var parts = 'a-b'.split(/-(x)?/); parts.length === 3 && parts[1] === undefined && parts[2] === 'b'",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// RegExp splits respect an explicit zero limit.
+    #[test]
+    fn e2e_string_split_regexp_separator_zero_limit() {
+        let r = global_eval("'a1b2'.split(/(\\d)/, 0).length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// RegExp splits with no matches return the original string.
+    #[test]
+    fn e2e_string_split_regexp_separator_no_match_returns_whole_string() {
+        let r = global_eval("'abc'.split(/\\d+/).join('|')").unwrap();
+        assert_eq!(r, JsValue::String("abc".into()));
+    }
+
+    /// String search falls back to string matching for non-RegExp inputs.
+    #[test]
+    fn e2e_string_search_string_fallback_finds_first_match() {
+        let r = global_eval("'banana'.search('na')").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// String search returns `-1` when the string is absent.
+    #[test]
+    fn e2e_string_search_string_fallback_no_match() {
+        let r = global_eval("'banana'.search('xy')").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    /// `replaceAll` with a non-global regexp throws a `TypeError`.
+    #[test]
+    fn e2e_string_replace_all_non_global_regexp_throws_type_error() {
+        let r = global_eval(
+            "try { 'a1b2'.replaceAll(/\\d/, 'x'); 'no'; } catch (e) { e instanceof TypeError; }",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `replaceAll` with a global regexp replaces each match.
+    #[test]
+    fn e2e_string_replace_all_global_regexp_replaces_all_matches() {
+        let r = global_eval("'a1b2c3'.replaceAll(/\\d/g, 'x')").unwrap();
+        assert_eq!(r, JsValue::String("axbxcx".into()));
+    }
+
+    /// RegExp replacers are called for `replaceAll`.
+    #[test]
+    fn e2e_string_replace_all_regexp_function_replacer() {
+        let r = global_eval("'a1b2'.replaceAll(/\\d/g, function(m) { return '[' + m + ']'; })")
+            .unwrap();
+        assert_eq!(r, JsValue::String("a[1]b[2]".into()));
+    }
+
+    /// `matchAll` returns an iterator object with `next`.
+    #[test]
+    fn e2e_string_match_all_returns_iterator_with_next() {
+        let r = global_eval("typeof 'a1'.matchAll(/\\d/g).next").unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// `matchAll` iterators produce values until exhaustion.
+    #[test]
+    fn e2e_string_match_all_iterator_exhausts_after_matches() {
+        let r = global_eval(
+            "var it = 'a1b2'.matchAll(/\\d/g); var a = it.next(); var b = it.next(); var c = it.next(); a.value[0] + b.value[0] + ':' + c.done",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("12:true".into()));
+    }
+
+    /// Empty `matchAll` iterators report `done` immediately.
+    #[test]
+    fn e2e_string_match_all_empty_iterator_is_done() {
+        let r = global_eval("var it = 'abc'.matchAll(/\\d+/g); it.next().done").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// String-pattern `matchAll` also returns an iterator.
+    #[test]
+    fn e2e_string_match_all_string_pattern_returns_iterator() {
+        let r = global_eval("typeof 'aba'.matchAll('a').next").unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
     }
 
     /// `String.prototype.at(-Infinity)` returns `undefined`.

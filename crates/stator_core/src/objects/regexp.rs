@@ -622,7 +622,7 @@ impl JsRegExp {
     pub fn symbol_match_all(&self, input: &str) -> Vec<RegExpMatch> {
         let has_indices = self.flags.contains(RegExpFlags::HAS_INDICES);
         let mut results = Vec::new();
-        let mut start = 0_usize;
+        let mut start = self.last_index.get();
         loop {
             if start > input.len() {
                 break;
@@ -1214,6 +1214,18 @@ mod tests {
             re.symbol_split("a-b", None),
             vec![Some("a".into()), None, Some("b".into())]
         );
+    }
+
+    #[test]
+    fn test_symbol_match_all_respects_last_index() {
+        let re = JsRegExp::new("a", "g").unwrap();
+        re.set_last_index(2);
+        let matches = re.symbol_match_all("baaa");
+        assert_eq!(
+            matches.into_iter().map(|m| m.index).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(re.last_index(), 2);
     }
 
     // ── Unicode property escapes ──────────────────────────────────────────────
