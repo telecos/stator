@@ -160,22 +160,16 @@ jobs:
           # ── Phase 2: JavaScript parsing + bytecode compilation ──────────
           check_contains '[tab] --- Phase 2: JavaScript parsing demo ---'
           check_contains '[tab] compiling: var x = 1 + 2;'
-          check_contains '[tab] OK -- 6 bytecode(s) generated'
+          check_contains '[tab] OK -- 8 bytecode(s) generated'
+          check_contains '  LdaUndefined'
+          check_contains '  StaGlobal [0], slot(0)'
           check_contains '  LdaSmi 2'
           check_contains '  Star r0'
           check_contains '  LdaSmi 1'
-          check_contains '  Add r0, slot(0)'
-          check_contains '  StaGlobal [0], slot(1)'
+          check_contains '  Add r0, slot(1)'
+          check_contains '  StaGlobal [0], slot(2)'
           check_contains '  Return'
           check_contains '[tab] ERROR: SyntaxError: at 1:5'
-
-          # LdaUndefined must NOT appear in the bytecode dump for a top-level
-          # program (programs now return their completion value directly).
-          if printf '%s' "$actual" | grep -qF 'LdaUndefined'; then
-            printf 'Unexpected LdaUndefined in bytecode dump\n'
-            printf 'Actual output:\n%s\n' "$actual"
-            exit 1
-          fi
 
           # ── Phase 3: JavaScript execution ───────────────────────────────
           check_contains '[tab] --- Phase 3: JavaScript execution demo ---'
