@@ -39738,4 +39738,745 @@ mod tests {
         let result = global_eval("(-255).toString(16)").unwrap();
         assert_eq!(result, JsValue::String("-ff".to_string()));
     }
+
+    // ── try/catch/finally deep conformance tests ────────────────────────
+
+    /// Catch variable is block-scoped — not accessible outside catch.
+    #[test]
+    fn e2e_try_catch_variable_block_scoped() {
+        let r = global_eval(
+            r#"
+            var outer = "untouched";
+            try { throw new Error("scoped"); } catch (e) { outer = typeof e; }
+            var after = typeof e;
+            outer + "," + after;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("object,undefined".into()));
+    }
+
+    /// Finally runs after break in a for loop.
+    #[test]
+    fn e2e_try_finally_runs_after_break() {
+        let r = global_eval(
+            r#"
+            var fin = false;
+            for (var i = 0; i < 5; i++) {
+                try { break; } finally { fin = true; }
+            }
+            fin;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Finally runs after continue in a for loop.
+    #[test]
+    fn e2e_try_finally_runs_after_continue() {
+        let r = global_eval(
+            r#"
+            var count = 0;
+            for (var i = 0; i < 3; i++) {
+                try { continue; } finally { count++; }
+            }
+            count;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// try/catch with break inside a for loop.
+    #[test]
+    fn e2e_try_catch_break_in_for_loop() {
+        let r = global_eval(
+            r#"
+            var result = 0;
+            for (var i = 0; i < 10; i++) {
+                try {
+                    if (i === 3) break;
+                    result = i;
+                } catch (e) {}
+            }
+            result;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// try/catch with continue inside a for loop.
+    #[test]
+    fn e2e_try_catch_continue_in_for_loop() {
+        let r = global_eval(
+            r#"
+            var sum = 0;
+            for (var i = 0; i < 5; i++) {
+                try {
+                    if (i % 2 === 0) continue;
+                    sum += i;
+                } catch (e) {}
+            }
+            sum;
+            "#,
+        )
+        .unwrap();
+        // 1 + 3 = 4
+        assert_eq!(r, JsValue::Smi(4));
+    }
+
+    /// try/catch with break in while loop.
+    #[test]
+    fn e2e_try_catch_break_in_while_loop() {
+        let r = global_eval(
+            r#"
+            var n = 0;
+            while (true) {
+                try {
+                    n++;
+                    if (n === 5) break;
+                } catch (e) {}
+            }
+            n;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    /// Catch a ReferenceError from accessing undefined variable.
+    #[test]
+    fn e2e_catch_reference_error() {
+        let r = global_eval(
+            r#"
+            var caught = false;
+            try { undeclaredVariable; } catch (e) {
+                caught = e instanceof ReferenceError;
+            }
+            caught;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Catch a SyntaxError from eval.
+    #[test]
+    fn e2e_catch_syntax_error_from_eval() {
+        let r = global_eval(
+            r#"
+            var caught = false;
+            try { eval("}"); } catch (e) {
+                caught = e instanceof SyntaxError;
+            }
+            caught;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Catch a RangeError from invalid array length.
+    #[test]
+    fn e2e_catch_range_error() {
+        let r = global_eval(
+            r#"
+            var caught = false;
+            try { new Array(-1); } catch (e) {
+                caught = e instanceof RangeError;
+            }
+            caught;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Finally preserves return value when finally does not return.
+    #[test]
+    fn e2e_finally_preserves_return_no_override() {
+        let r = global_eval(
+            r#"
+            function f() {
+                try { return 1; } finally { var x = 2; }
+            }
+            f();
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// Three levels of nested try/catch.
+    #[test]
+    fn e2e_deeply_nested_try_catch() {
+        let r = global_eval(
+            r#"
+            var depth = "none";
+            try {
+                try {
+                    try { throw new Error("deep"); }
+                    catch (e) { throw new Error("mid:" + e.message); }
+                } catch (e) { throw new Error("outer:" + e.message); }
+            } catch (e) {
+                depth = e.message;
+            }
+            depth;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("outer:mid:deep".into()));
+    }
+
+    /// throw expression value (e.g., throw 1 + 2).
+    #[test]
+    fn e2e_throw_expression_value() {
+        let r = global_eval("try { throw 1 + 2; } catch (e) { e; }").unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// throw an array, catch receives the array.
+    #[test]
+    fn e2e_throw_array() {
+        let r = global_eval(
+            r#"
+            var len = 0;
+            try { throw [1, 2, 3]; } catch (e) { len = e.length; }
+            len;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// try { return; } finally { x = 1; } — return undefined with side-effect.
+    #[test]
+    fn e2e_finally_after_return_undefined() {
+        let r = global_eval(
+            r#"
+            var x = 0;
+            function f() {
+                try { return; } finally { x = 1; }
+            }
+            f();
+            x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// Sequential try/catch blocks — each catches independently.
+    #[test]
+    fn e2e_sequential_try_catch_blocks() {
+        let r = global_eval(
+            r#"
+            var a = 0, b = 0;
+            try { throw 1; } catch (e) { a = e; }
+            try { throw 2; } catch (e) { b = e; }
+            a + b;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// try/catch/finally with no exception — all three run in order.
+    #[test]
+    fn e2e_try_catch_finally_no_exception() {
+        let r = global_eval(
+            r#"
+            var log = "";
+            try { log += "T"; } catch (e) { log += "C"; } finally { log += "F"; }
+            log;
+            "#,
+        )
+        .unwrap();
+        // No exception → catch is skipped.
+        assert_eq!(r, JsValue::String("TF".into()));
+    }
+
+    /// Finally side-effect visible after normal try completion.
+    #[test]
+    fn e2e_finally_side_effect_visible() {
+        let r = global_eval(
+            r#"
+            var x = 0;
+            try { x = 1; } finally { x = x + 10; }
+            x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(11));
+    }
+
+    /// Error name and message properties in catch.
+    #[test]
+    fn e2e_error_name_and_message_in_catch() {
+        let r = global_eval(
+            r#"
+            var info = "";
+            try { throw new TypeError("bad arg"); } catch (e) {
+                info = e.name + ":" + e.message;
+            }
+            info;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("TypeError:bad arg".into()));
+    }
+
+    /// Nested finally blocks both run.
+    #[test]
+    fn e2e_nested_finally_both_run() {
+        let r = global_eval(
+            r#"
+            var log = "";
+            try {
+                try { log += "A"; } finally { log += "B"; }
+            } finally { log += "C"; }
+            log;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("ABC".into()));
+    }
+
+    /// Catch binding not visible in finally block.
+    #[test]
+    fn e2e_catch_binding_not_in_finally() {
+        let r = global_eval(
+            r#"
+            var result = "ok";
+            try { throw new Error("x"); }
+            catch (e) { /* e is here */ }
+            finally { result = typeof e; }
+            result;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// finally overrides throw — try { throw 1; } finally { return 2; }.
+    #[test]
+    fn e2e_finally_return_overrides_throw() {
+        let r = global_eval(
+            r#"
+            function f() {
+                try { throw new Error("gone"); } finally { return 2; }
+            }
+            f();
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// Switch inside try/catch — throw inside case caught by try.
+    #[test]
+    fn e2e_switch_inside_try_catch() {
+        let r = global_eval(
+            r#"
+            var result = "none";
+            try {
+                switch (1) {
+                    case 1: throw new Error("from switch");
+                }
+            } catch (e) {
+                result = e.message;
+            }
+            result;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("from switch".into()));
+    }
+
+    /// Catch TypeError from property access on null.
+    #[test]
+    fn e2e_catch_type_error_null_property() {
+        let r = global_eval(
+            r#"
+            var caught = false;
+            try { var x = null; x.prop; } catch (e) {
+                caught = e instanceof TypeError;
+            }
+            caught;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Catch TypeError from property access on undefined.
+    #[test]
+    fn e2e_catch_type_error_undefined_property() {
+        let r = global_eval(
+            r#"
+            var caught = false;
+            try { var x = undefined; x.prop; } catch (e) {
+                caught = e instanceof TypeError;
+            }
+            caught;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Throw a function, catch and call it.
+    #[test]
+    fn e2e_throw_function_and_call() {
+        let r = global_eval(
+            r#"
+            var result = 0;
+            try { throw function() { return 42; }; } catch (e) { result = e(); }
+            result;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// for-of break closes iterator even in try.
+    #[test]
+    fn e2e_for_of_break_in_try_closes_iterator() {
+        let r = global_eval(
+            r#"
+            var returnCalled = false;
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() { n++; return { value: n, done: n > 10 }; },
+                    return: function() { returnCalled = true; return { done: true }; }
+                };
+            };
+            try {
+                for (var v of obj) { if (v === 2) break; }
+            } catch (e) {}
+            returnCalled;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// try/catch inside a for-of loop with continue.
+    #[test]
+    fn e2e_try_catch_for_of_continue() {
+        let r = global_eval(
+            r#"
+            var sum = 0;
+            for (var v of [1, 2, 3, 4, 5]) {
+                try {
+                    if (v % 2 === 0) continue;
+                    sum += v;
+                } catch (e) {}
+            }
+            sum;
+            "#,
+        )
+        .unwrap();
+        // 1 + 3 + 5 = 9
+        assert_eq!(r, JsValue::Smi(9));
+    }
+
+    /// try with labeled break.
+    #[test]
+    fn e2e_try_labeled_break() {
+        let r = global_eval(
+            r#"
+            var result = 0;
+            outer: for (var i = 0; i < 5; i++) {
+                try {
+                    for (var j = 0; j < 5; j++) {
+                        if (i === 1 && j === 2) break outer;
+                    }
+                } catch (e) {}
+                result = i;
+            }
+            result;
+            "#,
+        )
+        .unwrap();
+        // i=0 completes, result=0; i=1 breaks at j=2 before result=i
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// throw in finally propagates when no surrounding catch.
+    #[test]
+    fn e2e_throw_in_finally_propagates() {
+        let err = global_eval(r#"try { } finally { throw "fin_error"; }"#).unwrap_err();
+        assert!(
+            matches!(err, StatorError::JsException(_)),
+            "expected JsException, got {err:?}"
+        );
+    }
+
+    /// Multiple catch blocks — each has its own binding scope.
+    #[test]
+    fn e2e_multiple_catch_independent_bindings() {
+        let r = global_eval(
+            r#"
+            var a, b;
+            try { throw 10; } catch (e) { a = e; }
+            try { throw 20; } catch (e) { b = e; }
+            a + b;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(30));
+    }
+
+    /// Finally runs in every iteration of a loop that throws/catches.
+    #[test]
+    fn e2e_finally_runs_each_loop_iteration() {
+        let r = global_eval(
+            r#"
+            var finCount = 0;
+            for (var i = 0; i < 3; i++) {
+                try { throw i; } catch (e) {} finally { finCount++; }
+            }
+            finCount;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// Error constructor: new Error("msg") has correct name and message.
+    #[test]
+    fn e2e_error_constructor_name_message() {
+        let r = global_eval(
+            r#"
+            var e = new Error("test");
+            e.name === "Error" && e.message === "test";
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// ReferenceError constructor: new ReferenceError has correct name.
+    #[test]
+    fn e2e_reference_error_name() {
+        let r = global_eval(r#"new ReferenceError("ref").name"#).unwrap();
+        assert_eq!(r, JsValue::String("ReferenceError".into()));
+    }
+
+    /// SyntaxError constructor: new SyntaxError has correct name.
+    #[test]
+    fn e2e_syntax_error_name() {
+        let r = global_eval(r#"new SyntaxError("syn").name"#).unwrap();
+        assert_eq!(r, JsValue::String("SyntaxError".into()));
+    }
+
+    /// RangeError constructor: new RangeError has correct name.
+    #[test]
+    fn e2e_range_error_name_constructor() {
+        let r = global_eval(r#"new RangeError("rng").name"#).unwrap();
+        assert_eq!(r, JsValue::String("RangeError".into()));
+    }
+
+    /// try/catch in do-while loop.
+    #[test]
+    fn e2e_try_catch_in_do_while() {
+        let r = global_eval(
+            r#"
+            var n = 0;
+            do {
+                try { n++; if (n < 3) throw n; } catch (e) {}
+            } while (n < 3);
+            n;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// throw inside nested function, caught by outer try.
+    #[test]
+    fn e2e_throw_in_nested_function_caught_outer() {
+        let r = global_eval(
+            r#"
+            var result = 0;
+            function inner() { throw 7; }
+            try { inner(); } catch (e) { result = e; }
+            result;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    /// Catch binding with same name as outer variable — shadows correctly.
+    #[test]
+    fn e2e_catch_binding_shadows_outer() {
+        let r = global_eval(
+            r#"
+            var e = "outer";
+            try { throw "inner"; } catch (e) { /* e is "inner" here */ }
+            e;
+            "#,
+        )
+        .unwrap();
+        // Outer `e` should not be affected by catch binding.
+        assert_eq!(r, JsValue::String("outer".into()));
+    }
+
+    /// Finally executes even when return is in catch block.
+    #[test]
+    fn e2e_finally_runs_on_catch_return() {
+        let r = global_eval(
+            r#"
+            var fin = false;
+            function f() {
+                try { throw 1; }
+                catch (e) { return e; }
+                finally { fin = true; }
+            }
+            var ret = f();
+            fin && ret === 1;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// for-of with throw in try body — iterator .return() called.
+    #[test]
+    fn e2e_for_of_throw_in_try_calls_return() {
+        let r = global_eval(
+            r#"
+            var closed = false;
+            var obj = {};
+            obj[Symbol.iterator] = function() {
+                var n = 0;
+                return {
+                    next: function() { n++; return { value: n, done: false }; },
+                    return: function() { closed = true; return { done: true }; }
+                };
+            };
+            try {
+                for (var v of obj) {
+                    throw new Error("bail");
+                }
+            } catch(e) {}
+            closed;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Async try/catch — basic await with catch on rejection.
+    #[test]
+    fn e2e_async_try_catch_basic() {
+        use crate::builtins::promise::drain_active_microtask_queue;
+        let _r = global_eval(
+            r#"
+            var result = 0;
+            async function f() {
+                try {
+                    var p = Promise.reject("async_err");
+                    await p;
+                } catch (e) {
+                    result = e;
+                }
+            }
+            f();
+            "#,
+        )
+        .unwrap();
+        drain_active_microtask_queue();
+        let r2 = global_eval("result").unwrap();
+        assert_eq!(r2, JsValue::String("async_err".into()));
+    }
+
+    /// Async try/catch — await resolved promise in try, no catch triggered.
+    #[test]
+    fn e2e_async_try_catch_no_error() {
+        use crate::builtins::promise::drain_active_microtask_queue;
+        let _r = global_eval(
+            r#"
+            var result = 0;
+            async function f() {
+                try {
+                    var p = Promise.resolve(42);
+                    result = await p;
+                } catch (e) {
+                    result = -1;
+                }
+            }
+            f();
+            "#,
+        )
+        .unwrap();
+        drain_active_microtask_queue();
+        let r2 = global_eval("result").unwrap();
+        assert_eq!(r2, JsValue::Smi(42));
+    }
+
+    /// Throw non-error value in nested catch — correctly propagated.
+    #[test]
+    fn e2e_nested_rethrow_different_type() {
+        let r = global_eval(
+            r#"
+            var result = "none";
+            try {
+                try { throw "text"; }
+                catch (e) { throw { wrapped: e }; }
+            } catch (outer) {
+                result = outer.wrapped;
+            }
+            result;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("text".into()));
+    }
+
+    /// Error types: URIError has correct name.
+    #[test]
+    fn e2e_uri_error_name() {
+        let r = global_eval(r#"new URIError("bad uri").name"#).unwrap();
+        assert_eq!(r, JsValue::String("URIError".into()));
+    }
+
+    /// try/catch/finally — exception in try, catch handles, finally always runs.
+    #[test]
+    fn e2e_try_catch_finally_exception_path() {
+        let r = global_eval(
+            r#"
+            var log = "";
+            try { log += "T"; throw new Error("e"); }
+            catch (e) { log += "C"; }
+            finally { log += "F"; }
+            log;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("TCF".into()));
+    }
+
+    /// Throw in loop caught each iteration — accumulate values.
+    #[test]
+    fn e2e_throw_in_loop_caught_each_iteration() {
+        let r = global_eval(
+            r#"
+            var sum = 0;
+            for (var i = 1; i <= 5; i++) {
+                try { throw i; } catch (e) { sum += e; }
+            }
+            sum;
+            "#,
+        )
+        .unwrap();
+        // 1+2+3+4+5 = 15
+        assert_eq!(r, JsValue::Smi(15));
+    }
 }
