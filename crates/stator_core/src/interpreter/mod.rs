@@ -396,6 +396,100 @@ pub(crate) fn get_object_prototype(obj: &JsValue) -> Option<JsValue> {
     }
 }
 
+/// Returns `true` when `map` exposes an own property named `key`.
+///
+/// Internal accessor slots count as the user-visible property, while the
+/// implementation's `__proto__` link does not.
+pub(crate) fn plain_object_has_own_property(map: &PropertyMap, key: &str) -> bool {
+    key != "__proto__"
+        && (map.contains_key(key)
+            || map.contains_key(&format!("__get_{key}__"))
+            || map.contains_key(&format!("__set_{key}__")))
+}
+
+/// Returns `true` if `key` exists anywhere on `obj`'s prototype chain.
+pub(crate) fn has_property_in_chain(obj: &JsValue, key: &str) -> bool {
+    let mut current = obj.clone();
+    for _ in 0..256 {
+        match &current {
+            JsValue::PlainObject(map) => {
+                let next = {
+                    let borrow = map.borrow();
+                    if plain_object_has_own_property(&borrow, key) {
+                        return true;
+                    }
+                    borrow.get("__proto__").cloned()
+                };
+                match next {
+                    Some(JsValue::Null) | Some(JsValue::Undefined) => return false,
+                    Some(proto) => current = proto,
+                    None => {
+                        return matches!(
+                            key,
+                            "hasOwnProperty"
+                                | "propertyIsEnumerable"
+                                | "isPrototypeOf"
+                                | "constructor"
+                                | "toString"
+                                | "valueOf"
+                                | "toLocaleString"
+                                | "__lookupGetter__"
+                                | "__lookupSetter__"
+                                | "__defineGetter__"
+                                | "__defineSetter__"
+                        );
+                    }
+                }
+            }
+            JsValue::Null | JsValue::Undefined => return false,
+            _ => return !matches!(proto_lookup(&current, key), JsValue::Undefined),
+        }
+    }
+    false
+}
+
+/// Ordinary `[[SetPrototypeOf]]` for `PlainObject`-backed objects.
+pub(crate) fn ordinary_set_prototype_of(obj: &JsValue, proto: JsValue) -> StatorResult<()> {
+    if !matches!(proto, JsValue::Null) && !proto.is_object_like() {
+        return Err(StatorError::TypeError(
+            "Object prototype may only be an Object or null".to_string(),
+        ));
+    }
+
+    let current_proto = get_object_prototype(obj).unwrap_or(JsValue::Null);
+    if current_proto.same_value(&proto) {
+        return Ok(());
+    }
+
+    match obj {
+        JsValue::PlainObject(map) => {
+            if !map.borrow().extensible {
+                return Err(StatorError::TypeError(
+                    "Cannot set prototype of a non-extensible object".to_string(),
+                ));
+            }
+            if !matches!(proto, JsValue::Null) && has_prototype_in_chain(&proto, obj) {
+                return Err(StatorError::TypeError("Cyclic __proto__ value".to_string()));
+            }
+            map.borrow_mut().insert("__proto__".to_string(), proto);
+        }
+        JsValue::Error(e) => {
+            if !e.props.borrow().extensible {
+                return Err(StatorError::TypeError(
+                    "Cannot set prototype of a non-extensible object".to_string(),
+                ));
+            }
+            if !matches!(proto, JsValue::Null) && has_prototype_in_chain(&proto, obj) {
+                return Err(StatorError::TypeError("Cyclic __proto__ value".to_string()));
+            }
+            e.props.borrow_mut().insert("__proto__".to_string(), proto);
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
 /// Return whether `target_proto` appears in `value`'s prototype chain.
 pub(crate) fn has_prototype_in_chain(value: &JsValue, target_proto: &JsValue) -> bool {
     let mut current = value.clone();
@@ -2746,221 +2840,195 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             drop(borrow);
             return array_literal_proto_lookup(obj, key);
         }
-        // Object.prototype methods available on all plain objects.
-        match key {
-            "hasOwnProperty" => {
-                let map = Rc::clone(map);
-                drop(borrow);
-                return JsValue::NativeFunction(Rc::new(move |args| {
-                    let prop = match args.first() {
-                        Some(JsValue::String(s)) => s.to_string(),
-                        Some(JsValue::Smi(n)) => n.to_string(),
-                        Some(JsValue::HeapNumber(n)) => {
-                            let s = format!("{n}");
-                            s
-                        }
-                        Some(JsValue::Boolean(b)) => b.to_string(),
-                        Some(JsValue::Null) => "null".to_string(),
-                        Some(JsValue::Undefined) => "undefined".to_string(),
-                        _ => return Ok(JsValue::Boolean(false)),
-                    };
-                    // Filter internal implementation keys that are not real
-                    // own properties from the user's perspective.
-                    if prop == "__proto__"
-                        || prop == "__is_array__"
-                        || (prop.starts_with("__get_") && prop.ends_with("__"))
-                        || (prop.starts_with("__set_") && prop.ends_with("__"))
-                    {
-                        return Ok(JsValue::Boolean(false));
-                    }
-                    Ok(JsValue::Boolean(map.borrow().contains_key(&prop)))
-                }));
-            }
-            "propertyIsEnumerable" => {
-                let map = Rc::clone(map);
-                drop(borrow);
-                return JsValue::NativeFunction(Rc::new(move |args| {
-                    let prop = match args.first() {
-                        Some(JsValue::String(s)) => s.to_string(),
-                        Some(JsValue::Smi(n)) => n.to_string(),
-                        _ => return Ok(JsValue::Boolean(false)),
-                    };
-                    Ok(JsValue::Boolean(map.borrow().is_enumerable(&prop)))
-                }));
-            }
-            "isPrototypeOf" => {
-                let this_map = Rc::clone(map);
-                drop(borrow);
-                return JsValue::NativeFunction(Rc::new(move |args| {
-                    // ES §20.1.3.2 Object.prototype.isPrototypeOf(V)
-                    // 1. If V is not an object, return false.
-                    let mut v = match args.first() {
-                        Some(JsValue::PlainObject(_)) => args[0].clone(),
-                        _ => return Ok(JsValue::Boolean(false)),
-                    };
-                    // 2. Let O = ToObject(this) — already a PlainObject.
-                    // 3. Loop: walk the prototype chain of V.
-                    for _ in 0..256 {
-                        // V = V.[[GetPrototypeOf]]()
-                        v = match v {
-                            JsValue::PlainObject(ref obj_map) => {
-                                match obj_map.borrow().get("__proto__") {
-                                    Some(proto) => proto.clone(),
-                                    None => return Ok(JsValue::Boolean(false)),
-                                }
+        let explicit_proto = borrow.get("__proto__").cloned();
+        // Object.prototype methods for internal plain objects without an
+        // explicit `__proto__` slot.
+        if explicit_proto.is_none() {
+            match key {
+                "hasOwnProperty" => {
+                    let map = Rc::clone(map);
+                    drop(borrow);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(JsValue::Smi(n)) => n.to_string(),
+                            Some(JsValue::HeapNumber(n)) => {
+                                let s = format!("{n}");
+                                s
                             }
+                            Some(JsValue::Boolean(b)) => b.to_string(),
+                            Some(JsValue::Null) => "null".to_string(),
+                            Some(JsValue::Undefined) => "undefined".to_string(),
                             _ => return Ok(JsValue::Boolean(false)),
                         };
-                        // If V is null, return false.
-                        if matches!(v, JsValue::Null | JsValue::Undefined) {
-                            return Ok(JsValue::Boolean(false));
-                        }
-                        // If SameValue(O, V), return true.
-                        if let JsValue::PlainObject(ref v_map) = v
-                            && Rc::ptr_eq(&this_map, v_map)
-                        {
-                            return Ok(JsValue::Boolean(true));
-                        }
-                    }
-                    Ok(JsValue::Boolean(false))
-                }));
-            }
-            "constructor" => {
-                // Walk __proto__ chain to find constructor (set by finalize_ctor).
-                if let Some(proto) = borrow.get("__proto__").cloned() {
-                    drop(borrow);
-                    return proto_lookup(&proto, "constructor");
+                        Ok(JsValue::Boolean(plain_object_has_own_property(
+                            &map.borrow(),
+                            &prop,
+                        )))
+                    }));
                 }
-                drop(borrow);
-                return lookup_global_constructor("Object");
-            }
-            "toString" => {
-                let obj_clone = obj.clone();
-                drop(borrow);
-                return JsValue::NativeFunction(Rc::new(move |args| {
-                    // When called via .call(value), classify that value.
-                    if let Some(value) = args.first() {
-                        return Ok(JsValue::String(value.obj_to_string_tag().into()));
+                "propertyIsEnumerable" => {
+                    let map = Rc::clone(map);
+                    drop(borrow);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(JsValue::Smi(n)) => n.to_string(),
+                            _ => return Ok(JsValue::Boolean(false)),
+                        };
+                        Ok(JsValue::Boolean(map.borrow().is_enumerable(&prop)))
+                    }));
+                }
+                "isPrototypeOf" => {
+                    let this_map = Rc::clone(map);
+                    drop(borrow);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let target = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        Ok(JsValue::Boolean(
+                            target.is_object_like()
+                                && has_prototype_in_chain(
+                                    &target,
+                                    &JsValue::PlainObject(Rc::clone(&this_map)),
+                                ),
+                        ))
+                    }));
+                }
+                "constructor" => {
+                    // Walk __proto__ chain to find constructor (set by finalize_ctor).
+                    if let Some(proto) = borrow.get("__proto__").cloned() {
+                        drop(borrow);
+                        return proto_lookup(&proto, "constructor");
                     }
-                    // Direct call: classify the captured receiver.
-                    Ok(JsValue::String(obj_clone.obj_to_string_tag().into()))
-                }));
-            }
-            "valueOf" => {
-                let obj_clone = obj.clone();
-                drop(borrow);
-                return JsValue::NativeFunction(Rc::new(move |_args| Ok(obj_clone.clone())));
-            }
-            "toLocaleString" => {
-                let obj_clone = obj.clone();
-                drop(borrow);
-                return JsValue::NativeFunction(Rc::new(move |_args| {
-                    let ts = proto_lookup(&obj_clone, "toString");
-                    dispatch_call_value(&ts, vec![obj_clone.clone()])
-                }));
-            }
-            "__lookupGetter__" => {
-                let map = Rc::clone(map);
-                drop(borrow);
-                return JsValue::NativeFunction(Rc::new(move |args| {
-                    let prop = match args.first() {
-                        Some(JsValue::String(s)) => s.to_string(),
-                        Some(v) => js_to_string(v),
-                        None => return Ok(JsValue::Undefined),
-                    };
-                    let getter_key = format!("__get_{prop}__");
-                    // Walk the prototype chain looking for the getter.
-                    let mut cur = JsValue::PlainObject(Rc::clone(&map));
-                    for _ in 0..256 {
-                        if let JsValue::PlainObject(ref m) = cur {
-                            let b = m.borrow();
-                            if let Some(g) = b.get(&getter_key) {
-                                return Ok(g.clone());
-                            }
-                            match b.get("__proto__") {
-                                Some(next) => {
-                                    let next = next.clone();
-                                    drop(b);
-                                    cur = next;
-                                    continue;
-                                }
-                                None => break,
-                            }
+                    drop(borrow);
+                    return lookup_global_constructor("Object");
+                }
+                "toString" => {
+                    let obj_clone = obj.clone();
+                    drop(borrow);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        // When called via .call(value), classify that value.
+                        if let Some(value) = args.first() {
+                            return Ok(JsValue::String(value.obj_to_string_tag().into()));
                         }
-                        break;
-                    }
-                    Ok(JsValue::Undefined)
-                }));
-            }
-            "__lookupSetter__" => {
-                let map = Rc::clone(map);
-                drop(borrow);
-                return JsValue::NativeFunction(Rc::new(move |args| {
-                    let prop = match args.first() {
-                        Some(JsValue::String(s)) => s.to_string(),
-                        Some(v) => js_to_string(v),
-                        None => return Ok(JsValue::Undefined),
-                    };
-                    let setter_key = format!("__set_{prop}__");
-                    let mut cur = JsValue::PlainObject(Rc::clone(&map));
-                    for _ in 0..256 {
-                        if let JsValue::PlainObject(ref m) = cur {
-                            let b = m.borrow();
-                            if let Some(s) = b.get(&setter_key) {
-                                return Ok(s.clone());
-                            }
-                            match b.get("__proto__") {
-                                Some(next) => {
-                                    let next = next.clone();
-                                    drop(b);
-                                    cur = next;
-                                    continue;
+                        // Direct call: classify the captured receiver.
+                        Ok(JsValue::String(obj_clone.obj_to_string_tag().into()))
+                    }));
+                }
+                "valueOf" => {
+                    let obj_clone = obj.clone();
+                    drop(borrow);
+                    return JsValue::NativeFunction(Rc::new(move |_args| Ok(obj_clone.clone())));
+                }
+                "toLocaleString" => {
+                    let obj_clone = obj.clone();
+                    drop(borrow);
+                    return JsValue::NativeFunction(Rc::new(move |_args| {
+                        let ts = proto_lookup(&obj_clone, "toString");
+                        dispatch_call_value(&ts, vec![obj_clone.clone()])
+                    }));
+                }
+                "__lookupGetter__" => {
+                    let map = Rc::clone(map);
+                    drop(borrow);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(v) => js_to_string(v),
+                            None => return Ok(JsValue::Undefined),
+                        };
+                        let getter_key = format!("__get_{prop}__");
+                        // Walk the prototype chain looking for the getter.
+                        let mut cur = JsValue::PlainObject(Rc::clone(&map));
+                        for _ in 0..256 {
+                            if let JsValue::PlainObject(ref m) = cur {
+                                let b = m.borrow();
+                                if let Some(g) = b.get(&getter_key) {
+                                    return Ok(g.clone());
                                 }
-                                None => break,
+                                match b.get("__proto__") {
+                                    Some(next) => {
+                                        let next = next.clone();
+                                        drop(b);
+                                        cur = next;
+                                        continue;
+                                    }
+                                    None => break,
+                                }
                             }
+                            break;
                         }
-                        break;
-                    }
-                    Ok(JsValue::Undefined)
-                }));
+                        Ok(JsValue::Undefined)
+                    }));
+                }
+                "__lookupSetter__" => {
+                    let map = Rc::clone(map);
+                    drop(borrow);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(v) => js_to_string(v),
+                            None => return Ok(JsValue::Undefined),
+                        };
+                        let setter_key = format!("__set_{prop}__");
+                        let mut cur = JsValue::PlainObject(Rc::clone(&map));
+                        for _ in 0..256 {
+                            if let JsValue::PlainObject(ref m) = cur {
+                                let b = m.borrow();
+                                if let Some(s) = b.get(&setter_key) {
+                                    return Ok(s.clone());
+                                }
+                                match b.get("__proto__") {
+                                    Some(next) => {
+                                        let next = next.clone();
+                                        drop(b);
+                                        cur = next;
+                                        continue;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            break;
+                        }
+                        Ok(JsValue::Undefined)
+                    }));
+                }
+                "__defineGetter__" => {
+                    let map = Rc::clone(map);
+                    drop(borrow);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(v) => js_to_string(v),
+                            None => return Ok(JsValue::Undefined),
+                        };
+                        let getter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        let getter_key = format!("__get_{prop}__");
+                        map.borrow_mut().insert(getter_key, getter);
+                        Ok(JsValue::Undefined)
+                    }));
+                }
+                "__defineSetter__" => {
+                    let map = Rc::clone(map);
+                    drop(borrow);
+                    return JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(v) => js_to_string(v),
+                            None => return Ok(JsValue::Undefined),
+                        };
+                        let setter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        let setter_key = format!("__set_{prop}__");
+                        map.borrow_mut().insert(setter_key, setter);
+                        Ok(JsValue::Undefined)
+                    }));
+                }
+                _ => {}
             }
-            "__defineGetter__" => {
-                let map = Rc::clone(map);
-                drop(borrow);
-                return JsValue::NativeFunction(Rc::new(move |args| {
-                    let prop = match args.first() {
-                        Some(JsValue::String(s)) => s.to_string(),
-                        Some(v) => js_to_string(v),
-                        None => return Ok(JsValue::Undefined),
-                    };
-                    let getter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                    let getter_key = format!("__get_{prop}__");
-                    map.borrow_mut().insert(getter_key, getter);
-                    Ok(JsValue::Undefined)
-                }));
-            }
-            "__defineSetter__" => {
-                let map = Rc::clone(map);
-                drop(borrow);
-                return JsValue::NativeFunction(Rc::new(move |args| {
-                    let prop = match args.first() {
-                        Some(JsValue::String(s)) => s.to_string(),
-                        Some(v) => js_to_string(v),
-                        None => return Ok(JsValue::Undefined),
-                    };
-                    let setter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                    let setter_key = format!("__set_{prop}__");
-                    map.borrow_mut().insert(setter_key, setter);
-                    Ok(JsValue::Undefined)
-                }));
-            }
-            _ => {}
         }
         // Walk __proto__ chain.
-        if let Some(proto) = borrow.get("__proto__") {
-            let next = proto.clone();
+        if let Some(proto) = explicit_proto {
             drop(borrow);
-            return proto_lookup_chain(&next, key, obj);
+            return proto_lookup_chain(&proto, key, obj);
         }
         return JsValue::Undefined;
     }
@@ -5592,6 +5660,9 @@ fn array_literal_proto_lookup(obj: &JsValue, key: &str) -> JsValue {
 fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsValue {
     let mut current = current.clone();
     for _ in 0..256 {
+        if matches!(current, JsValue::Null | JsValue::Undefined) {
+            return JsValue::Undefined;
+        }
         if let JsValue::PlainObject(ref map) = current {
             let borrow = map.borrow();
             // Check for getter accessor BEFORE data key (same rationale
@@ -5633,7 +5704,10 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
                     _ => return Ok(JsValue::Boolean(false)),
                 };
                 if let JsValue::PlainObject(ref m) = this {
-                    return Ok(JsValue::Boolean(m.borrow().contains_key(&prop)));
+                    return Ok(JsValue::Boolean(plain_object_has_own_property(
+                        &m.borrow(),
+                        &prop,
+                    )));
                 }
                 Ok(JsValue::Boolean(false))
             }));
@@ -5653,7 +5727,15 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
             }));
         }
         "isPrototypeOf" => {
-            return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
+            let this = this_obj.clone();
+            return JsValue::NativeFunction(Rc::new(move |args| {
+                let target = args.first().cloned().unwrap_or(JsValue::Undefined);
+                Ok(JsValue::Boolean(
+                    matches!(this, JsValue::PlainObject(_))
+                        && target.is_object_like()
+                        && has_prototype_in_chain(&target, &this),
+                ))
+            }));
         }
         "constructor" => return lookup_global_constructor("Object"),
         "toString" => {
@@ -5960,6 +6042,12 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
         }
         JsValue::PlainObject(map) => {
             let prop_name = to_property_key(key)?;
+            if prop_name == "__proto__" {
+                if value.is_object_like() || matches!(value, JsValue::Null) {
+                    ordinary_set_prototype_of(obj, value)?;
+                }
+                return Ok(());
+            }
             // Check for setter accessor (__set_<key>__) first — accessor
             // properties take precedence over data properties.
             let setter_key = format!("__set_{prop_name}__");
