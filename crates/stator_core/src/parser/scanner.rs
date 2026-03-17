@@ -1415,6 +1415,28 @@ impl<'src> Scanner<'src> {
 
             // ── Multi-char punctuators ───────────────────────────────────
             '<' => {
+                // Annex B §B.1.1: `<!--` is a single-line comment in
+                // sloppy-mode scripts.
+                if self.peek() == Some('!') && self.source[self.pos..].starts_with("!--") {
+                    self.advance(); // !
+                    self.advance(); // -
+                    self.advance(); // -
+                    let text_start = self.pos;
+                    while let Some(ch) = self.peek() {
+                        if is_line_terminator(ch) {
+                            break;
+                        }
+                        self.advance();
+                    }
+                    let text = self.source[text_start..self.pos].to_string();
+                    let end = self.current_pos();
+                    return Ok(Token {
+                        kind: TokenKind::SingleLineComment,
+                        value: TokenValue::Str(text),
+                        span: Span { start, end },
+                        had_line_terminator_before: had_lt,
+                    });
+                }
                 let kind = if self.peek() == Some('<') {
                     self.advance();
                     if self.peek() == Some('=') {
@@ -1545,6 +1567,27 @@ impl<'src> Scanner<'src> {
             }
 
             '-' => {
+                // Annex B §B.1.1: `-->` at the start of a line (after
+                // whitespace) is a single-line comment.
+                if self.peek() == Some('-') && self.peek2() == Some('>') && had_lt {
+                    self.advance(); // second -
+                    self.advance(); // >
+                    let text_start = self.pos;
+                    while let Some(ch) = self.peek() {
+                        if is_line_terminator(ch) {
+                            break;
+                        }
+                        self.advance();
+                    }
+                    let text = self.source[text_start..self.pos].to_string();
+                    let end = self.current_pos();
+                    return Ok(Token {
+                        kind: TokenKind::SingleLineComment,
+                        value: TokenValue::Str(text),
+                        span: Span { start, end },
+                        had_line_terminator_before: had_lt,
+                    });
+                }
                 let kind = if self.peek() == Some('-') {
                     self.advance();
                     TokenKind::MinusMinus

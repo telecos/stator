@@ -94,7 +94,7 @@ use crate::builtins::proxy::{
     proxy_new_callable, proxy_own_keys, proxy_prevent_extensions, proxy_revocable, proxy_revoke,
     proxy_set_prototype_of, proxy_set_with_receiver,
 };
-use crate::builtins::regexp::regexp_construct;
+use crate::builtins::regexp::{regexp_construct, regexp_static_get};
 use crate::builtins::set::{
     SetIteratorKind, set_add, set_clear, set_create_iterator, set_delete, set_difference,
     set_from_iterable, set_has, set_intersection, set_is_disjoint_from, set_is_subset_of,
@@ -10514,15 +10514,33 @@ fn make_regexp() -> JsValue {
         // Callable: new RegExp(pattern, flags)
         props.insert("__call__".into(), native(|args| regexp_construct(&args)));
 
-        // Annex B legacy static properties (stubs)
+        // Annex B legacy static properties — live getters backed by
+        // thread-local state updated after every successful exec/test.
         for i in 1..=9 {
-            props.insert(format!("${i}"), JsValue::String(String::new().into()));
+            let key = format!("${i}");
+            let getter_key = format!("__get_{key}__");
+            props.insert(
+                getter_key,
+                native(move |_args| Ok(regexp_static_get(&format!("${i}")))),
+            );
+            // Placeholder so `"$1" in RegExp` is true.
+            props.insert(key, JsValue::String(String::new().into()));
         }
-        props.insert("input".into(), JsValue::String(String::new().into()));
-        props.insert("lastMatch".into(), JsValue::String(String::new().into()));
-        props.insert("lastParen".into(), JsValue::String(String::new().into()));
-        props.insert("leftContext".into(), JsValue::String(String::new().into()));
-        props.insert("rightContext".into(), JsValue::String(String::new().into()));
+        for &name in &[
+            "input",
+            "lastMatch",
+            "lastParen",
+            "leftContext",
+            "rightContext",
+        ] {
+            let getter_key = format!("__get_{name}__");
+            let name_owned = name.to_string();
+            props.insert(
+                getter_key,
+                native(move |_args| Ok(regexp_static_get(&name_owned))),
+            );
+            props.insert(name.into(), JsValue::String(String::new().into()));
+        }
 
         // §22.2.4.2 RegExp.escape(string)  — ES2025
         props.insert(
@@ -46835,5 +46853,280 @@ mod tests {
              } \
              var c = new C(); c.x === 'instance' && C.x === 'static'",
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Annex B compatibility — 30+ e2e tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── 1. Legacy octal literals ─────────────────────────────────────────
+
+    #[test]
+    fn e2e_annex_b_legacy_octal_0777_equals_511() {
+        let r = global_eval("0777").unwrap();
+        assert_eq!(r, JsValue::Smi(511));
+    }
+
+    #[test]
+    fn e2e_annex_b_legacy_octal_010_equals_8() {
+        let r = global_eval("010").unwrap();
+        assert_eq!(r, JsValue::Smi(8));
+    }
+
+    #[test]
+    fn e2e_annex_b_legacy_octal_0_is_zero() {
+        let r = global_eval("00").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    // ── 2. Legacy octal escape sequences ─────────────────────────────────
+
+    #[test]
+    fn e2e_annex_b_octal_escape_077_is_question_mark() {
+        // \077 = 63 decimal = '?'
+        let r = global_eval(r#""\077""#).unwrap();
+        assert_eq!(r, JsValue::String("?".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_octal_escape_101_is_A() {
+        // \101 = 65 decimal = 'A'
+        let r = global_eval(r#""\101""#).unwrap();
+        assert_eq!(r, JsValue::String("A".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_octal_escape_single_digit() {
+        // \7 = 7 decimal = BEL
+        let r = global_eval(r#""\7".charCodeAt(0)"#).unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_annex_b_octal_escape_strict_mode_error() {
+        let r = global_eval(r#"'use strict'; "\077""#);
+        assert!(r.is_err(), "octal escape in strict mode must throw");
+    }
+
+    // ── 3. HTML comment syntax ───────────────────────────────────────────
+
+    #[test]
+    fn e2e_annex_b_html_open_comment() {
+        // `<!-- comment` should be ignored as a single-line comment
+        let r = global_eval("var x = 1; <!-- comment\nx + 1").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_annex_b_html_close_comment() {
+        // `-->` at start of line is a single-line comment
+        let r = global_eval("var x = 5;\n--> this is a comment\nx * 2").unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_annex_b_html_open_comment_no_newline() {
+        // `<!--` should comment out the rest of the line
+        let r = global_eval("42 <!-- ignored").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    // ── 4. __proto__ in object literals ──────────────────────────────────
+
+    #[test]
+    fn e2e_annex_b_proto_in_object_literal() {
+        assert_eval_true("var proto = { x: 42 }; var obj = { __proto__: proto }; obj.x === 42");
+    }
+
+    #[test]
+    fn e2e_annex_b_proto_null_removes_prototype() {
+        assert_eval_true("var obj = { __proto__: null }; typeof obj.toString === 'undefined'");
+    }
+
+    #[test]
+    fn e2e_annex_b_proto_set_via_assignment() {
+        assert_eval_true("var proto = { y: 7 }; var obj = {}; obj.__proto__ = proto; obj.y === 7");
+    }
+
+    // ── 5. String.prototype.substr ───────────────────────────────────────
+
+    #[test]
+    fn e2e_annex_b_substr_basic() {
+        let r = global_eval("'hello world'.substr(6, 5)").unwrap();
+        assert_eq!(r, JsValue::String("world".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_substr_no_length() {
+        let r = global_eval("'hello'.substr(2)").unwrap();
+        assert_eq!(r, JsValue::String("llo".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_substr_negative_start() {
+        let r = global_eval("'hello'.substr(-3, 2)").unwrap();
+        assert_eq!(r, JsValue::String("ll".into()));
+    }
+
+    // ── 6. RegExp legacy static features ─────────────────────────────────
+
+    #[test]
+    fn e2e_annex_b_regexp_dollar1_after_exec() {
+        assert_eval_true(r#"var re = /(foo)(bar)/; re.exec("foobar"); RegExp.$1 === "foo""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_regexp_dollar2_after_exec() {
+        assert_eval_true(r#"var re = /(foo)(bar)/; re.exec("foobar"); RegExp.$2 === "bar""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_regexp_last_match_after_exec() {
+        assert_eval_true(r#"var re = /foo/; re.exec("foobar"); RegExp.lastMatch === "foo""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_regexp_input_after_exec() {
+        assert_eval_true(r#"var re = /x/; re.exec("xyz"); RegExp.input === "xyz""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_regexp_left_context() {
+        assert_eval_true(r#"var re = /bar/; re.exec("foobar"); RegExp.leftContext === "foo""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_regexp_right_context() {
+        assert_eval_true(r#"var re = /bar/; re.exec("foobar!"); RegExp.rightContext === "!""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_regexp_last_paren() {
+        assert_eval_true(r#"var re = /(a)(b)(c)/; re.exec("abc"); RegExp.lastParen === "c""#);
+    }
+
+    // ── 7. Block-scoped function declarations ────────────────────────────
+
+    #[test]
+    fn e2e_annex_b_block_fn_hoists_to_function() {
+        let r = global_eval("function f() { { function g() { return 99; } } return g(); } f()")
+            .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn e2e_annex_b_if_block_fn_hoists() {
+        let r = global_eval(
+            "function f() { if (true) { function g() { return 3; } } return g(); } f()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    // ── 8. escape() / unescape() ────────────────────────────────────────
+
+    #[test]
+    fn e2e_annex_b_escape_space() {
+        let r = global_eval("escape(' ')").unwrap();
+        assert_eq!(r, JsValue::String("%20".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_unescape_percent20() {
+        let r = global_eval("unescape('%20')").unwrap();
+        assert_eq!(r, JsValue::String(" ".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_escape_unescape_roundtrip() {
+        assert_eval_true(r#"unescape(escape("héllo wörld")) === "héllo wörld""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_escape_preserves_safe_chars() {
+        assert_eval_true(r#"escape("abc123") === "abc123""#);
+    }
+
+    // ── 9. String HTML methods ───────────────────────────────────────────
+
+    #[test]
+    fn e2e_annex_b_string_bold_wraps_b_tag() {
+        let r = global_eval("'hi'.bold()").unwrap();
+        assert_eq!(r, JsValue::String("<b>hi</b>".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_string_italics_wraps_i_tag() {
+        let r = global_eval("'hi'.italics()").unwrap();
+        assert_eq!(r, JsValue::String("<i>hi</i>".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_string_strike_wraps_strike_tag() {
+        let r = global_eval("'hi'.strike()").unwrap();
+        assert_eq!(r, JsValue::String("<strike>hi</strike>".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_string_anchor_with_name() {
+        let r = global_eval(r#"'text'.anchor('top')"#).unwrap();
+        assert_eq!(r, JsValue::String(r#"<a name="top">text</a>"#.into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_string_link_with_url() {
+        let r = global_eval(r#"'click'.link('http://x.com')"#).unwrap();
+        assert_eq!(
+            r,
+            JsValue::String(r#"<a href="http://x.com">click</a>"#.into())
+        );
+    }
+
+    #[test]
+    fn e2e_annex_b_string_small_wraps_small_tag() {
+        let r = global_eval("'hi'.small()").unwrap();
+        assert_eq!(r, JsValue::String("<small>hi</small>".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_string_big_wraps_big_tag() {
+        let r = global_eval("'hi'.big()").unwrap();
+        assert_eq!(r, JsValue::String("<big>hi</big>".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_string_fixed_wraps_tt_tag() {
+        let r = global_eval("'hi'.fixed()").unwrap();
+        assert_eq!(r, JsValue::String("<tt>hi</tt>".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_string_sub_wraps_sub_tag() {
+        let r = global_eval("'hi'.sub()").unwrap();
+        assert_eq!(r, JsValue::String("<sub>hi</sub>".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_string_sup_wraps_sup_tag() {
+        let r = global_eval("'hi'.sup()").unwrap();
+        assert_eq!(r, JsValue::String("<sup>hi</sup>".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_string_fontcolor() {
+        let r = global_eval(r#"'hi'.fontcolor('red')"#).unwrap();
+        assert_eq!(r, JsValue::String(r#"<font color="red">hi</font>"#.into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_string_fontsize() {
+        let r = global_eval(r#"'hi'.fontsize(3)"#).unwrap();
+        assert_eq!(r, JsValue::String(r#"<font size="3">hi</font>"#.into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_string_blink_wraps_blink_tag() {
+        let r = global_eval("'hi'.blink()").unwrap();
+        assert_eq!(r, JsValue::String("<blink>hi</blink>".into()));
     }
 }
