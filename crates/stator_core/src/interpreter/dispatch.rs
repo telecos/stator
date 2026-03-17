@@ -3254,7 +3254,7 @@ fn handle_sta_named_property(
                 if (new_len_u32 as usize) < current_len {
                     v.truncate(new_len_u32 as usize);
                 } else {
-                    v.resize(new_len_u32 as usize, JsValue::Undefined);
+                    v.resize(new_len_u32 as usize, JsValue::TheHole);
                 }
             }
         }
@@ -5243,7 +5243,7 @@ fn handle_delete_property_sloppy(
         } else if let Ok(idx) = key.parse::<usize>() {
             let mut arr = items.borrow_mut();
             if idx < arr.len() {
-                arr[idx] = JsValue::Undefined;
+                arr[idx] = JsValue::TheHole;
             }
             true
         } else {
@@ -5291,7 +5291,7 @@ fn handle_delete_property_strict(
         if let Ok(idx) = key.parse::<usize>() {
             let mut arr = items.borrow_mut();
             if idx < arr.len() {
-                arr[idx] = JsValue::Undefined;
+                arr[idx] = JsValue::TheHole;
             }
         }
     }

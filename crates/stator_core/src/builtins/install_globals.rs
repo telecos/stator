@@ -255,6 +255,20 @@ fn builtin_fn(
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
+fn materialize_array_holes(items: &[JsValue]) -> Vec<JsValue> {
+    items
+        .iter()
+        .cloned()
+        .map(|value| {
+            if value.is_the_hole() {
+                JsValue::Undefined
+            } else {
+                value
+            }
+        })
+        .collect()
+}
+
 /// Extract elements from an array-like value, preserving holes as `undefined`.
 fn try_to_array_like_elements(val: &JsValue) -> StatorResult<(Vec<JsValue>, usize)> {
     let len = array_like_length(val)?;
@@ -347,7 +361,12 @@ fn enumerable_own_string_keys(value: &JsValue) -> Vec<String> {
     match value {
         JsValue::PlainObject(map) => own_string_property_keys(&map.borrow(), true),
         JsValue::Error(error) => own_string_property_keys(&error.props.borrow(), true),
-        JsValue::Array(items) => (0..items.borrow().len()).map(|i| i.to_string()).collect(),
+        JsValue::Array(items) => items
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| (!value.is_the_hole()).then_some(index.to_string()))
+            .collect(),
         JsValue::String(s) => (0..utf16_len(s)).map(|i| i.to_string()).collect(),
         _ => Vec::new(),
     }
@@ -532,7 +551,7 @@ fn array_like_set_index(val: &JsValue, index: usize, value: JsValue) {
         JsValue::Array(items) => {
             let mut borrow = items.borrow_mut();
             if index >= borrow.len() {
-                borrow.resize(index + 1, JsValue::Undefined);
+                borrow.resize(index + 1, JsValue::TheHole);
             }
             borrow[index] = value;
         }
@@ -568,7 +587,7 @@ fn array_like_delete_index(val: &JsValue, index: usize) {
         JsValue::Array(items) => {
             let mut borrow = items.borrow_mut();
             if index < borrow.len() {
-                borrow[index] = JsValue::Undefined;
+                borrow[index] = JsValue::TheHole;
             }
         }
         JsValue::PlainObject(map) => {
@@ -590,7 +609,7 @@ fn array_like_set_length(val: &JsValue, new_len: usize) {
             if new_len < borrow.len() {
                 borrow.truncate(new_len);
             } else {
-                borrow.resize(new_len, JsValue::Undefined);
+                borrow.resize(new_len, JsValue::TheHole);
             }
         }
         JsValue::PlainObject(map) => {
@@ -1452,7 +1471,7 @@ fn normalize_at_index(len: usize, index: Option<&JsValue>) -> StatorResult<Optio
 /// Collect values from supported iterable forms used by built-ins.
 fn collect_iterable_values(iterable: &JsValue) -> StatorResult<Vec<JsValue>> {
     match iterable {
-        JsValue::Array(arr) => Ok(arr.borrow().clone()),
+        JsValue::Array(arr) => Ok(materialize_array_holes(&arr.borrow())),
         JsValue::Iterator(_) | JsValue::Generator(_) => iterator_to_vec(iterable),
         JsValue::String(s) => Ok(s
             .chars()
@@ -6627,6 +6646,9 @@ fn make_array() -> JsValue {
                 let start = normalize_from_index(len, args.get(2))?;
                 // §23.1.3.13 uses SameValueZero — NaN equals NaN, +0 equals -0.
                 for i in start..len {
+                    if !array_like_has_index(arr, i) {
+                        continue;
+                    }
                     if array_like_get_index(arr, i).same_value_zero(search) {
                         return Ok(JsValue::Boolean(true));
                     }
@@ -7076,7 +7098,7 @@ fn make_array() -> JsValue {
                 let mut result = Vec::with_capacity(len);
                 for i in 0..len {
                     if !array_like_has_index(arr, i) {
-                        result.push(JsValue::Undefined);
+                        result.push(JsValue::TheHole);
                         continue;
                     }
                     let mapped = call_callback_with_this(
@@ -7757,7 +7779,7 @@ fn make_array() -> JsValue {
                     match &args[0] {
                         JsValue::Smi(n) => {
                             let len = crate::builtins::util::checked_f64_to_length(*n as f64)?;
-                            let v: Vec<JsValue> = vec![JsValue::Undefined; len];
+                            let v: Vec<JsValue> = vec![JsValue::TheHole; len];
                             return Ok(JsValue::Array(Rc::new(RefCell::new(v))));
                         }
                         JsValue::HeapNumber(n) => {
@@ -7768,7 +7790,7 @@ fn make_array() -> JsValue {
                                 ));
                             }
                             let len = crate::builtins::util::checked_f64_to_length(*n)?;
-                            let v: Vec<JsValue> = vec![JsValue::Undefined; len];
+                            let v: Vec<JsValue> = vec![JsValue::TheHole; len];
                             return Ok(JsValue::Array(Rc::new(RefCell::new(v))));
                         }
                         _ => {
@@ -30894,9 +30916,9 @@ mod tests {
     }
 
     #[test]
-    fn test_includes_finds_undefined_in_hole() {
+    fn test_includes_skips_sparse_holes() {
         let result = global_eval("var a = []; a.length = 1; a.includes(undefined)").unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+        assert_eq!(result, JsValue::Boolean(false));
     }
 
     #[test]
@@ -45466,6 +45488,223 @@ mod tests {
     fn e2e_array_some_match() {
         let r = global_eval("[1, 2, 3].some(function(x) { return x === 2; })").unwrap();
         assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // ── Sparse array holes conformance ───────────────────────────────────
+
+    #[test]
+    fn e2e_sparse_array_map_preserves_hole() {
+        assert_eval_true(
+            "var r = [1, , 3].map(function(x) { return x * 2; }); r.length === 3 && r[0] === 2 && r[2] === 6 && !Object.hasOwn(r, '1')",
+        );
+    }
+
+    #[test]
+    fn e2e_sparse_array_map_skips_hole_callback() {
+        assert_eval_true(
+            "var seen = []; [1, , 3].map(function(x, i) { seen.push(i + ':' + x); return x * 2; }); seen.join('|') === '0:1|2:3'",
+        );
+    }
+
+    #[test]
+    fn e2e_sparse_array_map_passes_original_array() {
+        assert_eval_true(
+            "var arr = [1, , 3]; var ok = true; arr.map(function(_x, i, a) { ok = ok && a === arr && (i === 0 || i === 2); return i; }); ok",
+        );
+    }
+
+    #[test]
+    fn e2e_sparse_array_filter_skips_hole_and_compacts() {
+        assert_eval_true(
+            "var r = [1, , 3].filter(function() { return true; }); r.length === 2 && r[0] === 1 && r[1] === 3",
+        );
+    }
+
+    #[test]
+    fn e2e_sparse_array_filter_skips_hole_callback() {
+        assert_eval_true(
+            "var seen = []; [1, , 3].filter(function(x, i) { seen.push(i + ':' + x); return true; }); seen.join('|') === '0:1|2:3'",
+        );
+    }
+
+    #[test]
+    fn e2e_sparse_array_for_each_skips_hole() {
+        assert_eval_true(
+            "var seen = []; [1, , 3].forEach(function(x, i) { seen.push(i + ':' + x); }); seen.join('|') === '0:1|2:3'",
+        );
+    }
+
+    #[test]
+    fn e2e_sparse_array_for_each_passes_original_array() {
+        assert_eval_true(
+            "var arr = [1, , 3]; var ok = true; arr.forEach(function(_x, _i, a) { ok = ok && a === arr; }); ok",
+        );
+    }
+
+    #[test]
+    fn e2e_sparse_array_every_skips_hole() {
+        assert_eval_true(
+            "var seen = []; var ok = [1, , 3].every(function(x, i) { seen.push(i + ':' + x); return x > 0; }); ok && seen.join('|') === '0:1|2:3'",
+        );
+    }
+
+    #[test]
+    fn e2e_sparse_array_every_all_holes_never_calls_callback() {
+        assert_eval_true(
+            "var count = 0; Array(3).every(function() { count++; return false; }) && count === 0",
+        );
+    }
+
+    #[test]
+    fn e2e_sparse_array_some_skips_hole() {
+        assert_eval_true(
+            "var seen = []; var ok = [1, , 3].some(function(x, i) { seen.push(i + ':' + x); return x === 3; }); ok && seen.join('|') === '0:1|2:3'",
+        );
+    }
+
+    #[test]
+    fn e2e_sparse_array_some_all_holes_never_calls_callback() {
+        assert_eval_true(
+            "var count = 0; !Array(2).some(function() { count++; return true; }) && count === 0",
+        );
+    }
+
+    #[test]
+    fn e2e_sparse_array_reduce_skips_hole_with_initial() {
+        assert_eval_true("[1, , 3].reduce(function(acc, x) { return acc + x; }, 0) === 4");
+    }
+
+    #[test]
+    fn e2e_sparse_array_reduce_skips_leading_hole_without_initial() {
+        assert_eval_true("[, 2, 3].reduce(function(acc, x) { return acc + x; }) === 5");
+    }
+
+    #[test]
+    fn e2e_sparse_array_reduce_all_holes_without_initial_throws() {
+        assert_eval_true(
+            "try { Array(3).reduce(function(acc, x) { return acc + x; }); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_sparse_array_indexof_undefined_ignores_hole() {
+        assert_eval_true("[1, , 3].indexOf(undefined) === -1");
+    }
+
+    #[test]
+    fn e2e_sparse_array_indexof_undefined_finds_explicit_undefined() {
+        assert_eval_true("var a = [1, , 3]; a[1] = undefined; a.indexOf(undefined) === 1");
+    }
+
+    #[test]
+    fn e2e_sparse_array_includes_undefined_ignores_hole() {
+        assert_eval_true("[1, , 3].includes(undefined) === false");
+    }
+
+    #[test]
+    fn e2e_sparse_array_includes_undefined_finds_explicit_undefined() {
+        assert_eval_true("var a = [1, , 3]; a[1] = undefined; a.includes(undefined) === true");
+    }
+
+    #[test]
+    fn e2e_array_constructor_call_creates_sparse_length() {
+        assert_eval_true("var a = Array(5); a.length === 5 && Object.keys(a).length === 0");
+    }
+
+    #[test]
+    fn e2e_array_constructor_new_creates_sparse_length() {
+        assert_eval_true("var a = new Array(5); a.length === 5 && Object.keys(a).length === 0");
+    }
+
+    #[test]
+    fn e2e_array_constructor_has_no_index_property() {
+        assert_eval_true("var a = Array(5); !(0 in a) && !(4 in a)");
+    }
+
+    #[test]
+    fn e2e_array_constructor_iterator_materializes_undefined() {
+        assert_eval_true("Array.from(Array(3)).join('|') === 'undefined|undefined|undefined'");
+    }
+
+    #[test]
+    fn e2e_array_literal_only_holes_length_is_preserved() {
+        assert_eval_true("[,,].length === 2");
+    }
+
+    #[test]
+    fn e2e_array_literal_trailing_elision_preserves_length() {
+        assert_eval_true("[1,,].length === 2");
+    }
+
+    #[test]
+    fn e2e_delete_creates_hole() {
+        assert_eval_true("var a = [1, 2, 3]; delete a[1]; a[1] === undefined && !(1 in a)");
+    }
+
+    #[test]
+    fn e2e_delete_keeps_length() {
+        assert_eval_true("var a = [1, 2, 3]; delete a[1]; a.length === 3");
+    }
+
+    #[test]
+    fn e2e_delete_hole_skips_indexof_undefined() {
+        assert_eval_true("var a = [1, 2, 3]; delete a[1]; a.indexOf(undefined) === -1");
+    }
+
+    #[test]
+    fn e2e_delete_hole_map_preserves_hole() {
+        assert_eval_true(
+            "var a = [1, 2, 3]; delete a[1]; var r = a.map(function(x) { return x * 2; }); r.length === 3 && r[0] === 2 && r[2] === 6 && !Object.hasOwn(r, '1')",
+        );
+    }
+
+    #[test]
+    fn e2e_array_from_sparse_array_materializes_undefined() {
+        assert_eval_true("var a = Array.from([1, , 3]); a.length === 3 && a[1] === undefined");
+    }
+
+    #[test]
+    fn e2e_array_from_sparse_array_creates_dense_slot() {
+        assert_eval_true("var a = Array.from([1, , 3]); Object.hasOwn(a, '1')");
+    }
+
+    #[test]
+    fn e2e_spread_sparse_array_materializes_undefined() {
+        assert_eval_true("var a = [...[1, , 3]]; a.length === 3 && a[1] === undefined");
+    }
+
+    #[test]
+    fn e2e_spread_sparse_array_creates_dense_slot() {
+        assert_eval_true("var a = [...[1, , 3]]; Object.hasOwn(a, '1')");
+    }
+
+    #[test]
+    fn e2e_for_of_sparse_array_yields_undefined_for_hole() {
+        assert_eval_true(
+            "var seen = []; for (var value of [1, , 3]) { seen.push(String(value)); } seen.join('|') === '1|undefined|3'",
+        );
+    }
+
+    #[test]
+    fn e2e_for_of_array_constructor_yields_undefined_for_holes() {
+        assert_eval_true(
+            "var seen = []; for (var value of Array(2)) { seen.push(String(value)); } seen.join('|') === 'undefined|undefined'",
+        );
+    }
+
+    #[test]
+    fn e2e_object_keys_sparse_array_skips_hole() {
+        assert_eval_true("Object.keys([1, , 3]).join(',') === '0,2'");
+    }
+
+    #[test]
+    fn e2e_object_keys_array_constructor_has_no_indices() {
+        assert_eval_true("Object.keys(Array(3)).length === 0");
+    }
+
+    #[test]
+    fn e2e_json_stringify_sparse_array_uses_null_for_hole() {
+        assert_eval_true("JSON.stringify([1, , 3]) === '[1,null,3]'");
     }
 
     // ΓöÇΓöÇ Error and exception handling conformance ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
