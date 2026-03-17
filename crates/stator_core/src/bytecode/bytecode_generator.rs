@@ -1185,6 +1185,146 @@ impl FunctionCompiler {
         names
     }
 
+    /// Collect function declaration names from inside blocks
+    /// (Annex B §B.3.2.1).
+    ///
+    /// In non-strict mode, function declarations inside blocks create a
+    /// `var`-like binding in the enclosing function scope.  This method
+    /// collects those names so they can be pre-hoisted to `undefined`.
+    fn collect_block_fn_names(stmts: &[Stmt]) -> Vec<String> {
+        let mut names = Vec::new();
+        for stmt in stmts {
+            Self::collect_block_fn_names_in_stmt(stmt, &mut names);
+        }
+        names
+    }
+
+    /// Helper for [`Self::collect_block_fn_names`] — recurses into
+    /// control-flow structures looking for function declarations nested
+    /// inside blocks.
+    fn collect_block_fn_names_in_stmt(stmt: &Stmt, names: &mut Vec<String>) {
+        match stmt {
+            Stmt::Block(b) => {
+                for s in &b.body {
+                    if let Stmt::FnDecl(f) = s
+                        && let Some(id) = &f.id
+                    {
+                        names.push(id.name.clone());
+                    }
+                    Self::collect_block_fn_names_in_stmt(s, names);
+                }
+            }
+            Stmt::If(s) => {
+                if let Stmt::FnDecl(f) = s.consequent.as_ref()
+                    && let Some(id) = &f.id
+                {
+                    names.push(id.name.clone());
+                }
+                Self::collect_block_fn_names_in_stmt(&s.consequent, names);
+                if let Some(alt) = &s.alternate {
+                    if let Stmt::FnDecl(f) = alt.as_ref()
+                        && let Some(id) = &f.id
+                    {
+                        names.push(id.name.clone());
+                    }
+                    Self::collect_block_fn_names_in_stmt(alt, names);
+                }
+            }
+            Stmt::While(s) => Self::collect_block_fn_names_in_stmt(&s.body, names),
+            Stmt::DoWhile(s) => Self::collect_block_fn_names_in_stmt(&s.body, names),
+            Stmt::For(s) => Self::collect_block_fn_names_in_stmt(&s.body, names),
+            Stmt::ForIn(s) => Self::collect_block_fn_names_in_stmt(&s.body, names),
+            Stmt::ForOf(s) => Self::collect_block_fn_names_in_stmt(&s.body, names),
+            Stmt::Switch(s) => {
+                for case in &s.cases {
+                    for cs in &case.consequent {
+                        if let Stmt::FnDecl(f) = cs
+                            && let Some(id) = &f.id
+                        {
+                            names.push(id.name.clone());
+                        }
+                        Self::collect_block_fn_names_in_stmt(cs, names);
+                    }
+                }
+            }
+            Stmt::Try(s) => {
+                for ts in &s.block.body {
+                    if let Stmt::FnDecl(f) = ts
+                        && let Some(id) = &f.id
+                    {
+                        names.push(id.name.clone());
+                    }
+                    Self::collect_block_fn_names_in_stmt(ts, names);
+                }
+                if let Some(handler) = &s.handler {
+                    for hs in &handler.body.body {
+                        if let Stmt::FnDecl(f) = hs
+                            && let Some(id) = &f.id
+                        {
+                            names.push(id.name.clone());
+                        }
+                        Self::collect_block_fn_names_in_stmt(hs, names);
+                    }
+                }
+                if let Some(fin) = &s.finalizer {
+                    for fs in &fin.body {
+                        if let Stmt::FnDecl(f) = fs
+                            && let Some(id) = &f.id
+                        {
+                            names.push(id.name.clone());
+                        }
+                        Self::collect_block_fn_names_in_stmt(fs, names);
+                    }
+                }
+            }
+            Stmt::Labeled(s) => Self::collect_block_fn_names_in_stmt(&s.body, names),
+            _ => {}
+        }
+    }
+
+    /// Pre-hoist Annex B function declaration names from blocks as `var`
+    /// bindings in the current function scope, initialised to `undefined`.
+    fn hoist_annex_b_fn_declarations(&mut self, stmts: &[Stmt]) {
+        if self.is_strict {
+            return;
+        }
+        let names = Self::collect_block_fn_names(stmts);
+        for name in names {
+            if self.scopes[0].contains_key(&name) {
+                continue;
+            }
+            let reg = self.allocator.new_local();
+            self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+            self.emit_star(reg);
+            self.scopes[0].insert(
+                name,
+                LocalBinding {
+                    reg,
+                    is_const: false,
+                    needs_tdz_check: false,
+                },
+            );
+        }
+    }
+
+    /// Pre-hoist Annex B function declaration names from blocks at
+    /// program level into the global env (set to `undefined`).
+    fn hoist_annex_b_fn_declarations_global(&mut self, stmts: &[Stmt]) {
+        if self.is_strict {
+            return;
+        }
+        let names = Self::collect_block_fn_names(stmts);
+        for name in names {
+            let name_idx = self.add_string(&name);
+            self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+            let slot = self.alloc_slot(FeedbackSlotKind::StoreGlobal);
+            self.emit(Instruction::new_unchecked(
+                Opcode::StaGlobal,
+                vec![Operand::ConstantPoolIdx(name_idx), slot],
+            ));
+        }
+    }
+
     /// Pre-register `let`/`const` bindings in the current scope with
     /// `TheHole` so that any access before the declaration statement
     /// triggers a `ReferenceError` (Temporal Dead Zone).
@@ -1481,8 +1621,14 @@ impl FunctionCompiler {
             vec![Operand::ConstantPoolIdx(pool_idx), slot, Operand::Flag(0)],
         ));
         // Bind the name in the current scope (accumulator holds the closure).
+        // If the name already exists (e.g. hoisted var with the same name),
+        // reuse the existing register so the function value overrides it.
         if let Some(id) = &decl.id {
-            let reg = self.define_local(&id.name);
+            let reg = if let Some(binding) = self.scopes.last().unwrap().get(&id.name) {
+                binding.reg
+            } else {
+                self.define_local(&id.name)
+            };
             self.emit_star(reg);
             // Top-level function declarations are also stored as globals so
             // that recursive calls via `LdaGlobal` can find them.
@@ -1496,6 +1642,17 @@ impl FunctionCompiler {
                     Opcode::StaGlobal,
                     vec![Operand::ConstantPoolIdx(name_idx), sta_slot],
                 ));
+            }
+
+            // Annex B: In non-strict mode, function declarations inside blocks
+            // also update a var-like binding in the enclosing function scope.
+            if !self.is_strict
+                && self.scopes.len() > 1
+                && let Some(binding) = self.scopes[0].get(&id.name)
+            {
+                let outer_reg = binding.reg;
+                self.emit_ldar(reg);
+                self.emit_star(outer_reg);
             }
         }
         Ok(())
@@ -6136,6 +6293,10 @@ fn compile_function_inner(
     // instead of throwing.
     compiler.hoist_var_declarations(&body.body);
 
+    // Annex B: in non-strict mode, function declarations inside
+    // blocks also create var-like bindings in the function scope.
+    compiler.hoist_annex_b_fn_declarations(&body.body);
+
     // Hoist function declarations to the top of the scope.
     for stmt in &body.body {
         if let Stmt::FnDecl(decl) = stmt {
@@ -6216,6 +6377,10 @@ impl BytecodeGenerator {
 
         // Hoist `var` declarations into the global env (set to undefined).
         compiler.hoist_var_declarations_global(&stmts_owned);
+
+        // Annex B: in non-strict mode, function declarations
+        // inside blocks also hoist as var-like globals.
+        compiler.hoist_annex_b_fn_declarations_global(&stmts_owned);
 
         // Hoist `let`/`const` declarations with TDZ.
         compiler.hoist_lexical_decls(&stmts_owned);

@@ -278,6 +278,10 @@ fn visible_string_property_name(raw_key: &str) -> Option<String> {
     Some(visible.to_string())
 }
 
+fn utf16_code_unit_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
 fn own_string_property_keys(map: &PropertyMap, enumerable_only: bool) -> Vec<String> {
     let mut ordered = Vec::new();
     let mut seen = HashSet::new();
@@ -17344,6 +17348,676 @@ mod tests {
         }
     }
 
+    // ── Promise: e2e chain/microtask conformance tests ─────────────────────
+
+    /// Helper: run JS, drain microtasks, return the result.
+    fn eval_with_microtasks(src: &str) -> JsValue {
+        use crate::builtins::promise::drain_active_microtask_queue;
+        let result = global_eval(src).unwrap();
+        drain_active_microtask_queue();
+        result
+    }
+
+    // -- 1. Promise.resolve returns the same promise for Promise input
+    #[test]
+    fn e2e_promise_resolve_identity() {
+        let result = eval_with_microtasks(
+            r#"
+            var p = Promise.resolve(42);
+            Promise.resolve(p) === p;
+            "#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // -- 2. Promise.reject wraps any value
+    #[test]
+    fn e2e_promise_reject_wraps_value() {
+        let result = eval_with_microtasks(
+            r#"
+            var caught = false;
+            var p = Promise.reject("boom");
+            p.catch(function(r) { caught = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("caught").unwrap();
+        assert_eq!(result2, JsValue::String("boom".into()));
+    }
+
+    // -- 3. Promise.prototype.then chains fulfilled values
+    #[test]
+    fn e2e_promise_then_chain_fulfilled() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.resolve(1)
+                .then(function(v) { return v + 1; })
+                .then(function(v) { return v * 3; })
+                .then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(6));
+    }
+
+    // -- 4. Promise.prototype.catch is alias for .then(undefined, onRejected)
+    #[test]
+    fn e2e_promise_catch_alias() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.reject("err")
+                .catch(function(r) { return "caught:" + r; })
+                .then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("caught:err".into()));
+    }
+
+    // -- 5. Microtask ordering: then callbacks run in FIFO order
+    #[test]
+    fn e2e_promise_microtask_fifo_order() {
+        let result = eval_with_microtasks(
+            r#"
+            var log = [];
+            var p = Promise.resolve();
+            p.then(function() { log.push(1); });
+            p.then(function() { log.push(2); });
+            p.then(function() { log.push(3); });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("JSON.stringify(log)").unwrap();
+        assert_eq!(result2, JsValue::String("[1,2,3]".into()));
+    }
+
+    // -- 6. Constructor: executor throw rejects the promise
+    #[test]
+    fn e2e_promise_constructor_throw_rejects() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            new Promise(function(resolve, reject) {
+                throw "oops";
+            }).catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        // The rejection reason is a string representation of the error.
+        let result2 = global_eval("typeof out").unwrap();
+        assert_eq!(result2, JsValue::String("string".into()));
+    }
+
+    // -- 7. Promise.all with non-iterable rejects with TypeError-like reason
+    #[test]
+    fn e2e_promise_all_non_iterable_rejects() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.all(42).catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        if let JsValue::String(s) = &result2 {
+            assert!(
+                s.contains("not iterable"),
+                "expected TypeError about iterable, got: {s}"
+            );
+        } else {
+            panic!("expected string rejection reason, got: {:?}", result2);
+        }
+    }
+
+    // -- 8. Promise.allSettled produces correct status fields
+    #[test]
+    fn e2e_promise_all_settled_status_fields() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.allSettled([
+                Promise.resolve("ok"),
+                Promise.reject("fail")
+            ]).then(function(results) {
+                out = results[0].status + "," + results[1].status;
+            });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("fulfilled,rejected".into()));
+    }
+
+    // -- 9. Promise.allSettled includes value and reason
+    #[test]
+    fn e2e_promise_all_settled_value_and_reason() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.allSettled([
+                Promise.resolve(42),
+                Promise.reject("no")
+            ]).then(function(results) {
+                out = results[0].value + "," + results[1].reason;
+            });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("42,no".into()));
+    }
+
+    // -- 10. Promise.race resolves with the first settled
+    #[test]
+    fn e2e_promise_race_first_wins() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.race([
+                Promise.resolve(1),
+                Promise.resolve(2)
+            ]).then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(1));
+    }
+
+    // -- 11. Promise.any resolves with first fulfilled
+    #[test]
+    fn e2e_promise_any_first_fulfilled() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.any([
+                Promise.reject("a"),
+                Promise.resolve(99),
+                Promise.resolve(100)
+            ]).then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(99));
+    }
+
+    // -- 12. Promise.any rejects with AggregateError when all reject
+    #[test]
+    fn e2e_promise_any_all_reject() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.any([
+                Promise.reject("a"),
+                Promise.reject("b")
+            ]).catch(function(e) { out = typeof e; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        // The AggregateError is an object.
+        assert_eq!(result2, JsValue::String("object".into()));
+    }
+
+    // -- 13. Promise.all resolves with ordered results
+    #[test]
+    fn e2e_promise_all_ordered_results() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.all([
+                Promise.resolve("a"),
+                Promise.resolve("b"),
+                Promise.resolve("c")
+            ]).then(function(arr) { out = arr.join(","); });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("a,b,c".into()));
+    }
+
+    // -- 14. Promise.all rejects on first rejection
+    #[test]
+    fn e2e_promise_all_first_rejection() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.all([
+                Promise.resolve(1),
+                Promise.reject("bad"),
+                Promise.resolve(3)
+            ]).catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("bad".into()));
+    }
+
+    // -- 15. Promise.all with empty array resolves immediately
+    #[test]
+    fn e2e_promise_all_empty() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = false;
+            Promise.all([]).then(function(arr) { out = arr.length === 0; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Boolean(true));
+    }
+
+    // -- 16. then handler returning a promise chains through
+    #[test]
+    fn e2e_promise_then_returns_promise() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.resolve(1)
+                .then(function(v) { return Promise.resolve(v + 10); })
+                .then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(11));
+    }
+
+    // -- 17. Promise self-resolution rejects with TypeError
+    #[test]
+    fn e2e_promise_self_resolution_rejects() {
+        use crate::builtins::promise::{MicrotaskQueue, promise_with_resolvers};
+        let q = MicrotaskQueue::new();
+        let wr = promise_with_resolvers(&q);
+        // Resolve the promise with itself.
+        let p_clone = wr.promise.clone();
+        (wr.resolve)(JsValue::Promise(p_clone));
+        q.drain();
+        assert!(wr.promise.is_rejected());
+        if let Some(JsValue::String(s)) = wr.promise.reason() {
+            assert!(
+                s.contains("resolve itself"),
+                "expected self-resolution TypeError, got: {s}"
+            );
+        } else {
+            panic!("expected string rejection reason");
+        }
+    }
+
+    // -- 18. Thenable assimilation: object with .then method is treated as promise
+    #[test]
+    fn e2e_promise_thenable_assimilation() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            var thenable = { then: function(resolve) { resolve(77); } };
+            Promise.resolve(thenable).then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(77));
+    }
+
+    // -- 19. Thenable rejection
+    #[test]
+    fn e2e_promise_thenable_rejection() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            var thenable = { then: function(resolve, reject) { reject("nope"); } };
+            Promise.resolve(thenable).catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("nope".into()));
+    }
+
+    // -- 20. Thenable: only first call to resolve/reject takes effect
+    #[test]
+    fn e2e_promise_thenable_first_call_wins() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            var thenable = { then: function(resolve, reject) { resolve(1); resolve(2); reject(3); } };
+            Promise.resolve(thenable).then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(1));
+    }
+
+    // -- 21. Promise.finally runs on fulfillment and passes value through
+    #[test]
+    fn e2e_promise_finally_on_fulfilled() {
+        let result = eval_with_microtasks(
+            r#"
+            var ran = false;
+            var out = 0;
+            Promise.resolve(42)
+                .finally(function() { ran = true; })
+                .then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let ran = global_eval("ran").unwrap();
+        let out = global_eval("out").unwrap();
+        assert_eq!(ran, JsValue::Boolean(true));
+        assert_eq!(out, JsValue::Smi(42));
+    }
+
+    // -- 22. Promise.finally runs on rejection and passes reason through
+    #[test]
+    fn e2e_promise_finally_on_rejected() {
+        let result = eval_with_microtasks(
+            r#"
+            var ran = false;
+            var out = "";
+            Promise.reject("err")
+                .finally(function() { ran = true; })
+                .catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let ran = global_eval("ran").unwrap();
+        let out = global_eval("out").unwrap();
+        assert_eq!(ran, JsValue::Boolean(true));
+        assert_eq!(out, JsValue::String("err".into()));
+    }
+
+    // -- 23. Chained catch recovers and allows subsequent then
+    #[test]
+    fn e2e_promise_catch_recovery_chain() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.reject("bad")
+                .catch(function(r) { return 100; })
+                .then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(100));
+    }
+
+    // -- 24. then with no onFulfilled passes value through
+    #[test]
+    fn e2e_promise_then_passthrough_fulfilled() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.resolve(5)
+                .then(undefined, function(r) { return -1; })
+                .then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(5));
+    }
+
+    // -- 25. then with no onRejected passes rejection through
+    #[test]
+    fn e2e_promise_then_passthrough_rejected() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.reject("err")
+                .then(function(v) { return v; })
+                .catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("err".into()));
+    }
+
+    // -- 26. Promise.allSettled with non-iterable rejects
+    #[test]
+    fn e2e_promise_all_settled_non_iterable_rejects() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.allSettled("not-array").catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        if let JsValue::String(s) = &result2 {
+            assert!(s.contains("not iterable"), "expected TypeError, got: {s}");
+        } else {
+            panic!("expected string rejection reason");
+        }
+    }
+
+    // -- 27. Promise.any with non-iterable rejects
+    #[test]
+    fn e2e_promise_any_non_iterable_rejects() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.any(null).catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        if let JsValue::String(s) = &result2 {
+            assert!(s.contains("not iterable"), "expected TypeError, got: {s}");
+        } else {
+            panic!("expected string rejection reason");
+        }
+    }
+
+    // -- 28. Promise.race with non-iterable rejects
+    #[test]
+    fn e2e_promise_race_non_iterable_rejects() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.race(true).catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        if let JsValue::String(s) = &result2 {
+            assert!(s.contains("not iterable"), "expected TypeError, got: {s}");
+        } else {
+            panic!("expected string rejection reason");
+        }
+    }
+
+    // -- 29. Microtask ordering across multiple promises
+    #[test]
+    fn e2e_promise_microtask_interleaved_order() {
+        let result = eval_with_microtasks(
+            r#"
+            var log = [];
+            Promise.resolve().then(function() {
+                log.push("a1");
+                Promise.resolve().then(function() { log.push("a2"); });
+            });
+            Promise.resolve().then(function() { log.push("b1"); });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("JSON.stringify(log)").unwrap();
+        // a1 runs first, enqueues a2, then b1 runs, then a2 runs
+        assert_eq!(result2, JsValue::String(r#"["a1","b1","a2"]"#.into()));
+    }
+
+    // -- 30. Promise.resolve with non-thenable plain object
+    #[test]
+    fn e2e_promise_resolve_non_thenable_object() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            var obj = { x: 1 };
+            Promise.resolve(obj).then(function(v) { out = v.x; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(1));
+    }
+
+    // -- 31. Constructor with synchronous resolve
+    #[test]
+    fn e2e_promise_constructor_sync_resolve() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            new Promise(function(resolve) { resolve(7); })
+                .then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(7));
+    }
+
+    // -- 32. Constructor with synchronous reject
+    #[test]
+    fn e2e_promise_constructor_sync_reject() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            new Promise(function(resolve, reject) { reject("no"); })
+                .catch(function(r) { out = r; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("no".into()));
+    }
+
+    // -- 33. Long then chain
+    #[test]
+    fn e2e_promise_long_then_chain() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.resolve(1)
+                .then(function(v) { return v + 1; })
+                .then(function(v) { return v + 1; })
+                .then(function(v) { return v + 1; })
+                .then(function(v) { return v + 1; })
+                .then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(5));
+    }
+
+    // -- 34. Promise.allSettled with empty array
+    #[test]
+    fn e2e_promise_all_settled_empty() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = -1;
+            Promise.allSettled([]).then(function(arr) { out = arr.length; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(0));
+    }
+
+    // -- 35. Promise.withResolvers resolve/reject work end-to-end
+    #[test]
+    fn e2e_promise_with_resolvers_resolve() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            var wr = Promise.withResolvers();
+            wr.promise.then(function(v) { out = v; });
+            wr.resolve(99);
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(99));
+    }
+
+    // -- 36. Thenable assimilation in then handler return
+    #[test]
+    fn e2e_promise_then_returns_thenable() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = 0;
+            Promise.resolve(1)
+                .then(function(v) {
+                    return { then: function(resolve) { resolve(v + 100); } };
+                })
+                .then(function(v) { out = v; });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::Smi(101));
+    }
+
+    // -- 37. Promise.all wraps non-promise values
+    #[test]
+    fn e2e_promise_all_wraps_non_promises() {
+        let result = eval_with_microtasks(
+            r#"
+            var out = "";
+            Promise.all([1, "two", true]).then(function(arr) {
+                out = arr[0] + "," + arr[1] + "," + arr[2];
+            });
+            "#,
+        );
+        use crate::builtins::promise::drain_active_microtask_queue;
+        drain_active_microtask_queue();
+        let result2 = global_eval("out").unwrap();
+        assert_eq!(result2, JsValue::String("1,two,true".into()));
+    }
+
     // ── eval: direct vs indirect (end-to-end) ───────────────────────────────
 
     /// Direct eval `eval("1+2")` is recognised by the bytecode generator
@@ -21399,6 +22073,241 @@ mod tests {
     fn e2e_string_repeat_infinity() {
         let result = global_eval("'x'.repeat(Infinity)");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn e2e_string_from_code_point_astral() {
+        let result = global_eval("String.fromCodePoint(0x1F600)").unwrap();
+        assert_eq!(result, JsValue::String("😀".into()));
+    }
+
+    #[test]
+    fn e2e_string_from_code_point_mixed_planes() {
+        let result = global_eval("String.fromCodePoint(0x41, 0x1F600, 0x42)").unwrap();
+        assert_eq!(result, JsValue::String("A😀B".into()));
+    }
+
+    #[test]
+    fn e2e_string_from_code_point_max_scalar() {
+        let result = global_eval("String.fromCodePoint(0x10FFFF)").unwrap();
+        assert_eq!(result, JsValue::String("\u{10FFFF}".into()));
+    }
+
+    #[test]
+    fn e2e_string_from_code_point_rejects_surrogate() {
+        assert!(global_eval("String.fromCodePoint(0xD800)").is_err());
+    }
+
+    #[test]
+    fn e2e_string_from_code_point_rejects_fractional() {
+        assert!(global_eval("String.fromCodePoint(65.5)").is_err());
+    }
+
+    #[test]
+    fn e2e_string_from_code_point_rejects_infinity() {
+        assert!(global_eval("String.fromCodePoint(Infinity)").is_err());
+    }
+
+    #[test]
+    fn e2e_string_code_point_at_surrogate_pair_start() {
+        let result = global_eval("'😀'.codePointAt(0)").unwrap();
+        assert_eq!(result, JsValue::Smi(128512));
+    }
+
+    #[test]
+    fn e2e_string_code_point_at_low_surrogate_index() {
+        let result = global_eval("'😀'.codePointAt(1)").unwrap();
+        assert_eq!(result, JsValue::Smi(56832));
+    }
+
+    #[test]
+    fn e2e_string_code_point_at_fractional_index() {
+        let result = global_eval("'😀'.codePointAt(0.9)").unwrap();
+        assert_eq!(result, JsValue::Smi(128512));
+    }
+
+    #[test]
+    fn e2e_string_code_point_at_infinity_is_undefined() {
+        let result = global_eval("'😀'.codePointAt(Infinity) === undefined").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_string_iterator_for_of_uses_code_points() {
+        let result =
+            global_eval("var out = []; for (var ch of 'A😀B') out.push(ch); out.join('|')")
+                .unwrap();
+        assert_eq!(result, JsValue::String("A|😀|B".into()));
+    }
+
+    #[test]
+    fn e2e_string_iterator_array_from_uses_code_points() {
+        let result = global_eval("Array.from('😀').length").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_string_iterator_next_preserves_astral_character() {
+        let result = global_eval(
+            "var iter = '😀x'[Symbol.iterator](); var a = iter.next(); var b = iter.next(); a.value + ':' + b.value",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("😀:x".into()));
+    }
+
+    #[test]
+    fn e2e_string_length_counts_utf16_code_units() {
+        let result = global_eval("'😀'.length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_string_length_mixed_ascii_and_astral() {
+        let result = global_eval("'A😀B'.length").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn e2e_string_length_descriptor_uses_code_units() {
+        let result = global_eval("Object.getOwnPropertyDescriptor('😀', 'length').value").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_string_object_keys_use_code_units() {
+        let result = global_eval("Object.keys('😀').length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_string_object_property_names_use_code_units() {
+        let result = global_eval("Object.getOwnPropertyNames('😀').join(',')").unwrap();
+        assert_eq!(result, JsValue::String("0,1,length".into()));
+    }
+
+    #[test]
+    fn e2e_string_has_own_second_surrogate_index() {
+        let result = global_eval("Object.hasOwn('😀', '1')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_string_for_in_uses_code_unit_indices() {
+        let result =
+            global_eval("var keys = []; for (var k in '😀') keys.push(k); keys.join(',')").unwrap();
+        assert_eq!(result, JsValue::String("0,1".into()));
+    }
+
+    #[test]
+    fn e2e_string_starts_with_position_uses_utf16_units() {
+        let result = global_eval("'😀b'.startsWith('b', 2)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_string_starts_with_fractional_position_truncates() {
+        let result = global_eval("'abc'.startsWith('b', 1.9)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_string_includes_position_uses_utf16_units() {
+        let result = global_eval("'😀b'.includes('b', 2)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_string_includes_infinity_position_is_false() {
+        let result = global_eval("'abc'.includes('c', Infinity)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_string_ends_with_end_position_uses_utf16_units() {
+        let result = global_eval("'😀b'.endsWith('😀', 2)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_string_ends_with_fractional_end_position_truncates() {
+        let result = global_eval("'abc'.endsWith('b', 2.9)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_string_repeat_fractional_count_truncates() {
+        let result = global_eval("'ab'.repeat(2.9)").unwrap();
+        assert_eq!(result, JsValue::String("abab".into()));
+    }
+
+    #[test]
+    fn e2e_string_repeat_nan_count_is_empty() {
+        let result = global_eval("'ab'.repeat(NaN)").unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    #[test]
+    fn e2e_string_repeat_null_count_is_empty() {
+        let result = global_eval("'ab'.repeat(null)").unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    #[test]
+    fn e2e_string_pad_start_negative_target_is_noop() {
+        let result = global_eval("'x'.padStart(-1, '0')").unwrap();
+        assert_eq!(result, JsValue::String("x".into()));
+    }
+
+    #[test]
+    fn e2e_string_pad_start_nan_target_is_noop() {
+        let result = global_eval("'x'.padStart(NaN, '0')").unwrap();
+        assert_eq!(result, JsValue::String("x".into()));
+    }
+
+    #[test]
+    fn e2e_string_pad_start_infinity_throws() {
+        assert!(global_eval("'x'.padStart(Infinity, '0')").is_err());
+    }
+
+    #[test]
+    fn e2e_string_pad_start_utf16_target_uses_full_surrogate_pair() {
+        let result = global_eval("'x'.padStart(3, '😀')").unwrap();
+        assert_eq!(result, JsValue::String("😀x".into()));
+    }
+
+    #[test]
+    fn e2e_string_pad_start_empty_fill_is_noop() {
+        let result = global_eval("'x'.padStart(3, '')").unwrap();
+        assert_eq!(result, JsValue::String("x".into()));
+    }
+
+    #[test]
+    fn e2e_string_pad_start_fractional_target_truncates() {
+        let result = global_eval("'x'.padStart(4.9, '0')").unwrap();
+        assert_eq!(result, JsValue::String("000x".into()));
+    }
+
+    #[test]
+    fn e2e_string_pad_end_infinity_throws() {
+        assert!(global_eval("'x'.padEnd(Infinity, '0')").is_err());
+    }
+
+    #[test]
+    fn e2e_string_pad_end_utf16_target_uses_full_surrogate_pair() {
+        let result = global_eval("'x'.padEnd(3, '😀')").unwrap();
+        assert_eq!(result, JsValue::String("x😀".into()));
+    }
+
+    #[test]
+    fn e2e_string_pad_end_empty_fill_is_noop() {
+        let result = global_eval("'x'.padEnd(3, '')").unwrap();
+        assert_eq!(result, JsValue::String("x".into()));
+    }
+
+    #[test]
+    fn e2e_string_pad_end_fractional_target_truncates() {
+        let result = global_eval("'x'.padEnd(4.9, '0')").unwrap();
+        assert_eq!(result, JsValue::String("x000".into()));
     }
 
     // ── String.prototype.padStart / padEnd tests ────────────────────────
@@ -28863,6 +29772,423 @@ mod tests {
         assert_eq!(r, JsValue::String("revoked_keys".into()));
     }
 
+    // ── Proxy/Reflect receiver & ownKeys conformance ──────────────────────────
+
+    #[test]
+    fn e2e_reflect_get_basic() {
+        let r = global_eval(r#"Reflect.get({ x: 42 }, 'x')"#).unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_reflect_get_missing_returns_undefined() {
+        let r = global_eval(r#"Reflect.get({}, 'x')"#).unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_reflect_set_basic() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Reflect.set(obj, 'x', 10);
+            obj.x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_reflect_has_own() {
+        let r = global_eval(r#"Reflect.has({ a: 1 }, 'a')"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_reflect_has_missing() {
+        let r = global_eval(r#"Reflect.has({}, 'z')"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_reflect_delete_property() {
+        let r = global_eval(
+            r#"
+            var obj = { a: 1 };
+            var ok = Reflect.deleteProperty(obj, 'a');
+            ok && obj.a === undefined;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_reflect_own_keys_integer_ordering() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj['c'] = 1;
+            obj['2'] = 1;
+            obj['b'] = 1;
+            obj['0'] = 1;
+            obj['1'] = 1;
+            var keys = Reflect.ownKeys(obj);
+            keys[0] + ',' + keys[1] + ',' + keys[2] + ',' + keys[3] + ',' + keys[4];
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,1,2,c,b".into()));
+    }
+
+    #[test]
+    fn e2e_reflect_own_keys_strings_only() {
+        let r = global_eval(
+            r#"
+            var obj = { z: 1, a: 2, m: 3 };
+            Reflect.ownKeys(obj).join(',');
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("z,a,m".into()));
+    }
+
+    #[test]
+    fn e2e_reflect_is_extensible_true() {
+        let r = global_eval(r#"Reflect.isExtensible({})"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_reflect_prevent_extensions() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Reflect.preventExtensions(obj);
+            Reflect.isExtensible(obj);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_reflect_define_property() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Reflect.defineProperty(obj, 'x', { value: 99 });
+            obj.x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn e2e_reflect_get_own_property_descriptor() {
+        let r = global_eval(
+            r#"
+            var obj = { x: 7 };
+            var d = Reflect.getOwnPropertyDescriptor(obj, 'x');
+            d.value;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_reflect_construct_basic() {
+        let r = global_eval(
+            r#"
+            function Foo(v) { this.val = v; }
+            var obj = Reflect.construct(Foo, [42]);
+            obj.val;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_reflect_apply_basic() {
+        let r = global_eval(
+            r#"
+            function add(a, b) { return a + b; }
+            Reflect.apply(add, null, [3, 4]);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_proxy_get_trap_with_receiver() {
+        let r = global_eval(
+            r#"
+            var target = { x: 1 };
+            var handler = {
+                get: function(t, k, r) { return k + '_trapped'; }
+            };
+            var p = new Proxy(target, handler);
+            p.x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("x_trapped".into()));
+    }
+
+    #[test]
+    fn e2e_proxy_set_trap_intercepts() {
+        let r = global_eval(
+            r#"
+            var log = '';
+            var target = {};
+            var handler = {
+                set: function(t, k, v) { log += k + '=' + v; t[k] = v; return true; }
+            };
+            var p = new Proxy(target, handler);
+            p.a = 5;
+            log;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a=5".into()));
+    }
+
+    #[test]
+    fn e2e_proxy_has_trap() {
+        let r = global_eval(
+            r#"
+            var handler = { has: function(t, k) { return k === 'yes'; } };
+            var p = new Proxy({}, handler);
+            ('yes' in p) + ',' + ('no' in p);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("true,false".into()));
+    }
+
+    #[test]
+    fn e2e_proxy_delete_trap() {
+        let r = global_eval(
+            r#"
+            var deleted = '';
+            var handler = { deleteProperty: function(t, k) { deleted = k; return true; } };
+            var p = new Proxy({ a: 1 }, handler);
+            delete p.a;
+            deleted;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a".into()));
+    }
+
+    #[test]
+    fn e2e_proxy_own_keys_trap() {
+        let r = global_eval(
+            r#"
+            var handler = { ownKeys: function(t) { return ['x', 'y']; } };
+            var p = new Proxy({}, handler);
+            Reflect.ownKeys(p).join(',');
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("x,y".into()));
+    }
+
+    #[test]
+    fn e2e_proxy_apply_trap() {
+        let r = global_eval(
+            r#"
+            var handler = { apply: function(t, thisArg, args) { return args[0] * 2; } };
+            var p = new Proxy(function(x) { return x; }, handler);
+            p(21);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_proxy_construct_trap() {
+        let r = global_eval(
+            r#"
+            function Base() {}
+            var handler = {
+                construct: function(t, args) { return { built: args[0] }; }
+            };
+            var P = new Proxy(Base, handler);
+            var obj = new P(99);
+            obj.built;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn e2e_proxy_is_extensible_trap() {
+        let r = global_eval(
+            r#"
+            var handler = { isExtensible: function(t) { return true; } };
+            var p = new Proxy({}, handler);
+            Reflect.isExtensible(p);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_proxy_prevent_extensions_trap() {
+        let r = global_eval(
+            r#"
+            var frozen = false;
+            var target = {};
+            var handler = {
+                preventExtensions: function(t) {
+                    Object.preventExtensions(t);
+                    frozen = true;
+                    return true;
+                }
+            };
+            var p = new Proxy(target, handler);
+            Reflect.preventExtensions(p);
+            frozen;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_proxy_get_prototype_of_trap() {
+        let r = global_eval(
+            r#"
+            var proto = { tag: 'proto' };
+            var handler = { getPrototypeOf: function(t) { return proto; } };
+            var p = new Proxy({}, handler);
+            Reflect.getPrototypeOf(p).tag;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("proto".into()));
+    }
+
+    #[test]
+    fn e2e_proxy_chained_two_levels() {
+        let r = global_eval(
+            r#"
+            var inner = new Proxy({ v: 1 }, { get: function(t,k) { return t[k] + 10; } });
+            var outer = new Proxy(inner, { get: function(t,k) { return t[k] + 100; } });
+            outer.v;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(111));
+    }
+
+    #[test]
+    fn e2e_reflect_own_keys_via_proxy_own_keys_trap() {
+        let r = global_eval(
+            r#"
+            var handler = { ownKeys: function() { return ['b', 'a']; } };
+            var p = new Proxy({}, handler);
+            Reflect.ownKeys(p).join(',');
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("b,a".into()));
+    }
+
+    #[test]
+    fn e2e_proxy_revocable_basic() {
+        let r = global_eval(
+            r#"
+            var rev = Proxy.revocable({ x: 5 }, {});
+            var before = rev.proxy.x;
+            rev.revoke();
+            var after;
+            try { after = rev.proxy.x; } catch(e) { after = 'revoked'; }
+            before + ',' + after;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("5,revoked".into()));
+    }
+
+    #[test]
+    fn e2e_proxy_no_trap_forwarding_all_ops() {
+        let r = global_eval(
+            r#"
+            var obj = { a: 1, b: 2 };
+            var p = new Proxy(obj, {});
+            p.c = 3;
+            delete p.a;
+            Reflect.ownKeys(p).join(',');
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("b,c".into()));
+    }
+
+    #[test]
+    fn e2e_reflect_set_returns_boolean() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            Reflect.set(obj, 'k', 1) === true;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_object_keys_es_ordering() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            obj['z'] = 1;
+            obj['5'] = 1;
+            obj['a'] = 1;
+            obj['0'] = 1;
+            Object.keys(obj).join(',');
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,5,z,a".into()));
+    }
+
+    #[test]
+    fn e2e_reflect_get_prototype_of_null_proto() {
+        let r = global_eval(
+            r#"
+            var obj = Object.create(null);
+            Reflect.getPrototypeOf(obj) === null;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_reflect_set_prototype_of_basic() {
+        let r = global_eval(
+            r#"
+            var obj = {};
+            var proto = { inherited: 99 };
+            Reflect.setPrototypeOf(obj, proto);
+            obj.inherited;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
     // ── Property descriptor conformance e2e tests ───────────────────────
 
     /// Mixed descriptor (both accessor and data fields) throws TypeError.
@@ -32170,5 +33496,309 @@ mod tests {
     fn e2e_set_constructor_null_creates_empty() {
         let result = global_eval("var s = new Set(null); s.size === 0").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // E2E conformance: variable hoisting and scoping (30+ tests)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ── var hoisting to function scope ───────────────────────────────────
+
+    #[test]
+    fn e2e_var_hoisted_undefined_before_assignment() {
+        let result = global_eval("function f() { var r = x; var x = 5; return r; } f()").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_var_in_block_visible_outside() {
+        let result = global_eval("function f() { { var x = 42; } return x; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_var_in_if_visible_outside() {
+        let result =
+            global_eval("function f() { if (true) { var x = 99; } return x; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn e2e_var_in_if_else_visible_outside() {
+        let result = global_eval(
+            "function f() { if (false) { var x = 1; } else { var y = 2; } return y; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_var_in_while_visible_outside() {
+        let result = global_eval(
+            "function f() { var i = 0; while (i < 1) { var x = 10; i++; } return x; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_var_in_try_catch_visible_outside() {
+        let result = global_eval(
+            "function f() { try { var x = 1; throw 0; } catch(e) { var y = 2; } return x + y; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // ── var in for-loop body visible outside ─────────────────────────────
+
+    #[test]
+    fn e2e_var_in_for_init_visible_after() {
+        let result =
+            global_eval("function f() { for (var i = 0; i < 3; i++) {} return i; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_var_in_for_body_visible_after() {
+        let result = global_eval(
+            "function f() { for (var i = 0; i < 1; i++) { var x = 77; } return x; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(77));
+    }
+
+    #[test]
+    fn e2e_var_in_for_in_visible_after() {
+        let result = global_eval("function f() { for (var k in {a:1}) {} return k; } f()").unwrap();
+        assert_eq!(result, JsValue::String("a".into()));
+    }
+
+    // ── Duplicate var declarations allowed ───────────────────────────────
+
+    #[test]
+    fn e2e_duplicate_var_allowed() {
+        let result = global_eval("function f() { var x = 1; var x = 2; return x; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_duplicate_var_no_init_keeps_value() {
+        let result = global_eval("function f() { var x = 5; var x; return x; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_duplicate_var_across_blocks() {
+        let result =
+            global_eval("function f() { var x = 1; { var x = 2; } return x; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    // ── Hoisted function declarations override var of same name ─────────
+
+    #[test]
+    fn e2e_fn_decl_overrides_var() {
+        let result =
+            global_eval("function f() { var g; function g() { return 42; } return g(); } f()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_fn_decl_hoisted_before_var_init() {
+        let result =
+            global_eval("function f() { var r = typeof g; function g() {} return r; } f()")
+                .unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn e2e_var_init_overwrites_fn_decl() {
+        let result =
+            global_eval("function f() { var g = 99; function g() { return 1; } return g; } f()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    // ── let/const TDZ ───────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_let_tdz_throws() {
+        let result = global_eval(
+            "function f() { try { return x; } catch(e) { return 'caught'; } let x = 1; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("caught".into()));
+    }
+
+    #[test]
+    fn e2e_const_tdz_throws() {
+        let result = global_eval(
+            "function f() { try { return x; } catch(e) { return 'caught'; } const x = 1; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("caught".into()));
+    }
+
+    #[test]
+    fn e2e_let_tdz_in_block_shadows_outer() {
+        let result = global_eval(
+            "var x = 'outer'; var r; { try { r = x; } catch(e) { r = 'tdz'; } let x = 'inner'; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("tdz".into()));
+    }
+
+    #[test]
+    fn e2e_let_tdz_assignment_throws() {
+        let result = global_eval(
+            "function f() { try { x = 5; } catch(e) { return 'caught'; } let x; return x; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("caught".into()));
+    }
+
+    // ── const reassignment ──────────────────────────────────────────────
+
+    #[test]
+    fn e2e_hoisting_const_reassignment_throws() {
+        let result = global_eval("const x = 1; x = 2;");
+        assert!(result.is_err(), "const reassignment should throw");
+    }
+
+    // ── let/const block scoping ─────────────────────────────────────────
+
+    #[test]
+    fn e2e_hoisting_let_not_visible_outside_block() {
+        let result = global_eval("{ let x = 1; } typeof x").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_hoisting_const_not_visible_outside_block() {
+        let result = global_eval("{ const x = 1; } typeof x").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_let_separate_blocks_independent() {
+        let result =
+            global_eval("var r1, r2; { let x = 10; r1 = x; } { let x = 20; r2 = x; } r1 + r2")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    #[test]
+    fn e2e_let_in_for_not_visible_outside() {
+        let result = global_eval("for (let i = 0; i < 3; i++) {} typeof i").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    // ── Function declarations in blocks (Annex B) ───────────────────────
+
+    #[test]
+    fn e2e_annex_b_fn_in_block_visible_in_function() {
+        let result =
+            global_eval("function f() { { function g() { return 42; } } return g(); } f()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_annex_b_fn_in_block_undefined_before_block() {
+        let result = global_eval(
+            "function f() { var r = typeof g; { function g() { return 1; } } return r; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_fn_in_if_visible_in_function() {
+        let result = global_eval(
+            "function f() { if (true) { function g() { return 7; } } return g(); } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_annex_b_fn_in_block_at_program_level() {
+        let result = global_eval("{ function inner() { return 55; } } inner()").unwrap();
+        assert_eq!(result, JsValue::Smi(55));
+    }
+
+    // ── Combined scoping scenarios ──────────────────────────────────────
+
+    #[test]
+    fn e2e_var_and_let_coexist_in_function() {
+        let result = global_eval(
+            "function f() { var a = 1; let b = 2; { var c = 3; let d = 4; } return a + b + c; } f()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_nested_function_var_hoisting() {
+        let result = global_eval(
+            "function outer() { function inner() { return x; var x = 10; } return inner(); } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_var_in_switch_visible_outside() {
+        let result =
+            global_eval("function f() { switch(1) { case 1: var x = 42; break; } return x; } f()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_let_in_switch_block_scoped() {
+        let result = global_eval("switch(1) { case 1: let x = 42; break; } typeof x").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_var_hoisted_across_nested_blocks() {
+        let result =
+            global_eval("function f() { { { { var deep = 99; } } } return deep; } f()").unwrap();
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn e2e_function_hoisting_before_code_program() {
+        let result = global_eval("var r = f(); function f() { return 'hoisted'; } r").unwrap();
+        assert_eq!(result, JsValue::String("hoisted".into()));
+    }
+
+    #[test]
+    fn e2e_function_hoisting_inside_function() {
+        let result = global_eval(
+            "function outer() { var r = inner(); function inner() { return 7; } return r; } outer()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_var_hoisted_in_catch_block() {
+        let result =
+            global_eval("function f() { try { throw 1; } catch(e) { var x = 42; } return x; } f()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_let_tdz_function_param_shadows() {
+        let result = global_eval(
+            "function f(x) { { try { return x; } catch(e) { return 'tdz'; } let x = 99; } } f(1)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("tdz".into()));
     }
 }

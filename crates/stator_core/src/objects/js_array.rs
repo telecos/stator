@@ -199,6 +199,15 @@ impl JsArray {
     pub fn elements_as_mut_slice(&mut self) -> &mut [JsValue] {
         self.object.elements_as_mut_slice()
     }
+
+    /// Returns `true` if the element at `index` is a hole (sparse slot).
+    ///
+    /// Out-of-bounds indices are also considered holes.
+    pub fn is_hole_at(&self, index: u32) -> bool {
+        let idx = index as usize;
+        let slice = self.elements_as_slice();
+        idx >= slice.len() || slice[idx].is_the_hole()
+    }
 }
 
 impl Default for JsArray {
