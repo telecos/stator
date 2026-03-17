@@ -160,6 +160,28 @@ fn weak_collection_key(val: &JsValue) -> Option<usize> {
     }
 }
 
+fn get_hidden_method(
+    receiver: &JsValue,
+    marker: &str,
+    method_slot: &str,
+    display_name: &str,
+) -> StatorResult<JsValue> {
+    let JsValue::PlainObject(map) = receiver else {
+        return Err(StatorError::TypeError(format!(
+            "{display_name} called on incompatible receiver"
+        )));
+    };
+    let borrow = map.borrow();
+    if !matches!(borrow.get(marker), Some(JsValue::Boolean(true))) {
+        return Err(StatorError::TypeError(format!(
+            "{display_name} called on incompatible receiver"
+        )));
+    }
+    borrow.get(method_slot).cloned().ok_or_else(|| {
+        StatorError::TypeError(format!("{display_name} called on incompatible receiver"))
+    })
+}
+
 /// Wire up the spec-mandated `.name` and `.prototype.constructor` properties
 /// on a built-in constructor `PlainObject`.
 ///
@@ -8298,8 +8320,9 @@ fn make_weak_set_builtin() -> JsValue {
 /// Build the `WeakRef` constructor/namespace object.
 ///
 /// The returned `PlainObject` provides a `__call__` constructor that creates
-/// a new `WeakRef` instance with a `deref` prototype method.  The target
-/// must be an `Object` pointer; non-object targets cause a `TypeError`.
+/// a new `WeakRef` instance with hidden per-instance state and a shared
+/// `WeakRef.prototype.deref` method. The target must be an object;
+/// non-object targets cause a `TypeError`.
 #[inline(never)]
 fn make_weak_ref_builtin() -> JsValue {
     let mut props = PropertyMap::new();
@@ -8325,16 +8348,15 @@ fn make_weak_ref_builtin() -> JsValue {
                 PropertyAttributes::empty(),
             );
 
-            // deref()
+            // Hidden per-instance deref implementation used by WeakRef.prototype.deref.
             {
                 let inner = Rc::clone(&inner);
                 obj.insert(
-                    "deref".into(),
+                    "__weakref_deref__".into(),
                     native(move |_a| Ok(weak_ref_deref(&inner.borrow()))),
                 );
             }
 
-            // §26.1.3.4 WeakRef.prototype[@@toStringTag] = "WeakRef"
             obj.insert_with_attrs(
                 "@@toStringTag".into(),
                 JsValue::String("WeakRef".into()),
@@ -8345,6 +8367,35 @@ fn make_weak_ref_builtin() -> JsValue {
         }),
     );
 
+    // ── WeakRef.prototype ─────────────────────────────────────────────
+    {
+        let mut proto = PropertyMap::new();
+        proto.insert(
+            "deref".into(),
+            native(|args| {
+                let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                let method = get_hidden_method(
+                    receiver,
+                    "__is_weakref__",
+                    "__weakref_deref__",
+                    "WeakRef.prototype.deref",
+                )?;
+                dispatch_call_value(&method, vec![])
+            }),
+        );
+        proto.insert("constructor".into(), JsValue::Undefined);
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("WeakRef".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+        props.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        );
+    }
+
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
@@ -8354,8 +8405,8 @@ fn make_weak_ref_builtin() -> JsValue {
 /// Build the `FinalizationRegistry` constructor/namespace object.
 ///
 /// The returned `PlainObject` provides a `__call__` constructor that creates
-/// a new `FinalizationRegistry` instance with `register` and `unregister`
-/// prototype methods.  The cleanup callback is stored as a JS-level value;
+/// a new `FinalizationRegistry` instance with hidden per-instance state and
+/// shared prototype methods. The cleanup callback is stored as a JS-level value;
 /// actual invocation happens when the GC integration is complete.
 #[inline(never)]
 fn make_finalization_registry_builtin() -> JsValue {
@@ -8375,11 +8426,17 @@ fn make_finalization_registry_builtin() -> JsValue {
             let callback = Rc::new(callback);
             let mut obj = PropertyMap::new();
 
+            obj.insert_with_attrs(
+                "__is_finalization_registry__".into(),
+                JsValue::Boolean(true),
+                PropertyAttributes::empty(),
+            );
+
             // register(target, heldValue [, unregisterToken])
             {
                 let inner = Rc::clone(&inner);
                 obj.insert(
-                    "register".into(),
+                    "__finalization_registry_register__".into(),
                     native(move |a| {
                         let target = a.first().unwrap_or(&JsValue::Undefined);
                         let held_value = a.get(1).cloned().unwrap_or(JsValue::Undefined);
@@ -8449,7 +8506,7 @@ fn make_finalization_registry_builtin() -> JsValue {
             {
                 let inner = Rc::clone(&inner);
                 obj.insert(
-                    "unregister".into(),
+                    "__finalization_registry_unregister__".into(),
                     native(move |a| {
                         let token = a.first().unwrap_or(&JsValue::Undefined);
                         match token {
@@ -8472,7 +8529,7 @@ fn make_finalization_registry_builtin() -> JsValue {
                 let inner = Rc::clone(&inner);
                 let cb = Rc::clone(&callback);
                 obj.insert(
-                    "cleanupSome".into(),
+                    "__finalization_registry_cleanup_some__".into(),
                     native(move |_a| {
                         finalization_registry_sweep_plain(&mut inner.borrow_mut());
                         let held_values = finalization_registry_drain(&mut inner.borrow_mut());
@@ -8488,7 +8545,7 @@ fn make_finalization_registry_builtin() -> JsValue {
             {
                 let inner = Rc::clone(&inner);
                 obj.insert(
-                    "__notify__".into(),
+                    "__finalization_registry_notify__".into(),
                     native(move |a| {
                         let target = a.first().unwrap_or(&JsValue::Undefined);
                         if let JsValue::Object(ptr) = target {
@@ -8509,6 +8566,45 @@ fn make_finalization_registry_builtin() -> JsValue {
             Ok(JsValue::PlainObject(Rc::new(RefCell::new(obj))))
         }),
     );
+
+    // ── FinalizationRegistry.prototype ────────────────────────────────
+    {
+        let mut proto = PropertyMap::new();
+        for (method_name, hidden_name) in [
+            ("register", "__finalization_registry_register__"),
+            ("unregister", "__finalization_registry_unregister__"),
+            ("cleanupSome", "__finalization_registry_cleanup_some__"),
+            ("__notify__", "__finalization_registry_notify__"),
+        ] {
+            let name = method_name.to_string();
+            let hidden = hidden_name.to_string();
+            proto.insert(
+                name.clone(),
+                native(move |args| {
+                    let receiver = args.first().unwrap_or(&JsValue::Undefined);
+                    let rest: Vec<JsValue> = args.get(1..).unwrap_or(&[]).to_vec();
+                    let method = get_hidden_method(
+                        receiver,
+                        "__is_finalization_registry__",
+                        &hidden,
+                        &format!("FinalizationRegistry.prototype.{name}"),
+                    )?;
+                    dispatch_call_value(&method, rest)
+                }),
+            );
+        }
+        proto.insert("constructor".into(), JsValue::Undefined);
+        proto.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("FinalizationRegistry".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        proto.make_all_non_enumerable();
+        props.insert(
+            "prototype".into(),
+            JsValue::PlainObject(Rc::new(RefCell::new(proto))),
+        );
+    }
 
     props.make_all_non_enumerable();
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
@@ -17115,7 +17211,7 @@ mod tests {
         ));
     }
 
-    /// Constructing a WeakRef via `__call__` returns an object with `deref`.
+    /// Constructing a WeakRef via `__call__` returns an object with hidden weak-ref state.
     #[test]
     fn test_weak_ref_constructor_creates_instance() {
         let mut globals = HashMap::new();
@@ -17128,7 +17224,12 @@ mod tests {
                 let result = f(vec![JsValue::Object(ptr)]).unwrap();
                 if let JsValue::PlainObject(instance) = result {
                     let inst = instance.borrow();
-                    assert!(inst.contains_key("deref"));
+                    assert!(matches!(
+                        inst.get("__is_weakref__"),
+                        Some(JsValue::Boolean(true))
+                    ));
+                    assert!(inst.contains_key("__weakref_deref__"));
+                    assert!(!inst.contains_key("deref"));
                 } else {
                     panic!("WeakRef() should return a PlainObject");
                 }
@@ -17161,10 +17262,11 @@ mod tests {
                 let mut obj = crate::objects::heap_object::HeapObject::new_null();
                 let ptr = &raw mut obj;
                 let instance = f(vec![JsValue::Object(ptr)]).unwrap();
-                if let JsValue::PlainObject(inst) = instance {
-                    let deref_fn = inst.borrow().get("deref").cloned().unwrap();
+                let proto = wr_ctor.borrow().get("prototype").cloned().unwrap();
+                if let JsValue::PlainObject(proto_map) = proto {
+                    let deref_fn = proto_map.borrow().get("deref").cloned().unwrap();
                     if let JsValue::NativeFunction(deref) = deref_fn {
-                        let result = deref(vec![]).unwrap();
+                        let result = deref(vec![instance]).unwrap();
                         assert!(matches!(result, JsValue::Object(p) if p == ptr));
                     }
                 }
@@ -17185,7 +17287,7 @@ mod tests {
         ));
     }
 
-    /// Constructing a FinalizationRegistry via `__call__` returns an object.
+    /// Constructing a FinalizationRegistry via `__call__` returns an object with hidden registry state.
     #[test]
     fn test_finalization_registry_constructor_creates_instance() {
         let mut globals = HashMap::new();
@@ -17197,9 +17299,14 @@ mod tests {
                 let result = f(vec![cb]).unwrap();
                 if let JsValue::PlainObject(instance) = result {
                     let inst = instance.borrow();
-                    assert!(inst.contains_key("register"));
-                    assert!(inst.contains_key("unregister"));
-                    assert!(inst.contains_key("cleanupSome"));
+                    assert!(matches!(
+                        inst.get("__is_finalization_registry__"),
+                        Some(JsValue::Boolean(true))
+                    ));
+                    assert!(inst.contains_key("__finalization_registry_register__"));
+                    assert!(inst.contains_key("__finalization_registry_unregister__"));
+                    assert!(inst.contains_key("__finalization_registry_cleanup_some__"));
+                    assert!(!inst.contains_key("register"));
                 } else {
                     panic!("FinalizationRegistry() should return a PlainObject");
                 }
@@ -17231,10 +17338,11 @@ mod tests {
             if let JsValue::NativeFunction(f) = call {
                 let cb = native(|_| Ok(JsValue::Undefined));
                 let instance = f(vec![cb]).unwrap();
-                if let JsValue::PlainObject(inst) = instance {
-                    let register_fn = inst.borrow().get("register").cloned().unwrap();
+                let proto = fr_ctor.borrow().get("prototype").cloned().unwrap();
+                if let JsValue::PlainObject(proto_map) = proto {
+                    let register_fn = proto_map.borrow().get("register").cloned().unwrap();
                     if let JsValue::NativeFunction(register) = register_fn {
-                        let result = register(vec![JsValue::Smi(42), JsValue::Smi(1)]);
+                        let result = register(vec![instance, JsValue::Smi(42), JsValue::Smi(1)]);
                         assert!(result.is_err());
                     }
                 }
@@ -17244,25 +17352,28 @@ mod tests {
 
     // ── WeakRef & FinalizationRegistry (end-to-end) ─────────────────────────
 
+    fn assert_eval_true(script: &str) {
+        let result = global_eval(script).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
     /// `WeakRef.prototype.deref()` returns the original object and `@@toStringTag`
     /// identifies the instance as `WeakRef`.
     #[test]
     fn test_e2e_weak_ref_deref_and_to_string_tag() {
-        let result = global_eval(
+        assert_eval_true(
             r#"
             const target = {};
             const refObj = new WeakRef(target);
             refObj.deref() === target && Object.prototype.toString.call(refObj) === "[object WeakRef]";
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+        );
     }
 
-    /// `WeakRef` construction rejects non-object targets.
+    /// `WeakRef` construction rejects number targets.
     #[test]
-    fn test_e2e_weak_ref_constructor_rejects_non_object() {
-        let result = global_eval(
+    fn test_e2e_weak_ref_constructor_rejects_number() {
+        assert_eval_true(
             r#"
             try {
                 new WeakRef(1);
@@ -17271,28 +17382,168 @@ mod tests {
                 true;
             }
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+        );
+    }
+
+    /// `WeakRef` construction rejects string targets.
+    #[test]
+    fn test_e2e_weak_ref_constructor_rejects_string() {
+        assert_eval_true(
+            r#"
+            try {
+                new WeakRef("value");
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// `WeakRef` construction rejects boolean targets.
+    #[test]
+    fn test_e2e_weak_ref_constructor_rejects_boolean() {
+        assert_eval_true(
+            r#"
+            try {
+                new WeakRef(true);
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// `WeakRef` construction rejects `null`.
+    #[test]
+    fn test_e2e_weak_ref_constructor_rejects_null() {
+        assert_eval_true(
+            r#"
+            try {
+                new WeakRef(null);
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// `WeakRef` construction rejects `undefined`.
+    #[test]
+    fn test_e2e_weak_ref_constructor_rejects_undefined() {
+        assert_eval_true(
+            r#"
+            try {
+                new WeakRef(undefined);
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// `WeakRef` instances inherit a shared prototype `deref` method.
+    #[test]
+    fn test_e2e_weak_ref_uses_shared_prototype_method() {
+        assert_eval_true(
+            r#"
+            const refObj = new WeakRef({});
+            refObj.deref === WeakRef.prototype.deref
+                && Object.getPrototypeOf(refObj) === WeakRef.prototype;
+            "#,
+        );
+    }
+
+    /// `WeakRef.prototype.deref.call` uses the provided receiver.
+    #[test]
+    fn test_e2e_weak_ref_prototype_deref_call_uses_receiver() {
+        assert_eval_true(
+            r#"
+            const target = {};
+            const refObj = new WeakRef(target);
+            WeakRef.prototype.deref.call(refObj) === target;
+            "#,
+        );
+    }
+
+    /// `WeakRef.prototype.deref` rejects incompatible object receivers.
+    #[test]
+    fn test_e2e_weak_ref_prototype_deref_rejects_plain_object_receiver() {
+        assert_eval_true(
+            r#"
+            try {
+                WeakRef.prototype.deref.call({});
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// `WeakRef.prototype.deref` rejects undefined receivers.
+    #[test]
+    fn test_e2e_weak_ref_prototype_deref_rejects_undefined_receiver() {
+        assert_eval_true(
+            r#"
+            try {
+                WeakRef.prototype.deref.call(undefined);
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// Multiple weak refs to the same target dereference independently.
+    #[test]
+    fn test_e2e_multiple_weak_refs_to_same_target() {
+        assert_eval_true(
+            r#"
+            const target = {};
+            const first = new WeakRef(target);
+            const second = new WeakRef(target);
+            first.deref() === target
+                && second.deref() === target
+                && first.deref === second.deref;
+            "#,
+        );
+    }
+
+    /// Extracted `deref` methods use the call-site receiver, not the original instance.
+    #[test]
+    fn test_e2e_weak_ref_extracted_deref_uses_call_receiver() {
+        assert_eval_true(
+            r#"
+            const firstTarget = {};
+            const secondTarget = {};
+            const first = new WeakRef(firstTarget);
+            const second = new WeakRef(secondTarget);
+            const deref = first.deref;
+            deref.call(second) === secondTarget;
+            "#,
+        );
     }
 
     /// `FinalizationRegistry` accepts ordinary JS functions as cleanup callbacks.
     #[test]
     fn test_e2e_finalization_registry_accepts_function_callback() {
-        let result = global_eval(
+        assert_eval_true(
             r#"
             const registry = new FinalizationRegistry(function(value) { return value; });
             typeof registry.register === "function" && typeof registry.unregister === "function";
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+        );
     }
 
     /// `FinalizationRegistry` construction rejects non-callable cleanup callbacks.
     #[test]
     fn test_e2e_finalization_registry_rejects_non_callable_callback() {
-        let result = global_eval(
+        assert_eval_true(
             r#"
             try {
                 new FinalizationRegistry(1);
@@ -17301,16 +17552,27 @@ mod tests {
                 true;
             }
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+        );
+    }
+
+    /// `FinalizationRegistry` instances use shared prototype methods.
+    #[test]
+    fn test_e2e_finalization_registry_uses_shared_prototype_methods() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            registry.register === FinalizationRegistry.prototype.register
+                && registry.unregister === FinalizationRegistry.prototype.unregister
+                && Object.getPrototypeOf(registry) === FinalizationRegistry.prototype;
+            "#,
+        );
     }
 
     /// `register`/`unregister` track object tokens and `@@toStringTag` identifies
     /// the registry instance.
     #[test]
     fn test_e2e_finalization_registry_register_unregister_and_to_string_tag() {
-        let result = global_eval(
+        assert_eval_true(
             r#"
             const registry = new FinalizationRegistry(function() {});
             const target = {};
@@ -17322,15 +17584,13 @@ mod tests {
                 && second === false
                 && Object.prototype.toString.call(registry) === "[object FinalizationRegistry]";
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+        );
     }
 
     /// `register` rejects non-object targets and `target === heldValue`.
     #[test]
     fn test_e2e_finalization_registry_register_validates_inputs() {
-        let result = global_eval(
+        assert_eval_true(
             r#"
             const registry = new FinalizationRegistry(function() {});
             let nonObjectRejected = false;
@@ -17348,9 +17608,204 @@ mod tests {
             }
             nonObjectRejected && sameValueRejected;
             "#,
-        )
-        .unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+        );
+    }
+
+    /// `register` rejects `null` unregister tokens.
+    #[test]
+    fn test_e2e_finalization_registry_register_rejects_null_token() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            try {
+                registry.register({}, "held", null);
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// `register` rejects primitive unregister tokens.
+    #[test]
+    fn test_e2e_finalization_registry_register_rejects_primitive_token() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            try {
+                registry.register({}, "held", 1);
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// `unregister` rejects `undefined`.
+    #[test]
+    fn test_e2e_finalization_registry_unregister_rejects_undefined() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            try {
+                registry.unregister(undefined);
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// `unregister` rejects primitive tokens.
+    #[test]
+    fn test_e2e_finalization_registry_unregister_rejects_primitive() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            try {
+                registry.unregister("token");
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// `unregister` removes every registration sharing a token.
+    #[test]
+    fn test_e2e_finalization_registry_unregister_removes_all_matching_registrations() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            const token = {};
+            registry.register({}, "first", token);
+            registry.register({}, "second", token);
+            registry.unregister(token) === true && registry.unregister(token) === false;
+            "#,
+        );
+    }
+
+    /// `unregister` does not remove registrations associated with other tokens.
+    #[test]
+    fn test_e2e_finalization_registry_unregister_preserves_other_tokens() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            const firstToken = {};
+            const secondToken = {};
+            registry.register({}, "first", firstToken);
+            registry.register({}, "second", secondToken);
+            registry.unregister(firstToken) === true
+                && registry.unregister(firstToken) === false
+                && registry.unregister(secondToken) === true;
+            "#,
+        );
+    }
+
+    /// Extracted `register` methods use the call-site receiver.
+    #[test]
+    fn test_e2e_finalization_registry_extracted_register_uses_call_receiver() {
+        assert_eval_true(
+            r#"
+            const first = new FinalizationRegistry(function() {});
+            const second = new FinalizationRegistry(function() {});
+            const register = first.register;
+            const token = {};
+            register.call(second, {}, "held", token);
+            second.unregister(token) === true && first.unregister(token) === false;
+            "#,
+        );
+    }
+
+    /// Extracted `unregister` methods use the call-site receiver.
+    #[test]
+    fn test_e2e_finalization_registry_extracted_unregister_uses_call_receiver() {
+        assert_eval_true(
+            r#"
+            const first = new FinalizationRegistry(function() {});
+            const second = new FinalizationRegistry(function() {});
+            const token = {};
+            second.register({}, "held", token);
+            const unregister = first.unregister;
+            unregister.call(second, token) === true && second.unregister(token) === false;
+            "#,
+        );
+    }
+
+    /// `FinalizationRegistry.prototype.register` rejects incompatible receivers.
+    #[test]
+    fn test_e2e_finalization_registry_register_rejects_incompatible_receiver() {
+        assert_eval_true(
+            r#"
+            try {
+                FinalizationRegistry.prototype.register.call({}, {}, "held");
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// `FinalizationRegistry.prototype.unregister` rejects incompatible receivers.
+    #[test]
+    fn test_e2e_finalization_registry_unregister_rejects_incompatible_receiver() {
+        assert_eval_true(
+            r#"
+            try {
+                FinalizationRegistry.prototype.unregister.call({}, {});
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// `FinalizationRegistry.prototype.cleanupSome` rejects incompatible receivers.
+    #[test]
+    fn test_e2e_finalization_registry_cleanup_some_rejects_incompatible_receiver() {
+        assert_eval_true(
+            r#"
+            try {
+                FinalizationRegistry.prototype.cleanupSome.call({});
+                false;
+            } catch (e) {
+                true;
+            }
+            "#,
+        );
+    }
+
+    /// `register` works when invoked via `FinalizationRegistry.prototype.register.call`.
+    #[test]
+    fn test_e2e_finalization_registry_prototype_register_call_uses_receiver() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            const token = {};
+            FinalizationRegistry.prototype.register.call(registry, {}, "held", token);
+            registry.unregister(token) === true;
+            "#,
+        );
+    }
+
+    /// `unregister` works when invoked via `FinalizationRegistry.prototype.unregister.call`.
+    #[test]
+    fn test_e2e_finalization_registry_prototype_unregister_call_uses_receiver() {
+        assert_eval_true(
+            r#"
+            const registry = new FinalizationRegistry(function() {});
+            const token = {};
+            registry.register({}, "held", token);
+            FinalizationRegistry.prototype.unregister.call(registry, token) === true
+                && registry.unregister(token) === false;
+            "#,
+        );
     }
 
     // ── Promise ─────────────────────────────────────────────────────────────
