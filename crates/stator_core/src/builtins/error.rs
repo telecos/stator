@@ -409,10 +409,14 @@ impl JsError {
         let props = self.props.borrow();
         let name = match props.get("name") {
             Some(JsValue::String(s)) => s.to_string(),
+            Some(JsValue::Undefined) => "Error".to_string(),
+            Some(v) => v.to_js_string().unwrap_or_else(|_| "Error".to_string()),
             _ => self.kind.as_name().to_string(),
         };
         let msg = match props.get("message") {
             Some(JsValue::String(s)) => s.to_string(),
+            Some(JsValue::Undefined) => String::new(),
+            Some(v) => v.to_js_string().unwrap_or_default(),
             _ => self.message.clone(),
         };
         drop(props);
