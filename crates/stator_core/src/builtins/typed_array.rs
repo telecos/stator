@@ -1341,6 +1341,73 @@ pub fn typed_array_static_of(
     typed_array_from_values(kind, items)
 }
 
+// ── toReversed ────────────────────────────────────────────────────────────────
+
+/// `%TypedArray%.prototype.toReversed()` (ECMAScript §23.2.3.30).
+///
+/// Returns a **new** `JsTypedArray` of the same kind with elements in reverse
+/// order.  The original is unchanged.
+pub fn typed_array_to_reversed(ta: &JsTypedArray) -> StatorResult<JsTypedArray> {
+    let len = ta.effective_length();
+    let kind = ta.kind;
+    let result = typed_array_new_from_length(kind, len);
+    for i in 0..len {
+        let v = typed_array_get(ta, len - 1 - i);
+        typed_array_set(&result, i, &v)?;
+    }
+    Ok(result)
+}
+
+// ── toSorted ─────────────────────────────────────────────────────────────────
+
+/// `%TypedArray%.prototype.toSorted(comparefn?)` (ECMAScript §23.2.3.31).
+///
+/// Returns a **new** sorted `JsTypedArray` of the same kind without mutating the
+/// original.  When no comparator is provided the default numeric comparison is
+/// used (ascending, `NaN` at the end, `-0` before `+0`).
+pub fn typed_array_to_sorted(
+    ta: &JsTypedArray,
+    compare: SortCompareFn<'_>,
+) -> StatorResult<JsTypedArray> {
+    let len = ta.effective_length();
+    let kind = ta.kind;
+    let copy = typed_array_new_from_length(kind, len);
+    for i in 0..len {
+        let v = typed_array_get(ta, i);
+        typed_array_set(&copy, i, &v)?;
+    }
+    typed_array_sort(&copy, compare)?;
+    Ok(copy)
+}
+
+// ── with ─────────────────────────────────────────────────────────────────────
+
+/// `%TypedArray%.prototype.with(index, value)` (ECMAScript §23.2.3.37).
+///
+/// Returns a **new** `JsTypedArray` identical to `ta` except that the element at
+/// `index` is replaced with `value`.
+///
+/// Returns [`StatorError::RangeError`] if `index` is out of bounds.
+pub fn typed_array_with(
+    ta: &JsTypedArray,
+    index: i64,
+    value: &JsValue,
+) -> StatorResult<JsTypedArray> {
+    let len = ta.effective_length() as i64;
+    let actual = if index < 0 { len + index } else { index };
+    if actual < 0 || actual >= len {
+        return Err(StatorError::RangeError(format!("Invalid index : {index}")));
+    }
+    let kind = ta.kind;
+    let result = typed_array_new_from_length(kind, len as usize);
+    for i in 0..len as usize {
+        let v = typed_array_get(ta, i);
+        typed_array_set(&result, i, &v)?;
+    }
+    typed_array_set(&result, actual as usize, value)?;
+    Ok(result)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────

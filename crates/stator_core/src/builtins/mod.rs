@@ -8,6 +8,9 @@
 
 /// ECMAScript §23.1 `Array` built-in static methods and prototype equivalents.
 pub mod array;
+/// End-to-end alignment tests for Array and TypedArray shared method semantics.
+#[cfg(test)]
+mod array_typed_array_alignment;
 /// ECMAScript §27.6 `AsyncGeneratorFunction` built-in and `AsyncGenerator.prototype`.
 pub mod async_generator;
 /// ECMAScript §21.4 `Date` built-in constructor and prototype methods.
