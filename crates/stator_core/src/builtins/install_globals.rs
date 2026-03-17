@@ -7070,82 +7070,10 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // group(callbackFn, thisArg?)
-        proto.insert(
-            "group".into(),
-            builtin_fn("group", 1, |args| {
-                let arr = args.first().unwrap_or(&JsValue::Undefined);
-                require_object_coercible(arr)?;
-                let callback = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                if !is_callable(&callback) {
-                    return Err(StatorError::TypeError(
-                        "Array.prototype.group callback must be callable".into(),
-                    ));
-                }
-                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
-                let len = array_like_length(arr)?;
-                let arr_val = arr.clone();
-                let mut groups = PropertyMap::new();
-                groups.insert("__proto__".into(), JsValue::Null);
-                let groups_rc = Rc::new(RefCell::new(groups));
-                for i in 0..len {
-                    let item = array_like_get_index(arr, i);
-                    let key = call_callback_with_this(
-                        &callback,
-                        this_arg.clone(),
-                        vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
-                    )?
-                    .to_js_string()?;
-                    let existing = groups_rc.borrow().get(&key).cloned();
-                    if let Some(JsValue::Array(values)) = existing {
-                        values.borrow_mut().push(item);
-                    } else {
-                        groups_rc
-                            .borrow_mut()
-                            .insert(key, JsValue::new_array(vec![item]));
-                    }
-                }
-                Ok(JsValue::PlainObject(groups_rc))
-            }),
-        );
-
-        // groupToMap(callbackFn, thisArg?)
-        proto.insert(
-            "groupToMap".into(),
-            builtin_fn("groupToMap", 1, |args| {
-                let arr = args.first().unwrap_or(&JsValue::Undefined);
-                require_object_coercible(arr)?;
-                let callback = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                if !is_callable(&callback) {
-                    return Err(StatorError::TypeError(
-                        "Array.prototype.groupToMap callback must be callable".into(),
-                    ));
-                }
-                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
-                let len = array_like_length(arr)?;
-                let arr_val = arr.clone();
-                let result_map = Rc::new(RefCell::new(map_new()));
-                for i in 0..len {
-                    let item = array_like_get_index(arr, i);
-                    let key = call_callback_with_this(
-                        &callback,
-                        this_arg.clone(),
-                        vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
-                    )?;
-                    let existing = map_get(&result_map.borrow(), &key);
-                    if let JsValue::Array(values) = existing {
-                        values.borrow_mut().push(item);
-                    } else {
-                        map_set(
-                            &mut result_map.borrow_mut(),
-                            key,
-                            JsValue::new_array(vec![item]),
-                        );
-                    }
-                }
-                build_map_instance(result_map.borrow().clone())
-            }),
-        );
+        // NOTE: Array.prototype.group and Array.prototype.groupToMap were
+        // removed — they were a Stage 3 TC39 proposal that shipped as
+        // `Object.groupBy` / `Map.groupBy` instead (ES2024 §22.1.2.5 /
+        // §24.1.2.1).  The instance methods are intentionally absent.
 
         // §23.1.3.36 Array.prototype.toString()
         // Equivalent to calling this.join() — produces a comma-separated string
@@ -7212,8 +7140,6 @@ fn make_array() -> JsValue {
                 "findLastIndex",
                 "flat",
                 "flatMap",
-                "group",
-                "groupToMap",
                 "includes",
                 "keys",
                 "toReversed",
@@ -34737,6 +34663,358 @@ mod tests {
         assert_eq!(result, JsValue::String("groupBy".into()));
     }
 
+    // ── Object.groupBy / Map.groupBy comprehensive e2e tests ────────────
+
+    /// Object.groupBy: groups numbers into three buckets.
+    #[test]
+    fn e2e_object_group_by_three_buckets() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([1,2,3,4,5,6,7,8,9], function(n) {
+                if (n <= 3) return "low";
+                if (n <= 6) return "mid";
+                return "high";
+            });
+            r.low.join(",") + "|" + r.mid.join(",") + "|" + r.high.join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1,2,3|4,5,6|7,8,9".into()));
+    }
+
+    /// Object.groupBy: groups preserve insertion order.
+    #[test]
+    fn e2e_object_group_by_preserves_order() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([3,1,4,1,5,9], function(n) {
+                return n % 2 === 0 ? "even" : "odd";
+            });
+            r.odd.join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("3,1,1,5,9".into()));
+    }
+
+    /// Object.groupBy: single-element array.
+    #[test]
+    fn e2e_object_group_by_single_element() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([42], function(n) { return "only"; });
+            r.only[0]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    /// Object.groupBy: callback can return numeric strings as keys.
+    #[test]
+    fn e2e_object_group_by_numeric_string_keys() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([10, 20, 30], function(n) { return String(n); });
+            Object.keys(r).join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("10,20,30".into()));
+    }
+
+    /// Object.groupBy: all elements in one group.
+    #[test]
+    fn e2e_object_group_by_all_same_key() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([1,2,3,4,5], function() { return "x"; });
+            r.x.length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    /// Object.groupBy: each element unique key.
+    #[test]
+    fn e2e_object_group_by_unique_keys() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy(["a","b","c"], function(s) { return s; });
+            Object.keys(r).length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// Object.groupBy: coerces non-string keys to strings.
+    #[test]
+    fn e2e_object_group_by_coerces_keys() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([1,2,3], function(n) { return n; });
+            r["1"].length + r["2"].length + r["3"].length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    /// Object.groupBy: callback returns undefined key.
+    #[test]
+    fn e2e_object_group_by_undefined_key() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([1,2], function() { return undefined; });
+            r["undefined"].length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// Object.groupBy: callback returns null key.
+    #[test]
+    fn e2e_object_group_by_null_key() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([1,2], function() { return null; });
+            r["null"].length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// Object.groupBy: callback returns boolean keys.
+    #[test]
+    fn e2e_object_group_by_boolean_keys() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([1,2,3,4], function(n) { return n > 2; });
+            r["false"].join(",") + "|" + r["true"].join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1,2|3,4".into()));
+    }
+
+    /// Object.groupBy: non-callable second argument throws TypeError.
+    #[test]
+    fn e2e_object_group_by_non_callable_throws() {
+        let result = global_eval("Object.groupBy([1,2], 42)");
+        assert!(result.is_err());
+    }
+
+    /// Object.groupBy: non-iterable first argument throws TypeError.
+    #[test]
+    fn e2e_object_group_by_non_iterable_throws() {
+        let result = global_eval("Object.groupBy(42, function() { return 'a'; })");
+        assert!(result.is_err());
+    }
+
+    /// Object.groupBy: undefined callback throws TypeError.
+    #[test]
+    fn e2e_object_group_by_undefined_callback_throws() {
+        let result = global_eval("Object.groupBy([1], undefined)");
+        assert!(result.is_err());
+    }
+
+    /// Object.groupBy: null callback throws TypeError.
+    #[test]
+    fn e2e_object_group_by_null_callback_throws() {
+        let result = global_eval("Object.groupBy([1], null)");
+        assert!(result.is_err());
+    }
+
+    /// Object.groupBy: result groups are real arrays.
+    #[test]
+    fn e2e_object_group_by_result_groups_are_arrays() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy([1,2], function() { return "k"; });
+            Array.isArray(r.k)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Object.groupBy: string iterable input (chars).
+    #[test]
+    fn e2e_object_group_by_string_input() {
+        let result = global_eval(
+            r#"
+            var r = Object.groupBy("abcabc", function(ch) { return ch; });
+            r.a.length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// Map.groupBy: empty iterable returns empty Map.
+    #[test]
+    fn e2e_map_group_by_empty() {
+        let result = global_eval(
+            r#"
+            var m = Map.groupBy([], function(n) { return "x"; });
+            m.size
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    /// Map.groupBy: non-callable second argument throws TypeError.
+    #[test]
+    fn e2e_map_group_by_non_callable_throws() {
+        let result = global_eval("Map.groupBy([1,2], 42)");
+        assert!(result.is_err());
+    }
+
+    /// Map.groupBy: non-iterable first argument throws TypeError.
+    #[test]
+    fn e2e_map_group_by_non_iterable_throws() {
+        let result = global_eval("Map.groupBy(42, function() { return 'a'; })");
+        assert!(result.is_err());
+    }
+
+    /// Map.groupBy: undefined callback throws TypeError.
+    #[test]
+    fn e2e_map_group_by_undefined_callback_throws() {
+        let result = global_eval("Map.groupBy([1], undefined)");
+        assert!(result.is_err());
+    }
+
+    /// Map.groupBy: null callback throws TypeError.
+    #[test]
+    fn e2e_map_group_by_null_callback_throws() {
+        let result = global_eval("Map.groupBy([1], null)");
+        assert!(result.is_err());
+    }
+
+    /// Map.groupBy: single group gathers all items.
+    #[test]
+    fn e2e_map_group_by_single_group() {
+        let result = global_eval(
+            r#"
+            var m = Map.groupBy([10,20,30], function() { return "all"; });
+            m.get("all").join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("10,20,30".into()));
+    }
+
+    /// Map.groupBy: result groups are real arrays.
+    #[test]
+    fn e2e_map_group_by_result_groups_are_arrays() {
+        let result = global_eval(
+            r#"
+            var m = Map.groupBy([1,2], function() { return "k"; });
+            Array.isArray(m.get("k"))
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Map.groupBy: preserves insertion order.
+    #[test]
+    fn e2e_map_group_by_preserves_order() {
+        let result = global_eval(
+            r#"
+            var m = Map.groupBy([3,1,4,1,5], function(n) {
+                return n % 2 === 0 ? "even" : "odd";
+            });
+            m.get("odd").join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("3,1,1,5".into()));
+    }
+
+    /// Map.groupBy: string iterable input.
+    #[test]
+    fn e2e_map_group_by_string_input() {
+        let result = global_eval(
+            r#"
+            var m = Map.groupBy("hello", function(ch) { return ch; });
+            m.get("l").length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    /// Map.groupBy: even group has correct elements.
+    #[test]
+    fn e2e_map_group_by_even_elements() {
+        let result = global_eval(
+            r#"
+            var m = Map.groupBy([1,2,3,4], function(n) {
+                return n % 2 === 0 ? "even" : "odd";
+            });
+            m.get("even").join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("2,4".into()));
+    }
+
+    /// Array.prototype.group must not exist.
+    #[test]
+    fn e2e_array_prototype_group_absent() {
+        let result = global_eval("typeof Array.prototype.group").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    /// Array.prototype.groupToMap must not exist.
+    #[test]
+    fn e2e_array_prototype_group_to_map_absent() {
+        let result = global_eval("typeof Array.prototype.groupToMap").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    /// Calling [].group() throws because it is not a function.
+    #[test]
+    fn e2e_array_group_call_throws() {
+        let result = global_eval("[].group(function() { return 'x'; })");
+        assert!(result.is_err());
+    }
+
+    /// Calling [].groupToMap() throws because it is not a function.
+    #[test]
+    fn e2e_array_group_to_map_call_throws() {
+        let result = global_eval("[].groupToMap(function() { return 'x'; })");
+        assert!(result.is_err());
+    }
+
+    /// Object.groupBy: typeof result is "object".
+    #[test]
+    fn e2e_object_group_by_typeof() {
+        let result =
+            global_eval(r#"typeof Object.groupBy([1], function() { return "a"; })"#).unwrap();
+        assert_eq!(result, JsValue::String("object".into()));
+    }
+
+    /// Object.groupBy: typeof is "function".
+    #[test]
+    fn e2e_object_group_by_is_function() {
+        let result = global_eval("typeof Object.groupBy").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
+    /// Map.groupBy: typeof is "function".
+    #[test]
+    fn e2e_map_group_by_is_function() {
+        let result = global_eval("typeof Map.groupBy").unwrap();
+        assert_eq!(result, JsValue::String("function".into()));
+    }
+
     // ── Object.hasOwn e2e conformance ───────────────────────────────────
 
     /// `Object.hasOwn` works on arrays with valid index.
@@ -40202,59 +40480,18 @@ mod tests {
         assert_eq!(r, JsValue::Boolean(true));
     }
 
-    /// `group` partitions values by callback result.
+    /// `Array.prototype.group` must not exist (removed Stage 3 TC39 proposal).
     #[test]
-    fn e2e_array_group_even_odd() {
-        let r = global_eval(
-            "[1, 2, 3, 4].group(function(v) { return v % 2 === 0 ? 'even' : 'odd'; }).odd.join(',') + '|' + \
-             [1, 2, 3, 4].group(function(v) { return v % 2 === 0 ? 'even' : 'odd'; }).even.join(',')",
-        )
-        .unwrap();
-        assert_eq!(r, JsValue::String("1,3|2,4".into()));
+    fn e2e_array_group_does_not_exist() {
+        let r = global_eval("typeof [].group").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
     }
 
-    /// `group` honors `thisArg`.
+    /// `Array.prototype.groupToMap` must not exist (removed Stage 3 TC39 proposal).
     #[test]
-    fn e2e_array_group_this_arg() {
-        let r = global_eval(
-            "var ctx = { cutoff: 3 }; \
-             var g = [1, 2, 3, 4].group(function(v) { return v < this.cutoff ? 'low' : 'high'; }, ctx); \
-             g.low.join(',') + '|' + g.high.join(',')",
-        )
-        .unwrap();
-        assert_eq!(r, JsValue::String("1,2|3,4".into()));
-    }
-
-    /// `group` creates a null-prototype result object.
-    #[test]
-    fn e2e_array_group_null_prototype() {
-        let r =
-            global_eval("Object.getPrototypeOf([1].group(function() { return 'x'; })) === null")
-                .unwrap();
-        assert_eq!(r, JsValue::Boolean(true));
-    }
-
-    /// `groupToMap` returns a map keyed by callback results.
-    #[test]
-    fn e2e_array_group_to_map_basic() {
-        let r = global_eval(
-            "var m = [1, 2, 3, 4].groupToMap(function(v) { return v % 2 === 0 ? 'even' : 'odd'; }); \
-             m.get('odd').join(',') + '|' + m.get('even').join(',')",
-        )
-        .unwrap();
-        assert_eq!(r, JsValue::String("1,3|2,4".into()));
-    }
-
-    /// `groupToMap` honors `thisArg`.
-    #[test]
-    fn e2e_array_group_to_map_this_arg() {
-        let r = global_eval(
-            "var ctx = { cutoff: 3 }; \
-             var m = [1, 2, 3, 4].groupToMap(function(v) { return v < this.cutoff ? 'low' : 'high'; }, ctx); \
-             m.get('low').join(',') + '|' + m.get('high').join(',')",
-        )
-        .unwrap();
-        assert_eq!(r, JsValue::String("1,2|3,4".into()));
+    fn e2e_array_group_to_map_does_not_exist() {
+        let r = global_eval("typeof [].groupToMap").unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
     }
 
     /// `Array.prototype[Symbol.iterator]` aliases `values`.
