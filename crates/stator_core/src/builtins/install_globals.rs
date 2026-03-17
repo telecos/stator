@@ -16023,6 +16023,13 @@ mod tests {
         ));
     }
 
+    fn assert_eval_range_error(script: &str) {
+        assert!(matches!(
+            global_eval(script),
+            Err(StatorError::RangeError(_))
+        ));
+    }
+
     fn assert_eval_syntax_error(script: &str) {
         assert!(matches!(
             global_eval(script),
@@ -22444,11 +22451,6 @@ mod tests {
 
     // ── WeakRef & FinalizationRegistry (end-to-end) ─────────────────────────
 
-    fn assert_eval_true(script: &str) {
-        let result = global_eval(script).unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
-    }
-
     /// `WeakRef.prototype.deref()` returns the original object and `@@toStringTag`
     /// identifies the instance as `WeakRef`.
     #[test]
@@ -24417,7 +24419,7 @@ mod tests {
     // -- 2. Promise.reject wraps any value
     #[test]
     fn e2e_promise_reject_wraps_value() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var caught = false;
             var p = Promise.reject("boom");
@@ -24433,7 +24435,7 @@ mod tests {
     // -- 3. Promise.prototype.then chains fulfilled values
     #[test]
     fn e2e_promise_then_chain_fulfilled() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             Promise.resolve(1)
@@ -24451,7 +24453,7 @@ mod tests {
     // -- 4. Promise.prototype.catch is alias for .then(undefined, onRejected)
     #[test]
     fn e2e_promise_catch_alias() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.reject("err")
@@ -24468,7 +24470,7 @@ mod tests {
     // -- 5. Microtask ordering: then callbacks run in FIFO order
     #[test]
     fn e2e_promise_microtask_fifo_order() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var log = [];
             var p = Promise.resolve();
@@ -24486,7 +24488,7 @@ mod tests {
     // -- 6. Constructor: executor throw rejects the promise
     #[test]
     fn e2e_promise_constructor_throw_rejects() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             new Promise(function(resolve, reject) {
@@ -24504,7 +24506,7 @@ mod tests {
     // -- 7. Promise.all with non-iterable rejects with TypeError-like reason
     #[test]
     fn e2e_promise_all_non_iterable_rejects() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.all(42).catch(function(r) { out = r; });
@@ -24526,7 +24528,7 @@ mod tests {
     // -- 8. Promise.allSettled produces correct status fields
     #[test]
     fn e2e_promise_all_settled_status_fields() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.allSettled([
@@ -24546,7 +24548,7 @@ mod tests {
     // -- 9. Promise.allSettled includes value and reason
     #[test]
     fn e2e_promise_all_settled_value_and_reason() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.allSettled([
@@ -24566,7 +24568,7 @@ mod tests {
     // -- 10. Promise.race resolves with the first settled
     #[test]
     fn e2e_promise_race_first_wins() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             Promise.race([
@@ -24584,7 +24586,7 @@ mod tests {
     // -- 11. Promise.any resolves with first fulfilled
     #[test]
     fn e2e_promise_any_first_fulfilled() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             Promise.any([
@@ -24603,7 +24605,7 @@ mod tests {
     // -- 12. Promise.any rejects with AggregateError when all reject
     #[test]
     fn e2e_promise_any_all_reject() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.any([
@@ -24622,7 +24624,7 @@ mod tests {
     // -- 13. Promise.all resolves with ordered results
     #[test]
     fn e2e_promise_all_ordered_results() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.all([
@@ -24641,7 +24643,7 @@ mod tests {
     // -- 14. Promise.all rejects on first rejection
     #[test]
     fn e2e_promise_all_first_rejection() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.all([
@@ -24660,7 +24662,7 @@ mod tests {
     // -- 15. Promise.all with empty array resolves immediately
     #[test]
     fn e2e_promise_all_empty() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = false;
             Promise.all([]).then(function(arr) { out = arr.length === 0; });
@@ -24675,7 +24677,7 @@ mod tests {
     // -- 16. then handler returning a promise chains through
     #[test]
     fn e2e_promise_then_returns_promise() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             Promise.resolve(1)
@@ -24713,7 +24715,7 @@ mod tests {
     // -- 18. Thenable assimilation: object with .then method is treated as promise
     #[test]
     fn e2e_promise_thenable_assimilation() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             var thenable = { then: function(resolve) { resolve(77); } };
@@ -24729,7 +24731,7 @@ mod tests {
     // -- 19. Thenable rejection
     #[test]
     fn e2e_promise_thenable_rejection() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             var thenable = { then: function(resolve, reject) { reject("nope"); } };
@@ -24745,7 +24747,7 @@ mod tests {
     // -- 20. Thenable: only first call to resolve/reject takes effect
     #[test]
     fn e2e_promise_thenable_first_call_wins() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             var thenable = { then: function(resolve, reject) { resolve(1); resolve(2); reject(3); } };
@@ -24761,7 +24763,7 @@ mod tests {
     // -- 21. Promise.finally runs on fulfillment and passes value through
     #[test]
     fn e2e_promise_finally_on_fulfilled() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var ran = false;
             var out = 0;
@@ -24781,7 +24783,7 @@ mod tests {
     // -- 22. Promise.finally runs on rejection and passes reason through
     #[test]
     fn e2e_promise_finally_on_rejected() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var ran = false;
             var out = "";
@@ -24801,7 +24803,7 @@ mod tests {
     // -- 23. Chained catch recovers and allows subsequent then
     #[test]
     fn e2e_promise_catch_recovery_chain() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             Promise.reject("bad")
@@ -24818,7 +24820,7 @@ mod tests {
     // -- 24. then with no onFulfilled passes value through
     #[test]
     fn e2e_promise_then_passthrough_fulfilled() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             Promise.resolve(5)
@@ -24835,7 +24837,7 @@ mod tests {
     // -- 25. then with no onRejected passes rejection through
     #[test]
     fn e2e_promise_then_passthrough_rejected() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.reject("err")
@@ -24852,7 +24854,7 @@ mod tests {
     // -- 26. Promise.allSettled with non-iterable rejects
     #[test]
     fn e2e_promise_all_settled_non_iterable_rejects() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.allSettled(42).catch(function(r) { out = r; });
@@ -24871,7 +24873,7 @@ mod tests {
     // -- 27. Promise.any with non-iterable rejects
     #[test]
     fn e2e_promise_any_non_iterable_rejects() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.any(null).catch(function(r) { out = r; });
@@ -24890,7 +24892,7 @@ mod tests {
     // -- 28. Promise.race with non-iterable rejects
     #[test]
     fn e2e_promise_race_non_iterable_rejects() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.race(true).catch(function(r) { out = r; });
@@ -24909,7 +24911,7 @@ mod tests {
     // -- 29. Microtask ordering across multiple promises
     #[test]
     fn e2e_promise_microtask_interleaved_order() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var log = [];
             Promise.resolve().then(function() {
@@ -24929,7 +24931,7 @@ mod tests {
     // -- 30. Promise.resolve with non-thenable plain object
     #[test]
     fn e2e_promise_resolve_non_thenable_object() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             var obj = { x: 1 };
@@ -24945,7 +24947,7 @@ mod tests {
     // -- 31. Constructor with synchronous resolve
     #[test]
     fn e2e_promise_constructor_sync_resolve() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             new Promise(function(resolve) { resolve(7); })
@@ -24961,7 +24963,7 @@ mod tests {
     // -- 32. Constructor with synchronous reject
     #[test]
     fn e2e_promise_constructor_sync_reject() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             new Promise(function(resolve, reject) { reject("no"); })
@@ -24977,7 +24979,7 @@ mod tests {
     // -- 33. Long then chain
     #[test]
     fn e2e_promise_long_then_chain() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             Promise.resolve(1)
@@ -24997,7 +24999,7 @@ mod tests {
     // -- 34. Promise.allSettled with empty array
     #[test]
     fn e2e_promise_all_settled_empty() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = -1;
             Promise.allSettled([]).then(function(arr) { out = arr.length; });
@@ -25012,7 +25014,7 @@ mod tests {
     // -- 35. Promise.withResolvers resolve/reject work end-to-end
     #[test]
     fn e2e_promise_with_resolvers_resolve() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             var wr = Promise.withResolvers();
@@ -25029,7 +25031,7 @@ mod tests {
     // -- 36. Thenable assimilation in then handler return
     #[test]
     fn e2e_promise_then_returns_thenable() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             Promise.resolve(1)
@@ -25048,7 +25050,7 @@ mod tests {
     // -- 37. Promise.all wraps non-promise values
     #[test]
     fn e2e_promise_all_wraps_non_promises() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.all([1, "two", true]).then(function(arr) {
@@ -25065,7 +25067,7 @@ mod tests {
     // -- 38. Promise.resolve with undefined
     #[test]
     fn e2e_promise_resolve_undefined() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "unset";
             Promise.resolve(undefined).then(function(v) { out = v; });
@@ -25080,7 +25082,7 @@ mod tests {
     // -- 39. Promise.resolve with null
     #[test]
     fn e2e_promise_resolve_null() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "unset";
             Promise.resolve(null).then(function(v) { out = (v === null) ? "null" : "other"; });
@@ -25095,7 +25097,7 @@ mod tests {
     // -- 40. Promise.reject with undefined
     #[test]
     fn e2e_promise_reject_undefined() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "unset";
             Promise.reject(undefined).catch(function(r) { out = r; });
@@ -25110,7 +25112,7 @@ mod tests {
     // -- 41. Constructor: resolve is idempotent (second call ignored)
     #[test]
     fn e2e_promise_constructor_resolve_idempotent() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             new Promise(function(resolve) { resolve(1); resolve(2); })
@@ -25126,7 +25128,7 @@ mod tests {
     // -- 42. Constructor: reject is idempotent
     #[test]
     fn e2e_promise_constructor_reject_idempotent() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             new Promise(function(resolve, reject) { reject("a"); reject("b"); })
@@ -25142,7 +25144,7 @@ mod tests {
     // -- 43. Constructor: resolve then reject — resolve wins
     #[test]
     fn e2e_promise_constructor_resolve_then_reject() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var fulfilled = false;
             var rejected = false;
@@ -25161,7 +25163,7 @@ mod tests {
     // -- 44. Promise.all with single element
     #[test]
     fn e2e_promise_all_single_element() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             Promise.all([Promise.resolve(42)]).then(function(arr) { out = arr[0]; });
@@ -25176,7 +25178,7 @@ mod tests {
     // -- 45. Promise.all result is array with correct length
     #[test]
     fn e2e_promise_all_result_length() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             Promise.all([1, 2, 3, 4, 5]).then(function(arr) { out = arr.length; });
@@ -25191,7 +25193,7 @@ mod tests {
     // -- 46. Promise.race with first rejection wins over later fulfillments
     #[test]
     fn e2e_promise_race_rejection_wins() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.race([
@@ -25219,7 +25221,7 @@ mod tests {
     // -- 48. Promise.any with empty array rejects
     #[test]
     fn e2e_promise_any_empty_rejects() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.any([]).catch(function(e) { out = e.message; });
@@ -25241,7 +25243,7 @@ mod tests {
     // -- 49. Promise.any with single fulfillment
     #[test]
     fn e2e_promise_any_single_fulfillment() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             Promise.any([Promise.resolve(55)]).then(function(v) { out = v; });
@@ -25256,7 +25258,7 @@ mod tests {
     // -- 50. Promise.allSettled preserves order
     #[test]
     fn e2e_promise_all_settled_preserves_order() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.allSettled([
@@ -25282,7 +25284,7 @@ mod tests {
     // -- 51. Promise.allSettled with all fulfilled
     #[test]
     fn e2e_promise_all_settled_all_fulfilled() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.allSettled([
@@ -25302,7 +25304,7 @@ mod tests {
     // -- 52. Promise.allSettled with all rejected
     #[test]
     fn e2e_promise_all_settled_all_rejected() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.allSettled([
@@ -25322,7 +25324,7 @@ mod tests {
     // -- 53. then handler throw rejects downstream
     #[test]
     fn e2e_promise_then_throw_rejects() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.resolve(1)
@@ -25352,7 +25354,7 @@ mod tests {
     // -- 55. Promise.reject does NOT unwrap — rejected with a promise value
     #[test]
     fn e2e_promise_reject_does_not_unwrap() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var inner = Promise.resolve(1);
             var out = false;
@@ -25370,7 +25372,7 @@ mod tests {
     // -- 56. Multiple .then on same resolved promise
     #[test]
     fn e2e_promise_multiple_then_on_same() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var log = [];
             var p = Promise.resolve("x");
@@ -25388,7 +25390,7 @@ mod tests {
     // -- 57. Promise.all rejects only once (first rejection only)
     #[test]
     fn e2e_promise_all_rejects_only_once() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var count = 0;
             Promise.all([
@@ -25407,7 +25409,7 @@ mod tests {
     // -- 58. Promise.race with single element
     #[test]
     fn e2e_promise_race_single_element() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             Promise.race([Promise.resolve(88)]).then(function(v) { out = v; });
@@ -25422,7 +25424,7 @@ mod tests {
     // -- 59. Promise.finally preserves fulfillment value through chain
     #[test]
     fn e2e_promise_finally_preserves_value_chain() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             Promise.resolve(10)
@@ -25440,7 +25442,7 @@ mod tests {
     // -- 60. Promise.finally preserves rejection through chain
     #[test]
     fn e2e_promise_finally_preserves_rejection_chain() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.reject("err")
@@ -25457,7 +25459,7 @@ mod tests {
     // -- 61. Thenable assimilation in Promise.all
     #[test]
     fn e2e_promise_all_with_thenable() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             var thenable = { then: function(resolve) { resolve(77); } };
@@ -25475,7 +25477,7 @@ mod tests {
     // -- 62. Chained promise resolution: then returning rejected promise
     #[test]
     fn e2e_promise_then_returns_rejected_promise() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.resolve(1)
@@ -25538,7 +25540,7 @@ mod tests {
         use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
         let q = MicrotaskQueue::new();
         let thenable_map = {
-            let q2 = q.clone();
+            let _q2 = q.clone();
             let mut map = PropertyMap::new();
             map.insert(
                 "then".into(),
@@ -25588,7 +25590,7 @@ mod tests {
     // -- 67. Promise.withResolvers reject end-to-end
     #[test]
     fn e2e_promise_with_resolvers_reject_e2e() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             var wr = Promise.withResolvers();
@@ -25605,7 +25607,7 @@ mod tests {
     // -- 68. Promise.all with mixed promises and values
     #[test]
     fn e2e_promise_all_mixed_types() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.all([Promise.resolve("a"), "b", Promise.resolve("c")])
@@ -25621,7 +25623,7 @@ mod tests {
     // -- 69. Promise.race with mixed values
     #[test]
     fn e2e_promise_race_with_plain_value() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             Promise.race([42]).then(function(v) { out = v; });
@@ -25636,7 +25638,7 @@ mod tests {
     // -- 70. Deep then chain with alternating success/failure
     #[test]
     fn e2e_promise_deep_chain_alternating() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.resolve("start")
@@ -25655,7 +25657,7 @@ mod tests {
     // -- 71. Promise.allSettled single element fulfilled
     #[test]
     fn e2e_promise_all_settled_single_fulfilled() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.allSettled([Promise.resolve(42)]).then(function(results) {
@@ -25672,7 +25674,7 @@ mod tests {
     // -- 72. Promise.allSettled single element rejected
     #[test]
     fn e2e_promise_all_settled_single_rejected() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.allSettled([Promise.reject("no")]).then(function(results) {
@@ -25689,7 +25691,7 @@ mod tests {
     // -- 73. Promise.any with last promise fulfilling
     #[test]
     fn e2e_promise_any_last_fulfills() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = 0;
             Promise.any([
@@ -25708,7 +25710,7 @@ mod tests {
     // -- 74. Promise.resolve with boolean
     #[test]
     fn e2e_promise_resolve_boolean() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.resolve(false).then(function(v) { out = typeof v + ":" + v; });
@@ -25723,7 +25725,7 @@ mod tests {
     // -- 75. Catch handler can re-throw to propagate rejection
     #[test]
     fn e2e_promise_catch_rethrow() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var out = "";
             Promise.reject("original")
@@ -25825,7 +25827,7 @@ mod tests {
     // -- 80. Microtask queue is FIFO across interleaved enqueues
     #[test]
     fn e2e_promise_microtask_deep_interleave() {
-        let result = eval_with_microtasks(
+        let _result = eval_with_microtasks(
             r#"
             var log = [];
             Promise.resolve().then(function() {
@@ -27010,7 +27012,7 @@ mod tests {
 
     // 10. eval with empty string returns undefined
     #[test]
-    fn e2e_eval_empty_string_returns_undefined() {
+    fn e2e_eval_empty_string_returns_undefined_v2() {
         assert_e2e_true("eval('') === undefined");
     }
 
@@ -27095,7 +27097,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_eval_no_args_returns_undefined() {
+    fn e2e_eval_no_args_returns_undefined_v2() {
         assert_e2e_true("eval() === undefined");
     }
 
@@ -34780,7 +34782,7 @@ mod tests {
 
     /// `Promise.any` resolves with the first fulfilled value.
     #[test]
-    fn e2e_promise_any_first_fulfilled() {
+    fn e2e_promise_any_first_fulfilled_v2() {
         let result = global_eval(
             r#"
             var result;
@@ -34798,7 +34800,7 @@ mod tests {
 
     /// `Promise.any` rejects with AggregateError when all reject.
     #[test]
-    fn e2e_promise_any_all_reject() {
+    fn e2e_promise_any_all_reject_v2() {
         let result = global_eval(
             r#"
             var name;
@@ -34815,7 +34817,7 @@ mod tests {
 
     /// `Promise.any` with empty array rejects with AggregateError.
     #[test]
-    fn e2e_promise_any_empty_rejects() {
+    fn e2e_promise_any_empty_rejects_v2() {
         let result = global_eval(
             r#"
             var name;
@@ -34960,7 +34962,7 @@ mod tests {
 
     /// Calling resolve then reject: only first (resolve) counts.
     #[test]
-    fn e2e_promise_constructor_resolve_then_reject() {
+    fn e2e_promise_constructor_resolve_then_reject_v2() {
         let result = global_eval(
             r#"
             var result;
@@ -41247,7 +41249,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_typed_array_reverse_returns_receiver() {
+    fn e2e_typed_array_reverse_returns_receiver_v2() {
         assert_eval_true("var a = new Int32Array([1,2,3]); a.reverse() === a");
     }
 
@@ -46746,13 +46748,13 @@ mod tests {
     }
 
     #[test]
-    fn e2e_reflect_has_missing() {
+    fn e2e_reflect_has_missing_v2() {
         let r = global_eval(r#"Reflect.has({}, 'z')"#).unwrap();
         assert_eq!(r, JsValue::Boolean(false));
     }
 
     #[test]
-    fn e2e_reflect_delete_property() {
+    fn e2e_reflect_delete_property_v2() {
         let r = global_eval(
             r#"
             var obj = { a: 1 };
@@ -46801,7 +46803,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_reflect_prevent_extensions() {
+    fn e2e_reflect_prevent_extensions_v2() {
         let r = global_eval(
             r#"
             var obj = {};
@@ -46814,7 +46816,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_reflect_define_property() {
+    fn e2e_reflect_define_property_v2() {
         let r = global_eval(
             r#"
             var obj = {};
@@ -46827,7 +46829,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_reflect_get_own_property_descriptor() {
+    fn e2e_reflect_get_own_property_descriptor_v2() {
         let r = global_eval(
             r#"
             var obj = { x: 7 };
@@ -46899,7 +46901,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_proxy_has_trap() {
+    fn e2e_proxy_has_trap_v2() {
         let r = global_eval(
             r#"
             var handler = { has: function(t, k) { return k === 'yes'; } };
@@ -46912,7 +46914,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_proxy_delete_trap() {
+    fn e2e_proxy_delete_trap_v2() {
         let r = global_eval(
             r#"
             var deleted = '';
@@ -46927,7 +46929,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_proxy_own_keys_trap() {
+    fn e2e_proxy_own_keys_trap_v2() {
         let r = global_eval(
             r#"
             var handler = { ownKeys: function(t) { return ['x', 'y']; } };
@@ -46940,7 +46942,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_proxy_apply_trap() {
+    fn e2e_proxy_apply_trap_v2() {
         let r = global_eval(
             r#"
             var handler = { apply: function(t, thisArg, args) { return args[0] * 2; } };
@@ -46953,7 +46955,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_proxy_construct_trap() {
+    fn e2e_proxy_construct_trap_v2() {
         let r = global_eval(
             r#"
             function Base() {}
@@ -47045,7 +47047,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_proxy_revocable_basic() {
+    fn e2e_proxy_revocable_basic_v2() {
         let r = global_eval(
             r#"
             var rev = Proxy.revocable({ x: 5 }, {});
@@ -51858,7 +51860,7 @@ mod tests {
 
     /// Bitwise NOT: `~0` ΓåÆ -1.
     #[test]
-    fn e2e_bitwise_not_zero() {
+    fn e2e_bitwise_not_zero_v2() {
         let r = global_eval("~0").unwrap();
         assert_eq!(r, JsValue::Smi(-1));
     }
@@ -51872,7 +51874,7 @@ mod tests {
 
     /// Bitwise NOT uses ToInt32: `~NaN` ΓåÆ -1 (ToInt32(NaN) is 0).
     #[test]
-    fn e2e_bitwise_not_nan() {
+    fn e2e_bitwise_not_nan_v2() {
         let r = global_eval("~NaN").unwrap();
         assert_eq!(r, JsValue::Smi(-1));
     }
@@ -52287,7 +52289,7 @@ mod tests {
 
     // 14. JSON.stringify toJSON — custom serialization method
     #[test]
-    fn e2e_json_stringify_to_json_method() {
+    fn e2e_json_stringify_to_json_method_v2() {
         let result = global_eval(
             r#"var obj = { val: 42, toJSON: function() { return "custom:" + this.val; } };
             JSON.stringify(obj)"#,
@@ -52495,7 +52497,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_map_constructor_from_another_map() {
+    fn e2e_map_constructor_from_another_map_v2() {
         let result = global_eval(
             "var a = new Map([['x', 1], ['y', 2]]); var b = new Map(a); \
              b.size === 2 && b.get('x') === 1 && b.get('y') === 2",
@@ -52523,7 +52525,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_map_delete_returns_boolean() {
+    fn e2e_map_delete_returns_boolean_v2() {
         let result = global_eval(
             "var m = new Map([['a', 1]]); var r1 = m.delete('a'); var r2 = m.delete('a'); \
              r1 === true && r2 === false",
@@ -52542,7 +52544,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_map_to_string_tag() {
+    fn e2e_map_to_string_tag_v2() {
         let result = global_eval("var m = new Map(); m[Symbol.toStringTag] === 'Map'").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
@@ -52582,7 +52584,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_set_delete_returns_boolean() {
+    fn e2e_set_delete_returns_boolean_v2() {
         let result = global_eval(
             "var s = new Set([1, 2]); var r1 = s.delete(1); var r2 = s.delete(1); \
              r1 === true && r2 === false && s.size === 1",
@@ -52600,7 +52602,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_set_to_string_tag() {
+    fn e2e_set_to_string_tag_v2() {
         let result = global_eval("var s = new Set(); s[Symbol.toStringTag] === 'Set'").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
@@ -52626,7 +52628,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_weakmap_no_size_property() {
+    fn e2e_weakmap_no_size_property_v2() {
         let result = global_eval("var wm = new WeakMap(); wm.size === undefined").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
@@ -52652,7 +52654,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_weakmap_to_string_tag() {
+    fn e2e_weakmap_to_string_tag_v2() {
         let result =
             global_eval("var wm = new WeakMap(); wm[Symbol.toStringTag] === 'WeakMap'").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -52669,7 +52671,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_weakset_no_size_property() {
+    fn e2e_weakset_no_size_property_v2() {
         let result = global_eval("var ws = new WeakSet(); ws.size === undefined").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
@@ -52682,7 +52684,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_weakset_to_string_tag() {
+    fn e2e_weakset_to_string_tag_v2() {
         let result =
             global_eval("var ws = new WeakSet(); ws[Symbol.toStringTag] === 'WeakSet'").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
@@ -55002,7 +55004,7 @@ mod tests {
     #[test]
     fn e2e_error_cause_string() {
         let result = global_eval(r#"new Error("x", { cause: "root" }).cause"#).unwrap();
-        assert_eq!(result, JsValue::String("root".to_string()));
+        assert_eq!(result, JsValue::String("root".into()));
     }
 
     /// Error with cause: another error
@@ -55012,14 +55014,14 @@ mod tests {
             r#"var inner = new Error("inner"); var outer = new Error("outer", { cause: inner }); outer.cause.message"#,
         )
         .unwrap();
-        assert_eq!(result, JsValue::String("inner".to_string()));
+        assert_eq!(result, JsValue::String("inner".into()));
     }
 
     /// TypeError supports cause option
     #[test]
-    fn e2e_type_error_cause() {
+    fn e2e_type_error_cause_v2() {
         let result = global_eval(r#"new TypeError("bad", { cause: "reason" }).cause"#).unwrap();
-        assert_eq!(result, JsValue::String("reason".to_string()));
+        assert_eq!(result, JsValue::String("reason".into()));
     }
 
     /// RangeError supports cause option
@@ -55059,10 +55061,10 @@ mod tests {
 
     /// AggregateError supports cause option (third arg)
     #[test]
-    fn e2e_aggregate_error_cause() {
+    fn e2e_aggregate_error_cause_v2() {
         let result =
             global_eval(r#"new AggregateError([], "msg", { cause: "root" }).cause"#).unwrap();
-        assert_eq!(result, JsValue::String("root".to_string()));
+        assert_eq!(result, JsValue::String("root".into()));
     }
 
     /// AggregateError .errors returns an array
@@ -55082,7 +55084,7 @@ mod tests {
             r#"var e = new AggregateError([new TypeError("t")], "one"); e.errors[0].name"#,
         )
         .unwrap();
-        assert_eq!(result, JsValue::String("TypeError".to_string()));
+        assert_eq!(result, JsValue::String("TypeError".into()));
     }
 
     /// AggregateError empty errors
@@ -55096,112 +55098,112 @@ mod tests {
     #[test]
     fn e2e_error_prototype_name_default() {
         let result = global_eval("Error.prototype.name").unwrap();
-        assert_eq!(result, JsValue::String("Error".to_string()));
+        assert_eq!(result, JsValue::String("Error".into()));
     }
 
     /// Error.prototype.message default is ""
     #[test]
-    fn e2e_error_prototype_message_default() {
+    fn e2e_error_prototype_message_default_v2() {
         let result = global_eval("Error.prototype.message").unwrap();
-        assert_eq!(result, JsValue::String(String::new()));
+        assert_eq!(result, JsValue::String("".into()));
     }
 
     /// TypeError.prototype.name is "TypeError"
     #[test]
-    fn e2e_type_error_prototype_name() {
+    fn e2e_type_error_prototype_name_v2() {
         let result = global_eval("TypeError.prototype.name").unwrap();
-        assert_eq!(result, JsValue::String("TypeError".to_string()));
+        assert_eq!(result, JsValue::String("TypeError".into()));
     }
 
     /// RangeError.prototype.name is "RangeError"
     #[test]
-    fn e2e_range_error_prototype_name() {
+    fn e2e_range_error_prototype_name_v2() {
         let result = global_eval("RangeError.prototype.name").unwrap();
-        assert_eq!(result, JsValue::String("RangeError".to_string()));
+        assert_eq!(result, JsValue::String("RangeError".into()));
     }
 
     /// SyntaxError.prototype.name is "SyntaxError"
     #[test]
-    fn e2e_syntax_error_prototype_name() {
+    fn e2e_syntax_error_prototype_name_v2() {
         let result = global_eval("SyntaxError.prototype.name").unwrap();
-        assert_eq!(result, JsValue::String("SyntaxError".to_string()));
+        assert_eq!(result, JsValue::String("SyntaxError".into()));
     }
 
     /// ReferenceError.prototype.name is "ReferenceError"
     #[test]
-    fn e2e_reference_error_prototype_name() {
+    fn e2e_reference_error_prototype_name_v2() {
         let result = global_eval("ReferenceError.prototype.name").unwrap();
-        assert_eq!(result, JsValue::String("ReferenceError".to_string()));
+        assert_eq!(result, JsValue::String("ReferenceError".into()));
     }
 
     /// URIError.prototype.name is "URIError"
     #[test]
-    fn e2e_uri_error_prototype_name() {
+    fn e2e_uri_error_prototype_name_v2() {
         let result = global_eval("URIError.prototype.name").unwrap();
-        assert_eq!(result, JsValue::String("URIError".to_string()));
+        assert_eq!(result, JsValue::String("URIError".into()));
     }
 
     /// EvalError.prototype.name is "EvalError"
     #[test]
-    fn e2e_eval_error_prototype_name() {
+    fn e2e_eval_error_prototype_name_v2() {
         let result = global_eval("EvalError.prototype.name").unwrap();
-        assert_eq!(result, JsValue::String("EvalError".to_string()));
+        assert_eq!(result, JsValue::String("EvalError".into()));
     }
 
     /// AggregateError.prototype.name is "AggregateError"
     #[test]
-    fn e2e_aggregate_error_prototype_name() {
+    fn e2e_aggregate_error_prototype_name_v2() {
         let result = global_eval("AggregateError.prototype.name").unwrap();
-        assert_eq!(result, JsValue::String("AggregateError".to_string()));
+        assert_eq!(result, JsValue::String("AggregateError".into()));
     }
 
     /// Error.prototype.toString exists and is a function
     #[test]
     fn e2e_error_prototype_tostring_exists() {
         let result = global_eval("typeof Error.prototype.toString").unwrap();
-        assert_eq!(result, JsValue::String("function".to_string()));
+        assert_eq!(result, JsValue::String("function".into()));
     }
 
     /// `new Error("msg").toString()` uses toString from prototype
     #[test]
     fn e2e_error_tostring_coercion() {
         let result = global_eval(r#"var e = new Error("fail"); "" + e"#).unwrap();
-        assert_eq!(result, JsValue::String("Error: fail".to_string()));
+        assert_eq!(result, JsValue::String("Error: fail".into()));
     }
 
     /// `new RangeError("x").toString()` → "RangeError: x"
     #[test]
     fn e2e_range_error_tostring() {
         let result = global_eval(r#"new RangeError("x").toString()"#).unwrap();
-        assert_eq!(result, JsValue::String("RangeError: x".to_string()));
+        assert_eq!(result, JsValue::String("RangeError: x".into()));
     }
 
     /// `new SyntaxError("y").toString()` → "SyntaxError: y"
     #[test]
     fn e2e_syntax_error_tostring() {
         let result = global_eval(r#"new SyntaxError("y").toString()"#).unwrap();
-        assert_eq!(result, JsValue::String("SyntaxError: y".to_string()));
+        assert_eq!(result, JsValue::String("SyntaxError: y".into()));
     }
 
     /// `new ReferenceError("z").toString()` → "ReferenceError: z"
     #[test]
     fn e2e_reference_error_tostring() {
         let result = global_eval(r#"new ReferenceError("z").toString()"#).unwrap();
-        assert_eq!(result, JsValue::String("ReferenceError: z".to_string()));
+        assert_eq!(result, JsValue::String("ReferenceError: z".into()));
     }
 
     /// `new AggregateError([], "a").toString()` → "AggregateError: a"
     #[test]
     fn e2e_aggregate_error_tostring() {
         let result = global_eval(r#"new AggregateError([], "a").toString()"#).unwrap();
-        assert_eq!(result, JsValue::String("AggregateError: a".to_string()));
+        assert_eq!(result, JsValue::String("AggregateError: a".into()));
     }
 
     /// `new Error("").toString()` → "Error" (empty message)
     #[test]
     fn e2e_error_tostring_empty_message() {
         let result = global_eval(r#"new Error("").toString()"#).unwrap();
-        assert_eq!(result, JsValue::String("Error".to_string()));
+        assert_eq!(result, JsValue::String("Error".into()));
     }
 
     /// instanceof: `new Error() instanceof Error` → true
@@ -55249,7 +55251,7 @@ mod tests {
 
     /// instanceof: `new AggregateError([]) instanceof Error` → true
     #[test]
-    fn e2e_aggregate_error_instanceof_error() {
+    fn e2e_aggregate_error_instanceof_error_v2() {
         let result = global_eval(r#"new AggregateError([], "x") instanceof Error"#).unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
@@ -55272,14 +55274,14 @@ mod tests {
     #[test]
     fn e2e_error_constructor_name() {
         let result = global_eval("Error.name").unwrap();
-        assert_eq!(result, JsValue::String("Error".to_string()));
+        assert_eq!(result, JsValue::String("Error".into()));
     }
 
     /// TypeError constructor: `.name` property
     #[test]
     fn e2e_type_error_constructor_name() {
         let result = global_eval("TypeError.name").unwrap();
-        assert_eq!(result, JsValue::String("TypeError".to_string()));
+        assert_eq!(result, JsValue::String("TypeError".into()));
     }
 
     /// Error.prototype.constructor === Error
@@ -55300,21 +55302,21 @@ mod tests {
     #[test]
     fn e2e_error_no_message_arg() {
         let result = global_eval("new Error().message").unwrap();
-        assert_eq!(result, JsValue::String(String::new()));
+        assert_eq!(result, JsValue::String("".into()));
     }
 
     /// Error.captureStackTrace exists
     #[test]
-    fn e2e_error_capture_stack_trace_exists() {
+    fn e2e_error_capture_stack_trace_exists_v2() {
         let result = global_eval("typeof Error.captureStackTrace").unwrap();
-        assert_eq!(result, JsValue::String("function".to_string()));
+        assert_eq!(result, JsValue::String("function".into()));
     }
 
     /// Error.stackTraceLimit is a number
     #[test]
     fn e2e_error_stack_trace_limit_type() {
         let result = global_eval("typeof Error.stackTraceLimit").unwrap();
-        assert_eq!(result, JsValue::String("number".to_string()));
+        assert_eq!(result, JsValue::String("number".into()));
     }
 
     fn assert_e2e_true(script: &str) {
@@ -56258,7 +56260,7 @@ mod tests {
 
     /// Number.isSafeInteger(3.14) returns false.
     #[test]
-    fn e2e_number_is_safe_integer_float() {
+    fn e2e_number_is_safe_integer_float_v2() {
         assert_eval_true("Number.isSafeInteger(3.14) === false");
     }
 
@@ -56284,28 +56286,28 @@ mod tests {
     #[test]
     fn e2e_to_fixed_basic() {
         let result = global_eval("(3.14159).toFixed(2)").unwrap();
-        assert_eq!(result, JsValue::String("3.14".to_string()));
+        assert_eq!(result, JsValue::String("3.14".into()));
     }
 
     /// toFixed(0) rounds to integer.
     #[test]
     fn e2e_to_fixed_zero_digits() {
         let result = global_eval("(1.5).toFixed(0)").unwrap();
-        assert_eq!(result, JsValue::String("2".to_string()));
+        assert_eq!(result, JsValue::String("2".into()));
     }
 
     /// toFixed on NaN returns "NaN".
     #[test]
     fn e2e_to_fixed_nan() {
         let result = global_eval("NaN.toFixed(2)").unwrap();
-        assert_eq!(result, JsValue::String("NaN".to_string()));
+        assert_eq!(result, JsValue::String("NaN".into()));
     }
 
     /// toFixed with no args defaults to 0 digits.
     #[test]
     fn e2e_to_fixed_no_args() {
         let result = global_eval("(1.7).toFixed()").unwrap();
-        assert_eq!(result, JsValue::String("2".to_string()));
+        assert_eq!(result, JsValue::String("2".into()));
     }
 
     /// toFixed range error for digits > 100.
@@ -56321,42 +56323,42 @@ mod tests {
     #[test]
     fn e2e_to_exponential_basic() {
         let result = global_eval("(123456).toExponential(2)").unwrap();
-        assert_eq!(result, JsValue::String("1.23e+5".to_string()));
+        assert_eq!(result, JsValue::String("1.23e+5".into()));
     }
 
     /// toExponential on zero.
     #[test]
     fn e2e_to_exponential_zero() {
         let result = global_eval("(0).toExponential(2)").unwrap();
-        assert_eq!(result, JsValue::String("0.00e+0".to_string()));
+        assert_eq!(result, JsValue::String("0.00e+0".into()));
     }
 
     /// toExponential with no args uses minimal digits.
     #[test]
     fn e2e_to_exponential_no_args() {
         let result = global_eval("(100).toExponential()").unwrap();
-        assert_eq!(result, JsValue::String("1e+2".to_string()));
+        assert_eq!(result, JsValue::String("1e+2".into()));
     }
 
     /// toExponential on NaN returns "NaN".
     #[test]
     fn e2e_to_exponential_nan() {
         let result = global_eval("NaN.toExponential(2)").unwrap();
-        assert_eq!(result, JsValue::String("NaN".to_string()));
+        assert_eq!(result, JsValue::String("NaN".into()));
     }
 
     /// toPrecision(5) formats with significant digits.
     #[test]
     fn e2e_to_precision_basic() {
         let result = global_eval("(123.456).toPrecision(5)").unwrap();
-        assert_eq!(result, JsValue::String("123.46".to_string()));
+        assert_eq!(result, JsValue::String("123.46".into()));
     }
 
     /// toPrecision with no args returns ToString(number).
     #[test]
     fn e2e_to_precision_no_args() {
         let result = global_eval("(123.456).toPrecision()").unwrap();
-        assert_eq!(result, JsValue::String("123.456".to_string()));
+        assert_eq!(result, JsValue::String("123.456".into()));
     }
 
     /// toPrecision range error for precision 0.
@@ -56372,35 +56374,35 @@ mod tests {
     #[test]
     fn e2e_to_string_hex() {
         let result = global_eval("(255).toString(16)").unwrap();
-        assert_eq!(result, JsValue::String("ff".to_string()));
+        assert_eq!(result, JsValue::String("ff".into()));
     }
 
     /// toString(2) for binary conversion.
     #[test]
     fn e2e_to_string_binary() {
         let result = global_eval("(10).toString(2)").unwrap();
-        assert_eq!(result, JsValue::String("1010".to_string()));
+        assert_eq!(result, JsValue::String("1010".into()));
     }
 
     /// toString(8) for octal conversion.
     #[test]
     fn e2e_to_string_octal() {
         let result = global_eval("(8).toString(8)").unwrap();
-        assert_eq!(result, JsValue::String("10".to_string()));
+        assert_eq!(result, JsValue::String("10".into()));
     }
 
     /// toString(36) for base-36 conversion.
     #[test]
     fn e2e_to_string_base36() {
         let result = global_eval("(35).toString(36)").unwrap();
-        assert_eq!(result, JsValue::String("z".to_string()));
+        assert_eq!(result, JsValue::String("z".into()));
     }
 
     /// toString() defaults to radix 10.
     #[test]
     fn e2e_to_string_default_radix() {
         let result = global_eval("(42).toString()").unwrap();
-        assert_eq!(result, JsValue::String("42".to_string()));
+        assert_eq!(result, JsValue::String("42".into()));
     }
 
     /// toString with invalid radix throws RangeError.
@@ -56465,19 +56467,19 @@ mod tests {
 
     /// Number.NaN is NaN.
     #[test]
-    fn e2e_number_nan_constant() {
+    fn e2e_number_nan_constant_v2() {
         assert_eval_true("Number.isNaN(Number.NaN)");
     }
 
     /// Number.POSITIVE_INFINITY is Infinity.
     #[test]
-    fn e2e_number_positive_infinity() {
+    fn e2e_number_positive_infinity_v2() {
         assert_eval_true("Number.POSITIVE_INFINITY === Infinity");
     }
 
     /// Number.NEGATIVE_INFINITY is -Infinity.
     #[test]
-    fn e2e_number_negative_infinity() {
+    fn e2e_number_negative_infinity_v2() {
         assert_eval_true("Number.NEGATIVE_INFINITY === -Infinity");
     }
 
@@ -56485,7 +56487,7 @@ mod tests {
     #[test]
     fn e2e_to_fixed_negative_zero() {
         let result = global_eval("(-0).toFixed(1)").unwrap();
-        assert_eq!(result, JsValue::String("0.0".to_string()));
+        assert_eq!(result, JsValue::String("0.0".into()));
     }
 
     // ── Deep Number / Math numeric conformance tests ────────────────────────
@@ -56822,7 +56824,7 @@ mod tests {
     #[test]
     fn e2e_to_string_negative_hex() {
         let result = global_eval("(-255).toString(16)").unwrap();
-        assert_eq!(result, JsValue::String("-ff".to_string()));
+        assert_eq!(result, JsValue::String("-ff".into()));
     }
 
     // ── Object utility method conformance tests ─────────────────────────────
@@ -56831,7 +56833,7 @@ mod tests {
 
     /// Object.assign copies enumerable own properties from multiple sources.
     #[test]
-    fn e2e_object_assign_multiple_sources() {
+    fn e2e_object_assign_multiple_sources_v2() {
         assert_eval_true(
             "var t = {}; Object.assign(t, {a:1}, {b:2}, {c:3}); \
              t.a === 1 && t.b === 2 && t.c === 3",
@@ -56858,7 +56860,7 @@ mod tests {
 
     /// Object.assign returns the target object.
     #[test]
-    fn e2e_object_assign_returns_target() {
+    fn e2e_object_assign_returns_target_v2() {
         assert_eval_true("var t = {}; Object.assign(t, {a:1}) === t");
     }
 
@@ -56920,7 +56922,7 @@ mod tests {
 
     /// Object.fromEntries with empty array returns empty object.
     #[test]
-    fn e2e_object_from_entries_empty() {
+    fn e2e_object_from_entries_empty_v2() {
         assert_eval_true("Object.keys(Object.fromEntries([])).length === 0");
     }
 
@@ -56978,13 +56980,13 @@ mod tests {
 
     /// Object.hasOwn returns true for own property.
     #[test]
-    fn e2e_object_has_own_true() {
+    fn e2e_object_has_own_true_v2() {
         assert_eval_true("Object.hasOwn({a:1}, 'a')");
     }
 
     /// Object.hasOwn returns false for missing property.
     #[test]
-    fn e2e_object_has_own_false() {
+    fn e2e_object_has_own_false_v2() {
         assert_eval_true("Object.hasOwn({a:1}, 'b') === false");
     }
 
@@ -57000,7 +57002,7 @@ mod tests {
 
     /// Object.hasOwn works on arrays (index check).
     #[test]
-    fn e2e_object_has_own_array_index() {
+    fn e2e_object_has_own_array_index_v2() {
         assert_eval_true(
             "Object.hasOwn([10,20,30], '1') === true && \
              Object.hasOwn([10,20,30], '5') === false",
@@ -57175,7 +57177,7 @@ mod tests {
 
     /// Object.create with property descriptors.
     #[test]
-    fn e2e_object_create_with_descriptors() {
+    fn e2e_object_create_with_descriptors_v2() {
         assert_eval_true(
             "var o = Object.create(null, { \
                x: {value: 42, writable: true, enumerable: true, configurable: true}, \
@@ -57207,7 +57209,7 @@ mod tests {
 
     /// Object.is: NaN equals NaN.
     #[test]
-    fn e2e_object_is_nan_nan() {
+    fn e2e_object_is_nan_nan_v2() {
         assert_eval_true("Object.is(NaN, NaN)");
     }
 
@@ -57617,7 +57619,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_nonconfig_data_to_accessor_throws() {
+    fn e2e_nonconfig_data_to_accessor_throws_v2() {
         assert_eval_true(
             "var o = {}; \
              Object.defineProperty(o, 'x', {value: 1, configurable: false}); \
@@ -57848,7 +57850,7 @@ mod tests {
     }
 
     #[test]
-    fn e2e_define_property_writable_and_set_throws() {
+    fn e2e_define_property_writable_and_set_throws_v2() {
         assert_eval_true(
             "try { \
                  Object.defineProperty({}, 'x', { \
@@ -58340,7 +58342,7 @@ mod tests {
 
     string_symbol_dispatch_test!(
         /// RegExp search preserves the original `lastIndex`.
-        e2e_string_search_regexp_preserves_last_index,
+        e2e_string_search_regexp_preserves_last_index_v2,
         r#"var re = /a/g; re.lastIndex = 2; "aba".search(re) === 0 && re.lastIndex === 2"#
     );
 
@@ -59718,7 +59720,7 @@ mod tests {
 
     // 10. Object.getOwnPropertyDescriptor on accessor
     #[test]
-    fn e2e_get_own_property_descriptor_accessor() {
+    fn e2e_get_own_property_descriptor_accessor_v2() {
         assert_eval_true(
             "var o = { get x() { return 1; } }; \
              var d = Object.getOwnPropertyDescriptor(o, 'x'); \
@@ -60465,7 +60467,7 @@ mod tests {
 
     /// `Map.groupBy` with empty array returns empty map.
     #[test]
-    fn e2e_map_group_by_empty() {
+    fn e2e_map_group_by_empty_v2() {
         let result = global_eval(
             r#"
             var m = Map.groupBy([], function(n) { return n; });
@@ -60478,7 +60480,7 @@ mod tests {
 
     /// `Map.groupBy` all elements in same group.
     #[test]
-    fn e2e_map_group_by_single_group() {
+    fn e2e_map_group_by_single_group_v2() {
         let result = global_eval(
             r#"
             var m = Map.groupBy([1,2,3], function() { return "k"; });
@@ -61354,7 +61356,7 @@ mod tests {
 
     /// getOwnPropertyDescriptor returns undefined for non-existent key.
     #[test]
-    fn e2e_gopd_missing_returns_undefined() {
+    fn e2e_gopd_missing_returns_undefined_v2() {
         assert_eval_true("Object.getOwnPropertyDescriptor({}, 'nope') === undefined");
     }
 
@@ -61390,7 +61392,7 @@ mod tests {
 
     /// defineProperties returns the target object.
     #[test]
-    fn e2e_define_properties_returns_target() {
+    fn e2e_define_properties_returns_target_v2() {
         assert_eval_true("var o = {}; Object.defineProperties(o, { a: { value: 1 } }) === o");
     }
 
@@ -62326,7 +62328,7 @@ mod tests {
             log"#,
         )
         .unwrap();
-        assert_eq!(result, JsValue::String("abcd".to_string()));
+        assert_eq!(result, JsValue::String("abcd".into()));
     }
 
     /// Nested try/finally with throw: inner finally runs before outer catch.
@@ -62340,7 +62342,7 @@ mod tests {
             log"#,
         )
         .unwrap();
-        assert_eq!(result, JsValue::String("innercatchouter".to_string()));
+        assert_eq!(result, JsValue::String("innercatchouter".into()));
     }
 
     /// Labeled block with break propagates completion value.
@@ -62359,7 +62361,7 @@ mod tests {
             log"#,
         )
         .unwrap();
-        assert_eq!(result, JsValue::String("ab".to_string()));
+        assert_eq!(result, JsValue::String("ab".into()));
     }
 
     /// Switch: basic completion value from matching case.
@@ -62502,7 +62504,7 @@ mod tests {
              f(1) + f(2) + f(3)",
         )
         .unwrap();
-        assert_eq!(result, JsValue::String("abc".to_string()));
+        assert_eq!(result, JsValue::String("abc".into()));
     }
 
     /// Logical AND with function call on right side in tail position.
