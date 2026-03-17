@@ -262,8 +262,14 @@ impl FullPropertyDescriptor {
     /// ECMAScript §10.1.6.3 *ValidateAndApplyPropertyDescriptor*.
     ///
     /// Validates whether a property redefinition is allowed and returns the
-    /// merged attribute set.  Returns `Err(TypeError)` when the change violates
-    /// the non-configurable invariants.
+    /// merged attribute set.  For [`Generic`](Self::Generic) descriptors the
+    /// result is the *current* attributes with only the explicitly specified
+    /// fields overridden — unspecified fields are preserved.  For [`Data`] and
+    /// [`Accessor`](Self::Accessor) descriptors all four attribute slots are
+    /// present so the result is simply [`to_attributes`](Self::to_attributes).
+    ///
+    /// Returns `Err(TypeError)` when the change violates the non-configurable
+    /// invariants.
     pub fn validate_against(
         &self,
         key: &str,
@@ -300,7 +306,42 @@ impl FullPropertyDescriptor {
             }
         }
 
-        Ok(self.to_attributes())
+        Ok(self.merge_into(current_attrs))
+    }
+
+    /// Merges this descriptor into `current_attrs`, overriding only the
+    /// attributes that are explicitly present in the descriptor.
+    ///
+    /// For [`Data`](Self::Data) and [`Accessor`](Self::Accessor) variants
+    /// every attribute is present so the result is equivalent to
+    /// [`to_attributes`](Self::to_attributes).  For
+    /// [`Generic`](Self::Generic) only the specified fields are changed;
+    /// unspecified fields are inherited from `current_attrs`.
+    pub fn merge_into(&self, current_attrs: PropertyAttributes) -> PropertyAttributes {
+        match self {
+            Self::Data { .. } | Self::Accessor { .. } => self.to_attributes(),
+            Self::Generic {
+                enumerable,
+                configurable,
+            } => {
+                let mut attrs = current_attrs;
+                if let Some(e) = enumerable {
+                    if *e {
+                        attrs |= PropertyAttributes::ENUMERABLE;
+                    } else {
+                        attrs -= PropertyAttributes::ENUMERABLE;
+                    }
+                }
+                if let Some(c) = configurable {
+                    if *c {
+                        attrs |= PropertyAttributes::CONFIGURABLE;
+                    } else {
+                        attrs -= PropertyAttributes::CONFIGURABLE;
+                    }
+                }
+                attrs
+            }
+        }
     }
 }
 
@@ -633,5 +674,64 @@ mod tests {
             desc.validate_against("p", current).is_ok(),
             "narrowing writable (false→false) on non-configurable should succeed"
         );
+    }
+
+    // ── merge_into ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_merge_into_data_ignores_current() {
+        let desc = FullPropertyDescriptor::Data {
+            value: JsValue::Smi(1),
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        };
+        let current = PropertyAttributes::all();
+        let merged = desc.merge_into(current);
+        // Data descriptor fully replaces current attributes.
+        assert!(merged.contains(PropertyAttributes::WRITABLE));
+        assert!(!merged.contains(PropertyAttributes::ENUMERABLE));
+        assert!(merged.contains(PropertyAttributes::CONFIGURABLE));
+    }
+
+    #[test]
+    fn test_merge_into_generic_preserves_unspecified() {
+        let desc = FullPropertyDescriptor::Generic {
+            enumerable: Some(true),
+            configurable: None,
+        };
+        let current = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
+        let merged = desc.merge_into(current);
+        // Writable preserved, enumerable overridden, configurable preserved.
+        assert!(merged.contains(PropertyAttributes::WRITABLE));
+        assert!(merged.contains(PropertyAttributes::ENUMERABLE));
+        assert!(merged.contains(PropertyAttributes::CONFIGURABLE));
+    }
+
+    #[test]
+    fn test_merge_into_generic_clears_specified() {
+        let desc = FullPropertyDescriptor::Generic {
+            enumerable: None,
+            configurable: Some(false),
+        };
+        let current = PropertyAttributes::WRITABLE
+            | PropertyAttributes::ENUMERABLE
+            | PropertyAttributes::CONFIGURABLE;
+        let merged = desc.merge_into(current);
+        // Configurable cleared, others preserved.
+        assert!(merged.contains(PropertyAttributes::WRITABLE));
+        assert!(merged.contains(PropertyAttributes::ENUMERABLE));
+        assert!(!merged.contains(PropertyAttributes::CONFIGURABLE));
+    }
+
+    #[test]
+    fn test_merge_into_generic_empty_preserves_all() {
+        let desc = FullPropertyDescriptor::Generic {
+            enumerable: None,
+            configurable: None,
+        };
+        let current = PropertyAttributes::WRITABLE | PropertyAttributes::ENUMERABLE;
+        let merged = desc.merge_into(current);
+        assert_eq!(merged, current);
     }
 }

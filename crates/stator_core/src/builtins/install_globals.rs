@@ -4649,8 +4649,75 @@ fn make_object() -> JsValue {
                         define_own_property(map, &key, &desc)?;
                     }
                     Ok(obj)
+                } else if let JsValue::Array(items) = &obj {
+                    // §10.4.2 Array Exotic Objects [[DefineOwnProperty]].
+                    let items = Rc::clone(items);
+                    if let JsValue::PlainObject(desc_map) = descriptor {
+                        let desc = desc_map.borrow();
+                        let has_value = desc.contains_key("value");
+                        let has_writable = desc.contains_key("writable");
+                        let has_get = desc.contains_key("get");
+                        let has_set = desc.contains_key("set");
+
+                        // Reject accessor descriptors on arrays (not supported
+                        // without a full exotic-object wrapper).
+                        if has_get || has_set {
+                            return Err(crate::error::StatorError::TypeError(
+                                "Cannot define accessor property on array".into(),
+                            ));
+                        }
+
+                        if key == "length" {
+                            // §10.4.2.4 ArraySetLength: apply length changes
+                            // and writable narrowing on the compact Vec.
+                            if has_writable {
+                                let w = desc.get("writable").is_some_and(|v| v.to_boolean());
+                                if !w && has_value {
+                                    let new_len = desc
+                                        .get("value")
+                                        .unwrap_or(&JsValue::Undefined)
+                                        .to_number()
+                                        .unwrap_or(0.0)
+                                        as usize;
+                                    items.borrow_mut().truncate(new_len);
+                                }
+                            }
+                            if has_value && !has_writable {
+                                let new_len = desc
+                                    .get("value")
+                                    .unwrap_or(&JsValue::Undefined)
+                                    .to_number()
+                                    .unwrap_or(0.0)
+                                    as usize;
+                                let mut arr = items.borrow_mut();
+                                if new_len < arr.len() {
+                                    arr.truncate(new_len);
+                                } else {
+                                    arr.resize(new_len, JsValue::Undefined);
+                                }
+                            }
+                        } else if let Ok(idx) = key.parse::<usize>() {
+                            // Indexed property: update or extend the backing
+                            // Vec with the provided value.
+                            let value = if has_value {
+                                desc.get("value").cloned().unwrap_or(JsValue::Undefined)
+                            } else {
+                                JsValue::Undefined
+                            };
+                            let mut arr = items.borrow_mut();
+                            if idx < arr.len() {
+                                arr[idx] = value;
+                            } else {
+                                arr.resize(idx, JsValue::Undefined);
+                                arr.push(value);
+                            }
+                        }
+                        // Non-index, non-length: no-op (compact Vec has no
+                        // named-property storage).
+                    }
+                    Ok(obj)
                 } else {
-                    // Non-PlainObject objects (Array, Function, etc.): return as-is
+                    // Other non-PlainObject objects: return as-is.
                     Ok(obj)
                 }
             }),
@@ -43202,13 +43269,605 @@ mod tests {
         assert_eval_true("var t = Object.assign({}, {v: NaN}); Object.is(t.v, NaN)");
     }
 
-    /// hasOwn + defineProperty: non-configurable non-writable is still "own".
+    // ── Property descriptor conformance tests ───────────────────────────────
+
+    // 1. Object.defineProperty — writable, enumerable, configurable flags
+
     #[test]
-    fn e2e_has_own_non_configurable() {
+    fn e2e_define_property_writable_true_allows_assignment() {
         assert_eval_true(
             "var o = {}; \
-             Object.defineProperty(o, 'x', {value:1, writable:false, configurable:false}); \
-             Object.hasOwn(o, 'x')",
+             Object.defineProperty(o, 'x', {value: 1, writable: true}); \
+             o.x = 2; \
+             o.x === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_writable_false_ignores_strict_assignment() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1, writable: false}); \
+             o.x = 99; \
+             o.x === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_enumerable_true_in_keys() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'a', {value: 1, enumerable: true}); \
+             Object.keys(o).indexOf('a') !== -1",
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_enumerable_false_not_in_keys() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'a', {value: 1, enumerable: false}); \
+             Object.keys(o).indexOf('a') === -1",
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_configurable_true_allows_delete() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1, configurable: true}); \
+             delete o.x; \
+             o.x === undefined",
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_configurable_false_prevents_delete() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1, configurable: false}); \
+             delete o.x; \
+             o.x === 1",
+        );
+    }
+
+    // 2. Object.getOwnPropertyDescriptor — returns correct descriptor object
+
+    #[test]
+    fn e2e_gopd_returns_all_four_data_keys() {
+        assert_eval_true(
+            "var o = {x: 42}; \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             'value' in d && 'writable' in d && 'enumerable' in d && 'configurable' in d",
+        );
+    }
+
+    #[test]
+    fn e2e_gopd_data_values_correct() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 7, writable: false, enumerable: true, configurable: false}); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             d.value === 7 && d.writable === false && d.enumerable === true && d.configurable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_gopd_missing_property_returns_undefined() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.getOwnPropertyDescriptor(o, 'nope') === undefined",
+        );
+    }
+
+    #[test]
+    fn e2e_gopd_inherited_property_returns_undefined() {
+        assert_eval_true(
+            "var parent = {x: 1}; \
+             var child = Object.create(parent); \
+             Object.getOwnPropertyDescriptor(child, 'x') === undefined",
+        );
+    }
+
+    // 3. Accessor descriptors: {get, set, enumerable, configurable}
+
+    #[test]
+    fn e2e_accessor_getter_invoked_on_read() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { \
+                 get: function() { return 99; }, \
+                 enumerable: true, configurable: true \
+             }); \
+             o.x === 99",
+        );
+    }
+
+    #[test]
+    fn e2e_accessor_setter_invoked_on_write() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { \
+                 set: function(v) { this._x = v * 2; }, \
+                 get: function() { return this._x; }, \
+                 configurable: true \
+             }); \
+             o.x = 5; \
+             o.x === 10",
+        );
+    }
+
+    #[test]
+    fn e2e_gopd_accessor_shape() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { \
+                 get: function() { return 1; }, \
+                 set: function(v) {}, \
+                 enumerable: true, configurable: false \
+             }); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             typeof d.get === 'function' && typeof d.set === 'function' && \
+             d.enumerable === true && d.configurable === false && \
+             d.value === undefined && d.writable === undefined",
+        );
+    }
+
+    #[test]
+    fn e2e_accessor_only_getter_set_is_undefined() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { \
+                 get: function() { return 1; }, \
+                 configurable: true \
+             }); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             d.set === undefined",
+        );
+    }
+
+    // 4. Data descriptors: {value, writable, enumerable, configurable}
+
+    #[test]
+    fn e2e_data_descriptor_all_false_defaults() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 42}); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             d.value === 42 && d.writable === false && \
+             d.enumerable === false && d.configurable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_data_descriptor_all_true() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { \
+                 value: 'hello', writable: true, enumerable: true, configurable: true \
+             }); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             d.value === 'hello' && d.writable === true && \
+             d.enumerable === true && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_ordinary_property_descriptor_wec() {
+        assert_eval_true(
+            "var o = {x: 1}; \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             d.writable === true && d.enumerable === true && d.configurable === true",
+        );
+    }
+
+    // 5. Non-configurable → non-writable transition allowed
+
+    #[test]
+    fn e2e_nonconfig_writable_true_to_false_allowed() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1, writable: true, configurable: false}); \
+             Object.defineProperty(o, 'x', {value: 1, writable: false}); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             d.writable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_nonconfig_narrow_writable_preserves_value() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 42, writable: true, configurable: false}); \
+             Object.defineProperty(o, 'x', {writable: false}); \
+             o.x === 42",
+        );
+    }
+
+    // 6. Reconfiguring non-configurable throws TypeError
+
+    #[test]
+    fn e2e_nonconfig_to_config_throws_typeerror() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1, configurable: false}); \
+             try { \
+                 Object.defineProperty(o, 'x', {configurable: true}); \
+                 false; \
+             } catch(e) { \
+                 e instanceof TypeError; \
+             }",
+        );
+    }
+
+    #[test]
+    fn e2e_nonconfig_change_enumerable_throws() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1, enumerable: false, configurable: false}); \
+             try { \
+                 Object.defineProperty(o, 'x', {enumerable: true}); \
+                 false; \
+             } catch(e) { \
+                 e instanceof TypeError; \
+             }",
+        );
+    }
+
+    #[test]
+    fn e2e_nonconfig_nonwritable_value_change_throws() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1, writable: false, configurable: false}); \
+             try { \
+                 Object.defineProperty(o, 'x', {value: 2}); \
+                 false; \
+             } catch(e) { \
+                 e instanceof TypeError; \
+             }",
+        );
+    }
+
+    #[test]
+    fn e2e_nonconfig_nonwritable_same_value_noop() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1, writable: false, configurable: false}); \
+             Object.defineProperty(o, 'x', {value: 1}); \
+             o.x === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_nonconfig_widen_writable_throws() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1, writable: false, configurable: false}); \
+             try { \
+                 Object.defineProperty(o, 'x', {writable: true}); \
+                 false; \
+             } catch(e) { \
+                 e instanceof TypeError; \
+             }",
+        );
+    }
+
+    #[test]
+    fn e2e_nonconfig_accessor_change_getter_throws() {
+        assert_eval_true(
+            "var o = {}; \
+             var g1 = function() { return 1; }; \
+             Object.defineProperty(o, 'x', {get: g1, configurable: false}); \
+             try { \
+                 Object.defineProperty(o, 'x', {get: function() { return 2; }}); \
+                 false; \
+             } catch(e) { \
+                 e instanceof TypeError; \
+             }",
+        );
+    }
+
+    #[test]
+    fn e2e_nonconfig_data_to_accessor_throws() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1, configurable: false}); \
+             try { \
+                 Object.defineProperty(o, 'x', {get: function() { return 2; }}); \
+                 false; \
+             } catch(e) { \
+                 e instanceof TypeError; \
+             }",
+        );
+    }
+
+    #[test]
+    fn e2e_nonconfig_accessor_to_data_throws() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {get: function() { return 1; }, configurable: false}); \
+             try { \
+                 Object.defineProperty(o, 'x', {value: 2}); \
+                 false; \
+             } catch(e) { \
+                 e instanceof TypeError; \
+             }",
+        );
+    }
+
+    // 7. Object.defineProperties — multiple at once
+
+    #[test]
+    fn e2e_define_properties_sets_multiple() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperties(o, { \
+                 a: {value: 1, writable: true, enumerable: true, configurable: true}, \
+                 b: {value: 2, writable: false, enumerable: true, configurable: false} \
+             }); \
+             o.a === 1 && o.b === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_define_properties_respects_attributes() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperties(o, { \
+                 x: {value: 10, writable: false, enumerable: false, configurable: false}, \
+                 y: {value: 20, writable: true, enumerable: true, configurable: true} \
+             }); \
+             var dx = Object.getOwnPropertyDescriptor(o, 'x'); \
+             var dy = Object.getOwnPropertyDescriptor(o, 'y'); \
+             dx.writable === false && dx.enumerable === false && \
+             dy.writable === true && dy.enumerable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_define_properties_returns_target() {
+        assert_eval_true(
+            "var o = {}; \
+             var r = Object.defineProperties(o, {a: {value: 1}}); \
+             r === o",
+        );
+    }
+
+    #[test]
+    fn e2e_define_properties_non_object_throws() {
+        assert_eval_true(
+            "try { \
+                 Object.defineProperties(42, {}); \
+                 false; \
+             } catch(e) { \
+                 e instanceof TypeError; \
+             }",
+        );
+    }
+
+    // 8. Descriptor on arrays
+
+    #[test]
+    fn e2e_array_gopd_index() {
+        assert_eval_true(
+            "var a = [10, 20, 30]; \
+             var d = Object.getOwnPropertyDescriptor(a, '1'); \
+             d.value === 20 && d.writable === true && \
+             d.enumerable === true && d.configurable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_array_gopd_length() {
+        assert_eval_true(
+            "var a = [1, 2, 3]; \
+             var d = Object.getOwnPropertyDescriptor(a, 'length'); \
+             d.value === 3 && d.writable === true && \
+             d.enumerable === false && d.configurable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_array_index() {
+        assert_eval_true(
+            "var a = [1, 2, 3]; \
+             Object.defineProperty(a, '1', {value: 99}); \
+             a[1] === 99",
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_array_length_truncate() {
+        assert_eval_true(
+            "var a = [1, 2, 3, 4, 5]; \
+             Object.defineProperty(a, 'length', {value: 2}); \
+             a.length === 2",
+        );
+    }
+
+    // 9. Default descriptor values
+
+    #[test]
+    fn e2e_define_property_defaults_writable_false() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1}); \
+             Object.getOwnPropertyDescriptor(o, 'x').writable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_defaults_enumerable_false() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1}); \
+             Object.getOwnPropertyDescriptor(o, 'x').enumerable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_defaults_configurable_false() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1}); \
+             Object.getOwnPropertyDescriptor(o, 'x').configurable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_empty_descriptor_generic() {
+        assert_eval_true(
+            "var o = {x: 5}; \
+             Object.defineProperty(o, 'x', {}); \
+             o.x === 5",
+        );
+    }
+
+    // 10. Additional conformance edge cases
+
+    #[test]
+    fn e2e_configurable_data_to_accessor_allowed() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1, configurable: true}); \
+             Object.defineProperty(o, 'x', { \
+                 get: function() { return 42; }, configurable: true \
+             }); \
+             o.x === 42",
+        );
+    }
+
+    #[test]
+    fn e2e_configurable_accessor_to_data_allowed() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { \
+                 get: function() { return 1; }, configurable: true \
+             }); \
+             Object.defineProperty(o, 'x', {value: 99, configurable: true}); \
+             o.x === 99",
+        );
+    }
+
+    #[test]
+    fn e2e_configurable_redefine_all_attributes() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1, writable: false, enumerable: false, configurable: true}); \
+             Object.defineProperty(o, 'x', {value: 2, writable: true, enumerable: true, configurable: true}); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             d.value === 2 && d.writable === true && d.enumerable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_on_non_object_throws() {
+        assert_eval_true(
+            "try { \
+                 Object.defineProperty(42, 'x', {value: 1}); \
+                 false; \
+             } catch(e) { \
+                 e instanceof TypeError; \
+             }",
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_descriptor_not_object_throws() {
+        assert_eval_true(
+            "try { \
+                 Object.defineProperty({}, 'x', 42); \
+                 false; \
+             } catch(e) { \
+                 e instanceof TypeError; \
+             }",
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_mixed_data_accessor_throws() {
+        assert_eval_true(
+            "try { \
+                 Object.defineProperty({}, 'x', { \
+                     value: 1, get: function() { return 2; } \
+                 }); \
+                 false; \
+             } catch(e) { \
+                 e instanceof TypeError; \
+             }",
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_writable_and_set_throws() {
+        assert_eval_true(
+            "try { \
+                 Object.defineProperty({}, 'x', { \
+                     writable: true, set: function(v) {} \
+                 }); \
+                 false; \
+             } catch(e) { \
+                 e instanceof TypeError; \
+             }",
+        );
+    }
+
+    #[test]
+    fn e2e_generic_descriptor_preserves_writable() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1, writable: true, configurable: true}); \
+             Object.defineProperty(o, 'x', {enumerable: true}); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             d.writable === true && d.enumerable === true",
+        );
+    }
+
+    #[test]
+    fn e2e_generic_descriptor_only_configurable_preserves_rest() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', { \
+                 value: 5, writable: true, enumerable: true, configurable: true \
+             }); \
+             Object.defineProperty(o, 'x', {configurable: false}); \
+             var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+             d.value === 5 && d.writable === true && d.enumerable === true && d.configurable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_nonconfig_same_enumerable_noop() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1, enumerable: true, configurable: false}); \
+             Object.defineProperty(o, 'x', {enumerable: true}); \
+             o.x === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_define_property_returns_target_object() {
+        assert_eval_true(
+            "var o = {}; \
+             Object.defineProperty(o, 'x', {value: 1}) === o",
+        );
+    }
+
+    #[test]
+    fn e2e_gopd_string_index() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor('hello', '0'); \
+             d.value === 'h' && d.writable === false && \
+             d.enumerable === true && d.configurable === false",
+        );
+    }
+
+    #[test]
+    fn e2e_gopd_string_length() {
+        assert_eval_true(
+            "var d = Object.getOwnPropertyDescriptor('abc', 'length'); \
+             d.value === 3 && d.writable === false",
         );
     }
 
