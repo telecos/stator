@@ -12747,6 +12747,15 @@ fn incompatible_receiver(display_name: &str) -> StatorError {
     StatorError::TypeError(format!("{display_name} called on incompatible receiver"))
 }
 
+fn dataview_bigint_argument(value: &JsValue) -> StatorResult<i128> {
+    match value.to_numeric()? {
+        JsValue::BigInt(n) => Ok(n),
+        _ => Err(StatorError::TypeError(
+            "Cannot convert a non-BigInt value to a BigInt".to_string(),
+        )),
+    }
+}
+
 fn buffer_option_max_byte_length(options: Option<&JsValue>) -> StatorResult<Option<usize>> {
     let Some(options) = options.filter(|value| !value.is_undefined()) else {
         return Ok(None);
@@ -13138,7 +13147,7 @@ fn make_dataview() -> JsValue {
             let Some(inner) = extract_dataview(receiver) else {
                 return Err(incompatible_receiver("DataView.prototype.byteLength"));
             };
-            Ok(JsValue::Smi(dataview_byte_length(&inner.borrow()) as i32))
+            Ok(JsValue::Smi(dataview_byte_length(&inner.borrow())? as i32))
         }),
     );
     prototype.insert(
@@ -13148,7 +13157,7 @@ fn make_dataview() -> JsValue {
             let Some(inner) = extract_dataview(receiver) else {
                 return Err(incompatible_receiver("DataView.prototype.byteOffset"));
             };
-            Ok(JsValue::Smi(dataview_byte_offset(&inner.borrow()) as i32))
+            Ok(JsValue::Smi(dataview_byte_offset(&inner.borrow())? as i32))
         }),
     );
 
@@ -13270,16 +13279,10 @@ fn make_dataview() -> JsValue {
         v.to_number()
     });
     dataview_proto_setter!("setBigInt64", 2, dataview_set_bigint64, |v: &JsValue| {
-        match v {
-            JsValue::BigInt(n) => Ok::<i64, StatorError>(*n as i64),
-            _ => Ok(v.to_number()? as i64),
-        }
+        Ok::<i64, StatorError>(dataview_bigint_argument(v)? as i64)
     });
     dataview_proto_setter!("setBigUint64", 2, dataview_set_biguint64, |v: &JsValue| {
-        match v {
-            JsValue::BigInt(n) => Ok::<u64, StatorError>(*n as u64),
-            _ => Ok(v.to_number()? as u64),
-        }
+        Ok::<u64, StatorError>(dataview_bigint_argument(v)? as u64)
     });
     prototype.insert("@@toStringTag".into(), JsValue::String("DataView".into()));
     prototype.make_all_non_enumerable();
@@ -13298,7 +13301,7 @@ fn make_dataview() -> JsValue {
                 Some(b) => b,
                 None => {
                     return Err(StatorError::TypeError(
-                        "First argument must be an ArrayBuffer".into(),
+                        "First argument must be an ArrayBuffer or SharedArrayBuffer".into(),
                     ));
                 }
             };
@@ -34998,6 +35001,167 @@ mod tests {
     fn e2e_dataview_setters_reject_out_of_bounds_writes() {
         assert_eval_true(
             "try { new DataView(new ArrayBuffer(2)).setUint32(0, 1); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_get_int16_big_endian_interprets_bytes() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(2)); v.setUint8(0, 0x12); v.setUint8(1, 0x34); v.getInt16(0) === 0x1234",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_get_uint16_big_endian_respects_view_offset() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(4), 1, 2); v.setUint8(0, 0xaa); v.setUint8(1, 0xbb); v.getUint16(0) === 0xaabb",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_get_int32_big_endian_interprets_bytes() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(4)); v.setUint8(0, 1); v.setUint8(1, 2); v.setUint8(2, 3); v.setUint8(3, 4); v.getInt32(0) === 0x01020304",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_get_float32_big_endian_interprets_bytes() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(4)); v.setUint8(0, 0x3f); v.setUint8(1, 0x80); v.setUint8(2, 0x00); v.setUint8(3, 0x00); v.getFloat32(0) === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_get_float64_big_endian_interprets_bytes() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(8)); v.setUint8(0, 0x3f); v.setUint8(1, 0xf0); v.setUint8(2, 0x00); v.setUint8(3, 0x00); v.setUint8(4, 0x00); v.setUint8(5, 0x00); v.setUint8(6, 0x00); v.setUint8(7, 0x00); v.getFloat64(0) === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_get_bigint64_big_endian_interprets_bytes() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(8)); v.setUint8(0, 0xff); v.setUint8(1, 0xff); v.setUint8(2, 0xff); v.setUint8(3, 0xff); v.setUint8(4, 0xff); v.setUint8(5, 0xff); v.setUint8(6, 0xff); v.setUint8(7, 0xfe); v.getBigInt64(0) === -2n",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_get_biguint64_little_endian_interprets_bytes() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(8)); v.setUint8(0, 0x08); v.setUint8(1, 0x07); v.setUint8(2, 0x06); v.setUint8(3, 0x05); v.setUint8(4, 0x04); v.setUint8(5, 0x03); v.setUint8(6, 0x02); v.setUint8(7, 0x01); v.getBigUint64(0, true) === BigInt('72623859790382856')",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_set_bigint64_little_endian_round_trips_and_writes_bytes() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(8)); v.setBigInt64(0, -2n, true); v.getBigInt64(0, true) === -2n && v.getUint8(0) === 0xfe && v.getUint8(7) === 0xff",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_set_biguint64_big_endian_round_trips_and_writes_bytes() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(8)); v.setBigUint64(0, BigInt('0x0102030405060708')); v.getBigUint64(0) === BigInt('0x0102030405060708') && v.getUint8(0) === 0x01 && v.getUint8(7) === 0x08",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_set_int16_big_endian_writes_bytes() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(2)); v.setInt16(0, 0x1234); v.getUint8(0) === 0x12 && v.getUint8(1) === 0x34",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_set_int32_big_endian_writes_bytes() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(4)); v.setInt32(0, 0x01020304); v.getUint8(0) === 0x01 && v.getUint8(1) === 0x02 && v.getUint8(2) === 0x03 && v.getUint8(3) === 0x04",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_set_float32_big_endian_writes_bytes() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(4)); v.setFloat32(0, 1); v.getUint8(0) === 0x3f && v.getUint8(1) === 0x80 && v.getUint8(2) === 0x00 && v.getUint8(3) === 0x00",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_set_float64_big_endian_writes_bytes() {
+        assert_eval_true(
+            "var v = new DataView(new ArrayBuffer(8)); v.setFloat64(0, 1); v.getUint8(0) === 0x3f && v.getUint8(1) === 0xf0 && v.getUint8(2) === 0x00 && v.getUint8(3) === 0x00 && v.getUint8(4) === 0x00 && v.getUint8(5) === 0x00 && v.getUint8(6) === 0x00 && v.getUint8(7) === 0x00",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_getters_reject_detached_buffer_after_transfer() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(8, { maxByteLength: 16 }); var view = new DataView(buf); buf.transfer(); try { view.getUint8(0); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_setters_reject_detached_buffer_after_transfer() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(8, { maxByteLength: 16 }); var view = new DataView(buf); buf.transfer(); try { view.setUint8(0, 1); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_byte_length_getter_rejects_detached_buffer_after_transfer() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(8, { maxByteLength: 16 }); var view = new DataView(buf); buf.transfer(); try { view.byteLength; false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_byte_offset_getter_rejects_detached_buffer_after_transfer() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(8, { maxByteLength: 16 }); var view = new DataView(buf, 2, 4); buf.transfer(); try { view.byteOffset; false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_constructor_rejects_detached_buffer() {
+        assert_eval_true(
+            "var buf = new ArrayBuffer(8, { maxByteLength: 16 }); buf.transfer(); try { new DataView(buf); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_bigint_setters_reject_number_values() {
+        assert_eval_true(
+            "try { new DataView(new ArrayBuffer(8)).setBigInt64(0, 1); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_biguint_setters_reject_number_values() {
+        assert_eval_true(
+            "try { new DataView(new ArrayBuffer(8)).setBigUint64(0, 1); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_shared_arraybuffer_round_trips() {
+        assert_eval_true(
+            "var buf = new SharedArrayBuffer(8); var view = new DataView(buf); view.setUint32(0, 0x01020304, true); view.getUint32(0, true) === 0x01020304 && view.buffer === buf",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_bounds_check_uses_view_length_not_buffer_length() {
+        assert_eval_true(
+            "try { new DataView(new ArrayBuffer(8), 2, 2).getUint32(0); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_dataview_bounds_check_allows_last_byte_within_view() {
+        assert_eval_true(
+            "var view = new DataView(new ArrayBuffer(4), 1, 2); view.setUint8(1, 7); view.getUint8(1) === 7",
         );
     }
 
