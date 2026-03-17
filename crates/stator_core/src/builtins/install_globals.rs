@@ -36010,6 +36010,11 @@ mod tests {
 
     // ── Conformance: for-in enumeration ─────────────────────────────────
 
+    fn assert_for_in_keys(src: &str, expected: &str) {
+        let result = global_eval(src).unwrap();
+        assert_eq!(result, JsValue::String(expected.into()), "script: {src}");
+    }
+
     /// for-in enumerates own enumerable string properties.
     #[test]
     fn e2e_for_in_own_enumerable() {
@@ -36082,6 +36087,398 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn e2e_for_in_multi_level_inherited_chain() {
+        assert_for_in_keys(
+            "var grand = { g: 1 }; \
+             var parent = Object.create(grand); parent.p = 2; \
+             var obj = Object.create(parent); obj.o = 3; \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "o,p,g",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_multi_level_preserves_per_object_order() {
+        assert_for_in_keys(
+            "var grand = { ga: 1, gb: 2 }; \
+             var parent = Object.create(grand); parent.pa = 3; parent.pb = 4; \
+             var obj = Object.create(parent); obj.oa = 5; obj.ob = 6; \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "oa,ob,pa,pb,ga,gb",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_multi_level_shadowing_visits_once() {
+        assert_for_in_keys(
+            "var grand = { x: 1, g: 2 }; \
+             var parent = Object.create(grand); parent.x = 3; parent.p = 4; \
+             var obj = Object.create(parent); obj.x = 5; obj.o = 6; \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "x,o,p,g",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_mid_non_enumerable_shadow_skips_grandparent() {
+        assert_for_in_keys(
+            "var grand = { x: 1 }; \
+             var parent = Object.create(grand); \
+             Object.defineProperty(parent, 'x', { value: 2, enumerable: false, configurable: true }); \
+             var obj = Object.create(parent); \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_inherited_non_enumerable_skipped() {
+        assert_for_in_keys(
+            "var parent = {}; \
+             Object.defineProperty(parent, 'hidden', { value: 1, enumerable: false, configurable: true }); \
+             var obj = Object.create(parent); obj.visible = 2; \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "visible",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_own_symbol_skipped() {
+        assert_for_in_keys(
+            "var s = Symbol('own'); \
+             var obj = { a: 1, b: 2 }; \
+             Object.defineProperty(obj, s, { value: 3, enumerable: true, configurable: true }); \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "a,b",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_inherited_symbol_skipped() {
+        assert_for_in_keys(
+            "var s = Symbol('inherited'); \
+             var parent = { a: 1 }; \
+             Object.defineProperty(parent, s, { value: 2, enumerable: true, configurable: true }); \
+             var obj = Object.create(parent); obj.b = 3; \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "b,a",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_only_string_keys_when_symbols_present_on_chain() {
+        assert_for_in_keys(
+            "var s1 = Symbol('one'); var s2 = Symbol('two'); \
+             var parent = { p: 1 }; parent[s1] = 2; \
+             var obj = Object.create(parent); obj.o = 3; \
+             Object.defineProperty(obj, s2, { value: 4, enumerable: true, configurable: true }); \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "o,p",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_null_proto_own_only() {
+        assert_for_in_keys(
+            "var obj = Object.create(null); obj.x = 1; obj.y = 2; \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "x,y",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_null_proto_empty() {
+        assert_for_in_keys(
+            "var obj = Object.create(null); \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_null_proto_skips_object_prototype() {
+        assert_for_in_keys(
+            "Object.defineProperty(Object.prototype, 'protoEnum', { value: 1, enumerable: true, configurable: true }); \
+             var obj = Object.create(null); \
+             var keys = []; for (var k in obj) { keys.push(k); } \
+             delete Object.prototype.protoEnum; \
+             keys.join(',')",
+            "",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_object_prototype_enumerable_visible() {
+        assert_for_in_keys(
+            "Object.defineProperty(Object.prototype, 'protoEnum', { value: 1, enumerable: true, configurable: true }); \
+             var obj = {}; \
+             var keys = []; for (var k in obj) { keys.push(k); } \
+             delete Object.prototype.protoEnum; \
+             keys.join(',')",
+            "protoEnum",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_object_prototype_shadowed_by_own_property() {
+        assert_for_in_keys(
+            "Object.defineProperty(Object.prototype, 'protoEnum', { value: 1, enumerable: true, configurable: true }); \
+             var obj = { protoEnum: 2 }; \
+             var keys = []; for (var k in obj) { keys.push(k); } \
+             delete Object.prototype.protoEnum; \
+             keys.join(',')",
+            "protoEnum",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_object_prototype_non_enumerable_skipped() {
+        assert_for_in_keys(
+            "Object.defineProperty(Object.prototype, 'hiddenProto', { value: 1, enumerable: false, configurable: true }); \
+             var obj = {}; \
+             var keys = []; for (var k in obj) { keys.push(k); } \
+             delete Object.prototype.hiddenProto; \
+             keys.join(',')",
+            "",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_accessor_getter_enumerable_own() {
+        assert_for_in_keys(
+            "var obj = {}; \
+             Object.defineProperty(obj, 'x', { get: function() { return 1; }, enumerable: true, configurable: true }); \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "x",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_accessor_setter_enumerable_own() {
+        assert_for_in_keys(
+            "var obj = {}; \
+             Object.defineProperty(obj, 'x', { set: function(v) {}, enumerable: true, configurable: true }); \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "x",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_accessor_non_enumerable_own() {
+        assert_for_in_keys(
+            "var obj = {}; \
+             Object.defineProperty(obj, 'x', { get: function() { return 1; }, enumerable: false, configurable: true }); \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_accessor_inherited_enumerable() {
+        assert_for_in_keys(
+            "var parent = {}; \
+             Object.defineProperty(parent, 'x', { get: function() { return 1; }, enumerable: true, configurable: true }); \
+             var obj = Object.create(parent); \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "x",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_accessor_shadowed_by_own_data_property() {
+        assert_for_in_keys(
+            "var parent = {}; \
+             Object.defineProperty(parent, 'x', { get: function() { return 1; }, enumerable: true, configurable: true }); \
+             var obj = Object.create(parent); obj.x = 2; \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "x",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_accessor_shadowed_by_own_non_enumerable_data_property() {
+        assert_for_in_keys(
+            "var parent = {}; \
+             Object.defineProperty(parent, 'x', { get: function() { return 1; }, enumerable: true, configurable: true }); \
+             var obj = Object.create(parent); \
+             Object.defineProperty(obj, 'x', { value: 2, enumerable: false, configurable: true }); \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_delete_own_property_before_visit_skips_it() {
+        assert_for_in_keys(
+            "var obj = { a: 1, b: 2 }; \
+             var keys = []; \
+             for (var k in obj) { \
+                 if (k === 'a') delete obj.b; \
+                 keys.push(k); \
+             } \
+             keys.join(',')",
+            "a",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_delete_inherited_property_before_visit_skips_it() {
+        assert_for_in_keys(
+            "var parent = { b: 2 }; \
+             var obj = Object.create(parent); obj.a = 1; \
+             var keys = []; \
+             for (var k in obj) { \
+                 if (k === 'a') delete parent.b; \
+                 keys.push(k); \
+             } \
+             keys.join(',')",
+            "a",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_add_own_property_during_iteration_not_visited() {
+        assert_for_in_keys(
+            "var obj = { a: 1 }; \
+             var keys = []; \
+             for (var k in obj) { \
+                 obj.b = 2; \
+                 keys.push(k); \
+             } \
+             keys.join(',')",
+            "a",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_add_inherited_property_during_iteration_not_visited() {
+        assert_for_in_keys(
+            "var parent = {}; \
+             var obj = Object.create(parent); obj.a = 1; \
+             var keys = []; \
+             for (var k in obj) { \
+                 parent.b = 2; \
+                 keys.push(k); \
+             } \
+             keys.join(',')",
+            "a",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_make_own_property_non_enumerable_before_visit_skips_it() {
+        assert_for_in_keys(
+            "var obj = { a: 1, b: 2 }; \
+             var keys = []; \
+             for (var k in obj) { \
+                 if (k === 'a') Object.defineProperty(obj, 'b', { value: 2, enumerable: false, configurable: true, writable: true }); \
+                 keys.push(k); \
+             } \
+             keys.join(',')",
+            "a",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_make_inherited_property_non_enumerable_before_visit_skips_it() {
+        assert_for_in_keys(
+            "var parent = {}; \
+             Object.defineProperty(parent, 'b', { value: 2, enumerable: true, configurable: true, writable: true }); \
+             var obj = Object.create(parent); obj.a = 1; \
+             var keys = []; \
+             for (var k in obj) { \
+                 if (k === 'a') Object.defineProperty(parent, 'b', { value: 2, enumerable: false, configurable: true, writable: true }); \
+                 keys.push(k); \
+             } \
+             keys.join(',')",
+            "a",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_add_non_enumerable_shadow_before_inherited_visit_skips_it() {
+        assert_for_in_keys(
+            "var parent = { b: 2 }; \
+             var obj = Object.create(parent); obj.a = 1; \
+             var keys = []; \
+             for (var k in obj) { \
+                 if (k === 'a') Object.defineProperty(obj, 'b', { value: 3, enumerable: false, configurable: true }); \
+                 keys.push(k); \
+             } \
+             keys.join(',')",
+            "a",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_primitives_number_empty() {
+        assert_for_in_keys(
+            "var keys = []; for (var k in 42) { keys.push(k); } keys.join(',')",
+            "",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_primitives_boolean_empty() {
+        assert_for_in_keys(
+            "var keys = []; for (var k in true) { keys.push(k); } keys.join(',')",
+            "",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_primitives_string_indices() {
+        assert_for_in_keys(
+            "var keys = []; for (var k in 'cat') { keys.push(k); } keys.join(',')",
+            "0,1,2",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_primitives_empty_string() {
+        assert_for_in_keys(
+            "var keys = []; for (var k in '') { keys.push(k); } keys.join(',')",
+            "",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_parent_and_grandparent_enumerables_both_visible() {
+        assert_for_in_keys(
+            "var grand = { g1: 1, g2: 2 }; \
+             var parent = Object.create(grand); parent.p1 = 3; parent.p2 = 4; \
+             var obj = Object.create(parent); \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "p1,p2,g1,g2",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_parent_shadow_suppresses_grandparent_duplicate() {
+        assert_for_in_keys(
+            "var grand = { dup: 1, g: 2 }; \
+             var parent = Object.create(grand); parent.dup = 3; parent.p = 4; \
+             var obj = Object.create(parent); \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "dup,p,g",
+        );
+    }
+
+    #[test]
+    fn e2e_for_in_own_then_inherited_define_property_mix() {
+        assert_for_in_keys(
+            "var parent = {}; \
+             Object.defineProperty(parent, 'x', { value: 1, enumerable: true, configurable: true }); \
+             Object.defineProperty(parent, 'y', { value: 2, enumerable: true, configurable: true }); \
+             var obj = Object.create(parent); \
+             Object.defineProperty(obj, 'a', { value: 3, enumerable: true, configurable: true }); \
+             Object.defineProperty(obj, 'b', { value: 4, enumerable: true, configurable: true }); \
+             var keys = []; for (var k in obj) { keys.push(k); } keys.join(',')",
+            "a,b,x,y",
+        );
     }
 
     /// `Object.groupBy` single group gathers all items.

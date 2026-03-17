@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use crate::builtins::string::{string_char_at, utf16_len};
 use crate::objects::map::PropertyAttributes;
-use crate::objects::property_map::PropertyMap;
+use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 
 use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
@@ -4794,60 +4794,27 @@ fn handle_for_in_enumerate(
         JsValue::PlainObject(map) => {
             let mut all_keys = Vec::new();
             let mut seen = std::collections::HashSet::new();
-            // Walk the prototype chain collecting enumerable keys.
-            // ALL own keys (including non-enumerable) are added to `seen` so
-            // that non-enumerable own properties correctly shadow inherited
-            // enumerable ones (ES §14.7.5.9).
-            let mut current_map = Some(Rc::clone(map));
+            // Walk the prototype chain collecting enumerable keys. All
+            // user-visible own keys (including non-enumerable ones) are added
+            // to `seen` so that non-enumerable own properties correctly shadow
+            // inherited enumerable ones (ES §14.7.5.9).
+            let mut current = Some(JsValue::PlainObject(Rc::clone(map)));
             for _ in 0..256 {
-                let Some(m) = current_map.take() else { break };
-                let borrow = m.borrow();
-                for (k, _val, attrs) in borrow.iter_with_attrs() {
-                    let is_enumerable = attrs.contains(PropertyAttributes::ENUMERABLE);
-                    // Translate accessor convention keys (__get_X__ / __set_X__)
-                    // to the actual property name X.
-                    if let Some(prop) = k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
-                    {
-                        seen.insert(k.clone());
-                        if seen.insert(prop.to_string()) && is_enumerable {
-                            all_keys.push(JsValue::String(prop.to_string().into()));
-                        }
+                let Some(JsValue::PlainObject(current_map)) = current.take() else {
+                    break;
+                };
+                let borrow = current_map.borrow();
+                for (raw_key, _value, attrs) in borrow.iter_with_attrs() {
+                    let Some(visible_key) = for_in_visible_key(raw_key) else {
                         continue;
-                    }
-                    if let Some(prop) = k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
+                    };
+                    if seen.insert(visible_key.clone())
+                        && attrs.contains(PropertyAttributes::ENUMERABLE)
                     {
-                        seen.insert(k.clone());
-                        if seen.insert(prop.to_string()) && is_enumerable {
-                            all_keys.push(JsValue::String(prop.to_string().into()));
-                        }
-                        continue;
-                    }
-                    // Skip engine-internal keys that must not appear in
-                    // for-in enumeration: __proto__, __call__, __is_array__,
-                    // Symbol()-keyed properties (for-in is string-only per
-                    // ES §14.7.5.9), @@-prefixed internal hooks, hidden
-                    // field initializers, and private fields (#name).
-                    if (k.starts_with("__") && k.ends_with("__"))
-                        || crate::builtins::symbol::is_symbol_property_key(k)
-                        || k.starts_with('.')
-                        || k.starts_with('#')
-                    {
-                        seen.insert(k.clone());
-                        continue;
-                    }
-                    // Regular property: add to seen for shadowing, push if
-                    // enumerable and not already seen at a higher level.
-                    if seen.insert(k.clone()) && is_enumerable {
-                        all_keys.push(JsValue::String(k.clone().into()));
+                        all_keys.push(JsValue::String(visible_key.into()));
                     }
                 }
-                current_map = borrow.get("__proto__").and_then(|v| {
-                    if let JsValue::PlainObject(proto) = v {
-                        Some(Rc::clone(proto))
-                    } else {
-                        None
-                    }
-                });
+                current = borrow.get(INTERNAL_PROTO_PROPERTY_KEY).cloned();
             }
             all_keys
         }
@@ -4872,6 +4839,52 @@ fn is_for_in_excluded_key(key: &str) -> bool {
         || key.starts_with('#')
 }
 
+fn for_in_visible_key(raw_key: &str) -> Option<String> {
+    if raw_key == INTERNAL_PROTO_PROPERTY_KEY {
+        return None;
+    }
+
+    let visible_key = raw_key
+        .strip_prefix("__get_")
+        .and_then(|key| key.strip_suffix("__"))
+        .or_else(|| {
+            raw_key
+                .strip_prefix("__set_")
+                .and_then(|key| key.strip_suffix("__"))
+        })
+        .unwrap_or(raw_key);
+
+    if is_for_in_excluded_key(visible_key) {
+        return None;
+    }
+
+    Some(visible_key.to_string())
+}
+
+fn for_in_find_own_property_enumerable(map: &PropertyMap, key: &str) -> Option<bool> {
+    if key == INTERNAL_PROTO_PROPERTY_KEY || is_for_in_excluded_key(key) {
+        return None;
+    }
+
+    if let Some(attrs) = map.attrs(key) {
+        return Some(attrs.contains(PropertyAttributes::ENUMERABLE));
+    }
+
+    let getter_key = format!("__get_{key}__");
+    let setter_key = format!("__set_{key}__");
+    let getter_attrs = map.attrs(&getter_key);
+    let setter_attrs = map.attrs(&setter_key);
+
+    if getter_attrs.is_none() && setter_attrs.is_none() {
+        return None;
+    }
+
+    Some(
+        getter_attrs.is_some_and(|attrs| attrs.contains(PropertyAttributes::ENUMERABLE))
+            || setter_attrs.is_some_and(|attrs| attrs.contains(PropertyAttributes::ENUMERABLE)),
+    )
+}
+
 fn for_in_key_still_enumerable(obj: &JsValue, key: &str) -> bool {
     if is_for_in_excluded_key(key) {
         return false;
@@ -4879,20 +4892,16 @@ fn for_in_key_still_enumerable(obj: &JsValue, key: &str) -> bool {
 
     match obj {
         JsValue::PlainObject(map) => {
-            let mut current_map = Some(Rc::clone(map));
+            let mut current = Some(JsValue::PlainObject(Rc::clone(map)));
             for _ in 0..256 {
-                let Some(m) = current_map.take() else { break };
-                let borrow = m.borrow();
-                if let Some((_value, attrs)) = borrow.get_with_attrs(key) {
-                    return attrs.contains(PropertyAttributes::ENUMERABLE);
+                let Some(JsValue::PlainObject(current_map)) = current.take() else {
+                    break;
+                };
+                let borrow = current_map.borrow();
+                if let Some(is_enumerable) = for_in_find_own_property_enumerable(&borrow, key) {
+                    return is_enumerable;
                 }
-                current_map = borrow.get("__proto__").and_then(|v| {
-                    if let JsValue::PlainObject(proto) = v {
-                        Some(Rc::clone(proto))
-                    } else {
-                        None
-                    }
-                });
+                current = borrow.get(INTERNAL_PROTO_PROPERTY_KEY).cloned();
             }
             false
         }
