@@ -1029,28 +1029,48 @@ fn plain_delete_property(map: &Rc<RefCell<PropertyMap>>, key: &str) -> bool {
 }
 
 fn plain_own_keys(map: &PropertyMap) -> Vec<JsValue> {
-    let mut keys = Vec::new();
+    let mut string_parts: Vec<JsValue> = Vec::new();
+    let mut symbols: Vec<JsValue> = Vec::new();
     let mut seen = HashSet::new();
     for key in map.keys() {
         if key == "__proto__" {
             continue;
         }
         if let Some(symbol) = property_key_to_symbol(key) {
-            keys.push(JsValue::Symbol(symbol));
+            symbols.push(JsValue::Symbol(symbol));
             continue;
         }
         if let Some(name) = accessor_property_name(key) {
             if seen.insert(name.to_string()) {
-                keys.push(JsValue::String(name.to_string().into()));
+                string_parts.push(JsValue::String(name.to_string().into()));
             }
             continue;
         }
         if is_internal_accessor_key(key) {
             continue;
         }
-        keys.push(JsValue::String(key.clone().into()));
+        string_parts.push(JsValue::String(key.clone().into()));
     }
-    keys
+    // ES spec ordering: integer indices ascending, then string keys in
+    // insertion order, then symbols in insertion order.
+    let mut integer_keys: Vec<(u32, JsValue)> = Vec::new();
+    let mut rest_keys: Vec<JsValue> = Vec::new();
+    for k in string_parts {
+        if let JsValue::String(ref s) = k
+            && let Some(idx) = parse_integer_index_key(s)
+        {
+            integer_keys.push((idx, k));
+            continue;
+        }
+        rest_keys.push(k);
+    }
+    integer_keys.sort_by_key(|(idx, _)| *idx);
+    integer_keys
+        .into_iter()
+        .map(|(_, v)| v)
+        .chain(rest_keys)
+        .chain(symbols)
+        .collect()
 }
 
 /// ECMAScript §23.1.3.1 step 5.b — check `@@isConcatSpreadable`.
@@ -4722,14 +4742,14 @@ fn make_object() -> JsValue {
                 match obj {
                     JsValue::PlainObject(map) => {
                         let borrow = map.borrow();
-                        let mut names: Vec<JsValue> = Vec::new();
+                        let mut names: Vec<String> = Vec::new();
                         let mut seen = std::collections::HashSet::new();
                         for k in borrow.keys() {
                             if let Some(prop) =
                                 k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
                             {
                                 if seen.insert(prop.to_string()) {
-                                    names.push(JsValue::String(prop.to_string().into()));
+                                    names.push(prop.to_string());
                                 }
                                 continue;
                             }
@@ -4737,7 +4757,7 @@ fn make_object() -> JsValue {
                                 k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
                             {
                                 if seen.insert(prop.to_string()) {
-                                    names.push(JsValue::String(prop.to_string().into()));
+                                    names.push(prop.to_string());
                                 }
                                 continue;
                             }
@@ -4745,10 +4765,27 @@ fn make_object() -> JsValue {
                                 continue;
                             }
                             if seen.insert(k.clone()) {
-                                names.push(JsValue::String(k.clone().into()));
+                                names.push(k.clone());
                             }
                         }
-                        Ok(JsValue::new_array(names))
+                        // ES spec ordering: integer indices ascending, then
+                        // string keys in insertion order.
+                        let mut integer_keys: Vec<(u32, String)> = Vec::new();
+                        let mut string_keys: Vec<String> = Vec::new();
+                        for name in names {
+                            if let Some(idx) = parse_integer_index_key(&name) {
+                                integer_keys.push((idx, name));
+                            } else {
+                                string_keys.push(name);
+                            }
+                        }
+                        integer_keys.sort_by_key(|(idx, _)| *idx);
+                        let sorted: Vec<JsValue> = integer_keys
+                            .into_iter()
+                            .map(|(_, s)| JsValue::String(s.into()))
+                            .chain(string_keys.into_iter().map(|s| JsValue::String(s.into())))
+                            .collect();
+                        Ok(JsValue::new_array(sorted))
                     }
                     JsValue::Array(items) => {
                         let len = items.borrow().len();
@@ -32170,5 +32207,394 @@ mod tests {
     fn e2e_set_constructor_null_creates_empty() {
         let result = global_eval("var s = new Set(null); s.size === 0").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Property enumeration order tests ──────────────────────────────────
+
+    /// Object.keys returns integer indices first (ascending), then string
+    /// keys in insertion order.
+    #[test]
+    fn e2e_object_keys_integer_indices_first() {
+        let r = global_eval(
+            r#"
+            var o = {}; o.b = 1; o["2"] = 2; o.a = 3; o["0"] = 4;
+            Object.keys(o).join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,2,b,a".into()));
+    }
+
+    /// Object.keys on object with only string keys preserves insertion order.
+    #[test]
+    fn e2e_object_keys_string_only_insertion_order() {
+        let r = global_eval(
+            r#"
+            var o = {}; o.z = 1; o.a = 2; o.m = 3;
+            Object.keys(o).join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("z,a,m".into()));
+    }
+
+    /// Object.keys on object with only integer indices returns sorted.
+    #[test]
+    fn e2e_object_keys_integer_only_sorted() {
+        let r = global_eval(
+            r#"
+            var o = {}; o["10"] = 1; o["2"] = 2; o["1"] = 3;
+            Object.keys(o).join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,2,10".into()));
+    }
+
+    /// Object.values follows same order as Object.keys.
+    #[test]
+    fn e2e_object_values_matches_keys_order() {
+        let r = global_eval(
+            r#"
+            var o = {}; o.b = "B"; o["1"] = "ONE"; o.a = "A"; o["0"] = "ZERO";
+            Object.values(o).join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("ZERO,ONE,B,A".into()));
+    }
+
+    /// Object.entries follows same order as Object.keys.
+    #[test]
+    fn e2e_object_entries_matches_keys_order() {
+        let r = global_eval(
+            r#"
+            var o = {}; o.b = 2; o["1"] = 11; o.a = 1; o["0"] = 10;
+            Object.entries(o).map(function(e){ return e[0]+":"+e[1]; }).join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0:10,1:11,b:2,a:1".into()));
+    }
+
+    /// Object.keys returns own properties only (not inherited).
+    #[test]
+    fn e2e_object_keys_own_only() {
+        let r = global_eval(
+            r#"
+            var parent = { inherited: true };
+            var child = Object.create(parent);
+            child.own = 1;
+            Object.keys(child).join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("own".into()));
+    }
+
+    /// Object.keys on an empty object returns empty array.
+    #[test]
+    fn e2e_object_keys_empty() {
+        let r = global_eval("Object.keys({}).length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Object.keys throws TypeError for null.
+    #[test]
+    fn e2e_object_keys_null_throws() {
+        let r =
+            global_eval("try { Object.keys(null); false; } catch(e) { e instanceof TypeError; }")
+                .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Object.keys throws TypeError for undefined.
+    #[test]
+    fn e2e_object_keys_undefined_throws() {
+        let r = global_eval(
+            "try { Object.keys(undefined); false; } catch(e) { e instanceof TypeError; }",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// Object.getOwnPropertyNames includes non-enumerable properties.
+    #[test]
+    fn e2e_get_own_property_names_includes_non_enumerable() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            Object.defineProperty(o, "hidden", { value: 1, enumerable: false });
+            o.visible = 2;
+            Object.getOwnPropertyNames(o).join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("hidden,visible".into()));
+    }
+
+    /// Object.getOwnPropertyNames sorts integer indices first.
+    #[test]
+    fn e2e_get_own_property_names_integer_first() {
+        let r = global_eval(
+            r#"
+            var o = {}; o.b = 1; o["5"] = 2; o.a = 3; o["0"] = 4;
+            Object.getOwnPropertyNames(o).join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,5,b,a".into()));
+    }
+
+    /// Object.getOwnPropertyNames on an array includes indices + length.
+    #[test]
+    fn e2e_get_own_property_names_array() {
+        let r = global_eval(
+            r#"
+            Object.getOwnPropertyNames([10, 20, 30]).join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,1,2,length".into()));
+    }
+
+    /// Object.getOwnPropertyNames on a string includes indices + length.
+    #[test]
+    fn e2e_get_own_property_names_string() {
+        let r = global_eval(
+            r#"
+            Object.getOwnPropertyNames("hi").join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,1,length".into()));
+    }
+
+    /// for-in enumerates integer indices first, then string keys.
+    #[test]
+    fn e2e_for_in_integer_indices_first() {
+        let r = global_eval(
+            r#"
+            var o = {}; o.b = 1; o["2"] = 2; o.a = 3; o["0"] = 4;
+            var r = []; for (var k in o) r.push(k); r.join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,2,b,a".into()));
+    }
+
+    /// for-in skips non-enumerable properties.
+    #[test]
+    fn e2e_for_in_skips_non_enumerable() {
+        let r = global_eval(
+            r#"
+            var o = { visible: 1 };
+            Object.defineProperty(o, "hidden", { value: 2, enumerable: false });
+            var r = []; for (var k in o) r.push(k); r.join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("visible".into()));
+    }
+
+    /// for-in traverses the prototype chain.
+    #[test]
+    fn e2e_for_in_prototype_chain() {
+        let r = global_eval(
+            r#"
+            var parent = { fromParent: 1 };
+            var child = Object.create(parent);
+            child.own = 2;
+            var r = []; for (var k in child) r.push(k); r.sort().join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("fromParent,own".into()));
+    }
+
+    /// for-in: own non-enumerable shadows inherited enumerable.
+    #[test]
+    fn e2e_for_in_shadow_non_enumerable() {
+        let r = global_eval(
+            r#"
+            var parent = { x: 1 };
+            var child = Object.create(parent);
+            Object.defineProperty(child, "x", { value: 2, enumerable: false });
+            var r = []; for (var k in child) r.push(k); r.join(",")
+            "#,
+        )
+        .unwrap();
+        // "x" is shadowed by non-enumerable own property, so not enumerated
+        assert_eq!(r, JsValue::String("".into()));
+    }
+
+    /// for-in on null/undefined produces no iterations.
+    #[test]
+    fn e2e_for_in_null_undefined() {
+        let r = global_eval(
+            r#"
+            var r = [];
+            for (var k in null) r.push(k);
+            for (var k in undefined) r.push(k);
+            r.length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// for-in on an array enumerates indices as strings.
+    #[test]
+    fn e2e_for_in_array_indices() {
+        let r = global_eval(
+            r#"
+            var r = []; for (var k in [10, 20, 30]) r.push(k); r.join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,1,2".into()));
+    }
+
+    /// for-in on a string enumerates character indices.
+    #[test]
+    fn e2e_for_in_string_indices() {
+        let r = global_eval(
+            r#"
+            var r = []; for (var k in "abc") r.push(k); r.join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("0,1,2".into()));
+    }
+
+    /// Object.values on an empty object returns empty array.
+    #[test]
+    fn e2e_object_values_empty() {
+        let r = global_eval("Object.values({}).length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Object.entries on an empty object returns empty array.
+    #[test]
+    fn e2e_object_entries_empty() {
+        let r = global_eval("Object.entries({}).length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// Object.values skips non-enumerable properties.
+    #[test]
+    fn e2e_object_values_skips_non_enumerable() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1 };
+            Object.defineProperty(o, "b", { value: 2, enumerable: false });
+            Object.values(o).join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1".into()));
+    }
+
+    /// Object.entries skips non-enumerable properties.
+    #[test]
+    fn e2e_object_entries_skips_non_enumerable() {
+        let r = global_eval(
+            r#"
+            var o = { a: 1 };
+            Object.defineProperty(o, "b", { value: 2, enumerable: false });
+            Object.entries(o).length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// for-in with mixed large integer keys and strings.
+    #[test]
+    fn e2e_for_in_large_integer_keys() {
+        let r = global_eval(
+            r#"
+            var o = {}; o["100"] = 1; o.z = 2; o["3"] = 3; o["50"] = 4;
+            var r = []; for (var k in o) r.push(k); r.join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("3,50,100,z".into()));
+    }
+
+    /// Object.keys: leading-zero keys are treated as strings, not indices.
+    #[test]
+    fn e2e_object_keys_leading_zero_is_string() {
+        let r = global_eval(
+            r#"
+            var o = {}; o["01"] = 1; o["1"] = 2; o["00"] = 3;
+            Object.keys(o).join(",")
+            "#,
+        )
+        .unwrap();
+        // "1" is an integer index; "01" and "00" are plain strings
+        assert_eq!(r, JsValue::String("1,01,00".into()));
+    }
+
+    /// for-in: leading-zero keys are treated as strings, not indices.
+    #[test]
+    fn e2e_for_in_leading_zero_is_string() {
+        let r = global_eval(
+            r#"
+            var o = {}; o["01"] = 1; o["1"] = 2; o["00"] = 3;
+            var r = []; for (var k in o) r.push(k); r.join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,01,00".into()));
+    }
+
+    /// Object.getOwnPropertyNames includes non-enumerable + correct order.
+    #[test]
+    fn e2e_get_own_property_names_mixed_order() {
+        let r = global_eval(
+            r#"
+            var o = {};
+            o.z = 1;
+            o["3"] = 2;
+            Object.defineProperty(o, "1", { value: 3, enumerable: false });
+            o.a = 4;
+            Object.getOwnPropertyNames(o).join(",")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,3,z,a".into()));
+    }
+
+    /// for-in prototype chain with integer indices on both levels.
+    #[test]
+    fn e2e_for_in_proto_integer_ordering() {
+        let r = global_eval(
+            r#"
+            var parent = {}; parent["5"] = "p5"; parent.x = "px";
+            var child = Object.create(parent);
+            child["2"] = "c2"; child.y = "cy";
+            var r = []; for (var k in child) r.push(k); r.join(",")
+            "#,
+        )
+        .unwrap();
+        // Child integer keys first, then child strings, then parent integer
+        // keys, then parent strings (each level sorted independently within
+        // for-in's chain-walk).
+        assert_eq!(r, JsValue::String("2,5,y,x".into()));
+    }
+
+    /// Object.keys on object literal preserves source order for string keys.
+    #[test]
+    fn e2e_object_keys_literal_order() {
+        let r = global_eval("Object.keys({ c: 3, a: 1, b: 2 }).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("c,a,b".into()));
+    }
+
+    /// Object.values returns values in same order as Object.keys.
+    #[test]
+    fn e2e_object_values_literal_order() {
+        let r = global_eval("Object.values({ c: 3, a: 1, b: 2 }).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("3,1,2".into()));
     }
 }

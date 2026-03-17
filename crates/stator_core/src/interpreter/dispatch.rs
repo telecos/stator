@@ -4679,7 +4679,34 @@ fn handle_for_in_enumerate(
                     }
                 });
             }
-            all_keys
+            // ES spec: integer-indexed keys come first (ascending),
+            // then remaining string keys in insertion order.
+            let mut integer_keys: Vec<(u32, JsValue)> = Vec::new();
+            let mut string_keys: Vec<JsValue> = Vec::new();
+            for k in all_keys {
+                let s = match &k {
+                    JsValue::String(s) => s.as_ref(),
+                    _ => {
+                        string_keys.push(k);
+                        continue;
+                    }
+                };
+                if !(s.is_empty() || s.len() > 1 && s.as_bytes()[0] == b'0')
+                    && s.len() <= 10
+                    && let Ok(n) = s.parse::<u32>()
+                    && n < u32::MAX
+                {
+                    integer_keys.push((n, k));
+                    continue;
+                }
+                string_keys.push(k);
+            }
+            integer_keys.sort_by_key(|(n, _)| *n);
+            integer_keys
+                .into_iter()
+                .map(|(_, k)| k)
+                .chain(string_keys)
+                .collect()
         }
         JsValue::Array(items) => (0..items.borrow().len())
             .map(|i| JsValue::String(i.to_string().into()))
