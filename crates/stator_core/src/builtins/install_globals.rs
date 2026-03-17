@@ -6075,7 +6075,7 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // concat(...arrays) — §23.1.3.1, respects @@isConcatSpreadable
+        // concat(...arrays) — §23.1.3.1, respects @@isConcatSpreadable & @@species
         proto.insert(
             "concat".into(),
             builtin_fn("concat", 1, |args| {
@@ -6091,6 +6091,10 @@ fn make_array() -> JsValue {
                     } else {
                         result.push(value.clone());
                     }
+                }
+                // §23.1.3.1 step 5: ArraySpeciesCreate
+                if let Some(species_result) = array_species_create(arr, result.len())? {
+                    return Ok(species_result);
                 }
                 Ok(JsValue::new_array(result))
             }),
@@ -6475,6 +6479,10 @@ fn make_array() -> JsValue {
                     }
                 }
                 apply_array_like_slots(arr, &slots);
+                // §23.1.3.31 step 12: ArraySpeciesCreate for deleted elements
+                if let Some(species_result) = array_species_create(arr, deleted.len())? {
+                    return Ok(species_result);
+                }
                 Ok(JsValue::new_array(deleted))
             }),
         );
@@ -6549,6 +6557,10 @@ fn make_array() -> JsValue {
                     if keep.to_boolean() {
                         result.push(item);
                     }
+                }
+                // §23.1.3.8 step 9: ArraySpeciesCreate
+                if let Some(species_result) = array_species_create(arr, result.len())? {
+                    return Ok(species_result);
                 }
                 Ok(JsValue::new_array(result))
             }),
@@ -46835,5 +46847,374 @@ mod tests {
              } \
              var c = new C(); c.x === 'instance' && C.x === 'static'",
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Well-known symbols deep conformance — e2e tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── @@species ────────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_wk_species_array_identity() {
+        assert_eval_true("Array[Symbol.species] === Array");
+    }
+
+    #[test]
+    fn e2e_wk_species_map_identity() {
+        assert_eval_true("Map[Symbol.species] === Map");
+    }
+
+    #[test]
+    fn e2e_wk_species_set_identity() {
+        assert_eval_true("Set[Symbol.species] === Set");
+    }
+
+    #[test]
+    fn e2e_wk_species_regexp_identity() {
+        assert_eval_true("RegExp[Symbol.species] === RegExp");
+    }
+
+    #[test]
+    fn e2e_wk_species_promise_identity() {
+        assert_eval_true("Promise[Symbol.species] === Promise");
+    }
+
+    #[test]
+    fn e2e_wk_species_arraybuffer_identity() {
+        assert_eval_true("ArrayBuffer[Symbol.species] === ArrayBuffer");
+    }
+
+    #[test]
+    fn e2e_wk_species_typeof_array() {
+        assert_eval_true("typeof Array[Symbol.species] === 'function'");
+    }
+
+    #[test]
+    fn e2e_wk_species_array_slice_returns_array() {
+        assert_eval_true("Array.isArray([1,2,3].slice(1))");
+    }
+
+    #[test]
+    fn e2e_wk_species_array_map_returns_array() {
+        assert_eval_true("Array.isArray([1,2,3].map(function(x) { return x * 2; }))");
+    }
+
+    #[test]
+    fn e2e_wk_species_array_filter_returns_array() {
+        assert_eval_true("Array.isArray([1,2,3,4].filter(function(x) { return x > 2; }))");
+    }
+
+    // ── @@hasInstance ────────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_wk_has_instance_basic_function() {
+        assert_eval_true(
+            "function Foo() {} \
+             var f = new Foo(); \
+             f instanceof Foo",
+        );
+    }
+
+    #[test]
+    fn e2e_wk_has_instance_custom_static() {
+        assert_eval_true(
+            r#"
+            var Checker = {};
+            Checker[Symbol.hasInstance] = function(inst) { return inst.cool === true; };
+            var a = { cool: true };
+            var b = { cool: false };
+            a[Symbol.hasInstance] !== undefined || (Checker[Symbol.hasInstance](a) === true && Checker[Symbol.hasInstance](b) === false)
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_wk_has_instance_class_override() {
+        assert_eval_true(
+            r#"
+            class EvenChecker {
+                static [Symbol.hasInstance](instance) {
+                    return typeof instance === 'number' && instance % 2 === 0;
+                }
+            }
+            EvenChecker[Symbol.hasInstance](4) && !EvenChecker[Symbol.hasInstance](3)
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_wk_has_instance_instanceof_non_callable_throws() {
+        assert_eval_type_error("({}) instanceof 42");
+    }
+
+    #[test]
+    fn e2e_wk_has_instance_array_instanceof() {
+        assert_eval_true("[] instanceof Array");
+    }
+
+    #[test]
+    fn e2e_wk_has_instance_error_instanceof() {
+        assert_eval_true("try { undefined.x } catch(e) { e instanceof TypeError }");
+    }
+
+    #[test]
+    fn e2e_wk_has_instance_function_proto_has_method() {
+        assert_eval_true("typeof Function.prototype[Symbol.hasInstance] === 'function'");
+    }
+
+    // ── @@isConcatSpreadable ────────────────────────────────────────────
+
+    #[test]
+    fn e2e_wk_concat_spreadable_default_array() {
+        assert_eval_true("[1,2].concat([3,4]).length === 4");
+    }
+
+    #[test]
+    fn e2e_wk_concat_spreadable_false_prevents_spread() {
+        assert_eval_true(
+            r#"
+            var a = [3, 4];
+            a[Symbol.isConcatSpreadable] = false;
+            var r = [1, 2].concat(a);
+            r.length === 3
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_wk_concat_spreadable_true_on_object() {
+        assert_eval_true(
+            r#"
+            var obj = { 0: 'a', 1: 'b', length: 2 };
+            obj[Symbol.isConcatSpreadable] = true;
+            var r = ['x'].concat(obj);
+            r.length === 3 && r[1] === 'a' && r[2] === 'b'
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_wk_concat_spreadable_default_object_not_spread() {
+        assert_eval_true(
+            r#"
+            var obj = { 0: 'a', 1: 'b', length: 2 };
+            var r = ['x'].concat(obj);
+            r.length === 2
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_wk_concat_spreadable_undefined_falls_back() {
+        assert_eval_true(
+            r#"
+            var a = [3, 4];
+            a[Symbol.isConcatSpreadable] = undefined;
+            var r = [1, 2].concat(a);
+            r.length === 4
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_wk_concat_spreadable_symbol_exists() {
+        assert_eval_true("typeof Symbol.isConcatSpreadable === 'symbol'");
+    }
+
+    #[test]
+    fn e2e_wk_concat_spreadable_description() {
+        assert_eval_true("Symbol.isConcatSpreadable.description === 'Symbol.isConcatSpreadable'");
+    }
+
+    // ── @@unscopables ───────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_wk_unscopables_array_proto_has_it() {
+        assert_eval_true("typeof Array.prototype[Symbol.unscopables] === 'object'");
+    }
+
+    #[test]
+    fn e2e_wk_unscopables_includes_find() {
+        assert_eval_true("Array.prototype[Symbol.unscopables].find === true");
+    }
+
+    #[test]
+    fn e2e_wk_unscopables_includes_findIndex() {
+        assert_eval_true("Array.prototype[Symbol.unscopables].findIndex === true");
+    }
+
+    #[test]
+    fn e2e_wk_unscopables_includes_at() {
+        assert_eval_true("Array.prototype[Symbol.unscopables].at === true");
+    }
+
+    #[test]
+    fn e2e_wk_unscopables_includes_findLast() {
+        assert_eval_true("Array.prototype[Symbol.unscopables].findLast === true");
+    }
+
+    #[test]
+    fn e2e_wk_unscopables_includes_findLastIndex() {
+        assert_eval_true("Array.prototype[Symbol.unscopables].findLastIndex === true");
+    }
+
+    #[test]
+    fn e2e_wk_unscopables_includes_flat() {
+        assert_eval_true("Array.prototype[Symbol.unscopables].flat === true");
+    }
+
+    #[test]
+    fn e2e_wk_unscopables_includes_flatMap() {
+        assert_eval_true("Array.prototype[Symbol.unscopables].flatMap === true");
+    }
+
+    #[test]
+    fn e2e_wk_unscopables_includes_includes() {
+        assert_eval_true("Array.prototype[Symbol.unscopables].includes === true");
+    }
+
+    #[test]
+    fn e2e_wk_unscopables_includes_values() {
+        assert_eval_true("Array.prototype[Symbol.unscopables].values === true");
+    }
+
+    #[test]
+    fn e2e_wk_unscopables_includes_keys() {
+        assert_eval_true("Array.prototype[Symbol.unscopables].keys === true");
+    }
+
+    #[test]
+    fn e2e_wk_unscopables_includes_entries() {
+        assert_eval_true("Array.prototype[Symbol.unscopables].entries === true");
+    }
+
+    #[test]
+    fn e2e_wk_unscopables_excludes_map() {
+        assert_eval_true("Array.prototype[Symbol.unscopables].map === undefined");
+    }
+
+    #[test]
+    fn e2e_wk_unscopables_symbol_description() {
+        assert_eval_true("Symbol.unscopables.description === 'Symbol.unscopables'");
+    }
+
+    // ── @@toPrimitive ───────────────────────────────────────────────────
+
+    #[test]
+    fn e2e_wk_to_primitive_custom_number() {
+        assert_eval_true(
+            r#"
+            var obj = {};
+            obj[Symbol.toPrimitive] = function(hint) {
+                if (hint === 'number') return 42;
+                if (hint === 'string') return 'hello';
+                return true;
+            };
+            +obj === 42
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_wk_to_primitive_custom_string() {
+        assert_eval_true(
+            r#"
+            var obj = {};
+            obj[Symbol.toPrimitive] = function(hint) {
+                if (hint === 'number') return 42;
+                if (hint === 'string') return 'hello';
+                return true;
+            };
+            String(obj) === 'hello'
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_wk_to_primitive_custom_default() {
+        assert_eval_true(
+            r#"
+            var obj = {};
+            obj[Symbol.toPrimitive] = function(hint) {
+                return hint;
+            };
+            obj + '' === 'default'
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_wk_to_primitive_date_string_hint() {
+        assert_eval_true("typeof String(new Date()) === 'string'");
+    }
+
+    #[test]
+    fn e2e_wk_to_primitive_date_number_hint() {
+        assert_eval_true("typeof (+new Date()) === 'number'");
+    }
+
+    #[test]
+    fn e2e_wk_to_primitive_non_primitive_throws() {
+        assert_eval_type_error(
+            r#"
+            var obj = {};
+            obj[Symbol.toPrimitive] = function(hint) { return {}; };
+            +obj
+            "#,
+        );
+    }
+
+    #[test]
+    fn e2e_wk_to_primitive_symbol_exists() {
+        assert_eval_true("typeof Symbol.toPrimitive === 'symbol'");
+    }
+
+    #[test]
+    fn e2e_wk_to_primitive_symbol_description() {
+        assert_eval_true("Symbol.toPrimitive.description === 'Symbol.toPrimitive'");
+    }
+
+    #[test]
+    fn e2e_wk_to_primitive_date_default_prefers_string() {
+        assert_eval_true("typeof (new Date() + '') === 'string'");
+    }
+
+    // ── Cross-cutting well-known symbol tests ───────────────────────────
+
+    #[test]
+    fn e2e_wk_symbol_species_is_symbol_type() {
+        assert_eval_true("typeof Symbol.species === 'symbol'");
+    }
+
+    #[test]
+    fn e2e_wk_symbol_has_instance_is_symbol_type() {
+        assert_eval_true("typeof Symbol.hasInstance === 'symbol'");
+    }
+
+    #[test]
+    fn e2e_wk_symbol_unscopables_is_symbol_type() {
+        assert_eval_true("typeof Symbol.unscopables === 'symbol'");
+    }
+
+    #[test]
+    fn e2e_wk_all_well_known_are_unique() {
+        assert_eval_true(
+            "Symbol.species !== Symbol.hasInstance && \
+             Symbol.hasInstance !== Symbol.isConcatSpreadable && \
+             Symbol.isConcatSpreadable !== Symbol.unscopables && \
+             Symbol.unscopables !== Symbol.toPrimitive && \
+             Symbol.toPrimitive !== Symbol.iterator",
+        );
+    }
+
+    #[test]
+    fn e2e_wk_species_not_in_symbol_for_registry() {
+        assert_eval_true("Symbol.keyFor(Symbol.species) === undefined");
+    }
+
+    #[test]
+    fn e2e_wk_has_instance_not_in_symbol_for_registry() {
+        assert_eval_true("Symbol.keyFor(Symbol.hasInstance) === undefined");
     }
 }
