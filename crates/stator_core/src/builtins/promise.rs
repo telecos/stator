@@ -354,39 +354,48 @@ impl JsPromise {
             }
         };
         if let Some(then_fn) = then_fn {
-            let already_called = Rc::new(Cell::new(false));
+            let target = self.clone();
+            let then_queue = queue.clone();
+            let then_value = value.clone();
+            queue.enqueue(Box::new(move || {
+                let already_called = Rc::new(Cell::new(false));
 
-            let resolve_self = self.clone();
-            let resolve_queue = queue.clone();
-            let resolve_called = Rc::clone(&already_called);
-            let resolve_fn = JsValue::NativeFunction(Rc::new(move |args| {
-                if resolve_called.replace(true) {
-                    return Ok(JsValue::Undefined);
+                let resolve_self = target.clone();
+                let resolve_queue = then_queue.clone();
+                let resolve_called = Rc::clone(&already_called);
+                let resolve_fn = JsValue::NativeFunction(Rc::new(move |args| {
+                    if resolve_called.replace(true) {
+                        return Ok(JsValue::Undefined);
+                    }
+                    let resolved = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    resolve_self.resolve(resolved, &resolve_queue);
+                    Ok(JsValue::Undefined)
+                }));
+
+                let reject_self = target.clone();
+                let reject_queue = then_queue.clone();
+                let reject_called = Rc::clone(&already_called);
+                let reject_fn = JsValue::NativeFunction(Rc::new(move |args| {
+                    if reject_called.replace(true) {
+                        return Ok(JsValue::Undefined);
+                    }
+                    let reason = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    reject_self.reject(reason, &reject_queue);
+                    Ok(JsValue::Undefined)
+                }));
+
+                match dispatch_call_with_this(
+                    &then_fn,
+                    then_value.clone(),
+                    vec![resolve_fn, reject_fn],
+                ) {
+                    Ok(_) => {}
+                    Err(err) if !already_called.replace(true) => {
+                        target.reject(rejection_reason_from_error(&err), &then_queue);
+                    }
+                    Err(_) => {}
                 }
-                let resolved = args.first().cloned().unwrap_or(JsValue::Undefined);
-                resolve_self.resolve(resolved, &resolve_queue);
-                Ok(JsValue::Undefined)
             }));
-
-            let reject_self = self.clone();
-            let reject_queue = queue.clone();
-            let reject_called = Rc::clone(&already_called);
-            let reject_fn = JsValue::NativeFunction(Rc::new(move |args| {
-                if reject_called.replace(true) {
-                    return Ok(JsValue::Undefined);
-                }
-                let reason = args.first().cloned().unwrap_or(JsValue::Undefined);
-                reject_self.reject(reason, &reject_queue);
-                Ok(JsValue::Undefined)
-            }));
-
-            match dispatch_call_with_this(&then_fn, value.clone(), vec![resolve_fn, reject_fn]) {
-                Ok(_) => {}
-                Err(err) if !already_called.replace(true) => {
-                    self.reject(rejection_reason_from_error(&err), queue);
-                }
-                Err(_) => {}
-            }
             return;
         }
 
