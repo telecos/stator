@@ -1021,6 +1021,7 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::DefineKeyedOwnProperty
             | Opcode::StaInArrayLiteral
             | Opcode::DefineKeyedOwnPropertyInLiteral
+            | Opcode::SetLiteralPrototype
             | Opcode::LdaGlobal
             | Opcode::LdaGlobalInsideTypeof
             | Opcode::StaGlobal

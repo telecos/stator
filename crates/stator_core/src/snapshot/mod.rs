@@ -1714,8 +1714,14 @@ mod tests {
         if let (Some(JsValue::PlainObject(c1)), Some(JsValue::PlainObject(c2))) =
             (r.get("c1"), r.get("c2"))
         {
-            let proto1 = c1.borrow().get("__proto__").cloned();
-            let proto2 = c2.borrow().get("__proto__").cloned();
+            let proto1 = c1
+                .borrow()
+                .get(crate::objects::property_map::INTERNAL_PROTO_PROPERTY_KEY)
+                .cloned();
+            let proto2 = c2
+                .borrow()
+                .get(crate::objects::property_map::INTERNAL_PROTO_PROPERTY_KEY)
+                .cloned();
             if let (Some(JsValue::PlainObject(p1)), Some(JsValue::PlainObject(p2))) =
                 (&proto1, &proto2)
             {

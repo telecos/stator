@@ -293,6 +293,8 @@ pub enum Opcode {
     StaInArrayLiteral,
     /// Define a keyed own property in a literal. `[obj, key_reg, flags, slot]`
     DefineKeyedOwnPropertyInLiteral,
+    /// Set an object literal's [[Prototype]] from the accumulator. `[obj]`
+    SetLiteralPrototype,
     /// Define a getter on an object (accumulator holds the getter function).
     /// `[obj, name_idx, slot]`
     DefineGetterProperty,
@@ -746,6 +748,7 @@ impl Opcode {
             Opcode::DefineKeyedOwnProperty => &[Register, Register, Flag, FeedbackSlot],
             Opcode::StaInArrayLiteral => &[Register, Register, FeedbackSlot],
             Opcode::DefineKeyedOwnPropertyInLiteral => &[Register, Register, Flag, FeedbackSlot],
+            Opcode::SetLiteralPrototype => &[Register],
             Opcode::DefineGetterProperty => &[Register, ConstantPoolIdx, FeedbackSlot],
             Opcode::DefineSetterProperty => &[Register, ConstantPoolIdx, FeedbackSlot],
             Opcode::DefineKeyedGetterProperty => &[Register, Register, FeedbackSlot],

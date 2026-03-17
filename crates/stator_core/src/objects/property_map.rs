@@ -32,6 +32,9 @@ use crate::builtins::symbol::{is_symbol_property_key, property_key_to_symbol};
 use crate::objects::map::PropertyAttributes;
 use crate::objects::value::JsValue;
 
+/// Internal storage key used for an object's prototype link.
+pub const INTERNAL_PROTO_PROPERTY_KEY: &str = "\0stator.internal.proto";
+
 /// Global monotonically-increasing counter used to assign unique shape
 /// identifiers to each [`PropertyMap`] structural configuration.
 static NEXT_SHAPE_ID: AtomicU64 = AtomicU64::new(1);
@@ -356,8 +359,8 @@ impl PropertyMap {
             if !self.extensible && !key.starts_with("__") {
                 return;
             }
-            // __proto__ is an internal link and must never be enumerable (ES §B.2.2.1).
-            let attrs = if key == "__proto__" {
+            // The internal prototype link must never be enumerable.
+            let attrs = if key == INTERNAL_PROTO_PROPERTY_KEY {
                 BUILTIN_ATTRS
             } else {
                 DEFAULT_ATTRS
@@ -1294,7 +1297,7 @@ mod tests {
     #[test]
     fn test_proto_key_non_enumerable() {
         let mut pm = PropertyMap::new();
-        pm.insert("__proto__".to_string(), JsValue::Null);
+        pm.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), JsValue::Null);
         pm.insert("visible".to_string(), JsValue::Smi(1));
         let enum_keys: Vec<&String> = pm.enumerable_keys().collect();
         assert_eq!(enum_keys.len(), 1);
