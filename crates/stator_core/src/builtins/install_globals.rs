@@ -32351,6 +32351,208 @@ mod tests {
         assert_eq!(result, JsValue::String("test".into()));
     }
 
+    #[test]
+    fn e2e_unicode_string_iterator_symbol_iterator_len_one_for_astral() {
+        assert_eval_true(r#"[..."𝐀"].length === 1"#);
+    }
+
+    #[test]
+    fn e2e_unicode_string_iterator_symbol_iterator_splits_two_astrals() {
+        assert_eval_true(r#"[..."𝐀𝐁"].length === 2"#);
+    }
+
+    #[test]
+    fn e2e_unicode_string_iterator_symbol_iterator_preserves_values() {
+        assert_eval_true(r#"[..."𝐀𝐁"].join("|") === "𝐀|𝐁""#);
+    }
+
+    #[test]
+    fn e2e_unicode_string_iterator_symbol_iterator_from_surrogate_escapes() {
+        assert_eval_true(r#"[..."\uD835\uDC00\uD835\uDC01"].length === 2"#);
+    }
+
+    #[test]
+    fn e2e_unicode_string_symbol_iterator_next_returns_full_code_point() {
+        assert_eval_true(
+            r#"var it = "𝐀"[Symbol.iterator](); var step = it.next(); step.done === false && step.value === "𝐀""#,
+        );
+    }
+
+    #[test]
+    fn e2e_unicode_string_symbol_iterator_second_step_done() {
+        assert_eval_true(r#"var it = "𝐀"[Symbol.iterator](); it.next(); it.next().done === true"#);
+    }
+
+    #[test]
+    fn e2e_unicode_array_from_two_astrals_has_two_elements() {
+        assert_eval_true(r#"Array.from("𝐀𝐁").length === 2"#);
+    }
+
+    #[test]
+    fn e2e_unicode_array_from_two_astrals_preserves_first_element() {
+        assert_eval_true(r#"Array.from("𝐀𝐁")[0] === "𝐀""#);
+    }
+
+    #[test]
+    fn e2e_unicode_array_from_two_astrals_preserves_second_element() {
+        assert_eval_true(r#"Array.from("𝐀𝐁")[1] === "𝐁""#);
+    }
+
+    #[test]
+    fn e2e_unicode_array_from_surrogate_escape_string_has_two_elements() {
+        assert_eval_true(r#"Array.from("\uD835\uDC00\uD835\uDC01").length === 2"#);
+    }
+
+    #[test]
+    fn e2e_unicode_array_from_surrogate_escape_string_round_trips() {
+        assert_eval_true(r#"Array.from("\uD835\uDC00\uD835\uDC01").join("") === "𝐀𝐁""#);
+    }
+
+    #[test]
+    fn e2e_unicode_utf16_length_of_astral_is_two() {
+        assert_eval_true(r#""𝐀".length === 2"#);
+    }
+
+    #[test]
+    fn e2e_unicode_utf16_length_of_two_astrals_is_four() {
+        assert_eval_true(r#""𝐀𝐁".length === 4"#);
+    }
+
+    #[test]
+    fn e2e_unicode_utf16_length_of_surrogate_escape_pair_is_two() {
+        assert_eval_true(r#""\uD835\uDC00".length === 2"#);
+    }
+
+    #[test]
+    fn e2e_unicode_code_point_at_returns_full_code_point_for_literal() {
+        assert_eval_true(r#""𝐀".codePointAt(0) === 0x1D400"#);
+    }
+
+    #[test]
+    fn e2e_unicode_code_point_at_returns_low_surrogate_at_second_unit() {
+        assert_eval_true(r#""𝐀".codePointAt(1) === 0xDC00"#);
+    }
+
+    #[test]
+    fn e2e_unicode_code_point_at_surrogate_escape_pair_returns_full_code_point() {
+        assert_eval_true(r#""\uD835\uDC00".codePointAt(0) === 0x1D400"#);
+    }
+
+    #[test]
+    fn e2e_unicode_from_code_point_builds_astral_literal() {
+        assert_eval_true(r#"String.fromCodePoint(0x1D400) === "𝐀""#);
+    }
+
+    #[test]
+    fn e2e_unicode_from_code_point_builds_multiple_astrals() {
+        assert_eval_true(r#"String.fromCodePoint(0x1D400, 0x1D401) === "𝐀𝐁""#);
+    }
+
+    #[test]
+    fn e2e_unicode_from_code_point_astral_has_utf16_length_two() {
+        assert_eval_true(r#"String.fromCodePoint(0x1D400).length === 2"#);
+    }
+
+    #[test]
+    fn e2e_unicode_char_at_returns_single_code_unit_length() {
+        assert_eval_true(r#""𝐀".charAt(0).length === 1"#);
+    }
+
+    #[test]
+    fn e2e_unicode_char_at_differs_from_code_point_at_on_astral() {
+        assert_eval_true(r#""𝐀".charCodeAt(0) !== "𝐀".codePointAt(0)"#);
+    }
+
+    #[test]
+    fn e2e_unicode_char_code_at_returns_high_surrogate_for_astral() {
+        assert_eval_true(r#""𝐀".charCodeAt(0) === 0xD835"#);
+    }
+
+    #[test]
+    fn e2e_unicode_literal_equals_surrogate_escape_pair() {
+        assert_eval_true(r#""𝐀" === "\uD835\uDC00""#);
+    }
+
+    #[test]
+    fn e2e_unicode_surrogate_escape_pair_concatenates_to_two_astrals() {
+        assert_eval_true(r#""\uD835\uDC00" + "\uD835\uDC01" === "𝐀𝐁""#);
+    }
+
+    #[test]
+    fn e2e_unicode_normalize_nfc_composes_combining_mark() {
+        assert_eval_true(r#""e\u0301".normalize("NFC") === "\u00E9""#);
+    }
+
+    #[test]
+    fn e2e_unicode_normalize_nfd_decomposes_precomposed_character() {
+        assert_eval_true(r#""\u00E9".normalize("NFD") === "e\u0301""#);
+    }
+
+    #[test]
+    fn e2e_unicode_normalize_nfkc_compatibility_composes_ligature() {
+        assert_eval_true(r#""\uFB03".normalize("NFKC") === "ffi""#);
+    }
+
+    #[test]
+    fn e2e_unicode_normalize_nfkd_compatibility_decomposes_ligature() {
+        assert_eval_true(r#""\uFB03".normalize("NFKD") === "ffi""#);
+    }
+
+    #[test]
+    fn e2e_unicode_normalize_leaves_astral_character_unchanged() {
+        assert_eval_true(r#""𝐀".normalize("NFC") === "𝐀""#);
+    }
+
+    #[test]
+    fn e2e_unicode_encode_uri_component_encodes_astral_utf8_bytes() {
+        assert_eval_true(r#"encodeURIComponent("𝐀") === "%F0%9D%90%80""#);
+    }
+
+    #[test]
+    fn e2e_unicode_encode_uri_component_encodes_surrogate_escape_pair_same_way() {
+        assert_eval_true(r#"encodeURIComponent("\uD835\uDC00") === "%F0%9D%90%80""#);
+    }
+
+    #[test]
+    fn e2e_unicode_template_literal_direct_astral_has_utf16_length_two() {
+        assert_eval_true(r#"`𝐀`.length === 2"#);
+    }
+
+    #[test]
+    fn e2e_unicode_template_literal_surrogate_escape_pair_equals_literal() {
+        assert_eval_true(r#"`\uD835\uDC00` === "𝐀""#);
+    }
+
+    #[test]
+    fn e2e_unicode_template_literal_interpolation_preserves_astral() {
+        assert_eval_true(r#"`${"𝐀"}${"𝐁"}` === "𝐀𝐁""#);
+    }
+
+    #[test]
+    fn e2e_unicode_regexp_unicode_dot_matches_entire_astral_character() {
+        assert_eval_true(r#"/./u.exec("𝐀")[0] === "𝐀""#);
+    }
+
+    #[test]
+    fn e2e_unicode_regexp_unicode_dot_match_has_utf16_length_two() {
+        assert_eval_true(r#"/./u.exec("𝐀")[0].length === 2"#);
+    }
+
+    #[test]
+    fn e2e_unicode_regexp_non_unicode_dot_matches_single_code_unit() {
+        assert_eval_true(r#"/./.exec("𝐀")[0].length === 1"#);
+    }
+
+    #[test]
+    fn e2e_unicode_regexp_unicode_braced_escape_matches_literal() {
+        assert_eval_true(r#"/\u{1D400}/u.test("𝐀")"#);
+    }
+
+    #[test]
+    fn e2e_unicode_regexp_unicode_braced_escape_exec_returns_literal() {
+        assert_eval_true(r#"/\u{1D400}/u.exec("𝐀")[0] === "𝐀""#);
+    }
+
     // ── Object.entries / Object.values tests ────────────────────────────
 
     /// `Object.entries` returns key-value pairs.

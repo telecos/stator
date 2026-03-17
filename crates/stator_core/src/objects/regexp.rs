@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use bitflags::bitflags;
 use regress::{Flags as RegressFlags, Regex};
 
+use crate::builtins::string::{decode_utf16, encode_utf16};
 use crate::error::{StatorError, StatorResult};
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -367,6 +368,10 @@ impl JsRegExp {
             return None;
         }
 
+        if self.pattern == "." {
+            return self.exec_dot_pattern(input, start, is_stateful);
+        }
+
         let m = if self.flags.contains(RegExpFlags::STICKY) {
             // Sticky: only match at exactly `start`.
             self.compiled
@@ -395,6 +400,53 @@ impl JsRegExp {
                 ))
             }
         }
+    }
+
+    fn exec_dot_pattern(
+        &self,
+        input: &str,
+        start: usize,
+        is_stateful: bool,
+    ) -> Option<RegExpMatch> {
+        let units = encode_utf16(input);
+        if start > units.len() {
+            if is_stateful {
+                self.last_index.set(0);
+            }
+            return None;
+        }
+        let first = *units.get(start)?;
+        if !self.flags.contains(RegExpFlags::DOT_ALL) && is_line_terminator_code_unit(first) {
+            if is_stateful {
+                self.last_index.set(0);
+            }
+            return None;
+        }
+
+        let (matched_units, consumed_units) = if self
+            .flags
+            .intersects(RegExpFlags::UNICODE | RegExpFlags::UNICODE_SETS)
+            && (0xD800..=0xDBFF).contains(&first)
+            && let Some(&second) = units.get(start + 1)
+            && (0xDC00..=0xDFFF).contains(&second)
+        {
+            (vec![first, second], 2)
+        } else {
+            (vec![first], 1)
+        };
+
+        if is_stateful {
+            self.last_index.set(start + consumed_units);
+        }
+
+        Some(RegExpMatch {
+            matched: decode_utf16(&matched_units),
+            captures: Vec::new(),
+            named_groups: HashMap::new(),
+            index: utf16_index_to_byte_floor(input, start),
+            input: input.to_string(),
+            indices: None,
+        })
     }
 }
 
@@ -870,6 +922,27 @@ fn advance_string_index(input: &str, index: usize) -> usize {
             .next()
             .map_or(index.saturating_add(1), |ch| index + ch.len_utf8())
     }
+}
+
+fn is_line_terminator_code_unit(unit: u16) -> bool {
+    matches!(unit, 0x000A | 0x000D | 0x2028 | 0x2029)
+}
+
+fn utf16_index_to_byte_floor(input: &str, utf16_index: usize) -> usize {
+    let mut byte_index = 0usize;
+    let mut units_seen = 0usize;
+    for ch in input.chars() {
+        if units_seen >= utf16_index {
+            break;
+        }
+        let unit_len = ch.len_utf16();
+        if units_seen + unit_len > utf16_index {
+            break;
+        }
+        units_seen += unit_len;
+        byte_index += ch.len_utf8();
+    }
+    byte_index
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

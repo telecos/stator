@@ -1803,6 +1803,39 @@ pub(crate) fn decode_unicode_escapes(raw: &str) -> String {
     out
 }
 
+fn flush_pending_template_surrogate(out: &mut String, pending_high_surrogate: &mut Option<u16>) {
+    if let Some(high) = pending_high_surrogate.take() {
+        out.push_str(&String::from_utf16_lossy(&[high]));
+    }
+}
+
+fn push_template_code_unit(out: &mut String, pending_high_surrogate: &mut Option<u16>, unit: u16) {
+    match unit {
+        0xD800..=0xDBFF => {
+            flush_pending_template_surrogate(out, pending_high_surrogate);
+            *pending_high_surrogate = Some(unit);
+        }
+        0xDC00..=0xDFFF => {
+            if let Some(high) = pending_high_surrogate.take() {
+                out.push_str(&String::from_utf16_lossy(&[high, unit]));
+            } else {
+                out.push_str(&String::from_utf16_lossy(&[unit]));
+            }
+        }
+        _ => {
+            flush_pending_template_surrogate(out, pending_high_surrogate);
+            if let Some(ch) = char::from_u32(u32::from(unit)) {
+                out.push(ch);
+            }
+        }
+    }
+}
+
+fn push_template_char(out: &mut String, pending_high_surrogate: &mut Option<u16>, ch: char) {
+    flush_pending_template_surrogate(out, pending_high_surrogate);
+    out.push(ch);
+}
+
 /// Decode escape sequences in a template literal raw segment, producing the
 /// *cooked* value.
 ///
@@ -1815,35 +1848,36 @@ pub(crate) fn decode_unicode_escapes(raw: &str) -> String {
 pub(crate) fn cook_template_raw(raw: &str) -> Option<String> {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
+    let mut pending_high_surrogate = None;
     while let Some(c) = chars.next() {
         if c != '\\' {
             // Handle bare CR → LF normalisation (ES2025 §12.9.4).
             if c == '\r' {
-                out.push('\n');
+                push_template_char(&mut out, &mut pending_high_surrogate, '\n');
                 if chars.peek() == Some(&'\n') {
                     chars.next();
                 }
             } else {
-                out.push(c);
+                push_template_char(&mut out, &mut pending_high_surrogate, c);
             }
             continue;
         }
         // Backslash escape.
         match chars.next() {
             None => return None,
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('b') => out.push('\u{0008}'),
-            Some('f') => out.push('\u{000C}'),
-            Some('v') => out.push('\u{000B}'),
-            Some('\\') => out.push('\\'),
-            Some('\'') => out.push('\''),
-            Some('"') => out.push('"'),
-            Some('`') => out.push('`'),
-            Some('$') => out.push('$'),
+            Some('n') => push_template_char(&mut out, &mut pending_high_surrogate, '\n'),
+            Some('r') => push_template_char(&mut out, &mut pending_high_surrogate, '\r'),
+            Some('t') => push_template_char(&mut out, &mut pending_high_surrogate, '\t'),
+            Some('b') => push_template_char(&mut out, &mut pending_high_surrogate, '\u{0008}'),
+            Some('f') => push_template_char(&mut out, &mut pending_high_surrogate, '\u{000C}'),
+            Some('v') => push_template_char(&mut out, &mut pending_high_surrogate, '\u{000B}'),
+            Some('\\') => push_template_char(&mut out, &mut pending_high_surrogate, '\\'),
+            Some('\'') => push_template_char(&mut out, &mut pending_high_surrogate, '\''),
+            Some('"') => push_template_char(&mut out, &mut pending_high_surrogate, '"'),
+            Some('`') => push_template_char(&mut out, &mut pending_high_surrogate, '`'),
+            Some('$') => push_template_char(&mut out, &mut pending_high_surrogate, '$'),
             Some('0') if !matches!(chars.peek(), Some('0'..='9')) => {
-                out.push('\0');
+                push_template_char(&mut out, &mut pending_high_surrogate, '\0');
             }
             Some('x') => {
                 let h = take_hex(&mut chars, 2);
@@ -1851,7 +1885,7 @@ pub(crate) fn cook_template_raw(raw: &str) -> Option<String> {
                     return None;
                 }
                 match u32::from_str_radix(&h, 16).ok().and_then(char::from_u32) {
-                    Some(cp) => out.push(cp),
+                    Some(cp) => push_template_char(&mut out, &mut pending_high_surrogate, cp),
                     None => return None,
                 }
             }
@@ -1870,7 +1904,7 @@ pub(crate) fn cook_template_raw(raw: &str) -> Option<String> {
                         return None;
                     }
                     match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
-                        Some(cp) => out.push(cp),
+                        Some(cp) => push_template_char(&mut out, &mut pending_high_surrogate, cp),
                         None => return None,
                     }
                 } else {
@@ -1878,9 +1912,11 @@ pub(crate) fn cook_template_raw(raw: &str) -> Option<String> {
                     if h.len() != 4 {
                         return None;
                     }
-                    match u32::from_str_radix(&h, 16).ok().and_then(char::from_u32) {
-                        Some(cp) => out.push(cp),
-                        None => return None,
+                    match u16::from_str_radix(&h, 16) {
+                        Ok(unit) => {
+                            push_template_code_unit(&mut out, &mut pending_high_surrogate, unit);
+                        }
+                        Err(_) => return None,
                     }
                 }
             }
@@ -1898,6 +1934,7 @@ pub(crate) fn cook_template_raw(raw: &str) -> Option<String> {
             Some(_other) => return None,
         }
     }
+    flush_pending_template_surrogate(&mut out, &mut pending_high_surrogate);
     Some(out)
 }
 
