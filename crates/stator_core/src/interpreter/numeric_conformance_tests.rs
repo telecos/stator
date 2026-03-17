@@ -319,4 +319,236 @@ mod tests {
     fn e2e_number_from_neg_infinity_string() {
         assert_eval_true("Number('-Infinity') === -Infinity");
     }
+
+    macro_rules! coercion_e2e_test {
+        ($name:ident, $script:expr) => {
+            #[test]
+            fn $name() {
+                assert_eval_true($script);
+            }
+        };
+    }
+
+    // ── 7. Coercion and comparison corner cases ───────────────────────────────
+
+    coercion_e2e_test!(
+        e2e_to_primitive_number_hint_prefers_value_of,
+        "Number({ valueOf() { return 7; }, toString() { return '9'; } }) === 7"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_string_hint_prefers_to_string,
+        "String({ toString() { return 'text'; }, valueOf() { return 9; } }) === 'text'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_default_hint_acts_like_number,
+        "({ valueOf() { return 5; }, toString() { return '9'; } }) + 1 === 6"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_number_hint_falls_back_to_to_string,
+        "Number({ valueOf() { return {}; }, toString() { return '13'; } }) === 13"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_string_hint_falls_back_to_value_of,
+        "String({ toString() { return {}; }, valueOf() { return 8; } }) === '8'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_symbol_method_has_priority_for_number,
+        "Number({ [Symbol.toPrimitive]() { return 11; }, valueOf() { return 1; } }) === 11"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_symbol_method_has_priority_for_string,
+        "String({ [Symbol.toPrimitive]() { return 'sym'; }, toString() { return 'no'; } }) === 'sym'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_symbol_method_receives_default_hint,
+        "({ [Symbol.toPrimitive](hint) { return hint; } }) + '' === 'default'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_symbol_method_receives_number_hint,
+        "Number({ [Symbol.toPrimitive](hint) { return hint === 'number' ? 2 : 0; } }) === 2"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_symbol_method_receives_string_hint,
+        "String({ [Symbol.toPrimitive](hint) { return hint === 'string' ? 'ok' : 'bad'; } }) === 'ok'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_symbol_method_non_primitive_throws,
+        "try { Number({ [Symbol.toPrimitive]() { return {}; } }); false; } catch (e) { e instanceof TypeError; }"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_symbol_method_non_callable_throws,
+        "try { Number({ [Symbol.toPrimitive]: 1 }); false; } catch (e) { e instanceof TypeError; }"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_both_number_methods_non_primitive_throw,
+        "try { Number({ valueOf() { return {}; }, toString() { return {}; } }); false; } catch (e) { e instanceof TypeError; }"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_both_string_methods_non_primitive_throw,
+        "try { String({ toString() { return {}; }, valueOf() { return {}; } }); false; } catch (e) { e instanceof TypeError; }"
+    );
+
+    coercion_e2e_test!(e2e_to_number_null_to_zero, "Number(null) === 0");
+    coercion_e2e_test!(
+        e2e_to_number_undefined_to_nan,
+        "Number.isNaN(Number(undefined))"
+    );
+    coercion_e2e_test!(e2e_to_number_true_to_one, "Number(true) === 1");
+    coercion_e2e_test!(e2e_to_number_false_to_zero, "Number(false) === 0");
+    coercion_e2e_test!(e2e_to_number_empty_string_to_zero, "Number('') === 0");
+    coercion_e2e_test!(
+        e2e_to_number_whitespace_string_to_zero,
+        "Number('  \\t\\n  ') === 0"
+    );
+    coercion_e2e_test!(e2e_to_number_hex_string_to_sixteen, "Number('0x10') === 16");
+    coercion_e2e_test!(
+        e2e_to_number_trimmed_hex_string_to_sixteen,
+        "Number('  0x10  ') === 16"
+    );
+    coercion_e2e_test!(
+        e2e_to_number_invalid_string_to_nan,
+        "Number.isNaN(Number('not numeric'))"
+    );
+    coercion_e2e_test!(
+        e2e_to_number_object_uses_number_hint,
+        "Number({ valueOf() { return '12'; } }) === 12"
+    );
+    coercion_e2e_test!(
+        e2e_to_number_object_falls_back_to_to_string,
+        "Number({ valueOf() { return {}; }, toString() { return '34'; } }) === 34"
+    );
+    coercion_e2e_test!(e2e_to_number_object_empty_array_to_zero, "Number([]) === 0");
+    coercion_e2e_test!(e2e_to_number_object_singleton_array, "Number([7]) === 7");
+    coercion_e2e_test!(
+        e2e_to_number_object_multi_element_array_is_nan,
+        "Number.isNaN(Number([1, 2]))"
+    );
+
+    coercion_e2e_test!(e2e_to_string_null_literal, "String(null) === 'null'");
+    coercion_e2e_test!(
+        e2e_to_string_undefined_literal,
+        "String(undefined) === 'undefined'"
+    );
+    coercion_e2e_test!(e2e_to_string_true_literal, "String(true) === 'true'");
+    coercion_e2e_test!(
+        e2e_to_string_symbol_via_constructor_function,
+        "String(Symbol('x')) === 'Symbol(x)'"
+    );
+    coercion_e2e_test!(
+        e2e_to_string_symbol_throws_in_concatenation,
+        "try { '' + Symbol('x'); false; } catch (e) { e instanceof TypeError; }"
+    );
+    coercion_e2e_test!(
+        e2e_to_string_object_prefers_to_string,
+        "String({ toString() { return 'ok'; }, valueOf() { return 1; } }) === 'ok'"
+    );
+    coercion_e2e_test!(
+        e2e_to_string_object_falls_back_to_value_of,
+        "String({ toString() { return {}; }, valueOf() { return 7; } }) === '7'"
+    );
+    coercion_e2e_test!(
+        e2e_to_string_array_joins_nullish_as_empty_segments,
+        "String([1, null, undefined, 4]) === '1,,,4'"
+    );
+
+    coercion_e2e_test!(e2e_to_boolean_zero_is_false, "!0 && !(-0)");
+    coercion_e2e_test!(e2e_to_boolean_nan_is_false, "!NaN");
+    coercion_e2e_test!(e2e_to_boolean_empty_string_is_false, "!''");
+    coercion_e2e_test!(
+        e2e_to_boolean_nullish_and_false_are_false,
+        "!null && !undefined && !false"
+    );
+    coercion_e2e_test!(
+        e2e_to_boolean_non_empty_string_is_true,
+        "Boolean('0') === true"
+    );
+    coercion_e2e_test!(e2e_to_boolean_object_is_true, "Boolean({}) === true");
+    coercion_e2e_test!(e2e_to_boolean_array_is_true, "Boolean([]) === true");
+    coercion_e2e_test!(
+        e2e_to_boolean_non_zero_numbers_are_true,
+        "Boolean(1) === true && Boolean(-1) === true && Boolean(Infinity) === true"
+    );
+
+    coercion_e2e_test!(
+        e2e_abstract_equality_null_equals_undefined_only,
+        "null == undefined && undefined == null && !(null == 0)"
+    );
+    coercion_e2e_test!(
+        e2e_abstract_equality_zero_empty_string_and_false,
+        "'0' == false && '' == 0 && '' == false"
+    );
+    coercion_e2e_test!(
+        e2e_abstract_equality_boolean_number_pairs,
+        "true == 1 && false == 0"
+    );
+    coercion_e2e_test!(
+        e2e_abstract_equality_array_and_number,
+        "[1] == 1 && ['1'] == 1"
+    );
+    coercion_e2e_test!(
+        e2e_abstract_equality_object_uses_to_primitive,
+        "({ valueOf() { return 5; } }) == '5'"
+    );
+    coercion_e2e_test!(
+        e2e_abstract_equality_object_falls_back_to_string_primitive,
+        "({ valueOf() { return {}; }, toString() { return '8'; } }) == 8"
+    );
+    coercion_e2e_test!(
+        e2e_abstract_equality_distinct_symbols_are_not_equal,
+        "!(Symbol('x') == Symbol('x'))"
+    );
+    coercion_e2e_test!(
+        e2e_abstract_equality_bigint_number_edges,
+        "1n == 1 && !(1n == 1.5)"
+    );
+    coercion_e2e_test!(
+        e2e_abstract_equality_nan_is_never_equal,
+        "!(NaN == NaN) && !(Number('foo') == Number('foo'))"
+    );
+
+    coercion_e2e_test!(e2e_relational_string_comparison_stays_stringy, "'10' < '9'");
+    coercion_e2e_test!(
+        e2e_relational_number_and_string_compare_numerically,
+        "!(10 < '9') && '5' < 10"
+    );
+    coercion_e2e_test!(
+        e2e_relational_utf16_string_ordering,
+        "'\\uD855\\uDE51' < '\\uFF3A'"
+    );
+    coercion_e2e_test!(
+        e2e_relational_nan_makes_all_order_checks_false,
+        "!(NaN < 1) && !(NaN > 1) && !(NaN <= 1) && !(NaN >= 1)"
+    );
+    coercion_e2e_test!(
+        e2e_relational_null_and_undefined_numeric_conversion,
+        "null < 1 && !(undefined < 1)"
+    );
+    coercion_e2e_test!(
+        e2e_relational_less_equal_and_greater_equal_use_number_hint,
+        "1 <= '1' && 1 >= '1'"
+    );
+    coercion_e2e_test!(
+        e2e_relational_object_less_than_number,
+        "({ valueOf() { return 3; } }) < 4"
+    );
+    coercion_e2e_test!(
+        e2e_relational_number_greater_than_object,
+        "4 > ({ valueOf() { return 3; } })"
+    );
+    coercion_e2e_test!(
+        e2e_relational_object_falls_back_to_string,
+        "({ valueOf() { return {}; }, toString() { return '2'; } }) <= 2"
+    );
+    coercion_e2e_test!(
+        e2e_relational_array_and_number_coercion,
+        "[5] < 10 && !([5] < [10])"
+    );
+    coercion_e2e_test!(
+        e2e_relational_bigint_and_number,
+        "1n < 2 && 2 > 1n && !(1n >= 2)"
+    );
+    coercion_e2e_test!(
+        e2e_relational_type_error_when_number_hint_cannot_produce_primitive,
+        "try { ({ valueOf() { return {}; }, toString() { return {}; } }) < 1; false; } catch (e) { e instanceof TypeError; }"
+    );
 }

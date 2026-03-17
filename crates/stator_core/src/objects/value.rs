@@ -709,6 +709,11 @@ impl JsValue {
                             "Symbol.toPrimitive returned a non-primitive".into(),
                         ));
                     }
+                    Some(_) => {
+                        return Err(StatorError::TypeError(
+                            "Symbol.toPrimitive is not a function".into(),
+                        ));
+                    }
                     _ => {}
                 }
                 ordinary_to_primitive_plain_object(map, hint)
@@ -1540,6 +1545,8 @@ fn ordinary_to_primitive_plain_object(
         ToPrimitiveHint::String => ["toString", "valueOf"],
         ToPrimitiveHint::Number | ToPrimitiveHint::Default => ["valueOf", "toString"],
     };
+    let has_own_value_of = map.borrow().contains_key("valueOf");
+    let has_own_to_string = map.borrow().contains_key("toString");
 
     for name in &method_names {
         let maybe_fn = map.borrow().get(name).cloned();
@@ -1585,6 +1592,12 @@ fn ordinary_to_primitive_plain_object(
             }
             return Ok(JsValue::String(parts.join(",").into()));
         }
+    }
+
+    if has_own_value_of && has_own_to_string {
+        return Err(StatorError::TypeError(
+            "Cannot convert object to primitive value".into(),
+        ));
     }
 
     // No callable method returned a primitive — use default.
@@ -2006,6 +2019,31 @@ mod tests {
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
         let prim = obj.to_primitive(ToPrimitiveHint::Number).unwrap();
         assert_eq!(prim, JsValue::String("hint:number".to_string().into()));
+    }
+
+    #[test]
+    fn test_to_primitive_with_non_callable_symbol_to_primitive_is_type_error() {
+        let mut map = PropertyMap::new();
+        map.insert("@@toPrimitive".to_string(), JsValue::Smi(1));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert!(matches!(
+            obj.to_primitive(ToPrimitiveHint::Number),
+            Err(StatorError::TypeError(message)) if message == "Symbol.toPrimitive is not a function"
+        ));
+    }
+
+    #[test]
+    fn test_to_primitive_plain_object_both_methods_non_primitive_is_type_error() {
+        let mut map = PropertyMap::new();
+        let value_of: NativeFn = Rc::new(|_| Ok(JsValue::new_array(vec![])));
+        let to_string: NativeFn = Rc::new(|_| Ok(JsValue::new_array(vec![])));
+        map.insert("valueOf".to_string(), JsValue::NativeFunction(value_of));
+        map.insert("toString".to_string(), JsValue::NativeFunction(to_string));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        assert!(matches!(
+            obj.to_primitive(ToPrimitiveHint::Number),
+            Err(StatorError::TypeError(message)) if message == "Cannot convert object to primitive value"
+        ));
     }
 
     #[test]
@@ -3583,16 +3621,18 @@ mod tests {
     }
 
     #[test]
-    fn test_to_number_plain_object_both_non_primitive_gives_nan() {
+    fn test_to_number_plain_object_both_non_primitive_is_type_error() {
         let mut map = PropertyMap::new();
-        // Both methods return non-primitives → fallback to "[object Object]" → NaN
+        // Both methods return non-primitives → TypeError per OrdinaryToPrimitive.
         let val_fn: NativeFn = Rc::new(|_| Ok(JsValue::new_array(vec![])));
         map.insert("valueOf".to_string(), JsValue::NativeFunction(val_fn));
         let ts_fn: NativeFn = Rc::new(|_| Ok(JsValue::new_array(vec![])));
         map.insert("toString".to_string(), JsValue::NativeFunction(ts_fn));
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
-        let n = obj.to_number().unwrap();
-        assert!(n.is_nan());
+        assert!(matches!(
+            obj.to_number(),
+            Err(StatorError::TypeError(message)) if message == "Cannot convert object to primitive value"
+        ));
     }
 
     #[test]
