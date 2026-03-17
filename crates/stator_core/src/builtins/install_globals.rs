@@ -4232,12 +4232,9 @@ fn make_object() -> JsValue {
                     JsValue::Undefined | JsValue::Null => Ok(JsValue::PlainObject(Rc::new(
                         RefCell::new(PropertyMap::new()),
                     ))),
-                    // If value is already an object, return it.
-                    JsValue::PlainObject(_) | JsValue::Array(_) | JsValue::Error(_) => {
-                        Ok(val.clone())
-                    }
-                    // Otherwise, return ToObject(value) — wrap primitive.
-                    _ => Ok(val.clone()),
+                    // Otherwise, return ToObject(value) — wrapping primitives and
+                    // returning object-like inputs as-is.
+                    _ => val.to_object(),
                 }
             }),
         );
@@ -15437,6 +15434,160 @@ mod tests {
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
+
+    macro_rules! coercion_e2e_test {
+        ($name:ident, $script:expr) => {
+            #[test]
+            fn $name() {
+                assert_eval_true($script);
+            }
+        };
+    }
+
+    // ── Type coercion and typeof conformance ─────────────────────────────
+
+    coercion_e2e_test!(
+        e2e_typeof_undefined_conforms,
+        "typeof undefined === 'undefined'"
+    );
+    coercion_e2e_test!(e2e_typeof_null_conforms, "typeof null === 'object'");
+    coercion_e2e_test!(e2e_typeof_boolean_conforms, "typeof false === 'boolean'");
+    coercion_e2e_test!(e2e_typeof_number_conforms, "typeof 1 === 'number'");
+    coercion_e2e_test!(e2e_typeof_string_conforms, "typeof 'stator' === 'string'");
+    coercion_e2e_test!(
+        e2e_typeof_symbol_conforms,
+        "typeof Symbol('x') === 'symbol'"
+    );
+    coercion_e2e_test!(
+        e2e_typeof_function_expression_conforms,
+        "typeof function () {} === 'function'"
+    );
+    coercion_e2e_test!(
+        e2e_typeof_object_literal_conforms,
+        "typeof ({}) === 'object'"
+    );
+    coercion_e2e_test!(
+        e2e_abstract_equality_null_and_undefined,
+        "null == undefined && undefined == null"
+    );
+    coercion_e2e_test!(e2e_abstract_equality_string_number, "'42' == 42");
+    coercion_e2e_test!(
+        e2e_abstract_equality_binary_string_number,
+        "'0b101' == 5 && '0o10' == 8"
+    );
+    coercion_e2e_test!(
+        e2e_abstract_equality_object_uses_value_of,
+        "({ valueOf() { return 7; } }) == 7"
+    );
+    coercion_e2e_test!(
+        e2e_abstract_equality_object_falls_back_to_to_string,
+        "({ valueOf() { return {}; }, toString() { return '9'; } }) == 9"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_prefers_symbol_to_primitive_for_number,
+        "Number({ [Symbol.toPrimitive]() { return 11; }, valueOf() { return 1; } }) === 11"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_prefers_symbol_to_primitive_for_string,
+        "String({ [Symbol.toPrimitive]() { return 'symbol-first'; }, toString() { return 'nope'; } }) === 'symbol-first'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_string_hint_prefers_to_string,
+        "String({ toString() { return 'text'; }, valueOf() { return 1; } }) === 'text'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_string_hint_falls_back_to_value_of,
+        "String({ toString() { return {}; }, valueOf() { return 7; } }) === '7'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_number_hint_prefers_value_of,
+        "Number({ valueOf() { return '12'; }, toString() { return '99'; } }) === 12"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_number_hint_falls_back_to_to_string,
+        "Number({ valueOf() { return {}; }, toString() { return '13'; } }) === 13"
+    );
+    coercion_e2e_test!(e2e_to_number_trims_whitespace, "Number('  \\t\\n  ') === 0");
+    coercion_e2e_test!(e2e_to_number_empty_string_is_zero, "Number('') === 0");
+    coercion_e2e_test!(e2e_to_number_hex_literal, "Number('0x10') === 16");
+    coercion_e2e_test!(e2e_to_number_octal_literal, "Number('0o10') === 8");
+    coercion_e2e_test!(e2e_to_number_binary_literal, "Number('0b101') === 5");
+    coercion_e2e_test!(
+        e2e_to_number_invalid_string_is_nan,
+        "Number.isNaN(Number('nope'))"
+    );
+    coercion_e2e_test!(
+        e2e_to_string_symbol_converter,
+        "String(Symbol('x')) === 'Symbol(x)'"
+    );
+    coercion_e2e_test!(
+        e2e_to_string_symbol_throws_during_concatenation,
+        "try { '' + Symbol('x'); false; } catch (e) { e instanceof TypeError; }"
+    );
+    coercion_e2e_test!(
+        e2e_to_string_object_uses_to_string,
+        "String({ toString() { return 'ok'; } }) === 'ok'"
+    );
+    coercion_e2e_test!(
+        e2e_to_string_object_falls_back_to_value_of,
+        "String({ toString() { return {}; }, valueOf() { return 7; } }) === '7'"
+    );
+    coercion_e2e_test!(
+        e2e_to_boolean_falsy_primitives,
+        "!false && !0 && !(-0) && !'' && !null && !undefined && !NaN"
+    );
+    coercion_e2e_test!(
+        e2e_to_boolean_truthy_object,
+        "Boolean({}) === true && !({}) === false"
+    );
+    coercion_e2e_test!(
+        e2e_boolean_converter_conforms,
+        "Boolean('value') === true && Boolean('') === false && Boolean(0) === false"
+    );
+    coercion_e2e_test!(
+        e2e_number_converter_uses_wrapper_to_primitive,
+        "Number(Object('42')) === 42 && Number(Object('0b11')) === 3"
+    );
+    coercion_e2e_test!(
+        e2e_string_converter_uses_wrapper_to_primitive,
+        "String(Object(Symbol('x'))) === 'Symbol(x)'"
+    );
+    coercion_e2e_test!(
+        e2e_object_converter_wraps_number_primitive,
+        "typeof Object(1) === 'object' && Object(1).valueOf() === 1 && Object.prototype.toString.call(Object(1)) === '[object Number]'"
+    );
+    coercion_e2e_test!(
+        e2e_object_converter_wraps_string_primitive,
+        "typeof Object('hi') === 'object' && Object('hi').toString() === 'hi' && Object.prototype.toString.call(Object('hi')) === '[object String]'"
+    );
+    coercion_e2e_test!(
+        e2e_object_converter_wraps_symbol_primitive,
+        "typeof Object(Symbol('x')) === 'object' && String(Object(Symbol('x')).valueOf()) === 'Symbol(x)' && Object.prototype.toString.call(Object(Symbol('x'))) === '[object Symbol]'"
+    );
+    coercion_e2e_test!(
+        e2e_object_converter_returns_object_inputs_as_is,
+        "var obj = { a: 1 }; Object(obj) === obj"
+    );
+    coercion_e2e_test!(
+        e2e_object_converter_creates_ordinary_object_for_nullish,
+        "typeof Object(null) === 'object' && typeof Object(undefined) === 'object'"
+    );
+    coercion_e2e_test!(
+        e2e_unary_plus_converts_strings,
+        "+'0x10' === 16 && +'0b11' === 3"
+    );
+    coercion_e2e_test!(
+        e2e_unary_plus_uses_object_to_primitive,
+        "+{ valueOf() { return '21'; } } === 21"
+    );
+    coercion_e2e_test!(
+        e2e_double_bitwise_not_truncates,
+        "~~4.9 === 4 && ~~(-4.9) === -4"
+    );
+    coercion_e2e_test!(
+        e2e_double_bitwise_not_zeroes_nan,
+        "~~NaN === 0 && ~~(-0) === 0"
+    );
 
     #[test]
     fn e2e_symbol_to_string_tag_custom_object() {

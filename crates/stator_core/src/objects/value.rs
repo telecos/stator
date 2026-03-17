@@ -35,6 +35,7 @@ use std::rc::Rc;
 
 use crate::builtins::error::JsError;
 use crate::builtins::proxy::JsProxy;
+use crate::builtins::symbol::symbol_description;
 use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::error::{StatorError, StatorResult};
 use crate::gc::trace::{Trace, Tracer};
@@ -914,8 +915,49 @@ impl JsValue {
             | Self::String(_)
             | Self::Symbol(_)
             | Self::BigInt(_) => {
+                let primitive_value = self.clone();
+                let string_value = match self {
+                    Self::Boolean(b) => {
+                        JsValue::String(if *b { "true" } else { "false" }.to_string().into())
+                    }
+                    Self::Smi(n) => JsValue::String(n.to_string().into()),
+                    Self::HeapNumber(n) => JsValue::String(number_to_string(*n).into()),
+                    Self::String(s) => JsValue::String(s.clone()),
+                    Self::Symbol(id) => {
+                        let text = match symbol_description(*id) {
+                            Some(desc) => format!("Symbol({desc})"),
+                            None => "Symbol()".to_string(),
+                        };
+                        JsValue::String(text.into())
+                    }
+                    Self::BigInt(n) => JsValue::String(n.to_string().into()),
+                    _ => unreachable!("only primitive wrappers reach this branch"),
+                };
+                let to_string_tag = match self {
+                    Self::Boolean(_) => "Boolean",
+                    Self::Smi(_) | Self::HeapNumber(_) => "Number",
+                    Self::String(_) => "String",
+                    Self::Symbol(_) => "Symbol",
+                    Self::BigInt(_) => "BigInt",
+                    _ => unreachable!("only primitive wrappers reach this branch"),
+                };
+                let primitive_for_value_of = primitive_value.clone();
+                let string_for_to_string = string_value.clone();
                 let mut map = PropertyMap::new();
-                map.insert("[[PrimitiveValue]]".to_string(), self.clone());
+                map.insert("[[PrimitiveValue]]".to_string(), primitive_value);
+                map.insert(
+                    "@@toStringTag".to_string(),
+                    JsValue::String(to_string_tag.to_string().into()),
+                );
+                map.insert(
+                    "valueOf".to_string(),
+                    JsValue::NativeFunction(Rc::new(move |_| Ok(primitive_for_value_of.clone()))),
+                );
+                map.insert(
+                    "toString".to_string(),
+                    JsValue::NativeFunction(Rc::new(move |_| Ok(string_for_to_string.clone()))),
+                );
+                map.make_all_non_enumerable();
                 Ok(JsValue::PlainObject(Rc::new(RefCell::new(map))))
             }
             // Object-like types return themselves.
