@@ -4384,7 +4384,7 @@ fn make_date_instance(t: f64) -> JsValue {
         obj.borrow_mut().insert(
             "@@toPrimitive".into(),
             native(move |args| {
-                let hint = match args.first() {
+                let hint = match args.get(1).or_else(|| args.first()) {
                     Some(JsValue::String(s)) => s.to_string(),
                     _ => "default".to_string(),
                 };
@@ -17255,6 +17255,15 @@ mod tests {
         };
     }
 
+    macro_rules! coercion_type_error_test {
+        ($name:ident, $script:expr) => {
+            #[test]
+            fn $name() {
+                assert_eval_type_error($script);
+            }
+        };
+    }
+
     // ── Type coercion and typeof conformance ─────────────────────────────
 
     coercion_e2e_test!(
@@ -17317,6 +17326,218 @@ mod tests {
     coercion_e2e_test!(
         e2e_to_primitive_number_hint_falls_back_to_to_string,
         "Number({ valueOf() { return {}; }, toString() { return '13'; } }) === 13"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_inherited_symbol_to_primitive_for_number,
+        "var proto = { [Symbol.toPrimitive](hint) { return hint === 'number' ? 14 : 'bad'; } }; Number(Object.create(proto)) === 14"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_inherited_symbol_to_primitive_for_string,
+        "var proto = { [Symbol.toPrimitive](hint) { return hint; } }; String(Object.create(proto)) === 'string'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_symbol_override_skips_value_of_and_to_string_for_number,
+        "var log = ''; Number({ [Symbol.toPrimitive]() { log += 'p'; return 15; }, valueOf() { log += 'v'; return 1; }, toString() { log += 't'; return '2'; } }) === 15 && log === 'p'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_symbol_override_skips_value_of_and_to_string_for_string,
+        "var log = ''; String({ [Symbol.toPrimitive]() { log += 'p'; return 'ok'; }, valueOf() { log += 'v'; return 1; }, toString() { log += 't'; return 'no'; } }) === 'ok' && log === 'p'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_number_hint_observable_order,
+        "var log = ''; Number({ valueOf() { log += 'v'; return {}; }, toString() { log += 't'; return '16'; } }) === 16 && log === 'vt'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_string_hint_observable_order,
+        "var log = ''; String({ toString() { log += 't'; return {}; }, valueOf() { log += 'v'; return 17; } }) === '17' && log === 'tv'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_plus_default_uses_value_of_first,
+        "'' + { valueOf() { return 18; }, toString() { return 99; } } === '18'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_plus_default_falls_back_to_to_string,
+        "'' + { valueOf() { return {}; }, toString() { return 19; } } === '19'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_plus_default_observable_order,
+        "var log = ''; '' + { valueOf() { log += 'v'; return {}; }, toString() { log += 't'; return 20; } } === '20' && log === 'vt'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_plus_default_custom_hint_visible,
+        "var hint = ''; var obj = { [Symbol.toPrimitive](h) { hint = h; return 21; } }; obj + 1 === 22 && hint === 'default'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_equality_uses_default_hint_lhs,
+        "var hint = ''; var obj = { [Symbol.toPrimitive](h) { hint = h; return 22; } }; obj == 22 && hint === 'default'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_equality_uses_default_hint_rhs,
+        "var hint = ''; var obj = { [Symbol.toPrimitive](h) { hint = h; return 23; } }; 23 == obj && hint === 'default'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_equality_falls_back_to_to_string,
+        "({ valueOf() { return {}; }, toString() { return '24'; } }) == 24"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_template_literal_uses_string_hint,
+        "var obj = { [Symbol.toPrimitive](hint) { return hint; } }; `${obj}` === 'string'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_template_literal_skips_value_of_when_symbol_present,
+        "var log = ''; var obj = { [Symbol.toPrimitive](hint) { log += hint[0]; return 'ok'; }, valueOf() { log += 'v'; return 1; }, toString() { log += 't'; return 'no'; } }; `${obj}` === 'ok' && log === 's'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_string_function_uses_string_hint,
+        "var hint = ''; var obj = { [Symbol.toPrimitive](h) { hint = h; return 'done'; } }; String(obj) === 'done' && hint === 'string'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_number_function_uses_number_hint,
+        "var hint = ''; var obj = { [Symbol.toPrimitive](h) { hint = h; return 25; } }; Number(obj) === 25 && hint === 'number'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_date_default_hint_is_string,
+        "var d = new Date(0); d + '' === d.toString() + ''"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_date_number_hint_returns_time_value,
+        "Number(new Date(0)) === 0"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_date_string_hint_returns_to_string,
+        "var d = new Date(0); String(d) === d.toString()"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_custom_symbol_to_primitive_on_date_overrides_methods,
+        "var d = new Date(0); d[Symbol.toPrimitive] = function(hint) { return hint === 'number' ? 26 : 'date'; }; Number(d) === 26 && String(d) === 'date'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_custom_symbol_to_primitive_on_array_overrides_methods,
+        "var a = [1, 2]; a[Symbol.toPrimitive] = function(hint) { return hint === 'number' ? 27 : 'array'; }; Number(a) === 27 && String(a) === 'array'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_array_number_uses_to_string_fallback,
+        "Number([28]) === 28"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_empty_array_number_is_zero,
+        "Number([]) === 0"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_multi_element_array_number_is_nan,
+        "Number.isNaN(Number([1, 2]))"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_inherited_value_of_is_used,
+        "var proto = { valueOf() { return 29; } }; Number(Object.create(proto)) === 29"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_inherited_to_string_is_used,
+        "var proto = { valueOf() { return {}; }, toString() { return '30'; } }; Number(Object.create(proto)) === 30"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_null_value_of_is_ignored,
+        "Number({ valueOf: null, toString() { return '31'; } }) === 31"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_null_to_string_is_ignored,
+        "String({ toString: null, valueOf() { return 32; } }) === '32'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_noncallable_value_of_is_ignored,
+        "Number({ valueOf: 1, toString() { return '33'; } }) === 33"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_noncallable_to_string_is_ignored,
+        "String({ toString: 1, valueOf() { return 34; } }) === '34'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_object_prototype_symbol_to_primitive_absent,
+        "Object.prototype[Symbol.toPrimitive] === undefined && !Object.prototype.hasOwnProperty(Symbol.toPrimitive)"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_plain_object_symbol_to_primitive_absent_by_default,
+        "var obj = {}; obj[Symbol.toPrimitive] === undefined && !obj.hasOwnProperty(Symbol.toPrimitive)"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_symbol_to_primitive_can_return_boolean,
+        "var obj = { [Symbol.toPrimitive]() { return true; } }; Number(obj) === 1"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_symbol_to_primitive_can_return_string_for_plus,
+        "var obj = { [Symbol.toPrimitive]() { return 'x'; } }; obj + 'y' === 'xy'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_symbol_to_primitive_on_proto_overrides_own_methods,
+        "var proto = { [Symbol.toPrimitive]() { return 35; } }; var obj = Object.create(proto); obj.valueOf = function() { return 1; }; obj.toString = function() { return '2'; }; Number(obj) === 35"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_symbol_to_primitive_default_on_proto_used_by_plus,
+        "var proto = { [Symbol.toPrimitive](hint) { return hint === 'default' ? 36 : 0; } }; '' + Object.create(proto) === '36'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_symbol_to_primitive_string_on_proto_used_by_template,
+        "var proto = { [Symbol.toPrimitive](hint) { return hint; } }; `${Object.create(proto)}` === 'string'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_symbol_to_primitive_number_on_proto_used_by_number,
+        "var proto = { [Symbol.toPrimitive](hint) { return hint === 'number' ? 37 : 0; } }; Number(Object.create(proto)) === 37"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_string_hint_can_fall_back_to_numeric_primitive,
+        "String({ toString() { return {}; }, valueOf() { return 38; } }) === '38'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_number_hint_can_use_string_primitive,
+        "Number({ valueOf() { return '39'; }, toString() { return '0'; } }) === 39"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_plus_uses_value_of_without_touching_to_string,
+        "var log = ''; '' + { valueOf() { log += 'v'; return 40; }, toString() { log += 't'; return 0; } } === '40' && log === 'v'"
+    );
+    coercion_e2e_test!(
+        e2e_to_primitive_template_literal_uses_to_string_before_value_of,
+        "var log = ''; `${{ toString() { log += 't'; return '41'; }, valueOf() { log += 'v'; return 0; } }}` === '41' && log === 't'"
+    );
+    coercion_type_error_test!(
+        e2e_to_primitive_own_symbol_to_primitive_noncallable_throws,
+        "Number({ [Symbol.toPrimitive]: 1 })"
+    );
+    coercion_type_error_test!(
+        e2e_to_primitive_inherited_symbol_to_primitive_noncallable_throws,
+        "Number(Object.create({ [Symbol.toPrimitive]: 1 }))"
+    );
+    coercion_type_error_test!(
+        e2e_to_primitive_number_hint_without_primitive_throws,
+        "Number({ valueOf() { return {}; }, toString() { return {}; } })"
+    );
+    coercion_type_error_test!(
+        e2e_to_primitive_string_hint_without_primitive_throws,
+        "String({ toString() { return {}; }, valueOf() { return {}; } })"
+    );
+    coercion_type_error_test!(
+        e2e_to_primitive_plus_without_primitive_throws,
+        "'' + { valueOf() { return {}; }, toString() { return {}; } }"
+    );
+    coercion_type_error_test!(
+        e2e_to_primitive_symbol_to_primitive_returning_object_throws_for_number,
+        "Number({ [Symbol.toPrimitive]() { return {}; } })"
+    );
+    coercion_type_error_test!(
+        e2e_to_primitive_symbol_to_primitive_returning_object_throws_for_string,
+        "String({ [Symbol.toPrimitive]() { return {}; } })"
+    );
+    coercion_type_error_test!(
+        e2e_to_primitive_symbol_to_primitive_returning_object_throws_for_equality,
+        "({ [Symbol.toPrimitive]() { return {}; } }) == 1"
+    );
+    coercion_type_error_test!(
+        e2e_to_primitive_inherited_methods_without_primitive_throw,
+        "Number(Object.create({ valueOf() { return {}; }, toString() { return {}; } }))"
+    );
+    coercion_type_error_test!(
+        e2e_to_primitive_inherited_string_methods_without_primitive_throw,
+        "String(Object.create({ toString() { return {}; }, valueOf() { return {}; } }))"
     );
     coercion_e2e_test!(e2e_to_number_trims_whitespace, "Number('  \\t\\n  ') === 0");
     coercion_e2e_test!(e2e_to_number_empty_string_is_zero, "Number('') === 0");
