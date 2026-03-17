@@ -306,7 +306,12 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
                 };
                 let parts = re_split.symbol_split(&input, limit);
                 sync_last_index_to_props(&w, &re_split);
-                Ok(JsValue::new_array(parts))
+                Ok(JsValue::new_array(
+                    parts
+                        .into_iter()
+                        .map(|s| JsValue::String(s.into()))
+                        .collect(),
+                ))
             })),
         );
     }
@@ -417,7 +422,7 @@ fn regexp_replace_with_callback(
     re: &JsRegExp,
     input: &str,
     replacement: &JsValue,
-    weak: &Weak<RefCell<PropertyMap>>,
+    _weak: &Weak<RefCell<PropertyMap>>,
 ) -> StatorResult<String> {
     let global = re.flags().contains(RegExpFlags::GLOBAL);
 
