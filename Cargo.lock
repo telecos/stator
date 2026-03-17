@@ -1743,6 +1743,7 @@ dependencies = [
  "stacker",
  "thiserror 2.0.18",
  "tungstenite",
+ "unicode-ident",
  "unicode-normalization",
  "wasmtime",
 ]
