@@ -82,7 +82,7 @@ pub(super) type OpcodeHandler =
     fn(&mut DispatchContext, &Instruction) -> StatorResult<DispatchAction>;
 
 /// Number of opcode variants (= `Opcode::Illegal as usize + 1`).
-const OPCODE_COUNT: usize = 193;
+const OPCODE_COUNT: usize = 194;
 
 #[inline]
 fn handle_lda_zero(
