@@ -15826,6 +15826,36 @@ mod tests {
         ));
     }
 
+    fn assert_eval_fulfilled_promise_value(script: &str, expected: JsValue) {
+        match eval_with_microtasks(script) {
+            JsValue::Promise(promise) => {
+                assert!(
+                    promise.is_fulfilled(),
+                    "expected fulfilled promise for {script:?}"
+                );
+                assert_eq!(promise.value(), Some(expected));
+            }
+            other => panic!("expected Promise for {script:?}, got {other:?}"),
+        }
+    }
+
+    fn assert_eval_fulfilled_promise_true(script: &str) {
+        assert_eval_fulfilled_promise_value(script, JsValue::Boolean(true));
+    }
+
+    fn assert_eval_rejected_promise_reason(script: &str, expected: JsValue) {
+        match eval_with_microtasks(script) {
+            JsValue::Promise(promise) => {
+                assert!(
+                    promise.is_rejected(),
+                    "expected rejected promise for {script:?}"
+                );
+                assert_eq!(promise.reason(), Some(expected));
+            }
+            other => panic!("expected Promise for {script:?}, got {other:?}"),
+        }
+    }
+
     /// Verify that `install_globals` populates the expected keys.
     #[test]
     fn test_install_globals_keys() {
@@ -48199,6 +48229,690 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::String("0,1,1,2,3,5,8,13".into()));
+    }
+
+    /// yield* returns the delegate's final return value.
+    #[test]
+    fn e2e_yield_star_propagates_return_value_to_outer_return() {
+        assert_eval_true(
+            r#"
+            function* inner() { yield 1; return 42; }
+            function* outer() { return yield* inner(); }
+            var it = outer();
+            var a = it.next();
+            var b = it.next();
+            a.value === 1 && a.done === false &&
+            b.value === 42 && b.done === true
+            "#,
+        );
+    }
+
+    /// yield* forwards throw() into the delegate where it can be caught.
+    #[test]
+    fn e2e_yield_star_throw_caught_by_inner() {
+        assert_eval_true(
+            r#"
+            function* inner() {
+                try { yield 1; }
+                catch (e) { yield 'caught:' + e; }
+            }
+            function* outer() { yield* inner(); }
+            var it = outer();
+            it.next();
+            var r = it.throw('boom');
+            r.value === 'caught:boom' && r.done === false
+            "#,
+        );
+    }
+
+    /// Uncaught throw() during yield* propagates to the caller.
+    #[test]
+    fn e2e_yield_star_throw_propagates_uncaught() {
+        let r = global_eval(
+            r#"
+            function* inner() { yield 1; }
+            function* outer() { yield* inner(); }
+            var it = outer();
+            it.next();
+            try { it.throw('boom'); 'nope'; } catch (e) { e; }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("boom".into()));
+    }
+
+    /// yield* over a plain iterable completes with undefined.
+    #[test]
+    fn e2e_yield_star_array_completion_value_is_undefined() {
+        assert_eval_true(
+            r#"
+            function* gen() {
+                var doneValue = yield* [1, 2];
+                return doneValue === undefined;
+            }
+            var it = gen();
+            it.next();
+            it.next();
+            it.next().value === true
+            "#,
+        );
+    }
+
+    /// yield* requires an iterable delegate.
+    #[test]
+    fn e2e_yield_star_non_iterable_throws_type_error() {
+        assert_eval_type_error(
+            r#"
+            function* gen() { yield* 1; }
+            gen().next();
+            "#,
+        );
+    }
+
+    /// Values sent with next() flow through yield* into the delegate.
+    #[test]
+    fn e2e_yield_star_passes_next_value_into_inner() {
+        assert_eval_true(
+            r#"
+            function* inner() {
+                var sent = yield 1;
+                return sent;
+            }
+            function* outer() { return yield* inner(); }
+            var it = outer();
+            it.next();
+            var r = it.next(9);
+            r.value === 9 && r.done === true
+            "#,
+        );
+    }
+
+    /// yield* return() runs the delegate's finally block.
+    #[test]
+    fn e2e_yield_star_return_runs_inner_finally() {
+        assert_eval_true(
+            r#"
+            var log = [];
+            function* inner() {
+                try { yield 1; yield 2; }
+                finally { log.push('inner'); }
+            }
+            function* outer() { yield* inner(); }
+            var it = outer();
+            it.next();
+            var r = it.return(7);
+            r.value === 7 && r.done === true && log.join(',') === 'inner'
+            "#,
+        );
+    }
+
+    /// yield* throw() also runs the delegate's finally block.
+    #[test]
+    fn e2e_yield_star_throw_runs_inner_finally() {
+        assert_eval_true(
+            r#"
+            var log = [];
+            function* inner() {
+                try { yield 1; }
+                finally { log.push('inner'); }
+            }
+            function* outer() { yield* inner(); }
+            var it = outer();
+            it.next();
+            try { it.throw('boom'); } catch (e) {}
+            log.join(',') === 'inner'
+            "#,
+        );
+    }
+
+    /// After return(), next() remains done forever.
+    #[test]
+    fn e2e_generator_return_then_next_stays_done() {
+        assert_eval_true(
+            r#"
+            function* gen() { yield 1; yield 2; }
+            var it = gen();
+            it.next();
+            it.return(5);
+            var r = it.next();
+            r.value === undefined && r.done === true
+            "#,
+        );
+    }
+
+    /// return() before first next() also leaves the generator closed.
+    #[test]
+    fn e2e_generator_return_before_start_then_next_done() {
+        assert_eval_true(
+            r#"
+            function* gen() { yield 1; }
+            var it = gen();
+            var r = it.return(8);
+            var n = it.next();
+            r.value === 8 && r.done === true &&
+            n.value === undefined && n.done === true
+            "#,
+        );
+    }
+
+    /// A caught throw() can resume once, then next() reports completion.
+    #[test]
+    fn e2e_generator_throw_caught_then_next_done() {
+        assert_eval_true(
+            r#"
+            function* gen() {
+                try { yield 1; }
+                catch (e) { yield e; }
+            }
+            var it = gen();
+            it.next();
+            it.throw(5);
+            var r = it.next();
+            r.value === undefined && r.done === true
+            "#,
+        );
+    }
+
+    /// throw() unwinds through finally blocks.
+    #[test]
+    fn e2e_generator_throw_runs_finally_block() {
+        assert_eval_true(
+            r#"
+            var finallyRan = false;
+            function* gen() {
+                try { yield 1; }
+                finally { finallyRan = true; }
+            }
+            var it = gen();
+            it.next();
+            try { it.throw('x'); } catch (e) {}
+            finallyRan
+            "#,
+        );
+    }
+
+    /// A completed generator stays done even after throw() is attempted.
+    #[test]
+    fn e2e_generator_throw_after_completion_keeps_next_done() {
+        assert_eval_true(
+            r#"
+            function* gen() { yield 1; }
+            var it = gen();
+            it.next();
+            it.next();
+            try { it.throw('late'); } catch (e) {}
+            var r = it.next();
+            r.value === undefined && r.done === true
+            "#,
+        );
+    }
+
+    /// throw() before the first next() closes the generator.
+    #[test]
+    fn e2e_generator_throw_before_start_then_next_done() {
+        assert_eval_true(
+            r#"
+            function* gen() { yield 1; }
+            var it = gen();
+            try { it.throw('x'); } catch (e) {}
+            var r = it.next();
+            r.value === undefined && r.done === true
+            "#,
+        );
+    }
+
+    /// Normal completion still leaves next() permanently done.
+    #[test]
+    fn e2e_generator_normal_completion_then_next_stays_done() {
+        assert_eval_true(
+            r#"
+            function* gen() { yield 1; return 2; }
+            var it = gen();
+            it.next();
+            it.next();
+            var r = it.next();
+            r.value === undefined && r.done === true
+            "#,
+        );
+    }
+
+    /// return() produces the required iterator-result shape.
+    #[test]
+    fn e2e_generator_return_result_has_done_true() {
+        assert_eval_true(
+            r#"
+            function* gen() { yield 1; }
+            var r = gen().return(33);
+            r.value === 33 && r.done === true
+            "#,
+        );
+    }
+
+    /// Generator function .prototype is an object distinct from GeneratorFunction.prototype.
+    #[test]
+    fn e2e_generator_function_prototype_is_object_not_generator_function_prototype() {
+        assert_eval_true(
+            r#"
+            function* gen() {}
+            typeof gen.prototype === 'object' &&
+            gen.prototype !== GeneratorFunction.prototype
+            "#,
+        );
+    }
+
+    /// Generator function .prototype.constructor points back to the function.
+    #[test]
+    fn e2e_generator_function_prototype_constructor_points_back() {
+        assert_eval_true(
+            r#"
+            function* gen() {}
+            gen.prototype.constructor === gen
+            "#,
+        );
+    }
+
+    /// Generator instances inherit from the function's own .prototype object.
+    #[test]
+    fn e2e_generator_instance_prototype_is_function_prototype_property() {
+        assert_eval_true(
+            r#"
+            function* gen() {}
+            Object.getPrototypeOf(gen()) === gen.prototype
+            "#,
+        );
+    }
+
+    /// Generator instances are their own synchronous iterators.
+    #[test]
+    fn e2e_generator_instance_symbol_iterator_returns_self() {
+        assert_eval_true(
+            r#"
+            function* gen() { yield 1; }
+            var it = gen();
+            it[Symbol.iterator]() === it
+            "#,
+        );
+    }
+
+    /// Generator expressions produce callable generator functions with object .prototype.
+    #[test]
+    fn e2e_generator_expression_has_object_prototype_property() {
+        assert_eval_true(
+            r#"
+            var gen = function*() { yield 1; };
+            typeof gen === 'function' && typeof gen.prototype === 'object'
+            "#,
+        );
+    }
+
+    /// Object literal generator methods yield values in order.
+    #[test]
+    fn e2e_generator_object_method_yields_values() {
+        assert_eval_true(
+            r#"
+            var obj = { *method() { yield 1; yield 2; } };
+            var it = obj.method();
+            it.next().value === 1 && it.next().value === 2
+            "#,
+        );
+    }
+
+    /// Class generator methods yield values in order.
+    #[test]
+    fn e2e_generator_class_method_yields_values() {
+        assert_eval_true(
+            r#"
+            class C { *method() { yield 3; yield 4; } }
+            var it = new C().method();
+            it.next().value === 3 && it.next().value === 4
+            "#,
+        );
+    }
+
+    /// Object literal generator methods keep the inferred method name.
+    #[test]
+    fn e2e_generator_object_method_name_is_preserved() {
+        assert_eval_true("({ *method() {} }).method.name === 'method'");
+    }
+
+    /// Class generator methods keep the inferred method name.
+    #[test]
+    fn e2e_generator_class_method_name_is_preserved() {
+        assert_eval_true("class C { *method() {} } new C().method.name === 'method'");
+    }
+
+    /// Generator expressions still create instances linked to their .prototype.
+    #[test]
+    fn e2e_generator_expression_instances_use_generator_prototype_chain() {
+        assert_eval_true(
+            r#"
+            var gen = function*() { yield 1; };
+            Object.getPrototypeOf(gen()) === gen.prototype
+            "#,
+        );
+    }
+
+    /// yield in a generator parameter default is an early SyntaxError.
+    #[test]
+    fn e2e_generator_param_default_yield_is_syntax_error() {
+        assert_eval_syntax_error("function* gen(a = yield 1) {}");
+    }
+
+    /// yield* in a generator parameter default is also a SyntaxError.
+    #[test]
+    fn e2e_generator_param_default_yield_star_is_syntax_error() {
+        assert_eval_syntax_error("function* gen(a = yield* []) {}");
+    }
+
+    /// yield inside object-pattern defaults in generator params is rejected.
+    #[test]
+    fn e2e_generator_object_pattern_default_yield_is_syntax_error() {
+        assert_eval_syntax_error("function* gen({ a = yield 1 }) {}");
+    }
+
+    /// yield inside array-pattern defaults in generator params is rejected.
+    #[test]
+    fn e2e_generator_array_pattern_default_yield_is_syntax_error() {
+        assert_eval_syntax_error("function* gen([a = yield 1]) {}");
+    }
+
+    /// Object generator method parameter defaults reject yield.
+    #[test]
+    fn e2e_generator_object_method_param_default_yield_is_syntax_error() {
+        assert_eval_syntax_error("({ *method(a = yield 1) {} })");
+    }
+
+    /// Class generator method parameter defaults reject yield.
+    #[test]
+    fn e2e_generator_class_method_param_default_yield_is_syntax_error() {
+        assert_eval_syntax_error("class C { *method(a = yield 1) {} }");
+    }
+
+    /// Async generator parameter defaults also reject yield.
+    #[test]
+    fn e2e_async_generator_param_default_yield_is_syntax_error() {
+        assert_eval_syntax_error("async function* gen(a = yield 1) {}");
+    }
+
+    /// Async generators await promise values before exposing them.
+    #[test]
+    fn e2e_async_generator_yield_awaits_promise_before_exposing_value() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function* gen() { yield await Promise.resolve(5); }
+            async function f() {
+                var r = await gen().next();
+                return r.value === 5 && r.done === false;
+            }
+            f()
+            "#,
+        );
+    }
+
+    /// for await...of awaits promise values yielded from async generators.
+    #[test]
+    fn e2e_async_generator_for_await_awaits_yielded_promises() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function* gen() { yield Promise.resolve(7); }
+            async function f() {
+                var out = [];
+                for await (const x of gen()) out.push(x);
+                return out.length === 1 && out[0] === 7;
+            }
+            f()
+            "#,
+        );
+    }
+
+    /// for await...of follows the async iteration protocol on async generators.
+    #[test]
+    fn e2e_async_generator_for_await_consumes_async_iteration_protocol() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function* gen() { yield 1; yield 2; yield 3; }
+            async function f() {
+                var sum = 0;
+                for await (const x of gen()) sum += x;
+                return sum === 6;
+            }
+            f()
+            "#,
+        );
+    }
+
+    /// Async generator return() resolves to an iterator result.
+    #[test]
+    fn e2e_async_generator_return_resolves_iterator_result() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function* gen() { yield 1; }
+            async function f() {
+                var it = gen();
+                await it.next();
+                var r = await it.return(9);
+                return r.value === 9 && r.done === true;
+            }
+            f()
+            "#,
+        );
+    }
+
+    /// Async generator return() triggers finally blocks.
+    #[test]
+    fn e2e_async_generator_return_runs_finally() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function* gen() {
+                try { yield 1; }
+                finally { globalThis.closed = true; }
+            }
+            async function f() {
+                globalThis.closed = false;
+                var it = gen();
+                await it.next();
+                await it.return(0);
+                return globalThis.closed;
+            }
+            f()
+            "#,
+        );
+    }
+
+    /// After async return(), next() stays done.
+    #[test]
+    fn e2e_async_generator_return_after_done_keeps_next_done() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function* gen() { yield 1; }
+            async function f() {
+                var it = gen();
+                await it.next();
+                await it.return(2);
+                var r = await it.next();
+                return r.value === undefined && r.done === true;
+            }
+            f()
+            "#,
+        );
+    }
+
+    /// Async generator throw() can be caught inside the generator.
+    #[test]
+    fn e2e_async_generator_throw_is_caught_inside() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function* gen() {
+                try { yield 1; }
+                catch (e) { yield 'caught:' + e; }
+            }
+            async function f() {
+                var it = gen();
+                await it.next();
+                var r = await it.throw('x');
+                return r.value === 'caught:x' && r.done === false;
+            }
+            f()
+            "#,
+        );
+    }
+
+    /// Uncaught async generator throw() rejects the returned promise.
+    #[test]
+    fn e2e_async_generator_throw_rejects_when_uncaught() {
+        assert_eval_rejected_promise_reason(
+            r#"
+            async function* gen() { yield 1; }
+            async function f() {
+                var it = gen();
+                await it.next();
+                return await it.throw('boom');
+            }
+            f()
+            "#,
+            JsValue::String("boom".into()),
+        );
+    }
+
+    /// After a caught async throw(), the following next() can observe completion.
+    #[test]
+    fn e2e_async_generator_throw_then_next_done() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function* gen() {
+                try { yield 1; }
+                catch (e) { yield 2; }
+            }
+            async function f() {
+                var it = gen();
+                await it.next();
+                await it.throw('x');
+                var r = await it.next();
+                return r.value === undefined && r.done === true;
+            }
+            f()
+            "#,
+        );
+    }
+
+    /// next() after async return() always stays done.
+    #[test]
+    fn e2e_async_generator_next_after_return_stays_done() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function* gen() { yield 1; yield 2; }
+            async function f() {
+                var it = gen();
+                await it.next();
+                await it.return(4);
+                var r1 = await it.next();
+                var r2 = await it.next();
+                return r1.done === true && r1.value === undefined &&
+                       r2.done === true && r2.value === undefined;
+            }
+            f()
+            "#,
+        );
+    }
+
+    /// Async generators are their own async iterator.
+    #[test]
+    fn e2e_async_generator_symbol_async_iterator_returns_self() {
+        assert_eval_true(
+            r#"
+            async function* gen() { yield 1; }
+            var it = gen();
+            it[Symbol.asyncIterator]() === it
+            "#,
+        );
+    }
+
+    /// Async yield* preserves the delegate's completion value.
+    #[test]
+    fn e2e_async_generator_yield_star_preserves_return_value() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function* inner() { yield 2; return 5; }
+            async function* outer() { var x = yield* inner(); yield x; }
+            async function f() {
+                var it = outer();
+                var a = await it.next();
+                var b = await it.next();
+                return a.value === 2 && b.value === 5;
+            }
+            f()
+            "#,
+        );
+    }
+
+    /// Breaking from for await...of closes the async generator.
+    #[test]
+    fn e2e_async_generator_for_await_break_runs_finally() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            async function* gen() {
+                try { yield 1; yield 2; }
+                finally { globalThis.asyncFinally = 'done'; }
+            }
+            async function f() {
+                globalThis.asyncFinally = '';
+                for await (const x of gen()) { break; }
+                return globalThis.asyncFinally === 'done';
+            }
+            f()
+            "#,
+        );
+    }
+
+    /// Async generator expressions are supported.
+    #[test]
+    fn e2e_async_generator_expression_yields_values() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            var gen = async function*() { yield 1; yield 2; };
+            async function f() {
+                var it = gen();
+                var a = await it.next();
+                var b = await it.next();
+                return a.value === 1 && b.value === 2;
+            }
+            f()
+            "#,
+        );
+    }
+
+    /// Async generator object methods are supported.
+    #[test]
+    fn e2e_async_generator_object_method_yields_values() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            var obj = { async *method() { yield 1; yield 2; } };
+            async function f() {
+                var it = obj.method();
+                var a = await it.next();
+                var b = await it.next();
+                return a.value === 1 && b.value === 2;
+            }
+            f()
+            "#,
+        );
+    }
+
+    /// Async generator class methods are supported.
+    #[test]
+    fn e2e_async_generator_class_method_yields_values() {
+        assert_eval_fulfilled_promise_true(
+            r#"
+            class C { async *method() { yield 3; yield 4; } }
+            async function f() {
+                var it = new C().method();
+                var a = await it.next();
+                var b = await it.next();
+                return a.value === 3 && b.value === 4;
+            }
+            f()
+            "#,
+        );
     }
 
     // ΓöÇΓöÇ Type coercion & conversion conformance ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ

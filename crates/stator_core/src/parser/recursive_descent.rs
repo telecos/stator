@@ -1177,6 +1177,9 @@ impl<'src> Parser<'src> {
         };
         self.expect(TokenKind::LeftParen)?;
         let params = self.parse_formal_params()?;
+        if is_generator {
+            self.check_generator_params_for_yield(&params, fn_span)?;
+        }
 
         // Save enclosing strict mode, then parse function body.
         let outer_strict = self.strict_mode;
@@ -1456,6 +1459,9 @@ impl<'src> Parser<'src> {
                 let fn_start = self.current_span();
                 self.expect(TokenKind::LeftParen)?;
                 let params = self.parse_formal_params()?;
+                if is_generator {
+                    self.check_generator_params_for_yield(&params, member_start)?;
+                }
                 // Class bodies are always strict — reject duplicate params.
                 self.check_strict_duplicate_params(&params)?;
                 let outer_fn = self.function_depth;
@@ -2035,6 +2041,166 @@ impl<'src> Parser<'src> {
         }
         self.expect(TokenKind::RightParen)?;
         Ok(params)
+    }
+
+    fn check_generator_params_for_yield(
+        &self,
+        params: &[Param],
+        error_span: Span,
+    ) -> StatorResult<()> {
+        if Self::params_contain_yield(params) {
+            return Err(Self::error_at(
+                error_span,
+                "yield expression not allowed in generator parameter list",
+            ));
+        }
+        Ok(())
+    }
+
+    fn params_contain_yield(params: &[Param]) -> bool {
+        params.iter().any(Self::param_contains_yield)
+    }
+
+    fn param_contains_yield(param: &Param) -> bool {
+        Self::pat_contains_yield(&param.pat)
+            || param
+                .default
+                .as_ref()
+                .is_some_and(Self::expr_contains_yield)
+    }
+
+    fn pat_contains_yield(pat: &Pat) -> bool {
+        match pat {
+            Pat::Ident(_) => false,
+            Pat::Array(array) => array
+                .elements
+                .iter()
+                .flatten()
+                .any(Self::pat_contains_yield),
+            Pat::Object(object) => object.properties.iter().any(|prop| match prop {
+                ObjectPatProp::KeyValue(prop) => {
+                    Self::prop_key_contains_yield(&prop.key)
+                        || Self::pat_contains_yield(&prop.value)
+                }
+                ObjectPatProp::Assign(prop) => {
+                    prop.value.as_deref().is_some_and(Self::expr_contains_yield)
+                }
+                ObjectPatProp::Rest(rest) => Self::pat_contains_yield(&rest.argument),
+            }),
+            Pat::Rest(rest) => Self::pat_contains_yield(&rest.argument),
+            Pat::Assign(assign) => {
+                Self::pat_contains_yield(&assign.left) || Self::expr_contains_yield(&assign.right)
+            }
+            Pat::Expr(expr) => Self::expr_contains_yield(expr),
+        }
+    }
+
+    fn assign_target_contains_yield(target: &AssignTarget) -> bool {
+        match target {
+            AssignTarget::Expr(expr) => Self::expr_contains_yield(expr),
+            AssignTarget::Pat(pat) => Self::pat_contains_yield(pat),
+        }
+    }
+
+    fn prop_key_contains_yield(key: &PropKey) -> bool {
+        match key {
+            PropKey::Computed(expr) => Self::expr_contains_yield(expr),
+            PropKey::Ident(_) | PropKey::Private(_) | PropKey::Str(_) | PropKey::Num(_) => false,
+        }
+    }
+
+    fn member_prop_contains_yield(prop: &MemberProp) -> bool {
+        match prop {
+            MemberProp::Computed(expr) => Self::expr_contains_yield(expr),
+            MemberProp::Ident(_) | MemberProp::Private(_) => false,
+        }
+    }
+
+    fn expr_contains_yield(expr: &Expr) -> bool {
+        match expr {
+            Expr::Yield(_) => true,
+            Expr::Array(array) => array
+                .elements
+                .iter()
+                .flatten()
+                .any(Self::expr_contains_yield),
+            Expr::Object(object) => object.properties.iter().any(|prop| match prop {
+                ObjectProp::Prop(prop) => {
+                    Self::prop_key_contains_yield(&prop.key)
+                        || match &prop.value {
+                            PropValue::Value(value) => Self::expr_contains_yield(value),
+                            PropValue::Shorthand => false,
+                            PropValue::Get(_) | PropValue::Set(_) | PropValue::Method(_) => false,
+                        }
+                }
+                ObjectProp::Spread(spread) => Self::expr_contains_yield(&spread.argument),
+            }),
+            Expr::Unary(unary) => Self::expr_contains_yield(&unary.argument),
+            Expr::Update(update) => Self::expr_contains_yield(&update.argument),
+            Expr::Binary(binary) => {
+                Self::expr_contains_yield(&binary.left) || Self::expr_contains_yield(&binary.right)
+            }
+            Expr::Logical(logical) => {
+                Self::expr_contains_yield(&logical.left)
+                    || Self::expr_contains_yield(&logical.right)
+            }
+            Expr::Conditional(conditional) => {
+                Self::expr_contains_yield(&conditional.test)
+                    || Self::expr_contains_yield(&conditional.consequent)
+                    || Self::expr_contains_yield(&conditional.alternate)
+            }
+            Expr::Assign(assign) => {
+                Self::assign_target_contains_yield(&assign.left)
+                    || Self::expr_contains_yield(&assign.right)
+            }
+            Expr::Sequence(sequence) => sequence.expressions.iter().any(Self::expr_contains_yield),
+            Expr::Member(member) => {
+                Self::expr_contains_yield(&member.object)
+                    || Self::member_prop_contains_yield(&member.property)
+            }
+            Expr::OptionalMember(member) => {
+                Self::expr_contains_yield(&member.object)
+                    || Self::member_prop_contains_yield(&member.property)
+            }
+            Expr::Call(call) => {
+                Self::expr_contains_yield(&call.callee)
+                    || call.arguments.iter().any(Self::expr_contains_yield)
+            }
+            Expr::OptionalCall(call) => {
+                Self::expr_contains_yield(&call.callee)
+                    || call.arguments.iter().any(Self::expr_contains_yield)
+            }
+            Expr::OptionalChain(inner) => Self::expr_contains_yield(inner),
+            Expr::New(new_expr) => {
+                Self::expr_contains_yield(&new_expr.callee)
+                    || new_expr.arguments.iter().any(Self::expr_contains_yield)
+            }
+            Expr::TaggedTemplate(tagged) => {
+                Self::expr_contains_yield(&tagged.tag)
+                    || tagged
+                        .quasi
+                        .expressions
+                        .iter()
+                        .any(Self::expr_contains_yield)
+            }
+            Expr::Spread(spread) => Self::expr_contains_yield(&spread.argument),
+            Expr::Await(await_expr) => Self::expr_contains_yield(&await_expr.argument),
+            Expr::Import(import_expr) => Self::expr_contains_yield(&import_expr.source),
+            Expr::Template(template) => template.expressions.iter().any(Self::expr_contains_yield),
+            Expr::Null(_)
+            | Expr::Bool(_)
+            | Expr::Num(_)
+            | Expr::Str(_)
+            | Expr::BigInt(_)
+            | Expr::Regexp(_)
+            | Expr::Ident(_)
+            | Expr::This(_)
+            | Expr::Fn(_)
+            | Expr::Arrow(_)
+            | Expr::Class(_)
+            | Expr::MetaProp(_)
+            | Expr::PrivateName(_) => false,
+        }
     }
 
     /// In strict mode, duplicate simple parameter names are a `SyntaxError`.
@@ -3714,6 +3880,9 @@ impl<'src> Parser<'src> {
                             let fn_start = self.current_span();
                             self.expect(TokenKind::LeftParen)?;
                             let params = self.parse_formal_params()?;
+                            if is_generator_method {
+                                self.check_generator_params_for_yield(&params, fn_start)?;
+                            }
                             // Method definitions always use UniqueFormalParameters.
                             self.check_unique_params(&params)?;
                             let outer_fn = self.function_depth;
@@ -4071,6 +4240,9 @@ impl<'src> Parser<'src> {
         };
         self.expect(TokenKind::LeftParen)?;
         let params = self.parse_formal_params()?;
+        if is_generator {
+            self.check_generator_params_for_yield(&params, fn_span)?;
+        }
 
         let outer_strict = self.strict_mode;
         let outer_async_depth = self.async_function_depth;
@@ -7860,6 +8032,18 @@ mod tests {
         } else {
             panic!("expected FnDecl");
         }
+    }
+
+    #[test]
+    fn test_generator_param_default_yield_is_syntax_error() {
+        let result = parse("function* g(a = yield 1) {}");
+        assert!(matches!(result, Err(StatorError::SyntaxError(_))));
+    }
+
+    #[test]
+    fn test_generator_method_param_default_yield_is_syntax_error() {
+        let result = parse("({ *g(a = yield 1) {} })");
+        assert!(matches!(result, Err(StatorError::SyntaxError(_))));
     }
 
     #[test]
