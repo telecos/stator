@@ -506,6 +506,12 @@ impl FunctionCompiler {
                 }
             },
             Pat::Object(obj_pat) => {
+                // Throw TypeError for `const {a} = null` / `const {a} = undefined`.
+                self.emit_ldar(source_reg);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::ThrowIfNullOrUndefined,
+                    vec![],
+                ));
                 // Check whether we need to track excluded keys for a rest
                 // element (e.g. `{a, ...rest} = obj` → rest must omit `a`).
                 let has_rest = obj_pat
@@ -690,6 +696,12 @@ impl FunctionCompiler {
                 }
             }
             Pat::Array(arr_pat) => {
+                // Throw TypeError for `const [a] = null` / `const [a] = undefined`.
+                self.emit_ldar(source_reg);
+                self.emit(Instruction::new_unchecked(
+                    Opcode::ThrowIfNullOrUndefined,
+                    vec![],
+                ));
                 let load_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
                 let call_slot = self.alloc_slot(FeedbackSlotKind::Call);
                 self.emit(Instruction::new_unchecked(
@@ -11838,5 +11850,308 @@ mod tests {
         let result =
             eval_to_value("var sum = 0; for (let {v} of [{v:1},{v:2},{v:3}]) sum += v; sum");
         assert_eq!(result, JsValue::Smi(6));
+    }
+
+    // ── Deep destructuring edge-case e2e tests ────────────────────────────
+
+    // 1. Nested rest: [a, ...[b, c]]
+    #[test]
+    fn test_nested_rest_array() {
+        let result = eval_to_value("var [a, ...[b, c]] = [1, 2, 3]; a + b + c");
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn test_nested_rest_array_skip() {
+        let result = eval_to_value("var [, ...[x]] = [1, 2, 3]; x");
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_nested_rest_into_object() {
+        let result = eval_to_value("var [a, ...{length}] = [1, 2, 3]; length");
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    // 2. Default with side effects (lazy evaluation)
+    #[test]
+    fn test_default_side_effect_not_triggered() {
+        let result = eval_to_value("var c = 0; var {a = (c = 99)} = {a: 5}; c");
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_default_side_effect_triggered() {
+        let result = eval_to_value("var c = 0; var {a = (c = 99)} = {}; c");
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_default_side_effect_array_not_triggered() {
+        let result = eval_to_value("var c = 0; var [a = (c = 42)] = [7]; c");
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_default_side_effect_array_triggered() {
+        let result = eval_to_value("var c = 0; var [a = (c = 42)] = []; c");
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    // 3. Computed property keys
+    #[test]
+    fn test_computed_key_expression() {
+        let result = eval_to_value(r#"var k = "a"; var {[k + "b"]: val} = {ab: 10}; val"#);
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_computed_key_side_effect() {
+        let result = eval_to_value("var i = 0; var {[i++]: a, [i++]: b} = {0: 10, 1: 20}; a + b");
+        assert_eq!(result, JsValue::Smi(30));
+    }
+
+    #[test]
+    fn test_computed_key_with_default() {
+        let result = eval_to_value(r#"var {["x"]: v = 42} = {}; v"#);
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_computed_key_with_default_present() {
+        let result = eval_to_value(r#"var {["x"]: v = 42} = {x: 7}; v"#);
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    // 4. Parameter destructuring
+    #[test]
+    fn test_param_destruct_object_with_default() {
+        let result = eval_to_value("function f({a = 1, b = 2}) { return a + b; } f({a: 10})");
+        assert_eq!(result, JsValue::Smi(12));
+    }
+
+    #[test]
+    fn test_param_destruct_array_with_rest() {
+        let result =
+            eval_to_value("function f([a, ...rest]) { return a + rest.length; } f([1, 2, 3])");
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_param_destruct_nested() {
+        let result = eval_to_value("function f({a: {b}}) { return b; } f({a: {b: 42}})");
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_param_destruct_multiple() {
+        let result = eval_to_value("function f({a}, [b]) { return a + b; } f({a: 3}, [7])");
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_arrow_param_destruct_object() {
+        let result = eval_to_value("var f = ({x, y}) => x * y; f({x: 3, y: 4})");
+        assert_eq!(result, JsValue::Smi(12));
+    }
+
+    #[test]
+    fn test_arrow_param_destruct_array() {
+        let result = eval_to_value("var f = ([a, b]) => a - b; f([10, 3])");
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    // 5. Assignment destructuring
+    #[test]
+    fn test_assign_destruct_object_rest() {
+        let result =
+            eval_to_value("var a, rest; ({a, ...rest} = {a: 1, b: 2, c: 3}); rest.b + rest.c");
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_assign_destruct_array_rest() {
+        let result = eval_to_value("var a, rest; [a, ...rest] = [1, 2, 3]; rest[0] + rest[1]");
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_assign_destruct_returns_rhs() {
+        let result = eval_to_value("var a, b; var r = ({a, b} = {a: 1, b: 2}); r.a + r.b");
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    // 6. Error on null/undefined
+    #[test]
+    fn test_object_destruct_null_throws() {
+        let result = crate::builtins::global::global_eval("var {a} = null; a");
+        assert!(result.is_err(), "destructuring null should throw TypeError");
+    }
+
+    #[test]
+    fn test_object_destruct_undefined_throws() {
+        let result = crate::builtins::global::global_eval("var {a} = undefined; a");
+        assert!(
+            result.is_err(),
+            "destructuring undefined should throw TypeError"
+        );
+    }
+
+    #[test]
+    fn test_array_destruct_null_throws() {
+        let result = crate::builtins::global::global_eval("var [a] = null; a");
+        assert!(
+            result.is_err(),
+            "array destructuring null should throw TypeError"
+        );
+    }
+
+    #[test]
+    fn test_array_destruct_undefined_throws() {
+        let result = crate::builtins::global::global_eval("var [a] = undefined; a");
+        assert!(
+            result.is_err(),
+            "array destructuring undefined should throw TypeError"
+        );
+    }
+
+    #[test]
+    fn test_empty_object_destruct_null_throws() {
+        let result = crate::builtins::global::global_eval("var {} = null");
+        assert!(
+            result.is_err(),
+            "empty object destructuring null should throw"
+        );
+    }
+
+    #[test]
+    fn test_nested_destruct_null_inner_throws() {
+        let result = crate::builtins::global::global_eval("var {a: {b}} = {a: null}; b");
+        assert!(
+            result.is_err(),
+            "nested destructuring of null inner should throw"
+        );
+    }
+
+    // 7. Defaults only for undefined, not null
+    #[test]
+    fn test_default_not_triggered_on_null_explicit() {
+        let result = eval_to_value("var {a = 42} = {a: null}; a");
+        assert_eq!(result, JsValue::Null);
+    }
+
+    #[test]
+    fn test_default_not_triggered_on_zero() {
+        let result = eval_to_value("var {a = 42} = {a: 0}; a");
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_default_not_triggered_on_false() {
+        let result = eval_to_value("var {a = 42} = {a: false}; a");
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_default_not_triggered_on_empty_string() {
+        let result = eval_to_value(r#"var {a = 42} = {a: ""}; a"#);
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    // 8. Deep nesting (3 levels)
+    #[test]
+    fn test_triple_nested_object() {
+        let result = eval_to_value("var {a: {b: {c: {d}}}} = {a:{b:{c:{d:99}}}}; d");
+        assert_eq!(result, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_triple_nested_array() {
+        let result = eval_to_value("var [[[[x]]]] = [[[[7]]]]; x");
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    // 9. Mixed nesting edge cases
+    #[test]
+    fn test_array_in_object_in_array() {
+        let result = eval_to_value("var [{a: [b]}] = [{a: [42]}]; b");
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_object_in_array_in_object() {
+        let result = eval_to_value("var {a: [{b}]} = {a: [{b: 10}]}; b");
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    // 10. Rest with other patterns
+    #[test]
+    fn test_object_rest_empty_remaining() {
+        let result = eval_to_value(
+            "var {a, b, ...rest} = {a: 1, b: 2}; \
+             Object.keys(rest).length",
+        );
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_array_rest_empty() {
+        let result = eval_to_value("var [a, ...rest] = [1]; rest.length");
+        assert_eq!(result, JsValue::Smi(0));
+    }
+
+    // 11. Destructuring with iterators (string)
+    #[test]
+    fn test_string_destruct_with_rest() {
+        let result = eval_to_value(r#"var [a, ...rest] = "hello"; rest.length"#);
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_string_destruct_first_char() {
+        let result = eval_to_value(r#"var [a] = "xyz"; a"#);
+        assert_eq!(result, JsValue::String("x".into()));
+    }
+
+    // 12. Destructuring in catch clause
+    #[test]
+    fn test_catch_destruct_object() {
+        let result = eval_to_value(
+            "var msg; try { throw {message: 'oops'}; } catch ({message}) { msg = message; } msg",
+        );
+        assert_eq!(result, JsValue::String("oops".into()));
+    }
+
+    // 13. Default value is a function call
+    #[test]
+    fn test_default_function_call() {
+        let result = eval_to_value("function d() { return 42; } var {a = d()} = {}; a");
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_default_function_call_not_triggered() {
+        let result = eval_to_value(
+            "var called = false; \
+             function d() { called = true; return 42; } \
+             var {a = d()} = {a: 1}; called",
+        );
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    // 14. Multiple rest exclusions with computed keys
+    #[test]
+    fn test_rest_excludes_computed_keys() {
+        let result =
+            eval_to_value(r#"var k = "b"; var {a, [k]: b, ...rest} = {a:1, b:2, c:3}; rest.c"#);
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_rest_excludes_computed_keys_verify() {
+        let result = eval_to_value(
+            r#"var k = "b"; var {a, [k]: b, ...rest} = {a:1, b:2, c:3}; rest.b === undefined"#,
+        );
+        assert_eq!(result, JsValue::Boolean(true));
     }
 }

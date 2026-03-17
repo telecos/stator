@@ -1111,6 +1111,7 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::ThrowReferenceErrorIfHole
             | Opcode::ThrowSuperNotCalledIfHole
             | Opcode::ThrowSuperAlreadyCalledIfNotHole
+            | Opcode::ThrowIfNullOrUndefined
             | Opcode::Debugger
             | Opcode::JumpConstant
             | Opcode::JumpIfTrueConstant

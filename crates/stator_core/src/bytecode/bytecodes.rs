@@ -554,6 +554,12 @@ pub enum Opcode {
     ThrowSuperNotCalledIfHole,
     /// Throw if `super()` has already been called.
     ThrowSuperAlreadyCalledIfNotHole,
+    /// Throw `TypeError` if the accumulator is null or undefined.
+    ///
+    /// Used at the entry of destructuring patterns so that
+    /// `const {a} = null` and `const [a] = undefined` produce a clear
+    /// error before any property/iterator access.  No operands.
+    ThrowIfNullOrUndefined,
     /// Throw the accumulator value.
     Throw,
     /// Re-throw a caught exception.
@@ -877,6 +883,7 @@ impl Opcode {
             Opcode::ThrowReferenceErrorIfHole => &[ConstantPoolIdx],
             Opcode::ThrowSuperNotCalledIfHole => &[],
             Opcode::ThrowSuperAlreadyCalledIfNotHole => &[],
+            Opcode::ThrowIfNullOrUndefined => &[],
             Opcode::Throw => &[],
             Opcode::ReThrow => &[],
             Opcode::SetPendingMessage => &[],

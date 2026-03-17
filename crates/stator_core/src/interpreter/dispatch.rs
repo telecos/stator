@@ -83,7 +83,7 @@ pub(super) type OpcodeHandler =
     fn(&mut DispatchContext, &Instruction) -> StatorResult<DispatchAction>;
 
 /// Number of opcode variants (= `Opcode::Illegal as usize + 1`).
-const OPCODE_COUNT: usize = 195;
+const OPCODE_COUNT: usize = 196;
 
 #[inline]
 fn handle_lda_zero(
@@ -5241,6 +5241,25 @@ fn handle_throw_super_already_called_if_not_hole(
     Ok(DispatchAction::Continue)
 }
 
+/// Throw `TypeError` if the accumulator is `null` or `undefined`.
+///
+/// This is emitted at the start of destructuring patterns so that
+/// `const {a} = null` or `const [x] = undefined` produce a proper error.
+fn handle_throw_if_null_or_undefined(
+    ctx: &mut DispatchContext,
+    _instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    match &ctx.frame.accumulator {
+        JsValue::Null => Err(StatorError::TypeError(
+            "Cannot destructure 'null' as it is null".to_string(),
+        )),
+        JsValue::Undefined => Err(StatorError::TypeError(
+            "Cannot destructure 'undefined' as it is undefined".to_string(),
+        )),
+        _ => Ok(DispatchAction::Continue),
+    }
+}
+
 fn handle_call_property0(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -6940,6 +6959,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::ThrowSuperNotCalledIfHole as usize] = handle_throw_super_not_called_if_hole;
     table[Opcode::ThrowSuperAlreadyCalledIfNotHole as usize] =
         handle_throw_super_already_called_if_not_hole;
+    table[Opcode::ThrowIfNullOrUndefined as usize] = handle_throw_if_null_or_undefined;
     table[Opcode::Throw as usize] = handle_throw;
     table[Opcode::ReThrow as usize] = handle_throw;
     table[Opcode::SetPendingMessage as usize] = handle_set_pending_message;
