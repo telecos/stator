@@ -53,6 +53,24 @@ pub fn object_create(proto: Option<Rc<RefCell<JsObject>>>) -> JsObject {
     }
 }
 
+/// ECMAScript §20.1.2.2 `Object.create(proto, propertiesObject)`.
+///
+/// Creates a new ordinary object with the given prototype, then defines
+/// properties on it using the same semantics as
+/// [`object_define_properties`] (i.e. the second argument to `Object.create`).
+///
+/// If `properties` is `None`, behaves identically to [`object_create`].
+pub fn object_create_with_properties(
+    proto: Option<Rc<RefCell<JsObject>>>,
+    properties: Option<&JsValue>,
+) -> StatorResult<JsObject> {
+    let mut obj = object_create(proto);
+    if let Some(props) = properties {
+        object_define_properties(&mut obj, props)?;
+    }
+    Ok(obj)
+}
+
 // ── Object.assign ─────────────────────────────────────────────────────────────
 
 /// ECMAScript §20.1.2.1 `Object.assign(target, ...sources)`.
@@ -404,6 +422,26 @@ pub fn object_get_own_property_descriptors(
         .collect()
 }
 
+/// ECMAScript §20.1.2.10 `Object.getOwnPropertyDescriptors(obj)` — returns a
+/// descriptor *object*.
+///
+/// Returns a [`JsValue::PlainObject`] whose own properties are property names
+/// (including symbol keys) mapped to their corresponding descriptor objects
+/// (as returned by [`object_get_own_property_descriptor_as_object`]).
+pub fn object_get_own_property_descriptors_as_object(obj: &JsObject) -> JsValue {
+    use crate::objects::property_map::PropertyMap;
+    let mut map = PropertyMap::new();
+    for key in obj.own_property_keys() {
+        if is_internal_accessor_key(&key) {
+            continue;
+        }
+        if let Some(desc_obj) = object_get_own_property_descriptor_as_object(obj, &key) {
+            map.insert(key, desc_obj);
+        }
+    }
+    JsValue::PlainObject(Rc::new(RefCell::new(map)))
+}
+
 // ── Object.getOwnPropertySymbols ─────────────────────────────────────────────
 
 /// ECMAScript §20.1.2.11 `Object.getOwnPropertySymbols(obj)`.
@@ -526,7 +564,7 @@ pub fn object_define_properties(obj: &mut JsObject, props: &JsValue) -> StatorRe
     let entries: Vec<(String, JsValue)> = match props {
         JsValue::PlainObject(map) => map
             .borrow()
-            .iter()
+            .enumerable_iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         _ => {
@@ -1562,6 +1600,788 @@ mod tests {
         let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
         object_define_property_from_descriptor(&mut obj, "x", &desc).unwrap();
 
+        let (_, attrs) = obj.get_own_property_descriptor("x").unwrap();
+        assert!(!attrs.contains(PropertyAttributes::WRITABLE));
+        assert!(attrs.contains(PropertyAttributes::ENUMERABLE));
+        assert!(attrs.contains(PropertyAttributes::CONFIGURABLE));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  E2E property-attribute deep-conformance tests
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── 1. Object.defineProperties ──────────────────────────────────────────
+
+    #[test]
+    fn test_e2e_define_properties_defines_multiple_with_correct_attrs() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+
+        let mut desc_x = PropertyMap::new();
+        desc_x.insert("value".to_string(), JsValue::Smi(1));
+        desc_x.insert("writable".to_string(), JsValue::Boolean(false));
+        desc_x.insert("enumerable".to_string(), JsValue::Boolean(true));
+        desc_x.insert("configurable".to_string(), JsValue::Boolean(false));
+
+        let mut desc_y = PropertyMap::new();
+        desc_y.insert("value".to_string(), JsValue::Smi(2));
+        desc_y.insert("writable".to_string(), JsValue::Boolean(true));
+        desc_y.insert("enumerable".to_string(), JsValue::Boolean(false));
+        desc_y.insert("configurable".to_string(), JsValue::Boolean(true));
+
+        let mut props_map = PropertyMap::new();
+        props_map.insert(
+            "x".to_string(),
+            JsValue::PlainObject(Rc::new(RefCell::new(desc_x))),
+        );
+        props_map.insert(
+            "y".to_string(),
+            JsValue::PlainObject(Rc::new(RefCell::new(desc_y))),
+        );
+        let props = JsValue::PlainObject(Rc::new(RefCell::new(props_map)));
+
+        object_define_properties(&mut obj, &props).unwrap();
+
+        // x: non-writable, enumerable, non-configurable
+        let (xv, xa) = obj.get_own_property_descriptor("x").unwrap();
+        assert_eq!(xv, JsValue::Smi(1));
+        assert!(!xa.contains(PropertyAttributes::WRITABLE));
+        assert!(xa.contains(PropertyAttributes::ENUMERABLE));
+        assert!(!xa.contains(PropertyAttributes::CONFIGURABLE));
+
+        // y: writable, non-enumerable, configurable
+        let (yv, ya) = obj.get_own_property_descriptor("y").unwrap();
+        assert_eq!(yv, JsValue::Smi(2));
+        assert!(ya.contains(PropertyAttributes::WRITABLE));
+        assert!(!ya.contains(PropertyAttributes::ENUMERABLE));
+        assert!(ya.contains(PropertyAttributes::CONFIGURABLE));
+    }
+
+    #[test]
+    fn test_e2e_define_properties_only_reads_enumerable_props() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+
+        let mut desc_a = PropertyMap::new();
+        desc_a.insert("value".to_string(), JsValue::Smi(10));
+        let mut desc_b = PropertyMap::new();
+        desc_b.insert("value".to_string(), JsValue::Smi(20));
+
+        let mut props_map = PropertyMap::new();
+        props_map.insert(
+            "a".to_string(),
+            JsValue::PlainObject(Rc::new(RefCell::new(desc_a))),
+        );
+        // Make 'b' non-enumerable in the props object.
+        props_map.insert_with_attrs(
+            "b".to_string(),
+            JsValue::PlainObject(Rc::new(RefCell::new(desc_b))),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        );
+        let props = JsValue::PlainObject(Rc::new(RefCell::new(props_map)));
+
+        object_define_properties(&mut obj, &props).unwrap();
+
+        assert!(obj.has_own_property("a"), "'a' should be defined");
+        assert!(
+            !obj.has_own_property("b"),
+            "'b' should NOT be defined (non-enumerable in props)"
+        );
+    }
+
+    // ── 2. Non-writable property semantics ──────────────────────────────────
+
+    #[test]
+    fn test_e2e_nonwritable_rejects_set_property() {
+        let mut obj = JsObject::new();
+        obj.define_own_property("ro", JsValue::Smi(42), PropertyAttributes::ENUMERABLE)
+            .unwrap();
+        let err = obj.set_property("ro", JsValue::Smi(99));
+        assert!(err.is_err(), "set_property on non-writable must fail");
+        assert_eq!(obj.get_own_property("ro"), Some(JsValue::Smi(42)));
+    }
+
+    #[test]
+    fn test_e2e_nonwritable_value_preserved_after_failed_set() {
+        let mut obj = JsObject::new();
+        obj.define_own_property(
+            "x",
+            JsValue::String("original".to_string().into()),
+            PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE,
+        )
+        .unwrap();
+        let _ = obj.set_property("x", JsValue::String("changed".to_string().into()));
+        assert_eq!(
+            obj.get_own_property("x"),
+            Some(JsValue::String("original".to_string().into()))
+        );
+    }
+
+    // ── 3. Non-enumerable property semantics ────────────────────────────────
+
+    #[test]
+    fn test_e2e_nonenumerable_hidden_from_object_keys() {
+        let mut obj = JsObject::new();
+        obj.set_property("visible", JsValue::Smi(1)).unwrap();
+        obj.define_own_property(
+            "hidden",
+            JsValue::Smi(2),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        )
+        .unwrap();
+
+        let keys = object_keys(&obj);
+        assert!(keys.contains(&"visible".to_string()));
+        assert!(!keys.contains(&"hidden".to_string()));
+    }
+
+    #[test]
+    fn test_e2e_nonenumerable_hidden_from_object_values() {
+        let mut obj = JsObject::new();
+        obj.set_property("a", JsValue::Smi(1)).unwrap();
+        obj.define_own_property(
+            "b",
+            JsValue::Smi(2),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        )
+        .unwrap();
+
+        let vals = object_values(&obj);
+        assert_eq!(vals, vec![JsValue::Smi(1)]);
+    }
+
+    #[test]
+    fn test_e2e_nonenumerable_hidden_from_object_entries() {
+        let mut obj = JsObject::new();
+        obj.set_property("a", JsValue::Smi(1)).unwrap();
+        obj.define_own_property(
+            "b",
+            JsValue::Smi(2),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        )
+        .unwrap();
+
+        let entries = object_entries(&obj);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "a");
+    }
+
+    #[test]
+    fn test_e2e_nonenumerable_visible_to_get_own_property_names() {
+        let mut obj = JsObject::new();
+        obj.define_own_property(
+            "hidden",
+            JsValue::Smi(1),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        )
+        .unwrap();
+
+        let names = object_get_own_property_names(&obj);
+        assert!(names.contains(&"hidden".to_string()));
+    }
+
+    #[test]
+    fn test_e2e_nonenumerable_hidden_from_object_assign() {
+        let mut target = JsObject::new();
+        let mut src = JsObject::new();
+        src.set_property("vis", JsValue::Smi(1)).unwrap();
+        src.define_own_property(
+            "hid",
+            JsValue::Smi(2),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        )
+        .unwrap();
+
+        object_assign(&mut target, &[&src]).unwrap();
+        assert!(target.has_own_property("vis"));
+        assert!(!target.has_own_property("hid"));
+    }
+
+    // ── 4. Non-configurable property semantics ──────────────────────────────
+
+    #[test]
+    fn test_e2e_nonconfigurable_cannot_delete() {
+        let mut obj = JsObject::new();
+        obj.define_own_property("nc", JsValue::Smi(1), PropertyAttributes::WRITABLE)
+            .unwrap();
+        assert!(!obj.delete_own_property("nc").unwrap());
+        assert!(obj.has_own_property("nc"));
+    }
+
+    #[test]
+    fn test_e2e_nonconfigurable_cannot_change_configurable_flag() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+        obj.define_own_property("p", JsValue::Smi(1), PropertyAttributes::WRITABLE)
+            .unwrap();
+
+        let mut desc_map = PropertyMap::new();
+        desc_map.insert("configurable".to_string(), JsValue::Boolean(true));
+        let desc = JsValue::PlainObject(Rc::new(RefCell::new(desc_map)));
+
+        let err = object_define_property_from_descriptor(&mut obj, "p", &desc);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_e2e_nonconfigurable_cannot_change_enumerable() {
+        let mut obj = JsObject::new();
+        obj.define_own_property("p", JsValue::Smi(1), PropertyAttributes::WRITABLE)
+            .unwrap();
+
+        let err = obj.define_own_property(
+            "p",
+            JsValue::Smi(1),
+            PropertyAttributes::WRITABLE | PropertyAttributes::ENUMERABLE,
+        );
+        assert!(err.is_err());
+    }
+
+    // ── 5. Accessor ↔ data conversion ───────────────────────────────────────
+
+    #[test]
+    fn test_e2e_configurable_accessor_to_data_conversion() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+
+        let mut acc = PropertyMap::new();
+        acc.insert("get".to_string(), JsValue::Boolean(true));
+        acc.insert("configurable".to_string(), JsValue::Boolean(true));
+        let acc_desc = JsValue::PlainObject(Rc::new(RefCell::new(acc)));
+        object_define_property_from_descriptor(&mut obj, "p", &acc_desc).unwrap();
+
+        let desc = object_get_own_property_descriptor_as_object(&obj, "p").unwrap();
+        let fpd = FullPropertyDescriptor::from_object(&desc).unwrap();
+        assert!(fpd.is_accessor());
+
+        let mut data = PropertyMap::new();
+        data.insert("value".to_string(), JsValue::Smi(42));
+        data.insert("writable".to_string(), JsValue::Boolean(true));
+        let data_desc = JsValue::PlainObject(Rc::new(RefCell::new(data)));
+        object_define_property_from_descriptor(&mut obj, "p", &data_desc).unwrap();
+
+        assert_eq!(obj.get_own_property("p"), Some(JsValue::Smi(42)));
+        assert!(!obj.has_own_property("__get_p__"));
+    }
+
+    #[test]
+    fn test_e2e_configurable_data_to_accessor_conversion() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+        obj.set_property("p", JsValue::Smi(10)).unwrap();
+
+        let mut acc = PropertyMap::new();
+        acc.insert("get".to_string(), JsValue::Boolean(true));
+        acc.insert("set".to_string(), JsValue::Boolean(false));
+        acc.insert("configurable".to_string(), JsValue::Boolean(true));
+        let acc_desc = JsValue::PlainObject(Rc::new(RefCell::new(acc)));
+        object_define_property_from_descriptor(&mut obj, "p", &acc_desc).unwrap();
+
+        assert!(obj.has_own_property("__get_p__"));
+        assert!(obj.has_own_property("__set_p__"));
+    }
+
+    #[test]
+    fn test_e2e_nonconfigurable_rejects_data_to_accessor() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+        obj.define_own_property("p", JsValue::Smi(1), PropertyAttributes::empty())
+            .unwrap();
+
+        let mut acc = PropertyMap::new();
+        acc.insert("get".to_string(), JsValue::Boolean(true));
+        let acc_desc = JsValue::PlainObject(Rc::new(RefCell::new(acc)));
+
+        let err = object_define_property_from_descriptor(&mut obj, "p", &acc_desc);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_e2e_nonconfigurable_rejects_accessor_to_data() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+
+        let mut acc = PropertyMap::new();
+        acc.insert("get".to_string(), JsValue::Boolean(true));
+        acc.insert("configurable".to_string(), JsValue::Boolean(false));
+        let acc_desc = JsValue::PlainObject(Rc::new(RefCell::new(acc)));
+        object_define_property_from_descriptor(&mut obj, "p", &acc_desc).unwrap();
+
+        let mut data = PropertyMap::new();
+        data.insert("value".to_string(), JsValue::Smi(1));
+        let data_desc = JsValue::PlainObject(Rc::new(RefCell::new(data)));
+
+        let err = object_define_property_from_descriptor(&mut obj, "p", &data_desc);
+        assert!(err.is_err());
+    }
+
+    // ── 6. Object.getOwnPropertyDescriptors (as object) ────────────────────
+
+    #[test]
+    fn test_e2e_get_own_property_descriptors_as_object_basic() {
+        let mut obj = JsObject::new();
+        obj.set_property("a", JsValue::Smi(1)).unwrap();
+        obj.define_own_property(
+            "b",
+            JsValue::Smi(2),
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+        )
+        .unwrap();
+
+        let result = object_get_own_property_descriptors_as_object(&obj);
+        if let JsValue::PlainObject(map) = result {
+            let borrow = map.borrow();
+            assert!(borrow.contains_key("a"));
+            assert!(borrow.contains_key("b"));
+
+            if let Some(JsValue::PlainObject(desc_a)) = borrow.get("a") {
+                let desc_a = desc_a.borrow();
+                assert_eq!(desc_a.get("value"), Some(&JsValue::Smi(1)));
+                assert_eq!(desc_a.get("enumerable"), Some(&JsValue::Boolean(true)));
+            } else {
+                panic!("expected PlainObject for descriptor 'a'");
+            }
+
+            if let Some(JsValue::PlainObject(desc_b)) = borrow.get("b") {
+                let desc_b = desc_b.borrow();
+                assert_eq!(desc_b.get("value"), Some(&JsValue::Smi(2)));
+                assert_eq!(desc_b.get("enumerable"), Some(&JsValue::Boolean(false)));
+            } else {
+                panic!("expected PlainObject for descriptor 'b'");
+            }
+        } else {
+            panic!("expected PlainObject");
+        }
+    }
+
+    #[test]
+    fn test_e2e_get_own_property_descriptors_as_object_empty() {
+        let obj = JsObject::new();
+        let result = object_get_own_property_descriptors_as_object(&obj);
+        if let JsValue::PlainObject(map) = result {
+            assert!(map.borrow().is_empty());
+        } else {
+            panic!("expected PlainObject");
+        }
+    }
+
+    // ── 7. Redefining properties ────────────────────────────────────────────
+
+    #[test]
+    fn test_e2e_configurable_property_allows_all_changes() {
+        let mut obj = JsObject::new();
+        obj.set_property("p", JsValue::Smi(1)).unwrap();
+
+        obj.define_own_property("p", JsValue::Smi(2), PropertyAttributes::CONFIGURABLE)
+            .unwrap();
+        let (v, a) = obj.get_own_property_descriptor("p").unwrap();
+        assert_eq!(v, JsValue::Smi(2));
+        assert!(!a.contains(PropertyAttributes::WRITABLE));
+        assert!(!a.contains(PropertyAttributes::ENUMERABLE));
+        assert!(a.contains(PropertyAttributes::CONFIGURABLE));
+    }
+
+    #[test]
+    fn test_e2e_nonconfigurable_allows_narrowing_writable() {
+        let mut obj = JsObject::new();
+        obj.define_own_property("p", JsValue::Smi(1), PropertyAttributes::WRITABLE)
+            .unwrap();
+        obj.define_own_property("p", JsValue::Smi(1), PropertyAttributes::empty())
+            .unwrap();
+        let (_, a) = obj.get_own_property_descriptor("p").unwrap();
+        assert!(!a.contains(PropertyAttributes::WRITABLE));
+    }
+
+    #[test]
+    fn test_e2e_nonconfigurable_rejects_widening_writable() {
+        let mut obj = JsObject::new();
+        obj.define_own_property("p", JsValue::Smi(1), PropertyAttributes::empty())
+            .unwrap();
+        let err = obj.define_own_property("p", JsValue::Smi(1), PropertyAttributes::WRITABLE);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_e2e_nonconfigurable_nonwritable_same_value_ok() {
+        let mut obj = JsObject::new();
+        obj.define_own_property("p", JsValue::Smi(42), PropertyAttributes::empty())
+            .unwrap();
+        obj.define_own_property("p", JsValue::Smi(42), PropertyAttributes::empty())
+            .unwrap();
+    }
+
+    #[test]
+    fn test_e2e_nonconfigurable_nonwritable_different_value_rejected() {
+        let mut obj = JsObject::new();
+        obj.define_own_property("p", JsValue::Smi(1), PropertyAttributes::empty())
+            .unwrap();
+        let err = obj.define_own_property("p", JsValue::Smi(2), PropertyAttributes::empty());
+        assert!(err.is_err());
+    }
+
+    // ── 8. Property order ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_e2e_property_order_slow_mode_preserves_insertion() {
+        let mut obj = JsObject::new();
+        for i in 0..crate::objects::js_object::MAX_FAST_PROPERTIES {
+            obj.set_property(&format!("p{i}"), JsValue::Smi(i as i32))
+                .unwrap();
+        }
+        obj.set_property("extra1", JsValue::Smi(100)).unwrap();
+        obj.set_property("extra2", JsValue::Smi(200)).unwrap();
+
+        let keys = obj.own_property_keys();
+        assert!(keys.contains(&"extra1".to_string()));
+        assert!(keys.contains(&"extra2".to_string()));
+        let i1 = keys.iter().position(|k| k == "extra1").unwrap();
+        let i2 = keys.iter().position(|k| k == "extra2").unwrap();
+        assert!(i1 < i2, "insertion order must be preserved in slow mode");
+    }
+
+    #[test]
+    fn test_e2e_property_order_integer_indices_first_in_property_map() {
+        use crate::objects::property_map::PropertyMap;
+        let mut pm = PropertyMap::new();
+        pm.insert("z".to_string(), JsValue::Smi(1));
+        pm.insert("10".to_string(), JsValue::Smi(2));
+        pm.insert("a".to_string(), JsValue::Smi(3));
+        pm.insert("2".to_string(), JsValue::Smi(4));
+
+        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["2", "10", "z", "a"]);
+    }
+
+    // ── 9. Object.create with propertiesObject ──────────────────────────────
+
+    #[test]
+    fn test_e2e_create_with_properties_defines_props() {
+        use crate::objects::property_map::PropertyMap;
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+
+        let mut desc_x = PropertyMap::new();
+        desc_x.insert("value".to_string(), JsValue::Smi(42));
+        desc_x.insert("writable".to_string(), JsValue::Boolean(true));
+        desc_x.insert("enumerable".to_string(), JsValue::Boolean(true));
+        desc_x.insert("configurable".to_string(), JsValue::Boolean(true));
+
+        let mut props_map = PropertyMap::new();
+        props_map.insert(
+            "x".to_string(),
+            JsValue::PlainObject(Rc::new(RefCell::new(desc_x))),
+        );
+        let props = JsValue::PlainObject(Rc::new(RefCell::new(props_map)));
+
+        let obj = object_create_with_properties(Some(proto), Some(&props)).unwrap();
+        assert_eq!(obj.get_own_property("x"), Some(JsValue::Smi(42)));
+        assert!(obj.prototype().is_some());
+    }
+
+    #[test]
+    fn test_e2e_create_with_properties_null_proto() {
+        use crate::objects::property_map::PropertyMap;
+        let mut desc = PropertyMap::new();
+        desc.insert("value".to_string(), JsValue::Smi(1));
+        let mut props_map = PropertyMap::new();
+        props_map.insert(
+            "k".to_string(),
+            JsValue::PlainObject(Rc::new(RefCell::new(desc))),
+        );
+        let props = JsValue::PlainObject(Rc::new(RefCell::new(props_map)));
+
+        let obj = object_create_with_properties(None, Some(&props)).unwrap();
+        assert!(obj.prototype().is_none());
+        assert_eq!(obj.get_own_property("k"), Some(JsValue::Smi(1)));
+    }
+
+    #[test]
+    fn test_e2e_create_with_no_properties() {
+        let obj = object_create_with_properties(None, None).unwrap();
+        assert!(obj.own_property_keys().is_empty());
+    }
+
+    #[test]
+    fn test_e2e_create_with_properties_respects_attributes() {
+        use crate::objects::property_map::PropertyMap;
+        let mut desc = PropertyMap::new();
+        desc.insert("value".to_string(), JsValue::Smi(7));
+        desc.insert("writable".to_string(), JsValue::Boolean(false));
+        desc.insert("enumerable".to_string(), JsValue::Boolean(false));
+        desc.insert("configurable".to_string(), JsValue::Boolean(false));
+        let mut props_map = PropertyMap::new();
+        props_map.insert(
+            "readonly".to_string(),
+            JsValue::PlainObject(Rc::new(RefCell::new(desc))),
+        );
+        let props = JsValue::PlainObject(Rc::new(RefCell::new(props_map)));
+
+        let obj = object_create_with_properties(None, Some(&props)).unwrap();
+        let (_, attrs) = obj.get_own_property_descriptor("readonly").unwrap();
+        assert!(!attrs.contains(PropertyAttributes::WRITABLE));
+        assert!(!attrs.contains(PropertyAttributes::ENUMERABLE));
+        assert!(!attrs.contains(PropertyAttributes::CONFIGURABLE));
+    }
+
+    // ── 10. Frozen / sealed property behaviour ──────────────────────────────
+
+    #[test]
+    fn test_e2e_frozen_object_rejects_define_property_value_change() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        object_freeze(&mut obj).unwrap();
+
+        let err = obj.define_own_property("x", JsValue::Smi(2), PropertyAttributes::empty());
+        assert!(err.is_err(), "frozen obj must reject value change");
+    }
+
+    #[test]
+    fn test_e2e_frozen_object_rejects_new_property() {
+        let mut obj = JsObject::new();
+        object_freeze(&mut obj).unwrap();
+        let err = obj.define_own_property("new", JsValue::Smi(1), PropertyAttributes::empty());
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_e2e_frozen_object_allows_same_value_define() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        object_freeze(&mut obj).unwrap();
+
+        obj.define_own_property("x", JsValue::Smi(1), PropertyAttributes::empty())
+            .unwrap();
+    }
+
+    #[test]
+    fn test_e2e_frozen_object_rejects_writable_change() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        object_freeze(&mut obj).unwrap();
+
+        let mut desc = PropertyMap::new();
+        desc.insert("writable".to_string(), JsValue::Boolean(true));
+        let d = JsValue::PlainObject(Rc::new(RefCell::new(desc)));
+
+        let err = object_define_property_from_descriptor(&mut obj, "x", &d);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_e2e_sealed_object_allows_value_change_on_writable() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        object_seal(&mut obj).unwrap();
+
+        obj.set_property("x", JsValue::Smi(99)).unwrap();
+        assert_eq!(obj.get_own_property("x"), Some(JsValue::Smi(99)));
+    }
+
+    #[test]
+    fn test_e2e_sealed_object_rejects_new_property() {
+        let mut obj = JsObject::new();
+        object_seal(&mut obj).unwrap();
+        let err = obj.set_property("new", JsValue::Smi(1));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_e2e_sealed_object_rejects_delete() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        object_seal(&mut obj).unwrap();
+        assert!(!obj.delete_own_property("x").unwrap());
+    }
+
+    // ── 11. Descriptor defaults ─────────────────────────────────────────────
+
+    #[test]
+    fn test_e2e_define_property_defaults_writable_false() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+        let mut desc = PropertyMap::new();
+        desc.insert("value".to_string(), JsValue::Smi(1));
+        let d = JsValue::PlainObject(Rc::new(RefCell::new(desc)));
+        object_define_property_from_descriptor(&mut obj, "p", &d).unwrap();
+
+        let (_, attrs) = obj.get_own_property_descriptor("p").unwrap();
+        assert!(!attrs.contains(PropertyAttributes::WRITABLE));
+        assert!(!attrs.contains(PropertyAttributes::ENUMERABLE));
+        assert!(!attrs.contains(PropertyAttributes::CONFIGURABLE));
+    }
+
+    #[test]
+    fn test_e2e_set_property_defaults_all_true() {
+        let mut obj = JsObject::new();
+        obj.set_property("p", JsValue::Smi(1)).unwrap();
+
+        let (_, attrs) = obj.get_own_property_descriptor("p").unwrap();
+        assert!(attrs.contains(PropertyAttributes::WRITABLE));
+        assert!(attrs.contains(PropertyAttributes::ENUMERABLE));
+        assert!(attrs.contains(PropertyAttributes::CONFIGURABLE));
+    }
+
+    // ── 12. Generic descriptor ──────────────────────────────────────────────
+
+    #[test]
+    fn test_e2e_generic_descriptor_only_changes_specified_attrs() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+        obj.set_property("p", JsValue::Smi(1)).unwrap();
+
+        let mut desc = PropertyMap::new();
+        desc.insert("enumerable".to_string(), JsValue::Boolean(false));
+        let d = JsValue::PlainObject(Rc::new(RefCell::new(desc)));
+        object_define_property_from_descriptor(&mut obj, "p", &d).unwrap();
+
+        let (v, a) = obj.get_own_property_descriptor("p").unwrap();
+        assert_eq!(v, JsValue::Smi(1));
+        assert!(a.contains(PropertyAttributes::WRITABLE));
+        assert!(!a.contains(PropertyAttributes::ENUMERABLE));
+        assert!(a.contains(PropertyAttributes::CONFIGURABLE));
+    }
+
+    // ── 13. Non-configurable accessor — getter/setter immutability ──────────
+
+    #[test]
+    fn test_e2e_nonconfigurable_accessor_same_getter_setter_ok() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+
+        let mut acc = PropertyMap::new();
+        acc.insert("get".to_string(), JsValue::Boolean(true));
+        acc.insert("set".to_string(), JsValue::Boolean(false));
+        acc.insert("configurable".to_string(), JsValue::Boolean(false));
+        let d = JsValue::PlainObject(Rc::new(RefCell::new(acc)));
+        object_define_property_from_descriptor(&mut obj, "x", &d).unwrap();
+
+        let mut acc2 = PropertyMap::new();
+        acc2.insert("get".to_string(), JsValue::Boolean(true));
+        acc2.insert("set".to_string(), JsValue::Boolean(false));
+        let d2 = JsValue::PlainObject(Rc::new(RefCell::new(acc2)));
+        object_define_property_from_descriptor(&mut obj, "x", &d2).unwrap();
+    }
+
+    #[test]
+    fn test_e2e_nonconfigurable_accessor_rejects_setter_change() {
+        use crate::objects::property_map::PropertyMap;
+        let mut obj = JsObject::new();
+
+        let mut acc = PropertyMap::new();
+        acc.insert("get".to_string(), JsValue::Boolean(true));
+        acc.insert("set".to_string(), JsValue::Boolean(false));
+        acc.insert("configurable".to_string(), JsValue::Boolean(false));
+        let d = JsValue::PlainObject(Rc::new(RefCell::new(acc)));
+        object_define_property_from_descriptor(&mut obj, "x", &d).unwrap();
+
+        let mut acc2 = PropertyMap::new();
+        acc2.insert("get".to_string(), JsValue::Boolean(true));
+        acc2.insert("set".to_string(), JsValue::Smi(999));
+        let d2 = JsValue::PlainObject(Rc::new(RefCell::new(acc2)));
+        let err = object_define_property_from_descriptor(&mut obj, "x", &d2);
+        assert!(err.is_err());
+    }
+
+    // ── 14. Extensibility ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_e2e_preventextensions_rejects_new_define() {
+        let mut obj = JsObject::new();
+        obj.prevent_extensions();
+        let err = obj.define_own_property("x", JsValue::Smi(1), PropertyAttributes::empty());
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_e2e_preventextensions_allows_existing_redefine() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        obj.prevent_extensions();
+        obj.define_own_property(
+            "x",
+            JsValue::Smi(2),
+            PropertyAttributes::WRITABLE
+                | PropertyAttributes::ENUMERABLE
+                | PropertyAttributes::CONFIGURABLE,
+        )
+        .unwrap();
+        assert_eq!(obj.get_own_property("x"), Some(JsValue::Smi(2)));
+    }
+
+    // ── 15. has_own vs prototype chain ──────────────────────────────────────
+
+    #[test]
+    fn test_e2e_object_keys_exclude_prototype_chain() {
+        let proto = Rc::new(RefCell::new(JsObject::new()));
+        proto
+            .borrow_mut()
+            .set_property("inherited", JsValue::Smi(0))
+            .unwrap();
+        let mut child = object_create(Some(proto));
+        child.set_property("own", JsValue::Smi(1)).unwrap();
+
+        let keys = object_keys(&child);
+        assert_eq!(keys, vec!["own".to_string()]);
+    }
+
+    // ── 16. Slow-mode delete preserves order ────────────────────────────────
+
+    #[test]
+    fn test_e2e_slow_mode_delete_preserves_key_order() {
+        let mut obj = JsObject::new();
+        for i in 0..crate::objects::js_object::MAX_FAST_PROPERTIES + 2 {
+            obj.set_property(&format!("p{i}"), JsValue::Smi(i as i32))
+                .unwrap();
+        }
+        assert!(!obj.is_fast_mode());
+
+        obj.delete_own_property("p0").unwrap();
+        let keys = obj.own_property_keys();
+        assert!(!keys.contains(&"p0".to_string()));
+        assert_eq!(keys[0], "p1");
+    }
+
+    // ── 17. is_frozen / is_sealed comprehensive ─────────────────────────────
+
+    #[test]
+    fn test_e2e_is_frozen_requires_all_conditions() {
+        let mut obj = JsObject::new();
+        obj.set_property("a", JsValue::Smi(1)).unwrap();
+        assert!(!object_is_frozen(&obj));
+
+        obj.prevent_extensions();
+        assert!(!object_is_frozen(&obj));
+
+        let keys: Vec<String> = obj.own_property_keys();
+        for key in keys {
+            if let Some((value, _)) = obj.get_own_property_descriptor(&key) {
+                obj.define_own_property(&key, value, PropertyAttributes::empty())
+                    .unwrap();
+            }
+        }
+        assert!(object_is_frozen(&obj));
+    }
+
+    #[test]
+    fn test_e2e_frozen_is_also_sealed() {
+        let mut obj = JsObject::new();
+        obj.set_property("x", JsValue::Smi(1)).unwrap();
+        object_freeze(&mut obj).unwrap();
+        assert!(object_is_frozen(&obj));
+        assert!(object_is_sealed(&obj));
+    }
+
+    // ── 18. defineProperty on new property sets correct attrs ──────────────
+
+    #[test]
+    fn test_e2e_define_own_property_new_prop_sets_exact_attrs() {
+        let mut obj = JsObject::new();
+        obj.define_own_property(
+            "x",
+            JsValue::Smi(1),
+            PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE,
+        )
+        .unwrap();
         let (_, attrs) = obj.get_own_property_descriptor("x").unwrap();
         assert!(!attrs.contains(PropertyAttributes::WRITABLE));
         assert!(attrs.contains(PropertyAttributes::ENUMERABLE));

@@ -69,9 +69,13 @@ enum NamedProperties {
     /// [`MAX_FAST_PROPERTIES`] properties are held inline via [`SmallVec`].
     Fast(Box<SmallVec<[JsValue; MAX_FAST_PROPERTIES]>>),
     /// Slow (dictionary) mode: each entry carries both its value and its
-    /// [`PropertyAttributes`].  Used once more than [`MAX_FAST_PROPERTIES`]
-    /// properties have been defined.
-    Slow(HashMap<String, SlowProperty>),
+    /// [`PropertyAttributes`].  `key_order` preserves ECMAScript property
+    /// enumeration order (integer indices ascending, then string keys in
+    /// insertion order).
+    Slow {
+        map: HashMap<String, SlowProperty>,
+        key_order: Vec<String>,
+    },
 }
 
 /// A JavaScript ordinary object per ECMAScript §10.1.
@@ -230,7 +234,7 @@ impl JsObject {
                 .iter()
                 .map(|d| d.key().to_string())
                 .collect(),
-            NamedProperties::Slow(map) => map.keys().cloned().collect(),
+            NamedProperties::Slow { key_order, .. } => key_order.clone(),
         }
     }
 
@@ -243,7 +247,9 @@ impl JsObject {
             NamedProperties::Fast(values) => self
                 .fast_index_and_attrs(key)
                 .and_then(|(i, attrs)| values.get(i).map(|v| (v.clone(), attrs))),
-            NamedProperties::Slow(map) => map.get(key).map(|e| (e.value.clone(), e.attributes)),
+            NamedProperties::Slow { map, .. } => {
+                map.get(key).map(|e| (e.value.clone(), e.attributes))
+            }
         }
     }
 
@@ -256,15 +262,15 @@ impl JsObject {
     fn normalise_to_slow(&mut self) {
         let new_storage = if let NamedProperties::Fast(ref values) = self.named_properties {
             let mut map = HashMap::new();
+            let mut key_order = Vec::with_capacity(self.map.descriptors().len());
             for (i, desc) in self.map.descriptors().iter().enumerate() {
                 if let Some(val) = values.get(i) {
-                    map.insert(
-                        desc.key().to_string(),
-                        SlowProperty::new(val.clone(), desc.attributes()),
-                    );
+                    let k = desc.key().to_string();
+                    map.insert(k.clone(), SlowProperty::new(val.clone(), desc.attributes()));
+                    key_order.push(k);
                 }
             }
-            Some(NamedProperties::Slow(map))
+            Some(NamedProperties::Slow { map, key_order })
         } else {
             None
         };
@@ -289,7 +295,7 @@ impl JsObject {
     fn own_property_attrs(&self, key: &str) -> Option<PropertyAttributes> {
         match &self.named_properties {
             NamedProperties::Fast(_) => self.fast_index_and_attrs(key).map(|(_, a)| a),
-            NamedProperties::Slow(map) => map.get(key).map(|e| e.attributes),
+            NamedProperties::Slow { map, .. } => map.get(key).map(|e| e.attributes),
         }
     }
 
@@ -313,7 +319,7 @@ impl JsObject {
             NamedProperties::Fast(values) => self
                 .fast_index_and_attrs(key)
                 .and_then(|(i, _)| values.get(i).cloned()),
-            NamedProperties::Slow(map) => map.get(key).map(|e| e.value.clone()),
+            NamedProperties::Slow { map, .. } => map.get(key).map(|e| e.value.clone()),
         }
     }
 
@@ -321,7 +327,7 @@ impl JsObject {
     pub fn has_own_property(&self, key: &str) -> bool {
         match &self.named_properties {
             NamedProperties::Fast(_) => self.fast_index_and_attrs(key).is_some(),
-            NamedProperties::Slow(map) => map.contains_key(key),
+            NamedProperties::Slow { map, .. } => map.contains_key(key),
         }
     }
 
@@ -404,7 +410,7 @@ impl JsObject {
             NamedProperties::Fast(values) => self
                 .fast_index_and_attrs(key)
                 .and_then(|(i, a)| values.get(i).map(|_| (i, a))),
-            NamedProperties::Slow(map) => map.get(key).map(|e| (usize::MAX, e.attributes)),
+            NamedProperties::Slow { map, .. } => map.get(key).map(|e| (usize::MAX, e.attributes)),
         };
 
         if let Some((idx, attrs)) = existing {
@@ -416,7 +422,7 @@ impl JsObject {
             }
             match &mut self.named_properties {
                 NamedProperties::Fast(values) => values[idx] = value,
-                NamedProperties::Slow(map) => {
+                NamedProperties::Slow { map, .. } => {
                     if let Some(entry) = map.get_mut(key) {
                         entry.value = value;
                     }
@@ -442,7 +448,7 @@ impl JsObject {
             // Create a new own property.
             let fast_len = match &self.named_properties {
                 NamedProperties::Fast(v) => Some(v.len()),
-                NamedProperties::Slow(_) => None,
+                NamedProperties::Slow { .. } => None,
             };
             if let Some(len) = fast_len {
                 if len < MAX_FAST_PROPERTIES {
@@ -455,12 +461,22 @@ impl JsObject {
                 } else {
                     // Exceeded fast-mode capacity: normalise then add.
                     self.normalise_to_slow();
-                    if let NamedProperties::Slow(ref mut map) = self.named_properties {
+                    if let NamedProperties::Slow {
+                        ref mut map,
+                        ref mut key_order,
+                    } = self.named_properties
+                    {
                         map.insert(key.to_string(), SlowProperty::new(value, default_attrs));
+                        key_order.push(key.to_string());
                     }
                 }
-            } else if let NamedProperties::Slow(ref mut map) = self.named_properties {
+            } else if let NamedProperties::Slow {
+                ref mut map,
+                ref mut key_order,
+            } = self.named_properties
+            {
                 map.insert(key.to_string(), SlowProperty::new(value, default_attrs));
+                key_order.push(key.to_string());
             }
         }
         Ok(())
@@ -524,7 +540,7 @@ impl JsObject {
             if self.is_fast_mode() {
                 self.normalise_to_slow();
             }
-            if let NamedProperties::Slow(ref mut map) = self.named_properties {
+            if let NamedProperties::Slow { ref mut map, .. } = self.named_properties {
                 map.insert(key.to_string(), SlowProperty::new(value, attributes));
             }
         } else {
@@ -536,7 +552,7 @@ impl JsObject {
             }
             let fast_len = match &self.named_properties {
                 NamedProperties::Fast(v) => Some(v.len()),
-                NamedProperties::Slow(_) => None,
+                NamedProperties::Slow { .. } => None,
             };
             if let Some(len) = fast_len {
                 if len < MAX_FAST_PROPERTIES {
@@ -547,12 +563,22 @@ impl JsObject {
                     }
                 } else {
                     self.normalise_to_slow();
-                    if let NamedProperties::Slow(ref mut map) = self.named_properties {
+                    if let NamedProperties::Slow {
+                        ref mut map,
+                        ref mut key_order,
+                    } = self.named_properties
+                    {
                         map.insert(key.to_string(), SlowProperty::new(value, attributes));
+                        key_order.push(key.to_string());
                     }
                 }
-            } else if let NamedProperties::Slow(ref mut map) = self.named_properties {
+            } else if let NamedProperties::Slow {
+                ref mut map,
+                ref mut key_order,
+            } = self.named_properties
+            {
                 map.insert(key.to_string(), SlowProperty::new(value, attributes));
+                key_order.push(key.to_string());
             }
         }
         Ok(())
@@ -571,8 +597,13 @@ impl JsObject {
                 if self.is_fast_mode() {
                     self.normalise_to_slow();
                 }
-                if let NamedProperties::Slow(ref mut map) = self.named_properties {
+                if let NamedProperties::Slow {
+                    ref mut map,
+                    ref mut key_order,
+                } = self.named_properties
+                {
                     map.remove(key);
+                    key_order.retain(|k| k != key);
                 }
                 Ok(true)
             }
@@ -743,7 +774,7 @@ impl Trace for JsObject {
                     v.trace(tracer);
                 }
             }
-            NamedProperties::Slow(map) => {
+            NamedProperties::Slow { map, .. } => {
                 for prop in map.values() {
                     prop.value().trace(tracer);
                 }
