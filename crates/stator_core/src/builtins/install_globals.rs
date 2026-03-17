@@ -4878,8 +4878,10 @@ fn make_object() -> JsValue {
             "freeze".into(),
             builtin_fn("freeze", 1, |args| {
                 let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
-                if let JsValue::PlainObject(map) = &obj {
-                    map.borrow_mut().freeze();
+                match &obj {
+                    JsValue::PlainObject(map) => map.borrow_mut().freeze(),
+                    JsValue::Error(e) => e.props.borrow_mut().freeze(),
+                    _ => {}
                 }
                 Ok(obj)
             }),
@@ -4890,8 +4892,10 @@ fn make_object() -> JsValue {
             "seal".into(),
             builtin_fn("seal", 1, |args| {
                 let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
-                if let JsValue::PlainObject(map) = &obj {
-                    map.borrow_mut().seal();
+                match &obj {
+                    JsValue::PlainObject(map) => map.borrow_mut().seal(),
+                    JsValue::Error(e) => e.props.borrow_mut().seal(),
+                    _ => {}
                 }
                 Ok(obj)
             }),
@@ -4904,7 +4908,11 @@ fn make_object() -> JsValue {
                 let obj = args.first().unwrap_or(&JsValue::Undefined);
                 match obj {
                     JsValue::PlainObject(map) => Ok(JsValue::Boolean(map.borrow().is_frozen())),
-                    _ => Ok(JsValue::Boolean(true)),
+                    JsValue::Error(e) => Ok(JsValue::Boolean(e.props.borrow().is_frozen())),
+                    _ if obj.is_primitive() => Ok(JsValue::Boolean(true)),
+                    // Other object types (Array, Function, etc.) are not
+                    // frozen unless the engine explicitly froze them.
+                    _ => Ok(JsValue::Boolean(false)),
                 }
             }),
         );
@@ -4916,7 +4924,9 @@ fn make_object() -> JsValue {
                 let obj = args.first().unwrap_or(&JsValue::Undefined);
                 match obj {
                     JsValue::PlainObject(map) => Ok(JsValue::Boolean(map.borrow().is_sealed())),
-                    _ => Ok(JsValue::Boolean(true)),
+                    JsValue::Error(e) => Ok(JsValue::Boolean(e.props.borrow().is_sealed())),
+                    _ if obj.is_primitive() => Ok(JsValue::Boolean(true)),
+                    _ => Ok(JsValue::Boolean(false)),
                 }
             }),
         );
@@ -5155,8 +5165,10 @@ fn make_object() -> JsValue {
             "preventExtensions".into(),
             builtin_fn("preventExtensions", 1, |args| {
                 let obj = args.first().unwrap_or(&JsValue::Undefined).clone();
-                if let JsValue::PlainObject(map) = &obj {
-                    map.borrow_mut().extensible = false;
+                match &obj {
+                    JsValue::PlainObject(map) => map.borrow_mut().extensible = false,
+                    JsValue::Error(e) => e.props.borrow_mut().extensible = false,
+                    _ => {}
                 }
                 Ok(obj)
             }),
@@ -5169,7 +5181,10 @@ fn make_object() -> JsValue {
                 let obj = args.first().unwrap_or(&JsValue::Undefined);
                 match obj {
                     JsValue::PlainObject(map) => Ok(JsValue::Boolean(map.borrow().extensible)),
-                    _ => Ok(JsValue::Boolean(false)),
+                    JsValue::Error(e) => Ok(JsValue::Boolean(e.props.borrow().extensible)),
+                    _ if obj.is_primitive() => Ok(JsValue::Boolean(false)),
+                    // Other object types are extensible by default.
+                    _ => Ok(JsValue::Boolean(true)),
                 }
             }),
         );
