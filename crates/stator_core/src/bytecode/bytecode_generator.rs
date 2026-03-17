@@ -6520,6 +6520,15 @@ impl FunctionCompiler {
         let frame_size = self.allocator.frame_size();
         let bytes = encode(&self.instructions);
         let feedback_metadata = FeedbackMetadata::new(self.slot_kinds);
+        let binding_registers = self
+            .scopes
+            .iter()
+            .fold(HashMap::new(), |mut registers, scope| {
+                for (name, binding) in scope {
+                    registers.insert(name.clone(), binding.reg.0);
+                }
+                registers
+            });
         let ba = BytecodeArray::new(
             bytes,
             self.constant_pool,
@@ -6533,7 +6542,8 @@ impl FunctionCompiler {
             .with_generator_flag(self.is_generator)
             .with_async_flag(self.is_async)
             .with_module_flag(self.is_module)
-            .with_strict_flag(self.is_strict))
+            .with_strict_flag(self.is_strict)
+            .with_binding_registers(binding_registers))
     }
 }
 

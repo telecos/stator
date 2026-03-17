@@ -360,6 +360,14 @@ pub enum EvalMode {
     Indirect,
 }
 
+struct EvalOutcome {
+    result: JsValue,
+    global_env: Rc<RefCell<HashMap<String, JsValue>>>,
+    is_strict: bool,
+}
+
+type DirectEvalCapture = (JsValue, Rc<RefCell<HashMap<String, JsValue>>>, bool);
+
 /// ECMAScript §19.2.1 global `eval(x)`.
 ///
 /// Parses `source` as a JavaScript program, compiles it to bytecode, and
@@ -385,7 +393,7 @@ pub enum EvalMode {
 /// assert_eq!(result, JsValue::Boolean(true));
 /// ```
 pub fn global_eval(source: &str) -> StatorResult<JsValue> {
-    global_eval_indirect(source)
+    Ok(eval_core(source, EvalMode::Indirect, None, None)?.result)
 }
 
 /// Direct eval — ECMAScript §19.2.1.1 *PerformEval* with `direct = true`.
@@ -428,7 +436,7 @@ pub fn global_eval_direct(
 /// assert_eq!(result, JsValue::Smi(3));
 /// ```
 pub fn global_eval_indirect(source: &str) -> StatorResult<JsValue> {
-    eval_core(source, EvalMode::Indirect, None, None)
+    Ok(eval_core(source, EvalMode::Indirect, None, None)?.result)
 }
 
 /// Strict-mode eval — the evaluated code receives its own variable
@@ -476,16 +484,17 @@ fn eval_core(
     mode: EvalMode,
     caller_env: Option<Rc<RefCell<HashMap<String, JsValue>>>>,
     caller_context: Option<JsValue>,
-) -> StatorResult<JsValue> {
+) -> StatorResult<EvalOutcome> {
     use crate::bytecode::bytecode_generator::BytecodeGenerator;
     use crate::interpreter::{Interpreter, InterpreterFrame, current_global_env};
     use crate::parser::parse;
 
     let mut program = parse(source)?;
     rewrite_last_expr_to_return(&mut program);
+    let is_strict = program.is_strict;
 
     let mut frame = match mode {
-        EvalMode::Direct if program.is_strict => {
+        EvalMode::Direct if is_strict => {
             let bytecode = BytecodeGenerator::compile_program(&program)?;
             let env = caller_env.expect("direct eval requires a caller environment");
             let child_env = Rc::new(RefCell::new(env.borrow().clone()));
@@ -511,7 +520,12 @@ fn eval_core(
             }
         }
     };
-    Interpreter::run(&mut frame)
+    let result = Interpreter::run(&mut frame)?;
+    Ok(EvalOutcome {
+        result,
+        global_env: Rc::clone(&frame.global_env),
+        is_strict,
+    })
 }
 
 pub(crate) fn global_eval_direct_with_scope(
@@ -519,7 +533,16 @@ pub(crate) fn global_eval_direct_with_scope(
     caller_env: Rc<RefCell<HashMap<String, JsValue>>>,
     caller_context: Option<JsValue>,
 ) -> StatorResult<JsValue> {
-    eval_core(source, EvalMode::Direct, Some(caller_env), caller_context)
+    Ok(global_eval_direct_with_scope_capture(source, caller_env, caller_context)?.0)
+}
+
+pub(crate) fn global_eval_direct_with_scope_capture(
+    source: &str,
+    caller_env: Rc<RefCell<HashMap<String, JsValue>>>,
+    caller_context: Option<JsValue>,
+) -> StatorResult<DirectEvalCapture> {
+    let outcome = eval_core(source, EvalMode::Direct, Some(caller_env), caller_context)?;
+    Ok((outcome.result, outcome.global_env, outcome.is_strict))
 }
 
 /// If the last program item is an expression statement, rewrite it to a

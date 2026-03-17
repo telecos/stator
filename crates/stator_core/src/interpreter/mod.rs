@@ -13593,6 +13593,274 @@ mod tests {
         Interpreter::run(&mut frame)
     }
 
+    fn assert_script_result(src: &str, expected: JsValue) {
+        let result = compile_source_and_run(src).unwrap();
+        assert_eq!(result, expected, "script: {src}");
+    }
+
+    fn assert_script_syntax_error(src: &str) {
+        let err = compile_source_and_run(src).unwrap_err();
+        assert!(matches!(err, StatorError::SyntaxError(_)), "{src}: {err:?}");
+    }
+
+    #[test]
+    fn test_eval_direct_reads_function_scope_var() {
+        assert_script_result(
+            "function f() { var x = 1; return eval('x'); } f();",
+            JsValue::Smi(1),
+        );
+    }
+
+    #[test]
+    fn test_eval_direct_writes_function_scope_var() {
+        assert_script_result(
+            "function f() { var x = 1; eval('x = 3'); return x; } f();",
+            JsValue::Smi(3),
+        );
+    }
+
+    #[test]
+    fn test_eval_direct_writes_parameter_binding() {
+        assert_script_result(
+            "function f(x) { eval('x = x + 2'); return x; } f(5);",
+            JsValue::Smi(7),
+        );
+    }
+
+    #[test]
+    fn test_eval_direct_declares_var_visible_after_call() {
+        assert_script_result(
+            "function f() { eval('var x = 4'); return x; } f();",
+            JsValue::Smi(4),
+        );
+    }
+
+    #[test]
+    fn test_eval_direct_updates_existing_var_with_var_declaration() {
+        assert_script_result(
+            "function f() { var x = 1; eval('var x = 8'); return x; } f();",
+            JsValue::Smi(8),
+        );
+    }
+
+    #[test]
+    fn test_eval_direct_nested_scope_reads_local() {
+        assert_script_result(
+            "function f() { var x = 1; return eval('x'); } f();",
+            JsValue::Smi(1),
+        );
+    }
+
+    #[test]
+    fn test_eval_direct_returns_last_expression_value() {
+        assert_script_result("eval('1; 2; 3;');", JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_eval_direct_returns_last_expression_after_statement() {
+        assert_script_result("eval('var x = 2; x + 5;');", JsValue::Smi(7));
+    }
+
+    #[test]
+    fn test_eval_direct_returns_undefined_for_statement_only_program() {
+        assert_script_result(
+            "typeof eval('var x = 1; if (x) { }');",
+            JsValue::String("undefined".into()),
+        );
+    }
+
+    #[test]
+    fn test_eval_direct_non_string_returns_argument() {
+        assert_script_result("eval(123);", JsValue::Smi(123));
+    }
+
+    #[test]
+    fn test_eval_indirect_comma_operator_uses_global_scope() {
+        assert_script_result(
+            "var x = 10; function f() { var x = 1; return (0, eval)('x'); } f();",
+            JsValue::Smi(10),
+        );
+    }
+
+    #[test]
+    fn test_eval_indirect_alias_uses_global_scope() {
+        assert_script_result(
+            "var x = 10; function f() { var x = 1; var e = eval; return e('x'); } f();",
+            JsValue::Smi(10),
+        );
+    }
+
+    #[test]
+    fn test_eval_indirect_cannot_read_local_binding() {
+        assert_script_result(
+            "function f() { var x = 1; var e = eval; return typeof e('x'); } f();",
+            JsValue::String("undefined".into()),
+        );
+    }
+
+    #[test]
+    fn test_eval_indirect_var_declaration_targets_global_scope() {
+        assert_script_result(
+            "function f() { (0, eval)('var y = 6'); return y; } f();",
+            JsValue::Smi(6),
+        );
+    }
+
+    #[test]
+    fn test_eval_indirect_returns_completion_value() {
+        assert_script_result("(0, eval)('1; 2; 4;');", JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_eval_strict_var_declaration_does_not_leak() {
+        assert_script_result(
+            "function f() { eval('\"use strict\"; var x = 1'); return typeof x; } f();",
+            JsValue::String("undefined".into()),
+        );
+    }
+
+    #[test]
+    fn test_eval_strict_still_updates_existing_binding() {
+        assert_script_result(
+            "function f() { var x = 1; eval('\"use strict\"; x = 9'); return x; } f();",
+            JsValue::Smi(9),
+        );
+    }
+
+    #[test]
+    fn test_eval_strict_returns_completion_value() {
+        assert_script_result("eval('\"use strict\"; 1; 2;');", JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_eval_strict_nested_scope_reads_local() {
+        assert_script_result(
+            "function f() { var x = 11; return eval('\"use strict\"; x'); } f();",
+            JsValue::Smi(11),
+        );
+    }
+
+    #[test]
+    fn test_eval_direct_syntax_error_throws_syntax_error() {
+        assert_script_syntax_error("eval('}{');");
+    }
+
+    #[test]
+    fn test_eval_direct_invalid_return_throws_syntax_error() {
+        assert_script_syntax_error("eval('return 1;');");
+    }
+
+    #[test]
+    fn test_eval_indirect_syntax_error_throws_syntax_error() {
+        assert_script_syntax_error("(0, eval)('}{');");
+    }
+
+    #[test]
+    fn test_eval_direct_this_uses_method_receiver() {
+        assert_script_result(
+            "var obj = { marker: 7, run: function() { return eval('this.marker'); } }; obj.run();",
+            JsValue::Smi(7),
+        );
+    }
+
+    #[test]
+    fn test_eval_direct_this_is_undefined_in_strict_free_function() {
+        assert_script_result(
+            "function f() { 'use strict'; return eval('this') === undefined; } f();",
+            JsValue::Boolean(true),
+        );
+    }
+
+    #[test]
+    fn test_eval_direct_completion_value_from_nested_function_call() {
+        assert_script_result(
+            "function f() { return eval('1 + 2'); } f();",
+            JsValue::Smi(3),
+        );
+    }
+
+    #[test]
+    fn test_eval_direct_assignment_without_local_updates_global() {
+        assert_script_result(
+            "function f() { eval('z = 9'); return z; } f();",
+            JsValue::Smi(9),
+        );
+    }
+
+    #[test]
+    fn test_function_constructor_basic_addition() {
+        assert_script_result(
+            "new Function('a', 'b', 'return a + b')(2, 3);",
+            JsValue::Smi(5),
+        );
+    }
+
+    #[test]
+    fn test_function_constructor_length_zero_for_body_only() {
+        assert_script_result("new Function('return 1').length;", JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_function_constructor_length_matches_parameter_count() {
+        assert_script_result(
+            "new Function('a', 'b', 'return a + b').length;",
+            JsValue::Smi(2),
+        );
+    }
+
+    #[test]
+    fn test_function_constructor_name_is_anonymous() {
+        assert_script_result(
+            "new Function('a', 'return a').name;",
+            JsValue::String("anonymous".into()),
+        );
+    }
+
+    #[test]
+    fn test_function_constructor_property_points_back_to_function() {
+        assert_script_result(
+            "var f = new Function('return 1'); f.constructor === Function;",
+            JsValue::Boolean(true),
+        );
+    }
+
+    #[test]
+    fn test_function_prototype_constructor_points_to_function() {
+        assert_script_result(
+            "Function.prototype.constructor === Function;",
+            JsValue::Boolean(true),
+        );
+    }
+
+    #[test]
+    fn test_function_constructor_uses_global_scope() {
+        assert_script_result(
+            "var x = 40; function f() { var x = 2; return new Function('return x')(); } f();",
+            JsValue::Smi(40),
+        );
+    }
+
+    #[test]
+    fn test_function_constructor_ignores_local_shadowing() {
+        assert_script_result(
+            "var value = 12; function f() { var value = 99; var g = new Function('return value'); return g(); } f();",
+            JsValue::Smi(12),
+        );
+    }
+
+    #[test]
+    fn test_function_constructor_body_reads_global_this() {
+        assert_script_result(
+            "var marker = 8; var f = new Function('return this.marker'); f();",
+            JsValue::Smi(8),
+        );
+    }
+
+    #[test]
+    fn test_function_constructor_syntax_error_throws_syntax_error() {
+        assert_script_syntax_error("new Function('}{');");
+    }
+
     fn assert_fulfilled_promise_value(result: JsValue, expected: JsValue) {
         match result {
             JsValue::Promise(promise) => {
