@@ -2582,8 +2582,18 @@ impl FunctionCompiler {
     /// Labeled breaks look up the target in `label_map`; unlabeled breaks
     /// use the innermost `loop_stack` entry.
     fn compile_break(&mut self, s: &crate::parser::ast::BreakStmt) -> StatorResult<()> {
-        // Inline pending finally blocks before the jump.
-        self.inline_pending_finally_blocks()?;
+        // Inline pending finally blocks before the jump, preserving the
+        // accumulator (completion value) so the finally body doesn't
+        // clobber it — mirrors what `compile_return` already does.
+        if !self.finally_stack.is_empty() {
+            let save_reg = self.allocator.allocate_temporary();
+            self.emit_star(save_reg);
+            self.inline_pending_finally_blocks()?;
+            self.emit_ldar(save_reg);
+            self.allocator
+                .release_temporary(save_reg)
+                .map_err(|e| StatorError::Internal(e.to_string()))?;
+        }
         if let Some(label) = &s.label {
             let (_, break_label) = *self.label_map.get(&label.name).ok_or_else(|| {
                 StatorError::SyntaxError(format!("undefined label '{}'", label.name))
@@ -2633,8 +2643,18 @@ impl FunctionCompiler {
     /// `IteratorClose` for each intervening for-of iterator (excluding the
     /// target loop itself, since we are continuing it, not exiting it).
     fn compile_continue(&mut self, s: &crate::parser::ast::ContinueStmt) -> StatorResult<()> {
-        // Inline pending finally blocks before the jump.
-        self.inline_pending_finally_blocks()?;
+        // Inline pending finally blocks before the jump, preserving the
+        // accumulator so the finally body doesn't clobber the completion
+        // value — mirrors what `compile_return` already does.
+        if !self.finally_stack.is_empty() {
+            let save_reg = self.allocator.allocate_temporary();
+            self.emit_star(save_reg);
+            self.inline_pending_finally_blocks()?;
+            self.emit_ldar(save_reg);
+            self.allocator
+                .release_temporary(save_reg)
+                .map_err(|e| StatorError::Internal(e.to_string()))?;
+        }
         if let Some(label) = &s.label {
             let (continue_label, break_label) =
                 *self.label_map.get(&label.name).ok_or_else(|| {
@@ -5865,7 +5885,10 @@ impl FunctionCompiler {
         let loop_lbl = self.new_label();
         let continue_lbl = self.new_label();
         let break_lbl = self.new_label();
-        self.patch_pending_labels(loop_lbl);
+        // Patch pending labels with the continue target (not `loop_lbl`) so
+        // that `continue outer;` on a labeled for-in jumps to the index
+        // increment rather than the loop top, which would skip ForInStep.
+        self.patch_pending_labels(continue_lbl);
         self.loop_stack.push((continue_lbl, break_lbl));
 
         // Bind loop start.
