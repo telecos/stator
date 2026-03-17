@@ -5581,13 +5581,21 @@ fn make_array() -> JsValue {
                     }
                     _ => Vec::new(),
                 };
+                // §23.1.2.1 step 5: thisArg for mapFn.
+                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 // Apply mapFn if provided.
                 let mapped = if let Some(ref mf) = map_fn {
                     if !matches!(mf, JsValue::Undefined) {
                         items
                             .into_iter()
                             .enumerate()
-                            .map(|(i, v)| dispatch_call_value(mf, vec![v, JsValue::Smi(i as i32)]))
+                            .map(|(i, v)| {
+                                dispatch_call_with_this(
+                                    mf,
+                                    this_arg.clone(),
+                                    vec![v, JsValue::Smi(i as i32)],
+                                )
+                            })
                             .collect::<Result<Vec<_>, _>>()?
                     } else {
                         items
@@ -5599,7 +5607,10 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // Array.of(...items)
+        // Array.of(...items) — §23.1.2.3
+        // Creates a new Array from a variable number of arguments,
+        // regardless of number or type.  Unlike `Array(n)` which creates
+        // an array of length n, `Array.of(n)` creates `[n]`.
         props.insert(
             "of".into(),
             builtin_fn("of", 0, |args| Ok(JsValue::new_array(args))),
@@ -6027,44 +6038,39 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // fill(value, start?, end?)
+        // fill(value, start?, end?) — §23.1.3.7
+        // Works on both native JsValue::Array and PlainObject array-like
+        // values.  Negative start/end are resolved relative to length.
         proto.insert(
             "fill".into(),
             builtin_fn("fill", 1, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                if let JsValue::Array(items) = arr {
-                    let value = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                    let len = items.borrow().len() as i64;
-                    let start = args
-                        .get(2)
-                        .unwrap_or(&JsValue::Smi(0))
-                        .to_number()
-                        .unwrap_or(0.0) as i64;
-                    let end = args
-                        .get(3)
-                        .map(|v| v.to_number().unwrap_or(len as f64) as i64)
-                        .unwrap_or(len);
-                    let s = if start < 0 {
-                        (len + start).max(0)
-                    } else {
-                        start.min(len)
-                    } as usize;
-                    let e = if end < 0 {
-                        (len + end).max(0)
-                    } else {
-                        end.min(len)
-                    } as usize;
-                    {
-                        let mut vec = items.borrow_mut();
-                        for item in vec.iter_mut().take(e).skip(s) {
-                            *item = value.clone();
-                        }
-                    }
-                    Ok(arr.clone())
+                let value = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let len = array_like_length(arr)? as i64;
+                let start = args
+                    .get(2)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let end = args
+                    .get(3)
+                    .map(|v| v.to_number().unwrap_or(len as f64) as i64)
+                    .unwrap_or(len);
+                let s = if start < 0 {
+                    (len + start).max(0)
                 } else {
-                    Ok(JsValue::Undefined)
+                    start.min(len)
+                } as usize;
+                let e = if end < 0 {
+                    (len + end).max(0)
+                } else {
+                    end.min(len)
+                } as usize;
+                for i in s..e {
+                    array_like_set_index(arr, i, value.clone());
                 }
+                Ok(arr.clone())
             }),
         );
 
@@ -6082,19 +6088,27 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // flat(depth?)
+        // flat(depth?) — §23.1.3.11
+        // Handles `Infinity` depth and negative/NaN values.
         proto.insert(
             "flat".into(),
             builtin_fn("flat", 0, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let (elements, _) = to_array_like_elements(arr);
-                let depth = args
+                let depth_f = args
                     .get(1)
                     .unwrap_or(&JsValue::Smi(1))
                     .to_number()
-                    .unwrap_or(1.0) as u32;
-                fn flatten(items: &[JsValue], depth: u32) -> Vec<JsValue> {
+                    .unwrap_or(1.0);
+                let depth: usize = if depth_f.is_infinite() && depth_f > 0.0 {
+                    usize::MAX
+                } else if depth_f < 0.0 || depth_f.is_nan() {
+                    0
+                } else {
+                    depth_f as usize
+                };
+                fn flatten(items: &[JsValue], depth: usize) -> Vec<JsValue> {
                     let mut result = Vec::new();
                     for item in items {
                         if depth > 0 && is_js_array(item) {
@@ -6110,20 +6124,35 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // flatMap(callback)
+        // flatMap(callback, thisArg?) — §23.1.3.12
+        // Validates callback, supports thisArg, and skips holes.
         proto.insert(
             "flatMap".into(),
             builtin_fn("flatMap", 1, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                let (elements, _) = to_array_like_elements(arr);
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.flatMap callback must be callable".into(),
+                    ));
+                }
+                let len = array_like_length(arr)?;
+                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let arr_val = arr.clone();
                 let mut result = Vec::new();
-                for (i, item) in elements.iter().enumerate() {
-                    let mapped = call_callback(
+                for i in 0..len {
+                    if !array_like_has_index(arr, i) {
+                        continue;
+                    }
+                    let mapped = call_callback_with_this(
                         &cb,
-                        vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                        this_arg.clone(),
+                        vec![
+                            array_like_get_index(arr, i),
+                            JsValue::Smi(i as i32),
+                            arr_val.clone(),
+                        ],
                     )?;
                     if is_js_array(&mapped) {
                         let (inner, _) = to_array_like_elements(&mapped);
@@ -6136,56 +6165,64 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // copyWithin(target, start, end?)
+        // copyWithin(target, start, end?) — §23.1.3.4
+        // Works on both native JsValue::Array and PlainObject array-like
+        // values.  Copies a region within the array, preserving holes.
         proto.insert(
             "copyWithin".into(),
             builtin_fn("copyWithin", 2, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                if let JsValue::Array(items) = arr {
-                    let len = items.borrow().len() as i64;
-                    let target = args
-                        .get(1)
-                        .unwrap_or(&JsValue::Smi(0))
-                        .to_number()
-                        .unwrap_or(0.0) as i64;
-                    let start = args
-                        .get(2)
-                        .unwrap_or(&JsValue::Smi(0))
-                        .to_number()
-                        .unwrap_or(0.0) as i64;
-                    let end = args
-                        .get(3)
-                        .map(|v| v.to_number().unwrap_or(len as f64) as i64)
-                        .unwrap_or(len);
-                    let to = if target < 0 {
-                        (len + target).max(0)
-                    } else {
-                        target.min(len)
-                    } as usize;
-                    let from = if start < 0 {
-                        (len + start).max(0)
-                    } else {
-                        start.min(len)
-                    } as usize;
-                    let fin = if end < 0 {
-                        (len + end).max(0)
-                    } else {
-                        end.min(len)
-                    } as usize;
-                    let count =
-                        (fin.saturating_sub(from)).min(items.borrow().len().saturating_sub(to));
-                    let buf: Vec<JsValue> = items.borrow()[from..from + count].to_vec();
-                    {
-                        let mut vec = items.borrow_mut();
-                        for (i, val) in buf.into_iter().enumerate() {
-                            vec[to + i] = val;
-                        }
-                    }
-                    Ok(arr.clone())
+                let len = array_like_length(arr)? as i64;
+                let target = args
+                    .get(1)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let start = args
+                    .get(2)
+                    .unwrap_or(&JsValue::Smi(0))
+                    .to_number()
+                    .unwrap_or(0.0) as i64;
+                let end = args
+                    .get(3)
+                    .map(|v| v.to_number().unwrap_or(len as f64) as i64)
+                    .unwrap_or(len);
+                let to = if target < 0 {
+                    (len + target).max(0)
                 } else {
-                    Ok(JsValue::Undefined)
+                    target.min(len)
+                } as usize;
+                let from = if start < 0 {
+                    (len + start).max(0)
+                } else {
+                    start.min(len)
+                } as usize;
+                let fin = if end < 0 {
+                    (len + end).max(0)
+                } else {
+                    end.min(len)
+                } as usize;
+                let count = (fin.saturating_sub(from)).min((len as usize).saturating_sub(to));
+                // Buffer source elements first to handle overlapping regions.
+                let buf: Vec<(bool, JsValue)> = (0..count)
+                    .map(|i| {
+                        let idx = from + i;
+                        if array_like_has_index(arr, idx) {
+                            (true, array_like_get_index(arr, idx))
+                        } else {
+                            (false, JsValue::Undefined)
+                        }
+                    })
+                    .collect();
+                for (i, (present, val)) in buf.into_iter().enumerate() {
+                    if present {
+                        array_like_set_index(arr, to + i, val);
+                    } else {
+                        array_like_delete_index(arr, to + i);
+                    }
                 }
+                Ok(arr.clone())
             }),
         );
 
@@ -6250,20 +6287,36 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // map(callback)
+        // map(callback, thisArg?) — §23.1.3.18
+        // Validates callback, supports thisArg, skips holes in array-like.
         proto.insert(
             "map".into(),
             builtin_fn("map", 1, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (elements, _) = to_array_like_elements(arr);
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.map callback must be callable".into(),
+                    ));
+                }
+                let len = array_like_length(arr)?;
+                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let arr_val = arr.clone();
-                let mut result = Vec::with_capacity(elements.len());
-                for (i, item) in elements.iter().enumerate() {
-                    let mapped = call_callback(
+                let mut result = Vec::with_capacity(len);
+                for i in 0..len {
+                    if !array_like_has_index(arr, i) {
+                        result.push(JsValue::Undefined);
+                        continue;
+                    }
+                    let mapped = call_callback_with_this(
                         &cb,
-                        vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                        this_arg.clone(),
+                        vec![
+                            array_like_get_index(arr, i),
+                            JsValue::Smi(i as i32),
+                            arr_val.clone(),
+                        ],
                     )?;
                     result.push(mapped);
                 }
@@ -6405,19 +6458,34 @@ fn make_array() -> JsValue {
             }),
         );
 
-        // forEach(callback)
+        // forEach(callback, thisArg?) — §23.1.3.13
+        // Validates callback, supports thisArg, skips holes.
         proto.insert(
             "forEach".into(),
             builtin_fn("forEach", 1, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
                 let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                let (elements, _) = to_array_like_elements(arr);
+                if !is_callable(&cb) {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.forEach callback must be callable".into(),
+                    ));
+                }
+                let len = array_like_length(arr)?;
+                let this_arg = args.get(2).cloned().unwrap_or(JsValue::Undefined);
                 let arr_val = arr.clone();
-                for (i, item) in elements.iter().enumerate() {
-                    call_callback(
+                for i in 0..len {
+                    if !array_like_has_index(arr, i) {
+                        continue;
+                    }
+                    call_callback_with_this(
                         &cb,
-                        vec![item.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                        this_arg.clone(),
+                        vec![
+                            array_like_get_index(arr, i),
+                            JsValue::Smi(i as i32),
+                            arr_val.clone(),
+                        ],
                     )?;
                 }
                 Ok(JsValue::Undefined)
