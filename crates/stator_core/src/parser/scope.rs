@@ -1148,9 +1148,6 @@ impl Analyzer {
             Expr::Await(a) => self.visit_expr(&a.argument),
             Expr::Import(i) => {
                 self.visit_expr(&i.source);
-                if let Some(opts) = &i.options {
-                    self.visit_expr(opts);
-                }
             }
             Expr::PrivateName(_) => {}
         }

@@ -4194,7 +4194,7 @@ impl FunctionCompiler {
         Ok(())
     }
 
-    /// Compile a dynamic `import(source)` or `import(source, options)` call.
+    /// Compile a dynamic `import(source)` call.
     ///
     /// Emits `CallRuntime [RUNTIME_DYNAMIC_IMPORT, args_start, arg_count]`
     /// so the interpreter can resolve the import and return a `Promise`.
@@ -4204,32 +4204,14 @@ impl FunctionCompiler {
         let source_reg = self.allocator.allocate_temporary();
         self.emit_star(source_reg);
 
-        // Optionally compile the options argument.
-        let options_reg = if let Some(opts) = &imp.options {
-            self.compile_expr(opts)?;
-            let r = self.allocator.allocate_temporary();
-            self.emit_star(r);
-            Some(r)
-        } else {
-            None
-        };
-
-        let arg_count = if options_reg.is_some() { 2u32 } else { 1u32 };
-
         self.emit(Instruction::new_unchecked(
             Opcode::CallRuntime,
             vec![
                 Operand::RuntimeId(RUNTIME_DYNAMIC_IMPORT),
                 to_reg_op(source_reg),
-                Operand::RegisterCount(arg_count),
+                Operand::RegisterCount(1),
             ],
         ));
-
-        if let Some(r) = options_reg {
-            self.allocator
-                .release_temporary(r)
-                .map_err(|e| StatorError::Internal(e.to_string()))?;
-        }
         self.allocator
             .release_temporary(source_reg)
             .map_err(|e| StatorError::Internal(e.to_string()))?;
@@ -9534,7 +9516,6 @@ mod tests {
         let import_expr = Expr::Import(Box::new(ImportExpr {
             loc: span(),
             source: Box::new(str_expr("./mod.js")),
-            options: None,
         }));
         let prog = make_program(vec![Stmt::Expr(ExprStmt {
             loc: span(),
@@ -9649,13 +9630,12 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_import_with_options_emits_call_runtime() {
+    fn test_dynamic_import_emits_single_argument_runtime_call() {
         use crate::parser::ast::ImportExpr;
 
         let import_expr = Expr::Import(Box::new(ImportExpr {
             loc: span(),
             source: Box::new(str_expr("./mod.json")),
-            options: Some(Box::new(ident_expr("opts"))),
         }));
         let prog = make_program(vec![Stmt::Expr(ExprStmt {
             loc: span(),
@@ -9669,8 +9649,8 @@ mod tests {
             .expect("expected CallRuntime");
         assert_eq!(
             rt_call.operands[2],
-            Operand::RegisterCount(2),
-            "import with options should have 2 args"
+            Operand::RegisterCount(1),
+            "dynamic import should pass exactly one argument"
         );
     }
 

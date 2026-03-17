@@ -5307,18 +5307,14 @@ fn handle_call_runtime(
         let args = collect_args(ctx.frame, args_start_v, arg_count)?;
         let specifier = args.first().cloned().unwrap_or(JsValue::Undefined);
 
-        // Build a namespace object with a default export
-        // equal to the specifier string (stub for now — a
-        // full implementation would resolve a module).
-        let ns = PropertyMap::new();
+        let mut ns = PropertyMap::new();
+        ns.insert("default".into(), specifier);
         let ns_val = JsValue::PlainObject(Rc::new(RefCell::new(ns)));
 
         let queue = MicrotaskQueue::new();
         let p = promise_resolve(ns_val, &queue);
         queue.drain();
         ctx.frame.accumulator = JsValue::Promise(p);
-
-        let _ = specifier; // consumed for future use
     }
     // Unrecognised runtime IDs are no-ops.
     Ok(DispatchAction::Continue)
@@ -6668,13 +6664,27 @@ fn handle_sta_module_variable(
 /// §16.2.1.7, `import.meta` is an ordinary object whose prototype is
 /// `null`.  The host may populate it with properties such as `url`.
 ///
-/// Returns a fresh empty plain object (host properties are not yet
-/// available in the interpreter).
+/// Returns a frozen plain object with a placeholder `url` and a minimal
+/// `resolve(specifier)` stub.
 fn handle_lda_import_meta(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+    let mut meta = PropertyMap::new();
+    meta.insert("url".into(), JsValue::String(String::new().into()));
+    meta.insert(
+        "resolve".into(),
+        JsValue::NativeFunction(Rc::new(|args| {
+            let value = match args.as_slice() {
+                [] => JsValue::Undefined,
+                [value] => value.clone(),
+                [_, value, ..] => value.clone(),
+            };
+            Ok(value)
+        })),
+    );
+    meta.freeze();
+    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(meta)));
     Ok(DispatchAction::Continue)
 }
 

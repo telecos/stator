@@ -1409,8 +1409,6 @@ pub struct ImportExpr {
     pub loc: SourceLocation,
     /// The module specifier.
     pub source: Box<Expr>,
-    /// ES2025 import attributes (`with { … }`).
-    pub options: Option<Box<Expr>>,
 }
 
 /// `import.meta` or `new.target` — meta property expression.
@@ -1907,7 +1905,6 @@ mod tests {
             Expr::Import(Box::new(ImportExpr {
                 loc,
                 source: null(),
-                options: None,
             })),
             Expr::MetaProp(MetaPropExpr {
                 loc,
