@@ -82,7 +82,7 @@ pub(super) type OpcodeHandler =
     fn(&mut DispatchContext, &Instruction) -> StatorResult<DispatchAction>;
 
 /// Number of opcode variants (= `Opcode::Illegal as usize + 1`).
-const OPCODE_COUNT: usize = 194;
+const OPCODE_COUNT: usize = 195;
 
 #[inline]
 fn handle_lda_zero(
@@ -5387,6 +5387,54 @@ fn store_with_binding(context: &Option<JsValue>, name: &str, value: &JsValue) ->
     false
 }
 
+/// Delete a property from the with-scope chain.
+///
+/// Walks the context chain looking for a with-object that has the given
+/// property.  If found, deletes the property and returns `true`.
+fn delete_with_binding(context: &Option<JsValue>, name: &str) -> Option<bool> {
+    let Some(JsValue::Context(root)) = context else {
+        return None;
+    };
+    let mut current = Some(Rc::clone(root));
+    while let Some(ctx_rc) = current {
+        let (object, parent) = {
+            let borrow = ctx_rc.borrow();
+            (borrow.slots.first().cloned(), borrow.parent.clone())
+        };
+        if let Some(JsValue::PlainObject(map)) = object
+            && with_object_has_binding(&JsValue::PlainObject(Rc::clone(&map)), name)
+        {
+            map.borrow_mut().remove(name);
+            return Some(true);
+        }
+        current = parent;
+    }
+    None
+}
+
+fn handle_delete_lookup_slot(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+        return Err(err_bad_operand("DeleteLookupSlot", 0));
+    };
+    let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
+        Some(ConstantPoolEntry::String(s)) => s.clone(),
+        _ => {
+            return Err(StatorError::Internal(
+                "DeleteLookupSlot: slot name is not a string".into(),
+            ));
+        }
+    };
+    ctx.frame.accumulator = if let Some(deleted) = delete_with_binding(&ctx.frame.context, &name) {
+        JsValue::Boolean(deleted)
+    } else {
+        JsValue::Boolean(true)
+    };
+    Ok(DispatchAction::Continue)
+}
+
 fn handle_sta_lookup_slot(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -6672,6 +6720,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::LdaLookupGlobalSlotInsideTypeof as usize] =
         handle_lda_lookup_global_slot_inside_typeof;
     table[Opcode::StaLookupSlot as usize] = handle_sta_lookup_slot;
+    table[Opcode::DeleteLookupSlot as usize] = handle_delete_lookup_slot;
     table[Opcode::Ldar as usize] = handle_ldar;
     table[Opcode::Star as usize] = handle_star;
     table[Opcode::Mov as usize] = handle_mov;

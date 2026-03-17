@@ -3401,6 +3401,13 @@ impl FunctionCompiler {
                                 .into(),
                         ));
                     }
+                    Expr::Ident(id) if self.with_depth > 0 => {
+                        let name_idx = self.add_string(&id.name);
+                        self.emit(Instruction::new_unchecked(
+                            Opcode::DeleteLookupSlot,
+                            vec![Operand::ConstantPoolIdx(name_idx)],
+                        ));
+                    }
                     _ => {
                         // delete on non-member always returns true in sloppy mode.
                         self.emit(Instruction::new_unchecked(Opcode::LdaTrue, vec![]));

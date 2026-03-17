@@ -1038,6 +1038,7 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::LdaLookupContextSlotInsideTypeof
             | Opcode::LdaLookupGlobalSlotInsideTypeof
             | Opcode::StaLookupSlot
+            | Opcode::DeleteLookupSlot
             | Opcode::CallAnyReceiver
             | Opcode::CallProperty
             | Opcode::CallProperty0
