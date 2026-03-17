@@ -14,7 +14,7 @@ use std::rc::{Rc, Weak};
 
 use crate::builtins::string::encode_utf16;
 use crate::objects::map::PropertyAttributes;
-use crate::objects::property_map::PropertyMap;
+use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 
 use crate::error::StatorResult;
 use crate::interpreter::dispatch_call_value;
@@ -406,7 +406,7 @@ fn call_replace_callback(
     args.push(JsValue::String(input.to_string().into()));
     if !matched.named_groups.is_empty() {
         let mut groups = PropertyMap::new();
-        groups.insert("__proto__".into(), JsValue::Null);
+        groups.insert(INTERNAL_PROTO_PROPERTY_KEY.into(), JsValue::Null);
         for (key, value) in &matched.named_groups {
             groups.insert(
                 key.clone(),
@@ -542,7 +542,7 @@ fn named_groups_to_js(m: &RegExpMatch) -> JsValue {
         JsValue::Undefined
     } else {
         let mut groups = PropertyMap::new();
-        groups.insert("__proto__".into(), JsValue::Null);
+        groups.insert(INTERNAL_PROTO_PROPERTY_KEY.into(), JsValue::Null);
         for (k, v) in &m.named_groups {
             groups.insert(
                 k.clone(),

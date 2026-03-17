@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use crate::builtins::string::{string_char_at, utf16_len};
 use crate::objects::map::PropertyAttributes;
-use crate::objects::property_map::PropertyMap;
+use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 
 use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
@@ -22,10 +22,10 @@ use super::{
     error_message_from_value, extract_context, find_handler, fn_props_get, fn_props_set,
     has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
     maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
-    number_to_jsvalue, plain_object_to_array_items, populate_self_name, proto_lookup, resolve_jump,
-    restore_closure_context, set_function_name_if_missing, set_pending_exception,
-    settle_async_iterator_result, strict_eq, to_array_index, to_bigint, to_property_key,
-    try_execute_best_jit, walk_context_chain, wire_construct_prototype,
+    number_to_jsvalue, ordinary_set_prototype_of, plain_object_to_array_items, populate_self_name,
+    proto_lookup, resolve_jump, restore_closure_context, set_function_name_if_missing,
+    set_pending_exception, settle_async_iterator_result, strict_eq, to_array_index, to_bigint,
+    to_property_key, try_execute_best_jit, walk_context_chain, wire_construct_prototype,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -81,7 +81,7 @@ pub(super) type OpcodeHandler =
     fn(&mut DispatchContext, &Instruction) -> StatorResult<DispatchAction>;
 
 /// Number of opcode variants (= `Opcode::Illegal as usize + 1`).
-const OPCODE_COUNT: usize = 193;
+const OPCODE_COUNT: usize = 194;
 
 #[inline]
 fn handle_lda_zero(
@@ -1195,7 +1195,7 @@ fn handle_create_closure(
         if func_rc.is_generator()
             && let Some(generator_proto) = super::default_generator_object_prototype()
         {
-            proto.insert("__proto__".to_string(), generator_proto);
+            proto.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), generator_proto);
         }
         fn_props_set(
             &func_rc,
@@ -2091,7 +2091,7 @@ fn construct_class_from_plain_object(
     if !matches!(ctor_proto, JsValue::Undefined) {
         this_obj
             .borrow_mut()
-            .insert("__proto__".to_string(), ctor_proto.clone());
+            .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), ctor_proto.clone());
     }
     let this_val = JsValue::PlainObject(Rc::clone(&this_obj));
 
@@ -2102,7 +2102,8 @@ fn construct_class_from_plain_object(
     callee_frame.new_target = JsValue::PlainObject(Rc::clone(class_map));
 
     // 3. Expose parent constructor as "super" for `super()` calls.
-    let is_derived = if let Some(parent) = class_map.borrow().get("__proto__").cloned()
+    let is_derived = if let Some(parent) =
+        class_map.borrow().get(INTERNAL_PROTO_PROPERTY_KEY).cloned()
         && !matches!(parent, JsValue::Undefined | JsValue::Null)
     {
         callee_frame
@@ -2226,7 +2227,7 @@ fn handle_construct(
             if !matches!(ctor_proto, JsValue::Undefined) {
                 this_obj
                     .borrow_mut()
-                    .insert("__proto__".to_string(), ctor_proto.clone());
+                    .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), ctor_proto.clone());
             }
             let this_val = JsValue::PlainObject(this_obj);
             let mut callee_frame = InterpreterFrame::new_with_globals(
@@ -2327,7 +2328,7 @@ fn handle_construct_with_spread(
             if !matches!(ctor_proto, JsValue::Undefined) {
                 this_obj
                     .borrow_mut()
-                    .insert("__proto__".to_string(), ctor_proto.clone());
+                    .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), ctor_proto.clone());
             }
             let this_val = JsValue::PlainObject(this_obj);
             let mut callee_frame = InterpreterFrame::new_with_globals(
@@ -4294,7 +4295,7 @@ fn handle_create_reg_exp_literal(
                             props.insert("groups".to_string(), JsValue::Undefined);
                         } else {
                             let mut groups = PropertyMap::new();
-                            groups.insert("__proto__".to_string(), JsValue::Null);
+                            groups.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), JsValue::Null);
                             for (k, v) in &m.named_groups {
                                 groups.insert(
                                     k.clone(),
@@ -4445,6 +4446,21 @@ fn handle_define_keyed_own_property_in_literal(
         map.borrow_mut().insert(prop_name, val);
     }
     // Accumulator stays unchanged.
+    Ok(DispatchAction::Continue)
+}
+
+fn handle_set_literal_prototype(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(obj_v) = instr.operands[0] else {
+        return Err(err_bad_operand("SetLiteralPrototype", 0));
+    };
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let proto = ctx.frame.accumulator.clone();
+    if proto.is_object_like() || matches!(proto, JsValue::Null) {
+        ordinary_set_prototype_of(&obj, proto)?;
+    }
     Ok(DispatchAction::Continue)
 }
 
@@ -4737,7 +4753,7 @@ fn handle_for_in_enumerate(
                         all_keys.push(JsValue::String(k.clone().into()));
                     }
                 }
-                current_map = borrow.get("__proto__").and_then(|v| {
+                current_map = borrow.get(INTERNAL_PROTO_PROPERTY_KEY).and_then(|v| {
                     if let JsValue::PlainObject(proto) = v {
                         Some(Rc::clone(proto))
                     } else {
@@ -4782,7 +4798,7 @@ fn for_in_key_still_enumerable(obj: &JsValue, key: &str) -> bool {
                 if let Some((_value, attrs)) = borrow.get_with_attrs(key) {
                     return attrs.contains(PropertyAttributes::ENUMERABLE);
                 }
-                current_map = borrow.get("__proto__").and_then(|v| {
+                current_map = borrow.get(INTERNAL_PROTO_PROPERTY_KEY).and_then(|v| {
                     if let JsValue::PlainObject(proto) = v {
                         Some(Rc::clone(proto))
                     } else {
@@ -5275,7 +5291,7 @@ fn plain_object_has_property(map: &Rc<RefCell<PropertyMap>>, name: &str) -> bool
         if borrow.contains_key(name) {
             return true;
         }
-        borrow.get("__proto__").cloned()
+        borrow.get(INTERNAL_PROTO_PROPERTY_KEY).cloned()
     };
     proto.is_some_and(|value| with_object_has_binding(&value, name))
 }
@@ -5960,7 +5976,7 @@ fn handle_construct_forward_all_args(
             if !matches!(ctor_proto, JsValue::Undefined) {
                 this_obj
                     .borrow_mut()
-                    .insert("__proto__".to_string(), ctor_proto.clone());
+                    .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), ctor_proto.clone());
             }
             let this_val = JsValue::PlainObject(this_obj);
             let mut callee_frame = InterpreterFrame::new_with_globals(
@@ -6241,12 +6257,12 @@ fn handle_create_class(
         if !matches!(super_proto, JsValue::Undefined) {
             proto
                 .borrow_mut()
-                .insert("__proto__".to_string(), super_proto);
+                .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), super_proto);
         }
         // class.__proto__ = super_val (static inheritance)
         class_obj
             .borrow_mut()
-            .insert("__proto__".to_string(), super_val);
+            .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), super_val);
     }
 
     // 6. Wire constructor ↔ prototype.
@@ -6630,6 +6646,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::StaInArrayLiteral as usize] = handle_sta_in_array_literal;
     table[Opcode::DefineKeyedOwnPropertyInLiteral as usize] =
         handle_define_keyed_own_property_in_literal;
+    table[Opcode::SetLiteralPrototype as usize] = handle_set_literal_prototype;
     table[Opcode::DefineGetterProperty as usize] = handle_define_getter_property;
     table[Opcode::DefineSetterProperty as usize] = handle_define_setter_property;
     table[Opcode::DefineKeyedGetterProperty as usize] = handle_define_keyed_getter_property;
@@ -6793,6 +6810,24 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
 #[cfg(test)]
 mod tests {
     use crate::objects::value::JsValue;
+
+    fn assert_eval(source: &str, expected: JsValue) {
+        let result = crate::builtins::global::global_eval(source).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    fn assert_eval_true(source: &str) {
+        assert_eval(source, JsValue::Boolean(true));
+    }
+
+    macro_rules! computed_e2e_test {
+        ($name:ident, $source:expr) => {
+            #[test]
+            fn $name() {
+                assert_eval_true($source);
+            }
+        };
+    }
 
     #[test]
     fn test_typeof_generator() {
@@ -9874,4 +9909,201 @@ mod tests {
         .unwrap();
         assert_eq!(result, JsValue::Smi(12));
     }
+
+    computed_e2e_test!(
+        e2e_computed_object_string_value,
+        "var key = 'alpha'; var o = {[key]: 1}; o.alpha === 1"
+    );
+    computed_e2e_test!(
+        e2e_computed_object_number_value,
+        "var o = {[1 + 1]: 3}; o[2] === 3"
+    );
+    computed_e2e_test!(
+        e2e_computed_object_symbol_value,
+        "var s = Symbol('s'); var o = {[s]: 4}; o[s] === 4"
+    );
+    computed_e2e_test!(
+        e2e_computed_object_call_expression_key,
+        "function key() { return 'beta'; } var o = {[key()]: 2}; o.beta === 2"
+    );
+    computed_e2e_test!(
+        e2e_computed_object_symbol_iterator_method,
+        "var o = {[Symbol.iterator]() { return { next() { return { done: true }; } }; }}; \
+         typeof o[Symbol.iterator] === 'function'"
+    );
+    computed_e2e_test!(
+        e2e_computed_object_dynamic_method,
+        "var k = 'run'; var o = {[k]() { return 5; }}; o.run() === 5"
+    );
+    computed_e2e_test!(
+        e2e_computed_object_symbol_getter,
+        "var s = Symbol('g'); var o = { get [s]() { return 6; } }; o[s] === 6"
+    );
+    computed_e2e_test!(
+        e2e_computed_object_symbol_setter,
+        "var s = Symbol('s'); var hit = 0; var o = { set [s](v) { hit = v; } }; \
+         o[s] = 7; hit === 7"
+    );
+    computed_e2e_test!(
+        e2e_computed_object_symbol_getter_setter_pair,
+        "var s = Symbol('x'); \
+         var o = { _v: 0, get [s]() { return this._v; }, set [s](v) { this._v = v; } }; \
+         o[s] = 8; o[s] === 8"
+    );
+    computed_e2e_test!(
+        e2e_computed_object_toprimitive_key,
+        "var o = {}; o[{ [Symbol.toPrimitive]() { return 'x'; } }] = 9; o.x === 9"
+    );
+    computed_e2e_test!(
+        e2e_computed_object_proto_is_data_property,
+        "var proto = { p: 1 }; \
+         var o = { ['__proto__']: proto }; \
+         Object.getPrototypeOf(o) !== proto && o['__proto__'] === proto && o.hasOwnProperty('__proto__')"
+    );
+    computed_e2e_test!(
+        e2e_noncomputed_object_proto_still_sets_prototype,
+        "var proto = { p: 1 }; \
+         var o = { __proto__: proto }; \
+         Object.getPrototypeOf(o) === proto && !o.hasOwnProperty('__proto__')"
+    );
+    computed_e2e_test!(
+        e2e_computed_object_value_order,
+        "var order = []; \
+         var o = { [(order.push('k'), 'x')]: (order.push('v'), 1) }; \
+         order.join(',') === 'k,v' && o.x === 1"
+    );
+    computed_e2e_test!(
+        e2e_computed_object_property_order_left_to_right,
+        "var order = []; \
+         var o = { [(order.push('a'), 'x')]: 1, y: (order.push('b'), 2), [(order.push('c'), 'z')]: 3 }; \
+         order.join(',') === 'a,b,c'"
+    );
+    computed_e2e_test!(
+        e2e_computed_object_key_evaluated_once,
+        "var i = 0; var o = { [++i]: i }; i === 1 && o[1] === 1"
+    );
+    computed_e2e_test!(
+        e2e_computed_object_getter_key_order,
+        "var order = []; var k = 'x'; \
+         var o = { get [(order.push('k'), k)]() { return 1; }, y: (order.push('v'), 2) }; \
+         order.join(',') === 'k,v' && o.x === 1 && o.y === 2"
+    );
+    computed_e2e_test!(
+        e2e_computed_object_setter_key_order,
+        "var order = []; var k = 'x'; \
+         var o = { _v: 0, set [(order.push('k'), k)](v) { this._v = v; }, y: (order.push('v'), 2) }; \
+         o.x = 3; order.join(',') === 'k,v' && o._v === 3"
+    );
+    computed_e2e_test!(
+        e2e_computed_destructuring_string_key,
+        "var key = 'x'; var { [key]: value } = { x: 11 }; value === 11"
+    );
+    computed_e2e_test!(
+        e2e_computed_destructuring_symbol_key,
+        "var s = Symbol('d'); var { [s]: value } = { [s]: 12 }; value === 12"
+    );
+    computed_e2e_test!(
+        e2e_computed_destructuring_call_expression_key,
+        "function key() { return 'x'; } var { [key()]: value } = { x: 13 }; value === 13"
+    );
+    computed_e2e_test!(
+        e2e_computed_destructuring_order,
+        "var order = []; var src = { a: 1, b: 2 }; \
+         var { [(order.push('a'), 'a')]: x, [(order.push('b'), 'b')]: y } = src; \
+         order.join(',') === 'a,b' && x === 1 && y === 2"
+    );
+    computed_e2e_test!(
+        e2e_computed_destructuring_key_evaluated_once,
+        "var i = 0; var src = { x: 14 }; var { [(i++, 'x')]: value } = src; i === 1 && value === 14"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_method_dynamic_name,
+        "var name = 'm'; class C { [name]() { return 15; } } new C().m() === 15"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_static_method_dynamic_name,
+        "var name = 'm'; class C { static [name]() { return 16; } } C.m() === 16"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_symbol_iterator_method,
+        "class C { [Symbol.iterator]() { return { next() { return { done: true }; } }; } } \
+         typeof new C()[Symbol.iterator] === 'function'"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_static_symbol_method,
+        "class C { static [Symbol.iterator]() { return 18; } } C[Symbol.iterator]() === 18"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_getter,
+        "var name = 'value'; class C { get [name]() { return 19; } } new C().value === 19"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_setter,
+        "var name = 'value'; class C { set [name](v) { this._v = v; } } \
+         var c = new C(); c.value = 20; c._v === 20"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_static_getter,
+        "var name = 'value'; class C { static get [name]() { return 21; } } C.value === 21"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_static_setter,
+        "var name = 'value'; class C { static set [name](v) { this._v = v; } } \
+         C.value = 22; C._v === 22"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_field,
+        "var name = 'value'; class C { [name] = 23; } new C().value === 23"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_static_field,
+        "var name = 'value'; class C { static [name] = 24; } C.value === 24"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_symbol_field,
+        "var s = Symbol('f'); class C { [s] = 25; } var c = new C(); c[s] === 25"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_static_symbol_field,
+        "var s = Symbol('f'); class C { static [s] = 26; } C[s] === 26"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_field_order,
+        "var order = []; class C { [(order.push('k'), 'x')] = (order.push('v'), 27); } \
+         var c = new C(); order.join(',') === 'k,v' && c.x === 27"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_static_field_order,
+        "var order = []; class C { static [(order.push('k'), 'x')] = (order.push('v'), 28); } \
+         order.join(',') === 'k,v' && C.x === 28"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_field_key_evaluated_once,
+        "var i = 0; class C { [(++i, 'x')] = i; } var c = new C(); i === 1 && c.x === 1"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_element_order,
+        "var order = []; \
+         class C { \
+           [(order.push('a'), 'x')]() { return 1; } \
+           static [(order.push('b'), 'y')] = 2; \
+           get [(order.push('c'), 'z')]() { return 3; } \
+         } \
+         var c = new C(); order.join(',') === 'a,b,c' && c.x() === 1 && C.y === 2 && c.z === 3"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_field_proto_is_data_property,
+        "class C { ['__proto__'] = 29; } \
+         var c = new C(); \
+         Object.getPrototypeOf(c) !== 29 && c['__proto__'] === 29 && c.hasOwnProperty('__proto__')"
+    );
+    computed_e2e_test!(
+        e2e_computed_class_static_proto_method_is_not_special,
+        "class C { static ['__proto__']() { return 30; } } \
+         typeof C['__proto__'] === 'function' && C['__proto__']() === 30"
+    );
+    computed_e2e_test!(
+        e2e_computed_symbol_to_primitive_method_name,
+        "var o = { [Symbol.toPrimitive]() { return 31; } }; Number(o) === 31"
+    );
 }

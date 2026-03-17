@@ -582,13 +582,13 @@ mod tests {
 
     #[test]
     fn test_has_instance_matches_constructor_prototype_chain() {
-        use crate::objects::property_map::PropertyMap;
+        use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
         use std::cell::RefCell;
         let proto = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
         let instance_map = Rc::new(RefCell::new(PropertyMap::new()));
         instance_map
             .borrow_mut()
-            .insert("__proto__".into(), proto.clone());
+            .insert(INTERNAL_PROTO_PROPERTY_KEY.into(), proto.clone());
         let mut ctor_map = PropertyMap::new();
         ctor_map.insert("prototype".into(), proto);
         let constructor = JsValue::PlainObject(Rc::new(RefCell::new(ctor_map)));

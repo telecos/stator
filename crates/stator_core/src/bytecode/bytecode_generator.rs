@@ -1977,8 +1977,6 @@ impl FunctionCompiler {
     ) -> StatorResult<()> {
         use crate::parser::ast::{MethodKind, PropKey};
 
-        self.compile_fn_expr(&method.value)?;
-
         let key_name: Option<String> = match &method.key {
             PropKey::Ident(id) => Some(id.name.clone()),
             PropKey::Str(s) => Some(s.value.clone()),
@@ -1996,6 +1994,7 @@ impl FunctionCompiler {
         match method.kind {
             MethodKind::Method => {
                 if let Some(name) = key_name {
+                    self.compile_fn_expr(&method.value)?;
                     let name_idx = self.add_string(&name);
                     let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
                     self.emit(Instruction::new_unchecked(
@@ -2007,12 +2006,8 @@ impl FunctionCompiler {
                         ],
                     ));
                 } else if let PropKey::Computed(key_expr) = &method.key {
-                    let val_reg = self.allocator.allocate_temporary();
-                    self.emit_star(val_reg);
-                    self.compile_expr(key_expr)?;
-                    let key_reg = self.allocator.allocate_temporary();
-                    self.emit_star(key_reg);
-                    self.emit_ldar(val_reg);
+                    let key_reg = self.compile_computed_property_key(key_expr)?;
+                    self.compile_fn_expr(&method.value)?;
                     let slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
                     self.emit(Instruction::new_unchecked(
                         Opcode::DefineKeyedOwnProperty,
@@ -2026,13 +2021,11 @@ impl FunctionCompiler {
                     self.allocator
                         .release_temporary(key_reg)
                         .map_err(|e| StatorError::Internal(e.to_string()))?;
-                    self.allocator
-                        .release_temporary(val_reg)
-                        .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
             }
             MethodKind::Get => {
                 if let Some(name) = key_name {
+                    self.compile_fn_expr(&method.value)?;
                     let name_idx = self.add_string(&name);
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
@@ -2044,12 +2037,8 @@ impl FunctionCompiler {
                         ],
                     ));
                 } else if let PropKey::Computed(key_expr) = &method.key {
-                    let val_reg = self.allocator.allocate_temporary();
-                    self.emit_star(val_reg);
-                    self.compile_expr(key_expr)?;
-                    let key_reg = self.allocator.allocate_temporary();
-                    self.emit_star(key_reg);
-                    self.emit_ldar(val_reg);
+                    let key_reg = self.compile_computed_property_key(key_expr)?;
+                    self.compile_fn_expr(&method.value)?;
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
                         Opcode::DefineKeyedGetterProperty,
@@ -2058,13 +2047,11 @@ impl FunctionCompiler {
                     self.allocator
                         .release_temporary(key_reg)
                         .map_err(|e| StatorError::Internal(e.to_string()))?;
-                    self.allocator
-                        .release_temporary(val_reg)
-                        .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
             }
             MethodKind::Set => {
                 if let Some(name) = key_name {
+                    self.compile_fn_expr(&method.value)?;
                     let name_idx = self.add_string(&name);
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
@@ -2076,12 +2063,8 @@ impl FunctionCompiler {
                         ],
                     ));
                 } else if let PropKey::Computed(key_expr) = &method.key {
-                    let val_reg = self.allocator.allocate_temporary();
-                    self.emit_star(val_reg);
-                    self.compile_expr(key_expr)?;
-                    let key_reg = self.allocator.allocate_temporary();
-                    self.emit_star(key_reg);
-                    self.emit_ldar(val_reg);
+                    let key_reg = self.compile_computed_property_key(key_expr)?;
+                    self.compile_fn_expr(&method.value)?;
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
                         Opcode::DefineKeyedSetterProperty,
@@ -2089,9 +2072,6 @@ impl FunctionCompiler {
                     ));
                     self.allocator
                         .release_temporary(key_reg)
-                        .map_err(|e| StatorError::Internal(e.to_string()))?;
-                    self.allocator
-                        .release_temporary(val_reg)
                         .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
             }
@@ -2110,14 +2090,13 @@ impl FunctionCompiler {
     ) -> StatorResult<()> {
         use crate::parser::ast::PropKey;
 
-        if let Some(value) = &prop.value {
-            self.compile_expr(value)?;
-        } else {
-            self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
-        }
-
         match &prop.key {
             PropKey::Ident(id) => {
+                if let Some(value) = &prop.value {
+                    self.compile_expr(value)?;
+                } else {
+                    self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                }
                 let name_idx = self.add_string(&id.name);
                 let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
                 self.emit(Instruction::new_unchecked(
@@ -2130,6 +2109,11 @@ impl FunctionCompiler {
                 ));
             }
             PropKey::Str(s) => {
+                if let Some(value) = &prop.value {
+                    self.compile_expr(value)?;
+                } else {
+                    self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                }
                 let name_idx = self.add_string(&s.value);
                 let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
                 self.emit(Instruction::new_unchecked(
@@ -2142,6 +2126,11 @@ impl FunctionCompiler {
                 ));
             }
             PropKey::Num(n) => {
+                if let Some(value) = &prop.value {
+                    self.compile_expr(value)?;
+                } else {
+                    self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                }
                 let name = if n.value.fract() == 0.0 && n.value.is_finite() && n.value >= 0.0 {
                     format!("{}", n.value as u64)
                 } else {
@@ -2159,12 +2148,12 @@ impl FunctionCompiler {
                 ));
             }
             PropKey::Computed(key_expr) => {
-                let val_reg = self.allocator.allocate_temporary();
-                self.emit_star(val_reg);
-                self.compile_expr(key_expr)?;
-                let key_reg = self.allocator.allocate_temporary();
-                self.emit_star(key_reg);
-                self.emit_ldar(val_reg);
+                let key_reg = self.compile_computed_property_key(key_expr)?;
+                if let Some(value) = &prop.value {
+                    self.compile_expr(value)?;
+                } else {
+                    self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                }
                 let slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
                 self.emit(Instruction::new_unchecked(
                     Opcode::DefineKeyedOwnProperty,
@@ -2178,11 +2167,13 @@ impl FunctionCompiler {
                 self.allocator
                     .release_temporary(key_reg)
                     .map_err(|e| StatorError::Internal(e.to_string()))?;
-                self.allocator
-                    .release_temporary(val_reg)
-                    .map_err(|e| StatorError::Internal(e.to_string()))?;
             }
             PropKey::Private(id) => {
+                if let Some(value) = &prop.value {
+                    self.compile_expr(value)?;
+                } else {
+                    self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                }
                 let name_idx = self.add_string(&self.resolve_private_storage_key(&id.name));
                 let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
                 self.emit(Instruction::new_unchecked(
@@ -2317,16 +2308,14 @@ impl FunctionCompiler {
         }
 
         for field in fields {
-            // Compile the field value (or undefined).
-            if let Some(value) = &field.value {
-                ic.compile_expr(value)?;
-            } else {
-                ic.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
-            }
-
             // Define the property on `this`.
             match &field.key {
                 PropKey::Ident(id) => {
+                    if let Some(value) = &field.value {
+                        ic.compile_expr(value)?;
+                    } else {
+                        ic.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                    }
                     let name_idx = ic.add_string(&id.name);
                     let slot = ic.alloc_slot(FeedbackSlotKind::StoreProperty);
                     ic.emit(Instruction::new_unchecked(
@@ -2339,6 +2328,11 @@ impl FunctionCompiler {
                     ));
                 }
                 PropKey::Str(s) => {
+                    if let Some(value) = &field.value {
+                        ic.compile_expr(value)?;
+                    } else {
+                        ic.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                    }
                     let name_idx = ic.add_string(&s.value);
                     let slot = ic.alloc_slot(FeedbackSlotKind::StoreProperty);
                     ic.emit(Instruction::new_unchecked(
@@ -2351,6 +2345,11 @@ impl FunctionCompiler {
                     ));
                 }
                 PropKey::Num(n) => {
+                    if let Some(value) = &field.value {
+                        ic.compile_expr(value)?;
+                    } else {
+                        ic.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                    }
                     let name = if n.value.fract() == 0.0 && n.value.is_finite() && n.value >= 0.0 {
                         format!("{}", n.value as u64)
                     } else {
@@ -2368,12 +2367,12 @@ impl FunctionCompiler {
                     ));
                 }
                 PropKey::Computed(key_expr) => {
-                    let val_reg = ic.allocator.allocate_temporary();
-                    ic.emit_star(val_reg);
-                    ic.compile_expr(key_expr)?;
-                    let key_reg = ic.allocator.allocate_temporary();
-                    ic.emit_star(key_reg);
-                    ic.emit_ldar(val_reg);
+                    let key_reg = ic.compile_computed_property_key(key_expr)?;
+                    if let Some(value) = &field.value {
+                        ic.compile_expr(value)?;
+                    } else {
+                        ic.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                    }
                     let slot = ic.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
                     ic.emit(Instruction::new_unchecked(
                         Opcode::DefineKeyedOwnProperty,
@@ -2387,11 +2386,13 @@ impl FunctionCompiler {
                     ic.allocator
                         .release_temporary(key_reg)
                         .map_err(|e| StatorError::Internal(e.to_string()))?;
-                    ic.allocator
-                        .release_temporary(val_reg)
-                        .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
                 PropKey::Private(id) => {
+                    if let Some(value) = &field.value {
+                        ic.compile_expr(value)?;
+                    } else {
+                        ic.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
+                    }
                     let name_idx = ic.add_string(&ic.resolve_private_storage_key(&id.name));
                     let slot = ic.alloc_slot(FeedbackSlotKind::StoreProperty);
                     ic.emit(Instruction::new_unchecked(
@@ -5062,6 +5063,16 @@ impl FunctionCompiler {
         Ok(())
     }
 
+    fn compile_computed_property_key(
+        &mut self,
+        key_expr: &crate::parser::ast::Expr,
+    ) -> StatorResult<Register> {
+        self.compile_expr(key_expr)?;
+        let key_reg = self.allocator.allocate_temporary();
+        self.emit_star(key_reg);
+        Ok(key_reg)
+    }
+
     /// Compile a single property definition into an object literal.
     fn compile_object_prop(
         &mut self,
@@ -5086,11 +5097,26 @@ impl FunctionCompiler {
             PropKey::Private(id) => Some(format!("#{}", id.name)),
             PropKey::Computed(_) => None,
         };
+        let is_proto_literal_value = matches!(&p.value, PropValue::Value(_))
+            && !p.is_computed
+            && match &p.key {
+                PropKey::Ident(id) => id.name == "__proto__",
+                PropKey::Str(s) => {
+                    s.value == "\"__proto__\"" || s.value == "'__proto__'" || s.value == "__proto__"
+                }
+                _ => false,
+            };
 
         match &p.value {
             PropValue::Value(expr) => {
-                self.compile_expr(expr)?;
-                if let Some(name) = key_name {
+                if is_proto_literal_value {
+                    self.compile_expr(expr)?;
+                    self.emit(Instruction::new_unchecked(
+                        Opcode::SetLiteralPrototype,
+                        vec![to_reg_op(obj_reg)],
+                    ));
+                } else if let Some(name) = key_name {
+                    self.compile_expr(expr)?;
                     let name_idx = self.add_string(&name);
                     let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
                     self.emit(Instruction::new_unchecked(
@@ -5098,12 +5124,8 @@ impl FunctionCompiler {
                         vec![to_reg_op(obj_reg), Operand::ConstantPoolIdx(name_idx), slot],
                     ));
                 } else if let PropKey::Computed(key_expr) = &p.key {
-                    let val_reg = self.allocator.allocate_temporary();
-                    self.emit_star(val_reg);
-                    self.compile_expr(key_expr)?;
-                    let key_reg = self.allocator.allocate_temporary();
-                    self.emit_star(key_reg);
-                    self.emit_ldar(val_reg);
+                    let key_reg = self.compile_computed_property_key(key_expr)?;
+                    self.compile_expr(expr)?;
                     let slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
                     self.emit(Instruction::new_unchecked(
                         Opcode::DefineKeyedOwnProperty,
@@ -5116,9 +5138,6 @@ impl FunctionCompiler {
                     ));
                     self.allocator
                         .release_temporary(key_reg)
-                        .map_err(|e| StatorError::Internal(e.to_string()))?;
-                    self.allocator
-                        .release_temporary(val_reg)
                         .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
             }
@@ -5137,8 +5156,6 @@ impl FunctionCompiler {
             PropValue::Method(fn_expr) => {
                 if let Some(ref name) = key_name {
                     self.compile_fn_expr_named(fn_expr, name)?;
-                } else {
-                    self.compile_fn_expr(fn_expr)?;
                 }
                 if let Some(name) = key_name {
                     let name_idx = self.add_string(&name);
@@ -5148,12 +5165,8 @@ impl FunctionCompiler {
                         vec![to_reg_op(obj_reg), Operand::ConstantPoolIdx(name_idx), slot],
                     ));
                 } else if let PropKey::Computed(key_expr) = &p.key {
-                    let val_reg = self.allocator.allocate_temporary();
-                    self.emit_star(val_reg);
-                    self.compile_expr(key_expr)?;
-                    let key_reg = self.allocator.allocate_temporary();
-                    self.emit_star(key_reg);
-                    self.emit_ldar(val_reg);
+                    let key_reg = self.compile_computed_property_key(key_expr)?;
+                    self.compile_fn_expr(fn_expr)?;
                     let slot = self.alloc_slot(FeedbackSlotKind::KeyedStoreProperty);
                     self.emit(Instruction::new_unchecked(
                         Opcode::DefineKeyedOwnProperty,
@@ -5167,16 +5180,11 @@ impl FunctionCompiler {
                     self.allocator
                         .release_temporary(key_reg)
                         .map_err(|e| StatorError::Internal(e.to_string()))?;
-                    self.allocator
-                        .release_temporary(val_reg)
-                        .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
             }
             PropValue::Get(fn_expr) => {
                 if let Some(ref name) = key_name {
                     self.compile_fn_expr_named(fn_expr, &format!("get {name}"))?;
-                } else {
-                    self.compile_fn_expr(fn_expr)?;
                 }
                 if let Some(name) = key_name {
                     let name_idx = self.add_string(&name);
@@ -5186,12 +5194,8 @@ impl FunctionCompiler {
                         vec![to_reg_op(obj_reg), Operand::ConstantPoolIdx(name_idx), slot],
                     ));
                 } else if let PropKey::Computed(key_expr) = &p.key {
-                    let val_reg = self.allocator.allocate_temporary();
-                    self.emit_star(val_reg);
-                    self.compile_expr(key_expr)?;
-                    let key_reg = self.allocator.allocate_temporary();
-                    self.emit_star(key_reg);
-                    self.emit_ldar(val_reg);
+                    let key_reg = self.compile_computed_property_key(key_expr)?;
+                    self.compile_fn_expr(fn_expr)?;
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
                         Opcode::DefineKeyedGetterProperty,
@@ -5200,16 +5204,11 @@ impl FunctionCompiler {
                     self.allocator
                         .release_temporary(key_reg)
                         .map_err(|e| StatorError::Internal(e.to_string()))?;
-                    self.allocator
-                        .release_temporary(val_reg)
-                        .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
             }
             PropValue::Set(fn_expr) => {
                 if let Some(ref name) = key_name {
                     self.compile_fn_expr_named(fn_expr, &format!("set {name}"))?;
-                } else {
-                    self.compile_fn_expr(fn_expr)?;
                 }
                 if let Some(name) = key_name {
                     let name_idx = self.add_string(&name);
@@ -5219,12 +5218,8 @@ impl FunctionCompiler {
                         vec![to_reg_op(obj_reg), Operand::ConstantPoolIdx(name_idx), slot],
                     ));
                 } else if let PropKey::Computed(key_expr) = &p.key {
-                    let val_reg = self.allocator.allocate_temporary();
-                    self.emit_star(val_reg);
-                    self.compile_expr(key_expr)?;
-                    let key_reg = self.allocator.allocate_temporary();
-                    self.emit_star(key_reg);
-                    self.emit_ldar(val_reg);
+                    let key_reg = self.compile_computed_property_key(key_expr)?;
+                    self.compile_fn_expr(fn_expr)?;
                     let slot = self.alloc_slot(FeedbackSlotKind::DefineAccessor);
                     self.emit(Instruction::new_unchecked(
                         Opcode::DefineKeyedSetterProperty,
@@ -5232,9 +5227,6 @@ impl FunctionCompiler {
                     ));
                     self.allocator
                         .release_temporary(key_reg)
-                        .map_err(|e| StatorError::Internal(e.to_string()))?;
-                    self.allocator
-                        .release_temporary(val_reg)
                         .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
             }

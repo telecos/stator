@@ -142,7 +142,7 @@ use crate::interpreter::{
 };
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
-use crate::objects::property_map::PropertyMap;
+use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 use crate::objects::value::{JsValue, NativeIterator, ToPrimitiveHint, number_to_string};
 use std::collections::HashSet;
 
@@ -944,7 +944,7 @@ fn plain_get(target: &JsValue, key: &str, receiver: &JsValue) -> StatorResult<Js
             if let Some(value) = borrow.get(key).cloned() {
                 return Ok(value);
             }
-            if let Some(proto) = borrow.get("__proto__").cloned() {
+            if let Some(proto) = borrow.get(INTERNAL_PROTO_PROPERTY_KEY).cloned() {
                 drop(borrow);
                 current = proto;
                 continue;
@@ -1014,7 +1014,7 @@ fn plain_set(
                 drop(borrow);
                 return plain_set_on_receiver(receiver, key, value);
             }
-            if let Some(proto) = borrow.get("__proto__").cloned() {
+            if let Some(proto) = borrow.get(INTERNAL_PROTO_PROPERTY_KEY).cloned() {
                 drop(borrow);
                 current = proto;
                 continue;
@@ -1036,7 +1036,7 @@ fn plain_has(target: &JsValue, key: &str) -> bool {
             {
                 return true;
             }
-            if let Some(proto) = borrow.get("__proto__").cloned() {
+            if let Some(proto) = borrow.get(INTERNAL_PROTO_PROPERTY_KEY).cloned() {
                 drop(borrow);
                 current = proto;
                 continue;
@@ -1081,7 +1081,7 @@ fn plain_own_keys(map: &PropertyMap) -> Vec<JsValue> {
     let mut symbols: Vec<JsValue> = Vec::new();
     let mut seen = HashSet::new();
     for key in map.keys() {
-        if key == "__proto__" {
+        if key == INTERNAL_PROTO_PROPERTY_KEY {
             continue;
         }
         if let Some(symbol) = property_key_to_symbol(key) {
@@ -1892,7 +1892,7 @@ fn make_error_constructor_object(
             error_prototype_to_string(this)
         }),
     );
-    proto.insert("__proto__".into(), error_proto.clone());
+    proto.insert(INTERNAL_PROTO_PROPERTY_KEY.into(), error_proto.clone());
     proto.make_all_non_enumerable();
     let err_proto_rc = Rc::new(RefCell::new(proto));
     let err_proto_val = JsValue::PlainObject(err_proto_rc.clone());
@@ -1914,7 +1914,7 @@ fn make_error_constructor_object(
         })
     });
     // §20.5.6.1 NativeError.__proto__ → Error (constructor chain)
-    props.insert("__proto__".into(), error_ctor.clone());
+    props.insert(INTERNAL_PROTO_PROPERTY_KEY.into(), error_ctor.clone());
     props.insert("prototype".into(), err_proto_val);
     props.make_all_non_enumerable();
     let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
@@ -1992,7 +1992,7 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
             error_prototype_to_string(this)
         }),
     );
-    proto.insert("__proto__".into(), error_proto.clone());
+    proto.insert(INTERNAL_PROTO_PROPERTY_KEY.into(), error_proto.clone());
     proto.make_all_non_enumerable();
     let proto_rc = Rc::new(RefCell::new(proto));
     let proto_val = JsValue::PlainObject(proto_rc.clone());
@@ -2014,7 +2014,7 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
             )))
         })
     });
-    props.insert("__proto__".into(), error_ctor.clone());
+    props.insert(INTERNAL_PROTO_PROPERTY_KEY.into(), error_ctor.clone());
     props.insert("prototype".into(), proto_val);
     props.make_all_non_enumerable();
     let ctor = JsValue::PlainObject(Rc::new(RefCell::new(props)));
@@ -5100,10 +5100,10 @@ fn make_object() -> JsValue {
                 let mut map = PropertyMap::new();
                 match &proto {
                     JsValue::Null => {
-                        map.insert("__proto__".to_string(), JsValue::Null);
+                        map.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), JsValue::Null);
                     }
                     _ if proto.is_object_like() => {
-                        map.insert("__proto__".to_string(), proto.clone());
+                        map.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), proto.clone());
                     }
                     _ => {
                         return Err(StatorError::TypeError(
@@ -5172,7 +5172,7 @@ fn make_object() -> JsValue {
                 match obj {
                     JsValue::PlainObject(map) => {
                         let borrow = map.borrow();
-                        let has_data = borrow.contains_key(&key) && key != "__proto__";
+                        let has_data = borrow.contains_key(&key);
                         let has_accessor = borrow.contains_key(&format!("__get_{key}__"))
                             || borrow.contains_key(&format!("__set_{key}__"));
                         Ok(JsValue::Boolean(has_data || has_accessor))
@@ -5257,7 +5257,7 @@ fn make_object() -> JsValue {
                 };
 
                 let mut result = PropertyMap::new();
-                result.insert("__proto__".to_string(), JsValue::Null);
+                result.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), JsValue::Null);
                 let result_rc = Rc::new(RefCell::new(result));
                 for (i, item) in elements.iter().enumerate() {
                     let key = dispatch_call_value(&cb, vec![item.clone(), JsValue::Smi(i as i32)])?;
@@ -5561,7 +5561,7 @@ fn make_object() -> JsValue {
                 match this {
                     JsValue::PlainObject(map) => {
                         let borrow = map.borrow();
-                        let exists = borrow.contains_key(&prop) && prop != "__proto__";
+                        let exists = borrow.contains_key(&prop);
                         let enumerable = exists && borrow.is_enumerable(&prop);
                         Ok(JsValue::Boolean(enumerable))
                     }
@@ -5583,14 +5583,14 @@ fn make_object() -> JsValue {
                         return Ok(g.clone());
                     }
                     // Walk the prototype chain.
-                    let mut current = map.borrow().get("__proto__").cloned();
+                    let mut current = map.borrow().get(INTERNAL_PROTO_PROPERTY_KEY).cloned();
                     for _ in 0..256 {
                         match current {
                             Some(JsValue::PlainObject(p)) => {
                                 if let Some(g) = p.borrow().get(&getter_key) {
                                     return Ok(g.clone());
                                 }
-                                current = p.borrow().get("__proto__").cloned();
+                                current = p.borrow().get(INTERNAL_PROTO_PROPERTY_KEY).cloned();
                             }
                             _ => break,
                         }
@@ -5613,14 +5613,14 @@ fn make_object() -> JsValue {
                         return Ok(s.clone());
                     }
                     // Walk the prototype chain.
-                    let mut current = map.borrow().get("__proto__").cloned();
+                    let mut current = map.borrow().get(INTERNAL_PROTO_PROPERTY_KEY).cloned();
                     for _ in 0..256 {
                         match current {
                             Some(JsValue::PlainObject(p)) => {
                                 if let Some(s) = p.borrow().get(&setter_key) {
                                     return Ok(s.clone());
                                 }
-                                current = p.borrow().get("__proto__").cloned();
+                                current = p.borrow().get(INTERNAL_PROTO_PROPERTY_KEY).cloned();
                             }
                             _ => break,
                         }
@@ -5663,7 +5663,7 @@ fn make_object() -> JsValue {
         );
 
         // Annex B §B.2.2.1 — Object.prototype.__proto__ (terminal null)
-        obj_proto.insert("__proto__".into(), JsValue::Null);
+        obj_proto.insert(INTERNAL_PROTO_PROPERTY_KEY.into(), JsValue::Null);
 
         // Object.prototype.toString()
         // ECMAScript §20.1.3.6 — returns "[object X]" classification.
@@ -7072,7 +7072,7 @@ fn make_array() -> JsValue {
                 let len = array_like_length(arr)?;
                 let arr_val = arr.clone();
                 let mut groups = PropertyMap::new();
-                groups.insert("__proto__".into(), JsValue::Null);
+                groups.insert(INTERNAL_PROTO_PROPERTY_KEY.into(), JsValue::Null);
                 let groups_rc = Rc::new(RefCell::new(groups));
                 for i in 0..len {
                     let item = array_like_get_index(arr, i);
@@ -8869,7 +8869,7 @@ fn create_bound_function_object(call_fn: JsValue, name: String, length: i32) -> 
     props.insert("name".to_string(), JsValue::String(name.into()));
     props.insert("length".to_string(), JsValue::Smi(length));
     if let Some(function_proto) = function_prototype_value() {
-        props.insert("__proto__".to_string(), function_proto);
+        props.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), function_proto);
     }
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
@@ -11804,7 +11804,7 @@ fn plain_object_to_js_object(map: &Rc<RefCell<PropertyMap>>) -> JsObject {
     let mut obj = JsObject::new();
     let borrow = map.borrow();
     for (k, v) in borrow.iter() {
-        if k == "__proto__" || is_internal_accessor_key(k) {
+        if k == INTERNAL_PROTO_PROPERTY_KEY || is_internal_accessor_key(k) {
             continue;
         }
         let mut attrs = PropertyAttributes::empty();
@@ -12120,7 +12120,8 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
             if !matches!(ctor_proto, JsValue::Undefined | JsValue::Null)
                 && let JsValue::PlainObject(map) = &this_obj
             {
-                map.borrow_mut().insert("__proto__".to_string(), ctor_proto);
+                map.borrow_mut()
+                    .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), ctor_proto);
             }
             let result = dispatch_call_with_this(&target, this_obj.clone(), args)?;
             match result {
@@ -12509,7 +12510,8 @@ fn make_reflect() -> JsValue {
                 if !matches!(ctor_proto, JsValue::Undefined | JsValue::Null)
                     && let JsValue::PlainObject(map) = &this_obj
                 {
-                    map.borrow_mut().insert("__proto__".to_string(), ctor_proto);
+                    map.borrow_mut()
+                        .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), ctor_proto);
                 }
                 let result = dispatch_call_with_this(&target, this_obj.clone(), arg_list)?;
                 match result {
