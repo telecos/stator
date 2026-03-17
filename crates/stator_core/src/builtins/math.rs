@@ -312,19 +312,38 @@ pub fn math_hypot(values: &[f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
-    // Check for any infinities first (per ECMAScript spec).
-    for &v in values {
-        if v.is_infinite() {
+    let mut max = 0.0;
+    let mut saw_nan = false;
+
+    for &value in values {
+        let abs = value.abs();
+        if abs.is_infinite() {
             return f64::INFINITY;
         }
-    }
-    for &v in values {
-        if v.is_nan() {
-            return f64::NAN;
+        if abs.is_nan() {
+            saw_nan = true;
+            continue;
+        }
+        if abs > max {
+            max = abs;
         }
     }
-    let sum_sq: f64 = values.iter().map(|v| v * v).sum();
-    sum_sq.sqrt()
+
+    if saw_nan {
+        return f64::NAN;
+    }
+    if max == 0.0 {
+        return 0.0;
+    }
+
+    let scaled_sum = values
+        .iter()
+        .map(|value| {
+            let scaled = value / max;
+            scaled * scaled
+        })
+        .sum::<f64>();
+    max * scaled_sum.sqrt()
 }
 
 // ── Math.log / Math.log2 / Math.log10 ────────────────────────────────────────
@@ -541,8 +560,7 @@ pub fn math_random() -> f64 {
 /// assert_eq!(math_clz32(0.0), 32);
 /// ```
 pub fn math_clz32(x: f64) -> u32 {
-    let n = x as i64 as i32 as u32;
-    n.leading_zeros()
+    to_uint32_number(x).leading_zeros()
 }
 
 // ── Math.imul ─────────────────────────────────────────────────────────────────
@@ -563,9 +581,7 @@ pub fn math_clz32(x: f64) -> u32 {
 /// assert_eq!(math_imul(0xffffffff_u32 as f64, 5.0), -5);
 /// ```
 pub fn math_imul(a: f64, b: f64) -> i32 {
-    let a = a as i64 as i32;
-    let b = b as i64 as i32;
-    a.wrapping_mul(b)
+    to_uint32_number(a).wrapping_mul(to_uint32_number(b)) as i32
 }
 
 // ── Math.fround ───────────────────────────────────────────────────────────────
@@ -585,6 +601,13 @@ pub fn math_imul(a: f64, b: f64) -> i32 {
 /// ```
 pub fn math_fround(x: f64) -> f64 {
     (x as f32) as f64
+}
+
+fn to_uint32_number(n: f64) -> u32 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return 0;
+    }
+    n.trunc().rem_euclid(4_294_967_296.0) as u32
 }
 
 // ── Math.exp ──────────────────────────────────────────────────────────────────
