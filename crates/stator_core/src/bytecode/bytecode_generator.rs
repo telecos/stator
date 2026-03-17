@@ -1977,8 +1977,6 @@ impl FunctionCompiler {
     ) -> StatorResult<()> {
         use crate::parser::ast::{MethodKind, PropKey};
 
-        self.compile_fn_expr(&method.value)?;
-
         let key_name: Option<String> = match &method.key {
             PropKey::Ident(id) => Some(id.name.clone()),
             PropKey::Str(s) => Some(s.value.clone()),
@@ -1992,6 +1990,25 @@ impl FunctionCompiler {
             PropKey::Private(id) => Some(self.resolve_private_storage_key(&id.name)),
             PropKey::Computed(_) => None,
         };
+
+        // Compile the function with the correct name prefix for accessors.
+        match method.kind {
+            MethodKind::Get if key_name.is_some() => {
+                self.compile_fn_expr_named(
+                    &method.value,
+                    &format!("get {}", key_name.as_ref().unwrap()),
+                )?;
+            }
+            MethodKind::Set if key_name.is_some() => {
+                self.compile_fn_expr_named(
+                    &method.value,
+                    &format!("set {}", key_name.as_ref().unwrap()),
+                )?;
+            }
+            _ => {
+                self.compile_fn_expr(&method.value)?;
+            }
+        }
 
         match method.kind {
             MethodKind::Method => {
