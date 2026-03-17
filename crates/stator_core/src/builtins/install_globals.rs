@@ -25340,6 +25340,269 @@ mod tests {
         assert_eq!(result, JsValue::Smi(123));
     }
 
+    // ── eval & Function constructor scope-chain precision tests ────────
+
+    // 1. Direct eval inherits caller's scope and can declare variables in it
+    #[test]
+    fn e2e_eval_scope_direct_inherits_caller_scope() {
+        assert_e2e_true("function f() { var a = 5; return eval('a') === 5; } f()");
+    }
+
+    #[test]
+    fn e2e_eval_scope_direct_declares_var_in_caller() {
+        assert_e2e_true("function f() { eval('var declared = 42'); return declared === 42; } f()");
+    }
+
+    #[test]
+    fn e2e_eval_scope_direct_declares_function_in_caller() {
+        assert_e2e_true(
+            "function f() { eval('function g() { return 7; }'); return g() === 7; } f()",
+        );
+    }
+
+    // 2. Indirect eval uses global scope
+    #[test]
+    fn e2e_eval_scope_indirect_uses_global_scope() {
+        assert_e2e_true(
+            "var gv = 100; function f() { var gv = 1; return (0, eval)('gv') === 100; } f()",
+        );
+    }
+
+    #[test]
+    fn e2e_eval_scope_indirect_var_alias() {
+        assert_e2e_true(
+            "var gv = 99; function f() { var gv = 1; var e = eval; return e('gv') === 99; } f()",
+        );
+    }
+
+    #[test]
+    fn e2e_eval_scope_indirect_cannot_see_local() {
+        assert_e2e_true(
+            "function f() { var local = 5; try { (0, eval)('local'); return false; } catch(e) { return true; } } f()",
+        );
+    }
+
+    // 3. new Function always uses global scope, no closure
+    #[test]
+    fn e2e_function_ctor_scope_always_global() {
+        assert_e2e_true(
+            "var gv = 77; function f() { var gv = 1; return new Function('return gv')() === 77; } f()",
+        );
+    }
+
+    #[test]
+    fn e2e_function_ctor_scope_no_closure_over_local() {
+        assert_e2e_true(
+            "function f() { var secret = 999; var fn = new Function('try { return secret; } catch(e) { return -1; }'); return fn() === -1; } f()",
+        );
+    }
+
+    #[test]
+    fn e2e_function_ctor_scope_nested_in_function() {
+        assert_e2e_true(
+            "var outer = 10; function f() { var outer = 20; function g() { var outer = 30; return new Function('return outer')(); } return g(); } f() === 10",
+        );
+    }
+
+    // 4. eval in strict mode has its own variable scope
+    #[test]
+    fn e2e_eval_strict_var_does_not_leak() {
+        assert_e2e_true(
+            "function f() { 'use strict'; eval('var strictLocal = 1'); return typeof strictLocal === 'undefined'; } f()",
+        );
+    }
+
+    #[test]
+    fn e2e_eval_strict_function_does_not_leak() {
+        assert_e2e_true(
+            "function f() { 'use strict'; eval('function gStrict() {}'); return typeof gStrict === 'undefined'; } f()",
+        );
+    }
+
+    // 5. eval with let/const — block scoped to eval, not caller
+    #[test]
+    fn e2e_eval_let_scoped_to_eval_not_caller() {
+        assert_e2e_true(
+            "function f() { eval('let ev_let = 10'); return typeof ev_let === 'undefined'; } f()",
+        );
+    }
+
+    #[test]
+    fn e2e_eval_const_scoped_to_eval_not_caller() {
+        assert_e2e_true(
+            "function f() { eval('const ev_const = 10'); return typeof ev_const === 'undefined'; } f()",
+        );
+    }
+
+    #[test]
+    fn e2e_eval_let_visible_inside_eval() {
+        assert_e2e_true("function f() { return eval('let x = 42; x'); } f() === 42");
+    }
+
+    #[test]
+    fn e2e_eval_const_visible_inside_eval() {
+        assert_e2e_true("function f() { return eval('const y = 99; y'); } f() === 99");
+    }
+
+    // 6. eval with var in strict mode doesn't affect caller scope
+    #[test]
+    fn e2e_eval_strict_var_no_caller_effect() {
+        assert_e2e_true(
+            "function f() { 'use strict'; eval('var sv = 123'); return typeof sv === 'undefined'; } f()",
+        );
+    }
+
+    // 7. eval with var in sloppy mode affects caller scope
+    #[test]
+    fn e2e_eval_sloppy_var_affects_caller() {
+        assert_e2e_true(
+            "function f() { eval('var sloppyVar = 55'); return sloppyVar === 55; } f()",
+        );
+    }
+
+    #[test]
+    fn e2e_eval_sloppy_var_overwrite() {
+        assert_e2e_true("function f() { var x = 1; eval('var x = 2'); return x === 2; } f()");
+    }
+
+    // 8. Function.prototype.constructor === Function
+    #[test]
+    fn e2e_function_prototype_constructor_identity() {
+        assert_e2e_true("Function.prototype.constructor === Function");
+    }
+
+    #[test]
+    fn e2e_function_constructor_from_instance() {
+        assert_e2e_true("(function(){}).constructor === Function");
+    }
+
+    // 9. eval return value — last expression value
+    #[test]
+    fn e2e_eval_return_value_last_expr() {
+        assert_e2e_true("eval('10; 20; 30') === 30");
+    }
+
+    #[test]
+    fn e2e_eval_return_value_single_expr() {
+        assert_e2e_true("eval('42') === 42");
+    }
+
+    #[test]
+    fn e2e_eval_return_value_object() {
+        assert_e2e_true("typeof eval('({a: 1})') === 'object'");
+    }
+
+    #[test]
+    fn e2e_eval_return_value_string_expr() {
+        assert_e2e_true("eval('\"hello\"') === 'hello'");
+    }
+
+    // 10. eval with empty string returns undefined
+    #[test]
+    fn e2e_eval_empty_string_returns_undefined() {
+        assert_e2e_true("eval('') === undefined");
+    }
+
+    #[test]
+    fn e2e_eval_whitespace_only_returns_undefined() {
+        assert_e2e_true("eval('   ') === undefined");
+    }
+
+    // 11. eval with syntax error throws SyntaxError
+    #[test]
+    fn e2e_eval_syntax_error_throws() {
+        assert_e2e_true("try { eval('if ('); false; } catch(e) { e instanceof SyntaxError; }");
+    }
+
+    #[test]
+    fn e2e_eval_syntax_error_incomplete_object() {
+        assert_e2e_true("try { eval('{a:'); false; } catch(e) { e instanceof SyntaxError; }");
+    }
+
+    // 12. new Function() creates function with empty body
+    #[test]
+    fn e2e_function_ctor_empty_body() {
+        assert_e2e_true("new Function()() === undefined");
+    }
+
+    #[test]
+    fn e2e_function_ctor_empty_string_body() {
+        assert_e2e_true("new Function('')() === undefined");
+    }
+
+    #[test]
+    fn e2e_function_ctor_typeof_result() {
+        assert_e2e_true("typeof new Function() === 'function'");
+    }
+
+    #[test]
+    fn e2e_function_ctor_is_callable() {
+        assert_e2e_true("var fn = new Function('return 1'); fn() === 1");
+    }
+
+    // 13. Nested eval — inner eval in direct eval inherits scope chain
+    #[test]
+    fn e2e_eval_nested_direct_inherits_scope_chain() {
+        assert_e2e_true("function f() { var a = 3; return eval(\"eval('a')\") === 3; } f()");
+    }
+
+    #[test]
+    fn e2e_eval_nested_direct_three_deep() {
+        assert_e2e_true(
+            "function f() { var a = 7; return eval(\"eval(\\\"eval('a')\\\")\") === 7; } f()",
+        );
+    }
+
+    #[test]
+    fn e2e_eval_nested_direct_can_mutate() {
+        assert_e2e_true(
+            "function f() { var a = 1; eval(\"eval('a = a + 10')\"); return a === 11; } f()",
+        );
+    }
+
+    #[test]
+    fn e2e_eval_nested_indirect_in_direct_uses_global() {
+        assert_e2e_true(
+            "var nv = 50; function f() { var nv = 1; return eval(\"(0, eval)('nv')\") === 50; } f()",
+        );
+    }
+
+    // Additional edge-case tests
+    #[test]
+    fn e2e_eval_non_string_returns_value() {
+        assert_e2e_true("eval(42) === 42");
+    }
+
+    #[test]
+    fn e2e_eval_non_string_object_returns_same() {
+        assert_e2e_true("var obj = {x:1}; eval(obj) === obj");
+    }
+
+    #[test]
+    fn e2e_eval_non_string_boolean_returns_same() {
+        assert_e2e_true("eval(true) === true");
+    }
+
+    #[test]
+    fn e2e_eval_no_args_returns_undefined() {
+        assert_e2e_true("eval() === undefined");
+    }
+
+    #[test]
+    fn e2e_function_ctor_name_is_anonymous() {
+        assert_e2e_true("new Function().name === 'anonymous'");
+    }
+
+    #[test]
+    fn e2e_function_ctor_length_matches_params() {
+        assert_e2e_true("new Function('a', 'b', 'c', 'return 0').length === 3");
+    }
+
+    #[test]
+    fn e2e_function_ctor_single_comma_separated_params() {
+        assert_e2e_true("new Function('a, b', 'return a + b')(3, 4) === 7");
+    }
+
     #[test]
     fn e2e_function_prototype_call() {
         let result =
