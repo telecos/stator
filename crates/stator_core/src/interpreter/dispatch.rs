@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use crate::builtins::string::{string_char_at, utf16_len};
 use crate::objects::map::PropertyAttributes;
-use crate::objects::property_map::PropertyMap;
+use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 
 use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
@@ -3974,16 +3974,9 @@ fn handle_to_object(
             let sym_val = *sym;
             let mut map = PropertyMap::new();
             map.insert("__wrapped__".into(), JsValue::Symbol(sym_val));
-            map.insert(
-                "valueOf".into(),
-                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::Symbol(sym_val)))),
-            );
-            map.insert(
-                "toString".into(),
-                JsValue::NativeFunction(Rc::new(move |_| {
-                    Ok(JsValue::String(format!("Symbol({})", sym_val).into()))
-                })),
-            );
+            if let Some(proto) = super::global_constructor_prototype("Symbol") {
+                map.insert(INTERNAL_PROTO_PROPERTY_KEY.into(), proto);
+            }
             JsValue::PlainObject(Rc::new(RefCell::new(map)))
         }
         // ECMAScript §7.1.18 – BigInt wrapper object.

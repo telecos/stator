@@ -7531,15 +7531,26 @@ fn make_symbol() -> JsValue {
 
     // ── Symbol.prototype ─────────────────────────────────────────────────
     {
+        fn symbol_this_id(this: &JsValue) -> Option<u64> {
+            match this {
+                JsValue::Symbol(id) => Some(*id),
+                JsValue::PlainObject(map) => match map.borrow().get("__wrapped__") {
+                    Some(JsValue::Symbol(id)) => Some(*id),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+
         let mut proto = PropertyMap::new();
 
         // Symbol.prototype.description — getter returning the description.
         proto.insert(
-            "description".into(),
+            "__get_description__".into(),
             native(|args| {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
-                if let JsValue::Symbol(id) = this {
-                    match symbol_description(*id) {
+                if let Some(id) = symbol_this_id(this) {
+                    match symbol_description(id) {
                         Some(desc) => Ok(JsValue::String(desc.into())),
                         None => Ok(JsValue::Undefined),
                     }
@@ -7556,8 +7567,8 @@ fn make_symbol() -> JsValue {
             "toString".into(),
             native(|args| {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
-                if let JsValue::Symbol(id) = this {
-                    match symbol_description(*id) {
+                if let Some(id) = symbol_this_id(this) {
+                    match symbol_description(id) {
                         Some(desc) => Ok(JsValue::String(format!("Symbol({desc})").into())),
                         None => Ok(JsValue::String("Symbol()".to_string().into())),
                     }
@@ -7574,8 +7585,8 @@ fn make_symbol() -> JsValue {
             "valueOf".into(),
             native(|args| {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
-                if let JsValue::Symbol(id) = this {
-                    Ok(JsValue::Symbol(*id))
+                if let Some(id) = symbol_this_id(this) {
+                    Ok(JsValue::Symbol(id))
                 } else {
                     Err(crate::error::StatorError::TypeError(
                         "Symbol.prototype.valueOf requires a symbol".into(),
@@ -7590,8 +7601,8 @@ fn make_symbol() -> JsValue {
             "@@toPrimitive".into(),
             native(|args| {
                 let this = args.first().unwrap_or(&JsValue::Undefined);
-                if let JsValue::Symbol(id) = this {
-                    Ok(JsValue::Symbol(*id))
+                if let Some(id) = symbol_this_id(this) {
+                    Ok(JsValue::Symbol(id))
                 } else {
                     Err(crate::error::StatorError::TypeError(
                         "Symbol.prototype[@@toPrimitive] requires a symbol".into(),
@@ -16645,6 +16656,34 @@ mod tests {
         assert_eq!(result, JsValue::String("Symbol.matchAll".into()));
     }
 
+    /// `Symbol.prototype.description` is exposed as an accessor property.
+    #[test]
+    fn e2e_symbol_description_descriptor_is_accessor() {
+        assert_eval_true(
+            r#"
+            var desc = Object.getOwnPropertyDescriptor(Symbol.prototype, "description");
+            typeof desc.get === "function" &&
+            desc.set === undefined &&
+            desc.enumerable === false &&
+            desc.configurable === true
+            "#,
+        );
+    }
+
+    /// `Object(Symbol("foo")).description` uses the wrapper receiver.
+    #[test]
+    fn e2e_symbol_wrapper_description_with_value() {
+        let result = global_eval(r#"Object(Symbol("foo")).description"#).unwrap();
+        assert_eq!(result, JsValue::String("foo".into()));
+    }
+
+    /// `Object(Symbol()).description` returns `undefined`.
+    #[test]
+    fn e2e_symbol_wrapper_description_undefined() {
+        let result = global_eval("Object(Symbol()).description").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
     // ── Symbol.prototype.toString tests ─────────────────────────────────
 
     /// `Symbol("foo").toString()` → "Symbol(foo)"
@@ -16682,6 +16721,55 @@ mod tests {
     fn e2e_symbol_value_of_identity() {
         let result = global_eval("Symbol.iterator.valueOf() === Symbol.iterator").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Object(Symbol("x"))` inherits from `Symbol.prototype`.
+    #[test]
+    fn e2e_symbol_wrapper_has_symbol_prototype() {
+        assert_eval_true(r#"Object.getPrototypeOf(Object(Symbol("x"))) === Symbol.prototype"#);
+    }
+
+    /// `Object(Symbol("x")).toString()` uses `Symbol.prototype.toString`.
+    #[test]
+    fn e2e_symbol_wrapper_to_string_with_desc() {
+        let result = global_eval(r#"Object(Symbol("x")).toString()"#).unwrap();
+        assert_eq!(result, JsValue::String("Symbol(x)".into()));
+    }
+
+    /// `Object(Symbol()).toString()` preserves the empty description form.
+    #[test]
+    fn e2e_symbol_wrapper_to_string_without_desc() {
+        let result = global_eval("Object(Symbol()).toString()").unwrap();
+        assert_eq!(result, JsValue::String("Symbol()".into()));
+    }
+
+    /// `Object(Symbol("x")).valueOf()` unwraps back to the symbol primitive.
+    #[test]
+    fn e2e_symbol_wrapper_value_of_returns_symbol() {
+        assert_eval_true(
+            r#"
+            var s = Symbol("x");
+            Object(s).valueOf() === s
+            "#,
+        );
+    }
+
+    /// `Symbol.prototype.toString` accepts boxed symbol receivers.
+    #[test]
+    fn e2e_symbol_prototype_to_string_accepts_wrapper() {
+        let result = global_eval(r#"Symbol.prototype.toString.call(Object(Symbol("x")))"#).unwrap();
+        assert_eq!(result, JsValue::String("Symbol(x)".into()));
+    }
+
+    /// `Symbol.prototype.valueOf` accepts boxed symbol receivers.
+    #[test]
+    fn e2e_symbol_prototype_value_of_accepts_wrapper() {
+        assert_eval_true(
+            r#"
+            var s = Symbol("x");
+            Symbol.prototype.valueOf.call(Object(s)) === s
+            "#,
+        );
     }
 
     // ── Symbol as property key tests ────────────────────────────────────
@@ -17870,6 +17958,28 @@ mod tests {
     fn e2e_symbol_to_primitive_result_is_symbol() {
         let result = global_eval(r#"typeof Symbol("x")[Symbol.toPrimitive]("string")"#).unwrap();
         assert_eq!(result, JsValue::String("symbol".into()));
+    }
+
+    /// Boxed symbols inherit `@@toPrimitive` from `Symbol.prototype`.
+    #[test]
+    fn e2e_symbol_wrapper_to_primitive_returns_symbol() {
+        assert_eval_true(
+            r#"
+            var s = Symbol("x");
+            Object(s)[Symbol.toPrimitive]("default") === s
+            "#,
+        );
+    }
+
+    /// `Symbol.prototype[@@toPrimitive]` accepts boxed symbol receivers.
+    #[test]
+    fn e2e_symbol_prototype_to_primitive_accepts_wrapper() {
+        assert_eval_true(
+            r#"
+            var s = Symbol("x");
+            Symbol.prototype[Symbol.toPrimitive].call(Object(s), "number") === s
+            "#,
+        );
     }
 
     /// Well-known symbol via @@toPrimitive preserves identity.
@@ -47994,6 +48104,39 @@ mod tests {
     #[test]
     fn e2e_get_own_property_symbols_empty() {
         assert_eval_true("Object.getOwnPropertySymbols({a:1, b:2}).length === 0");
+    }
+
+    /// `Object.getOwnPropertySymbols` preserves insertion order.
+    #[test]
+    fn e2e_get_own_property_symbols_preserves_order() {
+        assert_eval_true(
+            r#"
+            var a = Symbol("a");
+            var b = Symbol("b");
+            var o = {};
+            o[b] = 1;
+            o[a] = 2;
+            var syms = Object.getOwnPropertySymbols(o);
+            syms.length === 2 && syms[0] === b && syms[1] === a
+            "#,
+        );
+    }
+
+    /// `Object.getOwnPropertySymbols` ignores inherited symbol keys.
+    #[test]
+    fn e2e_get_own_property_symbols_skips_inherited() {
+        assert_eval_true(
+            r#"
+            var inherited = Symbol("inherited");
+            var own = Symbol("own");
+            var proto = {};
+            proto[inherited] = 1;
+            var obj = Object.create(proto);
+            obj[own] = 2;
+            var syms = Object.getOwnPropertySymbols(obj);
+            syms.length === 1 && syms[0] === own
+            "#,
+        );
     }
 
     // ── Object.create ───────────────────────────────────────────────────────

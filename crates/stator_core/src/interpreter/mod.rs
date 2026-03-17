@@ -176,7 +176,6 @@ use std::time::Instant;
 use crate::builtins::error::{pop_call_frame, push_call_frame};
 use crate::builtins::function::{function_bound_name, function_length, function_to_string};
 use crate::builtins::proxy::{proxy_apply, proxy_get_with_receiver, proxy_set_with_receiver};
-use crate::builtins::symbol::symbol_description;
 use crate::bytecode::bytecode_array::{
     BytecodeArray, ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD,
     TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD,
@@ -5140,21 +5139,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
     if let JsValue::Proxy(p) = obj {
         return proxy_get_with_receiver(&p.borrow(), key, obj).unwrap_or(JsValue::Undefined);
     }
-    // Handle JsValue::Symbol — expose description, toString, valueOf.
-    if let JsValue::Symbol(id) = obj {
-        let id = *id;
+    // Handle JsValue::Symbol — delegate property access to Symbol.prototype.
+    if let JsValue::Symbol(_) = obj {
+        if key == "__proto__" {
+            return global_constructor_prototype("Symbol").unwrap_or(JsValue::Undefined);
+        }
+        if let Some(proto) = global_constructor_prototype("Symbol") {
+            return proto_lookup_chain(&proto, key, obj);
+        }
         return match key {
-            "description" => match symbol_description(id) {
-                Some(desc) => JsValue::String(desc.into()),
-                None => JsValue::Undefined,
-            },
-            "toString" => {
-                JsValue::NativeFunction(Rc::new(move |_args| match symbol_description(id) {
-                    Some(desc) => Ok(JsValue::String(format!("Symbol({desc})").into())),
-                    None => Ok(JsValue::String("Symbol()".to_string().into())),
-                }))
-            }
-            "valueOf" => JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::Symbol(id)))),
+            "constructor" => lookup_global_constructor("Symbol"),
+            "@@toStringTag" => JsValue::String("Symbol".into()),
             _ => JsValue::Undefined,
         };
     }
