@@ -3930,7 +3930,7 @@ impl<'src> Parser<'src> {
                         },
                         property: Ident {
                             loc: prop_tok.span,
-                            name: prop_name,
+                            name: "meta".into(),
                         },
                     }))
                 } else if self.peek_kind() == TokenKind::LeftParen {
@@ -7983,6 +7983,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_import_dot_non_meta_is_error() {
+        // `import.foo` is a SyntaxError — only `import.meta` is valid.
+        let err = parse("import.foo").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("expected 'meta' after 'import.'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_import_meta_not_module() {
+        // `import.meta` does NOT trigger module-mode detection.
+        let prog = parse("import.meta").unwrap();
+        assert_eq!(prog.source_type, SourceType::Script);
+    }
+
+    #[test]
     fn test_parse_import_decl_still_works() {
         // Ensure normal import declarations still parse correctly.
         let prog = parse("import foo from 'bar'").unwrap();
@@ -7991,6 +8009,14 @@ mod tests {
             ProgramItem::ModuleDecl(ModuleDecl::Import(_))
         ));
         assert_eq!(prog.source_type, SourceType::Module);
+    }
+
+    #[test]
+    fn test_parse_import_decl_is_module_strict() {
+        // Module code (has import declaration) is always strict.
+        let prog = parse("import x from 'y'").unwrap();
+        assert_eq!(prog.source_type, SourceType::Module);
+        assert!(prog.is_strict);
     }
 
     // ── Strict mode tests ────────────────────────────────────────────────
