@@ -47513,4 +47513,330 @@ mod tests {
     fn e2e_wk_has_instance_not_in_symbol_for_registry() {
         assert_eval_true("Symbol.keyFor(Symbol.hasInstance) === undefined");
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  matchAll deep-conformance e2e tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── 1. String.prototype.matchAll — basic iterator ────────────────────
+
+    /// matchAll returns an iterator, not an array.
+    #[test]
+    fn e2e_matchall_returns_iterator() {
+        assert_eval_true(
+            r#"var it = "a1b2".matchAll(/\d/g);
+            typeof it.next === "function""#,
+        );
+    }
+
+    /// matchAll iterator yields {value, done} result objects.
+    #[test]
+    fn e2e_matchall_iterator_protocol_value_done() {
+        assert_eval_true(
+            r#"var it = "ab".matchAll(/[a-z]/g);
+            var r = it.next();
+            r.done === false && r.value[0] === "a""#,
+        );
+    }
+
+    /// matchAll iterator done is true when exhausted.
+    #[test]
+    fn e2e_matchall_iterator_done_when_exhausted() {
+        assert_eval_true(
+            r#"var it = "a".matchAll(/a/g);
+            it.next();
+            it.next().done === true"#,
+        );
+    }
+
+    /// matchAll iterator value is undefined when done.
+    #[test]
+    fn e2e_matchall_iterator_value_undefined_when_done() {
+        assert_eval_true(
+            r#"var it = "a".matchAll(/a/g);
+            it.next();
+            it.next().value === undefined"#,
+        );
+    }
+
+    // ── 2. TypeError for non-global regexp ───────────────────────────────
+
+    /// matchAll with non-global regexp throws TypeError.
+    #[test]
+    fn e2e_matchall_throws_typeerror_nonglobal() {
+        assert_eval_true(
+            r#"var threw = false;
+            try { "abc".matchAll(/a/); } catch(e) { threw = e instanceof TypeError; }
+            threw"#,
+        );
+    }
+
+    /// matchAll with non-global sticky regexp also throws TypeError.
+    #[test]
+    fn e2e_matchall_throws_typeerror_sticky_nonglobal() {
+        assert_eval_true(
+            r#"var threw = false;
+            try { "abc".matchAll(/a/y); } catch(e) { threw = e instanceof TypeError; }
+            threw"#,
+        );
+    }
+
+    // ── 3. String pattern (non-regexp argument) ──────────────────────────
+
+    /// matchAll with a string converts to global regexp.
+    #[test]
+    fn e2e_matchall_string_arg_finds_all() {
+        assert_eval_true(
+            r#"var r = [];
+            for (var m of "abab".matchAll("ab")) { r.push(m[0]); }
+            r.length === 2 && r[0] === "ab" && r[1] === "ab""#,
+        );
+    }
+
+    /// matchAll with a string returns match objects with index.
+    #[test]
+    fn e2e_matchall_string_arg_has_index() {
+        assert_eval_true(
+            r#"var arr = Array.from("xyx".matchAll("x"));
+            arr[0].index === 0 && arr[1].index === 2"#,
+        );
+    }
+
+    /// matchAll with a string returns match objects with input.
+    #[test]
+    fn e2e_matchall_string_arg_has_input() {
+        assert_eval_true(
+            r#"var arr = Array.from("abc".matchAll("b"));
+            arr[0].input === "abc""#,
+        );
+    }
+
+    /// matchAll with empty string matches at every position.
+    #[test]
+    fn e2e_matchall_empty_string_arg() {
+        assert_eval_true(r#"Array.from("ab".matchAll("")).length === 3"#);
+    }
+
+    // ── 4. Named groups ──────────────────────────────────────────────────
+
+    /// Each matchAll result carries its own groups object.
+    #[test]
+    fn e2e_matchall_named_groups_per_match() {
+        assert_eval_true(
+            r#"var arr = Array.from("ab12 cd34".matchAll(/(?<a>[a-z]+)(?<n>\d+)/g));
+            arr[0].groups.a === "ab" && arr[0].groups.n === "12" &&
+            arr[1].groups.a === "cd" && arr[1].groups.n === "34""#,
+        );
+    }
+
+    /// matchAll named groups are undefined when capture does not participate.
+    #[test]
+    fn e2e_matchall_named_groups_undefined_capture() {
+        assert_eval_true(
+            r#"var arr = Array.from("a".matchAll(/(?<x>a)(?<y>b)?/g));
+            arr[0].groups.x === "a" && arr[0].groups.y === undefined"#,
+        );
+    }
+
+    /// matchAll without named groups has undefined groups property.
+    #[test]
+    fn e2e_matchall_no_named_groups_is_undefined() {
+        assert_eval_true(
+            r#"var arr = Array.from("ab".matchAll(/[a-z]/g));
+            arr[0].groups === undefined"#,
+        );
+    }
+
+    // ── 5. Empty match advancement ───────────────────────────────────────
+
+    /// matchAll with empty-match pattern advances past each position.
+    #[test]
+    fn e2e_matchall_empty_regex_advances() {
+        assert_eval_true(
+            r#"var arr = Array.from("ab".matchAll(/(?:)/g));
+            arr.length === 3 && arr[0].index === 0 && arr[1].index === 1 && arr[2].index === 2"#,
+        );
+    }
+
+    /// matchAll with zero-width lookahead advances correctly.
+    #[test]
+    fn e2e_matchall_zero_width_lookahead() {
+        assert_eval_true(
+            r#"var arr = Array.from("aaa".matchAll(/(?=a)/g));
+            arr.length === 3"#,
+        );
+    }
+
+    // ── 6. Preserves original regexp lastIndex ───────────────────────────
+
+    /// matchAll does not mutate the original regexp lastIndex.
+    #[test]
+    fn e2e_matchall_preserves_lastindex() {
+        assert_eval_true(
+            r#"var re = /a/g;
+            re.lastIndex = 5;
+            Array.from("aaa".matchAll(re));
+            re.lastIndex === 5"#,
+        );
+    }
+
+    /// matchAll with lastIndex=0 does not change it.
+    #[test]
+    fn e2e_matchall_preserves_zero_lastindex() {
+        assert_eval_true(
+            r#"var re = /x/g;
+            re.lastIndex = 0;
+            Array.from("xyz".matchAll(re));
+            re.lastIndex === 0"#,
+        );
+    }
+
+    // ── 7. RegExp.prototype[Symbol.matchAll] direct call ─────────────────
+
+    /// Calling [Symbol.matchAll] directly on a global regexp works.
+    #[test]
+    fn e2e_matchall_symbol_direct_call() {
+        assert_eval_true(
+            r#"var re = /\d+/g;
+            var r = [];
+            for (var m of re[Symbol.matchAll]("a1b22c")) { r.push(m[0]); }
+            r.join(",") === "1,22""#,
+        );
+    }
+
+    /// [Symbol.matchAll] result objects have correct index.
+    #[test]
+    fn e2e_matchall_symbol_direct_has_index() {
+        assert_eval_true(
+            r#"var re = /\w+/g;
+            var arr = Array.from(re[Symbol.matchAll]("hi there"));
+            arr[0].index === 0 && arr[1].index === 3"#,
+        );
+    }
+
+    // ── 8. matchAll with capture groups (numbered) ───────────────────────
+
+    /// matchAll yields numbered capture groups.
+    #[test]
+    fn e2e_matchall_numbered_captures() {
+        assert_eval_true(
+            r#"var arr = Array.from("a1b2".matchAll(/([a-z])(\d)/g));
+            arr[0][1] === "a" && arr[0][2] === "1" &&
+            arr[1][1] === "b" && arr[1][2] === "2""#,
+        );
+    }
+
+    /// matchAll length includes full match + captures.
+    #[test]
+    fn e2e_matchall_result_length() {
+        assert_eval_true(
+            r#"var arr = Array.from("x1".matchAll(/(x)(\d)/g));
+            arr[0].length === 3"#,
+        );
+    }
+
+    // ── 9. No matches returns empty iterator ─────────────────────────────
+
+    /// matchAll with no matches returns iterator that is immediately done.
+    #[test]
+    fn e2e_matchall_no_matches_empty_iterator() {
+        assert_eval_true(
+            r#"var it = "abc".matchAll(/\d+/g);
+            it.next().done === true"#,
+        );
+    }
+
+    /// Array.from on matchAll with no matches gives empty array.
+    #[test]
+    fn e2e_matchall_no_matches_array_from() {
+        assert_eval_true(r#"Array.from("abc".matchAll(/\d+/g)).length === 0"#);
+    }
+
+    // ── 10. matchAll with flags ──────────────────────────────────────────
+
+    /// matchAll with ignoreCase flag.
+    #[test]
+    fn e2e_matchall_ignorecase() {
+        assert_eval_true(
+            r#"var arr = Array.from("aAbB".matchAll(/[a-z]/gi));
+            arr.length === 4"#,
+        );
+    }
+
+    /// matchAll with multiline flag.
+    #[test]
+    fn e2e_matchall_multiline() {
+        assert_eval_true(
+            r#"var arr = Array.from("foo\nbar".matchAll(/^\w+/gm));
+            arr.length === 2 && arr[0][0] === "foo" && arr[1][0] === "bar""#,
+        );
+    }
+
+    /// matchAll with dotAll flag.
+    #[test]
+    fn e2e_matchall_dotall() {
+        assert_eval_true(
+            r#"var arr = Array.from("a\nb".matchAll(/./gs));
+            arr.length === 3"#,
+        );
+    }
+
+    // ── 11. UTF-16 index correctness ─────────────────────────────────────
+
+    /// matchAll reports UTF-16 code unit indices for emoji.
+    #[test]
+    fn e2e_matchall_utf16_index_emoji() {
+        assert_eval_true("Array.from('\\u{1F600}ab'.matchAll(/[ab]/g))[0].index === 2");
+    }
+
+    /// matchAll UTF-16 indices for multiple matches after emoji.
+    #[test]
+    fn e2e_matchall_utf16_indices_multiple() {
+        assert_eval_true(
+            "var r = Array.from('\\u{1F600}a\\u{1F600}b'.matchAll(/[ab]/g)); r[0].index === 2 && r[1].index === 5",
+        );
+    }
+
+    // ── 12. for-of with matchAll ─────────────────────────────────────────
+
+    /// for-of properly consumes matchAll iterator.
+    #[test]
+    fn e2e_matchall_forof_consumes() {
+        assert_eval_true(
+            r#"var count = 0;
+            for (var m of "aaa".matchAll(/a/g)) { count++; }
+            count === 3"#,
+        );
+    }
+
+    /// Spread syntax works on matchAll.
+    #[test]
+    fn e2e_matchall_spread() {
+        assert_eval_true(
+            r#"var arr = [...("ab".matchAll(/[a-z]/g))];
+            arr.length === 2 && arr[0][0] === "a" && arr[1][0] === "b""#,
+        );
+    }
+
+    // ── 13. matchAll match objects have input property ────────────────────
+
+    /// Each matchAll result has input equal to the original string.
+    #[test]
+    fn e2e_matchall_input_property() {
+        assert_eval_true(
+            r#"var arr = Array.from("hello world".matchAll(/\w+/g));
+            arr[0].input === "hello world" && arr[1].input === "hello world""#,
+        );
+    }
+
+    // ── 14. matchAll with global+sticky flags ────────────────────────────
+
+    /// matchAll with global+sticky finds consecutive matches.
+    #[test]
+    fn e2e_matchall_global_sticky() {
+        assert_eval_true(
+            r#"var arr = Array.from("aab".matchAll(/a/gy));
+            arr.length === 2 && arr[0].index === 0 && arr[1].index === 1"#,
+        );
+    }
 }

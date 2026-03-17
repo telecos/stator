@@ -619,10 +619,14 @@ impl JsRegExp {
     /// Returns all successive matches as a `Vec<RegExpMatch>`, producing the
     /// same kind of result objects that [`Self::exec`] would for each match.
     /// This is the underlying implementation for `String.prototype.matchAll`.
+    ///
+    /// The search starts from `self.last_index` so callers can set it before
+    /// invoking this method to honour an existing `lastIndex` on a cloned
+    /// regexp.
     pub fn symbol_match_all(&self, input: &str) -> Vec<RegExpMatch> {
         let has_indices = self.flags.contains(RegExpFlags::HAS_INDICES);
         let mut results = Vec::new();
-        let mut start = 0_usize;
+        let mut start = self.last_index.get();
         loop {
             if start > input.len() {
                 break;
@@ -645,6 +649,18 @@ impl JsRegExp {
             }
         }
         results
+    }
+
+    /// Create a clone of this regexp for use by `[Symbol.matchAll]`.
+    ///
+    /// Per §22.2.6.9 the clone has the same pattern and flags, and its
+    /// `lastIndex` is set to `last_index`.  This avoids mutating the
+    /// original regexp's state during iteration.
+    pub fn clone_for_match_all(&self, last_index: usize) -> StatorResult<Self> {
+        let flags_str = self.flags.to_flags_string();
+        let cloned = Self::new(&self.pattern, &flags_str)?;
+        cloned.last_index.set(last_index);
+        Ok(cloned)
     }
 }
 
@@ -1230,5 +1246,89 @@ mod tests {
         let re = JsRegExp::new(r"\p{N}", "u").unwrap();
         assert!(re.test("42"));
         assert!(!re.test("abc"));
+    }
+
+    // ── clone_for_match_all ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_clone_for_match_all_basic() {
+        let re = JsRegExp::new(r"\d+", "g").unwrap();
+        let cloned = re.clone_for_match_all(0).unwrap();
+        assert_eq!(cloned.pattern(), r"\d+");
+        assert_eq!(cloned.flags(), re.flags());
+        assert_eq!(cloned.last_index(), 0);
+    }
+
+    #[test]
+    fn test_clone_for_match_all_preserves_last_index() {
+        let re = JsRegExp::new(r"\d+", "g").unwrap();
+        re.set_last_index(5);
+        let cloned = re.clone_for_match_all(5).unwrap();
+        assert_eq!(cloned.last_index(), 5);
+        // Original unchanged.
+        assert_eq!(re.last_index(), 5);
+    }
+
+    #[test]
+    fn test_clone_for_match_all_independent() {
+        let re = JsRegExp::new("a", "g").unwrap();
+        let cloned = re.clone_for_match_all(0).unwrap();
+        // Mutating the clone must not affect the original.
+        cloned.set_last_index(99);
+        assert_eq!(re.last_index(), 0);
+    }
+
+    // ── symbol_match_all starts from last_index ──────────────────────────────
+
+    #[test]
+    fn test_symbol_match_all_from_start() {
+        let re = JsRegExp::new("a", "g").unwrap();
+        re.set_last_index(0);
+        let matches = re.symbol_match_all("aaa");
+        assert_eq!(matches.len(), 3);
+    }
+
+    #[test]
+    fn test_symbol_match_all_from_offset() {
+        let re = JsRegExp::new("a", "g").unwrap();
+        re.set_last_index(2);
+        let matches = re.symbol_match_all("baaa");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].index, 2);
+        assert_eq!(matches[1].index, 3);
+    }
+
+    #[test]
+    fn test_symbol_match_all_empty_pattern_advances() {
+        let re = JsRegExp::new("(?:)", "g").unwrap();
+        re.set_last_index(0);
+        let matches = re.symbol_match_all("ab");
+        // Empty matches at positions 0, 1, 2.
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[0].index, 0);
+        assert_eq!(matches[1].index, 1);
+        assert_eq!(matches[2].index, 2);
+    }
+
+    #[test]
+    fn test_symbol_match_all_no_match() {
+        let re = JsRegExp::new(r"\d+", "g").unwrap();
+        let matches = re.symbol_match_all("no digits");
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_symbol_match_all_named_groups() {
+        let re = JsRegExp::new(r"(?<y>\d{4})-(?<m>\d{2})", "g").unwrap();
+        let matches = re.symbol_match_all("2024-07 2025-01");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(
+            matches[0].named_groups.get("y"),
+            Some(&Some("2024".to_string()))
+        );
+        assert_eq!(
+            matches[1].named_groups.get("m"),
+            Some(&Some("01".to_string()))
+        );
     }
 }

@@ -405,16 +405,34 @@ pub fn wrap_regexp(re: JsRegExp) -> JsValue {
     }
 
     // [Symbol.matchAll](string)
+    //
+    // §22.2.6.9: clone the regexp so that the original's lastIndex is not
+    // mutated during iteration.  The clone starts at the original's current
+    // lastIndex and collects all successive matches eagerly into the
+    // returned iterator.
     {
         let re_match_all = Rc::clone(&re);
         let w = weak.clone();
         props_rc.borrow_mut().insert(
             "__symbol_match_all__".into(),
             JsValue::NativeFunction(Rc::new(move |args: Vec<JsValue>| {
+                // Read the current lastIndex from the property map so
+                // user-code mutations are picked up, but do NOT write back
+                // — the original regexp's lastIndex must remain unchanged.
                 sync_last_index_from_props(&w, &re_match_all);
+                let saved_last_index = re_match_all.last_index();
                 let input = args.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                let matches = re_match_all.symbol_match_all(&input);
+
+                // Clone the regexp for iteration; the clone inherits the
+                // same pattern, flags, and the current lastIndex value.
+                let cloned = re_match_all.clone_for_match_all(saved_last_index)?;
+                let matches = cloned.symbol_match_all(&input);
+
+                // Restore the original regexp's lastIndex so calling code
+                // sees it unchanged (spec requirement).
+                re_match_all.set_last_index(saved_last_index);
                 sync_last_index_to_props(&w, &re_match_all);
+
                 let items: Vec<JsValue> = matches.iter().map(match_to_js).collect();
                 Ok(JsValue::Iterator(NativeIterator::from_items(items)))
             })),
@@ -1041,6 +1059,114 @@ mod tests {
                 let result = f(vec![JsValue::String("a".into())]).unwrap();
                 assert_eq!(get_bool(&result, "__is_array__"), Some(true));
                 assert_eq!(get_smi(&result, "length"), Some(1));
+            }
+        }
+    }
+
+    // ── matchAll preserves original lastIndex ────────────────────────────
+
+    #[test]
+    fn test_match_all_preserves_last_index() {
+        let re =
+            regexp_construct(&[JsValue::String("a".into()), JsValue::String("g".into())]).unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            // Set lastIndex to a non-zero value.
+            map.borrow_mut().insert("lastIndex".into(), JsValue::Smi(2));
+            let ma_fn = map.borrow().get("__symbol_match_all__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = ma_fn {
+                let _ = f(vec![JsValue::String("aaa".into())]).unwrap();
+                // The original regexp's lastIndex must remain at 2.
+                assert_eq!(get_smi(&re, "lastIndex"), Some(2));
+            }
+        }
+    }
+
+    #[test]
+    fn test_match_all_starts_from_last_index() {
+        let re =
+            regexp_construct(&[JsValue::String("a".into()), JsValue::String("g".into())]).unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            // Set lastIndex = 2 to skip the first two characters.
+            map.borrow_mut().insert("lastIndex".into(), JsValue::Smi(2));
+            let ma_fn = map.borrow().get("__symbol_match_all__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = ma_fn {
+                let result = f(vec![JsValue::String("baaa".into())]).unwrap();
+                if let JsValue::Iterator(iter) = result {
+                    // Should find "a" at index 2 and "a" at index 3.
+                    let first = iter.borrow_mut().next_item();
+                    assert!(first.is_some());
+                    let second = iter.borrow_mut().next_item();
+                    assert!(second.is_some());
+                    let third = iter.borrow_mut().next_item();
+                    assert!(third.is_none());
+                } else {
+                    panic!("expected Iterator");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_match_all_collects_all_items() {
+        let re = regexp_construct(&[JsValue::String(r"\d+".into()), JsValue::String("g".into())])
+            .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let ma_fn = map.borrow().get("__symbol_match_all__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = ma_fn {
+                let result = f(vec![JsValue::String("x1 y22 z333".into())]).unwrap();
+                if let JsValue::Iterator(iter) = result {
+                    let mut count = 0;
+                    while iter.borrow_mut().next_item().is_some() {
+                        count += 1;
+                    }
+                    assert_eq!(count, 3);
+                } else {
+                    panic!("expected Iterator");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_match_all_no_match_returns_empty_iterator() {
+        let re = regexp_construct(&[JsValue::String(r"\d+".into()), JsValue::String("g".into())])
+            .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let ma_fn = map.borrow().get("__symbol_match_all__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = ma_fn {
+                let result = f(vec![JsValue::String("no digits".into())]).unwrap();
+                if let JsValue::Iterator(iter) = result {
+                    assert!(iter.borrow_mut().next_item().is_none());
+                } else {
+                    panic!("expected Iterator");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_match_all_result_has_groups() {
+        let re = regexp_construct(&[
+            JsValue::String(r"(?<w>\w+)".into()),
+            JsValue::String("g".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let ma_fn = map.borrow().get("__symbol_match_all__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = ma_fn {
+                let result = f(vec![JsValue::String("hi".into())]).unwrap();
+                if let JsValue::Iterator(iter) = result {
+                    let item = iter.borrow_mut().next_item().unwrap();
+                    if let JsValue::PlainObject(m) = &item {
+                        let groups = m.borrow().get("groups").cloned();
+                        assert!(matches!(groups, Some(JsValue::PlainObject(_))));
+                        if let Some(JsValue::PlainObject(g)) = groups {
+                            assert_eq!(g.borrow().get("w"), Some(&JsValue::String("hi".into())));
+                        }
+                    }
+                } else {
+                    panic!("expected Iterator");
+                }
             }
         }
     }
