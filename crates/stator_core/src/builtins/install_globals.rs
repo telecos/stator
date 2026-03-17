@@ -34945,6 +34945,509 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
+    // ── Date.parse comprehensive conformance tests ────────────────────
+
+    /// ISO 8601 full form: `YYYY-MM-DDTHH:mm:ss.sssZ` parses correctly.
+    #[test]
+    fn test_date_parse_iso_full_form() {
+        let result = global_eval("Date.parse('2024-06-15T14:30:45.123Z')").unwrap();
+        assert_eq!(result, JsValue::HeapNumber(1718458245123.0));
+    }
+
+    /// ISO 8601 date-only `YYYY` defaults to Jan 1 UTC.
+    #[test]
+    fn test_date_parse_year_only() {
+        let result = global_eval("Date.parse('2024') === Date.UTC(2024, 0, 1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// ISO 8601 date-only `YYYY-MM` defaults to first day UTC.
+    #[test]
+    fn test_date_parse_year_month_only() {
+        let result = global_eval("Date.parse('2024-06') === Date.UTC(2024, 5, 1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// ISO 8601 date-only `YYYY-MM-DD` is treated as UTC.
+    #[test]
+    fn test_date_parse_date_only_is_utc() {
+        let result = global_eval("Date.parse('2024-06-15') === Date.UTC(2024, 5, 15)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// UTC offset `+05:30` shifts the result by −5h30m.
+    #[test]
+    fn test_date_parse_positive_offset() {
+        let result = global_eval(
+            "Date.parse('2024-01-15T12:00:00.000+05:30') === Date.UTC(2024, 0, 15, 6, 30, 0, 0)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// UTC offset `-08:00` shifts the result by +8h.
+    #[test]
+    fn test_date_parse_negative_offset() {
+        let result = global_eval(
+            "Date.parse('2024-01-15T12:00:00.000-08:00') === Date.UTC(2024, 0, 15, 20, 0, 0, 0)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// UTC offset `Z` is equivalent to `+00:00`.
+    #[test]
+    fn test_date_parse_z_equals_zero_offset() {
+        let result = global_eval(
+            "Date.parse('2024-01-15T12:00:00Z') === Date.parse('2024-01-15T12:00:00+00:00')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Empty string returns NaN.
+    #[test]
+    fn test_date_parse_empty_string_nan() {
+        let result = global_eval("Number.isNaN(Date.parse(''))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Random garbage returns NaN.
+    #[test]
+    fn test_date_parse_garbage_string_nan() {
+        let result = global_eval("Number.isNaN(Date.parse('hello world'))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Incomplete ISO with trailing `T` returns NaN.
+    #[test]
+    fn test_date_parse_trailing_t_nan() {
+        let result = global_eval("Number.isNaN(Date.parse('2024-01-15T'))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Invalid month 13 returns NaN.
+    #[test]
+    fn test_date_parse_month_13_nan() {
+        let result = global_eval("Number.isNaN(Date.parse('2024-13-01'))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Invalid day 32 returns NaN for any month.
+    #[test]
+    fn test_date_parse_day_32_nan() {
+        let result = global_eval("Number.isNaN(Date.parse('2024-01-32'))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Feb 29 is valid in a leap year.
+    #[test]
+    fn test_date_parse_leap_day_valid() {
+        let result = global_eval("!Number.isNaN(Date.parse('2024-02-29'))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Feb 29 is invalid in a non-leap year.
+    #[test]
+    fn test_date_parse_leap_day_invalid_non_leap() {
+        let result = global_eval("Number.isNaN(Date.parse('2023-02-29'))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Millisecond precision is preserved in parsing.
+    #[test]
+    fn test_date_parse_millisecond_precision() {
+        let result =
+            global_eval("new Date(Date.parse('2024-01-01T00:00:00.999Z')).getUTCMilliseconds()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(999));
+    }
+
+    /// Single-digit fractional seconds are padded to milliseconds.
+    #[test]
+    fn test_date_parse_fractional_seconds_single_digit() {
+        let result =
+            global_eval("new Date(Date.parse('2024-01-01T00:00:00.1Z')).getUTCMilliseconds()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(100));
+    }
+
+    /// Two-digit fractional seconds are padded to milliseconds.
+    #[test]
+    fn test_date_parse_fractional_seconds_two_digits() {
+        let result =
+            global_eval("new Date(Date.parse('2024-01-01T00:00:00.12Z')).getUTCMilliseconds()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(120));
+    }
+
+    /// Extra fractional digits beyond 3 are ignored.
+    #[test]
+    fn test_date_parse_fractional_seconds_extra_digits() {
+        let result = global_eval(
+            "Date.parse('2024-01-01T00:00:00.1234Z') === Date.parse('2024-01-01T00:00:00.123Z')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// ISO without seconds `YYYY-MM-DDTHH:mmZ` parses correctly.
+    #[test]
+    fn test_date_parse_iso_without_seconds_value() {
+        let result =
+            global_eval("Date.parse('2024-01-15T12:30Z') === Date.UTC(2024, 0, 15, 12, 30, 0, 0)")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Date.UTC conformance tests ──────────────────────────────────────
+
+    /// `Date.UTC()` month is 0-indexed: month 0 = January.
+    #[test]
+    fn test_date_utc_month_zero_indexed() {
+        let result = global_eval("new Date(Date.UTC(2024, 0, 1)).getUTCMonth() === 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.UTC()` maps year 99 to 1999 (two-digit year rule).
+    #[test]
+    fn test_date_utc_two_digit_year_99() {
+        let result = global_eval("new Date(Date.UTC(99, 0, 1)).getUTCFullYear() === 1999").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.UTC()` maps year 0 to 1900.
+    #[test]
+    fn test_date_utc_two_digit_year_0() {
+        let result = global_eval("new Date(Date.UTC(0, 0, 1)).getUTCFullYear() === 1900").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.UTC()` does NOT map year 100; 100 stays 100 CE.
+    #[test]
+    fn test_date_utc_year_100_no_mapping() {
+        let result = global_eval("new Date(Date.UTC(100, 0, 1)).getUTCFullYear() === 100").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.UTC(NaN, ...)` returns NaN.
+    #[test]
+    fn test_date_utc_nan_returns_nan() {
+        let result = global_eval("Number.isNaN(Date.UTC(NaN, 0))").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.UTC()` month overflow: month 12 → next year January.
+    #[test]
+    fn test_date_utc_month_overflow_normalizes() {
+        let result = global_eval("Date.UTC(2024, 12, 1) === Date.UTC(2025, 0, 1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.UTC()` day overflow: Jan 32 → Feb 1.
+    #[test]
+    fn test_date_utc_day_overflow() {
+        let result = global_eval("Date.UTC(2024, 0, 32) === Date.UTC(2024, 1, 1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `Date.UTC()` negative month: month −1 → previous year December.
+    #[test]
+    fn test_date_utc_negative_month() {
+        let result = global_eval("Date.UTC(2024, -1, 1) === Date.UTC(2023, 11, 1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── new Date(string) uses Date.parse internally ─────────────────────
+
+    /// `new Date(string)` parses an ISO string and gives consistent getTime.
+    #[test]
+    fn test_new_date_string_uses_parse() {
+        let result = global_eval(
+            "new Date('2024-06-15T14:30:45.123Z').getTime() === Date.parse('2024-06-15T14:30:45.123Z')",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `new Date('invalid')` creates an invalid date (NaN getTime).
+    #[test]
+    fn test_new_date_invalid_string_nan() {
+        let result = global_eval("Number.isNaN(new Date('not a date').getTime())").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── new Date(year, month, ...) — 2-digit year mapping ───────────────
+
+    /// `new Date(99, 0)` maps year 99 to 1999 in local time.
+    #[test]
+    fn test_new_date_components_two_digit_year() {
+        let result = global_eval("new Date(99, 0).getFullYear() === 1999").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `new Date(0, 0)` maps year 0 to 1900 in local time.
+    #[test]
+    fn test_new_date_components_year_zero_maps_1900() {
+        let result = global_eval("new Date(0, 0).getFullYear() === 1900").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `new Date(2024, 0)` keeps year 2024 as-is (no mapping).
+    #[test]
+    fn test_new_date_components_large_year_no_mapping() {
+        let result = global_eval("new Date(2024, 0).getFullYear() === 2024").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Multi-arg constructor defaults day to 1, time to 0.
+    #[test]
+    fn test_new_date_components_defaults() {
+        let result = global_eval(
+            r#"
+            var d = new Date(2024, 5);
+            d.getMonth() === 5 && d.getDate() === 1 &&
+            d.getHours() === 0 && d.getMinutes() === 0 &&
+            d.getSeconds() === 0 && d.getMilliseconds() === 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Multi-arg constructor preserves all 7 components.
+    #[test]
+    fn test_new_date_components_all_seven() {
+        let result = global_eval(
+            r#"
+            var d = new Date(2024, 5, 15, 14, 30, 45, 123);
+            d.getFullYear() === 2024 && d.getMonth() === 5 &&
+            d.getDate() === 15 && d.getHours() === 14 &&
+            d.getMinutes() === 30 && d.getSeconds() === 45 &&
+            d.getMilliseconds() === 123
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Out-of-range overflow handling ───────────────────────────────────
+
+    /// Month 13 in constructor overflows to next year's February.
+    #[test]
+    fn test_new_date_month_overflow() {
+        let result = global_eval(
+            "new Date(2024, 13, 1).getMonth() === 1 && new Date(2024, 13, 1).getFullYear() === 2025",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Day 0 underflows to last day of previous month.
+    #[test]
+    fn test_new_date_day_underflow() {
+        let result = global_eval(
+            r#"
+            var d = new Date(2024, 1, 0);
+            d.getMonth() === 0 && d.getDate() === 31
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Day 32 in January overflows to February 1.
+    #[test]
+    fn test_new_date_day_overflow() {
+        let result = global_eval(
+            r#"
+            var d = new Date(2024, 0, 32);
+            d.getMonth() === 1 && d.getDate() === 1
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Hours overflow past 23 rolls into the next day.
+    #[test]
+    fn test_new_date_hours_overflow() {
+        let result = global_eval(
+            r#"
+            var d = new Date(2024, 0, 1, 25, 0, 0, 0);
+            d.getDate() === 2 && d.getHours() === 1
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Date.prototype.toISOString ──────────────────────────────────────
+
+    /// `toISOString()` always returns UTC in `YYYY-MM-DDTHH:mm:ss.sssZ` format.
+    #[test]
+    fn test_to_iso_string_format() {
+        let result =
+            global_eval("new Date(Date.UTC(2024, 5, 15, 14, 30, 45, 123)).toISOString()").unwrap();
+        assert_eq!(result, JsValue::String("2024-06-15T14:30:45.123Z".into()));
+    }
+
+    /// `toISOString()` pads single-digit months/days/hours/etc.
+    #[test]
+    fn test_to_iso_string_zero_padding() {
+        let result =
+            global_eval("new Date(Date.UTC(2024, 0, 1, 1, 2, 3, 4)).toISOString()").unwrap();
+        assert_eq!(result, JsValue::String("2024-01-01T01:02:03.004Z".into()));
+    }
+
+    /// `toISOString()` on epoch returns the canonical epoch string.
+    #[test]
+    fn test_to_iso_string_epoch() {
+        let result = global_eval("new Date(0).toISOString()").unwrap();
+        assert_eq!(result, JsValue::String("1970-01-01T00:00:00.000Z".into()));
+    }
+
+    /// `toISOString()` throws RangeError on invalid date.
+    #[test]
+    fn test_to_iso_string_throws_on_invalid() {
+        let result = global_eval(
+            "try { new Date('invalid').toISOString(); false; } catch (e) { e.name === 'RangeError'; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `toISOString()` formats extended positive years with `+` sign.
+    #[test]
+    fn test_to_iso_string_extended_positive_year_format() {
+        let result =
+            global_eval("new Date(Date.UTC(10000, 0, 1)).toISOString().startsWith('+010000')")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `toISOString()` formats negative years with `−` sign.
+    #[test]
+    fn test_to_iso_string_negative_year_format() {
+        let result =
+            global_eval("new Date(Date.UTC(-1, 0, 1)).toISOString().startsWith('-000001')")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Date.prototype.toJSON ───────────────────────────────────────────
+
+    /// `toJSON()` returns the same as `toISOString()` for valid dates.
+    #[test]
+    fn test_to_json_matches_to_iso_string() {
+        let result = global_eval(
+            r#"
+            var d = new Date(Date.UTC(2024, 5, 15));
+            d.toJSON() === d.toISOString()
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `toJSON()` returns `null` for invalid dates.
+    #[test]
+    fn test_to_json_null_on_invalid() {
+        let result = global_eval("new Date('invalid').toJSON()").unwrap();
+        assert_eq!(result, JsValue::Null);
+    }
+
+    /// `toJSON()` returns `null` for `NaN` timestamp.
+    #[test]
+    fn test_to_json_null_on_nan_timestamp() {
+        let result = global_eval("new Date(NaN).toJSON()").unwrap();
+        assert_eq!(result, JsValue::Null);
+    }
+
+    // ── Date.now ────────────────────────────────────────────────────────
+
+    /// `Date.now()` returns a number.
+    #[test]
+    fn test_date_now_returns_number() {
+        let result = global_eval("typeof Date.now()").unwrap();
+        assert_eq!(result, JsValue::String("number".into()));
+    }
+
+    /// `Date.now()` returns a non-negative value.
+    #[test]
+    fn test_date_now_non_negative() {
+        let result = global_eval("Date.now() >= 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Two consecutive `Date.now()` calls are monotonically non-decreasing.
+    #[test]
+    fn test_date_now_monotonic() {
+        let result = global_eval(
+            r#"
+            var a = Date.now();
+            var b = Date.now();
+            b >= a
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Round-trip parse → toISOString ───────────────────────────────────
+
+    /// Parse an ISO string and re-format; result must match the original.
+    #[test]
+    fn test_date_parse_iso_round_trip() {
+        let result = global_eval(
+            "new Date('2024-06-15T14:30:45.123Z').toISOString() === '2024-06-15T14:30:45.123Z'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Round-trip through Date.UTC → toISOString preserves all components.
+    #[test]
+    fn test_date_utc_to_iso_round_trip() {
+        let result = global_eval(
+            "new Date(Date.UTC(2000, 0, 1, 0, 0, 0, 0)).toISOString() === '2000-01-01T00:00:00.000Z'",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Midnight boundary: T24:00:00Z rolls over to next day 00:00.
+    #[test]
+    fn test_date_parse_t24_midnight_rolls_over() {
+        let result =
+            global_eval("Date.parse('2024-01-15T24:00:00Z') === Date.UTC(2024, 0, 16, 0, 0, 0, 0)")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Epoch millisecond 1 preserves through parse round-trip.
+    #[test]
+    fn test_date_parse_epoch_plus_one_ms() {
+        let result = global_eval("new Date('1970-01-01T00:00:00.001Z').getTime() === 1").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// Negative epoch value (before 1970) parses correctly.
+    #[test]
+    fn test_date_parse_before_epoch() {
+        let result = global_eval("new Date('1969-12-31T23:59:59.999Z').getTime() === -1").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    /// `new Date(number)` with a known timestamp round-trips through toISOString.
+    #[test]
+    fn test_new_date_number_round_trip() {
+        let result =
+            global_eval("new Date(1718458245123).toISOString() === '2024-06-15T14:30:45.123Z'")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
     // ── JSON built-in tests ─────────────────────────────────────────────
 
     /// `JSON.stringify(null)` returns `"null"`.
