@@ -52806,4 +52806,632 @@ mod tests {
         .unwrap();
         assert_eq!(result, JsValue::Smi(3));
     }
+
+    // ── Array.prototype comprehensive edge-case e2e tests ───────────────
+
+    // ── splice ──────────────────────────────────────────────────────────
+
+    /// `splice` with negative start counts from end.
+    #[test]
+    fn e2e_array_splice_negative_start() {
+        let r = global_eval(
+            r#"
+            var a = [1,2,3,4,5];
+            a.splice(-2, 1);
+            a.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,2,3,5".into()));
+    }
+
+    /// `splice` returns the removed elements.
+    #[test]
+    fn e2e_array_splice_return_value() {
+        let r = global_eval("[1,2,3,4,5].splice(1, 2).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("2,3".into()));
+    }
+
+    /// `splice` with zero deleteCount inserts without removing.
+    #[test]
+    fn e2e_array_splice_insert_no_delete() {
+        let r = global_eval(
+            r#"
+            var a = [1,2,3];
+            a.splice(1, 0, 10, 20);
+            a.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,10,20,2,3".into()));
+    }
+
+    /// `splice` with deleteCount larger than remaining length.
+    #[test]
+    fn e2e_array_splice_large_delete_count() {
+        let r = global_eval(
+            r#"
+            var a = [1,2,3,4,5];
+            a.splice(2, 100);
+            a.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,2".into()));
+    }
+
+    /// `splice` with no deleteCount removes to end.
+    #[test]
+    fn e2e_array_splice_no_delete_count() {
+        let r = global_eval(
+            r#"
+            var a = [1,2,3,4,5];
+            a.splice(2);
+            a.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,2".into()));
+    }
+
+    /// `splice` with insertion and deletion simultaneously.
+    #[test]
+    fn e2e_array_splice_replace() {
+        let r = global_eval(
+            r#"
+            var a = [1,2,3,4,5];
+            a.splice(1, 2, 10, 20, 30);
+            a.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("1,10,20,30,4,5".into()));
+    }
+
+    // ── slice ───────────────────────────────────────────────────────────
+
+    /// `slice` with both negative indices.
+    #[test]
+    fn e2e_array_slice_both_negative() {
+        let r = global_eval("[1,2,3,4,5].slice(-3, -1).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("3,4".into()));
+    }
+
+    /// `slice` with start beyond length returns empty.
+    #[test]
+    fn e2e_array_slice_start_beyond_length() {
+        let r = global_eval("[1,2,3].slice(10).length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// `slice` with no arguments returns shallow copy.
+    #[test]
+    fn e2e_array_slice_shallow_copy() {
+        let r = global_eval(
+            r#"
+            var a = [1,2,3];
+            var b = a.slice();
+            b.length === 3 && b[0] === 1 && b[2] === 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `slice` with negative start that exceeds length clamps to 0.
+    #[test]
+    fn e2e_array_slice_neg_start_clamp() {
+        let r = global_eval("[1,2,3].slice(-100).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,2,3".into()));
+    }
+
+    // ── concat ──────────────────────────────────────────────────────────
+
+    /// `concat` flattens one level of arrays.
+    #[test]
+    fn e2e_array_concat_basic() {
+        let r = global_eval("[1,2].concat([3,4],[5]).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,2,3,4,5".into()));
+    }
+
+    /// `concat` does not flatten nested arrays (only one level).
+    #[test]
+    fn e2e_array_concat_nested_not_flattened() {
+        let r = global_eval("[1].concat([[2,3]]).length").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    /// `concat` with non-array values appends them.
+    #[test]
+    fn e2e_array_concat_non_array() {
+        let r = global_eval("[1].concat(2, 3).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,2,3".into()));
+    }
+
+    /// `concat` with empty arrays.
+    #[test]
+    fn e2e_array_concat_empty() {
+        let r = global_eval("[].concat([],[]).length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    /// `concat` with Symbol.isConcatSpreadable false prevents spreading.
+    #[test]
+    fn e2e_array_concat_not_spreadable() {
+        let r = global_eval(
+            r#"
+            var a = [3,4];
+            a[Symbol.isConcatSpreadable] = false;
+            var r = [1,2].concat(a);
+            r.length
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// `concat` with Symbol.isConcatSpreadable true on object.
+    #[test]
+    fn e2e_array_concat_spreadable_object() {
+        let r = global_eval(
+            r#"
+            var obj = { length: 2, 0: 'a', 1: 'b' };
+            obj[Symbol.isConcatSpreadable] = true;
+            [].concat(obj).join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("a,b".into()));
+    }
+
+    // ── indexOf / lastIndexOf ───────────────────────────────────────────
+
+    /// `indexOf` uses strict equality (NaN !== NaN).
+    #[test]
+    fn e2e_array_indexof_nan() {
+        let r = global_eval("[1, NaN, 3].indexOf(NaN)").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    /// `indexOf` with positive fromIndex skips earlier elements.
+    #[test]
+    fn e2e_array_indexof_from_index() {
+        let r = global_eval("[1, 2, 3, 2, 1].indexOf(2, 2)").unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// `indexOf` with negative fromIndex.
+    #[test]
+    fn e2e_array_indexof_negative_from() {
+        let r = global_eval("[1, 2, 3, 2, 1].indexOf(2, -2)").unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// `indexOf` returns -1 for not found.
+    #[test]
+    fn e2e_array_indexof_not_found() {
+        let r = global_eval("[1, 2, 3].indexOf(99)").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    /// `indexOf` strict equality (no type coercion).
+    #[test]
+    fn e2e_array_indexof_strict_equality() {
+        let r = global_eval(r#"["1", "2", "3"].indexOf(2)"#).unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    /// `lastIndexOf` finds the last occurrence.
+    #[test]
+    fn e2e_array_lastindexof_basic() {
+        let r = global_eval("[1, 2, 3, 2, 1].lastIndexOf(2)").unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// `lastIndexOf` uses strict equality (NaN !== NaN).
+    #[test]
+    fn e2e_array_lastindexof_nan() {
+        let r = global_eval("[NaN, 1, NaN].lastIndexOf(NaN)").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    /// `lastIndexOf` with fromIndex limits search.
+    #[test]
+    fn e2e_array_lastindexof_from_index() {
+        let r = global_eval("[1, 2, 3, 2, 1].lastIndexOf(2, 2)").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// `lastIndexOf` with negative fromIndex.
+    #[test]
+    fn e2e_array_lastindexof_negative_from() {
+        let r = global_eval("[1, 2, 3, 2, 1].lastIndexOf(2, -3)").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// `lastIndexOf` strict equality check.
+    #[test]
+    fn e2e_array_lastindexof_strict() {
+        let r = global_eval(r#"[1, "1", 1].lastIndexOf("1")"#).unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    // ── every / some ────────────────────────────────────────────────────
+
+    /// `every` passes index as second argument.
+    #[test]
+    fn e2e_array_every_index_arg() {
+        let r = global_eval("[0, 1, 2].every(function(val, idx) { return val === idx; })").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `every` returns true for single-element pass.
+    #[test]
+    fn e2e_array_every_single_element() {
+        let r = global_eval("[42].every(function(x) { return x > 0; })").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `some` passes index as second argument.
+    #[test]
+    fn e2e_array_some_index_arg() {
+        let r = global_eval(
+            "[10, 20, 30].some(function(val, idx) { return idx === 2 && val === 30; })",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `some` returns true on first match and stops.
+    #[test]
+    fn e2e_array_some_early_return() {
+        let r = global_eval(
+            r#"
+            var count = 0;
+            [false, false, true, false].some(function(x) { count++; return x; });
+            count
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    // ── reduce / reduceRight ────────────────────────────────────────────
+
+    /// `reduce` sum with initial value.
+    #[test]
+    fn e2e_array_reduce_sum_initial() {
+        let r = global_eval("[1,2,3,4].reduce(function(a, b) { return a + b; }, 0)").unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    /// `reduce` without initial value uses first element.
+    #[test]
+    fn e2e_array_reduce_no_initial() {
+        let r = global_eval("[1,2,3,4].reduce(function(a, b) { return a + b; })").unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    /// `reduce` on single element without initial returns that element.
+    #[test]
+    fn e2e_array_reduce_single_no_initial() {
+        let r = global_eval("[42].reduce(function(a, b) { return a + b; })").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// `reduce` on empty array without initial throws TypeError.
+    #[test]
+    fn e2e_array_reduce_empty_no_initial_throws() {
+        let r = global_eval(
+            "try { [].reduce(function(a, b) { return a + b; }); false; } \
+             catch(e) { e instanceof TypeError; }",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `reduce` passes index and array.
+    #[test]
+    fn e2e_array_reduce_index_arg() {
+        let r = global_eval("[10,20,30].reduce(function(acc, val, idx) { return acc + idx; }, 0)")
+            .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    /// `reduceRight` processes from right to left.
+    #[test]
+    fn e2e_array_reduce_right_order() {
+        let r =
+            global_eval(r#"[1,2,3].reduceRight(function(a, b) { return a + "" + b; })"#).unwrap();
+        assert_eq!(r, JsValue::String("321".into()));
+    }
+
+    /// `reduceRight` without initial value uses last element.
+    #[test]
+    fn e2e_array_reduce_right_no_initial() {
+        let r = global_eval("[1,2,3,4].reduceRight(function(a, b) { return a - b; })").unwrap();
+        assert_eq!(r, JsValue::Smi(-2));
+    }
+
+    /// `reduceRight` on empty array without initial throws TypeError.
+    #[test]
+    fn e2e_array_reduce_right_empty_throws() {
+        let r = global_eval(
+            "try { [].reduceRight(function(a, b) { return a + b; }); false; } \
+             catch(e) { e instanceof TypeError; }",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `reduceRight` on single element without initial returns that element.
+    #[test]
+    fn e2e_array_reduce_right_single_no_initial() {
+        let r = global_eval("[99].reduceRight(function(a, b) { return a + b; })").unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    // ── fill ────────────────────────────────────────────────────────────
+
+    /// `fill` with both negative start and end.
+    #[test]
+    fn e2e_array_fill_both_negative() {
+        let r = global_eval("[1,2,3,4,5].fill(0, -4, -1).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,0,0,0,5".into()));
+    }
+
+    /// `fill` when start >= end does nothing.
+    #[test]
+    fn e2e_array_fill_start_ge_end() {
+        let r = global_eval("[1,2,3].fill(0, 2, 1).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,2,3".into()));
+    }
+
+    /// `fill` on empty array is no-op.
+    #[test]
+    fn e2e_array_fill_empty() {
+        let r = global_eval("[].fill(9).length").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    // ── copyWithin ──────────────────────────────────────────────────────
+
+    /// `copyWithin` overlapping forward region.
+    #[test]
+    fn e2e_array_copywithin_overlap_forward() {
+        let r = global_eval("[1,2,3,4,5].copyWithin(1, 0, 3).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,1,2,3,5".into()));
+    }
+
+    /// `copyWithin` all negative indices.
+    #[test]
+    fn e2e_array_copywithin_all_negative() {
+        let r = global_eval("[1,2,3,4,5].copyWithin(-3, -4, -1).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,2,2,3,4".into()));
+    }
+
+    /// `copyWithin` when target exceeds length does nothing.
+    #[test]
+    fn e2e_array_copywithin_target_beyond() {
+        let r = global_eval("[1,2,3].copyWithin(10, 0).join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,2,3".into()));
+    }
+
+    // ── entries / keys / values iterators ───────────────────────────────
+
+    /// `keys()` iterator protocol via next().
+    #[test]
+    fn e2e_array_keys_next_protocol() {
+        let r = global_eval(
+            r#"
+            var it = [10, 20, 30].keys();
+            var a = it.next();
+            var b = it.next();
+            var c = it.next();
+            var d = it.next();
+            a.value === 0 && b.value === 1 && c.value === 2 && d.done === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `values()` iterator protocol via next().
+    #[test]
+    fn e2e_array_values_next_protocol() {
+        let r = global_eval(
+            r#"
+            var it = [10, 20, 30].values();
+            var a = it.next();
+            var b = it.next();
+            var c = it.next();
+            var d = it.next();
+            a.value === 10 && b.value === 20 && c.value === 30 && d.done === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `entries()` iterator protocol via next().
+    #[test]
+    fn e2e_array_entries_next_protocol() {
+        let r = global_eval(
+            r#"
+            var it = ['a', 'b'].entries();
+            var a = it.next();
+            var b = it.next();
+            var c = it.next();
+            a.value[0] === 0 && a.value[1] === 'a' &&
+            b.value[0] === 1 && b.value[1] === 'b' &&
+            c.done === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `keys()` on empty array gives done immediately.
+    #[test]
+    fn e2e_array_keys_empty_done() {
+        let r = global_eval("[].keys().next().done").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `values()` on empty array gives done immediately.
+    #[test]
+    fn e2e_array_values_empty_done() {
+        let r = global_eval("[].values().next().done").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // ── Array.isArray ───────────────────────────────────────────────────
+
+    /// `Array.isArray` returns false for null.
+    #[test]
+    fn e2e_array_isarray_null() {
+        let r = global_eval("Array.isArray(null)").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `Array.isArray` returns false for undefined.
+    #[test]
+    fn e2e_array_isarray_undefined() {
+        let r = global_eval("Array.isArray(undefined)").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `Array.isArray` returns false for a number.
+    #[test]
+    fn e2e_array_isarray_number() {
+        let r = global_eval("Array.isArray(42)").unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    /// `Array.isArray` returns true for new Array().
+    #[test]
+    fn e2e_array_isarray_new_array() {
+        let r = global_eval("Array.isArray(new Array(3))").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // ── toString / toLocaleString / join ─────────────────────────────────
+
+    /// `join` with custom separator.
+    #[test]
+    fn e2e_array_join_custom_sep() {
+        let r = global_eval("[1, 2, 3].join(' - ')").unwrap();
+        assert_eq!(r, JsValue::String("1 - 2 - 3".into()));
+    }
+
+    /// `join` with empty string separator.
+    #[test]
+    fn e2e_array_join_empty_sep() {
+        let r = global_eval("[1, 2, 3].join('')").unwrap();
+        assert_eq!(r, JsValue::String("123".into()));
+    }
+
+    /// `join` treats null/undefined elements as empty strings.
+    #[test]
+    fn e2e_array_join_null_undefined() {
+        let r = global_eval("[1, null, undefined, 4].join(',')").unwrap();
+        assert_eq!(r, JsValue::String("1,,,4".into()));
+    }
+
+    /// `join` with no argument uses comma.
+    #[test]
+    fn e2e_array_join_default_comma() {
+        let r = global_eval("[1, 2, 3].join()").unwrap();
+        assert_eq!(r, JsValue::String("1,2,3".into()));
+    }
+
+    /// `join` on empty array returns empty string.
+    #[test]
+    fn e2e_array_join_empty_array() {
+        let r = global_eval("[].join('-')").unwrap();
+        assert_eq!(r, JsValue::String("".into()));
+    }
+
+    /// `join` on single element omits separator.
+    #[test]
+    fn e2e_array_join_single_element() {
+        let r = global_eval("[42].join('-')").unwrap();
+        assert_eq!(r, JsValue::String("42".into()));
+    }
+
+    /// `toString` delegates to join.
+    #[test]
+    fn e2e_array_tostring_delegates_join() {
+        let r = global_eval("[1, null, 3].toString()").unwrap();
+        assert_eq!(r, JsValue::String("1,,3".into()));
+    }
+
+    /// `toLocaleString` on null/undefined elements.
+    #[test]
+    fn e2e_array_tolocalestring_null_undefined() {
+        let r = global_eval("[1, null, undefined, 4].toLocaleString()").unwrap();
+        assert_eq!(r, JsValue::String("1,,,4".into()));
+    }
+
+    // ── Additional splice edge cases ────────────────────────────────────
+
+    /// `splice` on empty array with no args returns empty.
+    #[test]
+    fn e2e_array_splice_empty_no_args() {
+        let r = global_eval(
+            r#"
+            var a = [];
+            var r = a.splice();
+            r.length === 0 && a.length === 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// `splice` negative start that exceeds length clamps to 0.
+    #[test]
+    fn e2e_array_splice_neg_start_clamp() {
+        let r = global_eval(
+            r#"
+            var a = [1,2,3];
+            a.splice(-100, 1);
+            a.join(',')
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("2,3".into()));
+    }
+
+    // ── Additional indexOf/lastIndexOf ──────────────────────────────────
+
+    /// `indexOf` on empty array returns -1.
+    #[test]
+    fn e2e_array_indexof_empty() {
+        let r = global_eval("[].indexOf(1)").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    /// `lastIndexOf` on empty array returns -1.
+    #[test]
+    fn e2e_array_lastindexof_empty() {
+        let r = global_eval("[].lastIndexOf(1)").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    // ── Additional reduce edge cases ────────────────────────────────────
+
+    /// `reduce` with initial value on empty array returns initial.
+    #[test]
+    fn e2e_array_reduce_empty_with_initial() {
+        let r = global_eval("[].reduce(function(a, b) { return a + b; }, 42)").unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    /// `reduceRight` with initial value on empty array returns initial.
+    #[test]
+    fn e2e_array_reduce_right_empty_with_initial() {
+        let r = global_eval("[].reduceRight(function(a, b) { return a + b; }, 99)").unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
 }
