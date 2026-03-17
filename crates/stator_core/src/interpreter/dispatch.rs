@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use crate::builtins::string::{string_char_at, utf16_len};
 use crate::objects::map::PropertyAttributes;
-use crate::objects::property_map::PropertyMap;
+use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 
 use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
@@ -63,6 +63,35 @@ fn js_object_to_plain_value(obj: JsObject) -> JsValue {
         }
     }
     JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+/// When a `NativeFunction` is called as `super()` inside a derived
+/// constructor, install the call result as `this` and wire the derived
+/// class prototype onto the result.  Returns `true` if this was indeed
+/// a super-call and `this` was installed.
+fn maybe_install_super_this(ctx: &mut DispatchContext, result: &JsValue) -> bool {
+    let env = ctx.frame.global_env.borrow();
+    if !env.contains_key(".class_pending_this") {
+        return false;
+    }
+    let current_this = env.get("this").cloned().unwrap_or(JsValue::Undefined);
+    if current_this != JsValue::TheHole {
+        return false;
+    }
+    // Wire the derived prototype onto the result.
+    if let Some(JsValue::PlainObject(pm)) = env.get(".class_pending_this").cloned()
+        && let Some(proto) = pm.borrow().get(INTERNAL_PROTO_PROPERTY_KEY).cloned()
+        && let JsValue::PlainObject(rm) = result
+    {
+        rm.borrow_mut()
+            .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), proto);
+    }
+    drop(env);
+    ctx.frame
+        .global_env
+        .borrow_mut()
+        .insert("this".to_string(), result.clone());
+    true
 }
 
 /// Mutable execution context passed to every opcode handler.
@@ -1207,7 +1236,7 @@ fn handle_create_closure(
         if func_rc.is_generator()
             && let Some(generator_proto) = super::default_generator_object_prototype()
         {
-            proto.insert("__proto__".to_string(), generator_proto);
+            proto.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), generator_proto);
         }
         fn_props_set(
             &func_rc,
@@ -1284,7 +1313,9 @@ fn handle_call_any_receiver(
         }
         JsValue::NativeFunction(f) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-            ctx.frame.accumulator = f(args)?;
+            let result = f(args)?;
+            maybe_install_super_this(ctx, &result);
+            ctx.frame.accumulator = result;
         }
         JsValue::PlainObject(ref map) => {
             let call_val = map.borrow().get("__call__").cloned();
@@ -2023,7 +2054,9 @@ fn handle_call_with_spread(
             }
         }
         JsValue::NativeFunction(f) => {
-            ctx.frame.accumulator = f(args)?;
+            let result = f(args)?;
+            maybe_install_super_this(ctx, &result);
+            ctx.frame.accumulator = result;
         }
         JsValue::PlainObject(ref map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
@@ -2126,10 +2159,15 @@ fn construct_class_from_plain_object(
 ) -> StatorResult<()> {
     // 1. Create `this`.
     let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
-    if !matches!(ctor_proto, JsValue::Undefined) {
+    if !matches!(ctor_proto, JsValue::Undefined | JsValue::Null) {
         this_obj
             .borrow_mut()
-            .insert("__proto__".to_string(), ctor_proto.clone());
+            .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), ctor_proto.clone());
+    } else if matches!(ctor_proto, JsValue::Null) {
+        // extends null: prototype chain ends here
+        this_obj
+            .borrow_mut()
+            .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), JsValue::Null);
     }
     let this_val = JsValue::PlainObject(Rc::clone(&this_obj));
 
@@ -2140,7 +2178,8 @@ fn construct_class_from_plain_object(
     callee_frame.new_target = JsValue::PlainObject(Rc::clone(class_map));
 
     // 3. Expose parent constructor as "super" for `super()` calls.
-    let is_derived = if let Some(parent) = class_map.borrow().get("__proto__").cloned()
+    let is_derived = if let Some(parent) =
+        class_map.borrow().get(INTERNAL_PROTO_PROPERTY_KEY).cloned()
         && !matches!(parent, JsValue::Undefined | JsValue::Null)
     {
         callee_frame
@@ -2264,7 +2303,7 @@ fn handle_construct(
             if !matches!(ctor_proto, JsValue::Undefined) {
                 this_obj
                     .borrow_mut()
-                    .insert("__proto__".to_string(), ctor_proto.clone());
+                    .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), ctor_proto.clone());
             }
             let this_val = JsValue::PlainObject(this_obj);
             let mut callee_frame = InterpreterFrame::new_with_globals(
@@ -2365,7 +2404,7 @@ fn handle_construct_with_spread(
             if !matches!(ctor_proto, JsValue::Undefined) {
                 this_obj
                     .borrow_mut()
-                    .insert("__proto__".to_string(), ctor_proto.clone());
+                    .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), ctor_proto.clone());
             }
             let this_val = JsValue::PlainObject(this_obj);
             let mut callee_frame = InterpreterFrame::new_with_globals(
@@ -2968,7 +3007,7 @@ fn handle_sta_named_property(
             }
             // Walk the prototype chain for inherited setters/getters.
             {
-                let mut proto = map.borrow().get("__proto__").cloned();
+                let mut proto = map.borrow().get(INTERNAL_PROTO_PROPERTY_KEY).cloned();
                 for _ in 0..256 {
                     match proto.take() {
                         Some(JsValue::PlainObject(p)) => {
@@ -2986,7 +3025,7 @@ fn handle_sta_named_property(
                                 }
                                 return Ok(DispatchAction::Continue);
                             }
-                            proto = pb.get("__proto__").cloned();
+                            proto = pb.get(INTERNAL_PROTO_PROPERTY_KEY).cloned();
                         }
                         _ => break,
                     }
@@ -3147,7 +3186,7 @@ fn handle_sta_keyed_property(
         }
         // Walk prototype chain for inherited setters/getters.
         {
-            let mut proto = map.borrow().get("__proto__").cloned();
+            let mut proto = map.borrow().get(INTERNAL_PROTO_PROPERTY_KEY).cloned();
             for _ in 0..256 {
                 match proto.take() {
                     Some(JsValue::PlainObject(p)) => {
@@ -3165,7 +3204,7 @@ fn handle_sta_keyed_property(
                             }
                             return Ok(DispatchAction::Continue);
                         }
-                        proto = pb.get("__proto__").cloned();
+                        proto = pb.get(INTERNAL_PROTO_PROPERTY_KEY).cloned();
                     }
                     _ => break,
                 }
@@ -4395,7 +4434,7 @@ fn handle_create_reg_exp_literal(
                             props.insert("groups".to_string(), JsValue::Undefined);
                         } else {
                             let mut groups = PropertyMap::new();
-                            groups.insert("__proto__".to_string(), JsValue::Null);
+                            groups.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), JsValue::Null);
                             for (k, v) in &m.named_groups {
                                 groups.insert(
                                     k.clone(),
@@ -4841,7 +4880,7 @@ fn handle_for_in_enumerate(
                         all_keys.push(JsValue::String(k.clone().into()));
                     }
                 }
-                current_map = borrow.get("__proto__").and_then(|v| {
+                current_map = borrow.get(INTERNAL_PROTO_PROPERTY_KEY).and_then(|v| {
                     if let JsValue::PlainObject(proto) = v {
                         Some(Rc::clone(proto))
                     } else {
@@ -4886,7 +4925,7 @@ fn for_in_key_still_enumerable(obj: &JsValue, key: &str) -> bool {
                 if let Some((_value, attrs)) = borrow.get_with_attrs(key) {
                     return attrs.contains(PropertyAttributes::ENUMERABLE);
                 }
-                current_map = borrow.get("__proto__").and_then(|v| {
+                current_map = borrow.get(INTERNAL_PROTO_PROPERTY_KEY).and_then(|v| {
                     if let JsValue::PlainObject(proto) = v {
                         Some(Rc::clone(proto))
                     } else {
@@ -5375,7 +5414,7 @@ fn plain_object_has_property(map: &Rc<RefCell<PropertyMap>>, name: &str) -> bool
         if borrow.contains_key(name) {
             return true;
         }
-        borrow.get("__proto__").cloned()
+        borrow.get(INTERNAL_PROTO_PROPERTY_KEY).cloned()
     };
     proto.is_some_and(|value| with_object_has_binding(&value, name))
 }
@@ -6110,7 +6149,7 @@ fn handle_construct_forward_all_args(
             if !matches!(ctor_proto, JsValue::Undefined) {
                 this_obj
                     .borrow_mut()
-                    .insert("__proto__".to_string(), ctor_proto.clone());
+                    .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), ctor_proto.clone());
             }
             let this_val = JsValue::PlainObject(this_obj);
             let mut callee_frame = InterpreterFrame::new_with_globals(
@@ -6414,19 +6453,26 @@ fn handle_create_class(
     let proto: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
 
     // 5. Wire `extends` — set up prototype chain.
-    if !matches!(super_val, JsValue::Undefined | JsValue::Null) {
+    if matches!(super_val, JsValue::Null) {
+        // class Foo extends null {}
+        // proto has no __proto__ (null prototype)
+        proto
+            .borrow_mut()
+            .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), JsValue::Null);
+        // class.__proto__ = Function.prototype (not null)
+    } else if !matches!(super_val, JsValue::Undefined) {
         // class Foo extends Bar {}
         // proto.__proto__ = super_val.prototype
         let super_proto = proto_lookup(&super_val, "prototype");
         if !matches!(super_proto, JsValue::Undefined) {
             proto
                 .borrow_mut()
-                .insert("__proto__".to_string(), super_proto);
+                .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), super_proto);
         }
         // class.__proto__ = super_val (static inheritance)
         class_obj
             .borrow_mut()
-            .insert("__proto__".to_string(), super_val);
+            .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), super_val);
     }
 
     // 6. Wire constructor ↔ prototype.
@@ -10860,5 +10906,529 @@ mod tests {
         .unwrap();
         // For each of 4 keys: i=0 → r++, i=1 → continue outer
         assert_eq!(result, JsValue::Smi(4));
+    }
+
+    // ── Class inheritance deep conformance tests ─────────────────────────
+
+    #[test]
+    fn e2e_super_method_call_correct_this() {
+        let r = crate::builtins::global::global_eval(
+            "class A { x() { return this.v; } } \
+             class B extends A { constructor() { super(); this.v = 42; } \
+             y() { return super.x(); } } \
+             new B().y()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_super_method_call_adds_to_parent() {
+        let r = crate::builtins::global::global_eval(
+            "class A { val() { return 10; } } \
+             class B extends A { val() { return super.val() + 5; } } \
+             new B().val()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(15));
+    }
+
+    #[test]
+    fn e2e_super_prop_read() {
+        let r = crate::builtins::global::global_eval(
+            "class A { get info() { return 'base'; } } \
+             class B extends A { get info() { return super.info + '-child'; } } \
+             new B().info",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("base-child".into()));
+    }
+
+    #[test]
+    fn e2e_super_static_method() {
+        let r = crate::builtins::global::global_eval(
+            "class A { static greet() { return 'hello'; } } \
+             class B extends A { static greet() { return super.greet() + ' world'; } } \
+             B.greet()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("hello world".into()));
+    }
+
+    #[test]
+    fn e2e_super_static_prop() {
+        let r = crate::builtins::global::global_eval(
+            "class A { static x = 10; } \
+             class B extends A {} \
+             B.x",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_extends_expression_function_call() {
+        let r = crate::builtins::global::global_eval(
+            "function getBase() { return class { x() { return 1; } }; } \
+             class C extends getBase() { y() { return 2; } } \
+             var c = new C(); c.x() + c.y()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_extends_expression_ternary() {
+        let r = crate::builtins::global::global_eval(
+            "class A { v() { return 'A'; } } \
+             class B { v() { return 'B'; } } \
+             var flag = true; \
+             class C extends (flag ? A : B) {} \
+             new C().v()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("A".into()));
+    }
+
+    #[test]
+    fn e2e_extends_null_prototype() {
+        let r = crate::builtins::global::global_eval(
+            "class C extends null { \
+               constructor() { return Object.create(null); } \
+             } \
+             typeof C.prototype",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn e2e_extends_null_proto_is_null() {
+        let r = crate::builtins::global::global_eval(
+            "class C extends null { \
+               constructor() { return Object.create(null); } \
+             } \
+             Object.getPrototypeOf(C.prototype) === null",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_constructor_return_override_object() {
+        let r = crate::builtins::global::global_eval(
+            "class A { constructor() { return { custom: true }; } } \
+             new A().custom",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_constructor_return_override_ignores_primitive() {
+        let r = crate::builtins::global::global_eval(
+            "class A { constructor() { this.x = 5; return 42; } } \
+             new A().x",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_constructor_return_override_derived() {
+        let r = crate::builtins::global::global_eval(
+            "class A {} \
+             class B extends A { constructor() { super(); return { overridden: true }; } } \
+             new B().overridden",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_no_super_before_this_reference_error() {
+        let r = crate::builtins::global::global_eval(
+            "class A {} \
+             class B extends A { constructor() { this.x = 1; super(); } } \
+             try { new B(); false; } catch (e) { e instanceof ReferenceError }",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_super_called_twice_reference_error() {
+        let r = crate::builtins::global::global_eval(
+            "class A {} \
+             class B extends A { constructor() { super(); super(); } } \
+             try { new B(); false; } catch (e) { e instanceof ReferenceError }",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_multi_level_method_resolution() {
+        let r = crate::builtins::global::global_eval(
+            "class A { x() { return 1; } } \
+             class B extends A { y() { return 2; } } \
+             class C extends B { z() { return 3; } } \
+             var c = new C(); c.x() + c.y() + c.z()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_multi_level_instanceof() {
+        let r = crate::builtins::global::global_eval(
+            "class A {} class B extends A {} class C extends B {} \
+             var c = new C(); \
+             (c instanceof C) && (c instanceof B) && (c instanceof A)",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_multi_level_super_chain() {
+        let r = crate::builtins::global::global_eval(
+            "class A { v() { return 'A'; } } \
+             class B extends A { v() { return super.v() + 'B'; } } \
+             class C extends B { v() { return super.v() + 'C'; } } \
+             new C().v()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("ABC".into()));
+    }
+
+    #[test]
+    fn e2e_mixin_pattern_basic() {
+        let r = crate::builtins::global::global_eval(
+            "function Mixin(Base) { \
+               return class extends Base { mixed() { return true; } }; \
+             } \
+             class Orig { orig() { return 1; } } \
+             class C extends Mixin(Orig) {} \
+             var c = new C(); c.mixed() && c.orig() === 1",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_mixin_chain() {
+        let r = crate::builtins::global::global_eval(
+            "function M1(B) { return class extends B { m1() { return 1; } }; } \
+             function M2(B) { return class extends B { m2() { return 2; } }; } \
+             class Base { base() { return 0; } } \
+             class C extends M1(M2(Base)) {} \
+             var c = new C(); c.base() + c.m1() + c.m2()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_class_method_override() {
+        let r = crate::builtins::global::global_eval(
+            "class A { greet() { return 'hello'; } } \
+             class B extends A { greet() { return 'hi'; } } \
+             new B().greet()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("hi".into()));
+    }
+
+    #[test]
+    fn e2e_class_parent_method_still_works() {
+        let r = crate::builtins::global::global_eval(
+            "class A { greet() { return 'hello'; } } \
+             class B extends A {} \
+             new B().greet()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    #[test]
+    fn e2e_class_inheritance_prototype_chain_internal() {
+        let r = crate::builtins::global::global_eval(
+            "class A {} class B extends A {} \
+             Object.getPrototypeOf(B) === A && \
+             Object.getPrototypeOf(B.prototype) === A.prototype",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_derived_constructor_with_args() {
+        let r = crate::builtins::global::global_eval(
+            "class A { constructor(x) { this.x = x; } } \
+             class B extends A { constructor(x, y) { super(x); this.y = y; } } \
+             var b = new B(10, 20); b.x + b.y",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(30));
+    }
+
+    #[test]
+    fn e2e_derived_default_constructor() {
+        let r = crate::builtins::global::global_eval(
+            "class A { constructor(x) { this.x = x; } } \
+             class B extends A {} \
+             new B(7).x",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_derived_class_field_init() {
+        let r = crate::builtins::global::global_eval(
+            "class A { constructor() { this.a = 1; } } \
+             class B extends A { b = 2; } \
+             var o = new B(); o.a + o.b",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_class_static_inheritance() {
+        let r = crate::builtins::global::global_eval(
+            "class A { static val = 99; } \
+             class B extends A {} \
+             B.val",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn e2e_class_static_method_inheritance() {
+        let r = crate::builtins::global::global_eval(
+            "class A { static create() { return new this(); } } \
+             class B extends A { v() { return 42; } } \
+             B.create().v()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_class_name_property() {
+        let r = crate::builtins::global::global_eval("class Foo {} Foo.name").unwrap();
+        assert_eq!(r, JsValue::String("Foo".into()));
+    }
+
+    #[test]
+    fn e2e_class_constructor_requires_new_derived() {
+        let r = crate::builtins::global::global_eval(
+            "class A {} class B extends A {} \
+             try { B(); false; } catch (e) { e instanceof TypeError }",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_constructor_new_target_in_derived() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; class A { constructor() { nt = new.target; } } \
+             class B extends A {} new B(); nt === B",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_super_method_with_args() {
+        let r = crate::builtins::global::global_eval(
+            "class A { add(a, b) { return a + b; } } \
+             class B extends A { add(a, b) { return super.add(a, b) * 2; } } \
+             new B().add(3, 4)",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(14));
+    }
+
+    #[test]
+    fn e2e_class_method_this_binding() {
+        let r = crate::builtins::global::global_eval(
+            "class A { constructor() { this.n = 'A'; } \
+             who() { return this.n; } } \
+             class B extends A { constructor() { super(); this.n = 'B'; } } \
+             new B().who()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("B".into()));
+    }
+
+    #[test]
+    fn e2e_class_getter_setter_inheritance() {
+        let r = crate::builtins::global::global_eval(
+            "class A { get x() { return this._x || 0; } \
+               set x(v) { this._x = v; } } \
+             class B extends A {} \
+             var b = new B(); b.x = 5; b.x",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_class_computed_method_inherit() {
+        let r = crate::builtins::global::global_eval(
+            "var key = 'greet'; \
+             class A { [key]() { return 'hi'; } } \
+             class B extends A {} \
+             new B().greet()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("hi".into()));
+    }
+
+    #[test]
+    fn e2e_class_instanceof_with_extends() {
+        let r = crate::builtins::global::global_eval(
+            "class A {} class B extends A {} \
+             var b = new B(); \
+             (b instanceof B) && (b instanceof A)",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_prototype_not_instanceof_parent() {
+        let r = crate::builtins::global::global_eval(
+            "class A {} class B extends A {} \
+             !(B.prototype instanceof A)",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_expression_extends() {
+        let r = crate::builtins::global::global_eval(
+            "class A { v() { return 1; } } \
+             var B = class extends A { v() { return super.v() + 1; } }; \
+             new B().v()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_class_super_in_getter() {
+        let r = crate::builtins::global::global_eval(
+            "class A { get info() { return 'base'; } } \
+             class B extends A { get info() { return super.info; } } \
+             new B().info",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("base".into()));
+    }
+
+    #[test]
+    fn e2e_class_deep_4_levels() {
+        let r = crate::builtins::global::global_eval(
+            "class A { v() { return 1; } } \
+             class B extends A { } \
+             class C extends B { } \
+             class D extends C { } \
+             new D().v()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_class_hasownproperty() {
+        let r = crate::builtins::global::global_eval(
+            "class A { method() {} } \
+             class B extends A { constructor() { super(); this.own = 1; } } \
+             var b = new B(); \
+             b.hasOwnProperty('own') && !b.hasOwnProperty('method')",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_for_in_inherited_not_enumerable_methods() {
+        let r = crate::builtins::global::global_eval(
+            "class A { method() {} } \
+             class B extends A { constructor() { super(); this.x = 1; } } \
+             var b = new B(); var keys = []; \
+             for (var k in b) { keys.push(k); } \
+             keys.length",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_mixin_override_method() {
+        let r = crate::builtins::global::global_eval(
+            "function Logger(Base) { \
+               return class extends Base { \
+                 log() { return 'logged'; } \
+               }; \
+             } \
+             class App { run() { return 'running'; } } \
+             class MyApp extends Logger(App) {} \
+             var a = new MyApp(); a.run() + ' ' + a.log()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("running logged".into()));
+    }
+
+    #[test]
+    fn e2e_super_returns_correct_type() {
+        let r = crate::builtins::global::global_eval(
+            "class A { type() { return 'A'; } } \
+             class B extends A { type() { return 'B'; } \
+               parentType() { return super.type(); } } \
+             new B().parentType()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("A".into()));
+    }
+
+    #[test]
+    fn e2e_class_toString_inherited() {
+        let r = crate::builtins::global::global_eval(
+            "class A { toString() { return 'custom'; } } \
+             class B extends A {} \
+             '' + new B()",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("custom".into()));
+    }
+
+    #[test]
+    fn e2e_class_field_override_in_derived() {
+        let r = crate::builtins::global::global_eval(
+            "class A { x = 1; } \
+             class B extends A { x = 2; } \
+             new B().x",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_class_static_block_inheritance() {
+        let r = crate::builtins::global::global_eval(
+            "class A { static v; static { A.v = 10; } } \
+             class B extends A { static w; static { B.w = A.v + 5; } } \
+             B.w",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(15));
     }
 }
