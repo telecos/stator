@@ -391,8 +391,8 @@ fn handle_bitwise_or(
         let r = to_bigint(&rhs)?;
         ctx.frame.accumulator = JsValue::BigInt(l | r);
     } else {
-        let lhs = ctx.frame.accumulator.to_number()? as i32;
-        let rhs_i = rhs.to_number()? as i32;
+        let lhs = ctx.frame.accumulator.to_int32()?;
+        let rhs_i = rhs.to_int32()?;
         ctx.frame.accumulator = JsValue::Smi(lhs | rhs_i);
     }
     Ok(DispatchAction::Continue)
@@ -419,8 +419,8 @@ fn handle_bitwise_xor(
         let r = to_bigint(&rhs)?;
         ctx.frame.accumulator = JsValue::BigInt(l ^ r);
     } else {
-        let lhs = ctx.frame.accumulator.to_number()? as i32;
-        let rhs_i = rhs.to_number()? as i32;
+        let lhs = ctx.frame.accumulator.to_int32()?;
+        let rhs_i = rhs.to_int32()?;
         ctx.frame.accumulator = JsValue::Smi(lhs ^ rhs_i);
     }
     Ok(DispatchAction::Continue)
@@ -447,8 +447,8 @@ fn handle_bitwise_and(
         let r = to_bigint(&rhs)?;
         ctx.frame.accumulator = JsValue::BigInt(l & r);
     } else {
-        let lhs = ctx.frame.accumulator.to_number()? as i32;
-        let rhs_i = rhs.to_number()? as i32;
+        let lhs = ctx.frame.accumulator.to_int32()?;
+        let rhs_i = rhs.to_int32()?;
         ctx.frame.accumulator = JsValue::Smi(lhs & rhs_i);
     }
     Ok(DispatchAction::Continue)
@@ -476,8 +476,8 @@ fn handle_shift_left(
         let r = to_bigint(&rhs)?;
         ctx.frame.accumulator = JsValue::BigInt(l.wrapping_shl(r as u32));
     } else {
-        let lhs = ctx.frame.accumulator.to_number()? as i32;
-        let shift = (rhs.to_number()? as u32) & 0x1f;
+        let lhs = ctx.frame.accumulator.to_int32()?;
+        let shift = rhs.to_uint32()? & 0x1f;
         ctx.frame.accumulator = JsValue::Smi(lhs << shift);
     }
     Ok(DispatchAction::Continue)
@@ -505,8 +505,8 @@ fn handle_shift_right(
         let r = to_bigint(&rhs)?;
         ctx.frame.accumulator = JsValue::BigInt(l.wrapping_shr(r as u32));
     } else {
-        let lhs = ctx.frame.accumulator.to_number()? as i32;
-        let shift = (rhs.to_number()? as u32) & 0x1f;
+        let lhs = ctx.frame.accumulator.to_int32()?;
+        let shift = rhs.to_uint32()? & 0x1f;
         ctx.frame.accumulator = JsValue::Smi(lhs >> shift);
     }
     Ok(DispatchAction::Continue)
@@ -531,8 +531,8 @@ fn handle_shift_right_logical(
         return Ok(DispatchAction::Continue);
     }
     let rhs = rhs.cheap_clone();
-    let lhs = ctx.frame.accumulator.to_number()? as i32 as u32;
-    let shift = (rhs.to_number()? as u32) & 0x1f;
+    let lhs = ctx.frame.accumulator.to_int32()? as u32;
+    let shift = rhs.to_uint32()? & 0x1f;
     let result = lhs >> shift;
     ctx.frame.accumulator = number_to_jsvalue(result as f64);
     Ok(DispatchAction::Continue)
@@ -663,7 +663,7 @@ fn handle_bitwise_or_smi(
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n | i128::from(imm));
     } else {
-        let lhs = ctx.frame.accumulator.to_number()? as i32;
+        let lhs = ctx.frame.accumulator.to_int32()?;
         ctx.frame.accumulator = JsValue::Smi(lhs | imm);
     }
     Ok(DispatchAction::Continue)
@@ -679,7 +679,7 @@ fn handle_bitwise_xor_smi(
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n ^ i128::from(imm));
     } else {
-        let lhs = ctx.frame.accumulator.to_number()? as i32;
+        let lhs = ctx.frame.accumulator.to_int32()?;
         ctx.frame.accumulator = JsValue::Smi(lhs ^ imm);
     }
     Ok(DispatchAction::Continue)
@@ -695,7 +695,7 @@ fn handle_bitwise_and_smi(
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n & i128::from(imm));
     } else {
-        let lhs = ctx.frame.accumulator.to_number()? as i32;
+        let lhs = ctx.frame.accumulator.to_int32()?;
         ctx.frame.accumulator = JsValue::Smi(lhs & imm);
     }
     Ok(DispatchAction::Continue)
@@ -711,7 +711,7 @@ fn handle_shift_left_smi(
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n.wrapping_shl(imm as u32));
     } else {
-        let lhs = ctx.frame.accumulator.to_number()? as i32;
+        let lhs = ctx.frame.accumulator.to_int32()?;
         let shift = (imm as u32) & 0x1f;
         ctx.frame.accumulator = JsValue::Smi(lhs << shift);
     }
@@ -728,7 +728,7 @@ fn handle_shift_right_smi(
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n.wrapping_shr(imm as u32));
     } else {
-        let lhs = ctx.frame.accumulator.to_number()? as i32;
+        let lhs = ctx.frame.accumulator.to_int32()?;
         let shift = (imm as u32) & 0x1f;
         ctx.frame.accumulator = JsValue::Smi(lhs >> shift);
     }
@@ -742,7 +742,7 @@ fn handle_shift_right_logical_smi(
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("ShiftRightLogicalSmi", 0));
     };
-    let lhs = ctx.frame.accumulator.to_number()? as i32 as u32;
+    let lhs = ctx.frame.accumulator.to_int32()? as u32;
     let shift = (imm as u32) & 0x1f;
     let result = lhs >> shift;
     ctx.frame.accumulator = number_to_jsvalue(result as f64);

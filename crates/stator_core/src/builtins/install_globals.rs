@@ -22142,6 +22142,281 @@ mod tests {
         assert!(global_eval("1024n >> 5").is_err());
     }
 
+    // ===== Bitwise operator conformance (non-BigInt) =====
+
+    // -- AND, OR, XOR basics --
+
+    #[test]
+    fn e2e_bitwise_and_basic() {
+        let r = global_eval("5 & 3").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_bitwise_or_basic() {
+        let r = global_eval("5 | 3").unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_bitwise_xor_basic() {
+        let r = global_eval("5 ^ 3").unwrap();
+        assert_eq!(r, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_bitwise_not_basic() {
+        let r = global_eval("~5").unwrap();
+        assert_eq!(r, JsValue::Smi(-6));
+    }
+
+    #[test]
+    fn e2e_bitwise_not_zero() {
+        let r = global_eval("~0").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    #[test]
+    fn e2e_bitwise_not_minus_one() {
+        let r = global_eval("~(-1)").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    // -- Shift operators --
+
+    #[test]
+    fn e2e_shift_left_basic() {
+        let r = global_eval("1 << 10").unwrap();
+        assert_eq!(r, JsValue::Smi(1024));
+    }
+
+    #[test]
+    fn e2e_shift_right_basic() {
+        let r = global_eval("-16 >> 2").unwrap();
+        assert_eq!(r, JsValue::Smi(-4));
+    }
+
+    #[test]
+    fn e2e_unsigned_shift_right_basic() {
+        // -1 >>> 0 should be 4294967295 (all 32 bits set, unsigned)
+        let r = global_eval("-1 >>> 0").unwrap();
+        assert_eq!(r.to_number().unwrap(), 4294967295.0);
+    }
+
+    #[test]
+    fn e2e_unsigned_shift_right_positive() {
+        let r = global_eval("32 >>> 2").unwrap();
+        assert_eq!(r.to_number().unwrap(), 8.0);
+    }
+
+    // -- Shift amount masked to 5 bits (mod 32) --
+
+    #[test]
+    fn e2e_shift_left_mod32() {
+        // 1 << 33 should equal 1 << 1 = 2
+        let r = global_eval("1 << 33").unwrap();
+        assert_eq!(r, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_shift_right_mod32() {
+        // 8 >> 35 should equal 8 >> 3 = 1
+        let r = global_eval("8 >> 35").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_unsigned_shift_right_mod32() {
+        // -1 >>> 32 should equal -1 >>> 0 = 4294967295
+        let r = global_eval("-1 >>> 32").unwrap();
+        assert_eq!(r.to_number().unwrap(), 4294967295.0);
+    }
+
+    // -- NaN → 0 in bitwise ops --
+
+    #[test]
+    fn e2e_bitwise_or_nan_lhs() {
+        let r = global_eval("NaN | 5").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_bitwise_and_nan() {
+        let r = global_eval("NaN & 5").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn e2e_bitwise_xor_nan() {
+        let r = global_eval("NaN ^ 5").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_bitwise_not_nan() {
+        let r = global_eval("~NaN").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    #[test]
+    fn e2e_shift_left_nan() {
+        let r = global_eval("NaN << 5").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    // -- Type coercion: strings, booleans, null, undefined --
+
+    #[test]
+    fn e2e_bitwise_or_string_coercion() {
+        // "5" is coerced to 5 via ToNumber then ToInt32
+        let r = global_eval("\"5\" | 0").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_bitwise_and_boolean_true() {
+        let r = global_eval("true & 3").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_bitwise_or_boolean_false() {
+        let r = global_eval("false | 7").unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_bitwise_or_null() {
+        // null → 0
+        let r = global_eval("null | 5").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_bitwise_or_undefined() {
+        // undefined → NaN → 0
+        let r = global_eval("undefined | 5").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_bitwise_xor_string_number() {
+        let r = global_eval("\"3\" ^ 5").unwrap();
+        assert_eq!(r, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_bitwise_not_string() {
+        // ~"0" should be ~0 = -1
+        let r = global_eval("~\"0\"").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    // -- -0 treated as 0 --
+
+    #[test]
+    fn e2e_bitwise_or_negative_zero() {
+        let r = global_eval("(-0) | 0").unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn e2e_bitwise_not_negative_zero() {
+        let r = global_eval("~(-0)").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    // -- Large number truncation to 32-bit --
+
+    #[test]
+    fn e2e_bitwise_or_large_number() {
+        // 2^32 + 1 = 4294967297, ToInt32 → 1
+        let r = global_eval("4294967297 | 0").unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_bitwise_and_large_number() {
+        // 2^32 + 5 = 4294967301, ToInt32 → 5
+        let r = global_eval("4294967301 & 7").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_bitwise_not_large_number() {
+        // ToInt32(4294967296) = 0, ~0 = -1
+        let r = global_eval("~4294967296").unwrap();
+        assert_eq!(r, JsValue::Smi(-1));
+    }
+
+    // -- Negative number handling in shifts --
+
+    #[test]
+    fn e2e_shift_left_negative_lhs() {
+        let r = global_eval("-1 << 1").unwrap();
+        assert_eq!(r, JsValue::Smi(-2));
+    }
+
+    #[test]
+    fn e2e_shift_right_negative_preserves_sign() {
+        let r = global_eval("-8 >> 1").unwrap();
+        assert_eq!(r, JsValue::Smi(-4));
+    }
+
+    #[test]
+    fn e2e_unsigned_shift_right_negative_gives_positive() {
+        // -8 >>> 1 = (0xFFFFFFF8 >>> 1) = 0x7FFFFFFC = 2147483644
+        let r = global_eval("-8 >>> 1").unwrap();
+        assert_eq!(r.to_number().unwrap(), 2147483644.0);
+    }
+
+    // -- >>> always returns non-negative --
+
+    #[test]
+    fn e2e_unsigned_shift_right_always_nonneg() {
+        let r = global_eval("(-1) >>> 0").unwrap();
+        let n = r.to_number().unwrap();
+        assert!(n >= 0.0);
+    }
+
+    // -- Bitwise assignment operators --
+
+    #[test]
+    fn e2e_bitwise_and_assign() {
+        let r = global_eval("var x = 7; x &= 3; x").unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_bitwise_or_assign() {
+        let r = global_eval("var x = 5; x |= 2; x").unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_bitwise_xor_assign() {
+        let r = global_eval("var x = 7; x ^= 3; x").unwrap();
+        assert_eq!(r, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn e2e_shift_left_assign() {
+        let r = global_eval("var x = 1; x <<= 4; x").unwrap();
+        assert_eq!(r, JsValue::Smi(16));
+    }
+
+    #[test]
+    fn e2e_shift_right_assign() {
+        let r = global_eval("var x = -16; x >>= 2; x").unwrap();
+        assert_eq!(r, JsValue::Smi(-4));
+    }
+
+    #[test]
+    fn e2e_unsigned_shift_right_assign() {
+        let r = global_eval("var x = -1; x >>>= 0; x").unwrap();
+        assert_eq!(r.to_number().unwrap(), 4294967295.0);
+    }
+
     // -- Comparison: strict equality --
 
     #[test]
