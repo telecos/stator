@@ -40,7 +40,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use crate::builtins::proxy::{proxy_get, proxy_own_keys};
+use crate::builtins::proxy::{proxy_get, proxy_get_own_property_descriptor, proxy_own_keys};
 use crate::error::{StatorError, StatorResult};
 use crate::objects::value::JsValue;
 
@@ -1123,9 +1123,16 @@ fn js_value_to_json_inner(
             for key in keys {
                 let key_str = match &key {
                     JsValue::String(s) => s.to_string(),
-                    JsValue::Smi(n) => n.to_string(),
                     _ => continue,
                 };
+                let Some((_, attrs)) =
+                    proxy_get_own_property_descriptor(&proxy.borrow(), &key_str)?
+                else {
+                    continue;
+                };
+                if !attrs.contains(crate::objects::map::PropertyAttributes::ENUMERABLE) {
+                    continue;
+                }
                 let val = proxy_get(&proxy.borrow(), &key_str)?;
                 if let Some(jv) = js_value_to_json_inner(&val, seen)? {
                     entries.push((key_str, jv));
