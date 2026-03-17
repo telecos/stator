@@ -31,6 +31,7 @@
 //!   `Vec<JsValue>` and is surfaced as [`JsValue::Iterator`].
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::builtins::error::JsError;
@@ -121,12 +122,18 @@ pub struct GeneratorState {
     /// Saved register file at the point of suspension (empty before the
     /// first [`crate::bytecode::bytecodes::Opcode::SuspendGenerator`]).
     pub registers: Vec<JsValue>,
+    /// Original call arguments for the activation.
+    pub call_args: Vec<JsValue>,
+    /// Global environment used to execute/resume the activation.
+    pub global_env: Option<Rc<RefCell<HashMap<String, JsValue>>>>,
     /// Instruction index to resume from; `0` = start of function body.
     pub resume_pc: usize,
     /// Current lifecycle status.
     pub status: GeneratorStatus,
     /// How the generator should be resumed on the next step.
     pub resume_mode: GeneratorResumeMode,
+    /// The `new.target` value visible to the activation.
+    pub new_target: JsValue,
 }
 
 impl GeneratorState {
@@ -138,9 +145,12 @@ impl GeneratorState {
             bytecode_array,
             prototype: None,
             registers: Vec::new(),
+            call_args: Vec::new(),
+            global_env: None,
             resume_pc: 0,
             status: GeneratorStatus::SuspendedAtStart,
             resume_mode: GeneratorResumeMode::Normal,
+            new_target: JsValue::Undefined,
         }))
     }
 }
