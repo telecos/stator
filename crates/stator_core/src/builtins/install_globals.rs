@@ -61,9 +61,12 @@ use crate::builtins::global::{
     global_parse_float, global_parse_int, global_unescape,
 };
 use crate::builtins::intl::{
-    collator_compare_js, date_time_format_js, date_time_format_to_parts_js, display_names_of,
-    list_format_js, locale_base_name, locale_language, number_format_js, number_format_to_parts_js,
-    plural_rules_select_js, relative_time_format_js, segmenter_segment,
+    collator_compare_js, date_time_format_js, date_time_format_to_parts_js, display_names_of_typed,
+    list_format_js, list_format_to_parts_js, locale_base_name, locale_language, locale_maximize,
+    locale_minimize, locale_region, locale_script, number_format_js, number_format_range_js,
+    number_format_range_to_parts_js, number_format_to_parts_js, plural_rules_select_js,
+    plural_rules_select_range_js, relative_time_format_js, relative_time_format_to_parts_js,
+    segmenter_segment_objects,
 };
 use crate::builtins::iterator::{
     async_iterator_drop, async_iterator_every, async_iterator_filter, async_iterator_find,
@@ -11729,6 +11732,11 @@ fn make_intl() -> JsValue {
                         "formatToParts".into(),
                         native(|a| number_format_to_parts_js(&a)),
                     );
+                    obj.insert("formatRange".into(), native(|a| number_format_range_js(&a)));
+                    obj.insert(
+                        "formatRangeToParts".into(),
+                        native(|a| number_format_range_to_parts_js(&a)),
+                    );
                     obj.insert(
                         "resolvedOptions".into(),
                         native(|_| {
@@ -11748,6 +11756,11 @@ fn make_intl() -> JsValue {
             proto.insert(
                 "formatToParts".into(),
                 native(|a| number_format_to_parts_js(&a)),
+            );
+            proto.insert("formatRange".into(), native(|a| number_format_range_js(&a)));
+            proto.insert(
+                "formatRangeToParts".into(),
+                native(|a| number_format_range_to_parts_js(&a)),
             );
             proto.insert(
                 "resolvedOptions".into(),
@@ -11888,6 +11901,10 @@ fn make_intl() -> JsValue {
                     let mut obj = PropertyMap::new();
                     obj.insert("select".into(), native(|a| plural_rules_select_js(&a)));
                     obj.insert(
+                        "selectRange".into(),
+                        native(|a| plural_rules_select_range_js(&a)),
+                    );
+                    obj.insert(
                         "resolvedOptions".into(),
                         native(|_| {
                             let mut opts = PropertyMap::new();
@@ -11903,6 +11920,10 @@ fn make_intl() -> JsValue {
             ctor.insert("supportedLocalesOf".into(), make_supported_locales_of());
             let mut proto = PropertyMap::new();
             proto.insert("select".into(), native(|a| plural_rules_select_js(&a)));
+            proto.insert(
+                "selectRange".into(),
+                native(|a| plural_rules_select_range_js(&a)),
+            );
             proto.insert(
                 "resolvedOptions".into(),
                 native(|_| {
@@ -11955,7 +11976,7 @@ fn make_intl() -> JsValue {
                     );
                     obj.insert(
                         "formatToParts".into(),
-                        native(move |a| list_format_js(&a, &lt)),
+                        native(move |a| list_format_to_parts_js(&a, &lt)),
                     );
                     obj.insert(
                         "resolvedOptions".into(),
@@ -11979,7 +12000,7 @@ fn make_intl() -> JsValue {
             );
             proto.insert(
                 "formatToParts".into(),
-                native(|a| list_format_js(&a, "conjunction")),
+                native(|a| list_format_to_parts_js(&a, "conjunction")),
             );
             proto.insert(
                 "resolvedOptions".into(),
@@ -12016,7 +12037,7 @@ fn make_intl() -> JsValue {
                     obj.insert("format".into(), native(|a| relative_time_format_js(&a)));
                     obj.insert(
                         "formatToParts".into(),
-                        native(|a| relative_time_format_js(&a)),
+                        native(|a| relative_time_format_to_parts_js(&a)),
                     );
                     obj.insert(
                         "resolvedOptions".into(),
@@ -12037,7 +12058,7 @@ fn make_intl() -> JsValue {
             proto.insert("format".into(), native(|a| relative_time_format_js(&a)));
             proto.insert(
                 "formatToParts".into(),
-                native(|a| relative_time_format_js(&a)),
+                native(|a| relative_time_format_to_parts_js(&a)),
             );
             proto.insert(
                 "resolvedOptions".into(),
@@ -12075,11 +12096,7 @@ fn make_intl() -> JsValue {
                         "segment".into(),
                         native(|a| {
                             let s = a.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                            let segs: Vec<JsValue> = segmenter_segment(&s)
-                                .into_iter()
-                                .map(|s| JsValue::String(s.into()))
-                                .collect();
-                            Ok(JsValue::new_array(segs))
+                            segmenter_segment_objects(&s)
                         }),
                     );
                     obj.insert(
@@ -12101,11 +12118,7 @@ fn make_intl() -> JsValue {
                 "segment".into(),
                 native(|a| {
                     let s = a.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                    let segs: Vec<JsValue> = segmenter_segment(&s)
-                        .into_iter()
-                        .map(|s| JsValue::String(s.into()))
-                        .collect();
-                    Ok(JsValue::new_array(segs))
+                    segmenter_segment_objects(&s)
                 }),
             );
             proto.insert(
@@ -12137,21 +12150,38 @@ fn make_intl() -> JsValue {
             let mut ctor = PropertyMap::new();
             ctor.insert(
                 "__call__".into(),
-                native(|_args| {
+                native(|args| {
+                    let dn_type = if let Some(JsValue::PlainObject(opts)) = args.get(1) {
+                        opts.borrow()
+                            .get("type")
+                            .and_then(|v| {
+                                if let JsValue::String(s) = v {
+                                    Some(s.to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_else(|| "language".to_string())
+                    } else {
+                        "language".to_string()
+                    };
+                    let dt = dn_type.clone();
                     let mut obj = PropertyMap::new();
                     obj.insert(
                         "of".into(),
-                        native(|a| {
+                        native(move |a| {
                             let code = a.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                            Ok(JsValue::String(display_names_of(&code).into()))
+                            Ok(JsValue::String(
+                                display_names_of_typed(&code, &dn_type).into(),
+                            ))
                         }),
                     );
                     obj.insert(
                         "resolvedOptions".into(),
-                        native(|_| {
+                        native(move |_| {
                             let mut opts = PropertyMap::new();
                             opts.insert("locale".into(), JsValue::String("en-US".into()));
-                            opts.insert("type".into(), JsValue::String("language".into()));
+                            opts.insert("type".into(), JsValue::String(dt.clone().into()));
                             opts.insert("style".into(), JsValue::String("long".into()));
                             Ok(JsValue::PlainObject(Rc::new(RefCell::new(opts))))
                         }),
@@ -12166,7 +12196,9 @@ fn make_intl() -> JsValue {
                 "of".into(),
                 native(|a| {
                     let code = a.first().unwrap_or(&JsValue::Undefined).to_js_string()?;
-                    Ok(JsValue::String(display_names_of(&code).into()))
+                    Ok(JsValue::String(
+                        display_names_of_typed(&code, "language").into(),
+                    ))
                 }),
             );
             proto.insert(
@@ -12209,6 +12241,57 @@ fn make_intl() -> JsValue {
                     obj.insert(
                         "baseName".into(),
                         JsValue::String(locale_base_name(&tag).into()),
+                    );
+                    obj.insert("region".into(), JsValue::String(locale_region(&tag).into()));
+                    obj.insert("script".into(), JsValue::String(locale_script(&tag).into()));
+                    let tag_max = tag.clone();
+                    obj.insert(
+                        "maximize".into(),
+                        native(move |_| {
+                            let maximized = locale_maximize(&tag_max);
+                            // Return a new Locale-like object
+                            let mut m = PropertyMap::new();
+                            m.insert(
+                                "language".into(),
+                                JsValue::String(locale_language(&maximized).into()),
+                            );
+                            m.insert("baseName".into(), JsValue::String(maximized.clone().into()));
+                            m.insert(
+                                "region".into(),
+                                JsValue::String(locale_region(&maximized).into()),
+                            );
+                            m.insert(
+                                "script".into(),
+                                JsValue::String(locale_script(&maximized).into()),
+                            );
+                            let ms = maximized.clone();
+                            m.insert(
+                                "toString".into(),
+                                native(move |_| Ok(JsValue::String(ms.clone().into()))),
+                            );
+                            m.make_all_non_enumerable();
+                            Ok(JsValue::PlainObject(Rc::new(RefCell::new(m))))
+                        }),
+                    );
+                    let tag_min = tag.clone();
+                    obj.insert(
+                        "minimize".into(),
+                        native(move |_| {
+                            let minimized = locale_minimize(&tag_min);
+                            let mut m = PropertyMap::new();
+                            m.insert(
+                                "language".into(),
+                                JsValue::String(locale_language(&minimized).into()),
+                            );
+                            m.insert("baseName".into(), JsValue::String(minimized.clone().into()));
+                            let ms = minimized.clone();
+                            m.insert(
+                                "toString".into(),
+                                native(move |_| Ok(JsValue::String(ms.clone().into()))),
+                            );
+                            m.make_all_non_enumerable();
+                            Ok(JsValue::PlainObject(Rc::new(RefCell::new(m))))
+                        }),
                     );
                     obj.insert(
                         "toString".into(),
@@ -16225,8 +16308,8 @@ mod tests {
     }
 
     #[test]
-    fn e2e_intl_segmenter_segment_returns_array() {
-        assert_eval_true("Array.isArray(new Intl.Segmenter().segment('hi'))");
+    fn e2e_intl_segmenter_segment_returns_object() {
+        assert_eval_true("typeof new Intl.Segmenter().segment('hi') === 'object'");
     }
 
     #[test]
@@ -16315,6 +16398,279 @@ mod tests {
     #[test]
     fn e2e_intl_list_format_format_three_items() {
         assert_eval_true("new Intl.ListFormat().format(['A','B','C']) === 'A, B, and C'");
+    }
+
+    // ── Intl advanced method conformance e2e ────────────────────────────────
+
+    // NumberFormat.formatToParts
+    #[test]
+    fn e2e_intl_nf_format_to_parts_integer_type() {
+        assert_eval_true("Intl.NumberFormat().formatToParts(42)[0].type === 'integer'");
+    }
+
+    #[test]
+    fn e2e_intl_nf_format_to_parts_integer_value() {
+        assert_eval_true("Intl.NumberFormat().formatToParts(42)[0].value === '42'");
+    }
+
+    #[test]
+    fn e2e_intl_nf_format_to_parts_decimal() {
+        assert_eval_true("Intl.NumberFormat().formatToParts(1.5)[1].type === 'decimal'");
+    }
+
+    #[test]
+    fn e2e_intl_nf_format_to_parts_fraction() {
+        assert_eval_true("Intl.NumberFormat().formatToParts(1.5)[2].type === 'fraction'");
+    }
+
+    // DateTimeFormat.formatToParts
+    #[test]
+    fn e2e_intl_dtf_format_to_parts_year() {
+        assert_eval_true(
+            "Intl.DateTimeFormat().formatToParts(0).some(function(p) { return p.type === 'year' })",
+        );
+    }
+
+    #[test]
+    fn e2e_intl_dtf_format_to_parts_day() {
+        assert_eval_true(
+            "Intl.DateTimeFormat().formatToParts(0).some(function(p) { return p.type === 'day' })",
+        );
+    }
+
+    // NumberFormat.formatRange
+    #[test]
+    fn e2e_intl_nf_format_range_returns_string() {
+        assert_eval_true("typeof new Intl.NumberFormat().formatRange(1, 10) === 'string'");
+    }
+
+    #[test]
+    fn e2e_intl_nf_format_range_contains_dash() {
+        assert_eval_true("new Intl.NumberFormat().formatRange(1, 10).indexOf('–') !== -1");
+    }
+
+    #[test]
+    fn e2e_intl_nf_format_range_contains_start() {
+        assert_eval_true("new Intl.NumberFormat().formatRange(3, 7).indexOf('3') !== -1");
+    }
+
+    #[test]
+    fn e2e_intl_nf_format_range_contains_end() {
+        assert_eval_true("new Intl.NumberFormat().formatRange(3, 7).indexOf('7') !== -1");
+    }
+
+    // NumberFormat.formatRangeToParts
+    #[test]
+    fn e2e_intl_nf_format_range_to_parts_length() {
+        assert_eval_true("Intl.NumberFormat().formatRangeToParts(1, 10).length === 3");
+    }
+
+    #[test]
+    fn e2e_intl_nf_format_range_to_parts_start() {
+        assert_eval_true("Intl.NumberFormat().formatRangeToParts(1, 10)[0].type === 'startRange'");
+    }
+
+    #[test]
+    fn e2e_intl_nf_format_range_to_parts_end() {
+        assert_eval_true("Intl.NumberFormat().formatRangeToParts(1, 10)[2].type === 'endRange'");
+    }
+
+    // PluralRules.selectRange
+    #[test]
+    fn e2e_intl_pr_select_range_other() {
+        assert_eval_true("new Intl.PluralRules().selectRange(1, 5) === 'other'");
+    }
+
+    #[test]
+    fn e2e_intl_pr_select_range_one() {
+        assert_eval_true("new Intl.PluralRules().selectRange(0, 1) === 'one'");
+    }
+
+    #[test]
+    fn e2e_intl_pr_select_range_returns_string() {
+        assert_eval_true("typeof new Intl.PluralRules().selectRange(1, 2) === 'string'");
+    }
+
+    // Intl.Locale: region and script getters
+    #[test]
+    fn e2e_intl_locale_region() {
+        assert_eval_true("new Intl.Locale('en-US').region === 'US'");
+    }
+
+    #[test]
+    fn e2e_intl_locale_region_empty() {
+        assert_eval_true("new Intl.Locale('en').region === ''");
+    }
+
+    #[test]
+    fn e2e_intl_locale_script() {
+        assert_eval_true("new Intl.Locale('zh-Hans-CN').script === 'Hans'");
+    }
+
+    #[test]
+    fn e2e_intl_locale_script_empty() {
+        assert_eval_true("new Intl.Locale('en-US').script === ''");
+    }
+
+    // Intl.Locale.maximize / minimize
+    #[test]
+    fn e2e_intl_locale_maximize_language() {
+        assert_eval_true("new Intl.Locale('en').maximize().language === 'en'");
+    }
+
+    #[test]
+    fn e2e_intl_locale_maximize_has_script() {
+        assert_eval_true("new Intl.Locale('en').maximize().script === 'Latn'");
+    }
+
+    #[test]
+    fn e2e_intl_locale_maximize_has_region() {
+        assert_eval_true("new Intl.Locale('en').maximize().region === 'US'");
+    }
+
+    #[test]
+    fn e2e_intl_locale_minimize_returns_language() {
+        assert_eval_true("new Intl.Locale('en-US').minimize().language === 'en'");
+    }
+
+    // Intl.DisplayNames.of with type
+    #[test]
+    fn e2e_intl_display_names_language_en() {
+        assert_eval_true(
+            "new Intl.DisplayNames('en', { type: 'language' }).of('en') === 'English'",
+        );
+    }
+
+    #[test]
+    fn e2e_intl_display_names_region_us() {
+        assert_eval_true(
+            "new Intl.DisplayNames('en', { type: 'region' }).of('US') === 'United States'",
+        );
+    }
+
+    #[test]
+    fn e2e_intl_display_names_script_latn() {
+        assert_eval_true("new Intl.DisplayNames('en', { type: 'script' }).of('Latn') === 'Latin'");
+    }
+
+    #[test]
+    fn e2e_intl_display_names_currency_usd() {
+        assert_eval_true(
+            "new Intl.DisplayNames('en', { type: 'currency' }).of('USD') === 'US Dollar'",
+        );
+    }
+
+    // Segmenter.segment with containing()
+    #[test]
+    fn e2e_intl_segmenter_segment_has_containing() {
+        assert_eval_true("typeof new Intl.Segmenter().segment('hi').containing === 'function'");
+    }
+
+    #[test]
+    fn e2e_intl_segmenter_segment_containing_returns_object() {
+        assert_eval_true("typeof new Intl.Segmenter().segment('hi').containing(0) === 'object'");
+    }
+
+    #[test]
+    fn e2e_intl_segmenter_segment_containing_segment_value() {
+        assert_eval_true("new Intl.Segmenter().segment('hi').containing(0).segment === 'h'");
+    }
+
+    #[test]
+    fn e2e_intl_segmenter_segment_containing_index() {
+        assert_eval_true("new Intl.Segmenter().segment('hi').containing(1).index === 1");
+    }
+
+    #[test]
+    fn e2e_intl_segmenter_segment_containing_input() {
+        assert_eval_true("new Intl.Segmenter().segment('hi').containing(0).input === 'hi'");
+    }
+
+    // ListFormat.formatToParts
+    #[test]
+    fn e2e_intl_lf_format_to_parts_returns_array() {
+        assert_eval_true("Array.isArray(new Intl.ListFormat().formatToParts(['A','B']))");
+    }
+
+    #[test]
+    fn e2e_intl_lf_format_to_parts_element_type() {
+        assert_eval_true("new Intl.ListFormat().formatToParts(['A','B'])[0].type === 'element'");
+    }
+
+    #[test]
+    fn e2e_intl_lf_format_to_parts_element_value() {
+        assert_eval_true("new Intl.ListFormat().formatToParts(['A','B'])[0].value === 'A'");
+    }
+
+    #[test]
+    fn e2e_intl_lf_format_to_parts_literal_type() {
+        assert_eval_true("new Intl.ListFormat().formatToParts(['A','B'])[1].type === 'literal'");
+    }
+
+    #[test]
+    fn e2e_intl_lf_format_to_parts_length() {
+        assert_eval_true("new Intl.ListFormat().formatToParts(['A','B']).length === 3");
+    }
+
+    // RelativeTimeFormat.formatToParts
+    #[test]
+    fn e2e_intl_rtf_format_to_parts_returns_array() {
+        assert_eval_true("Array.isArray(new Intl.RelativeTimeFormat().formatToParts(-1, 'day'))");
+    }
+
+    #[test]
+    fn e2e_intl_rtf_format_to_parts_has_integer() {
+        assert_eval_true(
+            "new Intl.RelativeTimeFormat().formatToParts(-1, 'day').some(function(p) { return p.type === 'integer' })",
+        );
+    }
+
+    #[test]
+    fn e2e_intl_rtf_format_to_parts_has_unit() {
+        assert_eval_true(
+            "new Intl.RelativeTimeFormat().formatToParts(-1, 'day').some(function(p) { return p.type === 'unit' })",
+        );
+    }
+
+    // All constructors accept locales and options parameters
+    #[test]
+    fn e2e_intl_nf_accepts_locale_param() {
+        assert_eval_true("typeof new Intl.NumberFormat('en-US').format(1) === 'string'");
+    }
+
+    #[test]
+    fn e2e_intl_dtf_accepts_locale_param() {
+        assert_eval_true("typeof new Intl.DateTimeFormat('en-US').format(0) === 'string'");
+    }
+
+    #[test]
+    fn e2e_intl_collator_accepts_locale_param() {
+        assert_eval_true("typeof new Intl.Collator('en-US') === 'object'");
+    }
+
+    // Intl.supportedValuesOf
+    #[test]
+    fn e2e_intl_supported_values_of_collation() {
+        assert_eval_true("Intl.supportedValuesOf('collation').length >= 1");
+    }
+
+    #[test]
+    fn e2e_intl_supported_values_of_currency() {
+        assert_eval_true(
+            "Intl.supportedValuesOf('currency').length >= 1 && Intl.supportedValuesOf('currency')[0] === 'USD'",
+        );
+    }
+
+    #[test]
+    fn e2e_intl_supported_values_of_numbering_system() {
+        assert_eval_true(
+            "Intl.supportedValuesOf('numberingSystem').length >= 1 && Intl.supportedValuesOf('numberingSystem')[0] === 'latn'",
+        );
+    }
+
+    #[test]
+    fn e2e_intl_supported_values_of_unknown_returns_empty() {
+        assert_eval_true("Intl.supportedValuesOf('unknown').length === 0");
     }
 
     /// Verify that the `Math` object has the expected properties.
