@@ -104,6 +104,7 @@ use crate::builtins::string::{
     string_starts_with, string_strike, string_sub, string_substr, string_substring, string_sup,
     string_to_locale_lower_case, string_to_locale_upper_case, string_to_lower_case,
     string_to_upper_case, string_to_well_formed, string_trim, string_trim_end, string_trim_start,
+    utf16_len,
 };
 use crate::builtins::symbol::{
     SYMBOL_ASYNC_DISPOSE, SYMBOL_ASYNC_ITERATOR, SYMBOL_DISPOSE, SYMBOL_HAS_INSTANCE,
@@ -317,7 +318,7 @@ fn enumerable_own_string_keys(value: &JsValue) -> Vec<String> {
         JsValue::PlainObject(map) => own_string_property_keys(&map.borrow(), true),
         JsValue::Error(error) => own_string_property_keys(&error.props.borrow(), true),
         JsValue::Array(items) => (0..items.borrow().len()).map(|i| i.to_string()).collect(),
-        JsValue::String(s) => (0..s.chars().count()).map(|i| i.to_string()).collect(),
+        JsValue::String(s) => (0..utf16_len(s)).map(|i| i.to_string()).collect(),
         _ => Vec::new(),
     }
 }
@@ -4641,21 +4642,12 @@ fn make_object() -> JsValue {
                         }
                     }
                     JsValue::String(s) => {
-                        let char_count = s.chars().count();
+                        let length = utf16_len(s);
                         if key == "length" {
-                            Ok(data_desc(
-                                JsValue::Smi(char_count as i32),
-                                false,
-                                false,
-                                false,
-                            ))
+                            Ok(data_desc(JsValue::Smi(length as i32), false, false, false))
                         } else if let Ok(idx) = key.parse::<usize>() {
-                            if idx < char_count {
-                                let ch: String = s
-                                    .chars()
-                                    .nth(idx)
-                                    .map(|c| c.to_string())
-                                    .unwrap_or_default();
+                            if idx < length {
+                                let ch = string_char_at(s, idx as i64);
                                 Ok(data_desc(JsValue::String(ch.into()), false, true, false))
                             } else {
                                 Ok(JsValue::Undefined)
@@ -4763,7 +4755,7 @@ fn make_object() -> JsValue {
                         JsValue::String("name".into()),
                     ])),
                     JsValue::String(s) => {
-                        let mut keys: Vec<JsValue> = (0..s.chars().count())
+                        let mut keys: Vec<JsValue> = (0..utf16_len(s))
                             .map(|i| JsValue::String(i.to_string().into()))
                             .collect();
                         keys.push(JsValue::String("length".into()));
@@ -4943,7 +4935,7 @@ fn make_object() -> JsValue {
                         if key == "length" {
                             Ok(JsValue::Boolean(true))
                         } else if let Ok(idx) = key.parse::<usize>() {
-                            Ok(JsValue::Boolean(idx < s.chars().count()))
+                            Ok(JsValue::Boolean(idx < utf16_len(s)))
                         } else {
                             Ok(JsValue::Boolean(false))
                         }
@@ -32169,6 +32161,240 @@ mod tests {
     #[test]
     fn e2e_set_constructor_null_creates_empty() {
         let result = global_eval("var s = new Set(null); s.size === 0").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Unicode and string encoding conformance e2e tests ───────────────────
+
+    #[test]
+    fn e2e_unicode_string_length_emoji_utf16() {
+        let result = global_eval("'😀'.length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_unicode_string_length_mixed_utf16() {
+        let result = global_eval("'a😀b'.length").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn e2e_unicode_from_code_point_supplementary_value() {
+        let result = global_eval("String.fromCodePoint(0x1F600)").unwrap();
+        assert_eq!(result, JsValue::String("😀".into()));
+    }
+
+    #[test]
+    fn e2e_unicode_from_code_point_supplementary_length() {
+        let result = global_eval("String.fromCodePoint(0x1F600).length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_unicode_from_code_point_mixed_length() {
+        let result = global_eval("String.fromCodePoint(0x41, 0x1F600, 0x42).length").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn e2e_unicode_from_code_point_multiple_supplementary() {
+        let result = global_eval("String.fromCodePoint(0x1F600, 0x1F642).length").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn e2e_unicode_from_code_point_fractional_throws() {
+        let result = global_eval(
+            "try { String.fromCodePoint(65.5); false; } catch (e) { e instanceof RangeError; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_unicode_from_code_point_infinity_throws() {
+        let result = global_eval(
+            "try { String.fromCodePoint(Infinity); false; } catch (e) { e instanceof RangeError; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_unicode_from_code_point_surrogate_throws() {
+        let result = global_eval(
+            "try { String.fromCodePoint(0xD800); false; } catch (e) { e instanceof RangeError; }",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_unicode_code_point_at_supplementary_start() {
+        let result = global_eval("'😀'.codePointAt(0)").unwrap();
+        assert_eq!(result, JsValue::Smi(0x1F600));
+    }
+
+    #[test]
+    fn e2e_unicode_code_point_at_supplementary_in_middle() {
+        let result = global_eval("'a😀b'.codePointAt(1)").unwrap();
+        assert_eq!(result, JsValue::Smi(0x1F600));
+    }
+
+    #[test]
+    fn e2e_unicode_code_point_at_low_surrogate_index() {
+        let result = global_eval("'😀'.codePointAt(1)").unwrap();
+        assert_eq!(result, JsValue::Smi(0xDE00));
+    }
+
+    #[test]
+    fn e2e_unicode_code_point_at_position_after_pair() {
+        let result = global_eval("'a😀b'.codePointAt(3)").unwrap();
+        assert_eq!(result, JsValue::Smi(0x62));
+    }
+
+    #[test]
+    fn e2e_unicode_string_iterator_single_emoji() {
+        let result = global_eval("var i = '😀'[Symbol.iterator](); var a = i.next(); var b = i.next(); a.value + ',' + a.done + ',' + String(b.value) + ',' + b.done").unwrap();
+        assert_eq!(result, JsValue::String("😀,false,undefined,true".into()));
+    }
+
+    #[test]
+    fn e2e_unicode_string_iterator_mixed_sequence() {
+        let result =
+            global_eval("var r = []; for (var ch of 'a😀b') r.push(ch); r.join('|')").unwrap();
+        assert_eq!(result, JsValue::String("a|😀|b".into()));
+    }
+
+    #[test]
+    fn e2e_unicode_array_from_string_uses_code_points() {
+        let result = global_eval("Array.from('a😀b').length").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_unicode_spread_string_uses_code_points() {
+        let result = global_eval("[...'a😀b'].join('|')").unwrap();
+        assert_eq!(result, JsValue::String("a|😀|b".into()));
+    }
+
+    #[test]
+    fn e2e_unicode_starts_with_position_uses_utf16_units() {
+        let result = global_eval("'a😀b'.startsWith('😀', 1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_unicode_starts_with_negative_position_clamps() {
+        let result = global_eval("'abc'.startsWith('a', -1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_unicode_ends_with_position_uses_utf16_units() {
+        let result = global_eval("'a😀b'.endsWith('😀', 3)").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_unicode_ends_with_negative_position_clamps() {
+        let result = global_eval("'abc'.endsWith('a', -1)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_unicode_includes_position_uses_utf16_units() {
+        let result = global_eval("'a😀b'.includes('😀', 2)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_unicode_includes_infinity_position_false() {
+        let result = global_eval("'abc'.includes('a', Infinity)").unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_unicode_repeat_emoji_length_counts_utf16() {
+        let result = global_eval("'😀'.repeat(2).length").unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn e2e_unicode_repeat_fractional_count_truncates() {
+        let result = global_eval("'ab'.repeat(1.9)").unwrap();
+        assert_eq!(result, JsValue::String("ab".into()));
+    }
+
+    #[test]
+    fn e2e_unicode_repeat_nan_returns_empty() {
+        let result = global_eval("'ab'.repeat(NaN)").unwrap();
+        assert_eq!(result, JsValue::String("".into()));
+    }
+
+    #[test]
+    fn e2e_unicode_pad_start_emoji_full_pair() {
+        let result = global_eval("'x'.padStart(3, '😀')").unwrap();
+        assert_eq!(result, JsValue::String("😀x".into()));
+    }
+
+    #[test]
+    fn e2e_unicode_pad_end_emoji_full_pair() {
+        let result = global_eval("'x'.padEnd(3, '😀')").unwrap();
+        assert_eq!(result, JsValue::String("x😀".into()));
+    }
+
+    #[test]
+    fn e2e_unicode_pad_start_empty_pad_string_returns_original() {
+        let result = global_eval("'abc'.padStart(5, '')").unwrap();
+        assert_eq!(result, JsValue::String("abc".into()));
+    }
+
+    #[test]
+    fn e2e_unicode_pad_end_empty_pad_string_returns_original() {
+        let result = global_eval("'abc'.padEnd(5, '')").unwrap();
+        assert_eq!(result, JsValue::String("abc".into()));
+    }
+
+    #[test]
+    fn e2e_unicode_pad_start_nan_target_returns_original() {
+        let result = global_eval("'abc'.padStart(NaN, '0')").unwrap();
+        assert_eq!(result, JsValue::String("abc".into()));
+    }
+
+    #[test]
+    fn e2e_unicode_pad_end_shorter_target_returns_original() {
+        let result = global_eval("'abc'.padEnd(2, '0')").unwrap();
+        assert_eq!(result, JsValue::String("abc".into()));
+    }
+
+    #[test]
+    fn e2e_unicode_object_keys_string_uses_utf16_indices() {
+        let result = global_eval("Object.keys('😀').length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_unicode_get_own_property_names_string_uses_utf16_length() {
+        let result = global_eval("Object.getOwnPropertyNames('😀').length").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_unicode_has_own_string_second_surrogate_index() {
+        let result = global_eval("Object.hasOwn('😀', '1')").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_unicode_object_spread_string_uses_utf16_indices() {
+        let result = global_eval("Object.keys({...'😀'}).length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_unicode_string_index_access_second_code_unit_exists() {
+        let result = global_eval("'😀'[1] !== undefined").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
 }

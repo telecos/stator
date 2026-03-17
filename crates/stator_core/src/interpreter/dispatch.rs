@@ -10,6 +10,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::builtins::string::{string_char_at, utf16_len};
 use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
 
@@ -3453,9 +3454,11 @@ fn handle_copy_data_properties(
                 }
             }
             JsValue::String(s) => {
-                for (i, ch) in s.chars().enumerate() {
-                    t.borrow_mut()
-                        .insert(i.to_string(), JsValue::String(ch.to_string().into()));
+                for i in 0..utf16_len(s) {
+                    t.borrow_mut().insert(
+                        i.to_string(),
+                        JsValue::String(string_char_at(s, i as i64).into()),
+                    );
                 }
             }
             _ => {}
@@ -3778,10 +3781,13 @@ fn handle_to_object(
             let s_val = s.clone();
             let mut map = PropertyMap::new();
             map.insert("__wrapped__".into(), JsValue::String(s_val.clone()));
-            map.insert("length".into(), JsValue::Smi(s_val.len() as i32));
+            map.insert("length".into(), JsValue::Smi(utf16_len(&s_val) as i32));
             // Indexed character access ("0", "1", …).
-            for (i, ch) in s_val.chars().enumerate() {
-                map.insert(i.to_string(), JsValue::String(ch.to_string().into()));
+            for i in 0..utf16_len(&s_val) {
+                map.insert(
+                    i.to_string(),
+                    JsValue::String(string_char_at(&s_val, i as i64).into()),
+                );
             }
             let s_vo = s_val.clone();
             map.insert(
@@ -4685,7 +4691,7 @@ fn handle_for_in_enumerate(
             .map(|i| JsValue::String(i.to_string().into()))
             .collect(),
         // for...in on a string enumerates character indices ("0", "1", …).
-        JsValue::String(s) => (0..s.chars().count())
+        JsValue::String(s) => (0..utf16_len(s))
             .map(|i| JsValue::String(i.to_string().into()))
             .collect(),
         JsValue::Null | JsValue::Undefined => vec![],

@@ -35,6 +35,11 @@ pub(crate) fn encode_utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
+/// Returns the length of a string in UTF-16 code units.
+pub(crate) fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
 /// Decodes a slice of UTF-16 code units back to a `String`, replacing any
 /// unpaired surrogates with the Unicode replacement character (`U+FFFD`).
 pub(crate) fn decode_utf16(units: &[u16]) -> String {
@@ -826,8 +831,11 @@ pub fn string_repeat(s: &str, count: i64) -> StatorResult<String> {
             "Invalid count value: must be non-negative".to_string(),
         ));
     }
+    if s.is_empty() || count == 0 {
+        return Ok(String::new());
+    }
     let n = count as usize;
-    let total = n.saturating_mul(s.len());
+    let total = n.saturating_mul(utf16_len(s));
     if total > MAX_STRING_LEN {
         return Err(StatorError::RangeError(
             "Invalid count value: result string exceeds maximum length".to_string(),
