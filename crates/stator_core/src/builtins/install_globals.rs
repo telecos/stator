@@ -20,6 +20,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::builtins::proxy::proxy_get;
 use std::rc::Rc;
@@ -125,8 +126,8 @@ use crate::builtins::typed_array::{
     typed_array_at, typed_array_copy_within, typed_array_entries, typed_array_fill,
     typed_array_from_values, typed_array_get, typed_array_includes, typed_array_index_of,
     typed_array_join, typed_array_keys, typed_array_last_index_of, typed_array_new_from_buffer,
-    typed_array_new_from_length, typed_array_reverse, typed_array_set_from, typed_array_slice,
-    typed_array_sort, typed_array_subarray, typed_array_values,
+    typed_array_new_from_length, typed_array_reverse, typed_array_set, typed_array_set_from,
+    typed_array_slice, typed_array_sort, typed_array_subarray, typed_array_values,
 };
 use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new, weak_ref_new_plain};
 use crate::error::{StatorError, StatorResult};
@@ -2214,40 +2215,91 @@ fn arg_f64(args: &[JsValue], idx: usize) -> StatorResult<f64> {
     args.get(idx).unwrap_or(&JsValue::Undefined).to_number()
 }
 
-/// Deep-clone a `JsValue`, recursing into objects and arrays.
-fn structured_clone(val: &JsValue) -> JsValue {
+fn is_callable_value(value: &JsValue) -> bool {
+    matches!(value, JsValue::Function(_) | JsValue::NativeFunction(_))
+        || matches!(
+            value,
+            JsValue::PlainObject(map)
+                if matches!(
+                    map.borrow().get("__call__"),
+                    Some(JsValue::NativeFunction(_)) | Some(JsValue::Function(_))
+                )
+        )
+}
+
+/// Deep-clone a `JsValue`, recursing into plain objects and arrays.
+fn structured_clone(val: &JsValue) -> StatorResult<JsValue> {
     match val {
-        // Primitives: value types or immutable — return as-is.
         JsValue::Undefined
         | JsValue::Null
         | JsValue::Boolean(_)
         | JsValue::Smi(_)
         | JsValue::HeapNumber(_)
         | JsValue::String(_)
-        | JsValue::Symbol(_)
-        | JsValue::BigInt(_) => val.clone(),
-
-        // PlainObject: recursively clone every property.
+        | JsValue::BigInt(_) => Ok(val.clone()),
+        JsValue::Symbol(_) | JsValue::Function(_) | JsValue::NativeFunction(_) => Err(
+            StatorError::TypeError("structuredClone: value is not cloneable".into()),
+        ),
         JsValue::PlainObject(map) => {
             let mut cloned = PropertyMap::new();
             for (k, v) in map.borrow().iter() {
-                cloned.insert(k.clone(), structured_clone(v));
+                cloned.insert(k.clone(), structured_clone(v)?);
             }
-            JsValue::PlainObject(Rc::new(RefCell::new(cloned)))
+            Ok(JsValue::PlainObject(Rc::new(RefCell::new(cloned))))
         }
-
-        // Array: recursively clone every element.
         JsValue::Array(arr) => {
-            let cloned: Vec<JsValue> = arr.borrow().iter().map(structured_clone).collect();
-            JsValue::new_array(cloned)
+            let cloned: StatorResult<Vec<JsValue>> =
+                arr.borrow().iter().map(structured_clone).collect();
+            Ok(JsValue::new_array(cloned?))
         }
-
-        // Error: clone the error.
-        JsValue::Error(e) => JsValue::Error(Rc::new(JsError::clone(e))),
-
-        // Best-effort shallow clone for remaining types.
-        _ => val.clone(),
+        JsValue::Error(e) => Ok(JsValue::Error(Rc::new(JsError::clone(e)))),
+        _ => Err(StatorError::TypeError(
+            "structuredClone: value is not cloneable".into(),
+        )),
     }
+}
+
+fn pseudo_random_bytes(len: usize) -> Vec<u8> {
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        ^ ((len as u64).wrapping_mul(0xA076_1D64_78BD_642F));
+    let mut state = seed | 1;
+    let mut bytes = Vec::with_capacity(len);
+    for index in 0..len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        bytes.push(((state as u8) & 0xFE) ^ ((index as u8).wrapping_add(1)));
+    }
+    bytes
+}
+
+#[inline(never)]
+fn make_crypto() -> JsValue {
+    let mut props = PropertyMap::new();
+    props.insert(
+        "getRandomValues".into(),
+        builtin_fn("getRandomValues", 1, |args| {
+            let target = args.first().unwrap_or(&JsValue::Undefined);
+            match target {
+                JsValue::TypedArray(typed_array) => {
+                    let typed_array = typed_array.borrow();
+                    let random_bytes = pseudo_random_bytes(typed_array.length);
+                    for (index, byte) in random_bytes.into_iter().enumerate() {
+                        typed_array_set(&typed_array, index, &JsValue::Smi(i32::from(byte)))?;
+                    }
+                    Ok(target.clone())
+                }
+                _ => Err(StatorError::TypeError(
+                    "crypto.getRandomValues: argument must be a TypedArray".into(),
+                )),
+            }
+        }),
+    );
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
 }
 
 // ── Math ─────────────────────────────────────────────────────────────────────
@@ -14507,7 +14559,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "structuredClone".into(),
             native(|args| {
                 let val = args.first().unwrap_or(&JsValue::Undefined);
-                Ok(structured_clone(val))
+                structured_clone(val)
             }),
         );
 
@@ -14516,19 +14568,25 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
             "queueMicrotask".into(),
             native(|args| {
                 let cb = args.first().unwrap_or(&JsValue::Undefined);
-                match cb {
-                    JsValue::NativeFunction(f) => {
-                        f(vec![])?;
-                    }
-                    _ => {
-                        return Err(StatorError::TypeError(
-                            "queueMicrotask: argument must be a function".into(),
-                        ));
-                    }
+                if !is_callable_value(cb) {
+                    return Err(StatorError::TypeError(
+                        "queueMicrotask: argument must be a function".into(),
+                    ));
                 }
+                dispatch_call_value(cb, vec![])?;
                 Ok(JsValue::Undefined)
             }),
         );
+
+        globals.insert(
+            "setTimeout".into(),
+            builtin_fn("setTimeout", 1, |_args| Ok(JsValue::Smi(1))),
+        );
+        globals.insert(
+            "clearTimeout".into(),
+            builtin_fn("clearTimeout", 1, |_args| Ok(JsValue::Undefined)),
+        );
+        globals.insert("crypto".into(), make_crypto());
 
         // ── globalThis (ECMAScript §19.1) ───────────────────────────────────
         // `globalThis` is a self-referential property of the global object.
@@ -14628,6 +14686,11 @@ mod tests {
         // Base64 encoding/decoding
         assert!(globals.contains_key("btoa"));
         assert!(globals.contains_key("atob"));
+        assert!(globals.contains_key("structuredClone"));
+        assert!(globals.contains_key("queueMicrotask"));
+        assert!(globals.contains_key("setTimeout"));
+        assert!(globals.contains_key("clearTimeout"));
+        assert!(globals.contains_key("crypto"));
     }
 
     #[test]
@@ -29317,6 +29380,225 @@ mod tests {
     fn test_object_has_own_string_length() {
         let result = global_eval("Object.hasOwn('abc', 'length')").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── Global utility conformance e2e tests ───────────────────────────────
+
+    #[test]
+    fn e2e_queue_microtask_exists() {
+        assert_eval_true("typeof queueMicrotask === 'function'");
+    }
+
+    #[test]
+    fn e2e_queue_microtask_runs_callback() {
+        let result = global_eval(
+            "var order = []; queueMicrotask(function () { order.push('microtask'); }); order[0]",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("microtask".into()));
+    }
+
+    #[test]
+    fn e2e_queue_microtask_returns_undefined() {
+        let result = global_eval("queueMicrotask(function () {})").unwrap();
+        assert_eq!(result, JsValue::Undefined);
+    }
+
+    #[test]
+    fn e2e_queue_microtask_accepts_arrow_function() {
+        let result =
+            global_eval("var value = 0; queueMicrotask(() => { value = 3; }); value").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_queue_microtask_propagates_errors() {
+        assert_eval_true(
+            "try { queueMicrotask(function () { throw new Error('boom'); }); false; } catch (e) { e.message === 'boom'; }",
+        );
+    }
+
+    #[test]
+    fn e2e_queue_microtask_rejects_non_callable() {
+        assert_eval_type_error("queueMicrotask(1)");
+    }
+
+    #[test]
+    fn e2e_structured_clone_exists() {
+        assert_eval_true("typeof structuredClone === 'function'");
+    }
+
+    #[test]
+    fn e2e_structured_clone_primitives_round_trip() {
+        assert_eval_true(
+            "structuredClone(1) === 1 && structuredClone('ok') === 'ok' && structuredClone(true) === true && structuredClone(null) === null",
+        );
+    }
+
+    #[test]
+    fn e2e_structured_clone_returns_distinct_top_level_object() {
+        assert_eval_true(
+            "var source = { value: 1 }; var clone = structuredClone(source); clone !== source && clone.value === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_structured_clone_preserves_nested_structure() {
+        assert_eval_true(
+            "var source = { outer: { inner: 4 }, list: [1, { deep: 2 }] }; var clone = structuredClone(source); clone.outer.inner === 4 && clone.list[1].deep === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_structured_clone_breaks_nested_aliasing() {
+        assert_eval_true(
+            "var source = { outer: { inner: 1 }, list: [{ value: 2 }] }; var clone = structuredClone(source); clone.outer.inner = 9; clone.list[0].value = 7; source.outer.inner === 1 && source.list[0].value === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_structured_clone_copies_arrays() {
+        assert_eval_true(
+            "var source = [1, { nested: 2 }, [3]]; var clone = structuredClone(source); clone !== source && clone[1] !== source[1] && clone[2] !== source[2]",
+        );
+    }
+
+    #[test]
+    fn e2e_structured_clone_preserves_undefined_properties() {
+        assert_eval_true(
+            "var clone = structuredClone({ missing: undefined }); Object.hasOwn(clone, 'missing') && clone.missing === undefined",
+        );
+    }
+
+    #[test]
+    fn e2e_structured_clone_rejects_function() {
+        assert_eval_type_error("structuredClone(function () {})");
+    }
+
+    #[test]
+    fn e2e_structured_clone_rejects_nested_function() {
+        assert_eval_type_error("structuredClone({ fn: function () {} })");
+    }
+
+    #[test]
+    fn e2e_structured_clone_rejects_symbol() {
+        assert_eval_type_error("structuredClone(Symbol('x'))");
+    }
+
+    #[test]
+    fn e2e_structured_clone_rejects_nested_symbol() {
+        assert_eval_type_error("structuredClone({ value: Symbol('x') })");
+    }
+
+    #[test]
+    fn e2e_global_this_typeof_object() {
+        assert_eval_true("typeof globalThis === 'object'");
+    }
+
+    #[test]
+    fn e2e_global_this_equals_object_via_function_this() {
+        assert_eval_true("(function () { return this; })() === globalThis");
+    }
+
+    #[test]
+    fn e2e_global_this_exposes_console() {
+        assert_eval_true("globalThis.console === console");
+    }
+
+    #[test]
+    fn e2e_global_this_is_self_referential_e2e() {
+        assert_eval_true("globalThis.globalThis === globalThis");
+    }
+
+    #[test]
+    fn e2e_console_warn_exists() {
+        assert_eval_true("typeof console.warn === 'function'");
+    }
+
+    #[test]
+    fn e2e_console_error_exists() {
+        assert_eval_true("typeof console.error === 'function'");
+    }
+
+    #[test]
+    fn e2e_console_warn_does_not_throw() {
+        assert_eval_true("try { console.warn('ok'); true; } catch (e) { false; }");
+    }
+
+    #[test]
+    fn e2e_console_error_does_not_throw() {
+        assert_eval_true("try { console.error('ok'); true; } catch (e) { false; }");
+    }
+
+    #[test]
+    fn e2e_set_timeout_exists() {
+        assert_eval_true("typeof setTimeout === 'function'");
+    }
+
+    #[test]
+    fn e2e_clear_timeout_exists() {
+        assert_eval_true("typeof clearTimeout === 'function'");
+    }
+
+    #[test]
+    fn e2e_set_timeout_stub_returns_number() {
+        assert_eval_true("typeof setTimeout(function () {}, 0) === 'number'");
+    }
+
+    #[test]
+    fn e2e_clear_timeout_stub_does_not_throw() {
+        assert_eval_true(
+            "try { clearTimeout(setTimeout(function () {}, 0)); true; } catch (e) { false; }",
+        );
+    }
+
+    #[test]
+    fn e2e_btoa_basic_utility() {
+        assert_eval_true("btoa('foo') === 'Zm9v'");
+    }
+
+    #[test]
+    fn e2e_atob_basic_utility() {
+        assert_eval_true("atob('Zm9v') === 'foo'");
+    }
+
+    #[test]
+    fn e2e_btoa_latin1_round_trip() {
+        assert_eval_true("atob(btoa('\\u0000A\\u00ff')) === '\\u0000A\\u00ff'");
+    }
+
+    #[test]
+    fn e2e_atob_ignores_ascii_whitespace() {
+        assert_eval_true("atob('U 3RhdG9y\\n') === 'Stator'");
+    }
+
+    #[test]
+    fn e2e_crypto_object_exists() {
+        assert_eval_true("typeof crypto === 'object' && crypto !== null");
+    }
+
+    #[test]
+    fn e2e_crypto_get_random_values_exists() {
+        assert_eval_true("typeof crypto.getRandomValues === 'function'");
+    }
+
+    #[test]
+    fn e2e_crypto_get_random_values_returns_same_typed_array() {
+        assert_eval_true(
+            "var bytes = new Uint8Array(4); crypto.getRandomValues(bytes) === bytes && bytes.length === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_crypto_get_random_values_mutates_typed_array() {
+        assert_eval_true(
+            "var bytes = new Uint8Array(4); crypto.getRandomValues(bytes); bytes[0] !== 0 || bytes[1] !== 0 || bytes[2] !== 0 || bytes[3] !== 0",
+        );
+    }
+
+    #[test]
+    fn e2e_crypto_get_random_values_rejects_plain_object() {
+        assert_eval_type_error("crypto.getRandomValues({ length: 4 })");
     }
 
     /// `structuredClone` copies nested plain objects and arrays.
