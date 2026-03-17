@@ -17214,4 +17214,523 @@ mod tests {
             "with inside class method should fail (implicit strict)"
         );
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Operator edge-case e2e tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ── Comma operator ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_comma_returns_last() {
+        let r = eval("return (1, 2, 3);").unwrap();
+        assert_eq!(r, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_comma_side_effects() {
+        let r = eval("var x = 0; return (x = 1, x = x + 10, x);").unwrap();
+        assert_eq!(r, JsValue::Smi(11));
+    }
+
+    #[test]
+    fn test_comma_two_elements() {
+        let r = eval("return (10, 20);").unwrap();
+        assert_eq!(r, JsValue::Smi(20));
+    }
+
+    #[test]
+    fn test_comma_with_string_last() {
+        let r = eval(r#"return (1, 2, "hello");"#).unwrap();
+        assert_eq!(r, JsValue::String("hello".into()));
+    }
+
+    // ── void operator ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_void_returns_undefined() {
+        let r = eval("return void 0;").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_void_evaluates_expression() {
+        let r = eval("var x = 1; void (x = 5); return x;").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_void_string() {
+        let r = eval(r#"return void "hello";"#).unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_void_complex_expression() {
+        let r = eval("return void (1 + 2 + 3);").unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    // ── delete operator ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_delete_obj_property() {
+        let r = eval(
+            r#"
+            var obj = {x: 1, y: 2};
+            var result = delete obj.x;
+            return result;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_delete_obj_property_removes_it() {
+        let r = eval(
+            r#"
+            var obj = {x: 1, y: 2};
+            delete obj.x;
+            return obj.x;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_delete_nonexistent_property() {
+        let r = eval(
+            r#"
+            var obj = {x: 1};
+            return delete obj.y;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_delete_non_reference_returns_true() {
+        // `delete 42` should return true in sloppy mode
+        let r = eval("return delete 42;").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_delete_computed_property() {
+        let r = eval(
+            r#"
+            var obj = {a: 1, b: 2};
+            delete obj["a"];
+            return obj.a;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    // ── typeof operator ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_typeof_number() {
+        let r = eval(r#"return typeof 42;"#).unwrap();
+        assert_eq!(r, JsValue::String("number".into()));
+    }
+
+    #[test]
+    fn test_typeof_string() {
+        let r = eval(r#"return typeof "hello";"#).unwrap();
+        assert_eq!(r, JsValue::String("string".into()));
+    }
+
+    #[test]
+    fn test_typeof_boolean() {
+        let r = eval(r#"return typeof true;"#).unwrap();
+        assert_eq!(r, JsValue::String("boolean".into()));
+    }
+
+    #[test]
+    fn test_typeof_undefined() {
+        let r = eval(r#"return typeof undefined;"#).unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn test_typeof_null() {
+        let r = eval(r#"return typeof null;"#).unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn test_typeof_object() {
+        let r = eval(r#"return typeof {};"#).unwrap();
+        assert_eq!(r, JsValue::String("object".into()));
+    }
+
+    #[test]
+    fn test_typeof_function() {
+        let r = eval(r#"return typeof function(){};"#).unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    #[test]
+    fn test_typeof_undeclared_no_error() {
+        // typeof on undeclared variable must NOT throw — returns "undefined"
+        let r = eval(r#"return typeof someUndeclaredVariable;"#).unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn test_typeof_symbol() {
+        let r = eval(r#"return typeof Symbol("test");"#).unwrap();
+        assert_eq!(r, JsValue::String("symbol".into()));
+    }
+
+    // ── in operator ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_in_existing_property() {
+        let r = eval(r#"var obj = {x: 1}; return "x" in obj;"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_in_missing_property() {
+        let r = eval(r#"var obj = {x: 1}; return "y" in obj;"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_in_array_index() {
+        let r = eval(r#"var arr = [10, 20, 30]; return 1 in arr;"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_in_array_out_of_bounds() {
+        let r = eval(r#"var arr = [10, 20]; return 5 in arr;"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_in_throws_on_primitive() {
+        let r = eval(r#"return "x" in 42;"#);
+        assert!(r.is_err(), "in on primitive should throw TypeError");
+    }
+
+    #[test]
+    fn test_in_length_on_array() {
+        let r = eval(r#"return "length" in [1,2,3];"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // ── instanceof operator ─────────────────────────────────────────────
+
+    #[test]
+    fn test_instanceof_array() {
+        let r = eval(r#"return [] instanceof Array;"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_instanceof_error() {
+        let r = eval(r#"return new Error("x") instanceof Error;"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_instanceof_custom_class() {
+        let r = eval(
+            r#"
+            function Foo() {}
+            var f = new Foo();
+            return f instanceof Foo;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_instanceof_throws_on_non_callable() {
+        let r = eval(r#"return {} instanceof {};"#);
+        assert!(
+            r.is_err(),
+            "instanceof non-callable RHS should throw TypeError"
+        );
+    }
+
+    #[test]
+    fn test_instanceof_negative() {
+        let r = eval(r#"return 42 instanceof Number;"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    // ── Nullish coalescing (??) ─────────────────────────────────────────
+
+    #[test]
+    fn test_nullish_null_uses_rhs() {
+        let r = eval(r#"return null ?? "b";"#).unwrap();
+        assert_eq!(r, JsValue::String("b".into()));
+    }
+
+    #[test]
+    fn test_nullish_undefined_uses_rhs() {
+        let r = eval(r#"return undefined ?? "b";"#).unwrap();
+        assert_eq!(r, JsValue::String("b".into()));
+    }
+
+    #[test]
+    fn test_nullish_zero_keeps_lhs() {
+        let r = eval(r#"return 0 ?? "b";"#).unwrap();
+        assert_eq!(r, JsValue::Smi(0));
+    }
+
+    #[test]
+    fn test_nullish_empty_string_keeps_lhs() {
+        let r = eval(r#"return "" ?? "b";"#).unwrap();
+        assert_eq!(r, JsValue::String("".into()));
+    }
+
+    #[test]
+    fn test_nullish_false_keeps_lhs() {
+        let r = eval(r#"return false ?? "b";"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_nullish_chained() {
+        let r = eval(r#"return null ?? undefined ?? 42;"#).unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_nullish_cannot_mix_with_or() {
+        let r = crate::parser::parse("null || undefined ?? 42");
+        assert!(r.is_err(), "mixing || and ?? without parens should fail");
+    }
+
+    #[test]
+    fn test_nullish_cannot_mix_with_and() {
+        let r = crate::parser::parse("null && undefined ?? 42");
+        assert!(r.is_err(), "mixing && and ?? without parens should fail");
+    }
+
+    #[test]
+    fn test_nullish_with_parens_allowed() {
+        let r = eval(r#"return (null || undefined) ?? 42;"#).unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    // ── Optional chaining (?.) ──────────────────────────────────────────
+
+    #[test]
+    fn test_optional_chain_property_exists() {
+        let r = eval(
+            r#"
+            var obj = {a: {b: {c: 42}}};
+            return obj?.a?.b?.c;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_optional_chain_null_base() {
+        let r = eval(r#"var obj = null; return obj?.x;"#).unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_optional_chain_undefined_base() {
+        let r = eval(r#"var obj = undefined; return obj?.x;"#).unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_optional_chain_deep_null_middle() {
+        let r = eval(
+            r#"
+            var obj = {a: null};
+            return obj?.a?.b?.c;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_optional_chain_computed_property() {
+        let r = eval(
+            r#"
+            var obj = {x: 10};
+            return obj?.["x"];
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_optional_chain_computed_null() {
+        let r = eval(
+            r#"
+            var obj = null;
+            return obj?.["x"];
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_optional_call_exists() {
+        let r = eval(
+            r#"
+            var obj = {fn: function() { return 99; }};
+            return obj.fn?.();
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(99));
+    }
+
+    #[test]
+    fn test_optional_call_null() {
+        let r = eval(
+            r#"
+            var obj = {fn: null};
+            return obj.fn?.();
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_optional_chain_short_circuit_side_effects() {
+        // Side effects after ?. should NOT execute when base is null
+        let r = eval(
+            r#"
+            var called = false;
+            function effect() { called = true; return {}; }
+            var obj = null;
+            obj?.x;
+            return called;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    // ── Exponentiation (**) ─────────────────────────────────────────────
+
+    #[test]
+    fn test_exp_basic() {
+        let r = eval("return 2 ** 3;").unwrap();
+        assert_eq!(r, JsValue::Smi(8));
+    }
+
+    #[test]
+    fn test_exp_right_associative() {
+        // 2 ** 3 ** 2 = 2 ** (3 ** 2) = 2 ** 9 = 512
+        let r = eval("return 2 ** 3 ** 2;").unwrap();
+        assert_eq!(r, JsValue::Smi(512));
+    }
+
+    #[test]
+    fn test_exp_negative_base_with_parens() {
+        // (-2) ** 2 = 4
+        let r = eval("return (-2) ** 2;").unwrap();
+        assert_eq!(r, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn test_exp_unary_before_starstar_syntax_error() {
+        // -2 ** 2 is a SyntaxError — need parens
+        let r = crate::parser::parse("-2 ** 2");
+        assert!(r.is_err(), "unary minus before ** should be SyntaxError");
+    }
+
+    #[test]
+    fn test_exp_zero() {
+        // x ** 0 = 1
+        let r = eval("return 99 ** 0;").unwrap();
+        let n = match r {
+            JsValue::Smi(v) => v as f64,
+            JsValue::HeapNumber(v) => *v,
+            _ => panic!("expected number, got {r:?}"),
+        };
+        assert!((n - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_exp_one() {
+        let r = eval("return 5 ** 1;").unwrap();
+        assert_eq!(r, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn test_exp_fractional() {
+        // 4 ** 0.5 = 2.0
+        let r = eval("return 4 ** 0.5;").unwrap();
+        let n = match r {
+            JsValue::Smi(v) => v as f64,
+            JsValue::HeapNumber(v) => *v,
+            _ => panic!("expected number, got {r:?}"),
+        };
+        assert!((n - 2.0).abs() < f64::EPSILON);
+    }
+
+    // ── Combined / integration tests ────────────────────────────────────
+
+    #[test]
+    fn test_typeof_equals_string() {
+        let r = eval(r#"return typeof 42 === "number";"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_typeof_undeclared_equals_undefined() {
+        let r = eval(r#"return typeof noSuchVar === "undefined";"#).unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_in_with_delete() {
+        let r = eval(
+            r#"
+            var obj = {a: 1, b: 2};
+            delete obj.a;
+            return "a" in obj;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_nullish_with_void() {
+        // void 0 is undefined, so ?? should take RHS
+        let r = eval(r#"return void 0 ?? 42;"#).unwrap();
+        assert_eq!(r, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_comma_in_for_loop() {
+        let r = eval(
+            r#"
+            var sum = 0;
+            for (var i = 0, j = 10; i < 3; i = i + 1, j = j - 1) {
+                sum = sum + j;
+            }
+            return sum;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(10 + 9 + 8));
+    }
 }
