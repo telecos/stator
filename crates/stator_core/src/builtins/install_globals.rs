@@ -51877,6 +51877,307 @@ mod tests {
         );
     }
 
+    #[test]
+    fn e2e_private_field_wrong_receiver_type_error() {
+        assert_eval_type_error(
+            "class C { #x = 1; read(o) { return o.#x; } } \
+             new C().read({})",
+        );
+    }
+
+    #[test]
+    fn e2e_private_field_null_receiver_type_error() {
+        assert_eval_type_error(
+            "class C { #x = 1; read(o) { return o.#x; } } \
+             new C().read(null)",
+        );
+    }
+
+    #[test]
+    fn e2e_private_method_wrong_receiver_type_error() {
+        assert_eval_type_error(
+            "class C { #m() { return 1; } call(o) { return o.#m(); } } \
+             new C().call({})",
+        );
+    }
+
+    #[test]
+    fn e2e_private_method_non_writable() {
+        assert_eval_type_error(
+            "class C { #m() { return 1; } set() { this.#m = 2; } } \
+             new C().set()",
+        );
+    }
+
+    #[test]
+    fn e2e_private_method_reachable_from_nested_closure() {
+        assert_eval_true(
+            "class C { #x = 4; #m() { return this.#x; } make() { return () => this.#m(); } } \
+             let fnRef = new C().make(); \
+             fnRef() === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_private_static_field_class_access() {
+        assert_eval_true(
+            "class C { static #x = 7; static read() { return C.#x; } } \
+             C.read() === 7",
+        );
+    }
+
+    #[test]
+    fn e2e_private_static_field_wrong_receiver_type_error() {
+        assert_eval_type_error(
+            "class C { static #x = 7; static read(o) { return o.#x; } } \
+             C.read(new C())",
+        );
+    }
+
+    #[test]
+    fn e2e_private_static_method_class_access() {
+        assert_eval_true(
+            "class C { static #m() { return 9; } static call() { return C.#m(); } } \
+             C.call() === 9",
+        );
+    }
+
+    #[test]
+    fn e2e_private_static_method_wrong_receiver_type_error() {
+        assert_eval_type_error(
+            "class C { static #m() { return 9; } static call(o) { return o.#m(); } } \
+             C.call({})",
+        );
+    }
+
+    #[test]
+    fn e2e_private_static_method_non_writable() {
+        assert_eval_type_error(
+            "class C { static #m() { return 1; } static set() { C.#m = 2; } } \
+             C.set()",
+        );
+    }
+
+    #[test]
+    fn e2e_private_accessor_getter_behavior() {
+        assert_eval_true(
+            "class C { #value = 21; get #x() { return this.#value * 2; } read() { return this.#x; } } \
+             new C().read() === 42",
+        );
+    }
+
+    #[test]
+    fn e2e_private_accessor_setter_behavior() {
+        assert_eval_true(
+            "class C { #value = 0; set #x(v) { this.#value = v + 1; } run() { this.#x = 9; return this.#value; } } \
+             new C().run() === 10",
+        );
+    }
+
+    #[test]
+    fn e2e_private_accessor_getter_setter_pair() {
+        assert_eval_true(
+            "class C { #value = 1; get #x() { return this.#value; } set #x(v) { this.#value = v; } run() { this.#x = 7; return this.#x; } } \
+             new C().run() === 7",
+        );
+    }
+
+    #[test]
+    fn e2e_private_accessor_wrong_receiver_type_error() {
+        assert_eval_type_error(
+            "class C { #value = 1; get #x() { return this.#value; } read(o) { return o.#x; } } \
+             new C().read({})",
+        );
+    }
+
+    #[test]
+    fn e2e_private_static_accessor_getter_setter_behavior() {
+        assert_eval_true(
+            "class C { static #value = 1; static get #x() { return this.#value; } static set #x(v) { this.#value = v * 2; } static run() { this.#x = 6; return this.#x; } } \
+             C.run() === 12",
+        );
+    }
+
+    #[test]
+    fn e2e_private_static_accessor_wrong_receiver_type_error() {
+        assert_eval_type_error(
+            "class C { static #value = 1; static get #x() { return this.#value; } static read(o) { return o.#x; } } \
+             C.read({})",
+        );
+    }
+
+    #[test]
+    fn e2e_private_in_operator_subclass_instance_true() {
+        assert_eval_true(
+            "class Base { #x = 1; static has(o) { return #x in o; } } \
+             class Child extends Base {} \
+             Base.has(new Child()) === true",
+        );
+    }
+
+    #[test]
+    fn e2e_private_in_operator_same_name_other_class_false() {
+        assert_eval_true(
+            "class A { #x = 1; static has(o) { return #x in o; } } \
+             class B { #x = 2; } \
+             A.has(new B()) === false",
+        );
+    }
+
+    #[test]
+    fn e2e_private_static_in_operator_class_true() {
+        assert_eval_true(
+            "class C { static #x = 1; static has(o) { return #x in o; } } \
+             C.has(C) === true",
+        );
+    }
+
+    #[test]
+    fn e2e_private_static_in_operator_instance_false() {
+        assert_eval_true(
+            "class C { static #x = 1; static has(o) { return #x in o; } } \
+             C.has(new C()) === false",
+        );
+    }
+
+    #[test]
+    fn e2e_private_static_in_operator_subclass_false() {
+        assert_eval_true(
+            "class Base { static #x = 1; static has(o) { return #x in o; } } \
+             class Child extends Base {} \
+             Base.has(Child) === false",
+        );
+    }
+
+    #[test]
+    fn e2e_private_fields_in_subclass_inherit_parent_access() {
+        assert_eval_true(
+            "class Base { #x = 5; getBase() { return this.#x; } } \
+             class Child extends Base {} \
+             new Child().getBase() === 5",
+        );
+    }
+
+    #[test]
+    fn e2e_private_fields_in_subclass_keep_own_fields() {
+        assert_eval_true(
+            "class Base { #x = 5; getBase() { return this.#x; } } \
+             class Child extends Base { #y = 8; getChild() { return this.#y; } } \
+             let c = new Child(); \
+             c.getBase() === 5 && c.getChild() === 8",
+        );
+    }
+
+    #[test]
+    fn e2e_private_field_shadowing_parent_child() {
+        assert_eval_true(
+            "class Base { #x = 1; getBase() { return this.#x; } } \
+             class Child extends Base { #x = 2; getChild() { return this.#x; } sum() { return this.getBase() * 10 + this.getChild(); } } \
+             new Child().sum() === 12",
+        );
+    }
+
+    #[test]
+    fn e2e_private_method_shadowing_parent_child() {
+        assert_eval_true(
+            "class Base { #m() { return 1; } callBase() { return this.#m(); } } \
+             class Child extends Base { #m() { return 2; } callChild() { return this.#m(); } } \
+             let c = new Child(); \
+             c.callBase() === 1 && c.callChild() === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_private_field_nested_closure_read() {
+        assert_eval_true(
+            "class C { #x = 3; make() { let self = this; return function() { return self.#x; }; } } \
+             new C().make()() === 3",
+        );
+    }
+
+    #[test]
+    fn e2e_private_field_nested_arrow_update() {
+        assert_eval_true(
+            "class C { #x = 1; run() { let bump = () => { this.#x = this.#x + 1; return this.#x; }; return bump() === 2 && this.#x === 2; } } \
+             new C().run() === true",
+        );
+    }
+
+    #[test]
+    fn e2e_private_field_closure_survives_after_method_return() {
+        assert_eval_true(
+            "class C { #x = 11; make() { return () => this.#x; } } \
+             let read = new C().make(); \
+             read() === 11",
+        );
+    }
+
+    #[test]
+    fn e2e_private_brand_isolated_between_classes() {
+        assert_eval_true(
+            "class A { #x = 1; static has(o) { return #x in o; } get() { return this.#x; } } \
+             class B { #x = 2; static has(o) { return #x in o; } get() { return this.#x; } } \
+             let a = new A(); \
+             let b = new B(); \
+             A.has(a) && !A.has(b) && B.has(b) && !B.has(a) && a.get() === 1 && b.get() === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_private_brand_shadowing_adds_both_brands() {
+        assert_eval_true(
+            "class Base { #x = 1; static hasBase(o) { return #x in o; } getBase() { return this.#x; } } \
+             class Child extends Base { #x = 2; static hasChild(o) { return #x in o; } getChild() { return this.#x; } } \
+             let c = new Child(); \
+             Base.hasBase(c) && Child.hasChild(c) && c.getBase() === 1 && c.getChild() === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_private_field_initializer_with_sibling_private_access() {
+        assert_eval_true(
+            "class C { #x = 6; #y = this.#x + 1; sum() { return this.#x + this.#y; } } \
+             new C().sum() === 13",
+        );
+    }
+
+    #[test]
+    fn e2e_private_static_field_not_inherited_by_subclass_receiver() {
+        assert_eval_type_error(
+            "class Base { static #x = 1; static read(o) { return o.#x; } } \
+             class Child extends Base {} \
+             Base.read(Child)",
+        );
+    }
+
+    #[test]
+    fn e2e_private_static_method_not_inherited_by_subclass_receiver() {
+        assert_eval_type_error(
+            "class Base { static #m() { return 1; } static read(o) { return o.#m(); } } \
+             class Child extends Base {} \
+             Base.read(Child)",
+        );
+    }
+
+    #[test]
+    fn e2e_private_static_accessor_not_inherited_by_subclass_receiver() {
+        assert_eval_type_error(
+            "class Base { static #value = 1; static get #x() { return this.#value; } static read(o) { return o.#x; } } \
+             class Child extends Base {} \
+             Base.read(Child)",
+        );
+    }
+
+    #[test]
+    fn e2e_private_method_can_access_parent_private_field_on_subclass_instance() {
+        assert_eval_true(
+            "class Base { #x = 10; #m() { return this.#x; } callBase() { return this.#m(); } } \
+             class Child extends Base { #y = 1; getY() { return this.#y; } } \
+             let c = new Child(); \
+             c.callBase() === 10 && c.getY() === 1",
+        );
+    }
+
     // ── 10. Error.cause ──────────────────────────────────────────────
 
     /// `Error` with cause option sets `.cause` property.

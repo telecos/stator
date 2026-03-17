@@ -19,14 +19,14 @@ use super::{
     ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
     PropertyIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, concat_rc_strs,
     constant_pool_jump_delta, constant_to_value, decode_string_constant, dispatch_call_property,
-    dispatch_call_value, dispatch_call_with_this, dispatch_setter, err_bad_operand,
-    error_message_from_value, extract_context, find_handler, fn_props_get, fn_props_set,
-    has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
-    maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
-    number_to_jsvalue, plain_object_to_array_items, populate_self_name, proto_lookup, resolve_jump,
-    restore_closure_context, set_function_name_if_missing, set_pending_exception,
-    settle_async_iterator_result, strict_eq, to_array_index, to_bigint, to_property_key,
-    try_execute_best_jit, walk_context_chain, wire_construct_prototype,
+    dispatch_call_value, dispatch_call_with_this, dispatch_getter, dispatch_setter,
+    err_bad_operand, error_message_from_value, extract_context, find_handler, fn_props_get,
+    fn_props_set, has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load,
+    keyed_store, maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan,
+    normalize_async_iterator, number_to_jsvalue, plain_object_to_array_items, populate_self_name,
+    proto_lookup, resolve_jump, restore_closure_context, set_function_name_if_missing,
+    set_pending_exception, settle_async_iterator_result, strict_eq, to_array_index, to_bigint,
+    to_property_key, try_execute_best_jit, walk_context_chain, wire_construct_prototype,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -76,6 +76,185 @@ pub(super) struct DispatchContext<'a> {
     /// Exception handler table for the current function.
     #[allow(dead_code)]
     pub handler_table: &'a [HandlerTableEntry],
+}
+
+const PRIVATE_STORAGE_PREFIX: &str = ".private.";
+const PRIVATE_BRAND_PREFIX: &str = ".private.brand.";
+const PRIVATE_KIND_PREFIX: &str = ".private.kind.";
+
+fn is_private_storage_key(key: &str) -> bool {
+    key.starts_with(PRIVATE_STORAGE_PREFIX)
+        && !key.starts_with(PRIVATE_BRAND_PREFIX)
+        && !key.starts_with(PRIVATE_KIND_PREFIX)
+}
+
+fn private_brand_key(storage_key: &str) -> String {
+    storage_key.replacen(PRIVATE_STORAGE_PREFIX, PRIVATE_BRAND_PREFIX, 1)
+}
+
+fn private_kind_key(storage_key: &str) -> String {
+    storage_key.replacen(PRIVATE_STORAGE_PREFIX, PRIVATE_KIND_PREFIX, 1)
+}
+
+fn private_getter_key(storage_key: &str) -> String {
+    format!("__get_{storage_key}__")
+}
+
+fn private_setter_key(storage_key: &str) -> String {
+    format!("__set_{storage_key}__")
+}
+
+fn private_display_name(storage_key: &str) -> String {
+    format!("#{}", storage_key.rsplit('.').next().unwrap_or(storage_key))
+}
+
+fn private_access_error(action: &str, storage_key: &str) -> StatorError {
+    StatorError::TypeError(format!(
+        "Cannot {action} private member {} from an object whose class did not declare it",
+        private_display_name(storage_key)
+    ))
+}
+
+fn own_private_element_exists(map: &PropertyMap, storage_key: &str) -> bool {
+    map.contains_key(storage_key)
+        || map.contains_key(&private_getter_key(storage_key))
+        || map.contains_key(&private_setter_key(storage_key))
+        || map.contains_key(&private_kind_key(storage_key))
+}
+
+fn private_kind_marker(obj: &JsValue, storage_key: &str) -> Option<String> {
+    match proto_lookup(obj, &private_kind_key(storage_key)) {
+        JsValue::String(kind) => Some(kind.to_string()),
+        _ => None,
+    }
+}
+
+fn invalidate_plain_object_caches(ctx: &mut DispatchContext, map: &Rc<RefCell<PropertyMap>>) {
+    let map_ptr = Rc::as_ptr(map) as usize;
+    ctx.frame
+        .mono_load_cache
+        .retain(|_, (ptr, _)| *ptr != map_ptr);
+    ctx.frame.poly_load_cache.retain(|_, entries| {
+        entries.retain(|(ptr, _)| *ptr != map_ptr);
+        !entries.is_empty()
+    });
+}
+
+fn load_private_named_property(obj: &JsValue, storage_key: &str) -> StatorResult<JsValue> {
+    let JsValue::PlainObject(map) = obj else {
+        return Err(private_access_error("read", storage_key));
+    };
+
+    let has_brand = map.borrow().contains_key(&private_brand_key(storage_key));
+    if has_brand {
+        if private_kind_marker(obj, storage_key).is_none() {
+            return Err(private_access_error("read", storage_key));
+        }
+        return Ok(proto_lookup(obj, storage_key));
+    }
+
+    let getter_key = private_getter_key(storage_key);
+    let setter_key = private_setter_key(storage_key);
+    let kind_key = private_kind_key(storage_key);
+
+    let borrow = map.borrow();
+    if let Some(getter) = borrow.get(&getter_key).cloned() {
+        drop(borrow);
+        return dispatch_getter(&getter, obj);
+    }
+    if let Some(value) = borrow.get(storage_key).cloned() {
+        return Ok(value);
+    }
+    let has_setter = borrow.contains_key(&setter_key);
+    let kind = match borrow.get(&kind_key) {
+        Some(JsValue::String(kind)) => Some(kind.to_string()),
+        _ => None,
+    };
+    drop(borrow);
+
+    match kind.as_deref() {
+        Some("accessor") if has_setter => Ok(JsValue::Undefined),
+        _ => Err(private_access_error("read", storage_key)),
+    }
+}
+
+fn store_private_named_property(
+    ctx: &mut DispatchContext,
+    obj: &JsValue,
+    storage_key: &str,
+    value: JsValue,
+) -> StatorResult<()> {
+    let JsValue::PlainObject(map) = obj else {
+        return Err(private_access_error("write to", storage_key));
+    };
+
+    let has_brand = map.borrow().contains_key(&private_brand_key(storage_key));
+    if has_brand {
+        match private_kind_marker(obj, storage_key).as_deref() {
+            Some("field") => {
+                if map.borrow().contains_key(storage_key) {
+                    map.borrow_mut().insert(storage_key.to_string(), value);
+                    invalidate_plain_object_caches(ctx, map);
+                    return Ok(());
+                }
+            }
+            Some("accessor") => {
+                let setter = proto_lookup(obj, &private_setter_key(storage_key));
+                if !matches!(setter, JsValue::Undefined) {
+                    dispatch_setter(&setter, obj, value)?;
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+        return Err(private_access_error("write to", storage_key));
+    }
+
+    let kind_key = private_kind_key(storage_key);
+    let setter_key = private_setter_key(storage_key);
+    let kind = {
+        let borrow = map.borrow();
+        match borrow.get(&kind_key) {
+            Some(JsValue::String(kind)) => Some(kind.to_string()),
+            _ => None,
+        }
+    };
+
+    match kind.as_deref() {
+        Some("field") => {
+            if map.borrow().contains_key(storage_key) {
+                map.borrow_mut().insert(storage_key.to_string(), value);
+                invalidate_plain_object_caches(ctx, map);
+                Ok(())
+            } else {
+                Err(private_access_error("write to", storage_key))
+            }
+        }
+        Some("accessor") => {
+            let setter = map.borrow().get(&setter_key).cloned();
+            if let Some(setter) = setter {
+                dispatch_setter(&setter, obj, value)?;
+                Ok(())
+            } else {
+                Err(private_access_error("write to", storage_key))
+            }
+        }
+        _ => Err(private_access_error("write to", storage_key)),
+    }
+}
+
+fn private_named_property_attrs(prop_name: &str) -> Option<PropertyAttributes> {
+    if !prop_name.starts_with(PRIVATE_STORAGE_PREFIX) {
+        return None;
+    }
+    Some(
+        if prop_name.starts_with(PRIVATE_BRAND_PREFIX) || prop_name.starts_with(PRIVATE_KIND_PREFIX)
+        {
+            PropertyAttributes::CONFIGURABLE
+        } else {
+            PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE
+        },
+    )
 }
 
 /// Signature of a single opcode handler function.
@@ -2792,7 +2971,12 @@ fn handle_lda_named_property(
     } else {
         u32::MAX
     };
+    let prop_name = ctx.frame.get_string_constant(name_idx)?;
     let obj = ctx.frame.read_reg(obj_v)?.clone();
+    if is_private_storage_key(&prop_name) {
+        ctx.frame.accumulator = load_private_named_property(&obj, &prop_name)?;
+        return Ok(DispatchAction::Continue);
+    }
     // ── Shape IC fast path: O(1) own-property access via cached offset ──
     if slot != u32::MAX
         && let JsValue::PlainObject(ref map) = obj
@@ -2827,7 +3011,6 @@ fn handle_lda_named_property(
             }
         }
     }
-    let prop_name = ctx.frame.get_string_constant(name_idx)?;
     // TypeError for property access on null or undefined (ES §13.10.3).
     if matches!(obj, JsValue::Null | JsValue::Undefined) {
         return Err(StatorError::TypeError(format!(
@@ -2907,6 +3090,10 @@ fn handle_sta_named_property(
     let prop_name = ctx.frame.get_string_constant(name_idx)?;
     let val = ctx.frame.accumulator.clone();
     let obj = ctx.frame.read_reg(obj_v)?.clone();
+    if is_private_storage_key(&prop_name) {
+        store_private_named_property(ctx, &obj, &prop_name, val)?;
+        return Ok(DispatchAction::Continue);
+    }
     // TypeError for property store on null or undefined.
     if matches!(obj, JsValue::Null | JsValue::Undefined) {
         return Err(StatorError::TypeError(format!(
@@ -4506,7 +4693,11 @@ fn handle_define_named_own_property(
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     if let JsValue::PlainObject(ref map) = obj {
         set_named_property_function_metadata(&val, &obj, &prop_name);
-        map.borrow_mut().insert(prop_name, val);
+        if let Some(attrs) = private_named_property_attrs(&prop_name) {
+            map.borrow_mut().insert_with_attrs(prop_name, val, attrs);
+        } else {
+            map.borrow_mut().insert(prop_name, val);
+        }
     }
     // Accumulator stays unchanged.
     Ok(DispatchAction::Continue)
@@ -6505,8 +6696,11 @@ fn handle_define_getter_property(
         }
         // Store getter as __get_<name>__ — the property access handler
         // checks for this convention when loading.
-        // Object-literal and class accessors are enumerable + configurable.
-        let accessor_attrs = PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE;
+        let accessor_attrs = if is_private_storage_key(&prop_name) {
+            PropertyAttributes::CONFIGURABLE
+        } else {
+            PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE
+        };
         map.borrow_mut()
             .insert_with_attrs(format!("__get_{prop_name}__"), getter, accessor_attrs);
     }
@@ -6538,7 +6732,11 @@ fn handle_define_setter_property(
         if let JsValue::Function(ba) = &setter {
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
         }
-        let accessor_attrs = PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE;
+        let accessor_attrs = if is_private_storage_key(&prop_name) {
+            PropertyAttributes::CONFIGURABLE
+        } else {
+            PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE
+        };
         map.borrow_mut()
             .insert_with_attrs(format!("__set_{prop_name}__"), setter, accessor_attrs);
     }
@@ -6643,7 +6841,14 @@ fn handle_test_private_brand(
     }
 
     let has_brand = match &obj {
-        JsValue::PlainObject(map) => map.borrow().contains_key(&brand_key),
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            if brand_key.starts_with(PRIVATE_BRAND_PREFIX) {
+                borrow.contains_key(&brand_key)
+            } else {
+                own_private_element_exists(&borrow, &brand_key)
+            }
+        }
         _ => false,
     };
     ctx.frame.accumulator = JsValue::Boolean(has_brand);
@@ -6668,7 +6873,11 @@ fn handle_define_private_brand(
 
     match &obj {
         JsValue::PlainObject(map) => {
-            map.borrow_mut().insert(brand_key, JsValue::Boolean(true));
+            map.borrow_mut().insert_with_attrs(
+                brand_key,
+                JsValue::Boolean(true),
+                PropertyAttributes::CONFIGURABLE,
+            );
         }
         _ => {
             return Err(StatorError::TypeError(
