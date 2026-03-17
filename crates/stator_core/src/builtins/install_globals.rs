@@ -35164,6 +35164,244 @@ mod tests {
         assert_eq!(r, JsValue::Smi(33));
     }
 
+    /// Array destructuring defaults preserve present values.
+    #[test]
+    fn e2e_destructuring_array_defaults_preserve_present_values() {
+        assert_eval_true("let [a = 1, b = 2] = [10]; a === 10 && b === 2");
+    }
+
+    /// Array destructuring defaults apply to missing elements.
+    #[test]
+    fn e2e_destructuring_array_defaults_apply_to_missing_elements() {
+        assert_eval_true("let [a = 1, b = 2, c = 3] = [10]; a === 10 && b === 2 && c === 3");
+    }
+
+    /// Array destructuring defaults apply to undefined elements.
+    #[test]
+    fn e2e_destructuring_array_defaults_apply_to_undefined_elements() {
+        assert_eval_true("let [a = 1, b = 2] = [undefined, undefined]; a === 1 && b === 2");
+    }
+
+    /// Array destructuring defaults do not apply to null values.
+    #[test]
+    fn e2e_destructuring_array_defaults_do_not_apply_to_null_values() {
+        assert_eval_true("let [a = 1] = [null]; a === null");
+    }
+
+    /// Object destructuring defaults apply to missing properties.
+    #[test]
+    fn e2e_destructuring_object_defaults_apply_to_missing_properties() {
+        assert_eval_true("let {a = 1} = {}; a === 1");
+    }
+
+    /// Object destructuring defaults apply to undefined properties.
+    #[test]
+    fn e2e_destructuring_object_defaults_apply_to_undefined_properties() {
+        assert_eval_true("let {a = 1} = {a: undefined}; a === 1");
+    }
+
+    /// Object destructuring defaults preserve defined properties.
+    #[test]
+    fn e2e_destructuring_object_defaults_preserve_defined_properties() {
+        assert_eval_true("let {a = 1} = {a: 9}; a === 9");
+    }
+
+    /// Object destructuring defaults do not apply to null values.
+    #[test]
+    fn e2e_destructuring_object_defaults_do_not_apply_to_null_values() {
+        assert_eval_true("let {a = 1} = {a: null}; a === null");
+    }
+
+    /// Object destructuring rename defaults apply when the property is missing.
+    #[test]
+    fn e2e_destructuring_object_rename_defaults_apply_when_missing() {
+        assert_eval_true("let {a: value = 7} = {}; value === 7");
+    }
+
+    /// Nested object destructuring extracts inner values.
+    #[test]
+    fn e2e_destructuring_nested_object_basic() {
+        assert_eval_true("let {a: {b}} = {a: {b: 1}}; b === 1");
+    }
+
+    /// Deep nested object destructuring extracts inner values.
+    #[test]
+    fn e2e_destructuring_nested_object_deep() {
+        assert_eval_true("let {a: {b: {c}}} = {a: {b: {c: 4}}}; c === 4");
+    }
+
+    /// Nested mixed destructuring supports object then array patterns.
+    #[test]
+    fn e2e_destructuring_nested_mixed_object_then_array() {
+        assert_eval_true("let {a: [b, c]} = {a: [1, 2]}; b === 1 && c === 2");
+    }
+
+    /// Nested mixed destructuring supports array then object patterns.
+    #[test]
+    fn e2e_destructuring_nested_mixed_array_then_object() {
+        assert_eval_true("let [{a}, [b]] = [{a: 1}, [2]]; a === 1 && b === 2");
+    }
+
+    /// Array destructuring rest collects the remaining elements.
+    #[test]
+    fn e2e_destructuring_array_rest_collects_remaining_elements() {
+        assert_eval_true(
+            "let [a, ...rest] = [1, 2, 3]; a === 1 && rest.length === 2 && rest[0] === 2 && rest[1] === 3",
+        );
+    }
+
+    /// Array destructuring rest can be empty.
+    #[test]
+    fn e2e_destructuring_array_rest_can_be_empty() {
+        assert_eval_true("let [a, ...rest] = [1]; a === 1 && rest.length === 0");
+    }
+
+    /// Object destructuring rest collects the remaining properties.
+    #[test]
+    fn e2e_destructuring_object_rest_collects_remaining_properties() {
+        assert_eval_true(
+            "let {a, ...rest} = {a: 1, b: 2}; a === 1 && rest.b === 2 && rest.a === undefined && Object.keys(rest).length === 1",
+        );
+    }
+
+    /// Object destructuring rest excludes multiple extracted properties.
+    #[test]
+    fn e2e_destructuring_object_rest_excludes_extracted_properties() {
+        assert_eval_true(
+            "let {a, b, ...rest} = {a: 1, b: 2, c: 3, d: 4}; rest.a === undefined && rest.b === undefined && rest.c === 3 && rest.d === 4 && Object.keys(rest).length === 2",
+        );
+    }
+
+    /// Object destructuring rest excludes computed keys.
+    #[test]
+    fn e2e_destructuring_object_rest_excludes_computed_keys() {
+        assert_eval_true(
+            "let key = 'b'; let {a, [key]: value, ...rest} = {a: 1, b: 2, c: 3}; a === 1 && value === 2 && rest.a === undefined && rest.b === undefined && rest.c === 3 && Object.keys(rest).length === 1",
+        );
+    }
+
+    /// Computed property keys work in object destructuring.
+    #[test]
+    fn e2e_destructuring_computed_property_keys_work() {
+        assert_eval_true("let key = 'answer'; let {[key]: value} = {answer: 42}; value === 42");
+    }
+
+    /// Computed property expressions work in object destructuring.
+    #[test]
+    fn e2e_destructuring_computed_property_expressions_work() {
+        assert_eval_true(
+            "let prefix = 'na'; let {[prefix + 'me']: value} = {name: 'stator'}; value === 'stator'",
+        );
+    }
+
+    /// Numeric computed property keys work in object destructuring.
+    #[test]
+    fn e2e_destructuring_numeric_computed_property_keys_work() {
+        assert_eval_true("let {[1]: value} = {1: 99}; value === 99");
+    }
+
+    /// Function parameters support object destructuring.
+    #[test]
+    fn e2e_destructuring_function_parameters_support_object_patterns() {
+        assert_eval_true("function f({a, b}) { return a + b; } f({a: 3, b: 4}) === 7");
+    }
+
+    /// Function parameters support array destructuring.
+    #[test]
+    fn e2e_destructuring_function_parameters_support_array_patterns() {
+        assert_eval_true("function f([a, b]) { return a * b; } f([3, 4]) === 12");
+    }
+
+    /// Function parameters support nested mixed destructuring.
+    #[test]
+    fn e2e_destructuring_function_parameters_support_nested_mixed_patterns() {
+        assert_eval_true("function f([{a}, [b]]) { return a + b; } f([{a: 1}, [2]]) === 3");
+    }
+
+    /// Function parameters support object defaults.
+    #[test]
+    fn e2e_destructuring_function_parameters_support_object_defaults() {
+        assert_eval_true("function f({a = 1}) { return a; } f({}) === 1");
+    }
+
+    /// Function parameters support array defaults.
+    #[test]
+    fn e2e_destructuring_function_parameters_support_array_defaults() {
+        assert_eval_true("function f([a = 1, b = 2]) { return a + b; } f([10]) === 12");
+    }
+
+    /// Object destructuring assignment updates existing bindings.
+    #[test]
+    fn e2e_destructuring_assignment_supports_object_patterns() {
+        assert_eval_true("var a, b; ({a, b} = {a: 5, b: 6}); a === 5 && b === 6");
+    }
+
+    /// Array destructuring assignment updates existing bindings.
+    #[test]
+    fn e2e_destructuring_assignment_supports_array_patterns() {
+        assert_eval_true("var a, b; [a, b] = [7, 8]; a === 7 && b === 8");
+    }
+
+    /// Nested destructuring assignment updates existing bindings.
+    #[test]
+    fn e2e_destructuring_assignment_supports_nested_patterns() {
+        assert_eval_true(
+            "var a, b; ({a: {value: a}, b} = {a: {value: 9}, b: 10}); a === 9 && b === 10",
+        );
+    }
+
+    /// Object destructuring assignment supports defaults.
+    #[test]
+    fn e2e_destructuring_assignment_supports_object_defaults() {
+        assert_eval_true("var a; ({a = 5} = {a: undefined}); a === 5");
+    }
+
+    /// Array destructuring assignment supports defaults.
+    #[test]
+    fn e2e_destructuring_assignment_supports_array_defaults() {
+        assert_eval_true("var a, b; [a = 1, b = 2] = [undefined, 9]; a === 1 && b === 9");
+    }
+
+    /// Object destructuring assignment supports rest.
+    #[test]
+    fn e2e_destructuring_assignment_supports_object_rest() {
+        assert_eval_true(
+            "var a, rest; ({a, ...rest} = {a: 1, b: 2, c: 3}); a === 1 && rest.b === 2 && rest.c === 3 && rest.a === undefined && Object.keys(rest).length === 2",
+        );
+    }
+
+    /// Computed property keys work in destructuring assignment.
+    #[test]
+    fn e2e_destructuring_assignment_supports_computed_property_keys() {
+        assert_eval_true("var value; var key = 'z'; ({[key]: value} = {z: 11}); value === 11");
+    }
+
+    /// Destructuring can consume Set iterables.
+    #[test]
+    fn e2e_destructuring_iterable_set_basic() {
+        assert_eval_true("let [a, b] = new Set([1, 2]); a === 1 && b === 2");
+    }
+
+    /// Destructuring defaults apply when Set iteration stops early.
+    #[test]
+    fn e2e_destructuring_iterable_set_defaults_apply_to_missing_values() {
+        assert_eval_true("let [a = 1, b = 2] = new Set([10]); a === 10 && b === 2");
+    }
+
+    /// Destructuring from Set supports rest elements.
+    #[test]
+    fn e2e_destructuring_iterable_set_supports_rest_elements() {
+        assert_eval_true(
+            "let [a, ...rest] = new Set([1, 2, 3]); a === 1 && rest.length === 2 && rest[0] === 2 && rest[1] === 3",
+        );
+    }
+
+    /// Destructuring supports nested mixed iterable inputs.
+    #[test]
+    fn e2e_destructuring_nested_mixed_iterable_inputs() {
+        assert_eval_true("let [{a}, [b]] = [{a: 1}, new Set([2])]; a === 1 && b === 2");
+    }
+
     /// for-of return inside function exits the function and closes iterator.
     #[test]
     fn e2e_for_of_return_inside_function() {
