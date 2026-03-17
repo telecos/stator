@@ -51674,6 +51674,321 @@ mod tests {
         );
     }
 
+    // ── w21j: Error message consistency & subclass conformance ─────────
+
+    // 1. Error .message is own property (not inherited from prototype)
+    #[test]
+    fn e2e_w21j_error_message_is_own_property() {
+        assert_e2e_true(
+            r#"let e = new Error("hello");
+               e.hasOwnProperty("message") === true"#,
+        );
+    }
+
+    // 2. Error .name is inherited from prototype (not own)
+    #[test]
+    fn e2e_w21j_error_name_is_inherited() {
+        assert_e2e_true(
+            r#"let e = new Error("hello");
+               e.hasOwnProperty("name") === false && e.name === "Error""#,
+        );
+    }
+
+    // 3. Error .stack is a string
+    #[test]
+    fn e2e_w21j_error_stack_is_string() {
+        assert_e2e_true(r#"typeof new Error("x").stack === "string""#);
+    }
+
+    // 4a. TypeError has correct .name
+    #[test]
+    fn e2e_w21j_type_error_name() {
+        assert_e2e_true(r#"new TypeError("x").name === "TypeError""#);
+    }
+
+    // 4b. RangeError has correct .name
+    #[test]
+    fn e2e_w21j_range_error_name() {
+        assert_e2e_true(r#"new RangeError("x").name === "RangeError""#);
+    }
+
+    // 4c. ReferenceError has correct .name
+    #[test]
+    fn e2e_w21j_reference_error_name() {
+        assert_e2e_true(r#"new ReferenceError("x").name === "ReferenceError""#);
+    }
+
+    // 4d. SyntaxError has correct .name
+    #[test]
+    fn e2e_w21j_syntax_error_name() {
+        assert_e2e_true(r#"new SyntaxError("x").name === "SyntaxError""#);
+    }
+
+    // 4e. URIError has correct .name
+    #[test]
+    fn e2e_w21j_uri_error_name() {
+        assert_e2e_true(r#"new URIError("x").name === "URIError""#);
+    }
+
+    // 4f. EvalError has correct .name
+    #[test]
+    fn e2e_w21j_eval_error_name() {
+        assert_e2e_true(r#"new EvalError("x").name === "EvalError""#);
+    }
+
+    // 5. new TypeError("msg").message === "msg" && .name === "TypeError"
+    #[test]
+    fn e2e_w21j_type_error_message_and_name() {
+        assert_e2e_true(
+            r#"let e = new TypeError("msg");
+               e.message === "msg" && e.name === "TypeError""#,
+        );
+    }
+
+    // 6a. Error .constructor === Error
+    #[test]
+    fn e2e_w21j_error_constructor_identity() {
+        assert_e2e_true(r#"new Error("x").constructor === Error"#);
+    }
+
+    // 6b. TypeError .constructor === TypeError
+    #[test]
+    fn e2e_w21j_type_error_constructor_identity() {
+        assert_e2e_true(r#"new TypeError("x").constructor === TypeError"#);
+    }
+
+    // 6c. RangeError .constructor === RangeError
+    #[test]
+    fn e2e_w21j_range_error_constructor_identity() {
+        assert_e2e_true(r#"new RangeError("x").constructor === RangeError"#);
+    }
+
+    // 6d. ReferenceError .constructor === ReferenceError
+    #[test]
+    fn e2e_w21j_reference_error_constructor_identity() {
+        assert_e2e_true(r#"new ReferenceError("x").constructor === ReferenceError"#);
+    }
+
+    // 6e. SyntaxError .constructor === SyntaxError
+    #[test]
+    fn e2e_w21j_syntax_error_constructor_identity() {
+        assert_e2e_true(r#"new SyntaxError("x").constructor === SyntaxError"#);
+    }
+
+    // 6f. URIError .constructor === URIError
+    #[test]
+    fn e2e_w21j_uri_error_constructor_identity() {
+        assert_e2e_true(r#"new URIError("x").constructor === URIError"#);
+    }
+
+    // 6g. EvalError .constructor === EvalError
+    #[test]
+    fn e2e_w21j_eval_error_constructor_identity() {
+        assert_e2e_true(r#"new EvalError("x").constructor === EvalError"#);
+    }
+
+    // 7a. AggregateError .errors is own array property
+    #[test]
+    fn e2e_w21j_aggregate_error_errors_is_own_array() {
+        assert_e2e_true(
+            r#"let e = new AggregateError([1, 2, 3], "agg");
+               e.hasOwnProperty("errors") && Array.isArray(e.errors) && e.errors.length === 3"#,
+        );
+    }
+
+    // 7b. AggregateError message works
+    #[test]
+    fn e2e_w21j_aggregate_error_message() {
+        assert_e2e_true(r#"new AggregateError([], "hello").message === "hello""#);
+    }
+
+    // 7c. AggregateError cause works
+    #[test]
+    fn e2e_w21j_aggregate_error_cause() {
+        assert_e2e_true(
+            r#"let e = new AggregateError([], "msg", { cause: "reason" });
+               e.cause === "reason""#,
+        );
+    }
+
+    // 7d. AggregateError .constructor === AggregateError
+    #[test]
+    fn e2e_w21j_aggregate_error_constructor_identity() {
+        assert_e2e_true(r#"new AggregateError([], "x").constructor === AggregateError"#);
+    }
+
+    // 7e. AggregateError errors contents are correct
+    #[test]
+    fn e2e_w21j_aggregate_error_errors_contents() {
+        assert_e2e_true(
+            r#"let e = new AggregateError([10, 20], "oops");
+               e.errors[0] === 10 && e.errors[1] === 20"#,
+        );
+    }
+
+    // 8. Custom error subclass via class extends Error
+    #[test]
+    fn e2e_w21j_custom_error_subclass() {
+        assert_e2e_true(
+            r#"class MyError extends Error {
+                   constructor(msg) { super(msg); this.name = "MyError"; }
+               }
+               let e = new MyError("custom");
+               e.name === "MyError" && e.message === "custom" && e instanceof Error"#,
+        );
+    }
+
+    // 9a. Error.prototype.toString — "name: message" format
+    #[test]
+    fn e2e_w21j_error_to_string_name_colon_message() {
+        assert_e2e_true(r#"new Error("boom").toString() === "Error: boom""#);
+    }
+
+    // 9b. Error.prototype.toString — missing message returns just name
+    #[test]
+    fn e2e_w21j_error_to_string_no_message() {
+        assert_e2e_true(r#"new Error().toString() === "Error""#);
+    }
+
+    // 9c. Error.prototype.toString — empty name returns just message
+    #[test]
+    fn e2e_w21j_error_to_string_empty_name() {
+        assert_e2e_true(r#"let e = new Error("hi"); e.name = ""; e.toString() === "hi""#);
+    }
+
+    // 9d. Error.prototype.toString — both empty returns empty string
+    #[test]
+    fn e2e_w21j_error_to_string_both_empty() {
+        assert_e2e_true(r#"let e = new Error(); e.name = ""; e.toString() === """#);
+    }
+
+    // 10a. try/catch instanceof TypeError
+    #[test]
+    fn e2e_w21j_catch_instanceof_type_error() {
+        assert_e2e_true(
+            r#"let result = false;
+               try { null.foo; } catch (e) { result = e instanceof TypeError; }
+               result"#,
+        );
+    }
+
+    // 10b. instanceof Error for TypeError
+    #[test]
+    fn e2e_w21j_type_error_instanceof_error() {
+        assert_e2e_true(r#"new TypeError("x") instanceof Error"#);
+    }
+
+    // 10c. instanceof Error for RangeError
+    #[test]
+    fn e2e_w21j_range_error_instanceof_error() {
+        assert_e2e_true(r#"new RangeError("x") instanceof Error"#);
+    }
+
+    // 11. Error without message: new Error().message === ""
+    #[test]
+    fn e2e_w21j_error_without_message_is_empty_string() {
+        assert_e2e_true(r#"new Error().message === """#);
+    }
+
+    // 12. Error.captureStackTrace — may not exist; should not throw
+    #[test]
+    fn e2e_w21j_capture_stack_trace_no_throw() {
+        assert_e2e_true(
+            r#"let ok = true;
+               try {
+                   if (typeof Error.captureStackTrace === "function") {
+                       let obj = {};
+                       Error.captureStackTrace(obj);
+                   }
+               } catch (e) { ok = false; }
+               ok"#,
+        );
+    }
+
+    // 13. Error.prototype.name === "Error"
+    #[test]
+    fn e2e_w21j_error_prototype_name() {
+        assert_e2e_true(r#"Error.prototype.name === "Error""#);
+    }
+
+    // 14. TypeError.prototype.name === "TypeError"
+    #[test]
+    fn e2e_w21j_type_error_prototype_name() {
+        assert_e2e_true(r#"TypeError.prototype.name === "TypeError""#);
+    }
+
+    // 15. Error.prototype.message === ""
+    #[test]
+    fn e2e_w21j_error_prototype_message_is_empty() {
+        assert_e2e_true(r#"Error.prototype.message === """#);
+    }
+
+    // 16. Error .stack is own property
+    #[test]
+    fn e2e_w21j_error_stack_is_own() {
+        assert_e2e_true(r#"new Error("x").hasOwnProperty("stack")"#);
+    }
+
+    // 17. Error.prototype.toString is a function
+    #[test]
+    fn e2e_w21j_error_prototype_to_string_is_function() {
+        assert_e2e_true(r#"typeof Error.prototype.toString === "function""#);
+    }
+
+    // 18. AggregateError instanceof Error
+    #[test]
+    fn e2e_w21j_aggregate_error_instanceof_error() {
+        assert_e2e_true(r#"new AggregateError([], "x") instanceof Error"#);
+    }
+
+    // 19. All subclass prototypes inherit from Error.prototype
+    #[test]
+    fn e2e_w21j_subclass_prototypes_inherit_error_prototype() {
+        assert_e2e_true(
+            r#"Object.getPrototypeOf(TypeError.prototype) === Error.prototype &&
+               Object.getPrototypeOf(RangeError.prototype) === Error.prototype &&
+               Object.getPrototypeOf(ReferenceError.prototype) === Error.prototype &&
+               Object.getPrototypeOf(SyntaxError.prototype) === Error.prototype &&
+               Object.getPrototypeOf(URIError.prototype) === Error.prototype &&
+               Object.getPrototypeOf(EvalError.prototype) === Error.prototype"#,
+        );
+    }
+
+    // 20. Error cause property propagates through subclass
+    #[test]
+    fn e2e_w21j_subclass_error_cause_propagation() {
+        assert_e2e_true(
+            r#"let inner = new Error("root");
+               let outer = new TypeError("wrap", { cause: inner });
+               outer.cause === inner && outer.cause.message === "root""#,
+        );
+    }
+
+    // 21. Error without message has .message === "" for all subclasses
+    #[test]
+    fn e2e_w21j_subclass_no_message_is_empty_string() {
+        assert_e2e_true(
+            r#"new TypeError().message === "" &&
+               new RangeError().message === "" &&
+               new ReferenceError().message === "" &&
+               new SyntaxError().message === "" &&
+               new URIError().message === "" &&
+               new EvalError().message === """#,
+        );
+    }
+
+    // 22. Error.stackTraceLimit exists
+    #[test]
+    fn e2e_w21j_error_stack_trace_limit_exists() {
+        assert_e2e_true(r#"typeof Error.stackTraceLimit === "number""#);
+    }
+
+    // 23. TypeError.prototype.toString returns "TypeError: msg"
+    #[test]
+    fn e2e_w21j_type_error_to_string_format() {
+        assert_e2e_true(r#"new TypeError("fail").toString() === "TypeError: fail""#);
+    }
+
     // ── Number deep conformance e2e tests ───────────────────────────────
 
     /// Number() with no args returns 0.
