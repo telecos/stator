@@ -11065,6 +11065,23 @@ fn make_regexp() -> JsValue {
             props.insert(name.into(), JsValue::String(String::new().into()));
         }
 
+        // Annex B §B.2.4 — short alias getters: $_, $&, $+, $`, $'
+        for &(alias, canonical) in &[
+            ("$_", "input"),
+            ("$&", "lastMatch"),
+            ("$+", "lastParen"),
+            ("$`", "leftContext"),
+            ("$'", "rightContext"),
+        ] {
+            let getter_key = format!("__get_{alias}__");
+            let canon = canonical.to_string();
+            props.insert(
+                getter_key,
+                native(move |_args| Ok(regexp_static_get(&canon))),
+            );
+            props.insert(alias.into(), JsValue::String(String::new().into()));
+        }
+
         // §22.2.4.2 RegExp.escape(string)  — ES2025
         props.insert(
             "escape".into(),
@@ -11448,6 +11465,79 @@ fn make_regexp() -> JsValue {
                         return f(vec![input]);
                     }
                     Ok(JsValue::Undefined)
+                }),
+            );
+
+            // Annex B §B.2.5.1 RegExp.prototype.compile(pattern, flags)
+            //
+            // Deprecated legacy method that reinitialises a regexp in place.
+            // We create a fresh regexp from the new pattern/flags and then
+            // overwrite the properties on `this`.
+            proto.insert(
+                "compile".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    let pattern_arg = args.get(1).unwrap_or(&JsValue::Undefined);
+                    let flags_arg = args.get(2).unwrap_or(&JsValue::Undefined);
+
+                    let pattern = match pattern_arg {
+                        JsValue::Undefined => String::new(),
+                        v => v.to_js_string()?,
+                    };
+                    let flags = match flags_arg {
+                        JsValue::Undefined => String::new(),
+                        v => v.to_js_string()?,
+                    };
+
+                    let new_re = regexp_construct(&[
+                        JsValue::String(pattern.into()),
+                        JsValue::String(flags.into()),
+                    ])?;
+
+                    if let (JsValue::PlainObject(target), JsValue::PlainObject(source)) =
+                        (this, &new_re)
+                    {
+                        let src = source.borrow();
+                        let mut tgt = target.borrow_mut();
+                        // Copy key properties from the freshly-created regexp.
+                        for key in &[
+                            "source",
+                            "flags",
+                            "global",
+                            "ignoreCase",
+                            "multiline",
+                            "dotAll",
+                            "unicode",
+                            "unicodeSets",
+                            "sticky",
+                            "hasIndices",
+                            "lastIndex",
+                            "test",
+                            "exec",
+                            "toString",
+                            "__symbol_match__",
+                            "__symbol_replace__",
+                            "__symbol_search__",
+                            "__symbol_split__",
+                            "__symbol_match_all__",
+                            "__get_source__",
+                            "__get_flags__",
+                            "__get_global__",
+                            "__get_ignoreCase__",
+                            "__get_multiline__",
+                            "__get_dotAll__",
+                            "__get_unicode__",
+                            "__get_unicodeSets__",
+                            "__get_sticky__",
+                            "__get_hasIndices__",
+                        ] {
+                            if let Some(val) = src.get(key) {
+                                tgt.insert(key.to_string(), val.clone());
+                            }
+                        }
+                    }
+
+                    Ok(this.clone())
                 }),
             );
 
@@ -59184,5 +59274,268 @@ mod tests {
     #[test]
     fn e2e_w21f_typed_array_length() {
         assert_e2e_true("var ta = new Int32Array(5); ta.length === 5");
+    }
+
+    // ── Annex B RegExp extensions (§B.1.2, §B.2.4, §B.2.5) ────────────
+
+    // 1. Legacy backreferences \1–\9 in non-unicode mode
+    #[test]
+    fn e2e_annex_b_backref_1() {
+        assert_e2e_true(r#"/(a)\1/.test("aa")"#);
+    }
+
+    #[test]
+    fn e2e_annex_b_backref_2() {
+        assert_e2e_true(r#"/(a)(b)\2/.test("abb")"#);
+    }
+
+    #[test]
+    fn e2e_annex_b_backref_no_match() {
+        assert_e2e_true(r#"!/(a)\1/.test("ab")"#);
+    }
+
+    // 2. RegExp.prototype.compile() — reinitialises pattern
+    #[test]
+    fn e2e_annex_b_compile_basic() {
+        assert_e2e_true(
+            r#"var re = /abc/; re.compile("xyz", "g"); re.test("xyz") && re.global === true"#,
+        );
+    }
+
+    #[test]
+    fn e2e_annex_b_compile_returns_receiver() {
+        assert_e2e_true(r#"var re = /abc/; re.compile("def") === re"#);
+    }
+
+    #[test]
+    fn e2e_annex_b_compile_resets_last_index() {
+        assert_e2e_true(r#"var re = /a/g; re.test("a"); re.compile("b", "g"); re.lastIndex === 0"#);
+    }
+
+    #[test]
+    fn e2e_annex_b_compile_changes_source() {
+        assert_e2e_true(r#"var re = /old/; re.compile("new"); re.source === "new""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_compile_changes_flags() {
+        assert_e2e_true(r#"var re = /a/; re.compile("a", "gi"); re.flags === "gi""#);
+    }
+
+    // 3. Legacy RegExp static properties: $1–$9
+    #[test]
+    fn e2e_annex_b_static_dollar1() {
+        assert_e2e_true(r#"/(hello)/.test("hello world"); RegExp["$1"] === "hello""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_static_dollar2() {
+        assert_e2e_true(r#"/(a)(b)/.test("ab"); RegExp["$1"] === "a" && RegExp["$2"] === "b""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_static_input() {
+        assert_e2e_true(r#"/x/.test("xyz"); RegExp.input === "xyz""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_static_input_alias() {
+        assert_e2e_true(r#"/x/.test("xyz"); RegExp["$_"] === "xyz""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_static_last_match() {
+        assert_e2e_true(r#"/wo/.test("hello world"); RegExp.lastMatch === "wo""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_static_last_match_alias() {
+        assert_e2e_true(r#"/wo/.test("hello world"); RegExp["$&"] === "wo""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_static_last_paren() {
+        assert_e2e_true(r#"/(a)(b)(c)/.test("abc"); RegExp.lastParen === "c""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_static_last_paren_alias() {
+        assert_e2e_true(r#"/(a)(b)(c)/.test("abc"); RegExp["$+"] === "c""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_static_left_context() {
+        assert_e2e_true(r#"/wor/.test("hello world"); RegExp.leftContext === "hello ""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_static_left_context_alias() {
+        let r = global_eval(r#"/wor/.test("hello world"); RegExp["$`"]"#).unwrap();
+        assert_eq!(r, JsValue::String("hello ".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_static_right_context() {
+        assert_e2e_true(r#"/wor/.test("hello world"); RegExp.rightContext === "ld""#);
+    }
+
+    #[test]
+    fn e2e_annex_b_static_right_context_alias() {
+        assert_e2e_true(r#"/wor/.test("hello world"); RegExp["$'"] === "ld""#);
+    }
+
+    // 4. \cA–\cZ control character escapes
+    #[test]
+    fn e2e_annex_b_control_escape_a() {
+        // \cA = U+0001 (SOH)
+        assert_e2e_true(r#"/\cA/.test("\x01")"#);
+    }
+
+    #[test]
+    fn e2e_annex_b_control_escape_z() {
+        // \cZ = U+001A (SUB)
+        assert_e2e_true(r#"/\cZ/.test("\x1a")"#);
+    }
+
+    #[test]
+    fn e2e_annex_b_control_escape_m() {
+        // \cM = U+000D (CR)
+        assert_e2e_true(r#"/\cM/.test("\r")"#);
+    }
+
+    #[test]
+    fn e2e_annex_b_control_escape_j() {
+        // \cJ = U+000A (LF)
+        assert_e2e_true(r#"/\cJ/.test("\n")"#);
+    }
+
+    // 5. Extended pattern semantics in non-unicode mode (Annex B)
+    #[test]
+    fn e2e_annex_b_extended_brace_literal() {
+        // `{` not part of a valid quantifier is a literal in non-unicode mode.
+        assert_e2e_true(r#"/a{/.test("a{")"#);
+    }
+
+    #[test]
+    fn e2e_annex_b_extended_quantifier_range() {
+        // Valid quantifier still works.
+        assert_e2e_true(r#"/a{2,3}/.test("aa")"#);
+    }
+
+    // 6. ] and { treated as literals in non-unicode character classes
+    #[test]
+    fn e2e_annex_b_bracket_literal_in_class() {
+        // `]` as the first element in a character class is a literal.
+        assert_e2e_true(r#"/[]]/.test("]")"#);
+    }
+
+    #[test]
+    fn e2e_annex_b_brace_literal_in_class() {
+        assert_e2e_true(r#"/[{]/.test("{")"#);
+    }
+
+    // 7. Symbol.replace with $< when no named groups
+    #[test]
+    fn e2e_annex_b_replace_dollar_angle_no_groups() {
+        let r = global_eval(r#""abc".replace(/b/, "$<foo>")"#).unwrap();
+        assert_eq!(r, JsValue::String("a$<foo>c".into()));
+    }
+
+    #[test]
+    fn e2e_annex_b_replace_dollar_angle_with_named_group() {
+        let r = global_eval(r#""abc".replace(/(?<x>b)/, "[$<x>]")"#).unwrap();
+        assert_eq!(r, JsValue::String("a[b]c".into()));
+    }
+
+    // 8. Quantifier after assertion in non-unicode mode
+    #[test]
+    fn e2e_annex_b_quantifier_after_lookahead() {
+        // In non-unicode mode, quantifier after lookahead is allowed (Annex B).
+        // The `regress` crate permits this per ECMAScript Annex B.
+        assert_e2e_true(r#"/(?=a){1}/.test("a")"#);
+    }
+
+    // 9. \8 and \9 as literal matches in non-unicode mode
+    #[test]
+    fn e2e_annex_b_escape_8_literal() {
+        assert_e2e_true(r#"/\8/.test("8")"#);
+    }
+
+    #[test]
+    fn e2e_annex_b_escape_9_literal() {
+        assert_e2e_true(r#"/\9/.test("9")"#);
+    }
+
+    #[test]
+    fn e2e_annex_b_escape_8_no_false_match() {
+        assert_e2e_true(r#"!/\8/.test("7")"#);
+    }
+
+    // 10. HTML comment-like patterns <!-- --> in regexp
+    #[test]
+    fn e2e_annex_b_html_open_comment_pattern() {
+        assert_e2e_true(r#"/<!--/.test("<!-- hello")"#);
+    }
+
+    #[test]
+    fn e2e_annex_b_html_close_comment_pattern() {
+        assert_e2e_true(r#"/-->/.test("hello -->")"#);
+    }
+
+    // Additional coverage: backreferences beyond 9
+    #[test]
+    fn e2e_annex_b_backref_double_digit() {
+        assert_e2e_true(
+            r#"var re = /(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)\10/;
+            re.test("abcdefghijj")"#,
+        );
+    }
+
+    // Static $1-$9 reset on next exec
+    #[test]
+    fn e2e_annex_b_statics_updated_each_exec() {
+        assert_e2e_true(
+            r#"/(first)/.test("first"); var a = RegExp["$1"];
+            /(second)/.test("second"); var b = RegExp["$1"];
+            a === "first" && b === "second""#,
+        );
+    }
+
+    // compile with empty args
+    #[test]
+    fn e2e_annex_b_compile_empty() {
+        assert_e2e_true(r#"var re = /abc/; re.compile(); re.source === "(?:)""#);
+    }
+
+    // compile typeof is function
+    #[test]
+    fn e2e_annex_b_compile_exists_on_prototype() {
+        assert_e2e_true(r#"typeof /a/.compile === "function""#);
+    }
+
+    // Control escape lowercase a-z
+    #[test]
+    fn e2e_annex_b_control_escape_lowercase() {
+        // \ca is same as \cA in non-unicode mode per Annex B
+        // Actually spec says \c followed by lowercase letter is also valid.
+        assert_e2e_true(r#"/\ci/.test("\x09")"#);
+    }
+
+    // Multiple backreferences
+    #[test]
+    fn e2e_annex_b_multiple_backrefs() {
+        assert_e2e_true(r#"/(a)(b)\1\2/.test("abab")"#);
+    }
+
+    // \0 is NUL in character class
+    #[test]
+    fn e2e_annex_b_nul_escape() {
+        assert_e2e_true(r#"/\0/.test("\0")"#);
+    }
+
+    // compile preserves __is_regexp__ marker
+    #[test]
+    fn e2e_annex_b_compile_preserves_regexp_identity() {
+        assert_e2e_true(r#"var re = /old/; re.compile("new", "i"); re.ignoreCase === true"#);
     }
 }
