@@ -53,6 +53,7 @@ pub(super) enum DispatchAction {
     TailCall,
 }
 
+#[allow(dead_code)]
 fn js_object_to_plain_value(obj: JsObject) -> JsValue {
     let mut props = PropertyMap::new();
     for key in obj.own_property_keys() {
@@ -2289,7 +2290,7 @@ fn handle_construct(
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
             let ctor_val = ctx.frame.accumulator.clone();
             let obj = proxy_construct(&mut p.borrow_mut(), args, ctor_val)?;
-            ctx.frame.accumulator = js_object_to_plain_value(obj);
+            ctx.frame.accumulator = obj;
         }
         other => {
             return Err(StatorError::TypeError(format!(
@@ -2381,7 +2382,7 @@ fn handle_construct_with_spread(
         JsValue::Proxy(ref p) => {
             let ctor_val = ctx.frame.accumulator.clone();
             let obj = proxy_construct(&mut p.borrow_mut(), args, ctor_val)?;
-            ctx.frame.accumulator = js_object_to_plain_value(obj);
+            ctx.frame.accumulator = obj;
         }
         other => {
             return Err(StatorError::TypeError(format!(

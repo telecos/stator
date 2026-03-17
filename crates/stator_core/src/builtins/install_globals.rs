@@ -11820,6 +11820,7 @@ fn descriptor_value_to_parts(result: &JsValue) -> Option<(JsValue, PropertyAttri
     Some((value, attrs))
 }
 
+#[allow(dead_code)]
 fn plain_object_to_js_object(map: &Rc<RefCell<PropertyMap>>) -> JsObject {
     let mut obj = JsObject::new();
     let borrow = map.borrow();
@@ -12013,15 +12014,14 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
                     trap,
                     &handler_this,
                     vec![target.clone(), JsValue::String(key.to_string().into())],
-                )
-                .ok()?;
-                return descriptor_value_to_parts(&result);
+                )?;
+                return Ok(descriptor_value_to_parts(&result));
             }
             match &target {
-                JsValue::PlainObject(map) => {
-                    descriptor_value_to_parts(&plain_descriptor_as_object(map, key))
-                }
-                _ => None,
+                JsValue::PlainObject(map) => Ok(descriptor_value_to_parts(
+                    &plain_descriptor_as_object(map, key),
+                )),
+                _ => Ok(None),
             }
         }));
     }
@@ -12030,12 +12030,11 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
         let target = target_val.clone();
         let handler_this = handler_this.clone();
         handler.get_prototype_of = Some(Box::new(move |_target| {
-            let result =
-                call_proxy_handler_trap(&trap, &handler_this, vec![target.clone()]).ok()?;
+            let result = call_proxy_handler_trap(&trap, &handler_this, vec![target.clone()])?;
             if result.is_null() || result.is_undefined() {
-                None
+                Ok(JsValue::Null)
             } else {
-                Some(Rc::new(RefCell::new(JsObject::new())))
+                Ok(result)
             }
         }));
     }
@@ -12044,12 +12043,8 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
         let target = target_val.clone();
         let handler_this = handler_this.clone();
         handler.set_prototype_of = Some(Box::new(move |_target, proto| {
-            let proto_val = match proto {
-                Some(_) => JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))),
-                None => JsValue::Null,
-            };
             let result =
-                call_proxy_handler_trap(&trap, &handler_this, vec![target.clone(), proto_val])?;
+                call_proxy_handler_trap(&trap, &handler_this, vec![target.clone(), proto])?;
             Ok(result.to_boolean())
         }));
     }
@@ -12127,7 +12122,9 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
                     vec![target.clone(), JsValue::new_array(args), new_target],
                 )?;
                 return match &result {
-                    JsValue::PlainObject(map) => Ok(plain_object_to_js_object(map)),
+                    JsValue::PlainObject(_) | JsValue::Function(_) | JsValue::Error(_) => {
+                        Ok(result)
+                    }
                     _ => Err(StatorError::TypeError(
                         "construct trap must return an object".to_string(),
                     )),
@@ -12144,11 +12141,8 @@ fn build_proxy_handler(handler_val: &JsValue, target_val: &JsValue) -> ProxyHand
             }
             let result = dispatch_call_with_this(&target, this_obj.clone(), args)?;
             match result {
-                JsValue::PlainObject(map) => Ok(plain_object_to_js_object(&map)),
-                _ => match this_obj {
-                    JsValue::PlainObject(map) => Ok(plain_object_to_js_object(&map)),
-                    _ => Ok(JsObject::new()),
-                },
+                JsValue::PlainObject(_) | JsValue::Function(_) => Ok(result),
+                _ => Ok(this_obj),
             }
         }));
     }
@@ -12389,8 +12383,14 @@ fn make_reflect() -> JsValue {
                     ));
                 }
                 let proto = match &target {
-                    JsValue::Proxy(proxy) => proxy_get_prototype_of(&proxy.borrow())?
-                        .map(|_| JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())))),
+                    JsValue::Proxy(proxy) => {
+                        let result = proxy_get_prototype_of(&proxy.borrow())?;
+                        if result.is_null() || result.is_undefined() {
+                            None
+                        } else {
+                            Some(result)
+                        }
+                    }
                     _ => get_object_prototype(&target),
                 };
                 Ok(proto.unwrap_or(JsValue::Null))
@@ -12419,7 +12419,9 @@ fn make_reflect() -> JsValue {
                     JsValue::PlainObject(_) | JsValue::Error(_) => {
                         ordinary_set_prototype_of(&target, proto_arg.clone()).is_ok()
                     }
-                    JsValue::Proxy(proxy) => proxy_set_prototype_of(&mut proxy.borrow_mut(), None)?,
+                    JsValue::Proxy(proxy) => {
+                        proxy_set_prototype_of(&mut proxy.borrow_mut(), proto_arg)?
+                    }
                     _ => false,
                 };
                 Ok(JsValue::Boolean(result))
