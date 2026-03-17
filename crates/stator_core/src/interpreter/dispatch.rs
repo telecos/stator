@@ -9930,4 +9930,379 @@ mod tests {
         .unwrap();
         assert_eq!(result, JsValue::Smi(12));
     }
+
+    // ── Label / break / continue deep conformance ────────────────────────
+
+    #[test]
+    fn e2e_labeled_block_break() {
+        // label: { break label; } — basic labeled block
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; outer: { r = 1; break outer; r = 2; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_labeled_block_completion_value() {
+        // eval completion value: last value before break
+        let result = crate::builtins::global::global_eval(
+            "var x; outer: { x = 10; break outer; x = 20; } x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_labeled_while_break() {
+        // outer: while(true) { break outer; }
+        let result = crate::builtins::global::global_eval(
+            "var i = 0; outer: while (true) { i = 42; break outer; } i",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_labeled_for_break() {
+        // outer: for(...) { break outer; }
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; outer: for (var i = 0; i < 10; i++) { r = i; if (i === 3) break outer; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_nested_labeled_loops_break_outer() {
+        // outer: for(...) { inner: for(...) { break outer; } }
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; outer: for (var i = 0; i < 5; i++) { inner: for (var j = 0; j < 5; j++) { r++; if (j === 1) break outer; } } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_nested_labeled_loops_break_inner() {
+        // outer: for(...) { inner: for(...) { break inner; } }
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; outer: for (var i = 0; i < 3; i++) { inner: for (var j = 0; j < 10; j++) { if (j === 2) break inner; r++; } } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(6)); // 2 per outer iteration * 3
+    }
+
+    #[test]
+    fn e2e_continue_with_label() {
+        // outer: for(...) { continue outer; }
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; outer: for (var i = 0; i < 5; i++) { if (i === 3) continue outer; r++; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(4)); // skips i=3
+    }
+
+    #[test]
+    fn e2e_continue_label_nested_loops() {
+        // continue outer in nested loop
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; outer: for (var i = 0; i < 3; i++) { for (var j = 0; j < 3; j++) { if (j === 1) continue outer; r++; } } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3)); // j=0 for each i=0,1,2
+    }
+
+    #[test]
+    fn e2e_break_in_switch_inside_loop() {
+        // break without label exits switch, not the loop
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; for (var i = 0; i < 3; i++) { switch(i) { case 1: break; default: r++; } } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2)); // i=0 default, i=1 break (switch), i=2 default
+    }
+
+    #[test]
+    fn e2e_break_label_exits_loop_from_switch() {
+        // break label exits labeled loop, not the switch
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; loop1: for (var i = 0; i < 10; i++) { switch(i) { case 3: break loop1; default: r++; } } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3)); // i=0,1,2 → default
+    }
+
+    #[test]
+    fn e2e_labeled_do_while_break() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; outer: do { r++; if (r === 5) break outer; } while (true); r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_labeled_do_while_continue() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; var s = 0; outer: do { r++; if (r < 3) continue outer; s++; } while (r < 5); s",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3)); // r=3,4,5 → s incremented
+    }
+
+    #[test]
+    fn e2e_for_in_with_label_break() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; var obj = {a:1, b:2, c:3}; outer: for (var k in obj) { r++; if (k === 'b') break outer; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_for_in_with_label_continue() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; var obj = {a:1, b:2, c:3}; outer: for (var k in obj) { if (k === 'b') continue outer; r++; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2)); // a and c
+    }
+
+    #[test]
+    fn e2e_for_of_with_label_break() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; outer: for (var v of [10, 20, 30, 40]) { r += v; if (v === 20) break outer; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(30)); // 10 + 20
+    }
+
+    #[test]
+    fn e2e_for_of_with_label_continue() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; outer: for (var v of [1, 2, 3, 4]) { if (v === 2) continue outer; r += v; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(8)); // 1 + 3 + 4
+    }
+
+    #[test]
+    fn e2e_nested_for_in_break_outer() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; var a = {x:1, y:2}; var b = {p:1, q:2}; \
+             outer: for (var k1 in a) { for (var k2 in b) { r++; if (k2 === 'q') break outer; } } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_try_finally_with_break() {
+        // break in try should still execute finally
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; outer: { try { r = 1; break outer; } finally { r = r + 10; } } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(11)); // 1 + 10
+    }
+
+    #[test]
+    fn e2e_try_finally_with_continue() {
+        // continue in try should still execute finally
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; outer: for (var i = 0; i < 3; i++) { try { if (i === 1) continue outer; } finally { r++; } } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3)); // finally runs for all 3 iterations
+    }
+
+    #[test]
+    fn e2e_try_finally_break_preserves_value() {
+        // The finally body should not clobber the variable set before break
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; var f = 0; outer: { try { r = 42; break outer; } finally { f = 99; } } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_nested_finally_with_break() {
+        // Deeply nested try/finally with break targeting outer label
+        let result = crate::builtins::global::global_eval(
+            "var r = ''; outer: { try { try { r += 'a'; break outer; } finally { r += 'b'; } } finally { r += 'c'; } } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("abc".into()));
+    }
+
+    #[test]
+    fn e2e_labeled_statement_simple() {
+        // label: expr; — label on a non-block statement
+        let result = crate::builtins::global::global_eval("var r; foo: r = 42; r").unwrap();
+        assert_eq!(result, JsValue::Smi(42));
+    }
+
+    #[test]
+    fn e2e_labeled_if_statement() {
+        // label on an if statement (non-loop)
+        let result =
+            crate::builtins::global::global_eval("var r = 0; myLabel: if (true) { r = 7; } r")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_break_unlabeled_in_for() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; for (var i = 0; i < 10; i++) { if (i === 5) break; r++; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_continue_unlabeled_in_for() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; for (var i = 0; i < 5; i++) { if (i === 2) continue; r++; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn e2e_break_unlabeled_in_while() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; while (true) { r++; if (r === 3) break; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_continue_unlabeled_in_while() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; var i = 0; while (i < 5) { i++; if (i === 3) continue; r++; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn e2e_nested_labeled_blocks() {
+        // Nested labeled blocks with break targeting outer
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; outer: { r = 1; inner: { r = 2; break outer; r = 3; } r = 4; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_nested_labeled_blocks_break_inner() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; outer: { r = 1; inner: { r = 2; break inner; r = 3; } r = r + 10; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(12)); // 2 + 10
+    }
+
+    #[test]
+    fn e2e_labeled_for_continue_update() {
+        // continue label should still run the for-loop update expression
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; outer: for (var i = 0; i < 5; i++) { if (i % 2 === 0) continue outer; r += i; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(4)); // 1 + 3
+    }
+
+    #[test]
+    fn e2e_switch_fall_through_then_break() {
+        let result = crate::builtins::global::global_eval(
+            "var r = ''; switch(1) { case 1: r += 'a'; case 2: r += 'b'; break; case 3: r += 'c'; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("ab".into()));
+    }
+
+    #[test]
+    fn e2e_continue_in_switch_in_loop() {
+        // continue inside switch (targets the enclosing loop)
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; for (var i = 0; i < 4; i++) { switch(i) { case 1: continue; } r++; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3)); // i=0,2,3 → r++
+    }
+
+    #[test]
+    fn e2e_for_of_nested_break_outer() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; outer: for (var a of [1, 2, 3]) { for (var b of [10, 20]) { r += a * b; if (a === 2 && b === 10) break outer; } } r",
+        )
+        .unwrap();
+        // a=1: b=10 → 10, b=20 → 20. a=2: b=10 → 20, break outer. Total=50
+        assert_eq!(result, JsValue::Smi(50));
+    }
+
+    #[test]
+    fn e2e_try_catch_finally_break() {
+        // break inside try with both catch and finally
+        let result = crate::builtins::global::global_eval(
+            "var r = ''; outer: { try { r += 'try'; break outer; } catch(e) { r += 'catch'; } finally { r += 'finally'; } r += 'after'; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("tryfinally".into()));
+    }
+
+    #[test]
+    fn e2e_triple_nested_finally_break() {
+        let result = crate::builtins::global::global_eval(
+            "var r = ''; outer: { try { try { try { r += '1'; break outer; } finally { r += '2'; } } finally { r += '3'; } } finally { r += '4'; } } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::String("1234".into()));
+    }
+
+    #[test]
+    fn e2e_labeled_while_continue_label() {
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; var i = 0; outer: while (i < 10) { i++; if (i % 3 === 0) continue outer; r++; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(7)); // skip i=3,6,9
+    }
+
+    #[test]
+    fn e2e_multiple_labels_same_loop() {
+        // Multiple labels on the same loop: a: b: for(...)
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; a: b: for (var i = 0; i < 5; i++) { if (i === 3) break a; r++; } r",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_labeled_block_no_break() {
+        // Labeled block that doesn't use break — should just execute normally
+        let result =
+            crate::builtins::global::global_eval("var r = 0; myLabel: { r = 1; r = 2; } r")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_for_in_nested_continue_outer() {
+        // continue outer; where outer is a for-in loop
+        let result = crate::builtins::global::global_eval(
+            "var r = 0; var obj = {a:1, b:2, c:3, d:4}; \
+             outer: for (var k in obj) { for (var i = 0; i < 2; i++) { if (i === 1) continue outer; r++; } } r",
+        )
+        .unwrap();
+        // For each of 4 keys: i=0 → r++, i=1 → continue outer
+        assert_eq!(result, JsValue::Smi(4));
+    }
 }
