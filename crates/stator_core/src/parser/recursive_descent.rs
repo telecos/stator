@@ -264,23 +264,16 @@ impl<'src> Parser<'src> {
         Ok(())
     }
 
-    /// Check whether the current token is a `"use strict"` directive string.
-    fn is_use_strict_directive(&self) -> bool {
-        if self.current.kind != TokenKind::StringLiteral {
-            return false;
-        }
-        matches!(
-            &self.current.value,
-            TokenValue::Str(s) if s == "\"use strict\"" || s == "'use strict'"
-        )
-    }
-
-    /// Detect a `"use strict"` directive prologue at the start of a body.
-    /// Returns `true` if a directive was found.  Does **not** consume any
-    /// tokens — the directive is still parsed as a normal expression
-    /// statement later.
-    fn check_directive_prologue(&self) -> bool {
-        self.is_use_strict_directive()
+    /// Return the directive string value for an expression statement when it is
+    /// part of a directive prologue.
+    fn directive_prologue_value(stmt: &Stmt) -> Option<&str> {
+        let Stmt::Expr(expr_stmt) = stmt else {
+            return None;
+        };
+        let Expr::Str(str_lit) = expr_stmt.expr.as_ref() else {
+            return None;
+        };
+        Some(str_lit.value.as_str())
     }
 
     // ── Top-level ────────────────────────────────────────────────────────────
@@ -295,12 +288,8 @@ impl<'src> Parser<'src> {
         let start = self.current_span();
         let mut body = Vec::new();
         let mut is_module = false;
-
-        // Detect "use strict" directive prologue.
-        let is_strict = self.check_directive_prologue();
-        if is_strict {
-            self.strict_mode = true;
-        }
+        let mut is_strict = false;
+        let mut in_directive_prologue = true;
 
         while self.peek_kind() != TokenKind::Eof {
             match self.peek_kind() {
@@ -316,20 +305,42 @@ impl<'src> Parser<'src> {
                     self.current = saved_current;
                     if next == TokenKind::LeftParen || next == TokenKind::Dot {
                         let stmt = self.parse_stmt()?;
+                        if in_directive_prologue {
+                            if let Some(value) = Self::directive_prologue_value(&stmt) {
+                                if value == "use strict" {
+                                    self.strict_mode = true;
+                                    is_strict = true;
+                                }
+                            } else {
+                                in_directive_prologue = false;
+                            }
+                        }
                         body.push(ProgramItem::Stmt(stmt));
                     } else {
+                        in_directive_prologue = false;
                         is_module = true;
                         let decl = self.parse_import_decl()?;
                         body.push(ProgramItem::ModuleDecl(ModuleDecl::Import(decl)));
                     }
                 }
                 TokenKind::Export => {
+                    in_directive_prologue = false;
                     is_module = true;
                     let decl = self.parse_export_decl()?;
                     body.push(ProgramItem::ModuleDecl(decl));
                 }
                 _ => {
                     let stmt = self.parse_stmt()?;
+                    if in_directive_prologue {
+                        if let Some(value) = Self::directive_prologue_value(&stmt) {
+                            if value == "use strict" {
+                                self.strict_mode = true;
+                                is_strict = true;
+                            }
+                        } else {
+                            in_directive_prologue = false;
+                        }
+                    }
                     body.push(ProgramItem::Stmt(stmt));
                 }
             }
@@ -1156,14 +1167,6 @@ impl<'src> Parser<'src> {
     fn parse_function_body(&mut self) -> StatorResult<(BlockStmt, bool, bool)> {
         let start = self.current_span();
         self.expect(TokenKind::LeftBrace)?;
-
-        // Check for "use strict" directive before parsing statements.
-        let has_directive = self.check_directive_prologue();
-        let is_strict = self.strict_mode || has_directive;
-        if has_directive {
-            self.strict_mode = true;
-        }
-
         // Save and reset loop/breakable depths — a new function body starts
         // a fresh context for break/continue/return.
         let outer_function_depth = self.function_depth;
@@ -1182,31 +1185,44 @@ impl<'src> Parser<'src> {
         self.breakable_depth = outer_breakable_depth;
         self.labels = outer_labels;
 
-        let (body, end) = result?;
+        let (body, end, has_use_strict) = result?;
 
         Ok((
             BlockStmt {
                 loc: Self::merge_spans(start, end),
                 body,
             },
-            is_strict,
-            has_directive,
+            self.strict_mode,
+            has_use_strict,
         ))
     }
 
     /// Inner helper so that depth restore in [`parse_function_body`] always
     /// runs, even when the body contains a parse error.
-    fn parse_function_body_inner(&mut self, _start: Span) -> StatorResult<(Vec<Stmt>, Span)> {
+    fn parse_function_body_inner(&mut self, _start: Span) -> StatorResult<(Vec<Stmt>, Span, bool)> {
         let mut body = Vec::new();
+        let mut in_directive_prologue = true;
+        let mut has_use_strict = false;
         while self.peek_kind() != TokenKind::RightBrace {
             if self.peek_kind() == TokenKind::Eof {
                 return Err(self.error("unexpected end of input inside block"));
             }
-            body.push(self.parse_stmt()?);
+            let stmt = self.parse_stmt()?;
+            if in_directive_prologue {
+                if let Some(value) = Self::directive_prologue_value(&stmt) {
+                    if value == "use strict" {
+                        has_use_strict = true;
+                        self.strict_mode = true;
+                    }
+                } else {
+                    in_directive_prologue = false;
+                }
+            }
+            body.push(stmt);
         }
         let end = self.current_span();
         self.bump()?; // consume '}'
-        Ok((body, end))
+        Ok((body, end, has_use_strict))
     }
 
     // ── Class parsing ──────────────────────────────────────────────────────

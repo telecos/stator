@@ -32171,4 +32171,269 @@ mod tests {
         let result = global_eval("var s = new Set(null); s.size === 0").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
+
+    fn assert_strict_bool_eval(source: &str) {
+        assert_eq!(global_eval(source).unwrap(), JsValue::Boolean(true));
+    }
+
+    fn assert_strict_syntax_error(source: &str) {
+        assert!(matches!(
+            global_eval(source),
+            Err(StatorError::SyntaxError(_))
+        ));
+    }
+
+    #[test]
+    fn e2e_strict_top_level_plain_call_this_is_undefined() {
+        assert_strict_bool_eval(
+            r#""use strict"; function f() { return this === undefined; } f();"#,
+        );
+    }
+
+    #[test]
+    fn e2e_sloppy_top_level_plain_call_this_is_global_this() {
+        assert_strict_bool_eval("function f() { return this === globalThis; } f();");
+    }
+
+    #[test]
+    fn e2e_strict_plain_call_via_sequence_this_is_undefined() {
+        assert_strict_bool_eval(
+            r#""use strict"; function f() { return this === undefined; } (0, f)();"#,
+        );
+    }
+
+    #[test]
+    fn e2e_strict_plain_call_with_spread_this_is_undefined() {
+        assert_strict_bool_eval(
+            r#""use strict"; function f() { return this === undefined; } f(...[]);"#,
+        );
+    }
+
+    #[test]
+    fn e2e_strict_outer_plain_call_strict_inner_this_is_undefined() {
+        assert_strict_bool_eval(
+            r#""use strict";
+            function inner() { "use strict"; return this === undefined; }
+            function outer() { return inner(); }
+            outer();"#,
+        );
+    }
+
+    #[test]
+    fn e2e_strict_outer_plain_call_sloppy_inner_this_is_global_this() {
+        assert_strict_bool_eval(
+            r#""use strict";
+            function inner() { return this === globalThis; }
+            function outer() { return inner(); }
+            outer();"#,
+        );
+    }
+
+    #[test]
+    fn e2e_strict_program_directive_after_other_directive_enables_strict() {
+        assert_strict_bool_eval(
+            r#""use asm"; "use strict"; function f() { return this === undefined; } f();"#,
+        );
+    }
+
+    #[test]
+    fn e2e_strict_function_directive_after_other_directive_enables_strict() {
+        assert_strict_bool_eval(
+            r#"function f() { "use asm"; "use strict"; return this === undefined; } f();"#,
+        );
+    }
+
+    #[test]
+    fn e2e_strict_function_expr_directive_after_other_directive_enables_strict() {
+        assert_strict_bool_eval(
+            r#"var f = function() { "use asm"; "use strict"; return this === undefined; }; f();"#,
+        );
+    }
+
+    #[test]
+    fn e2e_strict_top_level_assignment_to_undeclared_throws_reference_error() {
+        assert_strict_bool_eval(
+            r#""use strict";
+            try { strict_missing_top_level = 1; false; }
+            catch (e) { e instanceof ReferenceError; }"#,
+        );
+    }
+
+    #[test]
+    fn e2e_strict_function_assignment_to_undeclared_throws_reference_error() {
+        assert_strict_bool_eval(
+            r#"function f() {
+                "use strict";
+                try { strict_missing_in_function = 1; return false; }
+                catch (e) { return e instanceof ReferenceError; }
+            }
+            f();"#,
+        );
+    }
+
+    #[test]
+    fn e2e_strict_function_second_directive_assignment_to_undeclared_throws_reference_error() {
+        assert_strict_bool_eval(
+            r#"function f() {
+                "use asm";
+                "use strict";
+                try { strict_missing_after_directive = 1; return false; }
+                catch (e) { return e instanceof ReferenceError; }
+            }
+            f();"#,
+        );
+    }
+
+    #[test]
+    fn e2e_sloppy_assignment_to_undeclared_creates_global() {
+        assert_strict_bool_eval(
+            "sloppy_created_binding = 1; sloppy_created_binding === 1 && globalThis.sloppy_created_binding === 1;",
+        );
+    }
+
+    #[test]
+    fn e2e_strict_duplicate_params_in_top_level_strict_function_decl_is_syntax_error() {
+        assert_strict_syntax_error(r#""use strict"; function f(a, a) { return a; }"#);
+    }
+
+    #[test]
+    fn e2e_strict_duplicate_params_in_function_decl_is_syntax_error() {
+        assert_strict_syntax_error(r#"function f(a, a) { "use strict"; return a; }"#);
+    }
+
+    #[test]
+    fn e2e_strict_duplicate_params_after_second_directive_in_function_decl_is_syntax_error() {
+        assert_strict_syntax_error(r#"function f(a, a) { "use asm"; "use strict"; return a; }"#);
+    }
+
+    #[test]
+    fn e2e_strict_duplicate_params_after_second_directive_in_function_expr_is_syntax_error() {
+        assert_strict_syntax_error(r#"(function(a, a) { "use asm"; "use strict"; return a; });"#);
+    }
+
+    #[test]
+    fn e2e_strict_non_simple_params_with_use_strict_directive_is_syntax_error() {
+        assert_strict_syntax_error(r#"function f(a = 1) { "use asm"; "use strict"; return a; }"#);
+    }
+
+    #[test]
+    fn e2e_strict_top_level_legacy_octal_is_syntax_error() {
+        assert_strict_syntax_error(r#""use strict"; 0123;"#);
+    }
+
+    #[test]
+    fn e2e_strict_program_second_directive_legacy_octal_is_syntax_error() {
+        assert_strict_syntax_error(r#""use asm"; "use strict"; 0123;"#);
+    }
+
+    #[test]
+    fn e2e_strict_function_second_directive_legacy_octal_is_syntax_error() {
+        assert_strict_syntax_error(r#"function f() { "use asm"; "use strict"; return 0123; }"#);
+    }
+
+    #[test]
+    fn e2e_strict_top_level_with_is_syntax_error() {
+        assert_strict_syntax_error(r#""use strict"; with ({ x: 1 }) x;"#);
+    }
+
+    #[test]
+    fn e2e_strict_program_second_directive_with_is_syntax_error() {
+        assert_strict_syntax_error(r#""use asm"; "use strict"; with ({ x: 1 }) x;"#);
+    }
+
+    #[test]
+    fn e2e_strict_function_second_directive_with_is_syntax_error() {
+        assert_strict_syntax_error(
+            r#"function f() { "use asm"; "use strict"; with ({ x: 1 }) return x; }"#,
+        );
+    }
+
+    #[test]
+    fn e2e_strict_arguments_callee_throws_type_error() {
+        assert_strict_bool_eval(
+            r#"function f() {
+                "use strict";
+                try { var x = arguments.callee; return false; }
+                catch (e) { return e instanceof TypeError; }
+            }
+            f();"#,
+        );
+    }
+
+    #[test]
+    fn e2e_strict_arguments_callee_after_second_directive_throws_type_error() {
+        assert_strict_bool_eval(
+            r#"function f() {
+                "use asm";
+                "use strict";
+                try { var x = arguments.callee; return false; }
+                catch (e) { return e instanceof TypeError; }
+            }
+            f();"#,
+        );
+    }
+
+    #[test]
+    fn e2e_strict_function_expr_arguments_callee_throws_type_error() {
+        assert_strict_bool_eval(
+            r#"(function() {
+                "use strict";
+                try { var x = arguments.callee; return false; }
+                catch (e) { return e instanceof TypeError; }
+            })();"#,
+        );
+    }
+
+    #[test]
+    fn e2e_sloppy_arguments_callee_returns_current_function() {
+        assert_strict_bool_eval("function f() { return arguments.callee === f; } f();");
+    }
+
+    #[test]
+    fn e2e_class_method_plain_call_this_is_undefined() {
+        assert_strict_bool_eval(
+            "class C { m() { return this === undefined; } } var m = new C().m; m();",
+        );
+    }
+
+    #[test]
+    fn e2e_class_method_assignment_to_undeclared_throws_reference_error() {
+        assert_strict_bool_eval(
+            r#"class C {
+                m() {
+                    try { strict_missing_in_class_method = 1; return false; }
+                    catch (e) { return e instanceof ReferenceError; }
+                }
+            }
+            new C().m();"#,
+        );
+    }
+
+    #[test]
+    fn e2e_class_method_arguments_callee_throws_type_error() {
+        assert_strict_bool_eval(
+            r#"class C {
+                m() {
+                    try { var x = arguments.callee; return false; }
+                    catch (e) { return e instanceof TypeError; }
+                }
+            }
+            new C().m();"#,
+        );
+    }
+
+    #[test]
+    fn e2e_class_method_with_is_syntax_error() {
+        assert_strict_syntax_error(r#"class C { m() { with ({ x: 1 }) return x; } }"#);
+    }
+
+    #[test]
+    fn e2e_class_method_legacy_octal_is_syntax_error() {
+        assert_strict_syntax_error(r#"class C { m() { return 0123; } }"#);
+    }
+
+    #[test]
+    fn e2e_class_method_duplicate_params_is_syntax_error() {
+        assert_strict_syntax_error(r#"class C { m(a, a) {} }"#);
+    }
 }

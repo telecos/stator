@@ -82,6 +82,56 @@ pub(super) type OpcodeHandler =
 /// Number of opcode variants (= `Opcode::Illegal as usize + 1`).
 const OPCODE_COUNT: usize = 193;
 
+fn plain_call_this_value(
+    frame: &InterpreterFrame,
+    bytecode: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
+) -> Option<JsValue> {
+    if bytecode.is_arrow() {
+        None
+    } else if bytecode.is_strict() {
+        Some(JsValue::Undefined)
+    } else {
+        Some(
+            frame
+                .global_env
+                .borrow()
+                .get("globalThis")
+                .cloned()
+                .unwrap_or(JsValue::Undefined),
+        )
+    }
+}
+
+fn install_plain_call_this(
+    frame: &mut InterpreterFrame,
+    bytecode: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
+) -> Option<Option<JsValue>> {
+    let next_this = plain_call_this_value(frame, bytecode)?;
+    let old_this = frame.global_env.borrow().get("this").cloned();
+    frame
+        .global_env
+        .borrow_mut()
+        .insert("this".to_string(), next_this);
+    Some(old_this)
+}
+
+fn restore_plain_call_this(frame: &mut InterpreterFrame, saved_this: Option<Option<JsValue>>) {
+    let Some(saved_this) = saved_this else {
+        return;
+    };
+    match saved_this {
+        Some(value) => {
+            frame
+                .global_env
+                .borrow_mut()
+                .insert("this".to_string(), value);
+        }
+        None => {
+            frame.global_env.borrow_mut().remove("this");
+        }
+    }
+}
+
 #[inline]
 fn handle_lda_zero(
     ctx: &mut DispatchContext,
@@ -1242,6 +1292,7 @@ fn handle_call_any_receiver(
                     tried_jit = true;
                 }
                 if !tried_jit {
+                    let saved_this = install_plain_call_this(ctx.frame, &ba);
                     let callee_val = JsValue::Function(Rc::clone(&ba));
                     let mut callee_frame = InterpreterFrame::new_with_globals(
                         (*ba).clone(),
@@ -1255,6 +1306,7 @@ fn handle_call_any_receiver(
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
+                    restore_plain_call_this(ctx.frame, saved_this);
                     ctx.frame.accumulator = result?;
                 }
             }
@@ -1334,6 +1386,8 @@ fn handle_tail_call(
                     tried_jit = true;
                 }
                 if !tried_jit {
+                    let next_this = plain_call_this_value(ctx.frame, &ba);
+                    let saved_this = install_plain_call_this(ctx.frame, &ba);
                     // ── Proper tail call: reuse the frame ─
                     let new_ba = (*ba).clone();
                     let param_count = new_ba.parameter_count() as usize;
@@ -1354,6 +1408,9 @@ fn handle_tail_call(
                     ctx.frame.poly_load_cache.clear();
                     ctx.frame.shape_load_ic.clear();
                     ctx.frame.shape_store_ic.clear();
+                    if next_this.is_none() {
+                        restore_plain_call_this(ctx.frame, saved_this);
+                    }
                     return Ok(DispatchAction::TailCall);
                 }
             }
@@ -1413,18 +1470,7 @@ fn handle_call_undefined_receiver0(
                     tried_jit = true;
                 }
                 if !tried_jit {
-                    // Arrow functions use lexical `this` — skip override.
-                    // Strict mode: `this` is undefined for free function calls.
-                    let saved_this = if !ba.is_arrow() && ba.is_strict() {
-                        let old = ctx.frame.global_env.borrow().get("this").cloned();
-                        ctx.frame
-                            .global_env
-                            .borrow_mut()
-                            .insert("this".to_string(), JsValue::Undefined);
-                        old
-                    } else {
-                        None
-                    };
+                    let saved_this = install_plain_call_this(ctx.frame, &ba);
                     let mut callee_frame = InterpreterFrame::new_with_globals(
                         (*ba).clone(),
                         args,
@@ -1437,19 +1483,7 @@ fn handle_call_undefined_receiver0(
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
-                    if !ba.is_arrow() && ba.is_strict() {
-                        match saved_this {
-                            Some(v) => {
-                                ctx.frame
-                                    .global_env
-                                    .borrow_mut()
-                                    .insert("this".to_string(), v);
-                            }
-                            None => {
-                                ctx.frame.global_env.borrow_mut().remove("this");
-                            }
-                        }
-                    }
+                    restore_plain_call_this(ctx.frame, saved_this);
                     ctx.frame.accumulator = result?;
                 }
             }
@@ -1513,17 +1547,7 @@ fn handle_call_undefined_receiver1(
                     tried_jit = true;
                 }
                 if !tried_jit {
-                    // Arrow functions use lexical `this` — skip override.
-                    let saved_this = if !ba.is_arrow() && ba.is_strict() {
-                        let old = ctx.frame.global_env.borrow().get("this").cloned();
-                        ctx.frame
-                            .global_env
-                            .borrow_mut()
-                            .insert("this".to_string(), JsValue::Undefined);
-                        old
-                    } else {
-                        None
-                    };
+                    let saved_this = install_plain_call_this(ctx.frame, &ba);
                     let mut callee_frame = InterpreterFrame::new_with_globals(
                         (*ba).clone(),
                         args,
@@ -1536,19 +1560,7 @@ fn handle_call_undefined_receiver1(
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
-                    if !ba.is_arrow() && ba.is_strict() {
-                        match saved_this {
-                            Some(v) => {
-                                ctx.frame
-                                    .global_env
-                                    .borrow_mut()
-                                    .insert("this".to_string(), v);
-                            }
-                            None => {
-                                ctx.frame.global_env.borrow_mut().remove("this");
-                            }
-                        }
-                    }
+                    restore_plain_call_this(ctx.frame, saved_this);
                     ctx.frame.accumulator = result?;
                 }
             }
@@ -1621,17 +1633,7 @@ fn handle_call_undefined_receiver2(
                     tried_jit = true;
                 }
                 if !tried_jit {
-                    // Arrow functions use lexical `this` — skip override.
-                    let saved_this = if !ba.is_arrow() && ba.is_strict() {
-                        let old = ctx.frame.global_env.borrow().get("this").cloned();
-                        ctx.frame
-                            .global_env
-                            .borrow_mut()
-                            .insert("this".to_string(), JsValue::Undefined);
-                        old
-                    } else {
-                        None
-                    };
+                    let saved_this = install_plain_call_this(ctx.frame, &ba);
                     let mut callee_frame = InterpreterFrame::new_with_globals(
                         (*ba).clone(),
                         args,
@@ -1644,19 +1646,7 @@ fn handle_call_undefined_receiver2(
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
-                    if !ba.is_arrow() && ba.is_strict() {
-                        match saved_this {
-                            Some(v) => {
-                                ctx.frame
-                                    .global_env
-                                    .borrow_mut()
-                                    .insert("this".to_string(), v);
-                            }
-                            None => {
-                                ctx.frame.global_env.borrow_mut().remove("this");
-                            }
-                        }
-                    }
+                    restore_plain_call_this(ctx.frame, saved_this);
                     ctx.frame.accumulator = result?;
                 }
             }
@@ -1727,6 +1717,7 @@ fn handle_call_property(
                 tried_jit = true;
             }
             if !tried_jit {
+                let saved_this = install_plain_call_this(ctx.frame, &ba);
                 let mut callee_frame = InterpreterFrame::new_with_globals(
                     (*ba).clone(),
                     args,
@@ -1746,6 +1737,7 @@ fn handle_call_property(
                     Interpreter::run(&mut callee_frame)
                 });
                 pop_call_frame();
+                restore_plain_call_this(ctx.frame, saved_this);
                 ctx.frame.accumulator = result?;
             }
         }
@@ -4953,8 +4945,13 @@ fn handle_create_unmapped_arguments(
         JsValue::Smi(args.len() as i32),
         PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
     );
-    map.insert(
+    map.insert_with_attrs(
         "callee".to_string(),
+        JsValue::Undefined,
+        PropertyAttributes::CONFIGURABLE,
+    );
+    map.insert(
+        "__get_callee__".to_string(),
         JsValue::NativeFunction(Rc::new(|_args: Vec<JsValue>| {
             Err(StatorError::TypeError(
                 "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them".into(),
@@ -6007,6 +6004,7 @@ fn handle_call_direct_eval(
                 if ba.is_generator() {
                     ctx.frame.accumulator = JsValue::Generator(GeneratorState::new((*ba).clone()));
                 } else {
+                    let saved_this = install_plain_call_this(ctx.frame, &ba);
                     let mut callee_frame = InterpreterFrame::new_with_globals(
                         (*ba).clone(),
                         args,
@@ -6019,6 +6017,7 @@ fn handle_call_direct_eval(
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
+                    restore_plain_call_this(ctx.frame, saved_this);
                     ctx.frame.accumulator = result?;
                 }
             }

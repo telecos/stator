@@ -6109,11 +6109,14 @@ fn compile_function_inner(
     // Arrow functions do NOT get their own `arguments` object — they
     // inherit the enclosing function's `arguments` (ES §15.3.4).
     if !is_arrow {
-        // Create the `arguments` object and bind it as a local variable.
-        compiler.emit(Instruction::new_unchecked(
-            Opcode::CreateMappedArguments,
-            vec![],
-        ));
+        // Strict functions use an unmapped `arguments` object so that
+        // `arguments.callee` traps and parameter aliasing is disabled.
+        let arguments_opcode = if is_strict {
+            Opcode::CreateUnmappedArguments
+        } else {
+            Opcode::CreateMappedArguments
+        };
+        compiler.emit(Instruction::new_unchecked(arguments_opcode, vec![]));
         let args_reg = compiler.define_local("arguments");
         compiler.emit_star(args_reg);
     }
