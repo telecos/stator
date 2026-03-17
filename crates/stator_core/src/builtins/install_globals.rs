@@ -14890,17 +14890,33 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         // ── globalThis (ECMAScript §19.1) ───────────────────────────────────
         // `globalThis` is a self-referential property of the global object.
         // The inner map is shared via `Rc` so that `globalThis.globalThis`
-        // resolves back to the same object (configurable, writable, not enumerable).
+        // resolves back to the same object.
+        //
+        // Per the ES spec, global properties have specific descriptor
+        // attributes:
+        //  - Value properties (undefined, NaN, Infinity): {W:0, E:0, C:0}
+        //  - Everything else (constructors, functions, namespaces,
+        //    globalThis): {W:1, E:0, C:1}
+        let non_writable_non_configurable = PropertyAttributes::empty();
+        let builtin_attrs = PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE;
         let mut inner_props = PropertyMap::new();
         for (k, v) in globals.iter() {
-            inner_props.insert(k.clone(), v.clone());
+            let attrs = match k.as_str() {
+                "undefined" | "NaN" | "Infinity" => non_writable_non_configurable,
+                _ => builtin_attrs,
+            };
+            inner_props.insert_with_attrs(k.clone(), v.clone(), attrs);
         }
         let inner = Rc::new(RefCell::new(inner_props));
         let global_object = JsValue::PlainObject(Rc::clone(&inner));
         {
             let mut inner_borrow = inner.borrow_mut();
-            inner_borrow.insert("globalThis".into(), global_object.clone());
-            inner_borrow.insert("this".into(), global_object.clone());
+            inner_borrow.insert_with_attrs(
+                "globalThis".into(),
+                global_object.clone(),
+                builtin_attrs,
+            );
+            inner_borrow.insert_with_attrs("this".into(), global_object.clone(), builtin_attrs);
         }
         globals.insert("globalThis".into(), global_object.clone());
         globals.insert("this".into(), global_object);
