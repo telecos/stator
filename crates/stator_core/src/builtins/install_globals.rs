@@ -120,6 +120,10 @@ use crate::builtins::symbol::{
     SYMBOL_UNSCOPABLES, property_key_to_symbol, symbol_create, symbol_description, symbol_for,
     symbol_key_for,
 };
+use crate::builtins::temporal::{
+    Duration as TemporalDuration, Instant as TemporalInstant, PlainDate as TemporalPlainDate,
+    PlainTime as TemporalPlainTime,
+};
 use crate::builtins::typed_array::{
     JsArrayBuffer, TypedArrayKind, arraybuffer_detached, arraybuffer_max_byte_length,
     arraybuffer_new, arraybuffer_new_resizable, arraybuffer_resizable, arraybuffer_resize,
@@ -142,11 +146,11 @@ use crate::interpreter::{
     current_global_env, dispatch_call_value, dispatch_call_with_this, dispatch_construct_call,
     dispatch_get_property_value, dispatch_set_property_value, function_display_name,
     function_length_value, function_to_string_value, get_object_prototype, has_prototype_in_chain,
-    ordinary_set_prototype_of, plain_object_has_own_property,
+    ordinary_set_prototype_of, plain_object_has_own_property, proto_lookup,
 };
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
-use crate::objects::property_map::PropertyMap;
+use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 use crate::objects::value::{JsValue, NativeIterator, ToPrimitiveHint, number_to_string};
 use std::collections::HashSet;
 
@@ -2849,6 +2853,217 @@ fn is_callable_value(value: &JsValue) -> bool {
                     Some(JsValue::NativeFunction(_)) | Some(JsValue::Function(_))
                 )
         )
+}
+
+const TEMPORAL_KIND_SLOT: &str = "__temporal_kind__";
+
+fn temporal_current_this() -> JsValue {
+    current_global_env()
+        .and_then(|globals| globals.borrow().get("this").cloned())
+        .unwrap_or(JsValue::Undefined)
+}
+
+fn temporal_receiver<'a>(
+    receiver: &'a JsValue,
+    expected_kind: &str,
+    display_name: &str,
+) -> StatorResult<&'a Rc<RefCell<PropertyMap>>> {
+    let JsValue::PlainObject(map) = receiver else {
+        return Err(StatorError::TypeError(format!(
+            "{display_name} called on incompatible receiver"
+        )));
+    };
+
+    let borrow = map.borrow();
+    let is_expected = matches!(
+        borrow.get(TEMPORAL_KIND_SLOT),
+        Some(JsValue::String(kind)) if kind.as_ref() == expected_kind
+    );
+    drop(borrow);
+
+    if !is_expected {
+        return Err(StatorError::TypeError(format!(
+            "{display_name} called on incompatible receiver"
+        )));
+    }
+
+    Ok(map)
+}
+
+fn temporal_slot(
+    receiver: &JsValue,
+    expected_kind: &str,
+    slot: &str,
+    display_name: &str,
+) -> StatorResult<JsValue> {
+    let map = temporal_receiver(receiver, expected_kind, display_name)?;
+    map.borrow().get(slot).cloned().ok_or_else(|| {
+        StatorError::TypeError(format!("{display_name} called on incompatible receiver"))
+    })
+}
+
+fn temporal_number_field(args: &[JsValue], key: &str) -> StatorResult<f64> {
+    let value = args.first().cloned().unwrap_or(JsValue::Undefined);
+    let field = dispatch_get_property_value(&value, JsValue::String(key.to_string().into()))?;
+    if matches!(field, JsValue::Undefined) {
+        Ok(0.0)
+    } else {
+        field.to_number()
+    }
+}
+
+fn parse_temporal_plain_date(input: &str) -> Option<TemporalPlainDate> {
+    let mut parts = input.trim().split('-');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = parts.next()?.parse::<u8>().ok()?;
+    let day = parts.next()?.parse::<u8>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    TemporalPlainDate::new(year, month, day)
+}
+
+fn parse_temporal_plain_time(input: &str) -> Option<TemporalPlainTime> {
+    let mut parts = input.trim().split(':');
+    let hour = parts.next()?.parse::<u8>().ok()?;
+    let minute = parts.next()?.parse::<u8>().ok()?;
+    let second = parts.next()?.parse::<u8>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    TemporalPlainTime::new(hour, minute, second, 0, 0, 0)
+}
+
+fn parse_temporal_epoch_milliseconds(input: &str) -> Option<i64> {
+    input.trim().parse::<i64>().ok()
+}
+
+fn make_temporal_plain_date_instance(date: TemporalPlainDate, proto: &JsValue) -> JsValue {
+    let mut obj = PropertyMap::new();
+    obj.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), proto.clone());
+    obj.insert(
+        TEMPORAL_KIND_SLOT.into(),
+        JsValue::String("PlainDate".into()),
+    );
+    obj.insert("__temporal_year__".into(), JsValue::Smi(date.year()));
+    obj.insert(
+        "__temporal_month__".into(),
+        JsValue::Smi(i32::from(date.month())),
+    );
+    obj.insert(
+        "__temporal_day__".into(),
+        JsValue::Smi(i32::from(date.day())),
+    );
+    obj.insert(
+        "@@toStringTag".into(),
+        JsValue::String("Temporal.PlainDate".into()),
+    );
+    obj.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(obj)))
+}
+
+fn make_temporal_plain_time_instance(time: TemporalPlainTime, proto: &JsValue) -> JsValue {
+    let mut obj = PropertyMap::new();
+    obj.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), proto.clone());
+    obj.insert(
+        TEMPORAL_KIND_SLOT.into(),
+        JsValue::String("PlainTime".into()),
+    );
+    obj.insert(
+        "__temporal_hour__".into(),
+        JsValue::Smi(i32::from(time.hour())),
+    );
+    obj.insert(
+        "__temporal_minute__".into(),
+        JsValue::Smi(i32::from(time.minute())),
+    );
+    obj.insert(
+        "__temporal_second__".into(),
+        JsValue::Smi(i32::from(time.second())),
+    );
+    obj.insert(
+        "@@toStringTag".into(),
+        JsValue::String("Temporal.PlainTime".into()),
+    );
+    obj.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(obj)))
+}
+
+fn make_temporal_duration_instance(duration: TemporalDuration, proto: &JsValue) -> JsValue {
+    let mut obj = PropertyMap::new();
+    obj.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), proto.clone());
+    obj.insert(
+        TEMPORAL_KIND_SLOT.into(),
+        JsValue::String("Duration".into()),
+    );
+    obj.insert("__temporal_years__".into(), JsValue::Smi(duration.years));
+    obj.insert("__temporal_months__".into(), JsValue::Smi(duration.months));
+    obj.insert("__temporal_weeks__".into(), JsValue::Smi(duration.weeks));
+    obj.insert("__temporal_days__".into(), JsValue::Smi(duration.days));
+    obj.insert("__temporal_hours__".into(), num(duration.hours as f64));
+    obj.insert("__temporal_minutes__".into(), num(duration.minutes as f64));
+    obj.insert("__temporal_seconds__".into(), num(duration.seconds as f64));
+    obj.insert(
+        "__temporal_milliseconds__".into(),
+        num(duration.milliseconds as f64),
+    );
+    obj.insert(
+        "__temporal_microseconds__".into(),
+        num(duration.microseconds as f64),
+    );
+    obj.insert(
+        "__temporal_nanoseconds__".into(),
+        num(duration.nanoseconds as f64),
+    );
+    obj.insert(
+        "@@toStringTag".into(),
+        JsValue::String("Temporal.Duration".into()),
+    );
+    obj.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(obj)))
+}
+
+fn make_temporal_instant_instance(instant: TemporalInstant, proto: &JsValue) -> JsValue {
+    let mut obj = PropertyMap::new();
+    obj.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), proto.clone());
+    obj.insert(TEMPORAL_KIND_SLOT.into(), JsValue::String("Instant".into()));
+    obj.insert(
+        "__temporal_epoch_milliseconds__".into(),
+        num(instant.epoch_milliseconds() as f64),
+    );
+    obj.insert(
+        "@@toStringTag".into(),
+        JsValue::String("Temporal.Instant".into()),
+    );
+    obj.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(obj)))
+}
+
+fn make_temporal_zoned_date_time_instance(
+    epoch_milliseconds: i64,
+    time_zone: String,
+    proto: &JsValue,
+) -> JsValue {
+    let mut obj = PropertyMap::new();
+    obj.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), proto.clone());
+    obj.insert(
+        TEMPORAL_KIND_SLOT.into(),
+        JsValue::String("ZonedDateTime".into()),
+    );
+    obj.insert(
+        "__temporal_epoch_milliseconds__".into(),
+        num(epoch_milliseconds as f64),
+    );
+    obj.insert(
+        "__temporal_time_zone__".into(),
+        JsValue::String(time_zone.into()),
+    );
+    obj.insert(
+        "@@toStringTag".into(),
+        JsValue::String("Temporal.ZonedDateTime".into()),
+    );
+    obj.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(obj)))
 }
 
 /// Deep-clone a `JsValue`, recursing into plain objects and arrays.
@@ -12261,6 +12476,496 @@ fn make_intl() -> JsValue {
     })
 }
 
+#[inline(never)]
+fn make_temporal() -> JsValue {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
+        let mut ns = PropertyMap::new();
+
+        let plain_date_proto = Rc::new(RefCell::new({
+            let mut proto = PropertyMap::new();
+            proto.insert_with_attrs(
+                "__get_year__".into(),
+                native(|_| {
+                    let receiver = temporal_current_this();
+                    temporal_slot(
+                        &receiver,
+                        "PlainDate",
+                        "__temporal_year__",
+                        "get Temporal.PlainDate.prototype.year",
+                    )
+                }),
+                PropertyAttributes::CONFIGURABLE,
+            );
+            proto.insert_with_attrs(
+                "__get_month__".into(),
+                native(|_| {
+                    let receiver = temporal_current_this();
+                    temporal_slot(
+                        &receiver,
+                        "PlainDate",
+                        "__temporal_month__",
+                        "get Temporal.PlainDate.prototype.month",
+                    )
+                }),
+                PropertyAttributes::CONFIGURABLE,
+            );
+            proto.insert_with_attrs(
+                "__get_day__".into(),
+                native(|_| {
+                    let receiver = temporal_current_this();
+                    temporal_slot(
+                        &receiver,
+                        "PlainDate",
+                        "__temporal_day__",
+                        "get Temporal.PlainDate.prototype.day",
+                    )
+                }),
+                PropertyAttributes::CONFIGURABLE,
+            );
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("Temporal.PlainDate".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
+            proto.make_all_non_enumerable();
+            proto
+        }));
+        ns.insert("PlainDate".into(), {
+            let mut ctor = PropertyMap::new();
+            let ctor_proto = JsValue::PlainObject(Rc::clone(&plain_date_proto));
+            {
+                let proto_for_ctor = ctor_proto.clone();
+                ctor.insert(
+                    "__call__".into(),
+                    native(move |args| {
+                        let year = arg_f64(&args, 0)?.trunc() as i32;
+                        let month = arg_f64(&args, 1)?.trunc() as u8;
+                        let day = arg_f64(&args, 2)?.trunc() as u8;
+                        let date = TemporalPlainDate::new(year, month, day).ok_or_else(|| {
+                            StatorError::RangeError("invalid Temporal.PlainDate".into())
+                        })?;
+                        Ok(make_temporal_plain_date_instance(date, &proto_for_ctor))
+                    }),
+                );
+            }
+            {
+                let proto_for_from = ctor_proto.clone();
+                ctor.insert(
+                    "from".into(),
+                    builtin_fn("from", 1, move |args| {
+                        let value = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let input = value.to_js_string()?;
+                        let date = parse_temporal_plain_date(&input).ok_or_else(|| {
+                            StatorError::RangeError("invalid Temporal.PlainDate string".into())
+                        })?;
+                        Ok(make_temporal_plain_date_instance(date, &proto_for_from))
+                    }),
+                );
+            }
+            ctor.insert("prototype".into(), ctor_proto);
+            finalize_ctor(
+                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
+                "PlainDate",
+            )
+        });
+
+        let plain_time_proto = Rc::new(RefCell::new({
+            let mut proto = PropertyMap::new();
+            for (visible, slot, display) in [
+                (
+                    "hour",
+                    "__temporal_hour__",
+                    "get Temporal.PlainTime.prototype.hour",
+                ),
+                (
+                    "minute",
+                    "__temporal_minute__",
+                    "get Temporal.PlainTime.prototype.minute",
+                ),
+                (
+                    "second",
+                    "__temporal_second__",
+                    "get Temporal.PlainTime.prototype.second",
+                ),
+            ] {
+                proto.insert_with_attrs(
+                    format!("__get_{visible}__"),
+                    native(move |_| {
+                        let receiver = temporal_current_this();
+                        temporal_slot(&receiver, "PlainTime", slot, display)
+                    }),
+                    PropertyAttributes::CONFIGURABLE,
+                );
+            }
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("Temporal.PlainTime".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
+            proto.make_all_non_enumerable();
+            proto
+        }));
+        ns.insert("PlainTime".into(), {
+            let mut ctor = PropertyMap::new();
+            let ctor_proto = JsValue::PlainObject(Rc::clone(&plain_time_proto));
+            {
+                let proto_for_ctor = ctor_proto.clone();
+                ctor.insert(
+                    "__call__".into(),
+                    native(move |args| {
+                        let hour = arg_f64(&args, 0)?.trunc() as u8;
+                        let minute = arg_f64(&args, 1)?.trunc() as u8;
+                        let second = arg_f64(&args, 2)?.trunc() as u8;
+                        let time = TemporalPlainTime::new(hour, minute, second, 0, 0, 0)
+                            .ok_or_else(|| {
+                                StatorError::RangeError("invalid Temporal.PlainTime".into())
+                            })?;
+                        Ok(make_temporal_plain_time_instance(time, &proto_for_ctor))
+                    }),
+                );
+            }
+            {
+                let proto_for_from = ctor_proto.clone();
+                ctor.insert(
+                    "from".into(),
+                    builtin_fn("from", 1, move |args| {
+                        let value = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let input = value.to_js_string()?;
+                        let time = parse_temporal_plain_time(&input).ok_or_else(|| {
+                            StatorError::RangeError("invalid Temporal.PlainTime string".into())
+                        })?;
+                        Ok(make_temporal_plain_time_instance(time, &proto_for_from))
+                    }),
+                );
+            }
+            ctor.insert("prototype".into(), ctor_proto);
+            finalize_ctor(
+                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
+                "PlainTime",
+            )
+        });
+
+        let instant_proto = Rc::new(RefCell::new({
+            let mut proto = PropertyMap::new();
+            proto.insert_with_attrs(
+                "__get_epochMilliseconds__".into(),
+                native(|_| {
+                    let receiver = temporal_current_this();
+                    temporal_slot(
+                        &receiver,
+                        "Instant",
+                        "__temporal_epoch_milliseconds__",
+                        "get Temporal.Instant.prototype.epochMilliseconds",
+                    )
+                }),
+                PropertyAttributes::CONFIGURABLE,
+            );
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("Temporal.Instant".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
+            proto.make_all_non_enumerable();
+            proto
+        }));
+        ns.insert("Instant".into(), {
+            let mut ctor = PropertyMap::new();
+            let ctor_proto = JsValue::PlainObject(Rc::clone(&instant_proto));
+            {
+                let proto_for_ctor = ctor_proto.clone();
+                ctor.insert(
+                    "__call__".into(),
+                    native(move |args| {
+                        let epoch_ms = arg_f64(&args, 0)?.trunc() as i64;
+                        let ns = i128::from(epoch_ms) * 1_000_000;
+                        let instant =
+                            TemporalInstant::from_epoch_nanoseconds(ns).ok_or_else(|| {
+                                StatorError::RangeError("invalid Temporal.Instant".into())
+                            })?;
+                        Ok(make_temporal_instant_instance(instant, &proto_for_ctor))
+                    }),
+                );
+            }
+            {
+                let proto_for_from = ctor_proto.clone();
+                ctor.insert(
+                    "from".into(),
+                    builtin_fn("from", 1, move |args| {
+                        let value = args.first().cloned().unwrap_or(JsValue::Undefined);
+                        let epoch_ms = match value {
+                            JsValue::String(text) => parse_temporal_epoch_milliseconds(&text)
+                                .ok_or_else(|| {
+                                    StatorError::RangeError("invalid Temporal.Instant epoch".into())
+                                })?,
+                            JsValue::Smi(v) => i64::from(v),
+                            JsValue::HeapNumber(v) => v.trunc() as i64,
+                            other => other
+                                .to_js_string()
+                                .ok()
+                                .and_then(|text| parse_temporal_epoch_milliseconds(&text))
+                                .ok_or_else(|| {
+                                    StatorError::RangeError("invalid Temporal.Instant epoch".into())
+                                })?,
+                        };
+                        let ns = i128::from(epoch_ms) * 1_000_000;
+                        let instant =
+                            TemporalInstant::from_epoch_nanoseconds(ns).ok_or_else(|| {
+                                StatorError::RangeError("invalid Temporal.Instant epoch".into())
+                            })?;
+                        Ok(make_temporal_instant_instance(instant, &proto_for_from))
+                    }),
+                );
+            }
+            ctor.insert("prototype".into(), ctor_proto);
+            finalize_ctor(JsValue::PlainObject(Rc::new(RefCell::new(ctor))), "Instant")
+        });
+
+        let duration_proto = Rc::new(RefCell::new({
+            let mut proto = PropertyMap::new();
+            for (visible, slot, display) in [
+                (
+                    "years",
+                    "__temporal_years__",
+                    "get Temporal.Duration.prototype.years",
+                ),
+                (
+                    "months",
+                    "__temporal_months__",
+                    "get Temporal.Duration.prototype.months",
+                ),
+                (
+                    "weeks",
+                    "__temporal_weeks__",
+                    "get Temporal.Duration.prototype.weeks",
+                ),
+                (
+                    "days",
+                    "__temporal_days__",
+                    "get Temporal.Duration.prototype.days",
+                ),
+                (
+                    "hours",
+                    "__temporal_hours__",
+                    "get Temporal.Duration.prototype.hours",
+                ),
+                (
+                    "minutes",
+                    "__temporal_minutes__",
+                    "get Temporal.Duration.prototype.minutes",
+                ),
+                (
+                    "seconds",
+                    "__temporal_seconds__",
+                    "get Temporal.Duration.prototype.seconds",
+                ),
+                (
+                    "milliseconds",
+                    "__temporal_milliseconds__",
+                    "get Temporal.Duration.prototype.milliseconds",
+                ),
+                (
+                    "microseconds",
+                    "__temporal_microseconds__",
+                    "get Temporal.Duration.prototype.microseconds",
+                ),
+                (
+                    "nanoseconds",
+                    "__temporal_nanoseconds__",
+                    "get Temporal.Duration.prototype.nanoseconds",
+                ),
+            ] {
+                proto.insert_with_attrs(
+                    format!("__get_{visible}__"),
+                    native(move |_| {
+                        let receiver = temporal_current_this();
+                        temporal_slot(&receiver, "Duration", slot, display)
+                    }),
+                    PropertyAttributes::CONFIGURABLE,
+                );
+            }
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("Temporal.Duration".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
+            proto.make_all_non_enumerable();
+            proto
+        }));
+        ns.insert("Duration".into(), {
+            let mut ctor = PropertyMap::new();
+            let ctor_proto = JsValue::PlainObject(Rc::clone(&duration_proto));
+            {
+                let proto_for_ctor = ctor_proto.clone();
+                ctor.insert(
+                    "__call__".into(),
+                    native(move |args| {
+                        let duration = TemporalDuration::new(
+                            arg_f64(&args, 0)?.trunc() as i32,
+                            arg_f64(&args, 1)?.trunc() as i32,
+                            arg_f64(&args, 2)?.trunc() as i32,
+                            arg_f64(&args, 3)?.trunc() as i32,
+                            arg_f64(&args, 4)?.trunc() as i64,
+                            arg_f64(&args, 5)?.trunc() as i64,
+                            arg_f64(&args, 6)?.trunc() as i64,
+                            arg_f64(&args, 7)?.trunc() as i64,
+                            arg_f64(&args, 8)?.trunc() as i64,
+                            arg_f64(&args, 9)?.trunc() as i64,
+                        )
+                        .ok_or_else(|| {
+                            StatorError::RangeError("invalid Temporal.Duration".into())
+                        })?;
+                        Ok(make_temporal_duration_instance(duration, &proto_for_ctor))
+                    }),
+                );
+            }
+            {
+                let proto_for_from = ctor_proto.clone();
+                ctor.insert(
+                    "from".into(),
+                    builtin_fn("from", 1, move |args| {
+                        let duration = TemporalDuration::new(
+                            temporal_number_field(&args, "years")?.trunc() as i32,
+                            temporal_number_field(&args, "months")?.trunc() as i32,
+                            temporal_number_field(&args, "weeks")?.trunc() as i32,
+                            temporal_number_field(&args, "days")?.trunc() as i32,
+                            temporal_number_field(&args, "hours")?.trunc() as i64,
+                            temporal_number_field(&args, "minutes")?.trunc() as i64,
+                            temporal_number_field(&args, "seconds")?.trunc() as i64,
+                            temporal_number_field(&args, "milliseconds")?.trunc() as i64,
+                            temporal_number_field(&args, "microseconds")?.trunc() as i64,
+                            temporal_number_field(&args, "nanoseconds")?.trunc() as i64,
+                        )
+                        .ok_or_else(|| {
+                            StatorError::RangeError("invalid Temporal.Duration".into())
+                        })?;
+                        Ok(make_temporal_duration_instance(duration, &proto_for_from))
+                    }),
+                );
+            }
+            ctor.insert("prototype".into(), ctor_proto);
+            finalize_ctor(
+                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
+                "Duration",
+            )
+        });
+
+        let zoned_date_time_proto = Rc::new(RefCell::new({
+            let mut proto = PropertyMap::new();
+            proto.insert_with_attrs(
+                "__get_epochMilliseconds__".into(),
+                native(|_| {
+                    let receiver = temporal_current_this();
+                    temporal_slot(
+                        &receiver,
+                        "ZonedDateTime",
+                        "__temporal_epoch_milliseconds__",
+                        "get Temporal.ZonedDateTime.prototype.epochMilliseconds",
+                    )
+                }),
+                PropertyAttributes::CONFIGURABLE,
+            );
+            proto.insert_with_attrs(
+                "__get_timeZone__".into(),
+                native(|_| {
+                    let receiver = temporal_current_this();
+                    temporal_slot(
+                        &receiver,
+                        "ZonedDateTime",
+                        "__temporal_time_zone__",
+                        "get Temporal.ZonedDateTime.prototype.timeZone",
+                    )
+                }),
+                PropertyAttributes::CONFIGURABLE,
+            );
+            proto.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("Temporal.ZonedDateTime".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
+            proto.make_all_non_enumerable();
+            proto
+        }));
+        ns.insert("ZonedDateTime".into(), {
+            let mut ctor = PropertyMap::new();
+            let ctor_proto = JsValue::PlainObject(Rc::clone(&zoned_date_time_proto));
+            {
+                let proto_for_ctor = ctor_proto.clone();
+                ctor.insert(
+                    "__call__".into(),
+                    native(move |args| {
+                        let epoch_ms = arg_f64(&args, 0)?.trunc() as i64;
+                        let time_zone = args
+                            .get(1)
+                            .cloned()
+                            .unwrap_or(JsValue::String("UTC".into()))
+                            .to_js_string()?;
+                        Ok(make_temporal_zoned_date_time_instance(
+                            epoch_ms,
+                            time_zone,
+                            &proto_for_ctor,
+                        ))
+                    }),
+                );
+            }
+            ctor.insert("prototype".into(), ctor_proto);
+            finalize_ctor(
+                JsValue::PlainObject(Rc::new(RefCell::new(ctor))),
+                "ZonedDateTime",
+            )
+        });
+
+        ns.insert("Now".into(), {
+            let mut now = PropertyMap::new();
+            {
+                let instant_ctor = ns.get("Instant").cloned().unwrap_or(JsValue::Undefined);
+                let plain_date_ctor = ns.get("PlainDate").cloned().unwrap_or(JsValue::Undefined);
+                let instant_proto = proto_lookup(&instant_ctor, "prototype");
+                let plain_date_proto = proto_lookup(&plain_date_ctor, "prototype");
+                now.insert(
+                    "instant".into(),
+                    builtin_fn("instant", 0, move |_| {
+                        let epoch_ms = date_now().trunc() as i64;
+                        let ns = i128::from(epoch_ms) * 1_000_000;
+                        let instant =
+                            TemporalInstant::from_epoch_nanoseconds(ns).ok_or_else(|| {
+                                StatorError::RangeError("invalid Temporal.Now.instant".into())
+                            })?;
+                        Ok(make_temporal_instant_instance(instant, &instant_proto))
+                    }),
+                );
+                now.insert(
+                    "plainDateISO".into(),
+                    builtin_fn("plainDateISO", 0, move |_| {
+                        let now_ms = date_now();
+                        let year = date_get_utc_full_year(now_ms) as i32;
+                        let month = date_get_utc_month(now_ms) as u8 + 1;
+                        let day = date_get_utc_date(now_ms) as u8;
+                        let date = TemporalPlainDate::new(year, month, day).ok_or_else(|| {
+                            StatorError::RangeError("invalid Temporal.Now.plainDateISO".into())
+                        })?;
+                        Ok(make_temporal_plain_date_instance(date, &plain_date_proto))
+                    }),
+                );
+            }
+            now.insert_with_attrs(
+                "@@toStringTag".into(),
+                JsValue::String("Temporal.Now".into()),
+                PropertyAttributes::CONFIGURABLE,
+            );
+            now.make_all_non_enumerable();
+            JsValue::PlainObject(Rc::new(RefCell::new(now)))
+        });
+
+        ns.insert_with_attrs(
+            "@@toStringTag".into(),
+            JsValue::String("Temporal".into()),
+            PropertyAttributes::CONFIGURABLE,
+        );
+        ns.make_all_non_enumerable();
+        JsValue::PlainObject(Rc::new(RefCell::new(ns)))
+    })
+}
+
 // ── Proxy ────────────────────────────────────────────────────────────────────
 
 /// Build the `Proxy` constructor namespace.
@@ -15349,6 +16054,7 @@ pub fn install_globals(globals: &mut HashMap<String, JsValue>) {
         globals.insert("console".into(), make_console());
         globals.insert("JSON".into(), make_json());
         globals.insert("Intl".into(), make_intl());
+        globals.insert("Temporal".into(), make_temporal());
 
         // ── Constructor / namespace objects ──────────────────────────────────
         globals.insert("Number".into(), finalize_ctor(make_number(), "Number"));
